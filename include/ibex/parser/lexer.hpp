@@ -2,46 +2,85 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
 #include <string_view>
 #include <vector>
 
 namespace ibex::parser {
 
 /// Token types for the Ibex lexer.
+/// See SPEC.md Section 2 (Lexical Structure) for the full specification.
 enum class TokenKind : std::uint8_t {
     // Literals
     IntLiteral,
     FloatLiteral,
     StringLiteral,
+    BoolLiteral,
+    DurationLiteral,
 
-    // Identifiers & keywords
+    // Identifiers
     Identifier,
-    KeywordSelect,
-    KeywordFrom,
-    KeywordWhere,
-    KeywordGroup,
-    KeywordBy,
-    KeywordAs,
 
-    // Operators
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    Plus,
-    Minus,
-    Star,
-    Slash,
+    // Hard keywords (SPEC.md Appendix B)
+    KeywordLet,
+    KeywordMut,
+    KeywordExtern,
+    KeywordFn,
+    KeywordFrom,
+    KeywordFilter,
+    KeywordSelect,
+    KeywordUpdate,
+    KeywordBy,
+    KeywordWindow,
+
+    // Type keywords
+    KeywordInt32,
+    KeywordInt64,
+    KeywordFloat32,
+    KeywordFloat64,
+    KeywordBool,
+    KeywordString,
+    KeywordTimestamp,
+    KeywordSeries,
+    KeywordDataFrame,
+    KeywordTimeFrame,
+
+    // Comparison operators
+    EqEq,     // ==
+    BangEq,   // !=
+    Lt,       // <
+    Le,       // <=
+    Gt,       // >
+    Ge,       // >=
+
+    // Arithmetic operators
+    Plus,     // +
+    Minus,    // -
+    Star,     // *
+    Slash,    // /
+    Percent,  // %
+
+    // Logical operators
+    AmpAmp,   // &&
+    PipePipe, // ||
+    Bang,     // !
+
+    // Scope escape (SPEC.md Section 6.2)
+    Caret,    // ^
+
+    // Assignment
+    Eq,       // =
 
     // Delimiters
-    LParen,
-    RParen,
-    Comma,
-    Semicolon,
-    Dot,
+    LParen,    // (
+    RParen,    // )
+    LBracket,  // [
+    RBracket,  // ]
+    LBrace,    // {
+    RBrace,    // }
+    Comma,     // ,
+    Semicolon, // ;
+    Colon,     // :
+    Arrow,     // ->
 
     // Special
     Eof,
@@ -58,7 +97,7 @@ struct Token {
 
 /// Tokenize an Ibex source string.
 ///
-/// TODO: Implement full lexer. Currently a stub.
+/// TODO: Implement full lexer per SPEC.md Section 2.
 [[nodiscard]] auto tokenize(std::string_view source) -> std::vector<Token>;
 
 }  // namespace ibex::parser

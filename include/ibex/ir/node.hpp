@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -11,6 +12,9 @@ namespace ibex::ir {
 /// Unique identifier for IR nodes.
 using NodeId = std::uint64_t;
 
+/// Duration type for window specifications (nanoseconds).
+using Duration = std::chrono::nanoseconds;
+
 /// Forward declarations
 class Node;
 using NodePtr = std::unique_ptr<Node>;
@@ -21,7 +25,16 @@ struct ColumnRef {
     NodeId source = 0;
 };
 
+/// A computed field: an alias mapped to an expression (represented as
+/// a column reference for now; will become an expression tree).
+/// See SPEC.md Section 5.3 (select/update field semantics).
+struct FieldSpec {
+    std::string alias;
+    ColumnRef column;  // TODO: Replace with ExprPtr once expression IR exists.
+};
+
 /// Supported comparison operators for filter predicates.
+/// See SPEC.md Section 2.5 (Operators).
 enum class CompareOp : std::uint8_t {
     Eq,
     Ne,
@@ -32,16 +45,20 @@ enum class CompareOp : std::uint8_t {
 };
 
 /// Supported aggregation functions.
+/// See SPEC.md Section 7.1 (Aggregate Functions).
 enum class AggFunc : std::uint8_t {
     Sum,
+    Mean,
     Min,
     Max,
-    Mean,
     Count,
+    First,
+    Last,
 };
 
 /// Filter predicate: column <op> literal.
-/// TODO: Extend to support compound predicates and expression trees.
+/// TODO: Extend to support compound predicates and expression trees
+///       per SPEC.md Section 5.3 (filter clause semantics).
 struct FilterPredicate {
     ColumnRef column;
     CompareOp op = CompareOp::Eq;
@@ -56,11 +73,14 @@ struct AggSpec {
 };
 
 /// IR node types.
+/// See SPEC.md Section 1.3 (Mapping to Relational Algebra).
 enum class NodeKind : std::uint8_t {
     Scan,
     Filter,
     Project,
     Aggregate,
+    Update,
+    Window,
 };
 
 /// Base IR node for the query plan.
@@ -106,6 +126,7 @@ private:
 };
 
 /// Filter node: applies a predicate to its child.
+/// See SPEC.md Section 5.3 (filter clause).
 class FilterNode final : public Node {
 public:
     FilterNode(NodeId id, FilterPredicate predicate)
@@ -119,7 +140,8 @@ private:
     FilterPredicate predicate_;
 };
 
-/// Project node: selects a subset of columns.
+/// Project node: selects and computes a subset of columns.
+/// See SPEC.md Section 5.3 (select clause).
 class ProjectNode final : public Node {
 public:
     ProjectNode(NodeId id, std::vector<ColumnRef> columns)
@@ -134,6 +156,7 @@ private:
 };
 
 /// Aggregate node: groups and aggregates.
+/// See SPEC.md Section 7 (Aggregation Rules).
 class AggregateNode final : public Node {
 public:
     AggregateNode(NodeId id, std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
@@ -151,6 +174,46 @@ public:
 private:
     std::vector<ColumnRef> group_by_;
     std::vector<AggSpec> aggregations_;
+};
+
+/// Update node: adds or replaces columns while retaining all existing ones.
+/// See SPEC.md Section 5.3 (update clause).
+///
+/// When group_by is non-empty, expressions are evaluated per group and
+/// broadcast back (SPEC.md Section 7.4).
+class UpdateNode final : public Node {
+public:
+    UpdateNode(NodeId id, std::vector<FieldSpec> fields, std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Update, id),
+          fields_(std::move(fields)),
+          group_by_(std::move(group_by)) {}
+
+    [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& {
+        return fields_;
+    }
+    [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
+        return group_by_;
+    }
+
+private:
+    std::vector<FieldSpec> fields_;
+    std::vector<ColumnRef> group_by_;
+};
+
+/// Window node: specifies a time-based window for rolling computations.
+/// See SPEC.md Section 8 (TimeFrame Extensions).
+///
+/// Valid only on TimeFrame operands. The duration defines the lookback
+/// range [t - duration, t] for each row at time t.
+class WindowNode final : public Node {
+public:
+    WindowNode(NodeId id, Duration duration)
+        : Node(NodeKind::Window, id), duration_(duration) {}
+
+    [[nodiscard]] auto duration() const noexcept -> Duration { return duration_; }
+
+private:
+    Duration duration_;
 };
 
 }  // namespace ibex::ir

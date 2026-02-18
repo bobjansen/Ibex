@@ -32,6 +32,16 @@ public:
             next_id(), std::move(group_by), std::move(aggregations));
     }
 
+    [[nodiscard]] auto update(
+        std::vector<FieldSpec> fields, std::vector<ColumnRef> group_by = {}) -> NodePtr {
+        return std::make_unique<UpdateNode>(
+            next_id(), std::move(fields), std::move(group_by));
+    }
+
+    [[nodiscard]] auto window(Duration duration) -> NodePtr {
+        return std::make_unique<WindowNode>(next_id(), duration);
+    }
+
 private:
     [[nodiscard]] auto next_id() -> NodeId {
         return next_id_.fetch_add(1, std::memory_order_relaxed);

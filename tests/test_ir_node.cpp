@@ -74,6 +74,33 @@ TEST_CASE("AggregateNode stores group-by and aggregations", "[ir][aggregate]") {
     REQUIRE(agg->aggregations()[0].alias == "total_volume");
 }
 
+TEST_CASE("UpdateNode stores fields and optional group-by", "[ir][update]") {
+    ibex::ir::Builder builder;
+
+    auto node = builder.update(
+        {ibex::ir::FieldSpec{.alias = "log_price", .column = {.name = "price"}}},
+        {ibex::ir::ColumnRef{.name = "symbol"}});
+
+    auto* upd = dynamic_cast<ibex::ir::UpdateNode*>(node.get());
+    REQUIRE(upd != nullptr);
+    REQUIRE(upd->kind() == ibex::ir::NodeKind::Update);
+    REQUIRE(upd->fields().size() == 1);
+    REQUIRE(upd->fields()[0].alias == "log_price");
+    REQUIRE(upd->group_by().size() == 1);
+    REQUIRE(upd->group_by()[0].name == "symbol");
+}
+
+TEST_CASE("WindowNode stores duration", "[ir][window]") {
+    ibex::ir::Builder builder;
+
+    auto node = builder.window(std::chrono::minutes{5});
+
+    auto* win = dynamic_cast<ibex::ir::WindowNode*>(node.get());
+    REQUIRE(win != nullptr);
+    REQUIRE(win->kind() == ibex::ir::NodeKind::Window);
+    REQUIRE(win->duration() == std::chrono::minutes{5});
+}
+
 TEST_CASE("Nodes can form a tree via add_child", "[ir][tree]") {
     ibex::ir::Builder builder;
 

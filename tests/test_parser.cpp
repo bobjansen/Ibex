@@ -1,0 +1,189 @@
+#include <ibex/parser/parser.hpp>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <variant>
+
+namespace {
+
+using namespace ibex::parser;
+
+const Expr& require_expr(const ExprPtr& expr) {
+    REQUIRE(expr != nullptr);
+    return *expr;
+}
+
+const BinaryExpr& require_binary(const Expr& expr, BinaryOp op) {
+    const auto* node = std::get_if<BinaryExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    REQUIRE(node->op == op);
+    return *node;
+}
+
+const LiteralExpr& require_literal(const Expr& expr) {
+    const auto* node = std::get_if<LiteralExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    return *node;
+}
+
+const IdentifierExpr& require_identifier(const Expr& expr) {
+    const auto* node = std::get_if<IdentifierExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    return *node;
+}
+
+const CallExpr& require_call(const Expr& expr) {
+    const auto* node = std::get_if<CallExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    return *node;
+}
+
+const BlockExpr& require_block(const Expr& expr) {
+    const auto* node = std::get_if<BlockExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    return *node;
+}
+
+}  // namespace
+
+TEST_CASE("Parse extern declaration with schema types") {
+    const char* source =
+        "extern fn read_csv(path: String, schema: DataFrame<{ id: Int64, name: String }>)"
+        " -> DataFrame<{ id: Int64, name: String }> from \"csv.hpp\";";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<ExternDecl>(stmt));
+    const auto& decl = std::get<ExternDecl>(stmt);
+    REQUIRE(decl.name == "read_csv");
+    REQUIRE(decl.params.size() == 2);
+    REQUIRE(decl.params[0].name == "path");
+    REQUIRE(decl.params[0].type.kind == Type::Kind::Scalar);
+    REQUIRE(std::get<ScalarType>(decl.params[0].type.arg) == ScalarType::String);
+    REQUIRE(decl.params[1].name == "schema");
+    REQUIRE(decl.params[1].type.kind == Type::Kind::DataFrame);
+    const auto& schema = std::get<SchemaType>(decl.params[1].type.arg);
+    REQUIRE(schema.fields.size() == 2);
+    REQUIRE(schema.fields[0].name == "id");
+    REQUIRE(schema.fields[0].type == ScalarType::Int64);
+    REQUIRE(schema.fields[1].name == "name");
+    REQUIRE(schema.fields[1].type == ScalarType::String);
+    REQUIRE(decl.return_type.kind == Type::Kind::DataFrame);
+    REQUIRE(std::get<SchemaType>(decl.return_type.arg).fields.size() == 2);
+    REQUIRE(decl.source_path == "csv.hpp");
+}
+
+TEST_CASE("Parse let binding with precedence") {
+    const char* source = "let mut x: Int64 = 1 + 2 * 3;";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<LetStmt>(stmt));
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    REQUIRE(let_stmt.is_mut);
+    REQUIRE(let_stmt.name == "x");
+    REQUIRE(let_stmt.type.has_value());
+    REQUIRE(let_stmt.type->kind == Type::Kind::Scalar);
+    REQUIRE(std::get<ScalarType>(let_stmt.type->arg) == ScalarType::Int64);
+
+    const auto& expr = require_expr(let_stmt.value);
+    const auto& add = require_binary(expr, BinaryOp::Add);
+    const auto& left_lit = require_literal(require_expr(add.left));
+    REQUIRE(std::get<std::int64_t>(left_lit.value) == 1);
+    const auto& mul = require_binary(require_expr(add.right), BinaryOp::Mul);
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(mul.left)).value) == 2);
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(mul.right)).value) == 3);
+}
+
+TEST_CASE("Parse expression statement with call") {
+    const char* source = "foo(1, 2 + 3);";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<ExprStmt>(stmt));
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& call = require_call(require_expr(expr_stmt.expr));
+    REQUIRE(call.callee == "foo");
+    REQUIRE(call.args.size() == 2);
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(call.args[0])).value) == 1);
+    const auto& add = require_binary(require_expr(call.args[1]), BinaryOp::Add);
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(add.left)).value) == 2);
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(add.right)).value) == 3);
+}
+
+TEST_CASE("Parse block expression with filter and select") {
+    const char* source = "df[filter price > 10, select { price, total = price * 2 }];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<ExprStmt>(stmt));
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 2);
+
+    REQUIRE(std::holds_alternative<FilterClause>(block.clauses[0]));
+    const auto& filter = std::get<FilterClause>(block.clauses[0]);
+    const auto& gt = require_binary(require_expr(filter.predicate), BinaryOp::Gt);
+    REQUIRE(require_identifier(require_expr(gt.left)).name == "price");
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(gt.right)).value) == 10);
+
+    REQUIRE(std::holds_alternative<SelectClause>(block.clauses[1]));
+    const auto& select = std::get<SelectClause>(block.clauses[1]);
+    REQUIRE(select.fields.size() == 2);
+    REQUIRE(select.fields[0].name == "price");
+    REQUIRE(select.fields[0].expr == nullptr);
+    REQUIRE(select.fields[1].name == "total");
+    REQUIRE(select.fields[1].expr != nullptr);
+}
+
+TEST_CASE("Parse by clause with braced keys") {
+    const char* source = "df[by { symbol, yr = year(ts) }];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+    REQUIRE(std::holds_alternative<ByClause>(block.clauses[0]));
+    const auto& by = std::get<ByClause>(block.clauses[0]);
+    REQUIRE(by.is_braced);
+    REQUIRE(by.keys.size() == 2);
+    REQUIRE(by.keys[0].name == "symbol");
+    REQUIRE(by.keys[0].expr == nullptr);
+    REQUIRE(by.keys[1].name == "yr");
+    REQUIRE(by.keys[1].expr != nullptr);
+}
+
+TEST_CASE("Parse window clause") {
+    const char* source = "tf[window 5m];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+    REQUIRE(std::holds_alternative<WindowClause>(block.clauses[0]));
+    const auto& window = std::get<WindowClause>(block.clauses[0]);
+    REQUIRE(window.duration.text == "5m");
+}
+
+TEST_CASE("Parse error for missing semicolon") {
+    const char* source = "let x = 1";
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("';'") != std::string::npos);
+}

@@ -29,15 +29,21 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             break;
         }
 
+        auto input = line;
+        auto last_non_space = input.find_last_not_of(" \t\r\n");
+        if (last_non_space != std::string::npos && input[last_non_space] != ';') {
+            input.push_back(';');
+        }
+
         // Attempt to parse
-        auto result = parser::parse(line);
+        auto result = parser::parse(input);
         if (!result) {
             fmt::print("error: {}\n", result.error().format());
             continue;
         }
 
-        // TODO: Execute the IR plan against the runtime.
-        fmt::print("parsed OK (node id={})\n", result.value()->id());
+        // TODO: Execute the program against the runtime.
+        fmt::print("parsed OK (statements={})\n", result.value().statements.size());
     }
 
     spdlog::info("Ibex REPL exiting");

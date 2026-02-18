@@ -3,12 +3,14 @@ include(Catch2Testing)
 add_executable(ibex_tests
     test_column.cpp
     test_ir_node.cpp
+    test_parser.cpp
 )
 
 target_link_libraries(ibex_tests
     PRIVATE
         Ibex::core
         Ibex::ir
+        Ibex::parser
         Ibex::CompilerOptions
         Catch2::Catch2WithMain
 )

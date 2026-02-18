@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ibex/ir/node.hpp>
+#include <ibex/parser/ast.hpp>
 
 #include <expected>
 #include <string>
@@ -18,12 +18,9 @@ struct ParseError {
 };
 
 /// Result type for parse operations.
-using ParseResult = std::expected<ir::NodePtr, ParseError>;
+using ParseResult = std::expected<Program, ParseError>;
 
-/// Parse an Ibex query string into an IR node tree.
-///
-/// TODO: Implement lexer and recursive-descent parser.
-/// Currently returns an error indicating parsing is not yet implemented.
+/// Parse an Ibex source string into a Program AST.
 [[nodiscard]] auto parse(std::string_view source) -> ParseResult;
 
 }  // namespace ibex::parser

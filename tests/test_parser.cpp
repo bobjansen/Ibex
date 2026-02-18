@@ -187,3 +187,17 @@ TEST_CASE("Parse error for missing semicolon") {
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().message.find("';'") != std::string::npos);
 }
+
+TEST_CASE("Parse error includes unexpected token lexeme") {
+    const char* source = "1 1;";
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("'1'") != std::string::npos);
+}
+
+TEST_CASE("Lexer error includes invalid numeric literal lexeme") {
+    const char* source = "1dfsd1;";
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("1dfsd1") != std::string::npos);
+}

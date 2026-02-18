@@ -2,8 +2,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <string>
-
 TEST_CASE("Column<int> basic operations", "[core][column]") {
     ibex::Column<int> col{1, 2, 3, 4, 5};
 

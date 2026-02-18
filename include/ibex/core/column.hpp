@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <concepts>
 #include <span>
-#include <stdexcept>
 #include <vector>
 
 namespace ibex {
@@ -18,7 +17,7 @@ concept ColumnElement = std::regular<T> && std::totally_ordered<T>;
 /// and exposes span-based access for zero-copy interop.
 template <ColumnElement T>
 class Column {
-public:
+   public:
     using value_type = T;
     using size_type = std::size_t;
 
@@ -41,14 +40,10 @@ public:
     [[nodiscard]] auto at(size_type idx) -> T& { return data_.at(idx); }
 
     /// Unchecked element access.
-    [[nodiscard]] auto operator[](size_type idx) const noexcept -> const T& {
-        return data_[idx];
-    }
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> const T& { return data_[idx]; }
 
     /// Unchecked mutable element access.
-    [[nodiscard]] auto operator[](size_type idx) noexcept -> T& {
-        return data_[idx];
-    }
+    [[nodiscard]] auto operator[](size_type idx) noexcept -> T& { return data_[idx]; }
 
     /// Zero-copy immutable view of the underlying data.
     [[nodiscard]] auto span() const noexcept -> std::span<const T> { return data_; }
@@ -88,7 +83,7 @@ public:
     [[nodiscard]] auto begin() const noexcept { return data_.cbegin(); }
     [[nodiscard]] auto end() const noexcept { return data_.cend(); }
 
-private:
+   private:
     std::vector<T> data_;
 };
 

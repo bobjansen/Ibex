@@ -10,6 +10,15 @@
 
 namespace ibex::repl {
 
+auto normalize_input(std::string_view input) -> std::string {
+    std::string normalized(input);
+    auto last_non_space = normalized.find_last_not_of(" \t\r\n");
+    if (last_non_space != std::string::npos && normalized[last_non_space] != ';') {
+        normalized.push_back(';');
+    }
+    return normalized;
+}
+
 void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
     spdlog::info("Ibex REPL started (verbose={})", config.verbose);
 
@@ -29,14 +38,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             break;
         }
 
-        auto input = line;
-        auto last_non_space = input.find_last_not_of(" \t\r\n");
-        if (last_non_space != std::string::npos && input[last_non_space] != ';') {
-            input.push_back(';');
-        }
-
         // Attempt to parse
-        auto result = parser::parse(input);
+        auto result = parser::parse(normalize_input(line));
         if (!result) {
             fmt::print("error: {}\n", result.error().format());
             continue;

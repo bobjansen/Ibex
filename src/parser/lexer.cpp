@@ -175,16 +175,20 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
 
             if (!is_float) {
                 std::size_t unit_start = i;
-                while (std::isalpha(static_cast<unsigned char>(peek())) != 0) {
-                    advance();
+                if (is_ident_start(static_cast<unsigned char>(peek()))) {
+                    while (is_ident_cont(static_cast<unsigned char>(peek()))) {
+                        advance();
+                    }
                 }
                 std::string_view unit = source.substr(unit_start, i - unit_start);
                 if (!unit.empty() && is_duration_unit(unit)) {
                     add_token(TokenKind::DurationLiteral, token_start, i - token_start, token_line, token_column);
                     continue;
                 }
-                i = unit_start;
-                column = token_column + (unit_start - token_start);
+                if (!unit.empty()) {
+                    add_token(TokenKind::Error, token_start, i - token_start, token_line, token_column);
+                    continue;
+                }
             }
 
             add_token(is_float ? TokenKind::FloatLiteral : TokenKind::IntLiteral,

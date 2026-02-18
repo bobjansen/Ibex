@@ -22,7 +22,7 @@ public:
         Program program;
         while (!is_at_end()) {
             if (peek().kind == TokenKind::Error) {
-                return std::unexpected(make_error(peek(), "invalid token"));
+                return std::unexpected(make_error(peek(), fmt::format("invalid token {}", format_token(peek()))));
             }
             auto stmt = parse_statement();
             if (!stmt.has_value()) {
@@ -135,6 +135,10 @@ private:
     auto parse_expr_stmt() -> std::optional<Stmt> {
         auto expr = parse_expression();
         if (!expr) {
+            return std::nullopt;
+        }
+        if (!check(TokenKind::Semicolon)) {
+            error_ = make_error(peek(), fmt::format("unexpected token {} after expression", format_token(peek())));
             return std::nullopt;
         }
         if (!consume(TokenKind::Semicolon, "expected ';' after expression")) {
@@ -641,6 +645,13 @@ private:
             .line = token.line,
             .column = token.column,
         };
+    }
+
+    auto format_token(const Token& token) const -> std::string {
+        if (token.kind == TokenKind::Eof || token.lexeme.empty()) {
+            return "'<eof>'";
+        }
+        return fmt::format("'{}'", std::string(token.lexeme));
     }
 
     auto fail_expr(const Token& token, std::string_view message) -> ExprPtr {

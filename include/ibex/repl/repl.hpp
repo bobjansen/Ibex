@@ -18,4 +18,7 @@ struct ReplConfig {
 /// TODO: Implement evaluation pipeline (parse -> IR -> execute).
 void run(const ReplConfig& config, runtime::ExternRegistry& registry);
 
+/// Normalize a single REPL input line (e.g., inject implicit semicolon).
+[[nodiscard]] auto normalize_input(std::string_view input) -> std::string;
+
 }  // namespace ibex::repl

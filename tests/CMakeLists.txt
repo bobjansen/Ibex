@@ -4,6 +4,9 @@ add_executable(ibex_tests
     test_column.cpp
     test_ir_node.cpp
     test_parser.cpp
+    test_repl.cpp
+    test_lower.cpp
+    test_interpreter.cpp
 )
 
 target_link_libraries(ibex_tests
@@ -11,6 +14,8 @@ target_link_libraries(ibex_tests
         Ibex::core
         Ibex::ir
         Ibex::parser
+        Ibex::repl
+        Ibex::runtime
         Ibex::CompilerOptions
         Catch2::Catch2WithMain
 )

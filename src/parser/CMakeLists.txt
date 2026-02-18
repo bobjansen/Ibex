@@ -1,5 +1,6 @@
 add_library(ibex_parser STATIC
     lexer.cpp
+    lower.cpp
     parser.cpp
 )
 add_library(Ibex::parser ALIAS ibex_parser)

@@ -3,12 +3,7 @@
 #include <ibex/core/column.hpp>
 
 #include <cassert>
-#include <concepts>
 #include <cstddef>
-#include <stdexcept>
-#include <string>
-#include <tuple>
-#include <utility>
 
 namespace ibex {
 
@@ -51,7 +46,7 @@ struct Schema<Tag, T, Rest...> {
 /// demonstrating the typed schema approach.
 template <typename SchemaT>
 class DataFrame {
-public:
+   public:
     DataFrame() = default;
 
     /// Number of rows (all columns must have equal length).
@@ -66,7 +61,7 @@ public:
     /// TODO: implement once column storage is wired up.
     [[nodiscard]] auto is_valid() const noexcept -> bool { return true; }
 
-private:
+   private:
     std::size_t rows_ = 0;
 };
 

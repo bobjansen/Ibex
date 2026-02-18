@@ -1,0 +1,58 @@
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    - "-Wall"
+    - "-Wextra"
+    - "-std=c++23"
+
+Diagnostics:
+  ClangTidy:
+    Add:
+      - bugprone-*
+      - cert-*
+      - cppcoreguidelines-*
+      - misc-*
+      - modernize-*
+      - performance-*
+      - readability-*
+    Remove:
+      - modernize-use-trailing-return-type
+      - readability-identifier-length
+      - cppcoreguidelines-avoid-magic-numbers
+      - readability-magic-numbers
+      - readability-braces-around-statements
+  UnusedIncludes: Strict
+
+InlayHints:
+  Enabled: true
+  ParameterNames: true
+  DeducedTypes: true
+
+---
+If:
+  PathMatch: [.*/_deps/.*, .*/build/.*]
+Diagnostics:
+  Suppress: '*'
+CompileFlags:
+  Add: [-w]
+
+---
+If:
+  PathMatch:
+    - '.*/tests/.*\.cpp'
+    - '.*/test_[^/]*\.cpp'
+    - '.*/_[^/]*_test\.cpp'
+Diagnostics:
+  Suppress:
+    - misc-use-anonymous-namespace
+  ClangTidy:
+    Remove:
+      - cppcoreguidelines-avoid-do-while
+      - cppcoreguidelines-avoid-non-const-global-variables
+      - cppcoreguidelines-pro-type-vararg
+      - cppcoreguidelines-owning-memory
+      - cppcoreguidelines-special-member-functions
+      - cert-err58-cpp
+      - misc-use-anonymous-namespace
+      - bugprone-exception-escape
+      - readability-function-cognitive-complexity

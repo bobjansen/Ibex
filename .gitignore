@@ -1,0 +1,19 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE & tool caches
+.idea/
+.vscode/
+.cache/
+*.swp
+*.swo
+*~
+
+# Compile commands (generated)
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db

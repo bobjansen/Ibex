@@ -1,0 +1,60 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+# Column limit
+ColumnLimit: 100
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+IndentCaseLabels: true
+NamespaceIndentation: None
+
+# Braces
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Includes
+SortIncludes: CaseInsensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Project headers
+  - Regex: '^<ibex/'
+    Priority: 1
+  # Third-party headers
+  - Regex: '^<(fmt|spdlog|CLI|catch2)/'
+    Priority: 2
+  # System headers
+  - Regex: '^<'
+    Priority: 3
+
+# Alignment
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignOperands: true
+AlignTrailingComments: true
+
+# Other
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+SpaceAfterTemplateKeyword: true
+SpacesBeforeTrailingComments: 2
+
+# C++20/23
+AllowShortLambdasOnASingleLine: Inline
+BinPackArguments: true
+BinPackParameters: true
+
+# Penalty tuning
+PenaltyBreakComment: 300
+PenaltyBreakFirstLessLess: 120
+PenaltyBreakString: 1000
+PenaltyExcessCharacter: 1000000
+PenaltyReturnTypeOnItsOwnLine: 200
+...

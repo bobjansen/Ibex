@@ -122,6 +122,7 @@ column names, or function names:
 ```
 let    mut    extern  fn     from
 filter select update  by     window
+join   left   asof    on
 true   false
 Int32  Int64  Float32 Float64
 Bool   String Timestamp
@@ -213,6 +214,8 @@ Use `a < b && b < c`.
 | `expr[clauses]` | DataFrame block   |
 
 Postfix operators bind tighter than all prefix and infix operators.
+Join expressions (`A join B on key`, etc.) have **lower precedence** than all
+binary operators and associate **left**.
 
 ---
 
@@ -311,7 +314,10 @@ schema_field    = IDENT ":" scalar_type ;
 expr            = primary
                 | unary_op expr
                 | expr binary_op expr
-                | expr "[" clause_list "]" ;
+                | expr "[" clause_list "]"
+                | expr "join" expr "on" join_keys
+                | expr "left" "join" expr "on" join_keys
+                | expr "asof" "join" expr "on" join_keys ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "^" IDENT                      (* scope escape *)
@@ -348,6 +354,9 @@ field_list      = field { "," field } [ "," ] ;
 
 field           = IDENT "=" expr
                 | IDENT ;
+
+join_keys       = IDENT
+                | "{" IDENT { "," IDENT } [ "," ] "}" ;
 
 (* --- Parameters --- *)
 
@@ -401,6 +410,8 @@ resolve all ambiguities in a recursive-descent or Pratt parser:
 6. **Scope escape.** `^` followed by `IDENT` is a scope-escape primary
    (Section 6.2). `^` cannot appear before a non-identifier token; `^(expr)`
    and `^42` are parse errors.
+7. **Join precedence.** Join forms parse after all binary operators and bind
+   left: `a join b on k join c on k` parses as `(a join b on k) join c on k`.
 
 ---
 
@@ -529,6 +540,43 @@ operand is a `TimeFrame`. See Section 8.
 
 If the input is a `TimeFrame` and no clause removes the time index column,
 the output remains a `TimeFrame`.
+
+### 5.5 Join Expressions
+
+Join expressions combine two DataFrames or TimeFrames using one or more key
+columns. The supported surface forms are:
+
+```
+A join B on key
+A left join B on key
+A asof join B on time
+A join B on { key1, key2 }
+A left join B on { key1, key2 }
+A asof join B on { time }
+```
+
+Semantics:
+
+- `A join B on key` is an inner join (rows must match on `key`).
+- `A left join B on key` is a left outer join (all rows from `A` are preserved).
+- `A asof join B on time` is an as-of join on the TimeFrame index column.
+
+The `on` list must be one or more unqualified column names present in both
+input schemas. `asof join` requires both operands to be `TimeFrame`s and the
+`on` list must include their shared time index column. Additional columns are
+treated as equality keys.
+
+Join expressions are **syntactic sugar** for the built-in join functions:
+
+- `A join B on key` → `inner_join(A, B, key)`
+- `A left join B on key` → `left_join(A, B, key)`
+- `A asof join B on time` → `asof_join(A, B, time, tolerance = 0s)`
+- `A join B on { k1, k2 }` → `inner_join(A, B, k1, k2)`
+- `A left join B on { k1, k2 }` → `left_join(A, B, k1, k2)`
+- `A asof join B on { time }` → `asof_join(A, B, time, tolerance = 0s)`
+- `A asof join B on { time, k1, k2 }` → `asof_join(A, B, time, k1, k2, tolerance = 0s)`
+
+For non-zero as-of tolerances, use the function forms directly (Section 10.3).
 
 ---
 
@@ -931,7 +979,9 @@ key columns appear once).
 
 `asof_join` is valid only on `TimeFrame` operands. The final argument is a
 duration literal specifying the maximum time difference for a match. Both
-TimeFrames must share the same time index column.
+TimeFrames must share the same time index column. Additional key arguments
+apply equality matching in addition to the time-based match. Join expressions
+(Section 5.5) always pass a tolerance of `0s`.
 
 ### 10.4 Ordering
 
@@ -1085,6 +1135,7 @@ Highest precedence at top.
 | 3     | Equality     | `==` `!=`                         | None   |
 | 2     | Logical AND  | `&&`                              | Left   |
 | 1     | Logical OR   | `\|\|`                            | Left   |
+| 0     | Join         | `join` `left join` `asof join`    | Left   |
 
 ---
 
@@ -1093,7 +1144,7 @@ Highest precedence at top.
 **Hard keywords** (always reserved, used by grammar):
 
 ```
-let  mut  extern  fn  from  filter  select  update  by  window  true  false
+let  mut  extern  fn  from  filter  select  update  by  window  join  left  asof  on  true  false
 ```
 
 **Type keywords** (reserved in type position and as identifiers):
@@ -1128,7 +1179,7 @@ parse_statement:
 
 parse_expr (Pratt):
     NUD: IDENT, "^" IDENT, literal, schema_lit, "(", unary_op
-    LED: binary_op, "[" (block), "(" (call — only after IDENT NUD)
+    LED: binary_op, join_form, "[" (block), "(" (call — only after IDENT NUD)
 
 parse_clause:
     "filter" → filter_clause
@@ -1137,6 +1188,11 @@ parse_clause:
     "by"     → peek "{" → braced field list
              → otherwise → single IDENT
     "window" → DURATION_LIT
+
+join_form:
+    expr "join" expr "on" IDENT
+    expr "left" "join" expr "on" IDENT
+    expr "asof" "join" expr "on" IDENT
 ```
 
 The parser is fully deterministic with 1-token lookahead after consuming the

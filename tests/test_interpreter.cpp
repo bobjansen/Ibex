@@ -25,8 +25,8 @@ auto require_ir(const char* source) -> ir::NodePtr {
 
 TEST_CASE("Interpret filter + select") {
     runtime::Table table;
-    table.columns.emplace("price", Column<std::int64_t>{10, 20, 30});
-    table.columns.emplace("symbol", Column<std::string>{"A", "B", "A"});
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A"});
 
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
@@ -36,16 +36,18 @@ TEST_CASE("Interpret filter + select") {
     REQUIRE(result.has_value());
     REQUIRE(result->columns.size() == 1);
 
-    const auto* price_col = std::get_if<Column<std::int64_t>>(&result->columns.at("price"));
+    const auto* price_col = result->find("price");
     REQUIRE(price_col != nullptr);
-    REQUIRE(price_col->size() == 2);
-    REQUIRE((*price_col)[0] == 20);
-    REQUIRE((*price_col)[1] == 30);
+    const auto* price_ints = std::get_if<Column<std::int64_t>>(price_col);
+    REQUIRE(price_col != nullptr);
+    REQUIRE(price_ints->size() == 2);
+    REQUIRE((*price_ints)[0] == 20);
+    REQUIRE((*price_ints)[1] == 30);
 }
 
 TEST_CASE("Interpret update alias") {
     runtime::Table table;
-    table.columns.emplace("price", Column<std::int64_t>{5, 7});
+    table.add_column("price", Column<std::int64_t>{5, 7});
 
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
@@ -55,11 +57,15 @@ TEST_CASE("Interpret update alias") {
     REQUIRE(result.has_value());
     REQUIRE(result->columns.size() == 2);
 
-    const auto* price_col = std::get_if<Column<std::int64_t>>(&result->columns.at("price"));
-    const auto* alias_col = std::get_if<Column<std::int64_t>>(&result->columns.at("p"));
+    const auto* price_col = result->find("price");
+    const auto* alias_col = result->find("p");
     REQUIRE(price_col != nullptr);
     REQUIRE(alias_col != nullptr);
-    REQUIRE(price_col->size() == alias_col->size());
-    REQUIRE((*alias_col)[0] == 5);
-    REQUIRE((*alias_col)[1] == 7);
+    const auto* price_ints = std::get_if<Column<std::int64_t>>(price_col);
+    const auto* alias_ints = std::get_if<Column<std::int64_t>>(alias_col);
+    REQUIRE(price_ints != nullptr);
+    REQUIRE(alias_ints != nullptr);
+    REQUIRE(price_ints->size() == alias_ints->size());
+    REQUIRE((*alias_ints)[0] == 5);
+    REQUIRE((*alias_ints)[1] == 7);
 }

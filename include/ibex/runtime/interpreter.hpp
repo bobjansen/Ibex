@@ -12,9 +12,17 @@ namespace ibex::runtime {
 
 using ColumnValue = std::variant<Column<std::int64_t>, Column<double>, Column<std::string>>;
 
-struct Table {
-    std::unordered_map<std::string, ColumnValue> columns;
+struct ColumnEntry {
+    std::string name;
+    ColumnValue column;
+};
 
+struct Table {
+    std::vector<ColumnEntry> columns;
+    std::unordered_map<std::string, std::size_t> index;
+
+    void add_column(std::string name, ColumnValue column);
+    [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;
     [[nodiscard]] auto rows() const noexcept -> std::size_t;
 };
 

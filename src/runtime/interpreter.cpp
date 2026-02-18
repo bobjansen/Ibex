@@ -105,24 +105,27 @@ auto compare_value(const ColumnValue& column, std::size_t index, const ir::Filte
 
 auto filter_table(const Table& input, const ir::FilterPredicate& predicate)
     -> std::expected<Table, std::string> {
-    auto it = input.columns.find(predicate.column.name);
-    if (it == input.columns.end()) {
+    const auto* predicate_column = input.find(predicate.column.name);
+    if (predicate_column == nullptr) {
         return std::unexpected("filter column not found: " + predicate.column.name);
     }
-    const auto& predicate_column = it->second;
-    std::size_t rows = column_size(predicate_column);
+    std::size_t rows = column_size(*predicate_column);
 
     Table output;
-    for (const auto& [name, column] : input.columns) {
-        output.columns.emplace(name, make_empty_like(column));
+    for (const auto& entry : input.columns) {
+        output.add_column(entry.name, make_empty_like(entry.column));
     }
 
     for (std::size_t row = 0; row < rows; ++row) {
-        if (!compare_value(predicate_column, row, predicate)) {
+        if (!compare_value(*predicate_column, row, predicate)) {
             continue;
         }
-        for (auto& [name, column] : output.columns) {
-            append_value(column, input.columns.at(name), row);
+        for (auto& entry : output.columns) {
+            const auto* source = input.find(entry.name);
+            if (source == nullptr) {
+                return std::unexpected("filter column missing: " + entry.name);
+            }
+            append_value(entry.column, *source, row);
         }
     }
     return output;
@@ -132,11 +135,11 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     -> std::expected<Table, std::string> {
     Table output;
     for (const auto& col : columns) {
-        auto it = input.columns.find(col.name);
-        if (it == input.columns.end()) {
+        const auto* source = input.find(col.name);
+        if (source == nullptr) {
             return std::unexpected("select column not found: " + col.name);
         }
-        output.columns.emplace(col.name, it->second);
+        output.add_column(col.name, *source);
     }
     return output;
 }
@@ -145,11 +148,11 @@ auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields)
     -> std::expected<Table, std::string> {
     Table output = input;
     for (const auto& field : fields) {
-        auto it = input.columns.find(field.column.name);
-        if (it == input.columns.end()) {
+        const auto* source = input.find(field.column.name);
+        if (source == nullptr) {
             return std::unexpected("update column not found: " + field.column.name);
         }
-        output.columns.insert_or_assign(field.alias, it->second);
+        output.add_column(field.alias, *source);
     }
     return output;
 }
@@ -211,11 +214,28 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry)
 
 }  // namespace
 
+void Table::add_column(std::string name, ColumnValue column) {
+    if (auto it = index.find(name); it != index.end()) {
+        columns[it->second].column = std::move(column);
+        return;
+    }
+    std::size_t pos = columns.size();
+    columns.push_back(ColumnEntry{.name = std::move(name), .column = std::move(column)});
+    index[columns.back().name] = pos;
+}
+
+auto Table::find(const std::string& name) const -> const ColumnValue* {
+    if (auto it = index.find(name); it != index.end()) {
+        return &columns[it->second].column;
+    }
+    return nullptr;
+}
+
 auto Table::rows() const noexcept -> std::size_t {
     if (columns.empty()) {
         return 0;
     }
-    return column_size(columns.begin()->second);
+    return column_size(columns.front().column);
 }
 
 auto interpret(const ir::Node& node, const TableRegistry& registry)

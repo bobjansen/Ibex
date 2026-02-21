@@ -4,6 +4,7 @@
 
 #include <charconv>
 #include <cctype>
+#include <memory>
 #include <unordered_map>
 
 namespace ibex::parser {
@@ -12,6 +13,9 @@ namespace {
 
 class Lowerer {
 public:
+    explicit Lowerer(std::unordered_map<std::string, ir::NodePtr>* bindings)
+        : bindings_(bindings) {}
+
     auto lower_program(const Program& program) -> LowerResult {
         ir::NodePtr last_expr;
         for (const auto& stmt : program.statements) {
@@ -24,7 +28,9 @@ public:
                 if (!value.has_value()) {
                     return std::unexpected(value.error());
                 }
-                bindings_[let_stmt.name] = std::move(value.value());
+                if (bindings_ != nullptr) {
+                    (*bindings_)[let_stmt.name] = std::move(value.value());
+                }
                 continue;
             }
             if (std::holds_alternative<ExprStmt>(stmt)) {
@@ -42,6 +48,8 @@ public:
         return last_expr;
     }
 
+    auto lower_expression(const Expr& expr) -> LowerResult { return lower_expr(expr); }
+
 private:
     auto lower_expr(const Expr& expr) -> LowerResult {
         if (const auto* block = std::get_if<BlockExpr>(&expr.node)) {
@@ -54,8 +62,10 @@ private:
     }
 
     auto lower_identifier(const IdentifierExpr& ident) -> LowerResult {
-        if (auto it = bindings_.find(ident.name); it != bindings_.end()) {
-            return clone_node(*it->second);
+        if (bindings_ != nullptr) {
+            if (auto it = bindings_->find(ident.name); it != bindings_->end()) {
+                return clone_node(*it->second);
+            }
         }
         return builder_.scan(ident.name);
     }
@@ -227,13 +237,13 @@ private:
             if (field.expr == nullptr) {
                 return std::unexpected(LowerError{.message = "update field requires expression"});
             }
-            const auto* ident = std::get_if<IdentifierExpr>(&field.expr->node);
-            if (ident == nullptr) {
-                return std::unexpected(LowerError{.message = "update expressions must be column references"});
+            auto expr = lower_expr_to_ir(*field.expr);
+            if (!expr.has_value()) {
+                return std::unexpected(expr.error());
             }
             fields.push_back(ir::FieldSpec{
                 .alias = field.name,
-                .column = ir::ColumnRef{.name = ident->name},
+                .expr = std::move(expr.value()),
             });
         }
         std::vector<ir::ColumnRef> group_by;
@@ -245,6 +255,48 @@ private:
             group_by = std::move(keys.value());
         }
         return builder_.update(std::move(fields), std::move(group_by));
+    }
+
+    auto lower_expr_to_ir(const Expr& expr) -> std::expected<ir::Expr, LowerError> {
+        if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+            return ir::Expr{.node = ir::ColumnRef{.name = ident->name}};
+        }
+        if (const auto* literal = std::get_if<LiteralExpr>(&expr.node)) {
+            if (const auto* int_value = std::get_if<std::int64_t>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *int_value}};
+            }
+            if (const auto* double_value = std::get_if<double>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *double_value}};
+            }
+            if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *str_value}};
+            }
+            return std::unexpected(LowerError{.message = "unsupported literal in expression"});
+        }
+        if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+            auto left = lower_expr_to_ir(*binary->left);
+            if (!left.has_value()) {
+                return std::unexpected(left.error());
+            }
+            auto right = lower_expr_to_ir(*binary->right);
+            if (!right.has_value()) {
+                return std::unexpected(right.error());
+            }
+            auto op = to_arithmetic_op(binary->op);
+            if (!op.has_value()) {
+                return std::unexpected(LowerError{.message = "unsupported binary operator in expression"});
+            }
+            ir::BinaryExpr bin{
+                .op = op.value(),
+                .left = std::make_shared<ir::Expr>(std::move(left.value())),
+                .right = std::make_shared<ir::Expr>(std::move(right.value())),
+            };
+            return ir::Expr{.node = std::move(bin)};
+        }
+        if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+            return lower_expr_to_ir(*group->expr);
+        }
+        return std::unexpected(LowerError{.message = "unsupported expression"});
     }
 
     auto lower_aggregate(const ByClause& by, const SelectClause& select)
@@ -396,6 +448,23 @@ private:
         }
     }
 
+    static auto to_arithmetic_op(BinaryOp op) -> std::optional<ir::ArithmeticOp> {
+        switch (op) {
+        case BinaryOp::Add:
+            return ir::ArithmeticOp::Add;
+        case BinaryOp::Sub:
+            return ir::ArithmeticOp::Sub;
+        case BinaryOp::Mul:
+            return ir::ArithmeticOp::Mul;
+        case BinaryOp::Div:
+            return ir::ArithmeticOp::Div;
+        case BinaryOp::Mod:
+            return ir::ArithmeticOp::Mod;
+        default:
+            return std::nullopt;
+        }
+    }
+
     auto parse_agg_func(std::string_view name) -> std::optional<ir::AggFunc> {
         if (name == "sum") {
             return ir::AggFunc::Sum;
@@ -458,14 +527,20 @@ private:
     }
 
     ir::Builder builder_;
-    std::unordered_map<std::string, ir::NodePtr> bindings_;
+    std::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
 };
 
 }  // namespace
 
 auto lower(const Program& program) -> LowerResult {
-    Lowerer lowerer;
+    std::unordered_map<std::string, ir::NodePtr> bindings;
+    Lowerer lowerer(&bindings);
     return lowerer.lower_program(program);
+}
+
+auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
+    Lowerer lowerer(&context.bindings);
+    return lowerer.lower_expression(expr);
 }
 
 }  // namespace ibex::parser

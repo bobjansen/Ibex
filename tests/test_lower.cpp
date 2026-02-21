@@ -65,7 +65,9 @@ TEST_CASE("Lower update with by to IR") {
     REQUIRE(update != nullptr);
     REQUIRE(update->fields().size() == 1);
     REQUIRE(update->fields()[0].alias == "avg");
-    REQUIRE(update->fields()[0].column.name == "price");
+    const auto* expr = std::get_if<ir::ColumnRef>(&update->fields()[0].expr.node);
+    REQUIRE(expr != nullptr);
+    REQUIRE(expr->name == "price");
     REQUIRE(update->group_by().size() == 1);
     REQUIRE(update->group_by()[0].name == "symbol");
 }

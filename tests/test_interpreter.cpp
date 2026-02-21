@@ -69,3 +69,24 @@ TEST_CASE("Interpret update alias") {
     REQUIRE((*alias_ints)[0] == 5);
     REQUIRE((*alias_ints)[1] == 7);
 }
+
+TEST_CASE("Interpret update with arithmetic") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[update { price = price + 1 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* price_col = result->find("price");
+    REQUIRE(price_col != nullptr);
+    const auto* price_ints = std::get_if<Column<std::int64_t>>(price_col);
+    REQUIRE(price_ints != nullptr);
+    REQUIRE(price_ints->size() == 3);
+    REQUIRE((*price_ints)[0] == 2);
+    REQUIRE((*price_ints)[1] == 3);
+    REQUIRE((*price_ints)[2] == 4);
+}

@@ -78,7 +78,10 @@ TEST_CASE("UpdateNode stores fields and optional group-by", "[ir][update]") {
     ibex::ir::Builder builder;
 
     auto node = builder.update(
-        {ibex::ir::FieldSpec{.alias = "log_price", .column = {.name = "price"}}},
+        {ibex::ir::FieldSpec{
+            .alias = "log_price",
+            .expr = ibex::ir::Expr{.node = ibex::ir::ColumnRef{.name = "price"}},
+        }},
         {ibex::ir::ColumnRef{.name = "symbol"}});
 
     auto* upd = dynamic_cast<ibex::ir::UpdateNode*>(node.get());
@@ -86,6 +89,9 @@ TEST_CASE("UpdateNode stores fields and optional group-by", "[ir][update]") {
     REQUIRE(upd->kind() == ibex::ir::NodeKind::Update);
     REQUIRE(upd->fields().size() == 1);
     REQUIRE(upd->fields()[0].alias == "log_price");
+    const auto* expr = std::get_if<ibex::ir::ColumnRef>(&upd->fields()[0].expr.node);
+    REQUIRE(expr != nullptr);
+    REQUIRE(expr->name == "price");
     REQUIRE(upd->group_by().size() == 1);
     REQUIRE(upd->group_by()[0].name == "symbol");
 }

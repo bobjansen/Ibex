@@ -1,6 +1,8 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 
 namespace ibex::runtime {
 
@@ -144,15 +146,190 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     return output;
 }
 
+enum class ExprType : std::uint8_t {
+    Int,
+    Double,
+    String,
+};
+
+auto expr_type_for_column(const ColumnValue& column) -> ExprType {
+    if (std::holds_alternative<Column<std::int64_t>>(column)) {
+        return ExprType::Int;
+    }
+    if (std::holds_alternative<Column<double>>(column)) {
+        return ExprType::Double;
+    }
+    return ExprType::String;
+}
+
+auto infer_expr_type(const ir::Expr& expr, const Table& input) -> std::expected<ExprType, std::string> {
+    if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
+        const auto* source = input.find(col->name);
+        if (source == nullptr) {
+            return std::unexpected("unknown column in expression: " + col->name);
+        }
+        return expr_type_for_column(*source);
+    }
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        if (std::holds_alternative<std::int64_t>(lit->value)) {
+            return ExprType::Int;
+        }
+        if (std::holds_alternative<double>(lit->value)) {
+            return ExprType::Double;
+        }
+        return ExprType::String;
+    }
+    if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        auto left = infer_expr_type(*bin->left, input);
+        if (!left) {
+            return left;
+        }
+        auto right = infer_expr_type(*bin->right, input);
+        if (!right) {
+            return right;
+        }
+        if (left.value() == ExprType::String || right.value() == ExprType::String) {
+            return std::unexpected("string arithmetic not supported");
+        }
+        if (left.value() == ExprType::Double || right.value() == ExprType::Double) {
+            return ExprType::Double;
+        }
+        return ExprType::Int;
+    }
+    return std::unexpected("unsupported expression");
+}
+
+using ExprValue = std::variant<std::int64_t, double, std::string>;
+
+auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row)
+    -> std::expected<ExprValue, std::string> {
+    if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
+        const auto* source = input.find(col->name);
+        if (source == nullptr) {
+            return std::unexpected("unknown column in expression: " + col->name);
+        }
+        return std::visit(
+            [&](const auto& column) -> ExprValue {
+                return column[row];
+            },
+            *source);
+    }
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        return lit->value;
+    }
+    if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        auto left = eval_expr(*bin->left, input, row);
+        if (!left) {
+            return left;
+        }
+        auto right = eval_expr(*bin->right, input, row);
+        if (!right) {
+            return right;
+        }
+        if (std::holds_alternative<std::string>(left.value()) ||
+            std::holds_alternative<std::string>(right.value())) {
+            return std::unexpected("string arithmetic not supported");
+        }
+        auto to_double = [](const ExprValue& v) -> double {
+            if (const auto* i = std::get_if<std::int64_t>(&v)) {
+                return static_cast<double>(*i);
+            }
+            return std::get<double>(v);
+        };
+        bool want_double = std::holds_alternative<double>(left.value()) ||
+            std::holds_alternative<double>(right.value());
+        if (want_double) {
+            double lhs = to_double(left.value());
+            double rhs = to_double(right.value());
+            switch (bin->op) {
+            case ir::ArithmeticOp::Add:
+                return lhs + rhs;
+            case ir::ArithmeticOp::Sub:
+                return lhs - rhs;
+            case ir::ArithmeticOp::Mul:
+                return lhs * rhs;
+            case ir::ArithmeticOp::Div:
+                return lhs / rhs;
+            case ir::ArithmeticOp::Mod:
+                return std::fmod(lhs, rhs);
+            }
+        } else {
+            std::int64_t lhs = std::get<std::int64_t>(left.value());
+            std::int64_t rhs = std::get<std::int64_t>(right.value());
+            switch (bin->op) {
+            case ir::ArithmeticOp::Add:
+                return lhs + rhs;
+            case ir::ArithmeticOp::Sub:
+                return lhs - rhs;
+            case ir::ArithmeticOp::Mul:
+                return lhs * rhs;
+            case ir::ArithmeticOp::Div:
+                return lhs / rhs;
+            case ir::ArithmeticOp::Mod:
+                return lhs % rhs;
+            }
+        }
+    }
+    return std::unexpected("unsupported expression");
+}
+
 auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields)
     -> std::expected<Table, std::string> {
     Table output = input;
+    std::size_t rows = input.rows();
     for (const auto& field : fields) {
-        const auto* source = input.find(field.column.name);
-        if (source == nullptr) {
-            return std::unexpected("update column not found: " + field.column.name);
+        auto inferred = infer_expr_type(field.expr, input);
+        if (!inferred) {
+            return std::unexpected(inferred.error());
         }
-        output.add_column(field.alias, *source);
+        ColumnValue new_column;
+        switch (inferred.value()) {
+        case ExprType::Int:
+            new_column = Column<std::int64_t>{};
+            break;
+        case ExprType::Double:
+            new_column = Column<double>{};
+            break;
+        case ExprType::String:
+            new_column = Column<std::string>{};
+            break;
+        }
+        for (std::size_t row = 0; row < rows; ++row) {
+            auto value = eval_expr(field.expr, input, row);
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+            std::visit(
+                [&](auto& col) {
+                    using ColType = std::decay_t<decltype(col)>;
+                    using ValueType = typename ColType::value_type;
+                    if constexpr (std::is_same_v<ValueType, std::int64_t>) {
+                        if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                            col.push_back(*int_value);
+                        } else if (const auto* double_value = std::get_if<double>(&value.value())) {
+                            col.push_back(static_cast<std::int64_t>(*double_value));
+                        } else {
+                            throw std::runtime_error("type mismatch");
+                        }
+                    } else if constexpr (std::is_same_v<ValueType, double>) {
+                        if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                            col.push_back(static_cast<double>(*int_value));
+                        } else if (const auto* double_value = std::get_if<double>(&value.value())) {
+                            col.push_back(*double_value);
+                        } else {
+                            throw std::runtime_error("type mismatch");
+                        }
+                    } else if constexpr (std::is_same_v<ValueType, std::string>) {
+                        if (const auto* v = std::get_if<std::string>(&value.value())) {
+                            col.push_back(*v);
+                        } else {
+                            throw std::runtime_error("type mismatch");
+                        }
+                    }
+                },
+                new_column);
+        }
+        output.add_column(field.alias, std::move(new_column));
     }
     return output;
 }

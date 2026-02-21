@@ -25,12 +25,38 @@ struct ColumnRef {
     NodeId source = 0;
 };
 
+/// Expression node for computed fields.
+struct Expr;
+using ExprPtr = std::shared_ptr<Expr>;
+
+struct Literal {
+    std::variant<std::int64_t, double, std::string> value;
+};
+
+enum class ArithmeticOp : std::uint8_t {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+};
+
+struct BinaryExpr {
+    ArithmeticOp op = ArithmeticOp::Add;
+    ExprPtr left;
+    ExprPtr right;
+};
+
+struct Expr {
+    std::variant<ColumnRef, Literal, BinaryExpr> node;
+};
+
 /// A computed field: an alias mapped to an expression (represented as
-/// a column reference for now; will become an expression tree).
+/// a small expression tree).
 /// See SPEC.md Section 5.3 (select/update field semantics).
 struct FieldSpec {
     std::string alias;
-    ColumnRef column;  // TODO: Replace with ExprPtr once expression IR exists.
+    Expr expr;
 };
 
 /// Supported comparison operators for filter predicates.

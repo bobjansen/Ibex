@@ -24,3 +24,14 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - `select` and `update` are mutually exclusive in a block
 - `by` requires `select` or `update`
 - `window` requires TimeFrame operand
+- Built-ins should remain minimal; prefer `extern fn` hooks for functionality implemented in C++
+
+## Recent REPL Features
+- `:schema`, `:head`, `:describe`, `:scalars`, `:tables`, `:load <file>`
+- `read_csv("path")` and `scalar(table, column)`
+
+## Recent Language Features
+- `fn name(params) -> Type { ... }` with required types
+- `Int` alias for `Int64`
+- `Column<T>` alias for `Series<T>`
+- Computed fields in `select` are supported (lowered via update + project)

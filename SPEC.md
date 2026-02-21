@@ -87,6 +87,7 @@ In interactive mode:
 - Trailing semicolons are optional for single-line inputs. In script files,
   semicolons are required.
 - All bindings persist for the duration of the session.
+- `:load <file>` loads and executes a script in the current REPL context.
 
 ---
 
@@ -126,12 +127,12 @@ join   left   asof    on
 true   false
 Int32  Int64  Float32 Float64
 Bool   String Timestamp
-Series DataFrame TimeFrame
+Int    Column  Series DataFrame TimeFrame
 ```
 
-Built-in function names (`read_csv`, `write_csv`, `as_timeframe`, `inner_join`,
-`left_join`, `asof_join`, `sort`, `print`) are **soft-reserved**: they cannot
-be shadowed by user bindings but are not syntactic keywords.
+Built-in function names are **soft-reserved**: they cannot be shadowed by user
+bindings but are not syntactic keywords. Built-ins are intentionally minimal;
+prefer `extern fn` hooks for functionality implemented in C++.
 
 ### 2.4 Literals
 
@@ -225,6 +226,7 @@ binary operators and associate **left**.
 
 | Type        | Description                  | C++ Mapping       |
 |-------------|------------------------------|--------------------|
+| `Int`       | Alias for `Int64`            | `std::int64_t`     |
 | `Int32`     | 32-bit signed integer        | `std::int32_t`     |
 | `Int64`     | 64-bit signed integer        | `std::int64_t`     |
 | `Float32`   | 32-bit IEEE 754 float        | `float`            |
@@ -240,6 +242,7 @@ Implicit narrowing conversions are prohibited; explicit widening is permitted
 ### 3.2 Compound Types
 
 ```
+Column<T>         — alias for Series<T>
 Series<T>         — a column of scalar values of type T
 DataFrame<S>      — a relation with schema S
 TimeFrame<S>      — a time-indexed relation with schema S
@@ -284,6 +287,7 @@ program         = { statement } ;
 
 statement       = let_stmt
                 | assign_stmt
+                | fn_decl
                 | extern_decl
                 | expr_stmt ;
 
@@ -291,14 +295,20 @@ let_stmt        = "let" [ "mut" ] IDENT [ ":" type ] "=" expr ";" ;
 assign_stmt     = IDENT "=" expr ";" ;
 extern_decl     = "extern" "fn" IDENT "(" [ param_list ] ")"
                   "->" type "from" STRING_LIT ";" ;
+fn_decl         = "fn" IDENT "(" [ param_list ] ")" "->" type
+                  "{" { fn_stmt } "}" ;
 expr_stmt       = expr ";" ;
+
+fn_stmt         = let_stmt
+                | expr_stmt ;
 
 (* --- Types --- *)
 
 type            = scalar_type
+                | "Column" "<" scalar_type ">"
                 | type_ctor "<" type_arg ">" ;
 
-scalar_type     = "Int32" | "Int64" | "Float32" | "Float64"
+scalar_type     = "Int" | "Int32" | "Int64" | "Float32" | "Float64"
                 | "Bool"  | "String" | "Timestamp" ;
 
 type_ctor       = "Series" | "DataFrame" | "TimeFrame" ;
@@ -576,7 +586,7 @@ Join expressions are **syntactic sugar** for the built-in join functions:
 - `A asof join B on { time }` → `asof_join(A, B, time, tolerance = 0s)`
 - `A asof join B on { time, k1, k2 }` → `asof_join(A, B, time, k1, k2, tolerance = 0s)`
 
-For non-zero as-of tolerances, use the function forms directly (Section 10.4).
+For non-zero as-of tolerances, use the function forms directly (Section 11.3).
 
 ---
 
@@ -882,7 +892,35 @@ tf[update { timestamp = timestamp + 1s }]  // ERROR: cannot mutate time index
 
 ## 9. Extern Function Interop
 
-### 9.1 Declaration Syntax
+## 9. User-Defined Functions
+
+User-defined functions group multiple statements under a single name.
+
+```
+fn <name>(<params>) -> <return_type> { <statements> }
+```
+
+- All parameters and the return type are **required**.
+- The function body may contain `let` statements and expression statements.
+- The **last expression statement** is the return value.
+- Nested function declarations are not supported.
+
+`Column<T>` is accepted in function signatures as an alias for `Series<T>`.
+Functions may return scalars, tables, or columns; the return expression must
+match the declared return type.
+
+Function calls inside DataFrame clause expressions are resolved against
+built-ins or extern functions. User-defined functions are evaluated at the
+statement level in the REPL/runtime.
+
+> Note: transpilation of user-defined function bodies is planned. The current
+> implementation evaluates them in the REPL/runtime.
+
+---
+
+## 10. Extern Function Interop
+
+### 10.1 Declaration Syntax
 
 External C++ functions are declared with `extern fn`:
 
@@ -902,17 +940,17 @@ The `from` clause specifies the C++ header that provides the function. The
 compiler generates the appropriate `#include` directive in the transpiled
 output.
 
-### 9.2 Parameter Types
+### 10.2 Parameter Types
 
 Extern function parameters may be:
 
-- Any scalar type (`Int64`, `Float64`, `Bool`, `String`, `Timestamp`)
-- `Series<T>` for any scalar type `T`
+- Any scalar type (`Int`, `Int64`, `Float64`, `Bool`, `String`, `Timestamp`)
+- `Series<T>` / `Column<T>` for any scalar type `T`
 
 Return types must be a scalar type. Extern functions cannot return
 `DataFrame`, `TimeFrame`, or `Series`.
 
-### 9.3 Calling Convention
+### 10.3 Calling Convention
 
 Extern functions are called with the same syntax as built-in functions:
 
@@ -945,27 +983,22 @@ with a unique name and declare that wrapper as the extern.
 
 ---
 
-## 10. Built-in Functions and Forms
+## 11. Built-in Functions and Forms
 
-### 10.1 I/O Functions
+Ibex keeps built-ins intentionally minimal. Implementations may provide
+additional functions, but the recommended path for custom functionality is
+`extern fn` interop with C++.
 
-```
-read_csv(path: String, schema: Schema) -> DataFrame<Schema>
-write_csv(df: DataFrame<S>, path: String) -> ()
-```
-
-`read_csv` requires a schema literal as its second argument. The compiler
-uses it to determine the output DataFrame type.
-
-### 10.2 Type Conversion
+### 11.1 I/O Functions
 
 ```
-as_timeframe(df: DataFrame<S>, index_col: Ident) -> TimeFrame<S>
+read_csv(path: String) -> DataFrame<Schema>
 ```
 
-`index_col` is an unqualified identifier naming a `Timestamp` column in `S`.
+`read_csv` infers column types from the input file. The resulting schema is
+implementation-defined.
 
-### 10.3 Scalar Extraction
+### 11.2 Scalar Extraction
 
 ```
 scalar(df: DataFrame<S>, col: Ident) -> T
@@ -974,7 +1007,7 @@ scalar(df: DataFrame<S>, col: Ident) -> T
 Extracts a single scalar from a one-row DataFrame. `col` names a column in `S`.
 It is a runtime error if the DataFrame has any row count other than 1.
 
-### 10.4 Join Functions
+### 11.3 Join Functions
 
 ```
 inner_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFrame<A ∪ B>
@@ -992,7 +1025,7 @@ TimeFrames must share the same time index column. Additional key arguments
 apply equality matching in addition to the time-based match. Join expressions
 (Section 5.5) always pass a tolerance of `0s`.
 
-### 10.5 Ordering
+### 11.4 Ordering
 
 ```
 sort(df: DataFrame<S>, col: Ident) -> DataFrame<S>
@@ -1001,7 +1034,7 @@ sort(df: DataFrame<S>, col: Ident) -> DataFrame<S>
 Returns a new DataFrame sorted by the named column in ascending order. Sorting
 a `TimeFrame` by its index column is a no-op (already sorted).
 
-### 10.6 Display
+### 11.5 Display
 
 ```
 print(value: Any) -> ()
@@ -1010,7 +1043,11 @@ print(value: Any) -> ()
 Outputs a human-readable representation of the value. In REPL mode, expression
 statements are implicitly printed without requiring `print`.
 
-### 10.7 Scalar Functions
+### 11.6 Scalar Functions
+
+These scalar functions are optional and may be provided by the runtime or by
+extern implementations. The recommended path for custom scalar logic is
+`extern fn`.
 
 | Function        | Signature                          |
 |-----------------|------------------------------------|
@@ -1026,7 +1063,7 @@ statements are implicitly printed without requiring `print`.
 
 ---
 
-## 11. Minimal Complete Example
+## 12. Minimal Complete Example
 
 The following program is syntactically and semantically valid under this
 specification. It demonstrates DataFrame loading, grouped aggregation, extern
@@ -1039,15 +1076,9 @@ function usage, and TimeFrame windowing.
 extern fn std_dev(x: Series<Float64>) -> Float64 from "stats.hpp";
 
 // --------------------------------------------------
-// Load iris dataset with explicit schema
+// Load iris dataset (schema inferred)
 // --------------------------------------------------
-let iris = read_csv("iris.csv", {
-    sepal_length: Float64,
-    sepal_width: Float64,
-    petal_length: Float64,
-    petal_width: Float64,
-    species: String,
-});
+let iris = read_csv("iris.csv");
 
 // --------------------------------------------------
 // Grouped aggregation with extern function call
@@ -1082,12 +1113,7 @@ let annotated = iris[
 // --------------------------------------------------
 // TimeFrame: load tick data, compute rolling returns
 // --------------------------------------------------
-let ticks = read_csv("ticks.csv", {
-    timestamp: Timestamp,
-    symbol: String,
-    price: Float64,
-    volume: Int64,
-});
+let ticks = read_csv("ticks.csv");
 
 let tf = as_timeframe(ticks, timestamp);
 
@@ -1159,18 +1185,15 @@ let  mut  extern  fn  from  filter  select  update  by  window  join  left  asof
 **Type keywords** (reserved in type position and as identifiers):
 
 ```
-Int32  Int64  Float32  Float64  Bool  String  Timestamp
-Series  DataFrame  TimeFrame
+Int  Int32  Int64  Float32  Float64  Bool  String  Timestamp
+Column  Series  DataFrame  TimeFrame
 ```
 
 **Soft-reserved** (cannot be shadowed by user bindings):
 
 ```
-read_csv  write_csv  as_timeframe  inner_join  left_join  asof_join
-sort  print
+read_csv  scalar
 sum  mean  min  max  count  first  last
-abs  log  sqrt  year  month  day  hour  minute  second
-lag  lead  rolling_sum  rolling_mean  rolling_min  rolling_max  rolling_count
 ```
 
 ---
@@ -1182,6 +1205,7 @@ For implementors. The core parsing loop:
 ```
 parse_statement:
     "let"    → let_stmt
+    "fn"     → fn_decl
     "extern" → extern_decl
     IDENT    → peek "=" (not "==") → assign_stmt
              → otherwise → expr_stmt

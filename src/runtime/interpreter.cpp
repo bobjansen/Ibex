@@ -2,7 +2,9 @@
 
 #include <cmath>
 #include <functional>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -299,36 +301,24 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         agg_columns.push_back(column);
     }
 
-    std::unordered_map<Key, AggState, KeyHash, KeyEq> groups;
-    std::vector<Key> order;
-    std::size_t rows = input.rows();
-    for (std::size_t row = 0; row < rows; ++row) {
-        Key key;
-        key.values.reserve(group_columns.size());
-        for (const auto* column : group_columns) {
-            key.values.push_back(scalar_from_column(*column, row));
-        }
-
-        auto it = groups.find(key);
-        if (it == groups.end()) {
-            AggState state;
-            state.slots.reserve(aggregations.size());
-            for (std::size_t i = 0; i < aggregations.size(); ++i) {
-                const auto& agg = aggregations[i];
-                AggSlot slot;
-                slot.func = agg.func;
-                if (agg.func == ir::AggFunc::Count) {
-                    slot.kind = ExprType::Int;
-                } else {
-                    slot.kind = expr_type_for_column(*agg_columns[i]);
-                }
-                state.slots.push_back(slot);
+    auto make_state = [&]() -> AggState {
+        AggState state;
+        state.slots.reserve(aggregations.size());
+        for (std::size_t i = 0; i < aggregations.size(); ++i) {
+            const auto& agg = aggregations[i];
+            AggSlot slot;
+            slot.func = agg.func;
+            if (agg.func == ir::AggFunc::Count) {
+                slot.kind = ExprType::Int;
+            } else {
+                slot.kind = expr_type_for_column(*agg_columns[i]);
             }
-            order.push_back(key);
-            it = groups.emplace(order.back(), std::move(state)).first;
+            state.slots.push_back(slot);
         }
+        return state;
+    };
 
-        AggState& state = it->second;
+    auto update_state = [&](AggState& state, std::size_t row) -> std::optional<std::string> {
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto& agg = aggregations[i];
             AggSlot& slot = state.slots[i];
@@ -340,7 +330,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (slot.kind == ExprType::String &&
                 (agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
                  agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max)) {
-                return std::unexpected("string aggregation not supported");
+                return "string aggregation not supported";
             }
             if (agg.func == ir::AggFunc::First) {
                 if (!slot.has_value) {
@@ -421,66 +411,63 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 slot.has_value = true;
             }
         }
-    }
+        return std::nullopt;
+    };
 
-    Table output;
-    for (const auto& key : group_by) {
-        const auto* column = input.find(key.name);
-        if (column == nullptr) {
-            return std::unexpected("group-by column not found: " + key.name);
-        }
-        output.add_column(key.name, make_empty_like(*column));
-    }
-    for (const auto& agg : aggregations) {
-        ColumnValue column;
-        switch (agg.func) {
-            case ir::AggFunc::Count:
-                column = Column<std::int64_t>{};
-                break;
-            case ir::AggFunc::Mean:
-                column = Column<double>{};
-                break;
-            case ir::AggFunc::Sum:
-            case ir::AggFunc::Min:
-            case ir::AggFunc::Max: {
-                const auto* input_col = input.find(agg.column.name);
-                if (input_col == nullptr) {
-                    return std::unexpected("aggregate column not found: " + agg.column.name);
-                }
-                if (std::holds_alternative<Column<double>>(*input_col)) {
-                    column = Column<double>{};
-                } else {
-                    column = Column<std::int64_t>{};
-                }
-                break;
-            }
-            case ir::AggFunc::First:
-            case ir::AggFunc::Last: {
-                const auto* input_col = input.find(agg.column.name);
-                if (input_col == nullptr) {
-                    return std::unexpected("aggregate column not found: " + agg.column.name);
-                }
-                column = make_empty_like(*input_col);
-                break;
-            }
-        }
-        output.add_column(agg.alias, std::move(column));
-    }
-
-    for (const auto& key : order) {
-        for (std::size_t i = 0; i < group_by.size(); ++i) {
-            auto* column = output.find(group_by[i].name);
+    auto build_output = [&]() -> std::expected<Table, std::string> {
+        Table output;
+        for (const auto& key : group_by) {
+            const auto* column = input.find(key.name);
             if (column == nullptr) {
-                return std::unexpected("missing group-by column in output");
+                return std::unexpected("group-by column not found: " + key.name);
             }
-            append_scalar(*column, key.values[i]);
+            output.add_column(key.name, make_empty_like(*column));
         }
-        const AggState& state = groups.at(key);
+        for (const auto& agg : aggregations) {
+            ColumnValue column;
+            switch (agg.func) {
+                case ir::AggFunc::Count:
+                    column = Column<std::int64_t>{};
+                    break;
+                case ir::AggFunc::Mean:
+                    column = Column<double>{};
+                    break;
+                case ir::AggFunc::Sum:
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max: {
+                    const auto* input_col = input.find(agg.column.name);
+                    if (input_col == nullptr) {
+                        return std::unexpected("aggregate column not found: " + agg.column.name);
+                    }
+                    if (std::holds_alternative<Column<double>>(*input_col)) {
+                        column = Column<double>{};
+                    } else {
+                        column = Column<std::int64_t>{};
+                    }
+                    break;
+                }
+                case ir::AggFunc::First:
+                case ir::AggFunc::Last: {
+                    const auto* input_col = input.find(agg.column.name);
+                    if (input_col == nullptr) {
+                        return std::unexpected("aggregate column not found: " + agg.column.name);
+                    }
+                    column = make_empty_like(*input_col);
+                    break;
+                }
+            }
+            output.add_column(agg.alias, std::move(column));
+        }
+        return output;
+    };
+
+    auto append_agg_values = [&](Table& output, const AggState& state)
+        -> std::optional<std::string> {
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto& agg = aggregations[i];
             auto* column = output.find(agg.alias);
             if (column == nullptr) {
-                return std::unexpected("missing aggregate column in output");
+                return "missing aggregate column in output";
             }
             const AggSlot& slot = state.slots[i];
             switch (agg.func) {
@@ -510,6 +497,173 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     append_scalar(*column, slot.last_value);
                     break;
             }
+        }
+        return std::nullopt;
+    };
+
+    std::size_t rows = input.rows();
+    if (group_by.size() == 1) {
+        const ColumnValue& key_column = *group_columns.front();
+        if (std::holds_alternative<Column<std::string>>(key_column)) {
+            const auto& col = std::get<Column<std::string>>(key_column);
+            std::unordered_map<std::string_view, std::size_t> index;
+            index.reserve(rows);
+            std::vector<std::string_view> order;
+            order.reserve(rows);
+            std::vector<AggState> states;
+            states.reserve(rows);
+            for (std::size_t row = 0; row < rows; ++row) {
+                std::string_view key{col[row]};
+                auto it = index.find(key);
+                std::size_t slot_index = 0;
+                if (it == index.end()) {
+                    slot_index = states.size();
+                    index.emplace(key, slot_index);
+                    order.push_back(key);
+                    states.push_back(make_state());
+                } else {
+                    slot_index = it->second;
+                }
+                if (auto err = update_state(states[slot_index], row)) {
+                    return std::unexpected(*err);
+                }
+            }
+            auto output = build_output();
+            if (!output.has_value()) {
+                return std::unexpected(output.error());
+            }
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                auto* column = output->find(group_by.front().name);
+                if (column == nullptr) {
+                    return std::unexpected("missing group-by column in output");
+                }
+                append_scalar(*column, std::string(order[i]));
+                if (auto err = append_agg_values(*output, states[i])) {
+                    return std::unexpected(*err);
+                }
+            }
+            return output;
+        }
+        if (std::holds_alternative<Column<std::int64_t>>(key_column)) {
+            const auto& col = std::get<Column<std::int64_t>>(key_column);
+            std::unordered_map<std::int64_t, std::size_t> index;
+            index.reserve(rows);
+            std::vector<std::int64_t> order;
+            order.reserve(rows);
+            std::vector<AggState> states;
+            states.reserve(rows);
+            for (std::size_t row = 0; row < rows; ++row) {
+                std::int64_t key = col[row];
+                auto it = index.find(key);
+                std::size_t slot_index = 0;
+                if (it == index.end()) {
+                    slot_index = states.size();
+                    index.emplace(key, slot_index);
+                    order.push_back(key);
+                    states.push_back(make_state());
+                } else {
+                    slot_index = it->second;
+                }
+                if (auto err = update_state(states[slot_index], row)) {
+                    return std::unexpected(*err);
+                }
+            }
+            auto output = build_output();
+            if (!output.has_value()) {
+                return std::unexpected(output.error());
+            }
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                auto* column = output->find(group_by.front().name);
+                if (column == nullptr) {
+                    return std::unexpected("missing group-by column in output");
+                }
+                append_scalar(*column, order[i]);
+                if (auto err = append_agg_values(*output, states[i])) {
+                    return std::unexpected(*err);
+                }
+            }
+            return output;
+        }
+        if (std::holds_alternative<Column<double>>(key_column)) {
+            const auto& col = std::get<Column<double>>(key_column);
+            std::unordered_map<double, std::size_t> index;
+            index.reserve(rows);
+            std::vector<double> order;
+            order.reserve(rows);
+            std::vector<AggState> states;
+            states.reserve(rows);
+            for (std::size_t row = 0; row < rows; ++row) {
+                double key = col[row];
+                auto it = index.find(key);
+                std::size_t slot_index = 0;
+                if (it == index.end()) {
+                    slot_index = states.size();
+                    index.emplace(key, slot_index);
+                    order.push_back(key);
+                    states.push_back(make_state());
+                } else {
+                    slot_index = it->second;
+                }
+                if (auto err = update_state(states[slot_index], row)) {
+                    return std::unexpected(*err);
+                }
+            }
+            auto output = build_output();
+            if (!output.has_value()) {
+                return std::unexpected(output.error());
+            }
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                auto* column = output->find(group_by.front().name);
+                if (column == nullptr) {
+                    return std::unexpected("missing group-by column in output");
+                }
+                append_scalar(*column, order[i]);
+                if (auto err = append_agg_values(*output, states[i])) {
+                    return std::unexpected(*err);
+                }
+            }
+            return output;
+        }
+    }
+
+    std::unordered_map<Key, AggState, KeyHash, KeyEq> groups;
+    std::vector<Key> order;
+    groups.reserve(rows);
+    order.reserve(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+        Key key;
+        key.values.reserve(group_columns.size());
+        for (const auto* column : group_columns) {
+            key.values.push_back(scalar_from_column(*column, row));
+        }
+
+        auto it = groups.find(key);
+        if (it == groups.end()) {
+            AggState state = make_state();
+            order.push_back(key);
+            it = groups.emplace(order.back(), std::move(state)).first;
+        }
+
+        if (auto err = update_state(it->second, row)) {
+            return std::unexpected(*err);
+        }
+    }
+
+    auto output = build_output();
+    if (!output.has_value()) {
+        return std::unexpected(output.error());
+    }
+    for (const auto& key : order) {
+        for (std::size_t i = 0; i < group_by.size(); ++i) {
+            auto* column = output->find(group_by[i].name);
+            if (column == nullptr) {
+                return std::unexpected("missing group-by column in output");
+            }
+            append_scalar(*column, key.values[i]);
+        }
+        const AggState& state = groups.at(key);
+        if (auto err = append_agg_values(*output, state)) {
+            return std::unexpected(*err);
         }
     }
 

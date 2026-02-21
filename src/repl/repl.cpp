@@ -2,6 +2,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/repl/repl.hpp>
+#include <ibex/runtime/csv.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <fmt/core.h>
@@ -265,16 +266,17 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             }
             if (std::holds_alternative<parser::LetStmt>(stmt)) {
                 const auto& let_stmt = std::get<parser::LetStmt>(stmt);
-                if (const auto* call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
-                    call != nullptr && call->callee == "scalar") {
-                    if (call->args.size() != 2) {
+                if (const auto* scalar_call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
+                    scalar_call != nullptr && scalar_call->callee == "scalar") {
+                    if (scalar_call->args.size() != 2) {
                         fmt::print("error: scalar() expects (table, column)\n");
                         had_error = true;
                         break;
                     }
                     const auto* col_ident =
-                        std::get_if<parser::IdentifierExpr>(&call->args[1]->node);
-                    const auto* col_lit = std::get_if<parser::LiteralExpr>(&call->args[1]->node);
+                        std::get_if<parser::IdentifierExpr>(&scalar_call->args[1]->node);
+                    const auto* col_lit =
+                        std::get_if<parser::LiteralExpr>(&scalar_call->args[1]->node);
                     std::string column_name;
                     if (col_ident != nullptr) {
                         column_name = col_ident->name;
@@ -286,7 +288,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
                         had_error = true;
                         break;
                     }
-                    auto lowered = parser::lower_expr(*call->args[0], context);
+                    auto lowered = parser::lower_expr(*scalar_call->args[0], context);
                     if (!lowered) {
                         fmt::print("error: {}\n", lowered.error().message);
                         had_error = true;
@@ -305,6 +307,29 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
                         break;
                     }
                     scalars.insert_or_assign(let_stmt.name, std::move(scalar.value()));
+                } else if (const auto* read_call =
+                               std::get_if<parser::CallExpr>(&let_stmt.value->node);
+                           read_call != nullptr && read_call->callee == "read_csv") {
+                    if (read_call->args.size() != 1) {
+                        fmt::print("error: read_csv() expects (path)\n");
+                        had_error = true;
+                        break;
+                    }
+                    const auto* path_lit =
+                        std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
+                    if (path_lit == nullptr ||
+                        !std::holds_alternative<std::string>(path_lit->value)) {
+                        fmt::print("error: read_csv() path must be string literal\n");
+                        had_error = true;
+                        break;
+                    }
+                    auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
+                    if (!table) {
+                        fmt::print("error: {}\n", table.error());
+                        had_error = true;
+                        break;
+                    }
+                    tables.insert_or_assign(let_stmt.name, std::move(table.value()));
                 } else {
                     auto lowered = parser::lower_expr(*let_stmt.value, context);
                     if (!lowered) {
@@ -324,16 +349,18 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             }
             if (std::holds_alternative<parser::ExprStmt>(stmt)) {
                 const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-                if (const auto* call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
-                    call != nullptr && call->callee == "scalar") {
-                    if (call->args.size() != 2) {
+                if (const auto* scalar_call =
+                        std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+                    scalar_call != nullptr && scalar_call->callee == "scalar") {
+                    if (scalar_call->args.size() != 2) {
                         fmt::print("error: scalar() expects (table, column)\n");
                         had_error = true;
                         break;
                     }
                     const auto* col_ident =
-                        std::get_if<parser::IdentifierExpr>(&call->args[1]->node);
-                    const auto* col_lit = std::get_if<parser::LiteralExpr>(&call->args[1]->node);
+                        std::get_if<parser::IdentifierExpr>(&scalar_call->args[1]->node);
+                    const auto* col_lit =
+                        std::get_if<parser::LiteralExpr>(&scalar_call->args[1]->node);
                     std::string column_name;
                     if (col_ident != nullptr) {
                         column_name = col_ident->name;
@@ -345,7 +372,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
                         had_error = true;
                         break;
                     }
-                    auto lowered = parser::lower_expr(*call->args[0], context);
+                    auto lowered = parser::lower_expr(*scalar_call->args[0], context);
                     if (!lowered) {
                         fmt::print("error: {}\n", lowered.error().message);
                         had_error = true;
@@ -365,6 +392,29 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
                     }
                     std::visit([](const auto& value) { fmt::print("{}\n", value); },
                                scalar.value());
+                } else if (const auto* read_call =
+                               std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+                           read_call != nullptr && read_call->callee == "read_csv") {
+                    if (read_call->args.size() != 1) {
+                        fmt::print("error: read_csv() expects (path)\n");
+                        had_error = true;
+                        break;
+                    }
+                    const auto* path_lit =
+                        std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
+                    if (path_lit == nullptr ||
+                        !std::holds_alternative<std::string>(path_lit->value)) {
+                        fmt::print("error: read_csv() path must be string literal\n");
+                        had_error = true;
+                        break;
+                    }
+                    auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
+                    if (!table) {
+                        fmt::print("error: {}\n", table.error());
+                        had_error = true;
+                        break;
+                    }
+                    print_table(table.value());
                 } else {
                     if (const auto* ident =
                             std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {

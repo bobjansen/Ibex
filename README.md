@@ -78,6 +78,13 @@ ctest --test-dir build --output-on-failure
 :describe <table> [n]    Schema + first n rows
 ```
 
+### REPL Functions
+
+```
+read_csv("path.csv")          Load a CSV (simple, no quotes/escapes)
+scalar(df, col)               Extract a scalar from a single-row DataFrame
+```
+
 ## Roadmap
 
 - [ ] Lexer implementation (tokenize Ibex source)

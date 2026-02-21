@@ -1,4 +1,5 @@
 add_library(ibex_runtime STATIC
+    csv.cpp
     extern_registry.cpp
     interpreter.cpp
 )

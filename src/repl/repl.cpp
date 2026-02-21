@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -72,6 +73,64 @@ void print_tables(const runtime::TableRegistry& tables) {
     fmt::print("\n");
 }
 
+std::string column_type_name(const runtime::ColumnValue& column) {
+    if (std::holds_alternative<Column<std::int64_t>>(column)) {
+        return "Int64";
+    }
+    if (std::holds_alternative<Column<double>>(column)) {
+        return "Float64";
+    }
+    if (std::holds_alternative<Column<std::string>>(column)) {
+        return "String";
+    }
+    return "Unknown";
+}
+
+void print_schema(const runtime::Table& table) {
+    fmt::print("columns:\n");
+    for (const auto& entry : table.columns) {
+        fmt::print("  {}: {}\n", entry.name, column_type_name(entry.column));
+    }
+}
+
+void describe_table(const runtime::Table& table, std::size_t max_rows = 10) {
+    print_schema(table);
+    print_table(table, max_rows);
+}
+
+std::string_view ltrim(std::string_view text) {
+    auto pos = text.find_first_not_of(" \t\r\n");
+    if (pos == std::string_view::npos) {
+        return {};
+    }
+    return text.substr(pos);
+}
+
+std::string_view rtrim(std::string_view text) {
+    auto pos = text.find_last_not_of(" \t\r\n");
+    if (pos == std::string_view::npos) {
+        return {};
+    }
+    return text.substr(0, pos + 1);
+}
+
+std::string_view trim(std::string_view text) {
+    return rtrim(ltrim(text));
+}
+
+std::size_t parse_optional_size(std::string_view text, std::size_t default_value) {
+    text = trim(text);
+    if (text.empty()) {
+        return default_value;
+    }
+    std::size_t value = 0;
+    auto result = std::from_chars(text.begin(), text.end(), value);
+    if (result.ec != std::errc()) {
+        return default_value;
+    }
+    return value;
+}
+
 }  // namespace
 
 auto normalize_input(std::string_view input) -> std::string {
@@ -105,6 +164,64 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
         }
         if (line == ":tables") {
             print_tables(tables);
+            continue;
+        }
+        if (line.starts_with(":schema")) {
+            auto arg = trim(line.substr(std::string_view(":schema").size()));
+            if (arg.empty()) {
+                fmt::print("usage: :schema <table>\n");
+                continue;
+            }
+            auto it = tables.find(std::string(arg));
+            if (it == tables.end()) {
+                fmt::print("error: unknown table '{}'\n", arg);
+                continue;
+            }
+            print_schema(it->second);
+            continue;
+        }
+        if (line.starts_with(":head")) {
+            auto rest = trim(line.substr(std::string_view(":head").size()));
+            auto space = rest.find(' ');
+            std::string_view name = rest;
+            std::string_view count_text;
+            if (space != std::string_view::npos) {
+                name = trim(rest.substr(0, space));
+                count_text = trim(rest.substr(space + 1));
+            }
+            if (name.empty()) {
+                fmt::print("usage: :head <table> [n]\n");
+                continue;
+            }
+            auto it = tables.find(std::string(name));
+            if (it == tables.end()) {
+                fmt::print("error: unknown table '{}'\n", name);
+                continue;
+            }
+            std::size_t count = parse_optional_size(count_text, 10);
+            print_table(it->second, count);
+            continue;
+        }
+        if (line.starts_with(":describe")) {
+            auto rest = trim(line.substr(std::string_view(":describe").size()));
+            auto space = rest.find(' ');
+            std::string_view name = rest;
+            std::string_view count_text;
+            if (space != std::string_view::npos) {
+                name = trim(rest.substr(0, space));
+                count_text = trim(rest.substr(space + 1));
+            }
+            if (name.empty()) {
+                fmt::print("usage: :describe <table> [n]\n");
+                continue;
+            }
+            auto it = tables.find(std::string(name));
+            if (it == tables.end()) {
+                fmt::print("error: unknown table '{}'\n", name);
+                continue;
+            }
+            std::size_t count = parse_optional_size(count_text, 10);
+            describe_table(it->second, count);
             continue;
         }
 

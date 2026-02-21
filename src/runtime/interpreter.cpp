@@ -335,9 +335,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             return std::unexpected("string aggregation not supported");
         }
 
-        if (agg.func != ir::AggFunc::Count && agg.func != ir::AggFunc::Sum &&
-            agg.func != ir::AggFunc::Mean && agg.func != ir::AggFunc::Min &&
-            agg.func != ir::AggFunc::Max) {
+        if (agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) {
+            // numeric First/Last are handled in the fast path; only fall back for strings
+            if (item.kind == ExprType::String) {
+                numeric_only = false;
+            }
+        } else if (agg.func != ir::AggFunc::Count && agg.func != ir::AggFunc::Sum &&
+                   agg.func != ir::AggFunc::Mean && agg.func != ir::AggFunc::Min &&
+                   agg.func != ir::AggFunc::Max) {
             numeric_only = false;
         }
         if (item.kind == ExprType::String) {
@@ -457,6 +462,26 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             AggSlot& slot = state.slots[i];
             if (item.func == ir::AggFunc::Count) {
                 slot.count += 1;
+                continue;
+            }
+            if (item.func == ir::AggFunc::First) {
+                if (!slot.has_value) {
+                    if (item.int_col != nullptr) {
+                        slot.int_value = (*item.int_col)[row];
+                    } else if (item.dbl_col != nullptr) {
+                        slot.double_value = (*item.dbl_col)[row];
+                    }
+                    slot.has_value = true;
+                }
+                continue;
+            }
+            if (item.func == ir::AggFunc::Last) {
+                if (item.int_col != nullptr) {
+                    slot.int_value = (*item.int_col)[row];
+                } else if (item.dbl_col != nullptr) {
+                    slot.double_value = (*item.dbl_col)[row];
+                }
+                slot.has_value = true;
                 continue;
             }
 
@@ -605,10 +630,22 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     break;
                 case ir::AggFunc::First:
-                    append_scalar(*column, slot.first_value);
+                    if (slot.kind == ExprType::Int) {
+                        append_scalar(*column, slot.int_value);
+                    } else if (slot.kind == ExprType::Double) {
+                        append_scalar(*column, slot.double_value);
+                    } else {
+                        append_scalar(*column, slot.first_value);
+                    }
                     break;
                 case ir::AggFunc::Last:
-                    append_scalar(*column, slot.last_value);
+                    if (slot.kind == ExprType::Int) {
+                        append_scalar(*column, slot.int_value);
+                    } else if (slot.kind == ExprType::Double) {
+                        append_scalar(*column, slot.double_value);
+                    } else {
+                        append_scalar(*column, slot.last_value);
+                    }
                     break;
             }
         }
@@ -620,29 +657,183 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         const ColumnValue& key_column = *group_columns.front();
         if (std::holds_alternative<Column<std::string>>(key_column)) {
             const auto& col = std::get<Column<std::string>>(key_column);
-            std::unordered_map<std::string_view, std::size_t> index;
-            index.reserve(rows);
-            std::vector<std::string_view> order;
-            order.reserve(rows);
-            std::vector<AggState> states;
-            states.reserve(rows);
+
+            // Pass 1: collect contiguous run boundaries (cheap string_view comparisons, no hashing)
+            struct Run {
+                std::string_view key;
+                std::size_t start;
+            };
+            std::vector<Run> runs;
+            runs.reserve(64);
             for (std::size_t row = 0; row < rows; ++row) {
                 std::string_view key{col[row]};
+                if (runs.empty() || key != runs.back().key) {
+                    runs.push_back({key, row});
+                }
+            }
+
+            // aggregate_range: apply all aggregations over column slice [start, end) using tight
+            // loops that the compiler can auto-vectorize — no per-row dispatch overhead.
+            auto aggregate_range = [&](AggState& state, std::size_t start,
+                                       std::size_t end) -> std::optional<std::string> {
+                for (std::size_t i = 0; i < plan.size(); ++i) {
+                    const auto& item = plan[i];
+                    AggSlot& slot = state.slots[i];
+                    std::size_t count = end - start;
+                    if (item.func == ir::AggFunc::Count) {
+                        slot.count += static_cast<std::int64_t>(count);
+                        continue;
+                    }
+                    if (count == 0) {
+                        continue;
+                    }
+                    if (item.func == ir::AggFunc::First) {
+                        if (!slot.has_value) {
+                            if (item.int_col != nullptr) {
+                                slot.int_value = (*item.int_col)[start];
+                            } else if (item.dbl_col != nullptr) {
+                                slot.double_value = (*item.dbl_col)[start];
+                            } else if (item.str_col != nullptr) {
+                                slot.first_value = (*item.str_col)[start];
+                            }
+                            slot.has_value = true;
+                        }
+                        continue;
+                    }
+                    if (item.func == ir::AggFunc::Last) {
+                        if (item.int_col != nullptr) {
+                            slot.int_value = (*item.int_col)[end - 1];
+                        } else if (item.dbl_col != nullptr) {
+                            slot.double_value = (*item.dbl_col)[end - 1];
+                        } else if (item.str_col != nullptr) {
+                            slot.last_value = (*item.str_col)[end - 1];
+                        }
+                        slot.has_value = true;
+                        continue;
+                    }
+                    if (item.int_col != nullptr) {
+                        const std::int64_t* data = item.int_col->data() + start;
+                        switch (item.func) {
+                            case ir::AggFunc::Sum: {
+                                std::int64_t s = slot.int_value;
+                                for (std::size_t r = 0; r < count; ++r) {
+                                    s += data[r];
+                                }
+                                slot.int_value = s;
+                                break;
+                            }
+                            case ir::AggFunc::Mean: {
+                                double s = slot.sum;
+                                for (std::size_t r = 0; r < count; ++r) {
+                                    s += static_cast<double>(data[r]);
+                                }
+                                slot.sum = s;
+                                slot.count += static_cast<std::int64_t>(count);
+                                break;
+                            }
+                            case ir::AggFunc::Min: {
+                                std::int64_t m = slot.has_value ? slot.int_value : data[0];
+                                std::size_t r0 = slot.has_value ? 0 : 1;
+                                for (std::size_t r = r0; r < count; ++r) {
+                                    if (data[r] < m) {
+                                        m = data[r];
+                                    }
+                                }
+                                slot.int_value = m;
+                                break;
+                            }
+                            case ir::AggFunc::Max: {
+                                std::int64_t m = slot.has_value ? slot.int_value : data[0];
+                                std::size_t r0 = slot.has_value ? 0 : 1;
+                                for (std::size_t r = r0; r < count; ++r) {
+                                    if (data[r] > m) {
+                                        m = data[r];
+                                    }
+                                }
+                                slot.int_value = m;
+                                break;
+                            }
+                            default:
+                                break;
+                        }
+                        slot.has_value = true;
+                    } else if (item.dbl_col != nullptr) {
+                        const double* data = item.dbl_col->data() + start;
+                        switch (item.func) {
+                            case ir::AggFunc::Sum: {
+                                double s = slot.double_value;
+                                for (std::size_t r = 0; r < count; ++r) {
+                                    s += data[r];
+                                }
+                                slot.double_value = s;
+                                break;
+                            }
+                            case ir::AggFunc::Mean: {
+                                double s = slot.sum;
+                                for (std::size_t r = 0; r < count; ++r) {
+                                    s += data[r];
+                                }
+                                slot.sum = s;
+                                slot.count += static_cast<std::int64_t>(count);
+                                break;
+                            }
+                            case ir::AggFunc::Min: {
+                                double m = slot.has_value ? slot.double_value : data[0];
+                                std::size_t r0 = slot.has_value ? 0 : 1;
+                                for (std::size_t r = r0; r < count; ++r) {
+                                    if (data[r] < m) {
+                                        m = data[r];
+                                    }
+                                }
+                                slot.double_value = m;
+                                break;
+                            }
+                            case ir::AggFunc::Max: {
+                                double m = slot.has_value ? slot.double_value : data[0];
+                                std::size_t r0 = slot.has_value ? 0 : 1;
+                                for (std::size_t r = r0; r < count; ++r) {
+                                    if (data[r] > m) {
+                                        m = data[r];
+                                    }
+                                }
+                                slot.double_value = m;
+                                break;
+                            }
+                            default:
+                                break;
+                        }
+                        slot.has_value = true;
+                    }
+                }
+                return std::nullopt;
+            };
+
+            // Pass 2: one hash lookup per run (not per row), then apply range aggregation
+            std::unordered_map<std::string_view, std::size_t> index;
+            index.reserve(runs.size());
+            std::vector<std::string_view> order;
+            order.reserve(runs.size());
+            std::vector<AggState> states;
+            states.reserve(runs.size());
+            for (std::size_t r = 0; r < runs.size(); ++r) {
+                std::string_view key = runs[r].key;
+                std::size_t start = runs[r].start;
+                std::size_t end = (r + 1 < runs.size()) ? runs[r + 1].start : rows;
                 auto it = index.find(key);
-                std::size_t slot_index = 0;
+                std::size_t slot_idx = 0;
                 if (it == index.end()) {
-                    slot_index = states.size();
-                    index.emplace(key, slot_index);
+                    slot_idx = states.size();
+                    index.emplace(key, slot_idx);
                     order.push_back(key);
                     states.push_back(make_state());
                 } else {
-                    slot_index = it->second;
+                    slot_idx = it->second;
                 }
-                if (auto err = (numeric_only ? update_state_numeric(states[slot_index], row)
-                                             : update_state(states[slot_index], row))) {
+                if (auto err = aggregate_range(states[slot_idx], start, end)) {
                     return std::unexpected(*err);
                 }
             }
+
             auto output = build_output();
             if (!output.has_value()) {
                 return std::unexpected(output.error());
@@ -1030,7 +1221,17 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (agg.children().empty()) {
                 return std::unexpected("aggregate node missing child");
             }
-            auto child = interpret_node(*agg.children().front(), registry, scalars);
+            // Fast path: Aggregate(Scan) — pass the registry table by const ref to skip the copy.
+            const ir::Node& child_node = *agg.children().front();
+            if (child_node.kind() == ir::NodeKind::Scan) {
+                const auto& scan = static_cast<const ir::ScanNode&>(child_node);
+                auto it = registry.find(scan.source_name());
+                if (it == registry.end()) {
+                    return std::unexpected("unknown table: " + scan.source_name());
+                }
+                return aggregate_table(it->second, agg.group_by(), agg.aggregations());
+            }
+            auto child = interpret_node(child_node, registry, scalars);
             if (!child) {
                 return std::unexpected(child.error());
             }

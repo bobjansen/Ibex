@@ -37,6 +37,14 @@ target_compile_options(ibex_compiler_options
         $<$<CONFIG:Debug>:-O0 -g>
 )
 
+# Optional -march=native
+if(IBEX_ENABLE_MARCH_NATIVE)
+    target_compile_options(ibex_compiler_options
+        INTERFACE
+            $<$<CONFIG:Release>:-march=native>
+    )
+endif()
+
 # Optional LTO
 if(IBEX_ENABLE_LTO)
     include(CheckIPOSupported)

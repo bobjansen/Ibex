@@ -16,6 +16,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Project options
 option(IBEX_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(IBEX_ENABLE_LTO "Enable link-time optimization in Release" OFF)
+option(IBEX_ENABLE_MARCH_NATIVE "Enable -march=native in Release" OFF)
 option(IBEX_ENABLE_SANITIZERS "Enable ASan + UBSan in Debug" OFF)
 option(IBEX_BUILD_TESTS "Build tests" ON)
 option(IBEX_BUILD_TOOLS "Build REPL and other tools" ON)

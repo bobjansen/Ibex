@@ -1,5 +1,5 @@
 fn square(a: Int) -> Int {
   a * a;
 }
-let prices = read_csv("prices_head.csv");
-
+extern fn read_csv(path: String) -> DataFrame<{symbol: String, price: Float64}> from "csv.hpp";
+let prices = read_csv("prices.csv");

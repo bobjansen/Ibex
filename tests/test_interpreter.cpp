@@ -1,5 +1,6 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -99,8 +100,23 @@ TEST_CASE("Interpret select with function call") {
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
 
+    runtime::ExternRegistry externs;
+    externs.register_scalar(
+        "square", runtime::ScalarKind::Int,
+        [](const runtime::ExternArgs& args)
+            -> std::expected<runtime::ExternValue, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("square() expects 1 argument");
+            }
+            const auto* value = std::get_if<std::int64_t>(&args[0]);
+            if (value == nullptr) {
+                return std::unexpected("square() expects int argument");
+            }
+            return runtime::ExternValue{(*value) * (*value)};
+        });
+
     auto ir = require_ir("trades[select { foo = square(price) }];");
-    auto result = runtime::interpret(*ir, registry);
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
     REQUIRE(result.has_value());
     REQUIRE(result->columns.size() == 1);
 

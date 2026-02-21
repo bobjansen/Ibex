@@ -942,13 +942,12 @@ output.
 
 ### 10.2 Parameter Types
 
-Extern function parameters may be:
+Extern function parameters may be any scalar type (`Int`, `Int64`, `Float64`,
+`Bool`, `String`, `Timestamp`). Series/column parameters are not supported in
+the current runtime.
 
-- Any scalar type (`Int`, `Int64`, `Float64`, `Bool`, `String`, `Timestamp`)
-- `Series<T>` / `Column<T>` for any scalar type `T`
-
-Return types must be a scalar type. Extern functions cannot return
-`DataFrame`, `TimeFrame`, or `Series`.
+Return types may be scalar or table types (`DataFrame`, `TimeFrame`). Extern
+functions cannot return `Series`.
 
 ### 10.3 Calling Convention
 
@@ -961,12 +960,9 @@ let summary = df[
 ];
 ```
 
-When an extern function accepts `Series<T>`, it receives the column (or
-per-group slice) as an argument. It is classified as an **aggregate function**
-for the purposes of aggregation well-formedness (Section 7.2).
-
-When an extern function accepts only scalar types, it is a **scalar function**
-applied element-wise.
+Extern functions currently accept only scalar arguments and are evaluated as
+**scalar functions** (applied element-wise). Column/series arguments are
+reserved for a future extension.
 
 ### 9.4 Restrictions
 
@@ -991,8 +987,10 @@ additional functions, but the recommended path for custom functionality is
 
 ### 11.1 I/O Functions
 
+I/O is provided via externs rather than built-ins. A common example:
+
 ```
-read_csv(path: String) -> DataFrame<Schema>
+extern fn read_csv(path: String) -> DataFrame<Schema> from "csv.hpp";
 ```
 
 `read_csv` infers column types from the input file. The resulting schema is
@@ -1071,9 +1069,10 @@ function usage, and TimeFrame windowing.
 
 ```
 // --------------------------------------------------
-// Extern: C++ standard deviation function
+// Extern: CSV loader + scalar helper
 // --------------------------------------------------
-extern fn std_dev(x: Series<Float64>) -> Float64 from "stats.hpp";
+extern fn read_csv(path: String) -> DataFrame<Schema> from "csv.hpp";
+extern fn clamp(x: Float64, lo: Float64, hi: Float64) -> Float64 from "stats.hpp";
 
 // --------------------------------------------------
 // Load iris dataset (schema inferred)
@@ -1087,7 +1086,6 @@ let summary = iris[
     select {
         species,
         mean_sl = mean(sepal_length),
-        sd_sl = std_dev(sepal_length),
         n = count(),
     },
     by species,
@@ -1106,7 +1104,10 @@ let wide_sepals = iris[
 // Grouped update (broadcast group mean to each row)
 // --------------------------------------------------
 let annotated = iris[
-    update { group_mean_sl = mean(sepal_length) },
+    update {
+        group_mean_sl = mean(sepal_length),
+        clamped_sl = clamp(sepal_length, 0.0, 10.0),
+    },
     by species,
 ];
 
@@ -1192,7 +1193,7 @@ Column  Series  DataFrame  TimeFrame
 **Soft-reserved** (cannot be shadowed by user bindings):
 
 ```
-read_csv  scalar
+scalar
 sum  mean  min  max  count  first  last
 ```
 

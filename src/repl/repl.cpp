@@ -2,7 +2,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/repl/repl.hpp>
-#include <ibex/runtime/csv.hpp>
+#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <fmt/core.h>
@@ -157,6 +157,7 @@ std::size_t parse_optional_size(std::string_view text, std::size_t default_value
 }
 
 using FunctionRegistry = std::unordered_map<std::string, parser::FunctionDecl>;
+using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
 using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
@@ -180,28 +181,33 @@ auto column_name_from_expr(const parser::Expr& expr) -> std::optional<std::strin
 
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     const FunctionRegistry& functions)
+                     const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                     const runtime::ExternRegistry& externs)
     -> std::expected<runtime::Table, std::string>;
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      const FunctionRegistry& functions)
+                      const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                      const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string>;
 
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        const FunctionRegistry& functions)
+                        const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                        const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string>;
 
 auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     const FunctionRegistry& functions)
+                     const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                     const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string> {
     if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
         std::holds_alternative<parser::UnaryExpr>(expr.node) ||
         std::holds_alternative<parser::GroupExpr>(expr.node)) {
-        auto scalar = eval_scalar_expr(expr, tables, scalars, columns, functions);
+        auto scalar =
+            eval_scalar_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
         if (!scalar) {
             return std::unexpected(scalar.error());
         }
@@ -217,17 +223,36 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (call->callee == "scalar") {
-            auto scalar = eval_scalar_expr(expr, tables, scalars, columns, functions);
+            auto scalar =
+                eval_scalar_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
             if (!scalar) {
                 return std::unexpected(scalar.error());
             }
             return EvalValue{std::move(scalar.value())};
         }
         if (functions.contains(call->callee)) {
-            return eval_function_call(*call, tables, scalars, columns, functions);
+            return eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
+                                      externs);
+        }
+        if (extern_decls.contains(call->callee)) {
+            const auto& decl = extern_decls.at(call->callee);
+            if (decl.return_type.kind == parser::Type::Kind::Scalar) {
+                auto scalar = eval_scalar_expr(expr, tables, scalars, columns, functions,
+                                               extern_decls, externs);
+                if (!scalar) {
+                    return std::unexpected(scalar.error());
+                }
+                return EvalValue{std::move(scalar.value())};
+            }
+            auto table = eval_table_expr(expr, tables, scalars, columns, functions, extern_decls,
+                                         externs);
+            if (!table) {
+                return std::unexpected(table.error());
+            }
+            return EvalValue{std::move(table.value())};
         }
     }
-    auto table = eval_table_expr(expr, tables, scalars, columns, functions);
+    auto table = eval_table_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
     if (!table) {
         return std::unexpected(table.error());
     }
@@ -236,7 +261,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      const FunctionRegistry& functions)
+                      const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                      const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string> {
     if (const auto* literal = std::get_if<parser::LiteralExpr>(&expr.node)) {
         if (const auto* int_value = std::get_if<std::int64_t>(&literal->value)) {
@@ -260,10 +286,13 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unknown scalar: " + ident->name);
     }
     if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
-        return eval_scalar_expr(*group->expr, tables, scalars, columns, functions);
+        return eval_scalar_expr(*group->expr, tables, scalars, columns, functions, extern_decls,
+                                externs);
     }
     if (const auto* unary = std::get_if<parser::UnaryExpr>(&expr.node)) {
-        auto value = eval_scalar_expr(*unary->expr, tables, scalars, columns, functions);
+        auto value =
+            eval_scalar_expr(*unary->expr, tables, scalars, columns, functions, extern_decls,
+                             externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -279,11 +308,15 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unsupported unary operand type");
     }
     if (const auto* binary = std::get_if<parser::BinaryExpr>(&expr.node)) {
-        auto left = eval_scalar_expr(*binary->left, tables, scalars, columns, functions);
+        auto left =
+            eval_scalar_expr(*binary->left, tables, scalars, columns, functions, extern_decls,
+                             externs);
         if (!left) {
             return std::unexpected(left.error());
         }
-        auto right = eval_scalar_expr(*binary->right, tables, scalars, columns, functions);
+        auto right =
+            eval_scalar_expr(*binary->right, tables, scalars, columns, functions, extern_decls,
+                             externs);
         if (!right) {
             return std::unexpected(right.error());
         }
@@ -335,7 +368,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!column_name.has_value()) {
                 return std::unexpected("scalar() column must be identifier or string");
             }
-            auto table = eval_table_expr(*call->args[0], tables, scalars, columns, functions);
+            auto table = eval_table_expr(*call->args[0], tables, scalars, columns, functions,
+                                         extern_decls, externs);
             if (!table) {
                 return std::unexpected(table.error());
             }
@@ -346,7 +380,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return scalar.value();
         }
         if (functions.contains(call->callee)) {
-            auto value = eval_function_call(*call, tables, scalars, columns, functions);
+            auto value =
+                eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
+                                   externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -355,6 +391,38 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return std::unexpected("function returned table where scalar expected");
         }
+        if (extern_decls.contains(call->callee)) {
+            const auto& decl = extern_decls.at(call->callee);
+            if (decl.return_type.kind != parser::Type::Kind::Scalar) {
+                return std::unexpected("extern function returns table: " + call->callee);
+            }
+            const auto* fn = externs.find(call->callee);
+            if (fn == nullptr) {
+                return std::unexpected("extern function not registered: " + call->callee);
+            }
+            if (fn->kind != runtime::ExternReturnKind::Scalar) {
+                return std::unexpected("extern function returns table: " + call->callee);
+            }
+            runtime::ExternArgs args;
+            args.reserve(call->args.size());
+            for (const auto& arg : call->args) {
+                auto value =
+                    eval_scalar_expr(*arg, tables, scalars, columns, functions, extern_decls,
+                                     externs);
+                if (!value) {
+                    return std::unexpected(value.error());
+                }
+                args.push_back(std::move(value.value()));
+            }
+            auto result = fn->func(args);
+            if (!result) {
+                return std::unexpected(result.error());
+            }
+            if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
+                return *scalar;
+            }
+            return std::unexpected("extern function returned table: " + call->callee);
+        }
         return std::unexpected("unknown function: " + call->callee);
     }
     return std::unexpected("expected scalar expression");
@@ -362,13 +430,52 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
 
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     const FunctionRegistry& functions)
+                     const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                     const runtime::ExternRegistry& externs)
     -> std::expected<runtime::Table, std::string> {
+    auto eval_extern_table_call = [&](parser::CallExpr& call)
+        -> std::expected<runtime::Table, std::string> {
+        const auto& decl = extern_decls.at(call.callee);
+        if (decl.return_type.kind == parser::Type::Kind::Scalar) {
+            return std::unexpected("extern function returns scalar: " + call.callee);
+        }
+        if (decl.return_type.kind == parser::Type::Kind::Series) {
+            return std::unexpected("extern function returns column: " + call.callee);
+        }
+        const auto* fn = externs.find(call.callee);
+        if (fn == nullptr) {
+            return std::unexpected("extern function not registered: " + call.callee);
+        }
+        if (fn->kind != runtime::ExternReturnKind::Table) {
+            return std::unexpected("extern function returns scalar: " + call.callee);
+        }
+        runtime::ExternArgs args;
+        args.reserve(call.args.size());
+        for (const auto& arg : call.args) {
+            auto value =
+                eval_scalar_expr(*arg, tables, scalars, columns, functions, extern_decls, externs);
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+            args.push_back(std::move(value.value()));
+        }
+        auto result = fn->func(args);
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        if (auto* table = std::get_if<runtime::Table>(&result.value())) {
+            return std::move(*table);
+        }
+        return std::unexpected("extern function returned scalar: " + call.callee);
+    };
+
     if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
         if (block->base && std::holds_alternative<parser::CallExpr>(block->base->node)) {
             auto* call = std::get_if<parser::CallExpr>(&block->base->node);
             if (call != nullptr && functions.contains(call->callee)) {
-                auto value = eval_function_call(*call, tables, scalars, columns, functions);
+                auto value =
+                    eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
+                                       externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -380,27 +487,23 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                         std::get<runtime::Table>(std::move(value.value())));
                 block->base = std::make_unique<parser::Expr>(
                     parser::Expr{parser::IdentifierExpr{temp_name}});
+            } else if (call != nullptr && extern_decls.contains(call->callee)) {
+                auto table = eval_extern_table_call(*call);
+                if (!table) {
+                    return std::unexpected(table.error());
+                }
+                auto temp_name = make_temp_table_name();
+                tables.insert_or_assign(temp_name, std::move(table.value()));
+                block->base = std::make_unique<parser::Expr>(
+                    parser::Expr{parser::IdentifierExpr{temp_name}});
             }
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
-        if (call->callee == "read_csv") {
-            if (call->args.size() != 1) {
-                return std::unexpected("read_csv() expects (path)");
-            }
-            const auto* path_lit = std::get_if<parser::LiteralExpr>(&call->args[0]->node);
-            if (path_lit == nullptr ||
-                !std::holds_alternative<std::string>(path_lit->value)) {
-                return std::unexpected("read_csv() path must be string literal");
-            }
-            auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
-            if (!table) {
-                return std::unexpected(table.error());
-            }
-            return std::move(table.value());
-        }
         if (functions.contains(call->callee)) {
-            auto value = eval_function_call(*call, tables, scalars, columns, functions);
+            auto value =
+                eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
+                                   externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -408,6 +511,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::move(*table);
             }
             return std::unexpected("function returned scalar where table expected");
+        }
+        if (extern_decls.contains(call->callee)) {
+            return eval_extern_table_call(*call);
         }
     }
     if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
@@ -423,7 +529,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     if (!lowered) {
         return std::unexpected(lowered.error().message);
     }
-    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
+    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars, &externs);
     if (!evaluated) {
         return std::unexpected(evaluated.error());
     }
@@ -432,7 +538,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
 
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        const FunctionRegistry& functions)
+                        const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                        const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string> {
     auto it = functions.find(call.callee);
     if (it == functions.end()) {
@@ -452,7 +559,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         auto& arg = *call.args[i];
         switch (param.type.kind) {
             case parser::Type::Kind::Scalar: {
-                auto value = eval_scalar_expr(arg, tables, scalars, columns, functions);
+                auto value = eval_scalar_expr(arg, tables, scalars, columns, functions,
+                                              extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -461,7 +569,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             }
             case parser::Type::Kind::DataFrame:
             case parser::Type::Kind::TimeFrame: {
-                auto value = eval_table_expr(arg, tables, scalars, columns, functions);
+                auto value = eval_table_expr(arg, tables, scalars, columns, functions,
+                                             extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -469,7 +578,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 break;
             }
             case parser::Type::Kind::Series:
-                if (auto value = eval_expr_value(arg, tables, scalars, columns, functions)) {
+                if (auto value = eval_expr_value(arg, tables, scalars, columns, functions,
+                                                 extern_decls, externs)) {
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                         local_columns.insert_or_assign(param.name, std::move(*col));
                         break;
@@ -501,14 +611,14 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                  let_stmt.type->kind == parser::Type::Kind::TimeFrame);
             if (type_is_scalar) {
                 auto value = eval_scalar_expr(*let_stmt.value, local_tables, local_scalars,
-                                              local_columns, functions);
+                                              local_columns, functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
                 local_scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
             } else if (type_is_table) {
                 auto value = eval_table_expr(*let_stmt.value, local_tables, local_scalars,
-                                             local_columns, functions);
+                                             local_columns, functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -517,7 +627,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                        let_stmt.type->kind == parser::Type::Kind::Series) {
                 auto value =
                     eval_expr_value(*let_stmt.value, local_tables, local_scalars, local_columns,
-                                    functions);
+                                    functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -535,7 +645,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 }
             } else {
                 auto value = eval_expr_value(*let_stmt.value, local_tables, local_scalars,
-                                             local_columns, functions);
+                                             local_columns, functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -552,7 +662,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         }
         const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
         auto value =
-            eval_expr_value(*expr_stmt.expr, local_tables, local_scalars, local_columns, functions);
+            eval_expr_value(*expr_stmt.expr, local_tables, local_scalars, local_columns, functions,
+                            extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -595,9 +706,12 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
 
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        FunctionRegistry& functions) -> bool {
+                        FunctionRegistry& functions, ExternDeclRegistry& extern_decls,
+                        runtime::ExternRegistry& externs) -> bool {
     for (auto& stmt : statements) {
         if (std::holds_alternative<parser::ExternDecl>(stmt)) {
+            const auto& decl = std::get<parser::ExternDecl>(stmt);
+            extern_decls.insert_or_assign(decl.name, decl);
             continue;
         }
         if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
@@ -607,10 +721,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
-            if (auto* fn_call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
-                fn_call != nullptr && functions.contains(fn_call->callee)) {
-                auto value =
-                    eval_function_call(*fn_call, tables, scalars, columns, functions);
+            if (std::get_if<parser::CallExpr>(&let_stmt.value->node) != nullptr) {
+                auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns, functions,
+                                             extern_decls, externs);
                 if (!value) {
                     fmt::print("error: {}\n", value.error());
                     return false;
@@ -653,119 +766,55 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 }
                 continue;
             }
-            if (const auto* scalar_call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
-                scalar_call != nullptr && scalar_call->callee == "scalar") {
-                auto scalar =
-                    eval_scalar_expr(*let_stmt.value, tables, scalars, columns, functions);
-                if (!scalar) {
-                    fmt::print("error: {}\n", scalar.error());
-                    return false;
-                }
-                scalars.insert_or_assign(let_stmt.name, std::move(scalar.value()));
-            } else if (const auto* read_call =
-                           std::get_if<parser::CallExpr>(&let_stmt.value->node);
-                       read_call != nullptr && read_call->callee == "read_csv") {
-                if (read_call->args.size() != 1) {
-                    fmt::print("error: read_csv() expects (path)\n");
-                    return false;
-                }
-                const auto* path_lit =
-                    std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
-                if (path_lit == nullptr ||
-                    !std::holds_alternative<std::string>(path_lit->value)) {
-                    fmt::print("error: read_csv() path must be string literal\n");
-                    return false;
-                }
-                auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
-                if (!table) {
-                    fmt::print("error: {}\n", table.error());
-                    return false;
-                }
-                tables.insert_or_assign(let_stmt.name, std::move(table.value()));
-            } else {
-                auto evaluated =
-                    eval_table_expr(*let_stmt.value, tables, scalars, columns, functions);
-                if (!evaluated) {
-                    fmt::print("error: {}\n", evaluated.error());
-                    return false;
-                }
-                tables.insert_or_assign(let_stmt.name, std::move(evaluated.value()));
+            auto evaluated = eval_table_expr(*let_stmt.value, tables, scalars, columns, functions,
+                                             extern_decls, externs);
+            if (!evaluated) {
+                fmt::print("error: {}\n", evaluated.error());
+                return false;
             }
+            tables.insert_or_assign(let_stmt.name, std::move(evaluated.value()));
             continue;
         }
-            if (std::holds_alternative<parser::ExprStmt>(stmt)) {
-                const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-                if (auto* fn_call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
-                    fn_call != nullptr && functions.contains(fn_call->callee)) {
-                    auto value =
-                        eval_function_call(*fn_call, tables, scalars, columns, functions);
-                    if (!value) {
-                        fmt::print("error: {}\n", value.error());
-                        return false;
-                    }
-                    if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                        std::visit([](const auto& v) { fmt::print("{}\n", v); }, *scalar);
-                    } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
-                        runtime::Table temp;
-                        temp.add_column("column", *col);
-                        print_table(temp);
-                    } else {
-                        print_table(std::get<runtime::Table>(std::move(value.value())));
-                    }
+        if (std::holds_alternative<parser::ExprStmt>(stmt)) {
+            const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
+            if (std::get_if<parser::CallExpr>(&expr_stmt.expr->node) != nullptr) {
+                auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, functions,
+                                             extern_decls, externs);
+                if (!value) {
+                    fmt::print("error: {}\n", value.error());
+                    return false;
+                }
+                if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+                    std::visit([](const auto& v) { fmt::print("{}\n", v); }, *scalar);
+                } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                    runtime::Table temp;
+                    temp.add_column("column", *col);
+                    print_table(temp);
+                } else {
+                    print_table(std::get<runtime::Table>(std::move(value.value())));
+                }
+                continue;
+            }
+            if (const auto* ident =
+                    std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
+                if (auto it = scalars.find(ident->name); it != scalars.end()) {
+                    std::visit([](const auto& value) { fmt::print("{}\n", value); }, it->second);
                     continue;
                 }
-                if (const auto* scalar_call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
-                    scalar_call != nullptr && scalar_call->callee == "scalar") {
-                    auto scalar =
-                        eval_scalar_expr(*expr_stmt.expr, tables, scalars, columns, functions);
-                    if (!scalar) {
-                        fmt::print("error: {}\n", scalar.error());
-                        return false;
-                    }
-                std::visit([](const auto& value) { fmt::print("{}\n", value); }, scalar.value());
-            } else if (const auto* read_call =
-                           std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
-                       read_call != nullptr && read_call->callee == "read_csv") {
-                if (read_call->args.size() != 1) {
-                    fmt::print("error: read_csv() expects (path)\n");
-                    return false;
+                if (auto it = columns.find(ident->name); it != columns.end()) {
+                    runtime::Table temp;
+                    temp.add_column(ident->name, it->second);
+                    print_table(temp);
+                    continue;
                 }
-                const auto* path_lit =
-                    std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
-                if (path_lit == nullptr ||
-                    !std::holds_alternative<std::string>(path_lit->value)) {
-                    fmt::print("error: read_csv() path must be string literal\n");
-                    return false;
-                }
-                auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
-                if (!table) {
-                    fmt::print("error: {}\n", table.error());
-                    return false;
-                }
-                print_table(table.value());
-                } else {
-                    if (const auto* ident =
-                            std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
-                        if (auto it = scalars.find(ident->name); it != scalars.end()) {
-                            std::visit([](const auto& value) { fmt::print("{}\n", value); },
-                                       it->second);
-                            continue;
-                        }
-                        if (auto it = columns.find(ident->name); it != columns.end()) {
-                            runtime::Table temp;
-                            temp.add_column(ident->name, it->second);
-                            print_table(temp);
-                            continue;
-                        }
-                    }
-                auto evaluated =
-                    eval_table_expr(*expr_stmt.expr, tables, scalars, columns, functions);
-                if (!evaluated) {
-                    fmt::print("error: {}\n", evaluated.error());
-                    return false;
-                }
-                print_table(evaluated.value());
             }
+            auto evaluated = eval_table_expr(*expr_stmt.expr, tables, scalars, columns, functions,
+                                             extern_decls, externs);
+            if (!evaluated) {
+                fmt::print("error: {}\n", evaluated.error());
+                return false;
+            }
+            print_table(evaluated.value());
         }
     }
     return true;
@@ -782,13 +831,14 @@ auto normalize_input(std::string_view input) -> std::string {
     return normalized;
 }
 
-void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
+void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     spdlog::info("Ibex REPL started (verbose={})", config.verbose);
 
     auto tables = build_builtin_tables();
     runtime::ScalarRegistry scalars;
     ColumnRegistry columns;
     FunctionRegistry functions;
+    ExternDeclRegistry extern_decls;
 
     std::string line;
     while (true) {
@@ -889,7 +939,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
                 fmt::print("error: {}\n", parsed.error().format());
                 continue;
             }
-            if (!execute_statements(parsed->statements, tables, scalars, columns, functions)) {
+            if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
+                                    extern_decls, registry)) {
                 continue;
             }
             continue;
@@ -902,7 +953,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             continue;
         }
 
-        execute_statements(parsed->statements, tables, scalars, columns, functions);
+        execute_statements(parsed->statements, tables, scalars, columns, functions, extern_decls,
+                           registry);
     }
 
     spdlog::info("Ibex REPL exiting");

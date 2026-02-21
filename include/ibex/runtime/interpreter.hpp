@@ -10,6 +10,12 @@
 
 namespace ibex::runtime {
 
+enum class ScalarKind : std::uint8_t {
+    Int,
+    Double,
+    String,
+};
+
 using ColumnValue = std::variant<Column<std::int64_t>, Column<double>, Column<std::string>>;
 using ScalarValue = std::variant<std::int64_t, double, std::string>;
 
@@ -32,8 +38,11 @@ using TableRegistry = std::unordered_map<std::string, Table>;
 using ScalarRegistry = std::unordered_map<std::string, ScalarValue>;
 
 /// Interpret an IR node tree against a table registry.
+class ExternRegistry;
+
 [[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,
-                             const ScalarRegistry* scalars = nullptr)
+                             const ScalarRegistry* scalars = nullptr,
+                             const ExternRegistry* externs = nullptr)
     -> std::expected<Table, std::string>;
 
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)

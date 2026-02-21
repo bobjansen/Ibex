@@ -1,4 +1,5 @@
 #include <ibex/repl/repl.hpp>
+#include <ibex/runtime/extern_functions.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 
 #include <CLI/CLI.hpp>
@@ -19,8 +20,7 @@ auto main(int argc, char** argv) -> int {
     }
 
     ibex::runtime::ExternRegistry registry;
-
-    // TODO: Register built-in extern functions here.
+    ibex::runtime::register_read_csv(registry);
 
     ibex::repl::ReplConfig config{
         .verbose = verbose,

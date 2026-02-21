@@ -28,7 +28,8 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 
 ## Recent REPL Features
 - `:schema`, `:head`, `:describe`, `:scalars`, `:tables`, `:load <file>`
-- `read_csv("path")` and `scalar(table, column)`
+- `scalar(table, column)`
+- `read_csv("path")` is provided via `extern fn` and registered in C++
 
 ## Recent Language Features
 - `fn name(params) -> Type { ... }` with required types

@@ -1019,22 +1019,76 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
     }
 
-    std::unordered_map<Key, AggState, KeyHash, KeyEq> groups;
+    // Multi-column GROUP BY: reuse a single Key vector across rows (no per-row
+    // heap allocation), reserve a sensible up-front capacity rather than rows,
+    // and use a robin_hood flat map (Key → AggState) so the map stays in L2.
+    //
+    // Precompute typed column pointers so the hot loop uses direct typed access
+    // instead of a ColumnValue variant dispatch (std::visit) per row × column.
+    enum class ColKind : std::uint8_t { Int, Double, Str };
+    struct ColPtr {
+        ColKind kind;
+        union {
+            const std::int64_t*       int_ptr;
+            const double*             dbl_ptr;
+            const Column<std::string>* str_ptr;
+        };
+    };
+    std::vector<ColPtr> col_ptrs(group_columns.size());
+    for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+        std::visit(
+            [&](const auto& col) {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (std::is_same_v<T, std::int64_t>) {
+                    col_ptrs[ci] = {ColKind::Int, {}};
+                    col_ptrs[ci].int_ptr = col.data();
+                } else if constexpr (std::is_same_v<T, double>) {
+                    col_ptrs[ci] = {ColKind::Double, {}};
+                    col_ptrs[ci].dbl_ptr = col.data();
+                } else {
+                    col_ptrs[ci] = {ColKind::Str, {}};
+                    col_ptrs[ci].str_ptr = &col;
+                }
+            },
+            *group_columns[ci]);
+    }
+
+    // Pre-initialise reuse_key slots to the correct variant alternative so the
+    // hot loop can use std::get<T> assignment (in-place overwrite, no
+    // destroy+construct) instead of emplace<T>.
+    robin_hood::unordered_flat_map<Key, AggState, KeyHash, KeyEq> groups;
     std::vector<Key> order;
-    groups.reserve(rows);
-    order.reserve(rows);
+    groups.reserve(1024);
+    order.reserve(1024);
+    Key reuse_key;
+    reuse_key.values.resize(group_columns.size());
+    for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+        switch (col_ptrs[ci].kind) {
+            case ColKind::Int:    reuse_key.values[ci].emplace<std::int64_t>(); break;
+            case ColKind::Double: reuse_key.values[ci].emplace<double>();       break;
+            case ColKind::Str:    reuse_key.values[ci].emplace<std::string>();  break;
+        }
+    }
     for (std::size_t row = 0; row < rows; ++row) {
-        Key key;
-        key.values.reserve(group_columns.size());
-        for (const auto* column : group_columns) {
-            key.values.push_back(scalar_from_column(*column, row));
+        for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+            const ColPtr& cp = col_ptrs[ci];
+            switch (cp.kind) {
+                case ColKind::Int:
+                    std::get<std::int64_t>(reuse_key.values[ci]) = cp.int_ptr[row];
+                    break;
+                case ColKind::Double:
+                    std::get<double>(reuse_key.values[ci]) = cp.dbl_ptr[row];
+                    break;
+                case ColKind::Str:
+                    std::get<std::string>(reuse_key.values[ci]) = (*cp.str_ptr)[row];
+                    break;
+            }
         }
 
-        auto it = groups.find(key);
+        auto it = groups.find(reuse_key);
         if (it == groups.end()) {
-            AggState state = make_state();
-            order.push_back(key);
-            it = groups.emplace(order.back(), std::move(state)).first;
+            order.push_back(reuse_key);
+            it = groups.emplace(reuse_key, make_state()).first;
         }
 
         if (auto err = (numeric_only ? update_state_numeric(it->second, row)
@@ -1055,7 +1109,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
             append_scalar(*column, key.values[i]);
         }
-        const AggState& state = groups.at(key);
+        const AggState& state = groups.find(key)->second;
         if (auto err = append_agg_values(*output, state)) {
             return std::unexpected(*err);
         }

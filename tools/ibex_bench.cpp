@@ -137,11 +137,15 @@ int main(int argc, char** argv) {
     CLI::App app{"Ibex benchmark harness"};
 
     std::string csv_path = "prices.csv";
+    std::string csv_multi_path;
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
 
-    app.add_option("--csv", csv_path, "CSV file path")->check(CLI::ExistingFile);
+    app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
+    app.add_option("--csv-multi", csv_multi_path,
+                   "CSV file path for multi-column group-by benchmarks (symbol, price, day)")
+        ->check(CLI::ExistingFile);
     app.add_option("--warmup", warmup_iters, "Warmup iterations")->check(CLI::NonNegativeNumber);
     app.add_option("--iters", iters, "Measured iterations")->check(CLI::PositiveNumber);
     app.add_flag("--include-parse", include_parse,
@@ -161,6 +165,7 @@ int main(int argc, char** argv) {
     ibex::runtime::TableRegistry tables;
     tables.emplace("prices", std::move(*table));
 
+    // Single-column group-by: exercises the string fast path (robin_hood).
     std::vector<BenchQuery> queries = {
         {
             "mean_by_symbol",
@@ -170,13 +175,62 @@ int main(int argc, char** argv) {
             "ohlc_by_symbol",
             "prices[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by symbol]",
         },
+        // Parse + lower overhead: same queries timed with parsing included.
+        // Run with --include-parse (default) to capture lexer/parser maps.
+        {
+            "parse_mean_by_symbol",
+            "prices[select {avg_price = mean(price)}, by symbol]",
+        },
+        {
+            "parse_ohlc_by_symbol",
+            "prices[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by symbol]",
+        },
     };
 
     int status = 0;
-    for (const auto& query : queries) {
-        status = run_benchmark(query, tables, warmup_iters, iters, include_parse);
+    // The first two queries benchmark pure execution (use --no-include-parse for isolation).
+    // The last two use default include_parse to measure parsing cost.
+    bool saved_include_parse = include_parse;
+    for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+        // parse_* queries always include parsing in the timing
+        bool this_include_parse = (qi >= 2) ? true : saved_include_parse;
+        status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
         if (status != 0) {
             break;
+        }
+    }
+
+    // Multi-column group-by: exercises the compound-key fallback path (std::unordered_map<Key>).
+    if (status == 0 && !csv_multi_path.empty()) {
+        auto multi_table = ibex::runtime::read_csv_simple(csv_multi_path);
+        if (!multi_table) {
+            fmt::print("error: failed to read multi CSV: {}\n", multi_table.error());
+            return 1;
+        }
+        ibex::runtime::TableRegistry multi_tables;
+        multi_tables.emplace("prices_multi", std::move(*multi_table));
+
+        // ~1008 distinct (symbol, day) groups across 4M rows.
+        std::vector<BenchQuery> multi_queries = {
+            {
+                "count_by_symbol_day",
+                "prices_multi[select {n = count()}, by {symbol, day}]",
+            },
+            {
+                "mean_by_symbol_day",
+                "prices_multi[select {avg_price = mean(price)}, by {symbol, day}]",
+            },
+            {
+                "ohlc_by_symbol_day",
+                "prices_multi[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by {symbol, day}]",
+            },
+        };
+
+        for (const auto& query : multi_queries) {
+            status = run_benchmark(query, multi_tables, warmup_iters, iters, saved_include_parse);
+            if (status != 0) {
+                break;
+            }
         }
     }
 

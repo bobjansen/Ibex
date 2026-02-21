@@ -301,18 +301,59 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         agg_columns.push_back(column);
     }
 
+    struct AggPlanItem {
+        ir::AggFunc func = ir::AggFunc::Sum;
+        ExprType kind = ExprType::Int;
+        const Column<std::int64_t>* int_col = nullptr;
+        const Column<double>* dbl_col = nullptr;
+        const Column<std::string>* str_col = nullptr;
+    };
+
+    std::vector<AggPlanItem> plan;
+    plan.reserve(aggregations.size());
+    bool numeric_only = true;
+    for (std::size_t i = 0; i < aggregations.size(); ++i) {
+        const auto& agg = aggregations[i];
+        AggPlanItem item;
+        item.func = agg.func;
+        if (agg.func == ir::AggFunc::Count) {
+            item.kind = ExprType::Int;
+        } else {
+            item.kind = expr_type_for_column(*agg_columns[i]);
+            if (const auto* int_col = std::get_if<Column<std::int64_t>>(agg_columns[i])) {
+                item.int_col = int_col;
+            } else if (const auto* dbl_col = std::get_if<Column<double>>(agg_columns[i])) {
+                item.dbl_col = dbl_col;
+            } else if (const auto* str_col = std::get_if<Column<std::string>>(agg_columns[i])) {
+                item.str_col = str_col;
+            }
+        }
+
+        if (item.kind == ExprType::String &&
+            (agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
+             agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max)) {
+            return std::unexpected("string aggregation not supported");
+        }
+
+        if (agg.func != ir::AggFunc::Count && agg.func != ir::AggFunc::Sum &&
+            agg.func != ir::AggFunc::Mean && agg.func != ir::AggFunc::Min &&
+            agg.func != ir::AggFunc::Max) {
+            numeric_only = false;
+        }
+        if (item.kind == ExprType::String) {
+            numeric_only = false;
+        }
+
+        plan.push_back(item);
+    }
+
     auto make_state = [&]() -> AggState {
         AggState state;
         state.slots.reserve(aggregations.size());
-        for (std::size_t i = 0; i < aggregations.size(); ++i) {
-            const auto& agg = aggregations[i];
+        for (std::size_t i = 0; i < plan.size(); ++i) {
             AggSlot slot;
-            slot.func = agg.func;
-            if (agg.func == ir::AggFunc::Count) {
-                slot.kind = ExprType::Int;
-            } else {
-                slot.kind = expr_type_for_column(*agg_columns[i]);
-            }
+            slot.func = plan[i].func;
+            slot.kind = plan[i].kind;
             state.slots.push_back(slot);
         }
         return state;
@@ -327,11 +368,6 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 continue;
             }
             const ColumnValue& column = *agg_columns[i];
-            if (slot.kind == ExprType::String &&
-                (agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
-                 agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max)) {
-                return "string aggregation not supported";
-            }
             if (agg.func == ir::AggFunc::First) {
                 if (!slot.has_value) {
                     slot.first_value = scalar_from_column(column, row);
@@ -414,6 +450,84 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return std::nullopt;
     };
 
+    auto update_state_numeric = [&](AggState& state,
+                                    std::size_t row) -> std::optional<std::string> {
+        for (std::size_t i = 0; i < plan.size(); ++i) {
+            const auto& item = plan[i];
+            AggSlot& slot = state.slots[i];
+            if (item.func == ir::AggFunc::Count) {
+                slot.count += 1;
+                continue;
+            }
+
+            if (slot.kind == ExprType::Int) {
+                std::int64_t value = 0;
+                if (item.int_col != nullptr) {
+                    value = (*item.int_col)[row];
+                } else if (item.dbl_col != nullptr) {
+                    value = static_cast<std::int64_t>((*item.dbl_col)[row]);
+                }
+
+                switch (item.func) {
+                    case ir::AggFunc::Sum:
+                        slot.int_value += value;
+                        break;
+                    case ir::AggFunc::Mean:
+                        slot.sum += static_cast<double>(value);
+                        slot.count += 1;
+                        break;
+                    case ir::AggFunc::Min:
+                        if (!slot.has_value || value < slot.int_value) {
+                            slot.int_value = value;
+                        }
+                        break;
+                    case ir::AggFunc::Max:
+                        if (!slot.has_value || value > slot.int_value) {
+                            slot.int_value = value;
+                        }
+                        break;
+                    case ir::AggFunc::Count:
+                    case ir::AggFunc::First:
+                    case ir::AggFunc::Last:
+                        break;
+                }
+                slot.has_value = true;
+            } else {
+                double value = 0.0;
+                if (item.dbl_col != nullptr) {
+                    value = (*item.dbl_col)[row];
+                } else if (item.int_col != nullptr) {
+                    value = static_cast<double>((*item.int_col)[row]);
+                }
+                switch (item.func) {
+                    case ir::AggFunc::Sum:
+                        slot.double_value += value;
+                        break;
+                    case ir::AggFunc::Mean:
+                        slot.sum += value;
+                        slot.count += 1;
+                        break;
+                    case ir::AggFunc::Min:
+                        if (!slot.has_value || value < slot.double_value) {
+                            slot.double_value = value;
+                        }
+                        break;
+                    case ir::AggFunc::Max:
+                        if (!slot.has_value || value > slot.double_value) {
+                            slot.double_value = value;
+                        }
+                        break;
+                    case ir::AggFunc::Count:
+                    case ir::AggFunc::First:
+                    case ir::AggFunc::Last:
+                        break;
+                }
+                slot.has_value = true;
+            }
+        }
+        return std::nullopt;
+    };
+
     auto build_output = [&]() -> std::expected<Table, std::string> {
         Table output;
         for (const auto& key : group_by) {
@@ -461,8 +575,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return output;
     };
 
-    auto append_agg_values = [&](Table& output, const AggState& state)
-        -> std::optional<std::string> {
+    auto append_agg_values = [&](Table& output,
+                                 const AggState& state) -> std::optional<std::string> {
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto& agg = aggregations[i];
             auto* column = output.find(agg.alias);
@@ -524,7 +638,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else {
                     slot_index = it->second;
                 }
-                if (auto err = update_state(states[slot_index], row)) {
+                if (auto err = (numeric_only ? update_state_numeric(states[slot_index], row)
+                                             : update_state(states[slot_index], row))) {
                     return std::unexpected(*err);
                 }
             }
@@ -564,7 +679,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else {
                     slot_index = it->second;
                 }
-                if (auto err = update_state(states[slot_index], row)) {
+                if (auto err = (numeric_only ? update_state_numeric(states[slot_index], row)
+                                             : update_state(states[slot_index], row))) {
                     return std::unexpected(*err);
                 }
             }
@@ -604,7 +720,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else {
                     slot_index = it->second;
                 }
-                if (auto err = update_state(states[slot_index], row)) {
+                if (auto err = (numeric_only ? update_state_numeric(states[slot_index], row)
+                                             : update_state(states[slot_index], row))) {
                     return std::unexpected(*err);
                 }
             }
@@ -644,7 +761,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             it = groups.emplace(order.back(), std::move(state)).first;
         }
 
-        if (auto err = update_state(it->second, row)) {
+        if (auto err = (numeric_only ? update_state_numeric(it->second, row)
+                                     : update_state(it->second, row))) {
             return std::unexpected(*err);
         }
     }
@@ -860,8 +978,8 @@ auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields,
 }
 
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
-auto interpret_node(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars)
-    -> std::expected<Table, std::string> {
+auto interpret_node(const ir::Node& node, const TableRegistry& registry,
+                    const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
             const auto& scan = static_cast<const ir::ScanNode&>(node);

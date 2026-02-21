@@ -92,6 +92,27 @@ TEST_CASE("Interpret update with arithmetic") {
     REQUIRE((*price_ints)[2] == 4);
 }
 
+TEST_CASE("Interpret select with function call") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { foo = square(price) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 1);
+
+    const auto* foo_col = result->find("foo");
+    REQUIRE(foo_col != nullptr);
+    const auto* foo_ints = std::get_if<Column<std::int64_t>>(foo_col);
+    REQUIRE(foo_ints != nullptr);
+    REQUIRE(foo_ints->size() == 2);
+    REQUIRE((*foo_ints)[0] == 4);
+    REQUIRE((*foo_ints)[1] == 9);
+}
+
 TEST_CASE("Interpret grouped aggregation") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{10, 20, 30, 25});

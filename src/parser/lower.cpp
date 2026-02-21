@@ -113,11 +113,10 @@ class Lowerer {
             }
             node = std::move(aggregate.value());
         } else if (state.select) {
-            auto project = lower_project(*state.select);
+            auto project = lower_select_projection(*state.select, std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
             }
-            project.value()->add_child(std::move(node));
             node = std::move(project.value());
         }
 
@@ -226,16 +225,41 @@ class Lowerer {
         };
     }
 
-    auto lower_project(const SelectClause& clause) -> std::expected<ir::NodePtr, LowerError> {
+    auto lower_select_projection(const SelectClause& clause, ir::NodePtr base)
+        -> std::expected<ir::NodePtr, LowerError> {
+        std::vector<ir::FieldSpec> fields;
         std::vector<ir::ColumnRef> columns;
+        fields.reserve(clause.fields.size());
+        columns.reserve(clause.fields.size());
+
         for (const auto& field : clause.fields) {
-            if (field.expr != nullptr) {
-                return std::unexpected(
-                    LowerError{.message = "select computed fields not supported yet"});
+            if (field.expr == nullptr) {
+                columns.push_back(ir::ColumnRef{.name = field.name});
+                continue;
             }
+            auto expr = lower_expr_to_ir(*field.expr);
+            if (!expr.has_value()) {
+                return std::unexpected(expr.error());
+            }
+            fields.push_back(ir::FieldSpec{
+                .alias = field.name,
+                .expr = std::move(expr.value()),
+            });
             columns.push_back(ir::ColumnRef{.name = field.name});
         }
-        return builder_.project(std::move(columns));
+
+        if (fields.empty()) {
+            auto project = builder_.project(std::move(columns));
+            project->add_child(std::move(base));
+            return project;
+        }
+
+        auto update = builder_.update(std::move(fields));
+        update->add_child(std::move(base));
+
+        auto project = builder_.project(std::move(columns));
+        project->add_child(std::move(update));
+        return project;
     }
 
     auto lower_update(const ByClause* by, const UpdateClause& clause)
@@ -280,6 +304,20 @@ class Lowerer {
                 return ir::Expr{.node = ir::Literal{.value = *str_value}};
             }
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
+        }
+        if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            ir::CallExpr lowered_call;
+            lowered_call.callee = call->callee;
+            lowered_call.args.reserve(call->args.size());
+            for (const auto& arg : call->args) {
+                auto lowered_arg = lower_expr_to_ir(*arg);
+                if (!lowered_arg.has_value()) {
+                    return std::unexpected(lowered_arg.error());
+                }
+                lowered_call.args.push_back(
+                    std::make_shared<ir::Expr>(std::move(lowered_arg.value())));
+            }
+            return ir::Expr{.node = std::move(lowered_call)};
         }
         if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
             auto left = lower_expr_to_ir(*binary->left);

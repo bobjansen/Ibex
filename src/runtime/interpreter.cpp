@@ -215,6 +215,47 @@ enum class ExprType : std::uint8_t {
     String,
 };
 
+using ExprValue = std::variant<std::int64_t, double, std::string>;
+
+struct BuiltinFunction {
+    std::size_t arity = 0;
+    std::function<std::expected<ExprType, std::string>(const std::vector<ExprType>&)> infer;
+    std::function<std::expected<ExprValue, std::string>(const std::vector<ExprValue>&)> eval;
+};
+
+auto builtin_functions() -> const std::unordered_map<std::string_view, BuiltinFunction>& {
+    static const std::unordered_map<std::string_view, BuiltinFunction> functions = {
+        {"square",
+         BuiltinFunction{
+             .arity = 1,
+             .infer =
+                 [](const std::vector<ExprType>& args) -> std::expected<ExprType, std::string> {
+                     if (args.size() != 1) {
+                         return std::unexpected("square() expects 1 argument");
+                     }
+                     if (args[0] == ExprType::String) {
+                         return std::unexpected("square() expects numeric argument");
+                     }
+                     return args[0];
+                 },
+             .eval =
+                 [](const std::vector<ExprValue>& args) -> std::expected<ExprValue, std::string> {
+                     if (args.size() != 1) {
+                         return std::unexpected("square() expects 1 argument");
+                     }
+                     if (const auto* int_value = std::get_if<std::int64_t>(&args[0])) {
+                         return (*int_value) * (*int_value);
+                     }
+                     if (const auto* double_value = std::get_if<double>(&args[0])) {
+                         return (*double_value) * (*double_value);
+                     }
+                     return std::unexpected("square() expects numeric argument");
+                 },
+         }},
+    };
+    return functions;
+}
+
 struct AggSlot {
     ir::AggFunc func = ir::AggFunc::Sum;
     ExprType kind = ExprType::Int;
@@ -1167,10 +1208,24 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         }
         return ExprType::Int;
     }
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        auto it = builtin_functions().find(call->callee);
+        if (it == builtin_functions().end()) {
+            return std::unexpected("unknown function in expression: " + call->callee);
+        }
+        std::vector<ExprType> arg_types;
+        arg_types.reserve(call->args.size());
+        for (const auto& arg : call->args) {
+            auto arg_type = infer_expr_type(*arg, input, scalars);
+            if (!arg_type) {
+                return arg_type;
+            }
+            arg_types.push_back(arg_type.value());
+        }
+        return it->second.infer(arg_types);
+    }
     return std::unexpected("unsupported expression");
 }
-
-using ExprValue = std::variant<std::int64_t, double, std::string>;
 
 auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                const ScalarRegistry* scalars) -> std::expected<ExprValue, std::string> {
@@ -1242,6 +1297,22 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                     return lhs % rhs;
             }
         }
+    }
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        auto it = builtin_functions().find(call->callee);
+        if (it == builtin_functions().end()) {
+            return std::unexpected("unknown function in expression: " + call->callee);
+        }
+        std::vector<ExprValue> arg_values;
+        arg_values.reserve(call->args.size());
+        for (const auto& arg : call->args) {
+            auto value = eval_expr(*arg, input, row, scalars);
+            if (!value) {
+                return value;
+            }
+            arg_values.push_back(std::move(value.value()));
+        }
+        return it->second.eval(arg_values);
     }
     return std::unexpected("unsupported expression");
 }

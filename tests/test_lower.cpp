@@ -72,10 +72,21 @@ TEST_CASE("Lower update with by to IR") {
     REQUIRE(update->group_by()[0].name == "symbol");
 }
 
-TEST_CASE("Lowering rejects computed select without aggregation") {
-    auto program = require_parse("df[select { x = price }];");
+TEST_CASE("Lower computed select without aggregation") {
+    auto program = require_parse("df[select { x = price * price }];");
     auto result = parser::lower(program);
-    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.has_value());
+
+    const auto* project = as_node<ir::ProjectNode>(result->get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->columns().size() == 1);
+    REQUIRE(project->columns()[0].name == "x");
+
+    REQUIRE(project->children().size() == 1);
+    const auto* update = as_node<ir::UpdateNode>(project->children()[0].get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->fields().size() == 1);
+    REQUIRE(update->fields()[0].alias == "x");
 }
 
 TEST_CASE("Lowering rejects computed group keys") {

@@ -1,4 +1,5 @@
 fn square(a: Int) -> Int {
   a * a;
 }
-let prices = read_csv("prices.csv");
+let prices = read_csv("prices_head.csv");
+

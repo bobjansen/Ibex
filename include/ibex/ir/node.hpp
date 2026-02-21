@@ -47,8 +47,13 @@ struct BinaryExpr {
     ExprPtr right;
 };
 
+struct CallExpr {
+    std::string callee;
+    std::vector<ExprPtr> args;
+};
+
 struct Expr {
-    std::variant<ColumnRef, Literal, BinaryExpr> node;
+    std::variant<ColumnRef, Literal, BinaryExpr, CallExpr> node;
 };
 
 /// A computed field: an alias mapped to an expression (represented as

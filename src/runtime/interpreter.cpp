@@ -1,7 +1,9 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -658,179 +660,261 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         if (std::holds_alternative<Column<std::string>>(key_column)) {
             const auto& col = std::get<Column<std::string>>(key_column);
 
-            // Pass 1: collect contiguous run boundaries (cheap string_view comparisons, no hashing)
-            struct Run {
-                std::string_view key;
-                std::size_t start;
-            };
-            std::vector<Run> runs;
-            runs.reserve(64);
-            for (std::size_t row = 0; row < rows; ++row) {
-                std::string_view key{col[row]};
-                if (runs.empty() || key != runs.back().key) {
-                    runs.push_back({key, row});
+            // Pass 1: Assign group IDs. One hash lookup per row, with a sorted-run shortcut
+            // that skips the lookup whenever the current key equals the previous one.
+            std::unordered_map<std::string_view, std::uint32_t> key_to_id;
+            key_to_id.reserve(64);
+            std::vector<std::string_view> order;
+            order.reserve(64);
+            std::vector<AggState> states;
+            states.reserve(64);
+            std::vector<std::uint32_t> group_ids(rows);
+            {
+                std::string_view prev_key;
+                std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::string_view key{col[row]};
+                    std::uint32_t gid;
+                    if (key == prev_key) {
+                        gid = prev_gid;
+                    } else {
+                        auto it = key_to_id.find(key);
+                        if (it == key_to_id.end()) {
+                            gid = static_cast<std::uint32_t>(states.size());
+                            key_to_id.emplace(key, gid);
+                            order.push_back(key);
+                            states.push_back(make_state());
+                        } else {
+                            gid = it->second;
+                        }
+                        prev_key = key;
+                        prev_gid = gid;
+                    }
+                    group_ids[row] = gid;
                 }
             }
 
-            // aggregate_range: apply all aggregations over column slice [start, end) using tight
-            // loops that the compiler can auto-vectorize — no per-row dispatch overhead.
-            auto aggregate_range = [&](AggState& state, std::size_t start,
-                                       std::size_t end) -> std::optional<std::string> {
-                for (std::size_t i = 0; i < plan.size(); ++i) {
-                    const auto& item = plan[i];
-                    AggSlot& slot = state.slots[i];
-                    std::size_t count = end - start;
-                    if (item.func == ir::AggFunc::Count) {
-                        slot.count += static_cast<std::int64_t>(count);
-                        continue;
-                    }
-                    if (count == 0) {
-                        continue;
-                    }
-                    if (item.func == ir::AggFunc::First) {
-                        if (!slot.has_value) {
-                            if (item.int_col != nullptr) {
-                                slot.int_value = (*item.int_col)[start];
-                            } else if (item.dbl_col != nullptr) {
-                                slot.double_value = (*item.dbl_col)[start];
-                            } else if (item.str_col != nullptr) {
-                                slot.first_value = (*item.str_col)[start];
-                            }
-                            slot.has_value = true;
-                        }
-                        continue;
-                    }
-                    if (item.func == ir::AggFunc::Last) {
-                        if (item.int_col != nullptr) {
-                            slot.int_value = (*item.int_col)[end - 1];
-                        } else if (item.dbl_col != nullptr) {
-                            slot.double_value = (*item.dbl_col)[end - 1];
-                        } else if (item.str_col != nullptr) {
-                            slot.last_value = (*item.str_col)[end - 1];
-                        }
-                        slot.has_value = true;
-                        continue;
-                    }
-                    if (item.int_col != nullptr) {
-                        const std::int64_t* data = item.int_col->data() + start;
-                        switch (item.func) {
-                            case ir::AggFunc::Sum: {
-                                std::int64_t s = slot.int_value;
-                                for (std::size_t r = 0; r < count; ++r) {
-                                    s += data[r];
-                                }
-                                slot.int_value = s;
-                                break;
-                            }
-                            case ir::AggFunc::Mean: {
-                                double s = slot.sum;
-                                for (std::size_t r = 0; r < count; ++r) {
-                                    s += static_cast<double>(data[r]);
-                                }
-                                slot.sum = s;
-                                slot.count += static_cast<std::int64_t>(count);
-                                break;
-                            }
-                            case ir::AggFunc::Min: {
-                                std::int64_t m = slot.has_value ? slot.int_value : data[0];
-                                std::size_t r0 = slot.has_value ? 0 : 1;
-                                for (std::size_t r = r0; r < count; ++r) {
-                                    if (data[r] < m) {
-                                        m = data[r];
-                                    }
-                                }
-                                slot.int_value = m;
-                                break;
-                            }
-                            case ir::AggFunc::Max: {
-                                std::int64_t m = slot.has_value ? slot.int_value : data[0];
-                                std::size_t r0 = slot.has_value ? 0 : 1;
-                                for (std::size_t r = r0; r < count; ++r) {
-                                    if (data[r] > m) {
-                                        m = data[r];
-                                    }
-                                }
-                                slot.int_value = m;
-                                break;
-                            }
-                            default:
-                                break;
-                        }
-                        slot.has_value = true;
-                    } else if (item.dbl_col != nullptr) {
-                        const double* data = item.dbl_col->data() + start;
-                        switch (item.func) {
-                            case ir::AggFunc::Sum: {
-                                double s = slot.double_value;
-                                for (std::size_t r = 0; r < count; ++r) {
-                                    s += data[r];
-                                }
-                                slot.double_value = s;
-                                break;
-                            }
-                            case ir::AggFunc::Mean: {
-                                double s = slot.sum;
-                                for (std::size_t r = 0; r < count; ++r) {
-                                    s += data[r];
-                                }
-                                slot.sum = s;
-                                slot.count += static_cast<std::int64_t>(count);
-                                break;
-                            }
-                            case ir::AggFunc::Min: {
-                                double m = slot.has_value ? slot.double_value : data[0];
-                                std::size_t r0 = slot.has_value ? 0 : 1;
-                                for (std::size_t r = r0; r < count; ++r) {
-                                    if (data[r] < m) {
-                                        m = data[r];
-                                    }
-                                }
-                                slot.double_value = m;
-                                break;
-                            }
-                            case ir::AggFunc::Max: {
-                                double m = slot.has_value ? slot.double_value : data[0];
-                                std::size_t r0 = slot.has_value ? 0 : 1;
-                                for (std::size_t r = r0; r < count; ++r) {
-                                    if (data[r] > m) {
-                                        m = data[r];
-                                    }
-                                }
-                                slot.double_value = m;
-                                break;
-                            }
-                            default:
-                                break;
-                        }
-                        slot.has_value = true;
-                    }
-                }
-                return std::nullopt;
-            };
+            auto n_groups = static_cast<std::uint32_t>(states.size());
+            const std::uint32_t* gids = group_ids.data();
 
-            // Pass 2: one hash lookup per run (not per row), then apply range aggregation
-            std::unordered_map<std::string_view, std::size_t> index;
-            index.reserve(runs.size());
-            std::vector<std::string_view> order;
-            order.reserve(runs.size());
-            std::vector<AggState> states;
-            states.reserve(runs.size());
-            for (std::size_t r = 0; r < runs.size(); ++r) {
-                std::string_view key = runs[r].key;
-                std::size_t start = runs[r].start;
-                std::size_t end = (r + 1 < runs.size()) ? runs[r + 1].start : rows;
-                auto it = index.find(key);
-                std::size_t slot_idx = 0;
-                if (it == index.end()) {
-                    slot_idx = states.size();
-                    index.emplace(key, slot_idx);
-                    order.push_back(key);
-                    states.push_back(make_state());
-                } else {
-                    slot_idx = it->second;
+            // Pass 2: Per-aggregation column scans with flat accumulator arrays.
+            // n_groups is typically small, so the flat accumulators stay in L1 cache,
+            // and the inner loops are simple scatter-updates: accum[gids[row]] op= data[row].
+            for (std::size_t agg_i = 0; agg_i < plan.size(); ++agg_i) {
+                const auto& item = plan[agg_i];
+
+                if (item.func == ir::AggFunc::Count) {
+                    std::vector<std::int64_t> acc(n_groups, 0);
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        acc[gids[row]]++;
+                    }
+                    for (std::uint32_t g = 0; g < n_groups; ++g) {
+                        states[g].slots[agg_i].count = acc[g];
+                    }
+                    continue;
                 }
-                if (auto err = aggregate_range(states[slot_idx], start, end)) {
-                    return std::unexpected(*err);
+
+                if (item.func == ir::AggFunc::First) {
+                    std::vector<bool> found(n_groups, false);
+                    if (item.int_col != nullptr) {
+                        std::vector<std::int64_t> acc(n_groups, 0);
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            std::uint32_t g = gids[row];
+                            if (!found[g]) {
+                                acc[g] = (*item.int_col)[row];
+                                found[g] = true;
+                            }
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].int_value = acc[g];
+                            states[g].slots[agg_i].has_value = true;
+                        }
+                    } else if (item.dbl_col != nullptr) {
+                        std::vector<double> acc(n_groups, 0.0);
+                        const double* data = item.dbl_col->data();
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            std::uint32_t g = gids[row];
+                            if (!found[g]) {
+                                acc[g] = data[row];
+                                found[g] = true;
+                            }
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].double_value = acc[g];
+                            states[g].slots[agg_i].has_value = true;
+                        }
+                    } else if (item.str_col != nullptr) {
+                        std::vector<std::string> acc(n_groups);
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            std::uint32_t g = gids[row];
+                            if (!found[g]) {
+                                acc[g] = (*item.str_col)[row];
+                                found[g] = true;
+                            }
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].first_value = std::move(acc[g]);
+                            states[g].slots[agg_i].has_value = true;
+                        }
+                    }
+                    continue;
+                }
+
+                if (item.func == ir::AggFunc::Last) {
+                    if (item.int_col != nullptr) {
+                        std::vector<std::int64_t> acc(n_groups, 0);
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            acc[gids[row]] = (*item.int_col)[row];
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].int_value = acc[g];
+                            states[g].slots[agg_i].has_value = true;
+                        }
+                    } else if (item.dbl_col != nullptr) {
+                        std::vector<double> acc(n_groups, 0.0);
+                        const double* data = item.dbl_col->data();
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            acc[gids[row]] = data[row];
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].double_value = acc[g];
+                            states[g].slots[agg_i].has_value = true;
+                        }
+                    } else if (item.str_col != nullptr) {
+                        std::vector<std::string> acc(n_groups);
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            acc[gids[row]] = (*item.str_col)[row];
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].last_value = std::move(acc[g]);
+                            states[g].slots[agg_i].has_value = true;
+                        }
+                    }
+                    continue;
+                }
+
+                if (item.dbl_col != nullptr) {
+                    const double* data = item.dbl_col->data();
+                    switch (item.func) {
+                        case ir::AggFunc::Sum: {
+                            std::vector<double> acc(n_groups, 0.0);
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                acc[gids[row]] += data[row];
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].double_value = acc[g];
+                                states[g].slots[agg_i].has_value = true;
+                            }
+                            break;
+                        }
+                        case ir::AggFunc::Mean: {
+                            std::vector<double> acc(n_groups, 0.0);
+                            std::vector<std::int64_t> counts(n_groups, 0);
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                std::uint32_t g = gids[row];
+                                acc[g] += data[row];
+                                counts[g]++;
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].sum = acc[g];
+                                states[g].slots[agg_i].count = counts[g];
+                            }
+                            break;
+                        }
+                        case ir::AggFunc::Min: {
+                            std::vector<double> acc(n_groups,
+                                                    std::numeric_limits<double>::infinity());
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                std::uint32_t g = gids[row];
+                                if (data[row] < acc[g]) {
+                                    acc[g] = data[row];
+                                }
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].double_value = acc[g];
+                                states[g].slots[agg_i].has_value = true;
+                            }
+                            break;
+                        }
+                        case ir::AggFunc::Max: {
+                            std::vector<double> acc(n_groups,
+                                                    -std::numeric_limits<double>::infinity());
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                std::uint32_t g = gids[row];
+                                if (data[row] > acc[g]) {
+                                    acc[g] = data[row];
+                                }
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].double_value = acc[g];
+                                states[g].slots[agg_i].has_value = true;
+                            }
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+                } else if (item.int_col != nullptr) {
+                    const std::int64_t* data = item.int_col->data();
+                    switch (item.func) {
+                        case ir::AggFunc::Sum: {
+                            std::vector<std::int64_t> acc(n_groups, 0);
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                acc[gids[row]] += data[row];
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].int_value = acc[g];
+                                states[g].slots[agg_i].has_value = true;
+                            }
+                            break;
+                        }
+                        case ir::AggFunc::Mean: {
+                            std::vector<double> acc(n_groups, 0.0);
+                            std::vector<std::int64_t> counts(n_groups, 0);
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                std::uint32_t g = gids[row];
+                                acc[g] += static_cast<double>(data[row]);
+                                counts[g]++;
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].sum = acc[g];
+                                states[g].slots[agg_i].count = counts[g];
+                            }
+                            break;
+                        }
+                        case ir::AggFunc::Min: {
+                            std::vector<std::int64_t> acc(
+                                n_groups, std::numeric_limits<std::int64_t>::max());
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                std::uint32_t g = gids[row];
+                                if (data[row] < acc[g]) {
+                                    acc[g] = data[row];
+                                }
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].int_value = acc[g];
+                                states[g].slots[agg_i].has_value = true;
+                            }
+                            break;
+                        }
+                        case ir::AggFunc::Max: {
+                            std::vector<std::int64_t> acc(
+                                n_groups, std::numeric_limits<std::int64_t>::min());
+                            for (std::size_t row = 0; row < rows; ++row) {
+                                std::uint32_t g = gids[row];
+                                if (data[row] > acc[g]) {
+                                    acc[g] = data[row];
+                                }
+                            }
+                            for (std::uint32_t g = 0; g < n_groups; ++g) {
+                                states[g].slots[agg_i].int_value = acc[g];
+                                states[g].slots[agg_i].has_value = true;
+                            }
+                            break;
+                        }
+                        default:
+                            break;
+                    }
                 }
             }
 

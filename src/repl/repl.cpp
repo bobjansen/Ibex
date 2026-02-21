@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -500,6 +501,161 @@ auto eval_function_call(const parser::CallExpr& call, runtime::TableRegistry& ta
     return std::unexpected("Column return types not supported yet");
 }
 
+auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
+                        runtime::ScalarRegistry& scalars, FunctionRegistry& functions) -> bool {
+    parser::LowerContext context;
+    for (auto& stmt : statements) {
+        if (std::holds_alternative<parser::ExternDecl>(stmt)) {
+            continue;
+        }
+        if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
+            auto fn = std::get<parser::FunctionDecl>(std::move(stmt));
+            functions.insert_or_assign(fn.name, std::move(fn));
+            continue;
+        }
+        if (std::holds_alternative<parser::LetStmt>(stmt)) {
+            const auto& let_stmt = std::get<parser::LetStmt>(stmt);
+            if (const auto* fn_call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
+                fn_call != nullptr && functions.contains(fn_call->callee)) {
+                auto value = eval_function_call(*fn_call, tables, scalars, functions);
+                if (!value) {
+                    fmt::print("error: {}\n", value.error());
+                    return false;
+                }
+                bool expect_scalar = let_stmt.type.has_value() &&
+                                     let_stmt.type->kind == parser::Type::Kind::Scalar;
+                bool expect_table = let_stmt.type.has_value() &&
+                                    (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
+                                     let_stmt.type->kind == parser::Type::Kind::TimeFrame);
+                if (expect_scalar && !std::holds_alternative<runtime::ScalarValue>(*value)) {
+                    fmt::print("error: expected scalar return for {}\n", let_stmt.name);
+                    return false;
+                }
+                if (expect_table && !std::holds_alternative<runtime::Table>(*value)) {
+                    fmt::print("error: expected table return for {}\n", let_stmt.name);
+                    return false;
+                }
+                if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+                    scalars.insert_or_assign(let_stmt.name, std::move(*scalar));
+                } else {
+                    tables.insert_or_assign(let_stmt.name,
+                                            std::get<runtime::Table>(std::move(value.value())));
+                }
+                continue;
+            }
+            if (const auto* scalar_call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
+                scalar_call != nullptr && scalar_call->callee == "scalar") {
+                auto scalar = eval_scalar_expr(*let_stmt.value, tables, scalars, functions);
+                if (!scalar) {
+                    fmt::print("error: {}\n", scalar.error());
+                    return false;
+                }
+                scalars.insert_or_assign(let_stmt.name, std::move(scalar.value()));
+            } else if (const auto* read_call =
+                           std::get_if<parser::CallExpr>(&let_stmt.value->node);
+                       read_call != nullptr && read_call->callee == "read_csv") {
+                if (read_call->args.size() != 1) {
+                    fmt::print("error: read_csv() expects (path)\n");
+                    return false;
+                }
+                const auto* path_lit =
+                    std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
+                if (path_lit == nullptr ||
+                    !std::holds_alternative<std::string>(path_lit->value)) {
+                    fmt::print("error: read_csv() path must be string literal\n");
+                    return false;
+                }
+                auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
+                if (!table) {
+                    fmt::print("error: {}\n", table.error());
+                    return false;
+                }
+                tables.insert_or_assign(let_stmt.name, std::move(table.value()));
+            } else {
+                auto lowered = parser::lower_expr(*let_stmt.value, context);
+                if (!lowered) {
+                    fmt::print("error: {}\n", lowered.error().message);
+                    return false;
+                }
+                auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
+                if (!evaluated) {
+                    fmt::print("error: {}\n", evaluated.error());
+                    return false;
+                }
+                tables.insert_or_assign(let_stmt.name, std::move(evaluated.value()));
+            }
+            continue;
+        }
+        if (std::holds_alternative<parser::ExprStmt>(stmt)) {
+            const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
+            if (const auto* fn_call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+                fn_call != nullptr && functions.contains(fn_call->callee)) {
+                auto value = eval_function_call(*fn_call, tables, scalars, functions);
+                if (!value) {
+                    fmt::print("error: {}\n", value.error());
+                    return false;
+                }
+                if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+                    std::visit([](const auto& v) { fmt::print("{}\n", v); }, *scalar);
+                } else {
+                    print_table(std::get<runtime::Table>(std::move(value.value())));
+                }
+                continue;
+            }
+            if (const auto* scalar_call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+                scalar_call != nullptr && scalar_call->callee == "scalar") {
+                auto scalar = eval_scalar_expr(*expr_stmt.expr, tables, scalars, functions);
+                if (!scalar) {
+                    fmt::print("error: {}\n", scalar.error());
+                    return false;
+                }
+                std::visit([](const auto& value) { fmt::print("{}\n", value); }, scalar.value());
+            } else if (const auto* read_call =
+                           std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+                       read_call != nullptr && read_call->callee == "read_csv") {
+                if (read_call->args.size() != 1) {
+                    fmt::print("error: read_csv() expects (path)\n");
+                    return false;
+                }
+                const auto* path_lit =
+                    std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
+                if (path_lit == nullptr ||
+                    !std::holds_alternative<std::string>(path_lit->value)) {
+                    fmt::print("error: read_csv() path must be string literal\n");
+                    return false;
+                }
+                auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
+                if (!table) {
+                    fmt::print("error: {}\n", table.error());
+                    return false;
+                }
+                print_table(table.value());
+            } else {
+                if (const auto* ident =
+                        std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
+                    if (auto it = scalars.find(ident->name); it != scalars.end()) {
+                        std::visit([](const auto& value) { fmt::print("{}\n", value); },
+                                   it->second);
+                        continue;
+                    }
+                }
+                auto lowered = parser::lower_expr(*expr_stmt.expr, context);
+                if (!lowered) {
+                    fmt::print("error: {}\n", lowered.error().message);
+                    return false;
+                }
+                auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
+                if (!evaluated) {
+                    fmt::print("error: {}\n", evaluated.error());
+                    return false;
+                }
+                print_table(evaluated.value());
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 auto normalize_input(std::string_view input) -> std::string {
@@ -599,6 +755,29 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             describe_table(it->second, count);
             continue;
         }
+        if (line.starts_with(":load")) {
+            auto arg = trim(line.substr(std::string_view(":load").size()));
+            if (arg.empty()) {
+                fmt::print("usage: :load <file>\n");
+                continue;
+            }
+            std::ifstream input{std::string(arg)};
+            if (!input) {
+                fmt::print("error: failed to open '{}'\n", arg);
+                continue;
+            }
+            std::string source((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+            auto parsed = parser::parse(source);
+            if (!parsed) {
+                fmt::print("error: {}\n", parsed.error().format());
+                continue;
+            }
+            if (!execute_statements(parsed->statements, tables, scalars, functions)) {
+                continue;
+            }
+            continue;
+        }
 
         auto normalized = normalize_input(line);
         auto parsed = parser::parse(normalized);
@@ -607,178 +786,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             continue;
         }
 
-        parser::LowerContext context;
-        bool had_error = false;
-        for (auto& stmt : parsed->statements) {
-            if (std::holds_alternative<parser::ExternDecl>(stmt)) {
-                continue;
-            }
-            if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
-                auto fn = std::get<parser::FunctionDecl>(std::move(stmt));
-                functions.insert_or_assign(fn.name, std::move(fn));
-                continue;
-            }
-            if (std::holds_alternative<parser::LetStmt>(stmt)) {
-                const auto& let_stmt = std::get<parser::LetStmt>(stmt);
-                if (const auto* fn_call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
-                    fn_call != nullptr && functions.contains(fn_call->callee)) {
-                    auto value = eval_function_call(*fn_call, tables, scalars, functions);
-                    if (!value) {
-                        fmt::print("error: {}\n", value.error());
-                        had_error = true;
-                        break;
-                    }
-                    bool expect_scalar = let_stmt.type.has_value() &&
-                                         let_stmt.type->kind == parser::Type::Kind::Scalar;
-                    bool expect_table = let_stmt.type.has_value() &&
-                                        (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
-                                         let_stmt.type->kind == parser::Type::Kind::TimeFrame);
-                    if (expect_scalar && !std::holds_alternative<runtime::ScalarValue>(*value)) {
-                        fmt::print("error: expected scalar return for {}\n", let_stmt.name);
-                        had_error = true;
-                        break;
-                    }
-                    if (expect_table && !std::holds_alternative<runtime::Table>(*value)) {
-                        fmt::print("error: expected table return for {}\n", let_stmt.name);
-                        had_error = true;
-                        break;
-                    }
-                    if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                        scalars.insert_or_assign(let_stmt.name, std::move(*scalar));
-                    } else {
-                        tables.insert_or_assign(let_stmt.name,
-                                                std::get<runtime::Table>(std::move(value.value())));
-                    }
-                    continue;
-                }
-                if (const auto* scalar_call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
-                    scalar_call != nullptr && scalar_call->callee == "scalar") {
-                    auto scalar = eval_scalar_expr(*let_stmt.value, tables, scalars, functions);
-                    if (!scalar) {
-                        fmt::print("error: {}\n", scalar.error());
-                        had_error = true;
-                        break;
-                    }
-                    scalars.insert_or_assign(let_stmt.name, std::move(scalar.value()));
-                } else if (const auto* read_call =
-                               std::get_if<parser::CallExpr>(&let_stmt.value->node);
-                           read_call != nullptr && read_call->callee == "read_csv") {
-                    if (read_call->args.size() != 1) {
-                        fmt::print("error: read_csv() expects (path)\n");
-                        had_error = true;
-                        break;
-                    }
-                    const auto* path_lit =
-                        std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
-                    if (path_lit == nullptr ||
-                        !std::holds_alternative<std::string>(path_lit->value)) {
-                        fmt::print("error: read_csv() path must be string literal\n");
-                        had_error = true;
-                        break;
-                    }
-                    auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
-                    if (!table) {
-                        fmt::print("error: {}\n", table.error());
-                        had_error = true;
-                        break;
-                    }
-                    tables.insert_or_assign(let_stmt.name, std::move(table.value()));
-                } else {
-                    auto lowered = parser::lower_expr(*let_stmt.value, context);
-                    if (!lowered) {
-                        fmt::print("error: {}\n", lowered.error().message);
-                        had_error = true;
-                        break;
-                    }
-                    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
-                    if (!evaluated) {
-                        fmt::print("error: {}\n", evaluated.error());
-                        had_error = true;
-                        break;
-                    }
-                    tables.insert_or_assign(let_stmt.name, std::move(evaluated.value()));
-                }
-                continue;
-            }
-            if (std::holds_alternative<parser::ExprStmt>(stmt)) {
-                const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-                if (const auto* fn_call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
-                    fn_call != nullptr && functions.contains(fn_call->callee)) {
-                    auto value = eval_function_call(*fn_call, tables, scalars, functions);
-                    if (!value) {
-                        fmt::print("error: {}\n", value.error());
-                        had_error = true;
-                        break;
-                    }
-                    if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                        std::visit([](const auto& v) { fmt::print("{}\n", v); }, *scalar);
-                    } else {
-                        print_table(std::get<runtime::Table>(std::move(value.value())));
-                    }
-                    continue;
-                }
-                if (const auto* scalar_call =
-                        std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
-                    scalar_call != nullptr && scalar_call->callee == "scalar") {
-                    auto scalar = eval_scalar_expr(*expr_stmt.expr, tables, scalars, functions);
-                    if (!scalar) {
-                        fmt::print("error: {}\n", scalar.error());
-                        had_error = true;
-                        break;
-                    }
-                    std::visit([](const auto& value) { fmt::print("{}\n", value); },
-                               scalar.value());
-                } else if (const auto* read_call =
-                               std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
-                           read_call != nullptr && read_call->callee == "read_csv") {
-                    if (read_call->args.size() != 1) {
-                        fmt::print("error: read_csv() expects (path)\n");
-                        had_error = true;
-                        break;
-                    }
-                    const auto* path_lit =
-                        std::get_if<parser::LiteralExpr>(&read_call->args[0]->node);
-                    if (path_lit == nullptr ||
-                        !std::holds_alternative<std::string>(path_lit->value)) {
-                        fmt::print("error: read_csv() path must be string literal\n");
-                        had_error = true;
-                        break;
-                    }
-                    auto table = runtime::read_csv_simple(std::get<std::string>(path_lit->value));
-                    if (!table) {
-                        fmt::print("error: {}\n", table.error());
-                        had_error = true;
-                        break;
-                    }
-                    print_table(table.value());
-                } else {
-                    if (const auto* ident =
-                            std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
-                        if (auto it = scalars.find(ident->name); it != scalars.end()) {
-                            std::visit([](const auto& value) { fmt::print("{}\n", value); },
-                                       it->second);
-                            continue;
-                        }
-                    }
-                    auto lowered = parser::lower_expr(*expr_stmt.expr, context);
-                    if (!lowered) {
-                        fmt::print("error: {}\n", lowered.error().message);
-                        had_error = true;
-                        break;
-                    }
-                    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
-                    if (!evaluated) {
-                        fmt::print("error: {}\n", evaluated.error());
-                        had_error = true;
-                        break;
-                    }
-                    print_table(evaluated.value());
-                }
-            }
-        }
-        if (had_error) {
-            continue;
-        }
+        execute_statements(parsed->statements, tables, scalars, functions);
     }
 
     spdlog::info("Ibex REPL exiting");

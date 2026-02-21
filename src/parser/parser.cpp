@@ -1,6 +1,5 @@
-#include <ibex/parser/parser.hpp>
-
 #include <ibex/parser/lexer.hpp>
+#include <ibex/parser/parser.hpp>
 
 #include <fmt/core.h>
 
@@ -15,14 +14,15 @@ namespace ibex::parser {
 namespace {
 
 class Parser {
-public:
+   public:
     explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
 
     auto parse_program() -> std::expected<Program, ParseError> {
         Program program;
         while (!is_at_end()) {
             if (peek().kind == TokenKind::Error) {
-                return std::unexpected(make_error(peek(), fmt::format("invalid token {}", format_token(peek()))));
+                return std::unexpected(
+                    make_error(peek(), fmt::format("invalid token {}", format_token(peek()))));
             }
             auto stmt = parse_statement();
             if (!stmt.has_value()) {
@@ -33,7 +33,7 @@ public:
         return program;
     }
 
-private:
+   private:
     auto parse_statement() -> std::optional<Stmt> {
         if (match(TokenKind::KeywordExtern)) {
             return parse_extern_decl();
@@ -69,7 +69,8 @@ private:
                 if (!param_type.has_value()) {
                     return std::nullopt;
                 }
-                params.push_back(Param{.name = std::move(*param_name), .type = std::move(*param_type)});
+                params.push_back(
+                    Param{.name = std::move(*param_name), .type = std::move(*param_type)});
             } while (match(TokenKind::Comma));
         }
         if (!consume(TokenKind::RParen, "expected ')' after parameter list")) {
@@ -138,7 +139,8 @@ private:
             return std::nullopt;
         }
         if (!check(TokenKind::Semicolon)) {
-            error_ = make_error(peek(), fmt::format("unexpected token {} after expression", format_token(peek())));
+            error_ = make_error(
+                peek(), fmt::format("unexpected token {} after expression", format_token(peek())));
             return std::nullopt;
         }
         if (!consume(TokenKind::Semicolon, "expected ';' after expression")) {
@@ -455,7 +457,8 @@ private:
             if (!consume(TokenKind::DurationLiteral, "expected duration literal after 'window'")) {
                 return std::nullopt;
             }
-            return WindowClause{.duration = DurationLiteral{.text = std::string(previous().lexeme)}};
+            return WindowClause{.duration =
+                                    DurationLiteral{.text = std::string(previous().lexeme)}};
         }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
@@ -639,7 +642,7 @@ private:
 
     auto previous() const -> const Token& { return tokens_[current_ - 1]; }
 
-    auto make_error(const Token& token, std::string_view message) const -> ParseError {
+    static auto make_error(const Token& token, std::string_view message) -> ParseError {
         return ParseError{
             .message = std::string(message),
             .line = token.line,
@@ -647,7 +650,7 @@ private:
         };
     }
 
-    auto format_token(const Token& token) const -> std::string {
+    static auto format_token(const Token& token) -> std::string {
         if (token.kind == TokenKind::Eof || token.lexeme.empty()) {
             return "'<eof>'";
         }
@@ -659,16 +662,16 @@ private:
         return nullptr;
     }
 
-    auto parse_int(std::string_view text) const -> std::optional<std::int64_t> {
+    static auto parse_int(std::string_view text) -> std::optional<std::int64_t> {
         std::int64_t value = 0;
-        auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+        auto result = std::from_chars(text.begin(), text.end(), value);
         if (result.ec != std::errc()) {
             return std::nullopt;
         }
         return value;
     }
 
-    auto parse_double(std::string_view text) const -> std::optional<double> {
+    static auto parse_double(std::string_view text) -> std::optional<double> {
         std::string tmp(text);
         char* end = nullptr;
         double value = std::strtod(tmp.c_str(), &end);
@@ -678,7 +681,7 @@ private:
         return value;
     }
 
-    auto unescape_string(std::string_view text) const -> std::string {
+    static auto unescape_string(std::string_view text) -> std::string {
         if (text.size() < 2) {
             return std::string(text);
         }
@@ -689,27 +692,27 @@ private:
             if (ch == '\\' && idx + 1 < text.size() - 1) {
                 char next = text[idx + 1];
                 switch (next) {
-                case 'n':
-                    result.push_back('\n');
-                    break;
-                case 'r':
-                    result.push_back('\r');
-                    break;
-                case 't':
-                    result.push_back('\t');
-                    break;
-                case '0':
-                    result.push_back('\0');
-                    break;
-                case '"':
-                    result.push_back('"');
-                    break;
-                case '\\':
-                    result.push_back('\\');
-                    break;
-                default:
-                    result.push_back(next);
-                    break;
+                    case 'n':
+                        result.push_back('\n');
+                        break;
+                    case 'r':
+                        result.push_back('\r');
+                        break;
+                    case 't':
+                        result.push_back('\t');
+                        break;
+                    case '0':
+                        result.push_back('\0');
+                        break;
+                    case '"':
+                        result.push_back('"');
+                        break;
+                    case '\\':
+                        result.push_back('\\');
+                        break;
+                    default:
+                        result.push_back(next);
+                        break;
                 }
                 idx += 1;
                 continue;
@@ -719,43 +722,43 @@ private:
         return result;
     }
 
-    auto make_literal(std::int64_t value) -> ExprPtr {
+    static auto make_literal(std::int64_t value) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
         expr->node = LiteralExpr{.value = value};
         return expr;
     }
 
-    auto make_literal(double value) -> ExprPtr {
+    static auto make_literal(double value) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
         expr->node = LiteralExpr{.value = value};
         return expr;
     }
 
-    auto make_literal(bool value) -> ExprPtr {
+    static auto make_literal(bool value) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
         expr->node = LiteralExpr{.value = value};
         return expr;
     }
 
-    auto make_literal(std::string value) -> ExprPtr {
+    static auto make_literal(std::string value) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
         expr->node = LiteralExpr{.value = std::move(value)};
         return expr;
     }
 
-    auto make_literal(DurationLiteral value) -> ExprPtr {
+    static auto make_literal(DurationLiteral value) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
         expr->node = LiteralExpr{.value = std::move(value)};
         return expr;
     }
 
-    auto make_unary(UnaryOp op, ExprPtr expr) -> ExprPtr {
+    static auto make_unary(UnaryOp op, ExprPtr expr) -> ExprPtr {
         auto node = std::make_unique<Expr>();
         node->node = UnaryExpr{.op = op, .expr = std::move(expr)};
         return node;
     }
 
-    auto make_binary(BinaryOp op, ExprPtr left, ExprPtr right) -> ExprPtr {
+    static auto make_binary(BinaryOp op, ExprPtr left, ExprPtr right) -> ExprPtr {
         auto node = std::make_unique<Expr>();
         node->node = BinaryExpr{
             .op = op,

@@ -16,6 +16,11 @@ Diagnostics:
       - performance-*
       - readability-*
     Remove:
+      - cppcoreguidelines-avoid-do-while
+      - misc-non-private-member-variables-in-classes
+      - readability-implicit-bool-conversion
+      - misc-no-recursion
+      - readability-function-cognitive-complexity
       - modernize-use-trailing-return-type
       - readability-identifier-length
       - cppcoreguidelines-avoid-magic-numbers

@@ -76,6 +76,30 @@ TEST_CASE("Parse extern declaration with schema types") {
     REQUIRE(decl.source_path == "csv.hpp");
 }
 
+TEST_CASE("Parse function declaration with typed params") {
+    const char* source = "fn foo(col: Column<Int>, x: Int) -> Int { x; }";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<FunctionDecl>(stmt));
+    const auto& fn = std::get<FunctionDecl>(stmt);
+    REQUIRE(fn.name == "foo");
+    REQUIRE(fn.params.size() == 2);
+    REQUIRE(fn.params[0].name == "col");
+    REQUIRE(fn.params[0].type.kind == Type::Kind::Series);
+    REQUIRE(std::get<ScalarType>(fn.params[0].type.arg) == ScalarType::Int64);
+    REQUIRE(fn.params[1].name == "x");
+    REQUIRE(fn.params[1].type.kind == Type::Kind::Scalar);
+    REQUIRE(std::get<ScalarType>(fn.params[1].type.arg) == ScalarType::Int64);
+    REQUIRE(fn.return_type.kind == Type::Kind::Scalar);
+    REQUIRE(std::get<ScalarType>(fn.return_type.arg) == ScalarType::Int64);
+    REQUIRE(fn.body.size() == 1);
+    REQUIRE(std::holds_alternative<ExprStmt>(fn.body.front()));
+}
+
 TEST_CASE("Parse let binding with precedence") {
     const char* source = "let mut x: Int64 = 1 + 2 * 3;";
 

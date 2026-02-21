@@ -141,13 +141,6 @@ struct Expr {
         node;
 };
 
-struct ExternDecl {
-    std::string name;
-    std::vector<Param> params;
-    Type return_type;
-    std::string source_path;
-};
-
 struct LetStmt {
     bool is_mut = false;
     std::string name;
@@ -159,7 +152,23 @@ struct ExprStmt {
     ExprPtr expr;
 };
 
-using Stmt = std::variant<ExternDecl, LetStmt, ExprStmt>;
+using FnStmt = std::variant<LetStmt, ExprStmt>;
+
+struct FunctionDecl {
+    std::string name;
+    std::vector<Param> params;
+    Type return_type;
+    std::vector<FnStmt> body;
+};
+
+struct ExternDecl {
+    std::string name;
+    std::vector<Param> params;
+    Type return_type;
+    std::string source_path;
+};
+
+using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, ExprStmt>;
 
 struct Program {
     std::vector<Stmt> statements;

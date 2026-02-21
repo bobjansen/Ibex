@@ -37,6 +37,7 @@ enum class TokenKind : std::uint8_t {
     KeywordOn,
 
     // Type keywords
+    KeywordInt,
     KeywordInt32,
     KeywordInt64,
     KeywordFloat32,
@@ -44,6 +45,7 @@ enum class TokenKind : std::uint8_t {
     KeywordBool,
     KeywordString,
     KeywordTimestamp,
+    KeywordColumn,
     KeywordSeries,
     KeywordDataFrame,
     KeywordTimeFrame,

@@ -38,6 +38,9 @@ class Parser {
         if (match(TokenKind::KeywordExtern)) {
             return parse_extern_decl();
         }
+        if (match(TokenKind::KeywordFn)) {
+            return parse_fn_decl();
+        }
         if (match(TokenKind::KeywordLet)) {
             return parse_let_stmt();
         }
@@ -98,6 +101,80 @@ class Parser {
             .params = std::move(params),
             .return_type = std::move(*return_type),
             .source_path = std::move(source_path),
+        };
+    }
+
+    auto parse_fn_decl() -> std::optional<Stmt> {
+        auto name = consume_identifier("expected function name");
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::LParen, "expected '(' after function name")) {
+            return std::nullopt;
+        }
+        std::vector<Param> params;
+        if (!check(TokenKind::RParen)) {
+            do {
+                auto param_name = consume_identifier("expected parameter name");
+                if (!param_name.has_value()) {
+                    return std::nullopt;
+                }
+                if (!consume(TokenKind::Colon, "expected ':' after parameter name")) {
+                    return std::nullopt;
+                }
+                auto param_type = parse_type();
+                if (!param_type.has_value()) {
+                    return std::nullopt;
+                }
+                params.push_back(
+                    Param{.name = std::move(*param_name), .type = std::move(*param_type)});
+            } while (match(TokenKind::Comma));
+        }
+        if (!consume(TokenKind::RParen, "expected ')' after parameter list")) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::Arrow, "expected '->' after parameter list")) {
+            return std::nullopt;
+        }
+        auto return_type = parse_type();
+        if (!return_type.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::LBrace, "expected '{' to start function body")) {
+            return std::nullopt;
+        }
+        std::vector<FnStmt> body;
+        while (!check(TokenKind::RBrace) && !is_at_end()) {
+            if (match(TokenKind::KeywordExtern)) {
+                error_ = make_error(previous(), "extern not allowed inside function body");
+                return std::nullopt;
+            }
+            if (match(TokenKind::KeywordFn)) {
+                error_ = make_error(previous(), "nested function not supported");
+                return std::nullopt;
+            }
+            if (match(TokenKind::KeywordLet)) {
+                auto stmt = parse_let_stmt();
+                if (!stmt.has_value()) {
+                    return std::nullopt;
+                }
+                body.push_back(std::get<LetStmt>(std::move(*stmt)));
+            } else {
+                auto stmt = parse_expr_stmt();
+                if (!stmt.has_value()) {
+                    return std::nullopt;
+                }
+                body.push_back(std::get<ExprStmt>(std::move(*stmt)));
+            }
+        }
+        if (!consume(TokenKind::RBrace, "expected '}' after function body")) {
+            return std::nullopt;
+        }
+        return FunctionDecl{
+            .name = std::move(*name),
+            .params = std::move(params),
+            .return_type = std::move(*return_type),
+            .body = std::move(body),
         };
     }
 
@@ -500,6 +577,20 @@ class Parser {
         if (auto scalar = parse_scalar_type()) {
             return Type{.kind = Type::Kind::Scalar, .arg = *scalar};
         }
+        if (match(TokenKind::KeywordColumn)) {
+            if (!consume(TokenKind::Lt, "expected '<' after 'Column'")) {
+                return std::nullopt;
+            }
+            auto arg = parse_scalar_type();
+            if (!arg.has_value()) {
+                error_ = make_error(peek(), "expected scalar type in Column<T>");
+                return std::nullopt;
+            }
+            if (!consume(TokenKind::Gt, "expected '>' after Column type argument")) {
+                return std::nullopt;
+            }
+            return Type{.kind = Type::Kind::Series, .arg = *arg};
+        }
         if (match(TokenKind::KeywordSeries)) {
             if (!consume(TokenKind::Lt, "expected '<' after 'Series'")) {
                 return std::nullopt;
@@ -573,6 +664,9 @@ class Parser {
     }
 
     auto parse_scalar_type() -> std::optional<ScalarType> {
+        if (match(TokenKind::KeywordInt)) {
+            return ScalarType::Int64;
+        }
         if (match(TokenKind::KeywordInt32)) {
             return ScalarType::Int32;
         }

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <memory>
+#include <functional>
 #include <unordered_map>
 
 namespace ibex::parser {
@@ -102,11 +103,10 @@ class Lowerer {
         }
 
         if (state.by && state.select) {
-            auto aggregate = lower_aggregate(*state.by, *state.select);
+            auto aggregate = lower_aggregate(*state.by, *state.select, std::move(node));
             if (!aggregate.has_value()) {
                 return std::unexpected(aggregate.error());
             }
-            aggregate.value()->add_child(std::move(node));
             node = std::move(aggregate.value());
         } else if (state.select) {
             auto project = lower_project(*state.select);
@@ -304,54 +304,192 @@ class Lowerer {
         return std::unexpected(LowerError{.message = "unsupported expression"});
     }
 
-    auto lower_aggregate(const ByClause& by, const SelectClause& select)
+    auto lower_aggregate(const ByClause& by, const SelectClause& select, ir::NodePtr child)
         -> std::expected<ir::NodePtr, LowerError> {
         auto group_by = lower_group_by(by);
         if (!group_by.has_value()) {
             return std::unexpected(group_by.error());
         }
+
+        std::unordered_map<std::string, bool> group_keys;
+        for (const auto& key : group_by.value()) {
+            group_keys.emplace(key.name, true);
+        }
+
         std::vector<ir::AggSpec> aggs;
-        for (const auto& field : select.fields) {
-            if (field.expr == nullptr) {
-                continue;
+        std::vector<ir::FieldSpec> updates;
+        std::vector<std::string> final_columns;
+        std::unordered_map<std::string, bool> temp_columns;
+        std::size_t temp_counter = 0;
+
+        auto make_temp = [&]() -> std::string {
+            return "_agg" + std::to_string(temp_counter++);
+        };
+
+        std::function<std::expected<ir::Expr, LowerError>(const Expr&)> lower_agg_expr;
+        lower_agg_expr = [&](const Expr& expr) -> std::expected<ir::Expr, LowerError> {
+            if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+                if (group_keys.contains(ident->name)) {
+                    return ir::Expr{.node = ir::ColumnRef{.name = ident->name}};
+                }
+                return std::unexpected(LowerError{
+                    .message = "non-aggregate column in aggregate expression: " + ident->name,
+                });
             }
-            const auto* call = std::get_if<CallExpr>(&field.expr->node);
-            if (call == nullptr) {
-                return std::unexpected(
-                    LowerError{.message = "aggregate field must be a function call"});
+            if (const auto* literal = std::get_if<LiteralExpr>(&expr.node)) {
+                if (const auto* int_value = std::get_if<std::int64_t>(&literal->value)) {
+                    return ir::Expr{.node = ir::Literal{.value = *int_value}};
+                }
+                if (const auto* double_value = std::get_if<double>(&literal->value)) {
+                    return ir::Expr{.node = ir::Literal{.value = *double_value}};
+                }
+                if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
+                    return ir::Expr{.node = ir::Literal{.value = *str_value}};
+                }
+                return std::unexpected(LowerError{.message = "unsupported literal in expression"});
             }
-            auto func = parse_agg_func(call->callee);
-            if (!func.has_value()) {
-                return std::unexpected(
-                    LowerError{.message = "unknown aggregate function: " + call->callee});
-            }
-            if (call->callee == "count") {
-                if (!call->args.empty()) {
-                    return std::unexpected(LowerError{.message = "count() takes no arguments"});
+            if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+                auto func = parse_agg_func(call->callee);
+                if (!func.has_value()) {
+                    return std::unexpected(
+                        LowerError{.message = "unknown aggregate function: " + call->callee});
+                }
+                std::string alias = make_temp();
+                if (call->callee == "count") {
+                    if (!call->args.empty()) {
+                        return std::unexpected(LowerError{.message = "count() takes no arguments"});
+                    }
+                    aggs.push_back(ir::AggSpec{
+                        .func = func.value(),
+                        .column = ir::ColumnRef{.name = ""},
+                        .alias = alias,
+                    });
+                    temp_columns[alias] = true;
+                    return ir::Expr{.node = ir::ColumnRef{.name = alias}};
+                }
+                if (call->args.size() != 1) {
+                    return std::unexpected(
+                        LowerError{.message = "aggregate functions take one argument"});
+                }
+                const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                if (ident == nullptr) {
+                    return std::unexpected(
+                        LowerError{.message = "aggregate argument must be a column"});
                 }
                 aggs.push_back(ir::AggSpec{
                     .func = func.value(),
-                    .column = ir::ColumnRef{.name = ""},
-                    .alias = field.name,
+                    .column = ir::ColumnRef{.name = ident->name},
+                    .alias = alias,
                 });
+                temp_columns[alias] = true;
+                return ir::Expr{.node = ir::ColumnRef{.name = alias}};
+            }
+            if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+                auto left = lower_agg_expr(*binary->left);
+                if (!left.has_value()) {
+                    return std::unexpected(left.error());
+                }
+                auto right = lower_agg_expr(*binary->right);
+                if (!right.has_value()) {
+                    return std::unexpected(right.error());
+                }
+                auto op = to_arithmetic_op(binary->op);
+                if (!op.has_value()) {
+                    return std::unexpected(
+                        LowerError{.message = "unsupported binary operator in expression"});
+                }
+                ir::BinaryExpr bin{
+                    .op = op.value(),
+                    .left = std::make_shared<ir::Expr>(std::move(left.value())),
+                    .right = std::make_shared<ir::Expr>(std::move(right.value())),
+                };
+                return ir::Expr{.node = std::move(bin)};
+            }
+            if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+                return lower_agg_expr(*group->expr);
+            }
+            return std::unexpected(LowerError{.message = "unsupported aggregate expression"});
+        };
+
+        for (const auto& field : select.fields) {
+            if (field.expr == nullptr) {
+                if (!group_keys.contains(field.name)) {
+                    return std::unexpected(LowerError{
+                        .message = "non-aggregate column in aggregate select: " + field.name,
+                    });
+                }
+                final_columns.push_back(field.name);
                 continue;
             }
-            if (call->args.size() != 1) {
-                return std::unexpected(
-                    LowerError{.message = "aggregate functions take one argument"});
+
+            if (const auto* call = std::get_if<CallExpr>(&field.expr->node)) {
+                auto func = parse_agg_func(call->callee);
+                if (func.has_value()) {
+                    if (call->callee == "count") {
+                        if (!call->args.empty()) {
+                            return std::unexpected(LowerError{.message = "count() takes no arguments"});
+                        }
+                        aggs.push_back(ir::AggSpec{
+                            .func = func.value(),
+                            .column = ir::ColumnRef{.name = ""},
+                            .alias = field.name,
+                        });
+                        final_columns.push_back(field.name);
+                        continue;
+                    }
+                    if (call->args.size() != 1) {
+                        return std::unexpected(
+                            LowerError{.message = "aggregate functions take one argument"});
+                    }
+                    const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                    if (ident == nullptr) {
+                        return std::unexpected(
+                            LowerError{.message = "aggregate argument must be a column"});
+                    }
+                    aggs.push_back(ir::AggSpec{
+                        .func = func.value(),
+                        .column = ir::ColumnRef{.name = ident->name},
+                        .alias = field.name,
+                    });
+                    final_columns.push_back(field.name);
+                    continue;
+                }
             }
-            const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
-            if (ident == nullptr) {
-                return std::unexpected(
-                    LowerError{.message = "aggregate argument must be a column"});
+
+            auto expr_ir = lower_agg_expr(*field.expr);
+            if (!expr_ir.has_value()) {
+                return std::unexpected(expr_ir.error());
             }
-            aggs.push_back(ir::AggSpec{
-                .func = func.value(),
-                .column = ir::ColumnRef{.name = ident->name},
+            updates.push_back(ir::FieldSpec{
                 .alias = field.name,
+                .expr = std::move(expr_ir.value()),
             });
+            final_columns.push_back(field.name);
         }
-        return builder_.aggregate(std::move(group_by.value()), std::move(aggs));
+
+        auto aggregate = builder_.aggregate(std::move(group_by.value()), std::move(aggs));
+        aggregate->add_child(std::move(child));
+
+        ir::NodePtr node = std::move(aggregate);
+        if (!updates.empty()) {
+            auto update = builder_.update(std::move(updates));
+            update->add_child(std::move(node));
+            node = std::move(update);
+        }
+
+        bool needs_project = !updates.empty();
+        if (needs_project) {
+            std::vector<ir::ColumnRef> columns;
+            columns.reserve(final_columns.size());
+            for (const auto& name : final_columns) {
+                columns.push_back(ir::ColumnRef{.name = name});
+            }
+            auto project = builder_.project(std::move(columns));
+            project->add_child(std::move(node));
+            node = std::move(project);
+        }
+
+        return node;
     }
 
     static auto lower_group_by(const ByClause& by)

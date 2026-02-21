@@ -22,6 +22,7 @@ struct Table {
     std::unordered_map<std::string, std::size_t> index;
 
     void add_column(std::string name, ColumnValue column);
+    [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;
     [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;
     [[nodiscard]] auto rows() const noexcept -> std::size_t;
 };

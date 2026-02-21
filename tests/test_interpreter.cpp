@@ -3,6 +3,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 namespace {
 
@@ -89,4 +90,100 @@ TEST_CASE("Interpret update with arithmetic") {
     REQUIRE((*price_ints)[0] == 2);
     REQUIRE((*price_ints)[1] == 3);
     REQUIRE((*price_ints)[2] == 4);
+}
+
+TEST_CASE("Interpret grouped aggregation") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30, 25});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "C"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { symbol, total = sum(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbol_col = result->find("symbol");
+    const auto* total_col = result->find("total");
+    REQUIRE(symbol_col != nullptr);
+    REQUIRE(total_col != nullptr);
+
+    const auto* symbols = std::get_if<Column<std::string>>(symbol_col);
+    const auto* totals = std::get_if<Column<std::int64_t>>(total_col);
+    REQUIRE(symbols != nullptr);
+    REQUIRE(totals != nullptr);
+    REQUIRE(symbols->size() == 3);
+    REQUIRE((*symbols)[0] == "A");
+    REQUIRE((*totals)[0] == 40);
+    REQUIRE((*symbols)[1] == "B");
+    REQUIRE((*totals)[1] == 20);
+    REQUIRE((*symbols)[2] == "C");
+    REQUIRE((*totals)[2] == 25);
+}
+
+TEST_CASE("Interpret aggregate arithmetic") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30, 25});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "C"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { symbol, avg = sum(price) / count() }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbol_col = result->find("symbol");
+    const auto* avg_col = result->find("avg");
+    REQUIRE(symbol_col != nullptr);
+    REQUIRE(avg_col != nullptr);
+
+    const auto* symbols = std::get_if<Column<std::string>>(symbol_col);
+    const auto* avgs = std::get_if<Column<double>>(avg_col);
+    REQUIRE(symbols != nullptr);
+    REQUIRE(avgs != nullptr);
+    REQUIRE(symbols->size() == 3);
+    REQUIRE((*symbols)[0] == "A");
+    REQUIRE((*avgs)[0] == Catch::Approx(20.0));
+    REQUIRE((*symbols)[1] == "B");
+    REQUIRE((*avgs)[1] == Catch::Approx(20.0));
+    REQUIRE((*symbols)[2] == "C");
+    REQUIRE((*avgs)[2] == Catch::Approx(25.0));
+}
+
+TEST_CASE("Interpret first and last aggregation") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30, 25});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir(
+        "trades[select { symbol, first_price = first(price), last_price = last(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbol_col = result->find("symbol");
+    const auto* first_col = result->find("first_price");
+    const auto* last_col = result->find("last_price");
+    REQUIRE(symbol_col != nullptr);
+    REQUIRE(first_col != nullptr);
+    REQUIRE(last_col != nullptr);
+
+    const auto* symbols = std::get_if<Column<std::string>>(symbol_col);
+    const auto* firsts = std::get_if<Column<std::int64_t>>(first_col);
+    const auto* lasts = std::get_if<Column<std::int64_t>>(last_col);
+    REQUIRE(symbols != nullptr);
+    REQUIRE(firsts != nullptr);
+    REQUIRE(lasts != nullptr);
+
+    REQUIRE(symbols->size() == 2);
+    REQUIRE((*symbols)[0] == "A");
+    REQUIRE((*firsts)[0] == 10);
+    REQUIRE((*lasts)[0] == 25);
+    REQUIRE((*symbols)[1] == "B");
+    REQUIRE((*firsts)[1] == 20);
+    REQUIRE((*lasts)[1] == 20);
 }

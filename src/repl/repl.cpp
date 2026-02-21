@@ -1,8 +1,7 @@
-#include <ibex/repl/repl.hpp>
-
 #include <ibex/core/column.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/repl/repl.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <fmt/core.h>
@@ -11,6 +10,7 @@
 #include <algorithm>
 #include <iostream>
 #include <string>
+#include <vector>
 
 namespace ibex::repl {
 
@@ -42,11 +42,7 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
         fmt::print("  ");
         for (std::size_t col = 0; col < table.columns.size(); ++col) {
             const auto& entry = table.columns[col];
-            std::visit(
-                [&](const auto& column) {
-                    fmt::print("{}", column[row]);
-                },
-                entry.column);
+            std::visit([&](const auto& column) { fmt::print("{}", column[row]); }, entry.column);
             if (col + 1 < table.columns.size()) {
                 fmt::print("\t");
             }
@@ -56,6 +52,24 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
     if (table.rows() > rows) {
         fmt::print("  ... ({} more rows)\n", table.rows() - rows);
     }
+}
+
+void print_tables(const runtime::TableRegistry& tables) {
+    if (tables.empty()) {
+        fmt::print("tables: <none>\n");
+        return;
+    }
+    std::vector<std::string> names;
+    names.reserve(tables.size());
+    for (const auto& entry : tables) {
+        names.push_back(entry.first);
+    }
+    std::ranges::sort(names);
+    fmt::print("tables:");
+    for (const auto& name : names) {
+        fmt::print(" {}", name);
+    }
+    fmt::print("\n");
 }
 
 }  // namespace
@@ -86,8 +100,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             continue;
         }
 
-        if (line == "quit" || line == "exit") {
+        if (line == ":q" || line == ":quit" || line == ":exit") {
             break;
+        }
+        if (line == ":tables") {
+            print_tables(tables);
+            continue;
         }
 
         auto normalized = normalize_input(line);

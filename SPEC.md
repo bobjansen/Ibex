@@ -576,7 +576,7 @@ Join expressions are **syntactic sugar** for the built-in join functions:
 - `A asof join B on { time }` → `asof_join(A, B, time, tolerance = 0s)`
 - `A asof join B on { time, k1, k2 }` → `asof_join(A, B, time, k1, k2, tolerance = 0s)`
 
-For non-zero as-of tolerances, use the function forms directly (Section 10.3).
+For non-zero as-of tolerances, use the function forms directly (Section 10.4).
 
 ---
 
@@ -965,7 +965,16 @@ as_timeframe(df: DataFrame<S>, index_col: Ident) -> TimeFrame<S>
 
 `index_col` is an unqualified identifier naming a `Timestamp` column in `S`.
 
-### 10.3 Join Functions
+### 10.3 Scalar Extraction
+
+```
+scalar(df: DataFrame<S>, col: Ident) -> T
+```
+
+Extracts a single scalar from a one-row DataFrame. `col` names a column in `S`.
+It is a runtime error if the DataFrame has any row count other than 1.
+
+### 10.4 Join Functions
 
 ```
 inner_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFrame<A ∪ B>
@@ -983,7 +992,7 @@ TimeFrames must share the same time index column. Additional key arguments
 apply equality matching in addition to the time-based match. Join expressions
 (Section 5.5) always pass a tolerance of `0s`.
 
-### 10.4 Ordering
+### 10.5 Ordering
 
 ```
 sort(df: DataFrame<S>, col: Ident) -> DataFrame<S>
@@ -992,7 +1001,7 @@ sort(df: DataFrame<S>, col: Ident) -> DataFrame<S>
 Returns a new DataFrame sorted by the named column in ascending order. Sorting
 a `TimeFrame` by its index column is a no-op (already sorted).
 
-### 10.5 Display
+### 10.6 Display
 
 ```
 print(value: Any) -> ()
@@ -1001,7 +1010,7 @@ print(value: Any) -> ()
 Outputs a human-readable representation of the value. In REPL mode, expression
 statements are implicitly printed without requiring `print`.
 
-### 10.6 Scalar Functions
+### 10.7 Scalar Functions
 
 | Function        | Signature                          |
 |-----------------|------------------------------------|

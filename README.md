@@ -68,6 +68,16 @@ ctest --test-dir build --output-on-failure
 ./build/tools/ibex --verbose
 ```
 
+### REPL Commands
+
+```
+:tables                  List available tables
+:scalars                 List scalar bindings and values
+:schema <table>          Show column names and types
+:head <table> [n]        Show first n rows (default 10)
+:describe <table> [n]    Schema + first n rows
+```
+
 ## Roadmap
 
 - [ ] Lexer implementation (tokenize Ibex source)

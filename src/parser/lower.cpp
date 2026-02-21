@@ -1,10 +1,11 @@
 #include <ibex/ir/builder.hpp>
 #include <ibex/parser/lower.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
-#include <memory>
 #include <functional>
+#include <memory>
 #include <unordered_map>
 
 namespace ibex::parser {
@@ -102,8 +103,8 @@ class Lowerer {
             node = std::move(filter_node);
         }
 
-        if (state.by && state.select) {
-            auto aggregate = lower_aggregate(*state.by, *state.select, std::move(node));
+        if (state.select && (state.by || select_has_aggregate(*state.select))) {
+            auto aggregate = lower_aggregate(state.by, *state.select, std::move(node));
             if (!aggregate.has_value()) {
                 return std::unexpected(aggregate.error());
             }
@@ -304,15 +305,19 @@ class Lowerer {
         return std::unexpected(LowerError{.message = "unsupported expression"});
     }
 
-    auto lower_aggregate(const ByClause& by, const SelectClause& select, ir::NodePtr child)
+    auto lower_aggregate(const ByClause* by, const SelectClause& select, ir::NodePtr child)
         -> std::expected<ir::NodePtr, LowerError> {
-        auto group_by = lower_group_by(by);
-        if (!group_by.has_value()) {
-            return std::unexpected(group_by.error());
+        std::vector<ir::ColumnRef> group_by;
+        if (by != nullptr) {
+            auto group_by_result = lower_group_by(*by);
+            if (!group_by_result.has_value()) {
+                return std::unexpected(group_by_result.error());
+            }
+            group_by = std::move(group_by_result.value());
         }
 
         std::unordered_map<std::string, bool> group_keys;
-        for (const auto& key : group_by.value()) {
+        for (const auto& key : group_by) {
             group_keys.emplace(key.name, true);
         }
 
@@ -427,7 +432,8 @@ class Lowerer {
                 if (func.has_value()) {
                     if (call->callee == "count") {
                         if (!call->args.empty()) {
-                            return std::unexpected(LowerError{.message = "count() takes no arguments"});
+                            return std::unexpected(
+                                LowerError{.message = "count() takes no arguments"});
                         }
                         aggs.push_back(ir::AggSpec{
                             .func = func.value(),
@@ -467,7 +473,7 @@ class Lowerer {
             final_columns.push_back(field.name);
         }
 
-        auto aggregate = builder_.aggregate(std::move(group_by.value()), std::move(aggs));
+        auto aggregate = builder_.aggregate(std::move(group_by), std::move(aggs));
         aggregate->add_child(std::move(child));
 
         ir::NodePtr node = std::move(aggregate);
@@ -490,6 +496,31 @@ class Lowerer {
         }
 
         return node;
+    }
+
+    static auto select_has_aggregate(const SelectClause& select) -> bool {
+        std::function<bool(const Expr&)> has_agg;
+        has_agg = [&](const Expr& expr) -> bool {
+            if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+                if (parse_agg_func(call->callee).has_value()) {
+                    return true;
+                }
+                return std::ranges::any_of(call->args, [&](const auto& arg) {
+                    return has_agg(*arg);
+                });
+            }
+            if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+                return has_agg(*binary->left) || has_agg(*binary->right);
+            }
+            if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+                return has_agg(*group->expr);
+            }
+            return false;
+        };
+
+        return std::ranges::any_of(select.fields, [&](const auto& field) {
+            return field.expr != nullptr && has_agg(*field.expr);
+        });
     }
 
     static auto lower_group_by(const ByClause& by)

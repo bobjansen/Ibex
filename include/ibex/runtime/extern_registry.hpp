@@ -1,7 +1,6 @@
 #pragma once
 
 #include <any>
-#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -14,7 +13,7 @@ namespace ibex::runtime {
 /// Stores C++ callables for interop with Ibex queries.
 /// Functions are registered by name and can be looked up at runtime.
 class ExternRegistry {
-public:
+   public:
     /// Callable signature: type-erased via std::any.
     /// In practice, callers must know the expected signature.
     using ErasedFunc = std::any;
@@ -54,7 +53,7 @@ public:
     /// Number of registered functions.
     [[nodiscard]] auto size() const noexcept -> std::size_t { return registry_.size(); }
 
-private:
+   private:
     std::unordered_map<std::string, ErasedFunc> registry_;
 };
 

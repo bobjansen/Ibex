@@ -11,6 +11,7 @@
 namespace ibex::runtime {
 
 using ColumnValue = std::variant<Column<std::int64_t>, Column<double>, Column<std::string>>;
+using ScalarValue = std::variant<std::int64_t, double, std::string>;
 
 struct ColumnEntry {
     std::string name;
@@ -28,9 +29,14 @@ struct Table {
 };
 
 using TableRegistry = std::unordered_map<std::string, Table>;
+using ScalarRegistry = std::unordered_map<std::string, ScalarValue>;
 
 /// Interpret an IR node tree against a table registry.
-[[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry)
+[[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,
+                             const ScalarRegistry* scalars = nullptr)
     -> std::expected<Table, std::string>;
+
+[[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)
+    -> std::expected<ScalarValue, std::string>;
 
 }  // namespace ibex::runtime

@@ -516,11 +516,22 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     return output;
 }
 
-auto infer_expr_type(const ir::Expr& expr, const Table& input)
+auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
     -> std::expected<ExprType, std::string> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
         const auto* source = input.find(col->name);
         if (source == nullptr) {
+            if (scalars != nullptr) {
+                if (auto it = scalars->find(col->name); it != scalars->end()) {
+                    if (std::holds_alternative<std::int64_t>(it->second)) {
+                        return ExprType::Int;
+                    }
+                    if (std::holds_alternative<double>(it->second)) {
+                        return ExprType::Double;
+                    }
+                    return ExprType::String;
+                }
+            }
             return std::unexpected("unknown column in expression: " + col->name);
         }
         return expr_type_for_column(*source);
@@ -535,11 +546,11 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input)
         return ExprType::String;
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
-        auto left = infer_expr_type(*bin->left, input);
+        auto left = infer_expr_type(*bin->left, input, scalars);
         if (!left) {
             return left;
         }
-        auto right = infer_expr_type(*bin->right, input);
+        auto right = infer_expr_type(*bin->right, input, scalars);
         if (!right) {
             return right;
         }
@@ -559,11 +570,16 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input)
 
 using ExprValue = std::variant<std::int64_t, double, std::string>;
 
-auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row)
-    -> std::expected<ExprValue, std::string> {
+auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
+               const ScalarRegistry* scalars) -> std::expected<ExprValue, std::string> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
         const auto* source = input.find(col->name);
         if (source == nullptr) {
+            if (scalars != nullptr) {
+                if (auto it = scalars->find(col->name); it != scalars->end()) {
+                    return it->second;
+                }
+            }
             return std::unexpected("unknown column in expression: " + col->name);
         }
         return std::visit([&](const auto& column) -> ExprValue { return column[row]; }, *source);
@@ -572,11 +588,11 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row)
         return lit->value;
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
-        auto left = eval_expr(*bin->left, input, row);
+        auto left = eval_expr(*bin->left, input, row, scalars);
         if (!left) {
             return left;
         }
-        auto right = eval_expr(*bin->right, input, row);
+        auto right = eval_expr(*bin->right, input, row, scalars);
         if (!right) {
             return right;
         }
@@ -628,12 +644,12 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row)
     return std::unexpected("unsupported expression");
 }
 
-auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields)
-    -> std::expected<Table, std::string> {
+auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields,
+                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     Table output = input;
     std::size_t rows = input.rows();
     for (const auto& field : fields) {
-        auto inferred = infer_expr_type(field.expr, input);
+        auto inferred = infer_expr_type(field.expr, input, scalars);
         if (!inferred) {
             return std::unexpected(inferred.error());
         }
@@ -650,7 +666,7 @@ auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields)
                 break;
         }
         for (std::size_t row = 0; row < rows; ++row) {
-            auto value = eval_expr(field.expr, input, row);
+            auto value = eval_expr(field.expr, input, row, scalars);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -690,7 +706,7 @@ auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields)
 }
 
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
-auto interpret_node(const ir::Node& node, const TableRegistry& registry)
+auto interpret_node(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
@@ -706,7 +722,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry)
             if (filter.children().empty()) {
                 return std::unexpected("filter node missing child");
             }
-            auto child = interpret_node(*filter.children().front(), registry);
+            auto child = interpret_node(*filter.children().front(), registry, scalars);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -717,7 +733,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry)
             if (project.children().empty()) {
                 return std::unexpected("project node missing child");
             }
-            auto child = interpret_node(*project.children().front(), registry);
+            auto child = interpret_node(*project.children().front(), registry, scalars);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -731,18 +747,18 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry)
             if (!update.group_by().empty()) {
                 return std::unexpected("grouped update not supported in interpreter");
             }
-            auto child = interpret_node(*update.children().front(), registry);
+            auto child = interpret_node(*update.children().front(), registry, scalars);
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return update_table(child.value(), update.fields());
+            return update_table(child.value(), update.fields(), scalars);
         }
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);
             if (agg.children().empty()) {
                 return std::unexpected("aggregate node missing child");
             }
-            auto child = interpret_node(*agg.children().front(), registry);
+            auto child = interpret_node(*agg.children().front(), registry, scalars);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -788,9 +804,21 @@ auto Table::rows() const noexcept -> std::size_t {
     return column_size(columns.front().column);
 }
 
-auto interpret(const ir::Node& node, const TableRegistry& registry)
+auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
-    return interpret_node(node, registry);
+    return interpret_node(node, registry, scalars);
+}
+
+auto extract_scalar(const Table& table, const std::string& column)
+    -> std::expected<ScalarValue, std::string> {
+    if (table.rows() != 1) {
+        return std::unexpected("scalar() requires exactly one row");
+    }
+    const auto* col = table.find(column);
+    if (col == nullptr) {
+        return std::unexpected("column not found: " + column);
+    }
+    return scalar_from_column(*col, 0);
 }
 
 }  // namespace ibex::runtime

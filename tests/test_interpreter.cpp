@@ -187,3 +187,44 @@ TEST_CASE("Interpret first and last aggregation") {
     REQUIRE((*firsts)[1] == 20);
     REQUIRE((*lasts)[1] == 20);
 }
+
+TEST_CASE("Extract scalar from single-row table") {
+    runtime::Table table;
+    table.add_column("total", Column<std::int64_t>{42});
+
+    auto result = runtime::extract_scalar(table, "total");
+    REQUIRE(result.has_value());
+    REQUIRE(std::get<std::int64_t>(result.value()) == 42);
+}
+
+TEST_CASE("Extract scalar errors on multi-row table") {
+    runtime::Table table;
+    table.add_column("total", Column<std::int64_t>{1, 2});
+
+    auto result = runtime::extract_scalar(table, "total");
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Interpret update with scalar reference") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("offset", std::int64_t{10});
+
+    auto ir = require_ir("trades[update { price = price + offset }];");
+    auto result = runtime::interpret(*ir, registry, &scalars);
+    REQUIRE(result.has_value());
+
+    const auto* price_col = result->find("price");
+    REQUIRE(price_col != nullptr);
+    const auto* price_ints = std::get_if<Column<std::int64_t>>(price_col);
+    REQUIRE(price_ints != nullptr);
+    REQUIRE(price_ints->size() == 3);
+    REQUIRE((*price_ints)[0] == 11);
+    REQUIRE((*price_ints)[1] == 12);
+    REQUIRE((*price_ints)[2] == 13);
+}

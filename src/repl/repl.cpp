@@ -73,6 +73,26 @@ void print_tables(const runtime::TableRegistry& tables) {
     fmt::print("\n");
 }
 
+void print_scalars(const runtime::ScalarRegistry& scalars) {
+    if (scalars.empty()) {
+        fmt::print("scalars: <none>\n");
+        return;
+    }
+    std::vector<std::string> names;
+    names.reserve(scalars.size());
+    for (const auto& entry : scalars) {
+        names.push_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    fmt::print("scalars:\n");
+    for (const auto& name : names) {
+        fmt::print("  {} = ", name);
+        const auto& value = scalars.at(name);
+        std::visit([](const auto& v) { fmt::print("{}", v); }, value);
+        fmt::print("\n");
+    }
+}
+
 std::string column_type_name(const runtime::ColumnValue& column) {
     if (std::holds_alternative<Column<std::int64_t>>(column)) {
         return "Int64";
@@ -146,6 +166,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
     spdlog::info("Ibex REPL started (verbose={})", config.verbose);
 
     auto tables = build_builtin_tables();
+    runtime::ScalarRegistry scalars;
 
     std::string line;
     while (true) {
@@ -164,6 +185,10 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
         }
         if (line == ":tables") {
             print_tables(tables);
+            continue;
+        }
+        if (line == ":scalars") {
+            print_scalars(scalars);
             continue;
         }
         if (line.starts_with(":schema")) {
@@ -240,36 +265,129 @@ void run(const ReplConfig& config, runtime::ExternRegistry& /*registry*/) {
             }
             if (std::holds_alternative<parser::LetStmt>(stmt)) {
                 const auto& let_stmt = std::get<parser::LetStmt>(stmt);
-                auto lowered = parser::lower_expr(*let_stmt.value, context);
-                if (!lowered) {
-                    fmt::print("error: {}\n", lowered.error().message);
-                    had_error = true;
-                    break;
+                if (const auto* call = std::get_if<parser::CallExpr>(&let_stmt.value->node);
+                    call != nullptr && call->callee == "scalar") {
+                    if (call->args.size() != 2) {
+                        fmt::print("error: scalar() expects (table, column)\n");
+                        had_error = true;
+                        break;
+                    }
+                    const auto* col_ident =
+                        std::get_if<parser::IdentifierExpr>(&call->args[1]->node);
+                    const auto* col_lit = std::get_if<parser::LiteralExpr>(&call->args[1]->node);
+                    std::string column_name;
+                    if (col_ident != nullptr) {
+                        column_name = col_ident->name;
+                    } else if (col_lit != nullptr &&
+                               std::holds_alternative<std::string>(col_lit->value)) {
+                        column_name = std::get<std::string>(col_lit->value);
+                    } else {
+                        fmt::print("error: scalar() column must be identifier or string\n");
+                        had_error = true;
+                        break;
+                    }
+                    auto lowered = parser::lower_expr(*call->args[0], context);
+                    if (!lowered) {
+                        fmt::print("error: {}\n", lowered.error().message);
+                        had_error = true;
+                        break;
+                    }
+                    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
+                    if (!evaluated) {
+                        fmt::print("error: {}\n", evaluated.error());
+                        had_error = true;
+                        break;
+                    }
+                    auto scalar = runtime::extract_scalar(evaluated.value(), column_name);
+                    if (!scalar) {
+                        fmt::print("error: {}\n", scalar.error());
+                        had_error = true;
+                        break;
+                    }
+                    scalars.insert_or_assign(let_stmt.name, std::move(scalar.value()));
+                } else {
+                    auto lowered = parser::lower_expr(*let_stmt.value, context);
+                    if (!lowered) {
+                        fmt::print("error: {}\n", lowered.error().message);
+                        had_error = true;
+                        break;
+                    }
+                    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
+                    if (!evaluated) {
+                        fmt::print("error: {}\n", evaluated.error());
+                        had_error = true;
+                        break;
+                    }
+                    tables.insert_or_assign(let_stmt.name, std::move(evaluated.value()));
                 }
-                auto evaluated = runtime::interpret(*lowered.value(), tables);
-                if (!evaluated) {
-                    fmt::print("error: {}\n", evaluated.error());
-                    had_error = true;
-                    break;
-                }
-                tables.insert_or_assign(let_stmt.name, std::move(evaluated.value()));
                 continue;
             }
             if (std::holds_alternative<parser::ExprStmt>(stmt)) {
                 const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-                auto lowered = parser::lower_expr(*expr_stmt.expr, context);
-                if (!lowered) {
-                    fmt::print("error: {}\n", lowered.error().message);
-                    had_error = true;
-                    break;
+                if (const auto* call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+                    call != nullptr && call->callee == "scalar") {
+                    if (call->args.size() != 2) {
+                        fmt::print("error: scalar() expects (table, column)\n");
+                        had_error = true;
+                        break;
+                    }
+                    const auto* col_ident =
+                        std::get_if<parser::IdentifierExpr>(&call->args[1]->node);
+                    const auto* col_lit = std::get_if<parser::LiteralExpr>(&call->args[1]->node);
+                    std::string column_name;
+                    if (col_ident != nullptr) {
+                        column_name = col_ident->name;
+                    } else if (col_lit != nullptr &&
+                               std::holds_alternative<std::string>(col_lit->value)) {
+                        column_name = std::get<std::string>(col_lit->value);
+                    } else {
+                        fmt::print("error: scalar() column must be identifier or string\n");
+                        had_error = true;
+                        break;
+                    }
+                    auto lowered = parser::lower_expr(*call->args[0], context);
+                    if (!lowered) {
+                        fmt::print("error: {}\n", lowered.error().message);
+                        had_error = true;
+                        break;
+                    }
+                    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
+                    if (!evaluated) {
+                        fmt::print("error: {}\n", evaluated.error());
+                        had_error = true;
+                        break;
+                    }
+                    auto scalar = runtime::extract_scalar(evaluated.value(), column_name);
+                    if (!scalar) {
+                        fmt::print("error: {}\n", scalar.error());
+                        had_error = true;
+                        break;
+                    }
+                    std::visit([](const auto& value) { fmt::print("{}\n", value); },
+                               scalar.value());
+                } else {
+                    if (const auto* ident =
+                            std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
+                        if (auto it = scalars.find(ident->name); it != scalars.end()) {
+                            std::visit([](const auto& value) { fmt::print("{}\n", value); },
+                                       it->second);
+                            continue;
+                        }
+                    }
+                    auto lowered = parser::lower_expr(*expr_stmt.expr, context);
+                    if (!lowered) {
+                        fmt::print("error: {}\n", lowered.error().message);
+                        had_error = true;
+                        break;
+                    }
+                    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars);
+                    if (!evaluated) {
+                        fmt::print("error: {}\n", evaluated.error());
+                        had_error = true;
+                        break;
+                    }
+                    print_table(evaluated.value());
                 }
-                auto evaluated = runtime::interpret(*lowered.value(), tables);
-                if (!evaluated) {
-                    fmt::print("error: {}\n", evaluated.error());
-                    had_error = true;
-                    break;
-                }
-                print_table(evaluated.value());
             }
         }
         if (had_error) {

@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <robin_hood.h>
 #include <unordered_map>
 #include <vector>
 
@@ -662,7 +663,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
             // Pass 1: Assign group IDs. One hash lookup per row, with a sorted-run shortcut
             // that skips the lookup whenever the current key equals the previous one.
-            std::unordered_map<std::string_view, std::uint32_t> key_to_id;
+            robin_hood::unordered_flat_map<std::string_view, std::uint32_t> key_to_id;
             key_to_id.reserve(64);
             std::vector<std::string_view> order;
             order.reserve(64);
@@ -936,7 +937,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
         if (std::holds_alternative<Column<std::int64_t>>(key_column)) {
             const auto& col = std::get<Column<std::int64_t>>(key_column);
-            std::unordered_map<std::int64_t, std::size_t> index;
+            robin_hood::unordered_flat_map<std::int64_t, std::size_t> index;
             index.reserve(rows);
             std::vector<std::int64_t> order;
             order.reserve(rows);
@@ -977,7 +978,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
         if (std::holds_alternative<Column<double>>(key_column)) {
             const auto& col = std::get<Column<double>>(key_column);
-            std::unordered_map<double, std::size_t> index;
+            robin_hood::unordered_flat_map<double, std::size_t> index;
             index.reserve(rows);
             std::vector<double> order;
             order.reserve(rows);

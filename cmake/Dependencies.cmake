@@ -31,6 +31,15 @@ set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(fmt spdlog CLI11)
 
+# robin-hood-hashing — fast open-addressing hash map (header-only)
+FetchContent_Declare(
+    robin_hood
+    GIT_REPOSITORY https://github.com/martinus/robin-hood-hashing.git
+    GIT_TAG        3.11.5
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(robin_hood)
+
 # Catch2 — testing framework (only when tests enabled)
 if(IBEX_BUILD_TESTS)
     FetchContent_Declare(

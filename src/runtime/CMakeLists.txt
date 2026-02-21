@@ -18,6 +18,7 @@ target_link_libraries(ibex_runtime
         Ibex::CompilerOptions
         fmt::fmt
         spdlog::spdlog
+        robin_hood::robin_hood
 )
 
 if(TARGET Ibex::Sanitizers)

@@ -76,6 +76,23 @@ TEST_CASE("Parse extern declaration with schema types") {
     REQUIRE(decl.source_path == "csv.hpp");
 }
 
+TEST_CASE("Parse extern declaration with inferred schema") {
+    const char* source = "extern fn read_csv(path: String) -> DataFrame from \"csv.hpp\";";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<ExternDecl>(stmt));
+    const auto& decl = std::get<ExternDecl>(stmt);
+    REQUIRE(decl.name == "read_csv");
+    REQUIRE(decl.return_type.kind == Type::Kind::DataFrame);
+    const auto& schema = std::get<SchemaType>(decl.return_type.arg);
+    REQUIRE(schema.fields.empty());
+    REQUIRE(decl.source_path == "csv.hpp");
+}
+
 TEST_CASE("Parse function declaration with typed params") {
     const char* source = "fn foo(col: Column<Int>, x: Int) -> Int { x; }";
 

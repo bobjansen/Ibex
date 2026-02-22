@@ -263,6 +263,11 @@ TimeFrame<S>      — a time-indexed relation with schema S
 one column of type `Timestamp` is designated as the time index, and rows are
 sorted by that index in ascending order.
 
+When a `DataFrame` or `TimeFrame` type omits its schema argument (e.g.
+`DataFrame`), the schema is inferred by the implementation (for example, from
+`read_csv`). This form is intended for external I/O and does not change the
+language’s static typing rules.
+
 ### 3.3 Schema Types
 
 A schema describes the typed column layout of a DataFrame or TimeFrame:
@@ -324,7 +329,7 @@ fn_stmt         = let_stmt
 
 type            = scalar_type
                 | "Column" "<" scalar_type ">"
-                | type_ctor "<" type_arg ">" ;
+                | type_ctor [ "<" type_arg ">" ] ;
 
 scalar_type     = "Int" | "Int32" | "Int64" | "Float32" | "Float64"
                 | "Bool"  | "String" | "Timestamp" ;

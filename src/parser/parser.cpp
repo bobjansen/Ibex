@@ -637,30 +637,30 @@ class Parser {
             return Type{.kind = Type::Kind::Series, .arg = *arg};
         }
         if (match(TokenKind::KeywordDataFrame)) {
-            if (!consume(TokenKind::Lt, "expected '<' after 'DataFrame'")) {
-                return std::nullopt;
+            if (match(TokenKind::Lt)) {
+                auto schema = parse_schema_type();
+                if (!schema.has_value()) {
+                    return std::nullopt;
+                }
+                if (!consume(TokenKind::Gt, "expected '>' after DataFrame type argument")) {
+                    return std::nullopt;
+                }
+                return Type{.kind = Type::Kind::DataFrame, .arg = std::move(*schema)};
             }
-            auto schema = parse_schema_type();
-            if (!schema.has_value()) {
-                return std::nullopt;
-            }
-            if (!consume(TokenKind::Gt, "expected '>' after DataFrame type argument")) {
-                return std::nullopt;
-            }
-            return Type{.kind = Type::Kind::DataFrame, .arg = std::move(*schema)};
+            return Type{.kind = Type::Kind::DataFrame, .arg = SchemaType{}};
         }
         if (match(TokenKind::KeywordTimeFrame)) {
-            if (!consume(TokenKind::Lt, "expected '<' after 'TimeFrame'")) {
-                return std::nullopt;
+            if (match(TokenKind::Lt)) {
+                auto schema = parse_schema_type();
+                if (!schema.has_value()) {
+                    return std::nullopt;
+                }
+                if (!consume(TokenKind::Gt, "expected '>' after TimeFrame type argument")) {
+                    return std::nullopt;
+                }
+                return Type{.kind = Type::Kind::TimeFrame, .arg = std::move(*schema)};
             }
-            auto schema = parse_schema_type();
-            if (!schema.has_value()) {
-                return std::nullopt;
-            }
-            if (!consume(TokenKind::Gt, "expected '>' after TimeFrame type argument")) {
-                return std::nullopt;
-            }
-            return Type{.kind = Type::Kind::TimeFrame, .arg = std::move(*schema)};
+            return Type{.kind = Type::Kind::TimeFrame, .arg = SchemaType{}};
         }
         error_ = make_error(peek(), "expected type");
         return std::nullopt;

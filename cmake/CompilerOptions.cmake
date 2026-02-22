@@ -21,6 +21,7 @@ target_compile_options(ibex_compiler_options
             -Wnull-dereference
             -Wformat=2
         >
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-deprecated-builtins>
 )
 
 if(IBEX_WARNINGS_AS_ERRORS)

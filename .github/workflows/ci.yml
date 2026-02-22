@@ -23,7 +23,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-18 cmake ninja-build
 
-      - name: Configure
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DIBEX_WARNINGS_AS_ERRORS=ON \
+            -DIBEX_ENABLE_SANITIZERS=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
+            -DIBEX_BUILD_TESTS=ON \
+            -DIBEX_BUILD_TOOLS=ON
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
         run: |
           cmake -B build \
             -G Ninja \

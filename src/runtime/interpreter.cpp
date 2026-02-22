@@ -55,6 +55,26 @@ auto format_columns(const Table& table) -> std::string {
     return out;
 }
 
+auto format_tables(const TableRegistry& registry) -> std::string {
+    if (registry.empty()) {
+        return "<none>";
+    }
+    std::vector<std::string_view> names;
+    names.reserve(registry.size());
+    for (const auto& entry : registry) {
+        names.emplace_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            out.append(", ");
+        }
+        out.append(names[i]);
+    }
+    return out;
+}
+
 auto column_size(const ColumnValue& column) -> std::size_t {
     return std::visit([](const auto& col) { return col.size(); }, column);
 }
@@ -1419,7 +1439,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             const auto& scan = static_cast<const ir::ScanNode&>(node);
             auto it = registry.find(scan.source_name());
             if (it == registry.end()) {
-                return std::unexpected("unknown table: " + scan.source_name());
+                return std::unexpected("unknown table: " + scan.source_name() +
+                                       " (available: " + format_tables(registry) + ")");
             }
             return it->second;
         }

@@ -22,6 +22,11 @@ namespace ibex::repl {
 
 namespace {
 
+using FunctionRegistry = std::unordered_map<std::string, parser::FunctionDecl>;
+using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
+using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
+using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
+
 auto build_builtin_tables() -> runtime::TableRegistry {
     runtime::TableRegistry registry;
     runtime::Table trades;
@@ -98,6 +103,71 @@ void print_scalars(const runtime::ScalarRegistry& scalars) {
     }
 }
 
+std::string format_scalar_names(const runtime::ScalarRegistry& scalars) {
+    if (scalars.empty()) {
+        return "<none>";
+    }
+    std::vector<std::string> names;
+    names.reserve(scalars.size());
+    for (const auto& entry : scalars) {
+        names.push_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            out.append(", ");
+        }
+        out.append(names[i]);
+    }
+    return out;
+}
+
+std::string format_table_names(const runtime::TableRegistry& tables) {
+    if (tables.empty()) {
+        return "<none>";
+    }
+    std::vector<std::string> names;
+    names.reserve(tables.size());
+    for (const auto& entry : tables) {
+        names.push_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            out.append(", ");
+        }
+        out.append(names[i]);
+    }
+    return out;
+}
+
+std::string format_function_names(const FunctionRegistry& functions,
+                                  const ExternDeclRegistry& extern_decls) {
+    std::vector<std::string> names;
+    names.reserve(functions.size() + extern_decls.size());
+    for (const auto& entry : functions) {
+        names.push_back(entry.first);
+    }
+    for (const auto& entry : extern_decls) {
+        names.push_back(entry.first);
+    }
+    if (names.empty()) {
+        return "<none>";
+    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            out.append(", ");
+        }
+        out.append(names[i]);
+    }
+    return out;
+}
+
 std::string column_type_name(const runtime::ColumnValue& column) {
     if (std::holds_alternative<Column<std::int64_t>>(column)) {
         return "Int64";
@@ -158,7 +228,6 @@ std::string parse_load_path(std::string_view text) {
     return std::string(view);
 }
 
-
 std::size_t parse_optional_size(std::string_view text, std::size_t default_value) {
     text = trim(text);
     if (text.empty()) {
@@ -171,11 +240,6 @@ std::size_t parse_optional_size(std::string_view text, std::size_t default_value
     }
     return value;
 }
-
-using FunctionRegistry = std::unordered_map<std::string, parser::FunctionDecl>;
-using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
-using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
-using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
 std::size_t temp_table_counter = 0;
 
@@ -439,7 +503,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return std::unexpected("extern function returned table: " + call->callee);
         }
-        return std::unexpected("unknown function: " + call->callee);
+        return std::unexpected("unknown function: " + call->callee + " (available: " +
+                               format_function_names(functions, extern_decls) + ")");
     }
     return std::unexpected("expected scalar expression");
 }
@@ -534,11 +599,14 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     }
     if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
         if (scalars.contains(ident->name)) {
-            return std::unexpected("expected table expression");
+            return std::unexpected("expected table expression (known scalars: " +
+                                   format_scalar_names(scalars) + ")");
         }
         if (columns.contains(ident->name)) {
-            return std::unexpected("expected table expression");
+            return std::unexpected("expected table expression (name refers to column)");
         }
+        return std::unexpected("unknown table: " + ident->name +
+                               " (available: " + format_table_names(tables) + ")");
     }
     parser::LowerContext context;
     auto lowered = parser::lower_expr(expr, context);
@@ -559,7 +627,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     -> std::expected<EvalValue, std::string> {
     auto it = functions.find(call.callee);
     if (it == functions.end()) {
-        return std::unexpected("unknown function: " + call.callee);
+        return std::unexpected("unknown function: " + call.callee + " (available: " +
+                               format_function_names(functions, extern_decls) + ")");
     }
     const auto& fn = it->second;
     if (call.args.size() != fn.params.size()) {

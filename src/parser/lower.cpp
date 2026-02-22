@@ -209,20 +209,31 @@ class Lowerer {
             return std::unexpected(
                 LowerError{.message = "filter predicate left side must be a column"});
         }
-        const auto* literal = std::get_if<LiteralExpr>(&binary->right->node);
-        if (literal == nullptr) {
-            return std::unexpected(
-                LowerError{.message = "filter predicate right side must be a literal"});
+        if (const auto* literal = std::get_if<LiteralExpr>(&binary->right->node)) {
+            auto value = lower_literal(*literal);
+            if (!value.has_value()) {
+                return std::unexpected(value.error());
+            }
+            auto wrapped = std::visit(
+                [](const auto& v)
+                    -> std::variant<std::int64_t, double, std::string,
+                                    ir::FilterPredicate::ScalarRef> { return v; },
+                value.value());
+            return ir::FilterPredicate{
+                .column = ir::ColumnRef{.name = ident->name},
+                .op = to_compare_op(binary->op),
+                .value = std::move(wrapped),
+            };
         }
-        auto value = lower_literal(*literal);
-        if (!value.has_value()) {
-            return std::unexpected(value.error());
+        if (const auto* rhs_ident = std::get_if<IdentifierExpr>(&binary->right->node)) {
+            return ir::FilterPredicate{
+                .column = ir::ColumnRef{.name = ident->name},
+                .op = to_compare_op(binary->op),
+                .value = ir::FilterPredicate::ScalarRef{.name = rhs_ident->name},
+            };
         }
-        return ir::FilterPredicate{
-            .column = ir::ColumnRef{.name = ident->name},
-            .op = to_compare_op(binary->op),
-            .value = std::move(value.value()),
-        };
+        return std::unexpected(
+            LowerError{.message = "filter predicate right side must be a literal or scalar"});
     }
 
     auto lower_select_projection(const SelectClause& clause, ir::NodePtr base)

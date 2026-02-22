@@ -504,6 +504,9 @@ is identical to the input schema.
 trades[filter price > 100.0 && volume > 0]
 ```
 
+Current implementation restricts filter predicates to simple comparisons of
+the form `column <op> literal` or `column <op> scalar`.
+
 **`select { field, ... }`**
 
 Produces a new DataFrame containing only the listed fields. Each field is

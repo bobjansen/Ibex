@@ -55,6 +55,26 @@ auto format_columns(const Table& table) -> std::string {
     return out;
 }
 
+auto format_scalars(const ScalarRegistry& scalars) -> std::string {
+    if (scalars.empty()) {
+        return "<none>";
+    }
+    std::vector<std::string_view> names;
+    names.reserve(scalars.size());
+    for (const auto& entry : scalars) {
+        names.emplace_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            out.append(", ");
+        }
+        out.append(names[i]);
+    }
+    return out;
+}
+
 auto format_tables(const TableRegistry& registry) -> std::string {
     if (registry.empty()) {
         return "<none>";
@@ -101,14 +121,14 @@ auto make_empty_like(const ColumnValue& src) -> ColumnValue {
         src);
 }
 
-auto compare_value(const ColumnValue& column, std::size_t index, const ir::FilterPredicate& pred)
-    -> bool {
+auto compare_value(const ColumnValue& column, std::size_t index, const ir::FilterPredicate& pred,
+                   const std::variant<std::int64_t, double, std::string>& value) -> bool {
     return std::visit(
         [&](const auto& col) -> bool {
             using ColType = std::decay_t<decltype(col)>;
             using ValueType = typename ColType::value_type;
             if constexpr (std::is_same_v<ValueType, std::int64_t>) {
-                if (const auto* v = std::get_if<std::int64_t>(&pred.value)) {
+                if (const auto* v = std::get_if<std::int64_t>(&value)) {
                     switch (pred.op) {
                         case ir::CompareOp::Eq:
                             return col[index] == *v;
@@ -124,7 +144,7 @@ auto compare_value(const ColumnValue& column, std::size_t index, const ir::Filte
                             return col[index] >= *v;
                     }
                 }
-                if (const auto* v = std::get_if<double>(&pred.value)) {
+                if (const auto* v = std::get_if<double>(&value)) {
                     double lhs = static_cast<double>(col[index]);
                     switch (pred.op) {
                         case ir::CompareOp::Eq:
@@ -144,7 +164,7 @@ auto compare_value(const ColumnValue& column, std::size_t index, const ir::Filte
                 return false;
             } else if constexpr (std::is_same_v<ValueType, double>) {
                 double lhs = col[index];
-                if (const auto* v = std::get_if<double>(&pred.value)) {
+                if (const auto* v = std::get_if<double>(&value)) {
                     switch (pred.op) {
                         case ir::CompareOp::Eq:
                             return lhs == *v;
@@ -160,7 +180,7 @@ auto compare_value(const ColumnValue& column, std::size_t index, const ir::Filte
                             return lhs >= *v;
                     }
                 }
-                if (const auto* v = std::get_if<std::int64_t>(&pred.value)) {
+                if (const auto* v = std::get_if<std::int64_t>(&value)) {
                     double rhs = static_cast<double>(*v);
                     switch (pred.op) {
                         case ir::CompareOp::Eq:
@@ -179,7 +199,7 @@ auto compare_value(const ColumnValue& column, std::size_t index, const ir::Filte
                 }
                 return false;
             } else if constexpr (std::is_same_v<ValueType, std::string>) {
-                if (const auto* v = std::get_if<std::string>(&pred.value)) {
+                if (const auto* v = std::get_if<std::string>(&value)) {
                     switch (pred.op) {
                         case ir::CompareOp::Eq:
                             return col[index] == *v;
@@ -203,12 +223,53 @@ auto compare_value(const ColumnValue& column, std::size_t index, const ir::Filte
         column);
 }
 
-auto filter_table(const Table& input, const ir::FilterPredicate& predicate)
+auto resolve_filter_value(const ir::FilterPredicate& predicate,
+                          const ScalarRegistry* scalars)
+    -> std::expected<std::variant<std::int64_t, double, std::string>, std::string> {
+    if (const auto* literal = std::get_if<std::int64_t>(&predicate.value)) {
+        return *literal;
+    }
+    if (const auto* literal = std::get_if<double>(&predicate.value)) {
+        return *literal;
+    }
+    if (const auto* literal = std::get_if<std::string>(&predicate.value)) {
+        return *literal;
+    }
+    const auto* ref = std::get_if<ir::FilterPredicate::ScalarRef>(&predicate.value);
+    if (ref == nullptr) {
+        return std::unexpected("filter predicate value not supported");
+    }
+    if (scalars == nullptr) {
+        return std::unexpected("unknown scalar in filter: " + ref->name);
+    }
+    auto it = scalars->find(ref->name);
+    if (it == scalars->end()) {
+        return std::unexpected("unknown scalar in filter: " + ref->name +
+                               " (available: " + format_scalars(*scalars) + ")");
+    }
+    if (const auto* int_value = std::get_if<std::int64_t>(&it->second)) {
+        return *int_value;
+    }
+    if (const auto* double_value = std::get_if<double>(&it->second)) {
+        return *double_value;
+    }
+    if (const auto* str_value = std::get_if<std::string>(&it->second)) {
+        return *str_value;
+    }
+    return std::unexpected("scalar type not supported in filter");
+}
+
+auto filter_table(const Table& input, const ir::FilterPredicate& predicate,
+                  const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
     const auto* predicate_column = input.find(predicate.column.name);
     if (predicate_column == nullptr) {
         return std::unexpected("filter column not found: " + predicate.column.name +
                                " (available: " + format_columns(input) + ")");
+    }
+    auto resolved = resolve_filter_value(predicate, scalars);
+    if (!resolved) {
+        return std::unexpected(resolved.error());
     }
     std::size_t rows = column_size(*predicate_column);
 
@@ -218,7 +279,7 @@ auto filter_table(const Table& input, const ir::FilterPredicate& predicate)
     }
 
     for (std::size_t row = 0; row < rows; ++row) {
-        if (!compare_value(*predicate_column, row, predicate)) {
+        if (!compare_value(*predicate_column, row, predicate, resolved.value())) {
             continue;
         }
         for (auto& entry : output.columns) {
@@ -1453,7 +1514,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return filter_table(child.value(), filter.predicate());
+            return filter_table(child.value(), filter.predicate(), scalars);
         }
         case ir::NodeKind::Project: {
             const auto& project = static_cast<const ir::ProjectNode&>(node);

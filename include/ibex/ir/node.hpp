@@ -93,7 +93,10 @@ enum class AggFunc : std::uint8_t {
 struct FilterPredicate {
     ColumnRef column;
     CompareOp op = CompareOp::Eq;
-    std::variant<std::int64_t, double, std::string> value;
+    struct ScalarRef {
+        std::string name;
+    };
+    std::variant<std::int64_t, double, std::string, ScalarRef> value;
 };
 
 /// Aggregation specification: apply function to column, store as alias.

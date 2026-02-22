@@ -47,6 +47,31 @@ TEST_CASE("Interpret filter + select") {
     REQUIRE((*price_ints)[1] == 30);
 }
 
+TEST_CASE("Interpret filter with scalar predicate") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("t", static_cast<std::int64_t>(15));
+
+    auto ir = require_ir("trades[filter price > t, select { price }];");
+    auto result = runtime::interpret(*ir, registry, &scalars);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 1);
+
+    const auto* price_col = result->find("price");
+    REQUIRE(price_col != nullptr);
+    const auto* price_ints = std::get_if<Column<std::int64_t>>(price_col);
+    REQUIRE(price_ints != nullptr);
+    REQUIRE(price_ints->size() == 2);
+    REQUIRE((*price_ints)[0] == 20);
+    REQUIRE((*price_ints)[1] == 30);
+}
+
 TEST_CASE("Interpret update alias") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{5, 7});

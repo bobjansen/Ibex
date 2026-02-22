@@ -87,12 +87,8 @@ scalar(df, col)               Extract a scalar from a single-row DataFrame
 
 ## Roadmap
 
-- [ ] Lexer implementation (tokenize Ibex source)
-- [ ] Recursive-descent parser (source → IR)
-- [ ] DataFrame column storage wiring
-- [ ] IR interpreter / evaluation engine
 - [ ] Time-indexed DataFrame support
 - [ ] Query optimizer (predicate pushdown, projection pruning)
+- [ ] Emitting C++ for direct use and inclusion elsewhere
 - [ ] CSV / Parquet IO adapters
-- [ ] Extern function type checking at registration
 - [ ] REPL tab completion and history

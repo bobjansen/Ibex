@@ -178,6 +178,10 @@ int main(int argc, char** argv) {
             "prices[select {open = first(price), high = max(price), low = min(price), last = "
             "last(price)}, by symbol]",
         },
+        {
+            "update_price_x2",
+            "prices[update {price_x2 = price * 2}]",
+        },
         // Parse + lower overhead: same queries timed with parsing included.
         // Run with --include-parse (default) to capture lexer/parser maps.
         {
@@ -189,6 +193,10 @@ int main(int argc, char** argv) {
             "prices[select {open = first(price), high = max(price), low = min(price), last = "
             "last(price)}, by symbol]",
         },
+        {
+            "parse_update_price_x2",
+            "prices[update {price_x2 = price * 2}]",
+        },
     };
 
     int status = 0;
@@ -197,7 +205,7 @@ int main(int argc, char** argv) {
     bool saved_include_parse = include_parse;
     for (std::size_t qi = 0; qi < queries.size(); ++qi) {
         // parse_* queries always include parsing in the timing
-        bool this_include_parse = (qi >= 2) ? true : saved_include_parse;
+        bool this_include_parse = (qi >= 3) ? true : saved_include_parse;
         status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
         if (status != 0) {
             break;

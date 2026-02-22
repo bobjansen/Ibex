@@ -1580,13 +1580,13 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
     return std::unexpected("unsupported expression");
 }
 
-auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields,
+auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<Table, std::string> {
-    Table output = input;
-    std::size_t rows = input.rows();
+    Table output = std::move(input);
+    std::size_t rows = output.rows();
     for (const auto& field : fields) {
-        auto inferred = infer_expr_type(field.expr, input, scalars, externs);
+        auto inferred = infer_expr_type(field.expr, output, scalars, externs);
         if (!inferred) {
             return std::unexpected(inferred.error());
         }
@@ -1602,8 +1602,9 @@ auto update_table(const Table& input, const std::vector<ir::FieldSpec>& fields,
                 new_column = Column<std::string>{};
                 break;
         }
+        std::visit([&](auto& col) { col.reserve(rows); }, new_column);
         for (std::size_t row = 0; row < rows; ++row) {
-            auto value = eval_expr(field.expr, input, row, scalars, externs);
+            auto value = eval_expr(field.expr, output, row, scalars, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -1690,7 +1691,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return update_table(child.value(), update.fields(), scalars, externs);
+            return update_table(std::move(child.value()), update.fields(), scalars, externs);
         }
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);

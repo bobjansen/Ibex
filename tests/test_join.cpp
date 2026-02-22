@@ -17,7 +17,7 @@ auto col_i64(const runtime::Table& t, const std::string& name) -> std::vector<st
     REQUIRE(col != nullptr);
     const auto* values = std::get_if<Column<std::int64_t>>(col);
     REQUIRE(values != nullptr);
-    return std::vector<std::int64_t>(values->begin(), values->end());
+    return {values->begin(), values->end()};
 }
 
 auto col_str(const runtime::Table& t, const std::string& name) -> std::vector<std::string> {
@@ -25,7 +25,7 @@ auto col_str(const runtime::Table& t, const std::string& name) -> std::vector<st
     REQUIRE(col != nullptr);
     const auto* values = std::get_if<Column<std::string>>(col);
     REQUIRE(values != nullptr);
-    return std::vector<std::string>(values->begin(), values->end());
+    return {values->begin(), values->end()};
 }
 
 auto interpret_expr(std::string_view src, const runtime::TableRegistry& tables) -> runtime::Table {

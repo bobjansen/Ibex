@@ -172,6 +172,60 @@ TEST_CASE("Parse block expression with filter and select") {
     REQUIRE(select.fields[1].expr != nullptr);
 }
 
+TEST_CASE("Parse select without braces") {
+    const char* source = "df[select price];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& select = std::get<SelectClause>(block.clauses[0]);
+    REQUIRE(select.fields.size() == 1);
+    REQUIRE(select.fields[0].name == "price");
+    REQUIRE(select.fields[0].expr == nullptr);
+}
+
+TEST_CASE("Parse select assignment without braces") {
+    const char* source = "df[select total = price * 2];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& select = std::get<SelectClause>(block.clauses[0]);
+    REQUIRE(select.fields.size() == 1);
+    REQUIRE(select.fields[0].name == "total");
+    REQUIRE(select.fields[0].expr != nullptr);
+}
+
+TEST_CASE("Parse update without braces") {
+    const char* source = "df[update price = price + 1];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.size() == 1);
+    REQUIRE(update.fields[0].name == "price");
+    REQUIRE(update.fields[0].expr != nullptr);
+}
+
 TEST_CASE("Parse quoted identifiers in column references") {
     const char* source = "df[filter `Sepal.Length` > 10, select { `Sepal.Length` }];";
 

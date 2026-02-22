@@ -506,14 +506,14 @@ class Parser {
             return FilterClause{.predicate = std::move(predicate)};
         }
         if (match(TokenKind::KeywordSelect)) {
-            auto fields = parse_field_list();
+            auto fields = parse_field_list_or_single();
             if (!fields.has_value()) {
                 return std::nullopt;
             }
             return SelectClause{.fields = std::move(*fields)};
         }
         if (match(TokenKind::KeywordUpdate)) {
-            auto fields = parse_field_list();
+            auto fields = parse_field_list_or_single();
             if (!fields.has_value()) {
                 return std::nullopt;
             }
@@ -547,11 +547,20 @@ class Parser {
         return std::nullopt;
     }
 
-    auto parse_field_list() -> std::optional<std::vector<Field>> {
-        if (!consume(TokenKind::LBrace, "expected '{' to start field list")) {
+    auto parse_field_list_or_single() -> std::optional<std::vector<Field>> {
+        if (check(TokenKind::LBrace)) {
+            if (!consume(TokenKind::LBrace, "expected '{' to start field list")) {
+                return std::nullopt;
+            }
+            return parse_field_list_after_open_brace();
+        }
+        auto field = parse_single_field();
+        if (!field.has_value()) {
             return std::nullopt;
         }
-        return parse_field_list_after_open_brace();
+        std::vector<Field> fields;
+        fields.push_back(std::move(*field));
+        return fields;
     }
 
     auto parse_field_list_after_open_brace() -> std::optional<std::vector<Field>> {
@@ -577,6 +586,22 @@ class Parser {
             return std::nullopt;
         }
         return fields;
+    }
+
+    auto parse_single_field() -> std::optional<Field> {
+        auto name = consume_column_identifier("expected field name");
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        ExprPtr expr = nullptr;
+        if (match(TokenKind::Eq)) {
+            auto value = parse_expression();
+            if (!value) {
+                return std::nullopt;
+            }
+            expr = std::move(value);
+        }
+        return Field{.name = std::move(*name), .expr = std::move(expr)};
     }
 
     auto parse_type() -> std::optional<Type> {

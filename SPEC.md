@@ -369,14 +369,17 @@ clause          = filter_clause
 
 filter_clause   = "filter" expr ;
 
-select_clause   = "select" "{" field_list "}" ;
+select_clause   = "select" field_or_list ;
 
-update_clause   = "update" "{" field_list "}" ;
+update_clause   = "update" field_or_list ;
 
 by_clause       = "by" IDENT
                 | "by" "{" field_list "}" ;
 
 window_clause   = "window" DURATION_LIT ;
+
+field_or_list   = field
+                | "{" field_list "}" ;
 
 field_list      = field { "," field } [ "," ] ;
 

@@ -8,6 +8,7 @@ add_executable(ibex_tests
     test_repl.cpp
     test_lower.cpp
     test_interpreter.cpp
+    test_codegen.cpp
 )
 
 target_link_libraries(ibex_tests
@@ -17,6 +18,7 @@ target_link_libraries(ibex_tests
         Ibex::parser
         Ibex::repl
         Ibex::runtime
+        Ibex::codegen
         Ibex::CompilerOptions
         Catch2::Catch2WithMain
 )

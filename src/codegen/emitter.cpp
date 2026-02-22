@@ -191,8 +191,12 @@ auto Emitter::emit_predicate(const ir::FilterPredicate& pred) -> std::string {
                 s += "std::int64_t{" + std::to_string(v) + "}";
             } else if constexpr (std::is_same_v<T, double>) {
                 s += format_double(v);
-            } else {
+            } else if constexpr (std::is_same_v<T, std::string>) {
                 s += "std::string{\"" + escape_string(v) + "\"}";
+            } else {
+                // ScalarRef: a named scalar variable — emit as a runtime lookup
+                s += "ibex::ir::FilterPredicate::ScalarRef{\"" +
+                     escape_string(v.name) + "\"}";
             }
         },
         pred.value);

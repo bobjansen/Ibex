@@ -18,7 +18,7 @@ BUILD_DIR="${BUILD_DIR:-$IBEX_ROOT/build}"
 PLUGIN_DIR="${PLUGIN_DIR:-$IBEX_ROOT/build/plugins/parquet}"
 CXX="${CXX:-clang++}"
 C="${C:-clang}"
-BUILD_TYPE="${BUILD_TYPE:-Debug}"
+BUILD_TYPE="${BUILD_TYPE:-Release}"
 
 if [[ ! -f "$BUILD_DIR/src/runtime/libibex_runtime.a" ]]; then
     echo "error: missing ibex build artifacts in $BUILD_DIR" >&2

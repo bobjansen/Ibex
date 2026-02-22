@@ -21,6 +21,11 @@ target_link_libraries(ibex_tests
         Catch2::Catch2WithMain
 )
 
+target_compile_definitions(ibex_tests
+    PRIVATE
+        IBEX_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+)
+
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_tests PRIVATE Ibex::Sanitizers)
 endif()

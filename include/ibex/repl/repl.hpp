@@ -18,6 +18,10 @@ struct ReplConfig {
 /// TODO: Implement evaluation pipeline (parse -> IR -> execute).
 void run(const ReplConfig& config, runtime::ExternRegistry& registry);
 
+/// Execute a script in a fresh REPL context (useful for tests).
+[[nodiscard]] auto execute_script(std::string_view source, runtime::ExternRegistry& registry)
+    -> bool;
+
 /// Normalize a single REPL input line (e.g., inject implicit semicolon).
 [[nodiscard]] auto normalize_input(std::string_view input) -> std::string;
 

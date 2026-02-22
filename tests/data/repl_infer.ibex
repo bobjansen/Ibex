@@ -1,0 +1,6 @@
+fn square(a: Int) -> Int {
+  a * a;
+}
+
+let prices = trades[select { price }];
+let total = scalar(trades[select { total = sum(price) }], total);

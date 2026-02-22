@@ -270,6 +270,13 @@ Example:
 Schemas are structural: two schemas with the same fields in the same order are
 the same type. Field order is significant.
 
+### 3.4 Local Type Inference
+
+`let` bindings may omit the type annotation. When omitted, the binding type is
+inferred from the right-hand side expression. The language remains statically
+typed; inference is local and does not alter function signatures (parameters
+and return types remain required).
+
 ---
 
 ## 4. Formal Grammar

@@ -35,4 +35,5 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - `fn name(params) -> Type { ... }` with required types
 - `Int` alias for `Int64`
 - `Column<T>` alias for `Series<T>`
+- `let` supports local type inference when the annotation is omitted
 - Computed fields in `select` are supported (lowered via update + project)

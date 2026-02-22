@@ -721,58 +721,69 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
-            if (std::get_if<parser::CallExpr>(&let_stmt.value->node) != nullptr) {
-                auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns, functions,
-                                             extern_decls, externs);
-                if (!value) {
-                    fmt::print("error: {}\n", value.error());
-                    return false;
+            if (let_stmt.type.has_value()) {
+                bool expect_scalar = let_stmt.type->kind == parser::Type::Kind::Scalar;
+                bool expect_table = let_stmt.type->kind == parser::Type::Kind::DataFrame ||
+                                    let_stmt.type->kind == parser::Type::Kind::TimeFrame;
+                bool expect_column = let_stmt.type->kind == parser::Type::Kind::Series;
+                if (expect_scalar) {
+                    auto value = eval_scalar_expr(*let_stmt.value, tables, scalars, columns,
+                                                  functions, extern_decls, externs);
+                    if (!value) {
+                        fmt::print("error: {}\n", value.error());
+                        return false;
+                    }
+                    scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
+                    continue;
                 }
-                bool expect_scalar = let_stmt.type.has_value() &&
-                                     let_stmt.type->kind == parser::Type::Kind::Scalar;
-                bool expect_table = let_stmt.type.has_value() &&
-                                    (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
-                                     let_stmt.type->kind == parser::Type::Kind::TimeFrame);
-                bool expect_column = let_stmt.type.has_value() &&
-                                     let_stmt.type->kind == parser::Type::Kind::Series;
-                if (expect_scalar && !std::holds_alternative<runtime::ScalarValue>(*value)) {
-                    fmt::print("error: expected scalar return for {}\n", let_stmt.name);
-                    return false;
+                if (expect_table) {
+                    auto value = eval_table_expr(*let_stmt.value, tables, scalars, columns,
+                                                 functions, extern_decls, externs);
+                    if (!value) {
+                        fmt::print("error: {}\n", value.error());
+                        return false;
+                    }
+                    tables.insert_or_assign(let_stmt.name, std::move(value.value()));
+                    continue;
                 }
-                if (expect_table && !std::holds_alternative<runtime::Table>(*value)) {
-                    fmt::print("error: expected table return for {}\n", let_stmt.name);
-                    return false;
-                }
-                if (expect_column && !std::holds_alternative<runtime::ColumnValue>(*value) &&
-                    !std::holds_alternative<runtime::Table>(*value)) {
-                    fmt::print("error: expected column return for {}\n", let_stmt.name);
-                    return false;
-                }
-                if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                    scalars.insert_or_assign(let_stmt.name, std::move(*scalar));
-                } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
-                    columns.insert_or_assign(let_stmt.name, std::move(*col));
-                } else {
-                    auto table = std::get<runtime::Table>(std::move(value.value()));
-                    if (expect_column) {
-                        if (table.columns.size() != 1) {
+                if (expect_column) {
+                    auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns,
+                                                 functions, extern_decls, externs);
+                    if (!value) {
+                        fmt::print("error: {}\n", value.error());
+                        return false;
+                    }
+                    if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                        columns.insert_or_assign(let_stmt.name, std::move(*col));
+                        continue;
+                    }
+                    if (auto* table = std::get_if<runtime::Table>(&value.value())) {
+                        if (table->columns.size() != 1) {
                             fmt::print("error: column return must have exactly one column\n");
                             return false;
                         }
-                        columns.insert_or_assign(let_stmt.name, table.columns.front().column);
-                    } else {
-                        tables.insert_or_assign(let_stmt.name, std::move(table));
+                        columns.insert_or_assign(let_stmt.name, table->columns.front().column);
+                        continue;
                     }
+                    fmt::print("error: expected column return for {}\n", let_stmt.name);
+                    return false;
                 }
-                continue;
             }
-            auto evaluated = eval_table_expr(*let_stmt.value, tables, scalars, columns, functions,
-                                             extern_decls, externs);
-            if (!evaluated) {
-                fmt::print("error: {}\n", evaluated.error());
+
+            auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns, functions,
+                                         extern_decls, externs);
+            if (!value) {
+                fmt::print("error: {}\n", value.error());
                 return false;
             }
-            tables.insert_or_assign(let_stmt.name, std::move(evaluated.value()));
+            if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+                scalars.insert_or_assign(let_stmt.name, std::move(*scalar));
+            } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                columns.insert_or_assign(let_stmt.name, std::move(*col));
+            } else {
+                tables.insert_or_assign(let_stmt.name,
+                                        std::get<runtime::Table>(std::move(value.value())));
+            }
             continue;
         }
         if (std::holds_alternative<parser::ExprStmt>(stmt)) {
@@ -829,6 +840,21 @@ auto normalize_input(std::string_view input) -> std::string {
         normalized.push_back(';');
     }
     return normalized;
+}
+
+auto execute_script(std::string_view source, runtime::ExternRegistry& registry) -> bool {
+    auto parsed = parser::parse(source);
+    if (!parsed) {
+        fmt::print("error: {}\n", parsed.error().format());
+        return false;
+    }
+    auto tables = build_builtin_tables();
+    runtime::ScalarRegistry scalars;
+    ColumnRegistry columns;
+    FunctionRegistry functions;
+    ExternDeclRegistry extern_decls;
+    return execute_statements(parsed->statements, tables, scalars, columns, functions,
+                              extern_decls, registry);
 }
 
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {

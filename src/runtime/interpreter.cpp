@@ -405,6 +405,159 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
         column);
 }
 
+struct FastOperand {
+    bool is_column = false;
+    const ColumnValue* column = nullptr;
+    ScalarValue literal;
+    ExprType kind = ExprType::Int;
+};
+
+auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {
+    if (std::holds_alternative<std::int64_t>(value)) {
+        return ExprType::Int;
+    }
+    if (std::holds_alternative<double>(value)) {
+        return ExprType::Double;
+    }
+    return ExprType::String;
+}
+
+auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
+    -> std::optional<FastOperand> {
+    if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
+        if (const auto* source = input.find(col->name); source != nullptr) {
+            return FastOperand{true, source, ScalarValue{}, expr_type_for_column(*source)};
+        }
+        if (scalars != nullptr) {
+            if (auto it = scalars->find(col->name); it != scalars->end()) {
+                return FastOperand{false, nullptr, it->second, scalar_kind_from_value(it->second)};
+            }
+        }
+        return std::nullopt;
+    }
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        return FastOperand{false, nullptr, lit->value, scalar_kind_from_value(lit->value)};
+    }
+    return std::nullopt;
+}
+
+auto apply_int_op(ir::ArithmeticOp op, std::int64_t lhs, std::int64_t rhs) -> std::int64_t {
+    switch (op) {
+        case ir::ArithmeticOp::Add:
+            return lhs + rhs;
+        case ir::ArithmeticOp::Sub:
+            return lhs - rhs;
+        case ir::ArithmeticOp::Mul:
+            return lhs * rhs;
+        case ir::ArithmeticOp::Div:
+            return lhs / rhs;
+        case ir::ArithmeticOp::Mod:
+            return lhs % rhs;
+    }
+    return 0;
+}
+
+auto apply_double_op(ir::ArithmeticOp op, double lhs, double rhs) -> double {
+    switch (op) {
+        case ir::ArithmeticOp::Add:
+            return lhs + rhs;
+        case ir::ArithmeticOp::Sub:
+            return lhs - rhs;
+        case ir::ArithmeticOp::Mul:
+            return lhs * rhs;
+        case ir::ArithmeticOp::Div:
+            return lhs / rhs;
+        case ir::ArithmeticOp::Mod:
+            return std::fmod(lhs, rhs);
+    }
+    return 0.0;
+}
+
+auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
+    if (!op.is_column) {
+        if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
+            return *int_value;
+        }
+        return static_cast<std::int64_t>(std::get<double>(op.literal));
+    }
+    if (const auto* int_col = std::get_if<Column<std::int64_t>>(op.column)) {
+        return (*int_col)[row];
+    }
+    if (const auto* double_col = std::get_if<Column<double>>(op.column)) {
+        return static_cast<std::int64_t>((*double_col)[row]);
+    }
+    throw std::runtime_error("type mismatch");
+}
+
+auto get_double_value(const FastOperand& op, std::size_t row) -> double {
+    if (!op.is_column) {
+        if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
+            return static_cast<double>(*int_value);
+        }
+        return std::get<double>(op.literal);
+    }
+    if (const auto* int_col = std::get_if<Column<std::int64_t>>(op.column)) {
+        return static_cast<double>((*int_col)[row]);
+    }
+    if (const auto* double_col = std::get_if<Column<double>>(op.column)) {
+        return (*double_col)[row];
+    }
+    throw std::runtime_error("type mismatch");
+}
+
+auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_t rows,
+                            ExprType output_kind, const ScalarRegistry* scalars)
+    -> std::optional<ColumnValue> {
+    const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
+    if (bin == nullptr) {
+        return std::nullopt;
+    }
+    auto left = resolve_fast_operand(*bin->left, input, scalars);
+    if (!left) {
+        return std::nullopt;
+    }
+    auto right = resolve_fast_operand(*bin->right, input, scalars);
+    if (!right) {
+        return std::nullopt;
+    }
+    if (left->kind == ExprType::String || right->kind == ExprType::String) {
+        return std::nullopt;
+    }
+    if (output_kind == ExprType::Double) {
+        Column<double> out;
+        if (!left->is_column && !right->is_column) {
+            double value =
+                apply_double_op(bin->op, get_double_value(*left, 0), get_double_value(*right, 0));
+            out.assign(rows, value);
+            return ColumnValue{std::move(out)};
+        }
+        out.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            double lhs = get_double_value(*left, row);
+            double rhs = get_double_value(*right, row);
+            out.push_back(apply_double_op(bin->op, lhs, rhs));
+        }
+        return ColumnValue{std::move(out)};
+    }
+    if (output_kind == ExprType::Int) {
+        Column<std::int64_t> out;
+        if (!left->is_column && !right->is_column) {
+            std::int64_t value =
+                apply_int_op(bin->op, get_int_value(*left, 0), get_int_value(*right, 0));
+            out.assign(rows, value);
+            return ColumnValue{std::move(out)};
+        }
+        out.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::int64_t lhs = get_int_value(*left, row);
+            std::int64_t rhs = get_int_value(*right, row);
+            out.push_back(apply_int_op(bin->op, lhs, rhs));
+        }
+        return ColumnValue{std::move(out)};
+    }
+    return std::nullopt;
+}
+
 auto default_scalar_for_column(const ColumnValue& column) -> ScalarValue {
     return std::visit(
         [](const auto& col) -> ScalarValue {
@@ -1589,6 +1742,11 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);
         if (!inferred) {
             return std::unexpected(inferred.error());
+        }
+        if (auto fast = try_fast_update_binary(field.expr, output, rows, inferred.value(), scalars);
+            fast.has_value()) {
+            output.add_column(field.alias, std::move(fast.value()));
+            continue;
         }
         ColumnValue new_column;
         switch (inferred.value()) {

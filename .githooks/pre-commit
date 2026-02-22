@@ -3,7 +3,17 @@
 
 set -euo pipefail
 
-if ! command -v clang-format >/dev/null 2>&1; then
+CLANG_FORMAT_BIN="${CLANG_FORMAT_BIN:-}"
+if [[ -z "$CLANG_FORMAT_BIN" ]]; then
+    for candidate in clang-format-20 clang-format-19 clang-format-18 clang-format; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            CLANG_FORMAT_BIN="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$CLANG_FORMAT_BIN" ]]; then
     echo "warning: clang-format not found; skipping format check" >&2
     exit 0
 fi
@@ -16,9 +26,9 @@ fi
 FAILED=0
 while IFS= read -r file; do
     [[ -z "$file" ]] && continue
-    clang-format -i "$file"
+    "$CLANG_FORMAT_BIN" -i "$file"
     git add "$file"
-    if ! clang-format --dry-run --Werror "$file"; then
+    if ! "$CLANG_FORMAT_BIN" --dry-run --Werror "$file"; then
         FAILED=1
     fi
 done <<< "$FILES"

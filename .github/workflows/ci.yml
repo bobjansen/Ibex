@@ -85,9 +85,9 @@ jobs:
       - name: Install clang-format
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format-18
+          sudo apt-get install -y clang-format-20 || sudo apt-get install -y clang-format-18
 
       - name: Check formatting
         run: |
           find src include tests tools -name '*.cpp' -o -name '*.hpp' | \
-            xargs clang-format-18 --dry-run --Werror
+            xargs ./scripts/clang-format.sh --dry-run --Werror

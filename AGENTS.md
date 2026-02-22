@@ -11,6 +11,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - Parquet plugin is built standalone: `scripts/ibex-parquet-build.sh` (after Ibex build).
 - End-to-end checks: `scripts/ibex-e2e.sh` (REPL + transpile + plugins).
 - Git hooks: `scripts/install-hooks.sh` (enables clang-format pre-commit check).
+- Format tool: `scripts/clang-format.sh` (uses newest available clang-format).
 - Workflow: run tests after any parser/lexer/AST changes before marking work done.
 - Workflow: add a usage example for new syntax in an `.ibex` file.
 

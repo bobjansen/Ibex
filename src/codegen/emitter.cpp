@@ -15,20 +15,28 @@ auto escape_string(const std::string& s) -> std::string {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
-        if (c == '"') out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else out += c;
+        if (c == '"')
+            out += "\\\"";
+        else if (c == '\\')
+            out += "\\\\";
+        else if (c == '\n')
+            out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
+        else if (c == '\t')
+            out += "\\t";
+        else
+            out += c;
     }
     return out;
 }
 
 auto format_double(double v) -> std::string {
-    if (std::isnan(v)) return "std::numeric_limits<double>::quiet_NaN()";
-    if (std::isinf(v)) return v > 0 ? "std::numeric_limits<double>::infinity()"
-                                    : "-std::numeric_limits<double>::infinity()";
+    if (std::isnan(v))
+        return "std::numeric_limits<double>::quiet_NaN()";
+    if (std::isinf(v))
+        return v > 0 ? "std::numeric_limits<double>::infinity()"
+                     : "-std::numeric_limits<double>::infinity()";
     // Round-trip precision
     std::ostringstream ss;
     ss.precision(17);
@@ -43,7 +51,7 @@ auto format_double(double v) -> std::string {
 
 }  // namespace
 
-//─── Public ──────────────────────────────────────────────────────────────────
+// ─── Public ──────────────────────────────────────────────────────────────────
 
 void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config) {
     out_ = &out;
@@ -81,7 +89,7 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     out_ = nullptr;
 }
 
-//─── Private helpers ─────────────────────────────────────────────────────────
+// ─── Private helpers ─────────────────────────────────────────────────────────
 
 auto Emitter::fresh_var() -> std::string {
     return "t" + std::to_string(tmp_counter_++);
@@ -92,14 +100,15 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
     switch (node.kind()) {
         case ir::NodeKind::Scan:
             throw std::runtime_error(
-                "ibex_compile: ScanNode cannot be emitted — use 'extern fn' to declare data sources");
+                "ibex_compile: ScanNode cannot be emitted — use 'extern fn' to declare data "
+                "sources");
 
         case ir::NodeKind::Filter: {
             const auto& filter = static_cast<const ir::FilterNode&>(node);
             auto child = emit_node(*filter.children().front());
             auto var = fresh_var();
-            *out_ << "    auto " << var << " = ibex::ops::filter(" << child
-                  << ", " << emit_predicate(filter.predicate()) << ");\n";
+            *out_ << "    auto " << var << " = ibex::ops::filter(" << child << ", "
+                  << emit_predicate(filter.predicate()) << ");\n";
             return var;
         }
 
@@ -110,7 +119,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "    auto " << var << " = ibex::ops::project(" << child << ", {";
             bool first = true;
             for (const auto& col : proj.columns()) {
-                if (!first) *out_ << ", ";
+                if (!first)
+                    *out_ << ", ";
                 first = false;
                 *out_ << '"' << escape_string(col.name) << '"';
             }
@@ -128,7 +138,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "        {";
             bool first = true;
             for (const auto& g : agg.group_by()) {
-                if (!first) *out_ << ", ";
+                if (!first)
+                    *out_ << ", ";
                 first = false;
                 *out_ << '"' << escape_string(g.name) << '"';
             }
@@ -138,12 +149,13 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "        {";
             first = true;
             for (const auto& a : agg.aggregations()) {
-                if (!first) *out_ << ", ";
+                if (!first)
+                    *out_ << ", ";
                 first = false;
                 *out_ << "ibex::ops::make_agg("
-                      << "ibex::ir::AggFunc::" << emit_agg_func(a.func)
-                      << ", \"" << escape_string(a.column.name)
-                      << "\", \"" << escape_string(a.alias) << "\")";
+                      << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
+                      << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
+                      << "\")";
             }
             *out_ << "});\n";
             return var;
@@ -156,18 +168,18 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "    auto " << var << " = ibex::ops::update(" << child << ", {\n";
             bool first = true;
             for (const auto& f : upd.fields()) {
-                if (!first) *out_ << ",\n";
+                if (!first)
+                    *out_ << ",\n";
                 first = false;
-                *out_ << "        ibex::ops::make_field(\"" << escape_string(f.alias)
-                      << "\", " << emit_expr(f.expr) << ")";
+                *out_ << "        ibex::ops::make_field(\"" << escape_string(f.alias) << "\", "
+                      << emit_expr(f.expr) << ")";
             }
             *out_ << "\n    });\n";
             return var;
         }
 
         case ir::NodeKind::Window:
-            throw std::runtime_error(
-                "ibex_compile: WindowNode emission is not yet supported");
+            throw std::runtime_error("ibex_compile: WindowNode emission is not yet supported");
 
         case ir::NodeKind::ExternCall: {
             const auto& ec = static_cast<const ir::ExternCallNode&>(node);
@@ -175,7 +187,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "    auto " << var << " = " << ec.callee() << "(";
             bool first = true;
             for (const auto& arg : ec.args()) {
-                if (!first) *out_ << ", ";
+                if (!first)
+                    *out_ << ", ";
                 first = false;
                 *out_ << emit_raw_expr(arg);
             }
@@ -203,11 +216,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     throw std::runtime_error(
                         "ibex_compile: asof join emission is not yet supported");
             }
-            *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left
-                  << ", " << right << ", {";
+            *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right
+                  << ", {";
             bool first = true;
             for (const auto& key : join.keys()) {
-                if (!first) *out_ << ", ";
+                if (!first)
+                    *out_ << ", ";
                 first = false;
                 *out_ << '"' << escape_string(key) << '"';
             }
@@ -237,8 +251,7 @@ auto Emitter::emit_predicate(const ir::FilterPredicate& pred) -> std::string {
                 s += "std::string{\"" + escape_string(v) + "\"}";
             } else {
                 // ScalarRef: a named scalar variable — emit as a runtime lookup
-                s += "ibex::ir::FilterPredicate::ScalarRef{\"" +
-                     escape_string(v.name) + "\"}";
+                s += "ibex::ir::FilterPredicate::ScalarRef{\"" + escape_string(v.name) + "\"}";
             }
         },
         pred.value);
@@ -258,8 +271,7 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                     [&](const auto& v) -> std::string {
                         using V = std::decay_t<decltype(v)>;
                         if constexpr (std::is_same_v<V, std::int64_t>) {
-                            return "ibex::ops::int_lit(std::int64_t{" +
-                                   std::to_string(v) + "})";
+                            return "ibex::ops::int_lit(std::int64_t{" + std::to_string(v) + "})";
                         } else if constexpr (std::is_same_v<V, double>) {
                             return "ibex::ops::dbl_lit(" + format_double(v) + ")";
                         } else {
@@ -268,16 +280,14 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                     },
                     node.value);
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                return "ibex::ops::binop(ibex::ir::ArithmeticOp::" +
-                       emit_arith_op(node.op) + ", " +
-                       emit_expr(*node.left) + ", " +
-                       emit_expr(*node.right) + ")";
+                return "ibex::ops::binop(ibex::ir::ArithmeticOp::" + emit_arith_op(node.op) + ", " +
+                       emit_expr(*node.left) + ", " + emit_expr(*node.right) + ")";
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                std::string s =
-                    "ibex::ops::fn_call(\"" + escape_string(node.callee) + "\", {";
+                std::string s = "ibex::ops::fn_call(\"" + escape_string(node.callee) + "\", {";
                 bool first = true;
                 for (const auto& arg : node.args) {
-                    if (!first) s += ", ";
+                    if (!first)
+                        s += ", ";
                     first = false;
                     s += emit_expr(*arg);
                 }
@@ -291,23 +301,34 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
 
 auto Emitter::emit_compare_op(ir::CompareOp op) -> std::string {
     switch (op) {
-        case ir::CompareOp::Eq: return "Eq";
-        case ir::CompareOp::Ne: return "Ne";
-        case ir::CompareOp::Lt: return "Lt";
-        case ir::CompareOp::Le: return "Le";
-        case ir::CompareOp::Gt: return "Gt";
-        case ir::CompareOp::Ge: return "Ge";
+        case ir::CompareOp::Eq:
+            return "Eq";
+        case ir::CompareOp::Ne:
+            return "Ne";
+        case ir::CompareOp::Lt:
+            return "Lt";
+        case ir::CompareOp::Le:
+            return "Le";
+        case ir::CompareOp::Gt:
+            return "Gt";
+        case ir::CompareOp::Ge:
+            return "Ge";
     }
     return "Eq";
 }
 
 auto Emitter::emit_arith_op(ir::ArithmeticOp op) -> std::string {
     switch (op) {
-        case ir::ArithmeticOp::Add: return "Add";
-        case ir::ArithmeticOp::Sub: return "Sub";
-        case ir::ArithmeticOp::Mul: return "Mul";
-        case ir::ArithmeticOp::Div: return "Div";
-        case ir::ArithmeticOp::Mod: return "Mod";
+        case ir::ArithmeticOp::Add:
+            return "Add";
+        case ir::ArithmeticOp::Sub:
+            return "Sub";
+        case ir::ArithmeticOp::Mul:
+            return "Mul";
+        case ir::ArithmeticOp::Div:
+            return "Div";
+        case ir::ArithmeticOp::Mod:
+            return "Mod";
     }
     return "Add";
 }
@@ -337,13 +358,20 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
 
 auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {
     switch (func) {
-        case ir::AggFunc::Sum:   return "Sum";
-        case ir::AggFunc::Mean:  return "Mean";
-        case ir::AggFunc::Min:   return "Min";
-        case ir::AggFunc::Max:   return "Max";
-        case ir::AggFunc::Count: return "Count";
-        case ir::AggFunc::First: return "First";
-        case ir::AggFunc::Last:  return "Last";
+        case ir::AggFunc::Sum:
+            return "Sum";
+        case ir::AggFunc::Mean:
+            return "Mean";
+        case ir::AggFunc::Min:
+            return "Min";
+        case ir::AggFunc::Max:
+            return "Max";
+        case ir::AggFunc::Count:
+            return "Count";
+        case ir::AggFunc::First:
+            return "First";
+        case ir::AggFunc::Last:
+            return "Last";
     }
     return "Sum";
 }

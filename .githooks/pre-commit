@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Pre-commit: run clang-format on staged C++ files and fail if formatting changes.
+
+set -euo pipefail
+
+if ! command -v clang-format >/dev/null 2>&1; then
+    echo "warning: clang-format not found; skipping format check" >&2
+    exit 0
+fi
+
+FILES=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.hpp' || true)
+if [[ -z "${FILES}" ]]; then
+    exit 0
+fi
+
+FAILED=0
+while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    clang-format -i "$file"
+    git add "$file"
+    if ! clang-format --dry-run --Werror "$file"; then
+        FAILED=1
+    fi
+done <<< "$FILES"
+
+if [[ "$FAILED" -ne 0 ]]; then
+    echo "error: clang-format check failed. Run clang-format on the files above." >&2
+    exit 1
+fi

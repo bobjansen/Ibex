@@ -62,7 +62,32 @@ class Lowerer {
         if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
             return lower_identifier(*ident);
         }
+        if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            return lower_table_call(*call);
+        }
         return std::unexpected(LowerError{.message = "expected DataFrame expression"});
+    }
+
+    auto lower_table_call(const CallExpr& call) -> LowerResult {
+        if (call.callee == "read_csv") {
+            if (call.args.size() != 1) {
+                return std::unexpected(
+                    LowerError{.message = "read_csv expects exactly one argument"});
+            }
+            const auto* lit = std::get_if<LiteralExpr>(&call.args[0]->node);
+            if (lit == nullptr) {
+                return std::unexpected(
+                    LowerError{.message = "read_csv argument must be a string literal"});
+            }
+            const auto* path = std::get_if<std::string>(&lit->value);
+            if (path == nullptr) {
+                return std::unexpected(
+                    LowerError{.message = "read_csv argument must be a string"});
+            }
+            return builder_.scan(*path);
+        }
+        return std::unexpected(
+            LowerError{.message = "unknown table function: " + call.callee});
     }
 
     auto lower_identifier(const IdentifierExpr& ident) -> LowerResult {

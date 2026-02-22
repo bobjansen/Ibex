@@ -42,6 +42,9 @@ private:
     /// Emit an Expr expression builder call (inline).
     auto emit_expr(const ir::Expr& expr) -> std::string;
 
+    /// Emit a raw C++ value expression for extern call arguments (literals only).
+    auto emit_raw_expr(const ir::Expr& expr) -> std::string;
+
     auto emit_compare_op(ir::CompareOp op) -> std::string;
     auto emit_arith_op(ir::ArithmeticOp op) -> std::string;
     auto emit_agg_func(ir::AggFunc func) -> std::string;

@@ -1,7 +1,8 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
-#include <ibex/runtime/csv.hpp>
 #include <ibex/runtime/interpreter.hpp>
+
+#include <csv.hpp>
 
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
@@ -156,14 +157,16 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
-    auto table = ibex::runtime::read_csv_simple(csv_path);
-    if (!table) {
-        fmt::print("error: failed to read CSV: {}\n", table.error());
+    ibex::runtime::Table table;
+    try {
+        table = read_csv(csv_path);
+    } catch (const std::exception& e) {
+        fmt::print("error: failed to read CSV: {}\n", e.what());
         return 1;
     }
 
     ibex::runtime::TableRegistry tables;
-    tables.emplace("prices", std::move(*table));
+    tables.emplace("prices", std::move(table));
 
     // Single-column group-by: exercises the string fast path (robin_hood).
     std::vector<BenchQuery> queries = {
@@ -202,13 +205,15 @@ int main(int argc, char** argv) {
 
     // Multi-column group-by: exercises the compound-key fallback path (std::unordered_map<Key>).
     if (status == 0 && !csv_multi_path.empty()) {
-        auto multi_table = ibex::runtime::read_csv_simple(csv_multi_path);
-        if (!multi_table) {
-            fmt::print("error: failed to read multi CSV: {}\n", multi_table.error());
+        ibex::runtime::Table multi_table;
+        try {
+            multi_table = read_csv(csv_multi_path);
+        } catch (const std::exception& e) {
+            fmt::print("error: failed to read multi CSV: {}\n", e.what());
             return 1;
         }
         ibex::runtime::TableRegistry multi_tables;
-        multi_tables.emplace("prices_multi", std::move(*multi_table));
+        multi_tables.emplace("prices_multi", std::move(multi_table));
 
         // ~1008 distinct (symbol, day) groups across 4M rows.
         std::vector<BenchQuery> multi_queries = {

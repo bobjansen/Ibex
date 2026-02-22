@@ -1564,6 +1564,32 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
         }
         case ir::NodeKind::Window:
             return std::unexpected("window not supported in interpreter");
+        case ir::NodeKind::ExternCall: {
+            const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+            if (externs == nullptr) {
+                return std::unexpected("extern call with no registry: " + ec.callee());
+            }
+            const auto* fn = externs->find(ec.callee());
+            if (fn == nullptr) {
+                return std::unexpected("unknown extern function: " + ec.callee());
+            }
+            if (fn->kind != ExternReturnKind::Table) {
+                return std::unexpected("extern function does not return a table: " + ec.callee());
+            }
+            ExternArgs args;
+            args.reserve(ec.args().size());
+            for (const auto& arg : ec.args()) {
+                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+                if (!val) return std::unexpected(val.error());
+                args.push_back(std::move(val.value()));
+            }
+            auto result = fn->func(args);
+            if (!result) return std::unexpected(result.error());
+            if (auto* table = std::get_if<Table>(&result.value())) {
+                return std::move(*table);
+            }
+            return std::unexpected("extern function did not return a table: " + ec.callee());
+        }
     }
     return std::unexpected("unknown node kind");
 }

@@ -115,6 +115,7 @@ enum class NodeKind : std::uint8_t {
     Aggregate,
     Update,
     Window,
+    ExternCall,
 };
 
 /// Base IR node for the query plan.
@@ -232,6 +233,27 @@ public:
 private:
     std::vector<FieldSpec> fields_;
     std::vector<ColumnRef> group_by_;
+};
+
+/// ExternCall node: calls a table-returning extern C++ function.
+///
+/// This is produced by the lowerer when it sees a call to a declared extern fn
+/// whose return type is DataFrame or TimeFrame.  At interpret time the call is
+/// dispatched through the ExternRegistry; at compile time the emitter emits a
+/// direct C++ function call.
+class ExternCallNode final : public Node {
+public:
+    ExternCallNode(NodeId id, std::string callee, std::vector<Expr> args)
+        : Node(NodeKind::ExternCall, id),
+          callee_(std::move(callee)),
+          args_(std::move(args)) {}
+
+    [[nodiscard]] auto callee() const noexcept -> const std::string& { return callee_; }
+    [[nodiscard]] auto args() const noexcept -> const std::vector<Expr>& { return args_; }
+
+private:
+    std::string callee_;
+    std::vector<Expr> args_;
 };
 
 /// Window node: specifies a time-based window for rolling computations.

@@ -1,4 +1,4 @@
-#include <ibex/runtime/csv.hpp>
+#include <csv.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -15,10 +15,9 @@ TEST_CASE("Read simple CSV") {
         out << "30,A\n";
     }
 
-    auto table = ibex::runtime::read_csv_simple(path.string());
-    REQUIRE(table.has_value());
-    const auto* price_col = table->find("price");
-    const auto* symbol_col = table->find("symbol");
+    auto table = read_csv(path.string());
+    const auto* price_col = table.find("price");
+    const auto* symbol_col = table.find("symbol");
     REQUIRE(price_col != nullptr);
     REQUIRE(symbol_col != nullptr);
     const auto* prices = std::get_if<ibex::Column<std::int64_t>>(price_col);

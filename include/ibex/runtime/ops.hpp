@@ -14,8 +14,6 @@ namespace ibex::ops {
 //─── Core table operations ────────────────────────────────────────────────────
 // These are the functions emitted by ibex_compile into the generated C++ file.
 
-[[nodiscard]] auto scan(std::string_view csv_path) -> runtime::Table;
-
 [[nodiscard]] auto filter(const runtime::Table& t, ir::FilterPredicate pred)
     -> runtime::Table;
 

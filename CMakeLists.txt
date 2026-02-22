@@ -12,6 +12,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
 endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Project options
 option(IBEX_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
@@ -50,6 +51,9 @@ target_link_libraries(ibex_lib
         Ibex::runtime
         Ibex::codegen
 )
+
+# Plugin libraries
+add_subdirectory(libraries)
 
 # Tools
 if(IBEX_BUILD_TOOLS)

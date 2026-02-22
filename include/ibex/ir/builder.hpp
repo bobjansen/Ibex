@@ -42,6 +42,10 @@ public:
         return std::make_unique<WindowNode>(next_id(), duration);
     }
 
+    [[nodiscard]] auto extern_call(std::string callee, std::vector<Expr> args) -> NodePtr {
+        return std::make_unique<ExternCallNode>(next_id(), std::move(callee), std::move(args));
+    }
+
 private:
     [[nodiscard]] auto next_id() -> NodeId {
         return next_id_.fetch_add(1, std::memory_order_relaxed);

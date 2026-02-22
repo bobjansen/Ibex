@@ -44,6 +44,7 @@ fi
 # ── Include / library paths from the build tree ──────────────────────────────
 IBEX_INCS=(
     "-I$IBEX_ROOT/include"
+    "-I$IBEX_ROOT/libraries"
     "-I$BUILD_DIR/_deps/fmt-src/include"
     "-I$BUILD_DIR/_deps/spdlog-src/include"
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"

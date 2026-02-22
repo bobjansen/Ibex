@@ -1,6 +1,7 @@
 #include <ibex/repl/repl.hpp>
-#include <ibex/runtime/extern_functions.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+
+#include <csv.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -31,7 +32,24 @@ TEST_CASE("REPL loads script with inferred lets") {
         source.replace(pos, token.size(), IBEX_SOURCE_DIR);
         pos += std::char_traits<char>::length(IBEX_SOURCE_DIR);
     }
+
     ibex::runtime::ExternRegistry registry;
-    ibex::runtime::register_read_csv(registry);
+    registry.register_table(
+        "read_csv",
+        [](const ibex::runtime::ExternArgs& args) -> std::expected<ibex::runtime::ExternValue, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("read_csv() expects 1 argument");
+            }
+            const auto* path = std::get_if<std::string>(&args[0]);
+            if (path == nullptr) {
+                return std::unexpected("read_csv() expects a string path");
+            }
+            try {
+                return ibex::runtime::ExternValue{read_csv(*path)};
+            } catch (const std::exception& e) {
+                return std::unexpected(std::string(e.what()));
+            }
+        });
+
     REQUIRE(ibex::repl::execute_script(source, registry));
 }

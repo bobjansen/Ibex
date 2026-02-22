@@ -3,6 +3,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 
 #include <string>
+#include <vector>
 
 namespace ibex::repl {
 
@@ -10,6 +11,10 @@ namespace ibex::repl {
 struct ReplConfig {
     bool verbose = false;
     std::string prompt = "ibex> ";
+    /// Directories searched (in order) for plugin shared libraries (*.so).
+    /// When a script declares `extern fn foo(...) from "bar.hpp"`, the REPL
+    /// looks for `bar.so` in each of these directories and loads it via dlopen.
+    std::vector<std::string> plugin_search_paths;
 };
 
 /// Run the interactive REPL loop.

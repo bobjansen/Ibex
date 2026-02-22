@@ -1,7 +1,6 @@
 #include <ibex/runtime/ops.hpp>
 
 #include <ibex/ir/builder.hpp>
-#include <ibex/runtime/csv.hpp>
 
 #include <fmt/format.h>
 
@@ -58,14 +57,6 @@ auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::stri
 }  // namespace
 
 //─── Core ops ─────────────────────────────────────────────────────────────────
-
-auto scan(std::string_view csv_path) -> runtime::Table {
-    auto result = runtime::read_csv_simple(csv_path);
-    if (!result) {
-        throw std::runtime_error("scan: " + result.error());
-    }
-    return std::move(*result);
-}
 
 auto filter(const runtime::Table& t, ir::FilterPredicate pred) -> runtime::Table {
     ir::Builder b;

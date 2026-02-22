@@ -90,13 +90,9 @@ auto Emitter::fresh_var() -> std::string {
 auto Emitter::emit_node(const ir::Node& node) -> std::string {
     // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
     switch (node.kind()) {
-        case ir::NodeKind::Scan: {
-            const auto& scan = static_cast<const ir::ScanNode&>(node);
-            auto var = fresh_var();
-            *out_ << "    auto " << var << " = ibex::ops::scan(\""
-                  << escape_string(scan.source_name()) << "\");\n";
-            return var;
-        }
+        case ir::NodeKind::Scan:
+            throw std::runtime_error(
+                "ibex_compile: ScanNode cannot be emitted — use 'extern fn' to declare data sources");
 
         case ir::NodeKind::Filter: {
             const auto& filter = static_cast<const ir::FilterNode&>(node);
@@ -172,6 +168,20 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         case ir::NodeKind::Window:
             throw std::runtime_error(
                 "ibex_compile: WindowNode emission is not yet supported");
+
+        case ir::NodeKind::ExternCall: {
+            const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = " << ec.callee() << "(";
+            bool first = true;
+            for (const auto& arg : ec.args()) {
+                if (!first) *out_ << ", ";
+                first = false;
+                *out_ << emit_raw_expr(arg);
+            }
+            *out_ << ");\n";
+            return var;
+        }
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     throw std::runtime_error("ibex_compile: unknown IR node kind");
@@ -268,6 +278,29 @@ auto Emitter::emit_arith_op(ir::ArithmeticOp op) -> std::string {
         case ir::ArithmeticOp::Mod: return "Mod";
     }
     return "Add";
+}
+
+auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
+    return std::visit(
+        [&](const auto& node) -> std::string {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::Literal>) {
+                return std::visit(
+                    [&](const auto& v) -> std::string {
+                        using V = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<V, std::int64_t>) {
+                            return std::to_string(v);
+                        } else if constexpr (std::is_same_v<V, double>) {
+                            return format_double(v);
+                        } else {
+                            return "\"" + escape_string(v) + "\"";
+                        }
+                    },
+                    node.value);
+            }
+            throw std::runtime_error("ibex_compile: non-literal argument in extern call");
+        },
+        expr.node);
 }
 
 auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {

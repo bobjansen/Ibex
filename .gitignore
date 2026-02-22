@@ -21,4 +21,5 @@ Thumbs.db
 
 # Data
 *.csv
+*.so
 tests/data/iris

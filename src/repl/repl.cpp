@@ -10,13 +10,17 @@
 
 #include <algorithm>
 #include <charconv>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <variant>
+
+#include <dlfcn.h>
 
 namespace ibex::repl {
 
@@ -789,14 +793,60 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     return std::unexpected("unsupported return type");
 }
 
+/// Derive the plugin filename stem from a source_path like "csv.hpp" -> "csv".
+auto plugin_stem(const std::string& source_path) -> std::string {
+    std::filesystem::path p(source_path);
+    return p.stem().string();
+}
+
+/// Try to load a plugin shared library for the given stem from the search paths.
+/// Returns true if the plugin was loaded (or was already loaded), false on failure.
+auto try_load_plugin(const std::string& stem,
+                     const std::vector<std::string>& search_paths,
+                     std::unordered_set<std::string>& loaded_plugins,
+                     runtime::ExternRegistry& externs) -> bool {
+    if (loaded_plugins.contains(stem)) {
+        return true;
+    }
+    std::string filename = stem + ".so";
+    for (const auto& dir : search_paths) {
+        auto full_path = std::filesystem::path(dir) / filename;
+        void* handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            continue;
+        }
+        using RegisterFn = void (*)(runtime::ExternRegistry*);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        auto* fn = reinterpret_cast<RegisterFn>(dlsym(handle, "ibex_register"));
+        if (fn == nullptr) {
+            dlclose(handle);
+            fmt::print("warning: plugin '{}' has no ibex_register symbol\n", full_path.string());
+            continue;
+        }
+        fn(&externs);
+        loaded_plugins.insert(stem);
+        spdlog::debug("loaded plugin: {}", full_path.string());
+        return true;
+    }
+    return false;
+}
+
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
                         FunctionRegistry& functions, ExternDeclRegistry& extern_decls,
-                        runtime::ExternRegistry& externs) -> bool {
+                        runtime::ExternRegistry& externs,
+                        const std::vector<std::string>& plugin_search_paths,
+                        std::unordered_set<std::string>& loaded_plugins) -> bool {
     for (auto& stmt : statements) {
         if (std::holds_alternative<parser::ExternDecl>(stmt)) {
             const auto& decl = std::get<parser::ExternDecl>(stmt);
             extern_decls.insert_or_assign(decl.name, decl);
+            if (!decl.source_path.empty()) {
+                auto stem = plugin_stem(decl.source_path);
+                if (!try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs)) {
+                    fmt::print("warning: could not find plugin '{}.so' in search path\n", stem);
+                }
+            }
             continue;
         }
         if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
@@ -938,8 +988,10 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry) 
     ColumnRegistry columns;
     FunctionRegistry functions;
     ExternDeclRegistry extern_decls;
+    std::vector<std::string> no_paths;
+    std::unordered_set<std::string> loaded_plugins;
     return execute_statements(parsed->statements, tables, scalars, columns, functions,
-                              extern_decls, registry);
+                              extern_decls, registry, no_paths, loaded_plugins);
 }
 
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
@@ -950,6 +1002,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     ColumnRegistry columns;
     FunctionRegistry functions;
     ExternDeclRegistry extern_decls;
+    std::unordered_set<std::string> loaded_plugins;
 
     std::string line;
     while (true) {
@@ -1057,7 +1110,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 continue;
             }
             if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
-                                    extern_decls, registry)) {
+                                    extern_decls, registry, config.plugin_search_paths,
+                                    loaded_plugins)) {
                 continue;
             }
             continue;
@@ -1071,7 +1125,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         }
 
         execute_statements(parsed->statements, tables, scalars, columns, functions, extern_decls,
-                           registry);
+                           registry, config.plugin_search_paths, loaded_plugins);
     }
 
     spdlog::info("Ibex REPL exiting");

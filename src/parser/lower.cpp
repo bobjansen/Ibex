@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ibex::parser {
 
@@ -20,7 +21,13 @@ class Lowerer {
     auto lower_program(const Program& program) -> LowerResult {
         ir::NodePtr last_expr;
         for (const auto& stmt : program.statements) {
-            if (std::holds_alternative<ExternDecl>(stmt)) {
+            if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
+                // Track externs that return a table so lower_table_call can
+                // produce ExternCallNodes for them.
+                if (ext->return_type.kind == Type::Kind::DataFrame ||
+                    ext->return_type.kind == Type::Kind::TimeFrame) {
+                    table_externs_.insert(ext->name);
+                }
                 continue;
             }
             if (std::holds_alternative<FunctionDecl>(stmt)) {
@@ -69,25 +76,20 @@ class Lowerer {
     }
 
     auto lower_table_call(const CallExpr& call) -> LowerResult {
-        if (call.callee == "read_csv") {
-            if (call.args.size() != 1) {
-                return std::unexpected(
-                    LowerError{.message = "read_csv expects exactly one argument"});
-            }
-            const auto* lit = std::get_if<LiteralExpr>(&call.args[0]->node);
-            if (lit == nullptr) {
-                return std::unexpected(
-                    LowerError{.message = "read_csv argument must be a string literal"});
-            }
-            const auto* path = std::get_if<std::string>(&lit->value);
-            if (path == nullptr) {
-                return std::unexpected(
-                    LowerError{.message = "read_csv argument must be a string"});
-            }
-            return builder_.scan(*path);
+        if (!table_externs_.contains(call.callee)) {
+            return std::unexpected(
+                LowerError{.message = "unknown table function: " + call.callee});
         }
-        return std::unexpected(
-            LowerError{.message = "unknown table function: " + call.callee});
+        std::vector<ir::Expr> args;
+        args.reserve(call.args.size());
+        for (const auto& arg : call.args) {
+            auto expr = lower_expr_to_ir(*arg);
+            if (!expr.has_value()) {
+                return std::unexpected(expr.error());
+            }
+            args.push_back(std::move(expr.value()));
+        }
+        return builder_.extern_call(call.callee, std::move(args));
     }
 
     auto lower_identifier(const IdentifierExpr& ident) -> LowerResult {
@@ -781,6 +783,10 @@ class Lowerer {
                 auto clone = builder_.window(window.duration());
                 return clone;
             }
+            case ir::NodeKind::ExternCall: {
+                const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+                return builder_.extern_call(ec.callee(), ec.args());
+            }
         }
         return nullptr;
     }
@@ -788,6 +794,7 @@ class Lowerer {
 
     ir::Builder builder_;
     std::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
+    std::unordered_set<std::string> table_externs_;
 };
 
 }  // namespace

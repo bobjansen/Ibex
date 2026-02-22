@@ -51,8 +51,7 @@ int main(int argc, char* argv[]) {
     config.source_name = input_path;
     for (const auto& stmt : program->statements) {
         if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
-            // read_csv is handled natively by ibex::ops::scan; skip its header.
-            if (!ext->source_path.empty() && ext->name != "read_csv") {
+            if (!ext->source_path.empty()) {
                 config.extern_headers.push_back(ext->source_path);
             }
         }

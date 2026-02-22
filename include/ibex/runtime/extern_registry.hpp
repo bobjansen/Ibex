@@ -36,18 +36,16 @@ class ExternRegistry {
 
     /// Register a scalar-returning extern function.
     void register_scalar(std::string name, ScalarKind kind, ExternFn func) {
-        registry_.insert_or_assign(std::move(name),
-                                   ExternFunction{.func = std::move(func),
-                                                  .kind = ExternReturnKind::Scalar,
-                                                  .scalar_kind = kind});
+        registry_.insert_or_assign(std::move(name), ExternFunction{.func = std::move(func),
+                                                                   .kind = ExternReturnKind::Scalar,
+                                                                   .scalar_kind = kind});
     }
 
     /// Register a table-returning extern function.
     void register_table(std::string name, ExternFn func) {
-        registry_.insert_or_assign(std::move(name),
-                                   ExternFunction{.func = std::move(func),
-                                                  .kind = ExternReturnKind::Table,
-                                                  .scalar_kind = std::nullopt});
+        registry_.insert_or_assign(std::move(name), ExternFunction{.func = std::move(func),
+                                                                   .kind = ExternReturnKind::Table,
+                                                                   .scalar_kind = std::nullopt});
     }
 
     /// Look up a registered function by name.

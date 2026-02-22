@@ -1,7 +1,6 @@
-#include <csv.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
+#include <csv.hpp>
 #include <filesystem>
 #include <fstream>
 

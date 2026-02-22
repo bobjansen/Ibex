@@ -28,8 +28,7 @@ auto col_str(const runtime::Table& t, const std::string& name) -> std::vector<st
     return std::vector<std::string>(values->begin(), values->end());
 }
 
-auto interpret_expr(std::string_view src, const runtime::TableRegistry& tables)
-    -> runtime::Table {
+auto interpret_expr(std::string_view src, const runtime::TableRegistry& tables) -> runtime::Table {
     auto parsed = parser::parse(src);
     REQUIRE(parsed.has_value());
     auto lowered = parser::lower(*parsed);

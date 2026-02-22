@@ -2,5 +2,9 @@ fn square(a: Int) -> Int {
   a * a;
 }
 
+extern fn read_csv(path: String) -> DataFrame<{}> from "csv.hpp";
+
 let prices = trades[select { price }];
+// Schema omitted for this demo; column headers in iris.csv contain dots.
+let iris = read_csv("${IBEX_SOURCE_DIR}/data/iris.csv");
 let total = scalar(trades[select { total = sum(price) }], total);

@@ -21,3 +21,4 @@ Thumbs.db
 
 # Data
 *.csv
+tests/data/iris

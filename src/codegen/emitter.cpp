@@ -53,12 +53,12 @@ auto format_double(double v) -> std::string {
 
 // ─── Public ──────────────────────────────────────────────────────────────────
 
-auto Emitter::indent_code(const std::string& code, int spaces) -> std::string {
+auto Emitter::indent_code(const std::string& code, size_t spaces) -> std::string {
     if (spaces <= 0 || code.empty())
         return code;
     std::string prefix(spaces, ' ');
     std::string result;
-    result.reserve(code.size() + prefix.size() * 16);
+    result.reserve(code.size() + (prefix.size() * 16));
     bool at_start = true;
     for (char c : code) {
         if (at_start && c != '\n') {
@@ -152,9 +152,10 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
 }
 
 void Emitter::collect_extern_calls(const ir::Node& node) {
-    if (cached_vars_.count(&node))
+    if (cached_vars_.contains(&node))
         return;
     if (node.kind() == ir::NodeKind::ExternCall) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& ec = static_cast<const ir::ExternCallNode&>(node);
         auto var = fresh_var();
         *out_ << "    auto " << var << " = " << ec.callee() << "(";

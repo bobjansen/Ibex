@@ -2,6 +2,7 @@
 
 #include <ibex/ir/node.hpp>
 
+#include <cstddef>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -68,7 +69,7 @@ class Emitter {
     static auto emit_agg_func(ir::AggFunc func) -> std::string;
 
     /// Prefix every line in `code` with `spaces` additional spaces.
-    static auto indent_code(const std::string& code, int spaces) -> std::string;
+    static auto indent_code(const std::string& code, size_t spaces) -> std::string;
 };
 
 }  // namespace ibex::codegen

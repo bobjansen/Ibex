@@ -72,9 +72,12 @@ bench("data.table", "ohlc_by_symbol",
                       last = data.table::last(price)),
                   by = symbol])
 
+copies <- lapply(seq_len(warmup + iters), function(...) copy(dt))
+copy_idx <- 0
 bench("data.table", "update_price_x2",
     function() {
-        tmp <- copy(dt)
+        copy_idx <<- copy_idx + 1
+        tmp <- copies[[copy_idx]]
         tmp[, price_x2 := price * 2][]
     })
 

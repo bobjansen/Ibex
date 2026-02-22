@@ -278,7 +278,7 @@ auto filter_table(const Table& input, const ir::FilterPredicate& predicate,
 
     Table output;
     for (const auto& entry : input.columns) {
-        output.add_column(entry.name, make_empty_like(entry.column));
+        output.add_column(entry.name, make_empty_like(*entry.column));
     }
 
     for (std::size_t row = 0; row < rows; ++row) {
@@ -290,7 +290,7 @@ auto filter_table(const Table& input, const ir::FilterPredicate& predicate,
             if (source == nullptr) {
                 return std::unexpected("filter column missing: " + entry.name);
             }
-            append_value(entry.column, *source, row);
+            append_value(*entry.column, *source, row);
         }
     }
     return output;
@@ -523,36 +523,137 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
     if (left->kind == ExprType::String || right->kind == ExprType::String) {
         return std::nullopt;
     }
-    if (output_kind == ExprType::Double) {
+    // Helper: dispatch on (op × layout) OUTSIDE the inner loop so each resulting
+    // loop body is a branch-free array kernel that the compiler can auto-vectorize.
+    // `run` receives a stateless lambda (unique type per op) and executes the
+    // appropriate col/col, col/scalar, or scalar/col loop.
+    auto make_double_result = [&](auto op_fn, const double* lp, double ls, const double* rp,
+                                  double rs) -> ColumnValue {
         Column<double> out;
+        out.resize(rows);
+        double* dst = out.data();
+        if (lp && rp) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = op_fn(lp[i], rp[i]);
+        } else if (lp) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = op_fn(lp[i], rs);
+        } else {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = op_fn(ls, rp[i]);
+        }
+        return ColumnValue{std::move(out)};
+    };
+    auto make_int_result = [&](auto op_fn, const std::int64_t* lp, std::int64_t ls,
+                               const std::int64_t* rp, std::int64_t rs) -> ColumnValue {
+        Column<std::int64_t> out;
+        out.resize(rows);
+        std::int64_t* dst = out.data();
+        if (lp && rp) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = op_fn(lp[i], rp[i]);
+        } else if (lp) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = op_fn(lp[i], rs);
+        } else {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = op_fn(ls, rp[i]);
+        }
+        return ColumnValue{std::move(out)};
+    };
+
+    if (output_kind == ExprType::Double) {
         if (!left->is_column && !right->is_column) {
             double value =
                 apply_double_op(bin->op, get_double_value(*left, 0), get_double_value(*right, 0));
+            Column<double> out;
             out.assign(rows, value);
             return ColumnValue{std::move(out)};
         }
-        out.reserve(rows);
-        for (std::size_t row = 0; row < rows; ++row) {
-            double lhs = get_double_value(*left, row);
-            double rhs = get_double_value(*right, row);
-            out.push_back(apply_double_op(bin->op, lhs, rhs));
+        // Hoist all variant/type dispatch outside the inner loop.
+        // Falls back to nullptr + scalar=0 for int-typed columns (uncommon path
+        // handled by the fallback reserve+push_back loop below).
+        const double* lp = (left->is_column && left->kind == ExprType::Double)
+                               ? std::get<Column<double>>(*left->column).data()
+                               : nullptr;
+        const double* rp = (right->is_column && right->kind == ExprType::Double)
+                               ? std::get<Column<double>>(*right->column).data()
+                               : nullptr;
+        double ls = left->is_column ? 0.0 : get_double_value(*left, 0);
+        double rs = right->is_column ? 0.0 : get_double_value(*right, 0);
+        // Only take the SIMD path when every used operand resolved to a raw pointer.
+        bool left_ok = !left->is_column || lp != nullptr;
+        bool right_ok = !right->is_column || rp != nullptr;
+        if (left_ok && right_ok) {
+            // Dispatch on op once, outside the loop, so each kernel is branch-free.
+            switch (bin->op) {
+                case ir::ArithmeticOp::Add:
+                    return make_double_result([](double a, double b) { return a + b; }, lp, ls, rp,
+                                              rs);
+                case ir::ArithmeticOp::Sub:
+                    return make_double_result([](double a, double b) { return a - b; }, lp, ls, rp,
+                                              rs);
+                case ir::ArithmeticOp::Mul:
+                    return make_double_result([](double a, double b) { return a * b; }, lp, ls, rp,
+                                              rs);
+                case ir::ArithmeticOp::Div:
+                    return make_double_result([](double a, double b) { return a / b; }, lp, ls, rp,
+                                              rs);
+                case ir::ArithmeticOp::Mod:
+                    return make_double_result([](double a, double b) { return std::fmod(a, b); },
+                                              lp, ls, rp, rs);
+            }
         }
+        // Fallback: handles int-column inputs that need cast-to-double.
+        Column<double> out;
+        out.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+            out.push_back(apply_double_op(bin->op, get_double_value(*left, row),
+                                          get_double_value(*right, row)));
         return ColumnValue{std::move(out)};
     }
     if (output_kind == ExprType::Int) {
-        Column<std::int64_t> out;
         if (!left->is_column && !right->is_column) {
             std::int64_t value =
                 apply_int_op(bin->op, get_int_value(*left, 0), get_int_value(*right, 0));
+            Column<std::int64_t> out;
             out.assign(rows, value);
             return ColumnValue{std::move(out)};
         }
-        out.reserve(rows);
-        for (std::size_t row = 0; row < rows; ++row) {
-            std::int64_t lhs = get_int_value(*left, row);
-            std::int64_t rhs = get_int_value(*right, row);
-            out.push_back(apply_int_op(bin->op, lhs, rhs));
+        const std::int64_t* lp = (left->is_column && left->kind == ExprType::Int)
+                                     ? std::get<Column<std::int64_t>>(*left->column).data()
+                                     : nullptr;
+        const std::int64_t* rp = (right->is_column && right->kind == ExprType::Int)
+                                     ? std::get<Column<std::int64_t>>(*right->column).data()
+                                     : nullptr;
+        std::int64_t ls = left->is_column ? 0 : get_int_value(*left, 0);
+        std::int64_t rs = right->is_column ? 0 : get_int_value(*right, 0);
+        bool left_ok = !left->is_column || lp != nullptr;
+        bool right_ok = !right->is_column || rp != nullptr;
+        if (left_ok && right_ok) {
+            switch (bin->op) {
+                case ir::ArithmeticOp::Add:
+                    return make_int_result([](std::int64_t a, std::int64_t b) { return a + b; }, lp,
+                                           ls, rp, rs);
+                case ir::ArithmeticOp::Sub:
+                    return make_int_result([](std::int64_t a, std::int64_t b) { return a - b; }, lp,
+                                           ls, rp, rs);
+                case ir::ArithmeticOp::Mul:
+                    return make_int_result([](std::int64_t a, std::int64_t b) { return a * b; }, lp,
+                                           ls, rp, rs);
+                case ir::ArithmeticOp::Div:
+                    return make_int_result([](std::int64_t a, std::int64_t b) { return a / b; }, lp,
+                                           ls, rp, rs);
+                case ir::ArithmeticOp::Mod:
+                    return make_int_result([](std::int64_t a, std::int64_t b) { return a % b; }, lp,
+                                           ls, rp, rs);
+            }
         }
+        Column<std::int64_t> out;
+        out.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row)
+            out.push_back(
+                apply_int_op(bin->op, get_int_value(*left, row), get_int_value(*right, row)));
         return ColumnValue{std::move(out)};
     }
     return std::nullopt;
@@ -625,7 +726,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
     for (const auto& entry : left.columns) {
         out_names.insert(entry.name);
-        output.add_column(entry.name, make_empty_like(entry.column));
+        output.add_column(entry.name, make_empty_like(*entry.column));
     }
 
     struct RightOut {
@@ -643,8 +744,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             name += "_right";
         }
         out_names.insert(name);
-        output.add_column(name, make_empty_like(entry.column));
-        right_out.push_back(RightOut{&entry.column, output.columns.size() - 1});
+        output.add_column(name, make_empty_like(*entry.column));
+        right_out.push_back(RightOut{entry.column.get(), output.columns.size() - 1});
     }
 
     std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_index;
@@ -660,19 +761,19 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
     auto append_left_row = [&](std::size_t row) {
         for (std::size_t i = 0; i < left.columns.size(); ++i) {
-            append_value(output.columns[i].column, left.columns[i].column, row);
+            append_value(*output.columns[i].column, *left.columns[i].column, row);
         }
     };
 
     auto append_right_row = [&](std::size_t row) {
         for (const auto& item : right_out) {
-            append_value(output.columns[item.out_index].column, *item.column, row);
+            append_value(*output.columns[item.out_index].column, *item.column, row);
         }
     };
 
     auto append_right_defaults = [&]() {
         for (const auto& item : right_out) {
-            append_scalar(output.columns[item.out_index].column,
+            append_scalar(*output.columns[item.out_index].column,
                           default_scalar_for_column(*item.column));
         }
     };
@@ -1926,24 +2027,26 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
 void Table::add_column(std::string name, ColumnValue column) {
     if (auto it = index.find(name); it != index.end()) {
-        columns[it->second].column = std::move(column);
+        // Reseat the shared_ptr rather than mutating shared data (copy-on-write).
+        columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
         return;
     }
     std::size_t pos = columns.size();
-    columns.push_back(ColumnEntry{.name = std::move(name), .column = std::move(column)});
+    columns.push_back(ColumnEntry{.name = std::move(name),
+                                  .column = std::make_shared<ColumnValue>(std::move(column))});
     index[columns.back().name] = pos;
 }
 
 auto Table::find(const std::string& name) -> ColumnValue* {
     if (auto it = index.find(name); it != index.end()) {
-        return &columns[it->second].column;
+        return columns[it->second].column.get();
     }
     return nullptr;
 }
 
 auto Table::find(const std::string& name) const -> const ColumnValue* {
     if (auto it = index.find(name); it != index.end()) {
-        return &columns[it->second].column;
+        return columns[it->second].column.get();
     }
     return nullptr;
 }
@@ -1952,7 +2055,7 @@ auto Table::rows() const noexcept -> std::size_t {
     if (columns.empty()) {
         return 0;
     }
-    return column_size(columns.front().column);
+    return column_size(*columns.front().column);
 }
 
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,

@@ -54,7 +54,7 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
         fmt::print("  ");
         for (std::size_t col = 0; col < table.columns.size(); ++col) {
             const auto& entry = table.columns[col];
-            std::visit([&](const auto& column) { fmt::print("{}", column[row]); }, entry.column);
+            std::visit([&](const auto& column) { fmt::print("{}", column[row]); }, *entry.column);
             if (col + 1 < table.columns.size()) {
                 fmt::print("\t");
             }
@@ -185,7 +185,7 @@ std::string column_type_name(const runtime::ColumnValue& column) {
 void print_schema(const runtime::Table& table) {
     fmt::print("columns:\n");
     for (const auto& entry : table.columns) {
-        fmt::print("  {}: {}\n", entry.name, column_type_name(entry.column));
+        fmt::print("  {}: {}\n", entry.name, column_type_name(*entry.column));
     }
 }
 
@@ -669,7 +669,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         if (table->columns.size() != 1) {
                             return std::unexpected("Column argument must have exactly one column");
                         }
-                        local_columns.insert_or_assign(param.name, table->columns.front().column);
+                        local_columns.insert_or_assign(param.name, *table->columns.front().column);
                         break;
                     }
                     return std::unexpected("Column argument must be a column or table");
@@ -715,7 +715,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     if (table->columns.size() != 1) {
                         return std::unexpected("Column binding must have exactly one column");
                     }
-                    local_columns.insert_or_assign(let_stmt.name, table->columns.front().column);
+                    local_columns.insert_or_assign(let_stmt.name, *table->columns.front().column);
                 } else {
                     return std::unexpected("Column binding must be a column or table");
                 }
@@ -771,7 +771,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             if (table->columns.size() != 1) {
                 return std::unexpected("Column return must have exactly one column");
             }
-            return EvalValue{table->columns.front().column};
+            return EvalValue{*table->columns.front().column};
         }
         return std::unexpected("function return type mismatch (expected column)");
     }
@@ -905,7 +905,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             fmt::print("error: column return must have exactly one column\n");
                             return false;
                         }
-                        columns.insert_or_assign(let_stmt.name, table->columns.front().column);
+                        columns.insert_or_assign(let_stmt.name, *table->columns.front().column);
                         continue;
                     }
                     fmt::print("error: expected column return for {}\n", let_stmt.name);

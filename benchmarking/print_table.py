@@ -13,6 +13,7 @@ FRAMEWORK_ORDER = ["ibex", "ibex+parse", "polars", "pandas", "data.table", "dply
 QUERY_ORDER = [
     "mean_by_symbol",
     "ohlc_by_symbol",
+    "update_price_x2",
     "count_by_symbol_day",
     "mean_by_symbol_day",
     "ohlc_by_symbol_day",
@@ -21,6 +22,7 @@ QUERY_ORDER = [
 QUERY_LABEL = {
     "mean_by_symbol":      "mean by symbol",
     "ohlc_by_symbol":      "OHLC by symbol",
+    "update_price_x2":     "update price×2",
     "count_by_symbol_day": "count by symbol×day",
     "mean_by_symbol_day":  "mean by symbol×day",
     "ohlc_by_symbol_day":  "OHLC by symbol×day",

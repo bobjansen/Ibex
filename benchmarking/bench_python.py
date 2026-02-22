@@ -50,6 +50,9 @@ def bench_pandas(csv_path, csv_multi_path, warmup, iters):
             last=("price", "last"),
         ).reset_index())
 
+    run("update_price_x2",
+        lambda: df.assign(price_x2=df["price"] * 2))
+
     if csv_multi_path:
         print("pandas: loading multi...", file=sys.stderr, flush=True)
         dfm = pd.read_csv(csv_multi_path)
@@ -95,6 +98,9 @@ def bench_polars(csv_path, csv_multi_path, warmup, iters):
             pl.col("price").min().alias("low"),
             pl.col("price").last().alias("last"),
         ))
+
+    run("update_price_x2",
+        lambda: df.with_columns((pl.col("price") * 2).alias("price_x2")))
 
     if csv_multi_path:
         print("polars: loading multi...", file=sys.stderr, flush=True)

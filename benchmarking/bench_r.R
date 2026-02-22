@@ -58,8 +58,6 @@ bench <- function(framework, name, fn) {
 # ── Load single-key data ──────────────────────────────────────────────────────
 message("data.table: loading prices.csv...")
 dt <- fread(csv_path)
-message("dplyr: using same tibble...")
-tb <- as_tibble(dt)
 
 # ── Single-column group-by ────────────────────────────────────────────────────
 message("\n=== data.table ===")
@@ -74,7 +72,15 @@ bench("data.table", "ohlc_by_symbol",
                       last = data.table::last(price)),
                   by = symbol])
 
+bench("data.table", "update_price_x2",
+    function() {
+        tmp <- copy(dt)
+        tmp[, price_x2 := price * 2][]
+    })
+
 message("\n=== dplyr ===")
+message("dplyr: loading prices.csv...")
+tb <- as_tibble(fread(csv_path))
 
 bench("dplyr", "mean_by_symbol",
     function() tb |> group_by(symbol) |>
@@ -87,6 +93,9 @@ bench("dplyr", "ohlc_by_symbol",
                   low  = min(price),
                   last = dplyr::last(price),
                   .groups = "drop"))
+
+bench("dplyr", "update_price_x2",
+    function() tb |> mutate(price_x2 = price * 2))
 
 # ── Multi-column group-by ─────────────────────────────────────────────────────
 if (!is.null(csv_multi_path)) {

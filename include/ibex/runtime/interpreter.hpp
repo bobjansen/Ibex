@@ -4,6 +4,7 @@
 #include <ibex/ir/node.hpp>
 
 #include <expected>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -21,7 +22,7 @@ using ScalarValue = std::variant<std::int64_t, double, std::string>;
 
 struct ColumnEntry {
     std::string name;
-    ColumnValue column;
+    std::shared_ptr<ColumnValue> column;
 };
 
 struct Table {

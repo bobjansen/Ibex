@@ -77,6 +77,29 @@ IBEX_LIBS=(
     "$_spdlog_lib"
 )
 
+# ── Arrow / Parquet (optional) ───────────────────────────────────────────────
+ARROW_INCS=()
+ARROW_LIBS=()
+if [[ -d "$BUILD_DIR/_deps/arrow-src" ]]; then
+    ARROW_INCS+=("-I$BUILD_DIR/_deps/arrow-src/cpp/src")
+fi
+if [[ -d "$BUILD_DIR/_deps/arrow-build" ]]; then
+    ARROW_INCS+=("-I$BUILD_DIR/_deps/arrow-build/src")
+    ARROW_INCS+=("-I$BUILD_DIR/_deps/arrow-build/src/arrow")
+    for lib in "$BUILD_DIR/_deps/arrow-build/libarrow.a" \
+               "$BUILD_DIR/_deps/arrow-build/libparquet.a" \
+               "$BUILD_DIR/_deps/arrow-build/libarrow.so" \
+               "$BUILD_DIR/_deps/arrow-build/libparquet.so"; do
+        if [[ -f "$lib" ]]; then
+            ARROW_LIBS+=("$lib")
+        fi
+    done
+    if [[ ! -f "$BUILD_DIR/_deps/arrow-build/src/arrow/util/config.h" ]]; then
+        echo "warning: Arrow generated headers not found; build may fail." >&2
+        echo "         Run: cmake --build $BUILD_DIR" >&2
+    fi
+fi
+
 # ── Validate build tree ───────────────────────────────────────────────────────
 for lib in "${IBEX_LIBS[@]}"; do
     if [[ ! -f "$lib" ]]; then
@@ -90,8 +113,10 @@ done
 echo "▸ compiling plugin $CPP_FILE → $OUTPUT"
 "$CXX" -std=c++23 -fPIC -shared \
     "${IBEX_INCS[@]}" \
+    "${ARROW_INCS[@]}" \
     "$CPP_FILE" \
     "${IBEX_LIBS[@]}" \
+    "${ARROW_LIBS[@]}" \
     -o "$OUTPUT"
 
 echo "✓ built $OUTPUT"

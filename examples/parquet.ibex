@@ -1,0 +1,4 @@
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+let flights = read_parquet("data/flights-1m.parquet");
+flights;

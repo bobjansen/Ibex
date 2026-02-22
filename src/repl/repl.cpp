@@ -609,6 +609,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (columns.contains(ident->name)) {
             return std::unexpected("expected table expression (name refers to column)");
         }
+        if (auto it = tables.find(ident->name); it != tables.end()) {
+            return it->second;
+        }
         return std::unexpected("unknown table: " + ident->name +
                                " (available: " + format_table_names(tables) + ")");
     }
@@ -801,18 +804,33 @@ auto plugin_stem(const std::string& source_path) -> std::string {
 
 /// Try to load a plugin shared library for the given stem from the search paths.
 /// Returns true if the plugin was loaded (or was already loaded), false on failure.
+enum class PluginLoadStatus { Loaded, NotFound, LoadError };
+
+struct PluginLoadResult {
+    PluginLoadStatus status;
+    std::string message;
+};
+
 auto try_load_plugin(const std::string& stem,
                      const std::vector<std::string>& search_paths,
                      std::unordered_set<std::string>& loaded_plugins,
-                     runtime::ExternRegistry& externs) -> bool {
+                     runtime::ExternRegistry& externs) -> PluginLoadResult {
     if (loaded_plugins.contains(stem)) {
-        return true;
+        return {PluginLoadStatus::Loaded, ""};
     }
     std::string filename = stem + ".so";
+    std::string last_error;
+    std::string last_candidate;
     for (const auto& dir : search_paths) {
         auto full_path = std::filesystem::path(dir) / filename;
         void* handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (handle == nullptr) {
+            if (std::filesystem::exists(full_path)) {
+                if (const char* err = dlerror()) {
+                    last_error = err;
+                }
+                last_candidate = full_path.string();
+            }
             continue;
         }
         using RegisterFn = void (*)(runtime::ExternRegistry*);
@@ -826,9 +844,14 @@ auto try_load_plugin(const std::string& stem,
         fn(&externs);
         loaded_plugins.insert(stem);
         spdlog::debug("loaded plugin: {}", full_path.string());
-        return true;
+        return {PluginLoadStatus::Loaded, ""};
     }
-    return false;
+    if (!last_candidate.empty()) {
+        return {PluginLoadStatus::LoadError,
+                fmt::format("failed to load '{}': {}", last_candidate,
+                            last_error.empty() ? "unknown error" : last_error)};
+    }
+    return {PluginLoadStatus::NotFound, ""};
 }
 
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
@@ -843,8 +866,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             extern_decls.insert_or_assign(decl.name, decl);
             if (!decl.source_path.empty()) {
                 auto stem = plugin_stem(decl.source_path);
-                if (!try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs)) {
+                auto result =
+                    try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
+                if (result.status == PluginLoadStatus::NotFound) {
                     fmt::print("warning: could not find plugin '{}.so' in search path\n", stem);
+                } else if (result.status == PluginLoadStatus::LoadError) {
+                    fmt::print("warning: {}\n", result.message);
                 }
             }
             continue;

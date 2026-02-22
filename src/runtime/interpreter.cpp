@@ -15,6 +15,46 @@ namespace ibex::runtime {
 
 namespace {
 
+auto is_simple_identifier(std::string_view name) -> bool {
+    if (name.empty()) {
+        return false;
+    }
+    auto is_alpha = [](unsigned char ch) -> bool { return std::isalpha(ch) != 0; };
+    auto is_alnum = [](unsigned char ch) -> bool { return std::isalnum(ch) != 0; };
+    unsigned char first = static_cast<unsigned char>(name.front());
+    if (!(is_alpha(first) || first == '_')) {
+        return false;
+    }
+    for (std::size_t i = 1; i < name.size(); ++i) {
+        unsigned char ch = static_cast<unsigned char>(name[i]);
+        if (!(is_alnum(ch) || ch == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto format_columns(const Table& table) -> std::string {
+    if (table.columns.empty()) {
+        return "<none>";
+    }
+    std::string out;
+    for (std::size_t i = 0; i < table.columns.size(); ++i) {
+        if (i > 0) {
+            out.append(", ");
+        }
+        const auto& name = table.columns[i].name;
+        if (is_simple_identifier(name)) {
+            out.append(name);
+        } else {
+            out.push_back('`');
+            out.append(name);
+            out.push_back('`');
+        }
+    }
+    return out;
+}
+
 auto column_size(const ColumnValue& column) -> std::size_t {
     return std::visit([](const auto& col) { return col.size(); }, column);
 }
@@ -147,7 +187,8 @@ auto filter_table(const Table& input, const ir::FilterPredicate& predicate)
     -> std::expected<Table, std::string> {
     const auto* predicate_column = input.find(predicate.column.name);
     if (predicate_column == nullptr) {
-        return std::unexpected("filter column not found: " + predicate.column.name);
+        return std::unexpected("filter column not found: " + predicate.column.name +
+                               " (available: " + format_columns(input) + ")");
     }
     std::size_t rows = column_size(*predicate_column);
 
@@ -177,7 +218,8 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     for (const auto& col : columns) {
         const auto* source = input.find(col.name);
         if (source == nullptr) {
-            return std::unexpected("select column not found: " + col.name);
+            return std::unexpected("select column not found: " + col.name +
+                                   " (available: " + format_columns(input) + ")");
         }
         output.add_column(col.name, *source);
     }
@@ -287,7 +329,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     for (const auto& key : group_by) {
         const auto* column = input.find(key.name);
         if (column == nullptr) {
-            return std::unexpected("group-by column not found: " + key.name);
+            return std::unexpected("group-by column not found: " + key.name +
+                                   " (available: " + format_columns(input) + ")");
         }
         group_columns.push_back(column);
     }
@@ -301,7 +344,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
         const auto* column = input.find(agg.column.name);
         if (column == nullptr) {
-            return std::unexpected("aggregate column not found: " + agg.column.name);
+            return std::unexpected("aggregate column not found: " + agg.column.name +
+                                   " (available: " + format_columns(input) + ")");
         }
         agg_columns.push_back(column);
     }
@@ -1136,7 +1180,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                     return ExprType::String;
                 }
             }
-            return std::unexpected("unknown column in expression: " + col->name);
+            return std::unexpected("unknown column in expression: " + col->name +
+                                   " (available: " + format_columns(input) + ")");
         }
         return expr_type_for_column(*source);
     }
@@ -1209,7 +1254,8 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                     return it->second;
                 }
             }
-            return std::unexpected("unknown column in expression: " + col->name);
+            return std::unexpected("unknown column in expression: " + col->name +
+                                   " (available: " + format_columns(input) + ")");
         }
         return std::visit([&](const auto& column) -> ExprValue { return column[row]; }, *source);
     }

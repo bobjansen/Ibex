@@ -5,9 +5,9 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <robin_hood.h>
 #include <stdexcept>
 #include <string_view>
-#include <robin_hood.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20,15 +20,19 @@ auto is_simple_identifier(std::string_view name) -> bool {
     if (name.empty()) {
         return false;
     }
-    auto is_alpha = [](unsigned char ch) -> bool { return std::isalpha(ch) != 0; };
-    auto is_alnum = [](unsigned char ch) -> bool { return std::isalnum(ch) != 0; };
+    auto is_alpha = [](unsigned char ch) -> bool {
+        return std::isalpha(ch) != 0;
+    };
+    auto is_alnum = [](unsigned char ch) -> bool {
+        return std::isalnum(ch) != 0;
+    };
     unsigned char first = static_cast<unsigned char>(name.front());
-    if (!(is_alpha(first) || first == '_')) {
+    if (!is_alpha(first) && first != '_') {
         return false;
     }
     for (std::size_t i = 1; i < name.size(); ++i) {
         unsigned char ch = static_cast<unsigned char>(name[i]);
-        if (!(is_alnum(ch) || ch == '_')) {
+        if (!is_alnum(ch) && ch != '_') {
             return false;
         }
     }
@@ -224,8 +228,7 @@ auto compare_value(const ColumnValue& column, std::size_t index, const ir::Filte
         column);
 }
 
-auto resolve_filter_value(const ir::FilterPredicate& predicate,
-                          const ScalarRegistry* scalars)
+auto resolve_filter_value(const ir::FilterPredicate& predicate, const ScalarRegistry* scalars)
     -> std::expected<std::variant<std::int64_t, double, std::string>, std::string> {
     if (const auto* literal = std::get_if<std::int64_t>(&predicate.value)) {
         return *literal;
@@ -261,8 +264,7 @@ auto resolve_filter_value(const ir::FilterPredicate& predicate,
 }
 
 auto filter_table(const Table& input, const ir::FilterPredicate& predicate,
-                  const ScalarRegistry* scalars)
-    -> std::expected<Table, std::string> {
+                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     const auto* predicate_column = input.find(predicate.column.name);
     if (predicate_column == nullptr) {
         return std::unexpected("filter column not found: " + predicate.column.name +
@@ -430,8 +432,7 @@ auto column_kind(const ColumnValue& column) -> ExprType {
 }
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
-                     const std::vector<std::string>& keys)
-    -> std::expected<Table, std::string> {
+                     const std::vector<std::string>& keys) -> std::expected<Table, std::string> {
     if (kind == ir::JoinKind::Asof) {
         return std::unexpected("asof join is not supported yet");
     }
@@ -1155,8 +1156,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             break;
                         }
                         case ir::AggFunc::Min: {
-                            std::vector<std::int64_t> acc(
-                                n_groups, std::numeric_limits<std::int64_t>::max());
+                            std::vector<std::int64_t> acc(n_groups,
+                                                          std::numeric_limits<std::int64_t>::max());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
                                 if (data[row] < acc[g]) {
@@ -1170,8 +1171,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             break;
                         }
                         case ir::AggFunc::Max: {
-                            std::vector<std::int64_t> acc(
-                                n_groups, std::numeric_limits<std::int64_t>::min());
+                            std::vector<std::int64_t> acc(n_groups,
+                                                          std::numeric_limits<std::int64_t>::min());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
                                 if (data[row] > acc[g]) {
@@ -1300,8 +1301,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     struct ColPtr {
         ColKind kind;
         union {
-            const std::int64_t*       int_ptr;
-            const double*             dbl_ptr;
+            const std::int64_t* int_ptr;
+            const double* dbl_ptr;
             const Column<std::string>* str_ptr;
         };
     };
@@ -1335,9 +1336,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     reuse_key.values.resize(group_columns.size());
     for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
         switch (col_ptrs[ci].kind) {
-            case ColKind::Int:    reuse_key.values[ci].emplace<std::int64_t>(); break;
-            case ColKind::Double: reuse_key.values[ci].emplace<double>();       break;
-            case ColKind::Str:    reuse_key.values[ci].emplace<std::string>();  break;
+            case ColKind::Int:
+                reuse_key.values[ci].emplace<std::int64_t>();
+                break;
+            case ColKind::Double:
+                reuse_key.values[ci].emplace<double>();
+                break;
+            case ColKind::Str:
+                reuse_key.values[ci].emplace<std::string>();
+                break;
         }
     }
     for (std::size_t row = 0; row < rows; ++row) {
@@ -1724,11 +1731,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             args.reserve(ec.args().size());
             for (const auto& arg : ec.args()) {
                 auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val) return std::unexpected(val.error());
+                if (!val)
+                    return std::unexpected(val.error());
                 args.push_back(std::move(val.value()));
             }
             auto result = fn->func(args);
-            if (!result) return std::unexpected(result.error());
+            if (!result)
+                return std::unexpected(result.error());
             if (auto* table = std::get_if<Table>(&result.value())) {
                 return std::move(*table);
             }

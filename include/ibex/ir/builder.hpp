@@ -11,7 +11,7 @@ namespace ibex::ir {
 /// Thread-safe ID generation via atomic counter.
 /// TODO: Add plan-level validation and optimization passes.
 class Builder {
-public:
+   public:
     Builder() = default;
 
     [[nodiscard]] auto scan(std::string source_name) -> NodePtr {
@@ -26,16 +26,15 @@ public:
         return std::make_unique<ProjectNode>(next_id(), std::move(columns));
     }
 
-    [[nodiscard]] auto aggregate(
-        std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations) -> NodePtr {
-        return std::make_unique<AggregateNode>(
-            next_id(), std::move(group_by), std::move(aggregations));
+    [[nodiscard]] auto aggregate(std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
+        -> NodePtr {
+        return std::make_unique<AggregateNode>(next_id(), std::move(group_by),
+                                               std::move(aggregations));
     }
 
-    [[nodiscard]] auto update(
-        std::vector<FieldSpec> fields, std::vector<ColumnRef> group_by = {}) -> NodePtr {
-        return std::make_unique<UpdateNode>(
-            next_id(), std::move(fields), std::move(group_by));
+    [[nodiscard]] auto update(std::vector<FieldSpec> fields, std::vector<ColumnRef> group_by = {})
+        -> NodePtr {
+        return std::make_unique<UpdateNode>(next_id(), std::move(fields), std::move(group_by));
     }
 
     [[nodiscard]] auto window(Duration duration) -> NodePtr {
@@ -50,7 +49,7 @@ public:
         return std::make_unique<JoinNode>(next_id(), kind, std::move(keys));
     }
 
-private:
+   private:
     [[nodiscard]] auto next_id() -> NodeId {
         return next_id_.fetch_add(1, std::memory_order_relaxed);
     }

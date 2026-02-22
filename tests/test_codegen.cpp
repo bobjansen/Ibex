@@ -10,8 +10,8 @@
 using namespace ibex;
 
 // Helper: emit an IR tree to a string.
-static auto emit_to_string(const ir::Node& root,
-                            const codegen::Emitter::Config& cfg = {}) -> std::string {
+static auto emit_to_string(const ir::Node& root, const codegen::Emitter::Config& cfg = {})
+    -> std::string {
     std::ostringstream oss;
     codegen::Emitter emitter;
     emitter.emit(oss, root, cfg);
@@ -46,8 +46,7 @@ TEST_CASE("emitter: extern call node", "[codegen]") {
 
 TEST_CASE("emitter: filter node — int64 predicate", "[codegen]") {
     ir::Builder b;
-    ir::FilterPredicate pred{ir::ColumnRef{"price"}, ir::CompareOp::Gt,
-                             std::int64_t{100}};
+    ir::FilterPredicate pred{ir::ColumnRef{"price"}, ir::CompareOp::Gt, std::int64_t{100}};
     auto filter = b.filter(std::move(pred));
     filter->add_child(make_source(b, "data.csv"));
 
@@ -71,8 +70,7 @@ TEST_CASE("emitter: filter node — double predicate", "[codegen]") {
 
 TEST_CASE("emitter: filter node — string predicate", "[codegen]") {
     ir::Builder b;
-    ir::FilterPredicate pred{ir::ColumnRef{"symbol"}, ir::CompareOp::Eq,
-                             std::string{"AAPL"}};
+    ir::FilterPredicate pred{ir::ColumnRef{"symbol"}, ir::CompareOp::Eq, std::string{"AAPL"}};
     auto filter = b.filter(std::move(pred));
     filter->add_child(make_source(b, "data.csv"));
 
@@ -98,10 +96,9 @@ TEST_CASE("emitter: project node", "[codegen]") {
 
 TEST_CASE("emitter: aggregate node", "[codegen]") {
     ir::Builder b;
-    auto agg = b.aggregate(
-        {ir::ColumnRef{"symbol"}},
-        {ir::AggSpec{ir::AggFunc::Sum, ir::ColumnRef{"price"}, "total"},
-         ir::AggSpec{ir::AggFunc::Count, ir::ColumnRef{"price"}, "n"}});
+    auto agg = b.aggregate({ir::ColumnRef{"symbol"}},
+                           {ir::AggSpec{ir::AggFunc::Sum, ir::ColumnRef{"price"}, "total"},
+                            ir::AggSpec{ir::AggFunc::Count, ir::ColumnRef{"price"}, "n"}});
     agg->add_child(make_source(b, "trades.csv"));
 
     auto out = emit_to_string(*agg);
@@ -125,8 +122,7 @@ TEST_CASE("emitter: update node — simple expression", "[codegen]") {
         ir::Expr{ir::BinaryExpr{
             ir::ArithmeticOp::Div,
             std::make_shared<ir::Expr>(ir::Expr{ir::BinaryExpr{
-                ir::ArithmeticOp::Add,
-                std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{"bid"}}),
+                ir::ArithmeticOp::Add, std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{"bid"}}),
                 std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{"ask"}})}}),
             std::make_shared<ir::Expr>(ir::Expr{ir::Literal{2.0}})}}};
 
@@ -161,8 +157,7 @@ TEST_CASE("emitter: update node — literal types", "[codegen]") {
 
 TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     ir::Builder b;
-    ir::FilterPredicate pred{ir::ColumnRef{"price"}, ir::CompareOp::Ge,
-                             std::int64_t{50}};
+    ir::FilterPredicate pred{ir::ColumnRef{"price"}, ir::CompareOp::Ge, std::int64_t{50}};
     auto filter = b.filter(std::move(pred));
     filter->add_child(make_source(b, "trades.csv"));
     auto proj = b.project({ir::ColumnRef{"symbol"}});
@@ -171,10 +166,10 @@ TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     auto out = emit_to_string(*proj);
     auto pos_source = out.find("read_csv(");
     auto pos_filter = out.find("ibex::ops::filter(");
-    auto pos_proj   = out.find("ibex::ops::project(");
+    auto pos_proj = out.find("ibex::ops::project(");
     REQUIRE(pos_source != std::string::npos);
     REQUIRE(pos_filter != std::string::npos);
-    REQUIRE(pos_proj   != std::string::npos);
+    REQUIRE(pos_proj != std::string::npos);
     CHECK(pos_source < pos_filter);
     CHECK(pos_filter < pos_proj);
 }
@@ -215,7 +210,7 @@ TEST_CASE("emitter: extern headers in config", "[codegen]") {
 TEST_CASE("emitter: escape quotes in extern call arg", "[codegen]") {
     ir::Builder b;
     auto root = b.extern_call("read_csv",
-        {ir::Expr{ir::Literal{std::string{R"(path/with "quotes".csv)"}}}});
+                              {ir::Expr{ir::Literal{std::string{R"(path/with "quotes".csv)"}}}});
     auto out = emit_to_string(*root);
     CHECK(contains(out, R"(path/with \"quotes\".csv)"));
 }

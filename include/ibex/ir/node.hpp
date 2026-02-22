@@ -131,7 +131,7 @@ enum class NodeKind : std::uint8_t {
 /// Represents a single relational operation in the query DAG.
 /// Children are owned via unique_ptr for clear ownership semantics.
 class Node {
-public:
+   public:
     explicit Node(NodeKind kind, NodeId id) : kind_(kind), id_(id) {}
     virtual ~Node() = default;
 
@@ -148,7 +148,7 @@ public:
 
     void add_child(NodePtr child) { children_.push_back(std::move(child)); }
 
-private:
+   private:
     NodeKind kind_;
     NodeId id_;
     std::vector<NodePtr> children_;
@@ -156,37 +156,33 @@ private:
 
 /// Scan node: reads from a named source.
 class ScanNode final : public Node {
-public:
+   public:
     ScanNode(NodeId id, std::string source_name)
         : Node(NodeKind::Scan, id), source_name_(std::move(source_name)) {}
 
-    [[nodiscard]] auto source_name() const noexcept -> const std::string& {
-        return source_name_;
-    }
+    [[nodiscard]] auto source_name() const noexcept -> const std::string& { return source_name_; }
 
-private:
+   private:
     std::string source_name_;
 };
 
 /// Filter node: applies a predicate to its child.
 /// See SPEC.md Section 5.3 (filter clause).
 class FilterNode final : public Node {
-public:
+   public:
     FilterNode(NodeId id, FilterPredicate predicate)
         : Node(NodeKind::Filter, id), predicate_(std::move(predicate)) {}
 
-    [[nodiscard]] auto predicate() const noexcept -> const FilterPredicate& {
-        return predicate_;
-    }
+    [[nodiscard]] auto predicate() const noexcept -> const FilterPredicate& { return predicate_; }
 
-private:
+   private:
     FilterPredicate predicate_;
 };
 
 /// Project node: selects and computes a subset of columns.
 /// See SPEC.md Section 5.3 (select clause).
 class ProjectNode final : public Node {
-public:
+   public:
     ProjectNode(NodeId id, std::vector<ColumnRef> columns)
         : Node(NodeKind::Project, id), columns_(std::move(columns)) {}
 
@@ -194,14 +190,14 @@ public:
         return columns_;
     }
 
-private:
+   private:
     std::vector<ColumnRef> columns_;
 };
 
 /// Aggregate node: groups and aggregates.
 /// See SPEC.md Section 7 (Aggregation Rules).
 class AggregateNode final : public Node {
-public:
+   public:
     AggregateNode(NodeId id, std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
         : Node(NodeKind::Aggregate, id),
           group_by_(std::move(group_by)),
@@ -214,7 +210,7 @@ public:
         return aggregations_;
     }
 
-private:
+   private:
     std::vector<ColumnRef> group_by_;
     std::vector<AggSpec> aggregations_;
 };
@@ -225,20 +221,16 @@ private:
 /// When group_by is non-empty, expressions are evaluated per group and
 /// broadcast back (SPEC.md Section 7.4).
 class UpdateNode final : public Node {
-public:
+   public:
     UpdateNode(NodeId id, std::vector<FieldSpec> fields, std::vector<ColumnRef> group_by = {})
-        : Node(NodeKind::Update, id),
-          fields_(std::move(fields)),
-          group_by_(std::move(group_by)) {}
+        : Node(NodeKind::Update, id), fields_(std::move(fields)), group_by_(std::move(group_by)) {}
 
-    [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& {
-        return fields_;
-    }
+    [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& { return fields_; }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
         return group_by_;
     }
 
-private:
+   private:
     std::vector<FieldSpec> fields_;
     std::vector<ColumnRef> group_by_;
 };
@@ -250,32 +242,28 @@ private:
 /// dispatched through the ExternRegistry; at compile time the emitter emits a
 /// direct C++ function call.
 class ExternCallNode final : public Node {
-public:
+   public:
     ExternCallNode(NodeId id, std::string callee, std::vector<Expr> args)
-        : Node(NodeKind::ExternCall, id),
-          callee_(std::move(callee)),
-          args_(std::move(args)) {}
+        : Node(NodeKind::ExternCall, id), callee_(std::move(callee)), args_(std::move(args)) {}
 
     [[nodiscard]] auto callee() const noexcept -> const std::string& { return callee_; }
     [[nodiscard]] auto args() const noexcept -> const std::vector<Expr>& { return args_; }
 
-private:
+   private:
     std::string callee_;
     std::vector<Expr> args_;
 };
 
 /// Join node: combines two tables using key equality (or as-of).
 class JoinNode final : public Node {
-public:
+   public:
     JoinNode(NodeId id, JoinKind kind, std::vector<std::string> keys)
         : Node(NodeKind::Join, id), kind_(kind), keys_(std::move(keys)) {}
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
-    [[nodiscard]] auto keys() const noexcept -> const std::vector<std::string>& {
-        return keys_;
-    }
+    [[nodiscard]] auto keys() const noexcept -> const std::vector<std::string>& { return keys_; }
 
-private:
+   private:
     JoinKind kind_;
     std::vector<std::string> keys_;
 };
@@ -286,13 +274,12 @@ private:
 /// Valid only on TimeFrame operands. The duration defines the lookback
 /// range [t - duration, t] for each row at time t.
 class WindowNode final : public Node {
-public:
-    WindowNode(NodeId id, Duration duration)
-        : Node(NodeKind::Window, id), duration_(duration) {}
+   public:
+    WindowNode(NodeId id, Duration duration) : Node(NodeKind::Window, id), duration_(duration) {}
 
     [[nodiscard]] auto duration() const noexcept -> Duration { return duration_; }
 
-private:
+   private:
     Duration duration_;
 };
 

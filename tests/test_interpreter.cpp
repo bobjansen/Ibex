@@ -3,8 +3,8 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
-#include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
 
 namespace {
 
@@ -128,12 +128,11 @@ TEST_CASE("Interpret select with function call") {
     runtime::ExternRegistry externs;
     externs.register_scalar(
         "square", runtime::ScalarKind::Int,
-        [](const runtime::ExternArgs& args)
-            -> std::expected<runtime::ExternValue, std::string> {
+        [](const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
             if (args.size() != 1) {
                 return std::unexpected("square() expects 1 argument");
             }
-            const auto* value = std::get_if<std::int64_t>(&args[0]);
+            const auto* value = std::get_if<std::int64_t>(args.data());
             if (value == nullptr) {
                 return std::unexpected("square() expects int argument");
             }
@@ -223,7 +222,8 @@ TEST_CASE("Interpret first and last aggregation") {
     registry.emplace("trades", table);
 
     auto ir = require_ir(
-        "trades[select { symbol, first_price = first(price), last_price = last(price) }, by symbol];");
+        "trades[select { symbol, first_price = first(price), last_price = last(price) }, by "
+        "symbol];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 

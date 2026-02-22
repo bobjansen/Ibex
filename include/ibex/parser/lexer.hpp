@@ -52,12 +52,12 @@ enum class TokenKind : std::uint8_t {
     KeywordTimeFrame,
 
     // Comparison operators
-    EqEq,     // ==
-    BangEq,   // !=
-    Lt,       // <
-    Le,       // <=
-    Gt,       // >
-    Ge,       // >=
+    EqEq,    // ==
+    BangEq,  // !=
+    Lt,      // <
+    Le,      // <=
+    Gt,      // >
+    Ge,      // >=
 
     // Arithmetic operators
     Plus,     // +
@@ -67,27 +67,27 @@ enum class TokenKind : std::uint8_t {
     Percent,  // %
 
     // Logical operators
-    AmpAmp,   // &&
-    PipePipe, // ||
-    Bang,     // !
+    AmpAmp,    // &&
+    PipePipe,  // ||
+    Bang,      // !
 
     // Scope escape (SPEC.md Section 6.2)
-    Caret,    // ^
+    Caret,  // ^
 
     // Assignment
-    Eq,       // =
+    Eq,  // =
 
     // Delimiters
-    LParen,    // (
-    RParen,    // )
-    LBracket,  // [
-    RBracket,  // ]
-    LBrace,    // {
-    RBrace,    // }
-    Comma,     // ,
-    Semicolon, // ;
-    Colon,     // :
-    Arrow,     // ->
+    LParen,     // (
+    RParen,     // )
+    LBracket,   // [
+    RBracket,   // ]
+    LBrace,     // {
+    RBrace,     // }
+    Comma,      // ,
+    Semicolon,  // ;
+    Colon,      // :
+    Arrow,      // ->
 
     // Special
     Eof,

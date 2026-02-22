@@ -59,13 +59,12 @@ TEST_CASE("ProjectNode stores column list", "[ir][project]") {
 TEST_CASE("AggregateNode stores group-by and aggregations", "[ir][aggregate]") {
     ibex::ir::Builder builder;
 
-    auto node = builder.aggregate(
-        {ibex::ir::ColumnRef{.name = "symbol"}},
-        {ibex::ir::AggSpec{
-            .func = ibex::ir::AggFunc::Sum,
-            .column = {.name = "volume"},
-            .alias = "total_volume",
-        }});
+    auto node = builder.aggregate({ibex::ir::ColumnRef{.name = "symbol"}},
+                                  {ibex::ir::AggSpec{
+                                      .func = ibex::ir::AggFunc::Sum,
+                                      .column = {.name = "volume"},
+                                      .alias = "total_volume",
+                                  }});
 
     auto* agg = dynamic_cast<ibex::ir::AggregateNode*>(node.get());
     REQUIRE(agg != nullptr);
@@ -77,12 +76,12 @@ TEST_CASE("AggregateNode stores group-by and aggregations", "[ir][aggregate]") {
 TEST_CASE("UpdateNode stores fields and optional group-by", "[ir][update]") {
     ibex::ir::Builder builder;
 
-    auto node = builder.update(
-        {ibex::ir::FieldSpec{
-            .alias = "log_price",
-            .expr = ibex::ir::Expr{.node = ibex::ir::ColumnRef{.name = "price"}},
-        }},
-        {ibex::ir::ColumnRef{.name = "symbol"}});
+    auto node =
+        builder.update({ibex::ir::FieldSpec{
+                           .alias = "log_price",
+                           .expr = ibex::ir::Expr{.node = ibex::ir::ColumnRef{.name = "price"}},
+                       }},
+                       {ibex::ir::ColumnRef{.name = "symbol"}});
 
     auto* upd = dynamic_cast<ibex::ir::UpdateNode*>(node.get());
     REQUIRE(upd != nullptr);

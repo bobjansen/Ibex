@@ -150,13 +150,7 @@ struct JoinExpr {
 };
 
 struct Expr {
-    std::variant<IdentifierExpr,
-                 LiteralExpr,
-                 CallExpr,
-                 UnaryExpr,
-                 BinaryExpr,
-                 GroupExpr,
-                 BlockExpr,
+    std::variant<IdentifierExpr, LiteralExpr, CallExpr, UnaryExpr, BinaryExpr, GroupExpr, BlockExpr,
                  JoinExpr>
         node;
 };

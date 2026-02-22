@@ -80,8 +80,7 @@ class Lowerer {
 
     auto lower_table_call(const CallExpr& call) -> LowerResult {
         if (!table_externs_.contains(call.callee)) {
-            return std::unexpected(
-                LowerError{.message = "unknown table function: " + call.callee});
+            return std::unexpected(LowerError{.message = "unknown table function: " + call.callee});
         }
         std::vector<ir::Expr> args;
         args.reserve(call.args.size());
@@ -274,9 +273,8 @@ class Lowerer {
                 return std::unexpected(value.error());
             }
             auto wrapped = std::visit(
-                [](const auto& v)
-                    -> std::variant<std::int64_t, double, std::string,
-                                    ir::FilterPredicate::ScalarRef> { return v; },
+                [](const auto& v) -> std::variant<std::int64_t, double, std::string,
+                                                  ir::FilterPredicate::ScalarRef> { return v; },
                 value.value());
             return ir::FilterPredicate{
                 .column = ir::ColumnRef{.name = ident->name},
@@ -616,9 +614,8 @@ class Lowerer {
                 if (parse_agg_func(call->callee).has_value()) {
                     return true;
                 }
-                return std::ranges::any_of(call->args, [&](const auto& arg) {
-                    return has_agg(*arg);
-                });
+                return std::ranges::any_of(call->args,
+                                           [&](const auto& arg) { return has_agg(*arg); });
             }
             if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
                 return has_agg(*binary->left) || has_agg(*binary->right);

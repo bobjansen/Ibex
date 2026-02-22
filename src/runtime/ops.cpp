@@ -1,6 +1,5 @@
-#include <ibex/runtime/ops.hpp>
-
 #include <ibex/ir/builder.hpp>
+#include <ibex/runtime/ops.hpp>
 
 #include <fmt/format.h>
 
@@ -43,8 +42,10 @@ auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::stri
                 return c[row];
             } else if constexpr (std::is_same_v<T, double>) {
                 double v = c[row];
-                if (std::isnan(v)) return "nan";
-                if (std::isinf(v)) return v > 0 ? "inf" : "-inf";
+                if (std::isnan(v))
+                    return "nan";
+                if (std::isinf(v))
+                    return v > 0 ? "inf" : "-inf";
                 std::string s = fmt::format("{:g}", v);
                 return s;
             } else {
@@ -56,7 +57,7 @@ auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::stri
 
 }  // namespace
 
-//─── Core ops ─────────────────────────────────────────────────────────────────
+// ─── Core ops ─────────────────────────────────────────────────────────────────
 
 auto filter(const runtime::Table& t, ir::FilterPredicate pred) -> runtime::Table {
     ir::Builder b;
@@ -66,8 +67,7 @@ auto filter(const runtime::Table& t, ir::FilterPredicate pred) -> runtime::Table
     return delegate(std::move(filter_node), t);
 }
 
-auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
-    -> runtime::Table {
+auto project(const runtime::Table& t, const std::vector<std::string>& col_names) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);
     auto proj_node = b.project(to_col_refs(col_names));
@@ -75,8 +75,7 @@ auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
     return delegate(std::move(proj_node), t);
 }
 
-auto aggregate(const runtime::Table& t,
-               const std::vector<std::string>& group_by,
+auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                const std::vector<ir::AggSpec>& aggs) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);
@@ -85,8 +84,7 @@ auto aggregate(const runtime::Table& t,
     return delegate(std::move(agg_node), t);
 }
 
-auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
-    -> runtime::Table {
+auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);
     auto upd_node = b.update(fields);
@@ -136,14 +134,16 @@ void print(const runtime::Table& t, std::ostream& out) {
 
     // Header row.
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c > 0) out << "  ";
+        if (c > 0)
+            out << "  ";
         out << fmt::format("{:<{}}", t.columns[c].name, widths[c]);
     }
     out << "\n";
 
     // Separator.
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c > 0) out << "  ";
+        if (c > 0)
+            out << "  ";
         out << std::string(widths[c], '-');
     }
     out << "\n";
@@ -151,14 +151,15 @@ void print(const runtime::Table& t, std::ostream& out) {
     // Data rows.
     for (std::size_t r = 0; r < rows; ++r) {
         for (std::size_t c = 0; c < t.columns.size(); ++c) {
-            if (c > 0) out << "  ";
+            if (c > 0)
+                out << "  ";
             out << fmt::format("{:<{}}", cells[c][r], widths[c]);
         }
         out << "\n";
     }
 }
 
-//─── Expression builders ──────────────────────────────────────────────────────
+// ─── Expression builders ──────────────────────────────────────────────────────
 
 auto col_ref(std::string name) -> ir::Expr {
     return ir::Expr{ir::ColumnRef{std::move(name)}};
@@ -194,7 +195,7 @@ auto fn_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr {
     return ir::Expr{std::move(call)};
 }
 
-//─── Compound builders ────────────────────────────────────────────────────────
+// ─── Compound builders ────────────────────────────────────────────────────────
 
 auto make_field(std::string alias, ir::Expr expr) -> ir::FieldSpec {
     return ir::FieldSpec{std::move(alias), std::move(expr)};

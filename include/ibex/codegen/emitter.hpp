@@ -19,12 +19,16 @@ class Emitter {
         std::vector<std::string> extern_headers;
         /// Source file name shown in the generated comment.
         std::string source_name;
+        /// Whether to emit ibex::ops::print() for the final result.
+        bool print_result = true;
     };
 
     /// Emit a complete C++ translation unit to `out`.
     ///
     /// The last IR node's result is passed to ibex::ops::print().
-    void emit(std::ostream& out, const ir::Node& root, const Config& config = {});
+    void emit(std::ostream& out, const ir::Node& root, const Config& config);
+
+    void emit(std::ostream& out, const ir::Node& root) { emit(out, root, Config{}); }
 
    private:
     std::ostream* out_{nullptr};

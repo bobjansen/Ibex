@@ -82,7 +82,9 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
 
     auto result_var = emit_node(root);
 
-    out << "    ibex::ops::print(" << result_var << ");\n";
+    if (config.print_result) {
+        out << "    ibex::ops::print(" << result_var << ");\n";
+    }
     out << "    return 0;\n";
     out << "}\n";
 

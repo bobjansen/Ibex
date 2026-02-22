@@ -10,12 +10,16 @@
 using namespace ibex;
 
 // Helper: emit an IR tree to a string.
-static auto emit_to_string(const ir::Node& root, const codegen::Emitter::Config& cfg = {})
+static auto emit_to_string(const ir::Node& root, const codegen::Emitter::Config& cfg)
     -> std::string {
     std::ostringstream oss;
     codegen::Emitter emitter;
     emitter.emit(oss, root, cfg);
     return oss.str();
+}
+
+static auto emit_to_string(const ir::Node& root) -> std::string {
+    return emit_to_string(root, codegen::Emitter::Config{});
 }
 
 // Check that a string contains a substring.

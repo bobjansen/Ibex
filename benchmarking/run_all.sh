@@ -2,7 +2,7 @@
 # run_all.sh — generate data, run all benchmarks, print comparison table.
 #
 # Usage:
-#   ./run_all.sh [--warmup N] [--iters N] [--skip-ibex] [--skip-python]
+#   ./run_all.sh [--warmup N] [--iters N] [--skip-ibex] [--skip-ibex-compiled]
 #                [--skip-r]
 #
 # Environment overrides:
@@ -25,6 +25,7 @@ fi
 WARMUP=1
 ITERS=5
 SKIP_IBEX=0
+SKIP_IBEX_COMPILED=0
 SKIP_PYTHON=0
 SKIP_R=0
 
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --warmup)      WARMUP="$2";   shift 2 ;;
         --iters)       ITERS="$2";    shift 2 ;;
         --skip-ibex)   SKIP_IBEX=1;   shift   ;;
+        --skip-ibex-compiled) SKIP_IBEX_COMPILED=1; shift ;;
         --skip-python) SKIP_PYTHON=1; shift   ;;
         --skip-r)      SKIP_R=1;      shift   ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
@@ -60,6 +62,17 @@ if [[ $SKIP_IBEX -eq 0 ]]; then
     echo ""
 fi
 
+# ── 2b. ibex (compiled) ──────────────────────────────────────────────────────
+if [[ $SKIP_IBEX_COMPILED -eq 0 ]]; then
+    echo "━━━ ibex (compiled) ━━━"
+    IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
+        bash "$SCRIPT_DIR/bench_ibex_compiled.sh" \
+            --csv "$CSV" \
+            --warmup "$WARMUP" --iters "$ITERS" \
+            --out "$RESULTS/ibex_compiled.tsv"
+    echo ""
+fi
+
 # ── 3. Python (pandas + polars) ───────────────────────────────────────────────
 if [[ $SKIP_PYTHON -eq 0 ]]; then
     echo "━━━ Python (pandas + polars) ━━━"
@@ -83,5 +96,6 @@ fi
 # ── 5. Print table ────────────────────────────────────────────────────────────
 echo "━━━ Summary ━━━"
 uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/print_table.py" \
-    "$RESULTS"/ibex.tsv "$RESULTS"/python.tsv "$RESULTS"/r.tsv 2>/dev/null \
+    "$RESULTS"/ibex.tsv "$RESULTS"/ibex_compiled.tsv \
+    "$RESULTS"/python.tsv "$RESULTS"/r.tsv 2>/dev/null \
     || python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*.tsv

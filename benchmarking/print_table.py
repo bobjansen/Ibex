@@ -8,7 +8,15 @@ Usage:
 import csv, pathlib, sys
 from collections import defaultdict
 
-FRAMEWORK_ORDER = ["ibex", "ibex+parse", "polars", "pandas", "data.table", "dplyr"]
+FRAMEWORK_ORDER = [
+    "ibex",
+    "ibex+parse",
+    "ibex-compiled",
+    "polars",
+    "pandas",
+    "data.table",
+    "dplyr",
+]
 
 QUERY_ORDER = [
     "mean_by_symbol",

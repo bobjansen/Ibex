@@ -15,9 +15,11 @@ int main(int argc, char* argv[]) {
 
     std::string input_path;
     std::string output_path;
+    bool no_print = false;
 
     app.add_option("input", input_path, "Input .ibex source file")->required();
     app.add_option("-o,--output", output_path, "Output .cpp file (default: stdout)");
+    app.add_flag("--no-print", no_print, "Disable ibex::ops::print() in generated code");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -47,6 +49,7 @@ int main(int argc, char* argv[]) {
     // Collect extern headers from the program
     ibex::codegen::Emitter::Config config;
     config.source_name = input_path;
+    config.print_result = !no_print;
     for (const auto& stmt : program->statements) {
         if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
             if (!ext->source_path.empty()) {

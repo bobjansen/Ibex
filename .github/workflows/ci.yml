@@ -21,7 +21,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build
+          sudo apt-get install -y clang-18 g++-13 cmake ninja-build
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
@@ -29,7 +29,7 @@ jobs:
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_CXX_COMPILER=g++-13 \
             -DIBEX_WARNINGS_AS_ERRORS=ON \
             -DIBEX_ENABLE_SANITIZERS=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
             -DIBEX_BUILD_TESTS=ON \

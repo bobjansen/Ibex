@@ -13,8 +13,10 @@ ibex/
 │   ├── runtime/           Extern function registry, execution engine
 │   └── repl/              Interactive REPL session
 ├── src/                   Implementation files (mirrors include/)
+├── libraries/             Bundled plugin sources (csv.hpp, csv.cpp → csv.so)
+├── scripts/               Helper shell scripts (build, run, plugin-build)
 ├── tests/                 Catch2 unit tests
-├── tools/                 CLI binaries (REPL entry point)
+├── tools/                 CLI binaries (REPL, compiler, benchmark)
 ├── examples/              Usage examples
 └── cmake/                 Build system modules
 ```
@@ -65,7 +67,14 @@ ctest --test-dir build --output-on-failure
 ## Running the REPL
 
 ```bash
-./build/tools/ibex --verbose
+# Without plugins (built-in tables only)
+./build/tools/ibex
+
+# With a plugin directory (required for extern fn libraries like read_csv)
+./build/tools/ibex --plugin-path ./build/libraries
+
+# Or via environment variable
+IBEX_LIBRARY_PATH=./build/libraries ./build/tools/ibex
 ```
 
 ### REPL Commands
@@ -76,19 +85,87 @@ ctest --test-dir build --output-on-failure
 :schema <table>          Show column names and types
 :head <table> [n]        Show first n rows (default 10)
 :describe <table> [n]    Schema + first n rows
+:load <file>             Load and execute an .ibex script
 ```
 
-### REPL Functions
+### Built-in Functions
 
 ```
-read_csv("path.csv")          Load a CSV (simple, no quotes/escapes)
 scalar(df, col)               Extract a scalar from a single-row DataFrame
 ```
+
+I/O functions such as `read_csv` are provided as plugins (see below).
+
+## Plugins
+
+Ibex data-source functions (e.g. `read_csv`, `read_parquet`) are **plugins** —
+shared libraries loaded at runtime when a script declares an `extern fn`.
+
+### How it works
+
+When the REPL encounters:
+
+```
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+```
+
+it looks for `csv.so` in the plugin search path and calls its
+`ibex_register(ExternRegistry*)` entry point to register the function.
+
+### Using the bundled CSV plugin
+
+```bash
+# The plugin is built automatically with the project:
+ls build/libraries/csv.so
+
+# Load it by pointing the REPL at the libraries build directory:
+IBEX_LIBRARY_PATH=./build/libraries ./build/tools/ibex
+```
+
+### Writing your own plugin
+
+1. Create a header (`my_source.hpp`) that implements your function returning
+   `ibex::runtime::Table`.
+
+2. Create a registration file (`my_source.cpp`):
+
+```cpp
+#include "my_source.hpp"
+#include <ibex/runtime/extern_registry.hpp>
+
+extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+    registry->register_table("my_source", [](const ibex::runtime::ExternArgs& args) {
+        // ...
+    });
+}
+```
+
+3. Compile it with the helper script:
+
+```bash
+scripts/ibex-plugin-build.sh my_source.cpp
+# Produces: my_source.so next to my_source.cpp
+```
+
+4. Use it from Ibex:
+
+```
+extern fn my_source(path: String) -> DataFrame from "my_source.hpp";
+let df = my_source("data/file.bin");
+```
+
+### Helper scripts
+
+| Script | Description |
+|--------|-------------|
+| `scripts/ibex-plugin-build.sh <src.cpp> [-o out.so]` | Compile a plugin `.cpp` into a loadable `.so` |
+| `scripts/ibex-build.sh <file.ibex> [-o output]` | Transpile an `.ibex` file and produce a binary |
+| `scripts/ibex-run.sh <file.ibex> [-- args...]` | Transpile, compile, and run an `.ibex` file |
+
+All scripts respect `IBEX_ROOT`, `BUILD_DIR`, and `CXX` environment overrides.
 
 ## Roadmap
 
 - [ ] Time-indexed DataFrame support
 - [ ] Query optimizer (predicate pushdown, projection pruning)
-- [ ] Emitting C++ for direct use and inclusion elsewhere
-- [ ] CSV / Parquet IO adapters
 - [ ] REPL tab completion and history

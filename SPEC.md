@@ -919,8 +919,6 @@ tf[update { timestamp = timestamp + 1s }]  // ERROR: cannot mutate time index
 
 ---
 
-## 9. Extern Function Interop
-
 ## 9. User-Defined Functions
 
 User-defined functions group multiple statements under a single name.
@@ -993,7 +991,29 @@ Extern functions currently accept only scalar arguments and are evaluated as
 **scalar functions** (applied element-wise). Column/series arguments are
 reserved for a future extension.
 
-### 9.4 Restrictions
+### 10.4 REPL Plugin Loading
+
+When the REPL processes an `extern fn` declaration whose `from` path is
+non-empty, it automatically loads the corresponding shared library plugin:
+
+1. The stem of the `from` path is derived (e.g. `"csv.hpp"` → `"csv"`).
+2. The REPL searches for `<stem>.so` in each directory on its plugin search
+   path (set via `--plugin-path` flag or `IBEX_LIBRARY_PATH` environment
+   variable).
+3. The first matching file is loaded via `dlopen`.
+4. The library's `ibex_register` symbol is resolved and called with the current
+   `ExternRegistry*`, registering the function for use in the session.
+
+A compliant plugin exports exactly:
+
+```cpp
+extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry);
+```
+
+Use `scripts/ibex-plugin-build.sh` to compile a plugin `.cpp` with the correct
+flags and include paths for the current build tree.
+
+### 10.4 Restrictions
 
 | Restriction                           | Rationale                         |
 |---------------------------------------|-----------------------------------|
@@ -1016,14 +1036,20 @@ additional functions, but the recommended path for custom functionality is
 
 ### 11.1 I/O Functions
 
-I/O is provided via externs rather than built-ins. A common example:
+I/O is provided exclusively via `extern fn` plugins rather than built-ins. A
+common example using the bundled CSV plugin:
 
 ```
-extern fn read_csv(path: String) -> DataFrame<Schema> from "csv.hpp";
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+let iris = read_csv("iris.csv");
 ```
 
-`read_csv` infers column types from the input file. The resulting schema is
-implementation-defined.
+`read_csv` infers column types from the input file (Int64, Float64, or String
+per column). The resulting schema is implementation-defined.
+
+The transpiler emits the `from` path as a `#include` in the generated C++.
+The REPL loads `<stem>.so` from the plugin search path at the point the
+`extern fn` declaration is evaluated (Section 10.4).
 
 ### 11.2 Scalar Extraction
 

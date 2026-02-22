@@ -26,13 +26,14 @@ let enriched = prices join ohlc on symbol;
 Aggregation benchmarks on 4 M rows (`prices.csv`, 252 symbols).
 Release build (`-O2`), 5 iterations, 1 warmup, WSL2 / clang++.
 
-| query               |   ibex | ibex+parse |  polars |  pandas | data.table |   dplyr |
-|---------------------|-------:|-----------:|--------:|--------:|-----------:|--------:|
-| mean by symbol      | 48 ms  |     49 ms  |  36 ms  | 206 ms  |     27 ms  |  59 ms  |
-| OHLC by symbol      | 55 ms  |     56 ms  |  17 ms  | 225 ms  |     27 ms  |  61 ms  |
-| count by symbol×day | 137 ms |     —      |  58 ms  | 364 ms  |     26 ms  | 108 ms  |
-| mean by symbol×day  | 141 ms |     —      |  60 ms  | 371 ms  |     32 ms  | 131 ms  |
-| OHLC by symbol×day  | 170 ms |     —      |  60 ms  | 392 ms  |     29 ms  | 146 ms  |
+| query               |     ibex | ibex+parse |   polars |   pandas | data.table |    dplyr
+|---------------------+----------+------------+----------+----------+------------+---------
+| mean by symbol      |  46.6 ms |    44.9 ms |  34.9 ms | 180.2 ms |    24.0 ms |  51.6 ms
+| OHLC by symbol      |  51.2 ms |    50.5 ms |  28.7 ms | 195.7 ms |    27.4 ms |  50.6 ms
+| update price×2      |  3.54 ms |    3.21 ms |  2.77 ms |  5.42 ms |    40.0 ms |  5.40 ms
+| count by symbol×day | 137.8 ms |          — |  51.8 ms | 314.5 ms |    24.6 ms | 103.4 ms
+| mean by symbol×day  | 138.3 ms |          — |  53.5 ms | 318.3 ms |    23.2 ms | 116.0 ms
+| OHLC by symbol×day  | 154.5 ms |          — |  57.5 ms | 338.0 ms |    27.4 ms | 137.2 ms
 
 **ibex vs. others (geometric mean):** 3.1× faster than pandas, on par with dplyr,
 2.3× slower than polars, 3.5× slower than data.table.

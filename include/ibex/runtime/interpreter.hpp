@@ -45,6 +45,10 @@ class ExternRegistry;
                              const ExternRegistry* externs = nullptr)
     -> std::expected<Table, std::string>;
 
+[[nodiscard]] auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
+                               const std::vector<std::string>& keys)
+    -> std::expected<Table, std::string>;
+
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)
     -> std::expected<ScalarValue, std::string>;
 

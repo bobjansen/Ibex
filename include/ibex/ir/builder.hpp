@@ -46,6 +46,10 @@ public:
         return std::make_unique<ExternCallNode>(next_id(), std::move(callee), std::move(args));
     }
 
+    [[nodiscard]] auto join(JoinKind kind, std::vector<std::string> keys) -> NodePtr {
+        return std::make_unique<JoinNode>(next_id(), kind, std::move(keys));
+    }
+
 private:
     [[nodiscard]] auto next_id() -> NodeId {
         return next_id_.fetch_add(1, std::memory_order_relaxed);

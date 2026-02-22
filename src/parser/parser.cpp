@@ -226,7 +226,53 @@ class Parser {
         return ExprStmt{.expr = std::move(expr)};
     }
 
-    auto parse_expression() -> ExprPtr { return parse_or(); }
+    auto parse_expression() -> ExprPtr { return parse_join(); }
+
+    auto parse_join() -> ExprPtr {
+        auto expr = parse_or();
+        if (!expr) {
+            return nullptr;
+        }
+        while (true) {
+            JoinKind kind;
+            if (match(TokenKind::KeywordJoin)) {
+                kind = JoinKind::Inner;
+            } else if (match(TokenKind::KeywordLeft)) {
+                if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'left'")) {
+                    return nullptr;
+                }
+                kind = JoinKind::Left;
+            } else if (match(TokenKind::KeywordAsof)) {
+                if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'asof'")) {
+                    return nullptr;
+                }
+                kind = JoinKind::Asof;
+            } else {
+                break;
+            }
+
+            auto right = parse_or();
+            if (!right) {
+                return nullptr;
+            }
+            if (!consume(TokenKind::KeywordOn, "expected 'on' after join expression")) {
+                return nullptr;
+            }
+            auto keys = parse_join_keys();
+            if (!keys.has_value()) {
+                return nullptr;
+            }
+            auto join = std::make_unique<Expr>();
+            join->node = JoinExpr{
+                .kind = kind,
+                .left = std::move(expr),
+                .right = std::move(right),
+                .keys = std::move(*keys),
+            };
+            expr = std::move(join);
+        }
+        return expr;
+    }
 
     auto parse_or() -> ExprPtr {
         auto expr = parse_and();
@@ -413,6 +459,34 @@ class Parser {
         return expr;
     }
 
+    auto parse_join_keys() -> std::optional<std::vector<std::string>> {
+        std::vector<std::string> keys;
+        if (match(TokenKind::LBrace)) {
+            if (!check(TokenKind::RBrace)) {
+                do {
+                    auto name = consume_column_identifier("expected join key");
+                    if (!name.has_value()) {
+                        return std::nullopt;
+                    }
+                    keys.push_back(std::move(*name));
+                } while (match(TokenKind::Comma));
+            }
+            if (!consume(TokenKind::RBrace, "expected '}' after join key list")) {
+                return std::nullopt;
+            }
+        } else {
+            auto name = consume_column_identifier("expected join key");
+            if (!name.has_value()) {
+                return std::nullopt;
+            }
+            keys.push_back(std::move(*name));
+        }
+        if (keys.empty()) {
+            error_ = make_error(peek(), "expected at least one join key");
+            return std::nullopt;
+        }
+        return keys;
+    }
     auto parse_primary() -> ExprPtr {
         if (match(TokenKind::Identifier)) {
             std::string name(previous().lexeme);

@@ -87,6 +87,13 @@ enum class AggFunc : std::uint8_t {
     Last,
 };
 
+/// Join type.
+enum class JoinKind : std::uint8_t {
+    Inner,
+    Left,
+    Asof,
+};
+
 /// Filter predicate: column <op> literal.
 /// TODO: Extend to support compound predicates and expression trees
 ///       per SPEC.md Section 5.3 (filter clause semantics).
@@ -116,6 +123,7 @@ enum class NodeKind : std::uint8_t {
     Update,
     Window,
     ExternCall,
+    Join,
 };
 
 /// Base IR node for the query plan.
@@ -254,6 +262,22 @@ public:
 private:
     std::string callee_;
     std::vector<Expr> args_;
+};
+
+/// Join node: combines two tables using key equality (or as-of).
+class JoinNode final : public Node {
+public:
+    JoinNode(NodeId id, JoinKind kind, std::vector<std::string> keys)
+        : Node(NodeKind::Join, id), kind_(kind), keys_(std::move(keys)) {}
+
+    [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
+    [[nodiscard]] auto keys() const noexcept -> const std::vector<std::string>& {
+        return keys_;
+    }
+
+private:
+    JoinKind kind_;
+    std::vector<std::string> keys_;
 };
 
 /// Window node: specifies a time-based window for rolling computations.

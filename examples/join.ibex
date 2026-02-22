@@ -1,0 +1,12 @@
+// Join examples (inner + left)
+
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let iris = read_csv("data/iris.csv");
+let species_meta = read_csv("data/iris.csv");
+
+// Inner join on a single key
+iris join species_meta on Species;
+
+// Left join on a single key
+iris left join species_meta on Species;

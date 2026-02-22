@@ -182,6 +182,38 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << ");\n";
             return var;
         }
+
+        case ir::NodeKind::Join: {
+            const auto& join = static_cast<const ir::JoinNode&>(node);
+            if (join.children().size() != 2) {
+                throw std::runtime_error("ibex_compile: JoinNode expects two children");
+            }
+            auto left = emit_node(*join.children()[0]);
+            auto right = emit_node(*join.children()[1]);
+            auto var = fresh_var();
+            const char* fn = nullptr;
+            switch (join.kind()) {
+                case ir::JoinKind::Inner:
+                    fn = "inner_join";
+                    break;
+                case ir::JoinKind::Left:
+                    fn = "left_join";
+                    break;
+                case ir::JoinKind::Asof:
+                    throw std::runtime_error(
+                        "ibex_compile: asof join emission is not yet supported");
+            }
+            *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left
+                  << ", " << right << ", {";
+            bool first = true;
+            for (const auto& key : join.keys()) {
+                if (!first) *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(key) << '"';
+            }
+            *out_ << "});\n";
+            return var;
+        }
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     throw std::runtime_error("ibex_compile: unknown IR node kind");

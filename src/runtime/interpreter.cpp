@@ -9,6 +9,7 @@
 #include <string_view>
 #include <robin_hood.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ibex::runtime {
@@ -400,6 +401,149 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
             }
         },
         column);
+}
+
+auto default_scalar_for_column(const ColumnValue& column) -> ScalarValue {
+    return std::visit(
+        [](const auto& col) -> ScalarValue {
+            using ColType = std::decay_t<decltype(col)>;
+            using ValueType = typename ColType::value_type;
+            if constexpr (std::is_same_v<ValueType, std::int64_t>) {
+                return std::int64_t{0};
+            } else if constexpr (std::is_same_v<ValueType, double>) {
+                return 0.0;
+            } else {
+                return std::string{};
+            }
+        },
+        column);
+}
+
+auto column_kind(const ColumnValue& column) -> ExprType {
+    if (std::holds_alternative<Column<std::int64_t>>(column)) {
+        return ExprType::Int;
+    }
+    if (std::holds_alternative<Column<double>>(column)) {
+        return ExprType::Double;
+    }
+    return ExprType::String;
+}
+
+auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
+                     const std::vector<std::string>& keys)
+    -> std::expected<Table, std::string> {
+    if (kind == ir::JoinKind::Asof) {
+        return std::unexpected("asof join is not supported yet");
+    }
+    if (keys.empty()) {
+        return std::unexpected("join requires at least one key");
+    }
+
+    std::vector<const ColumnValue*> left_keys;
+    std::vector<const ColumnValue*> right_keys;
+    left_keys.reserve(keys.size());
+    right_keys.reserve(keys.size());
+    for (const auto& key : keys) {
+        const auto* left_col = left.find(key);
+        if (left_col == nullptr) {
+            return std::unexpected("join key not found in left: " + key +
+                                   " (available: " + format_columns(left) + ")");
+        }
+        const auto* right_col = right.find(key);
+        if (right_col == nullptr) {
+            return std::unexpected("join key not found in right: " + key +
+                                   " (available: " + format_columns(right) + ")");
+        }
+        if (column_kind(*left_col) != column_kind(*right_col)) {
+            return std::unexpected("join key type mismatch for " + key);
+        }
+        left_keys.push_back(left_col);
+        right_keys.push_back(right_col);
+    }
+
+    std::unordered_set<std::string> key_set(keys.begin(), keys.end());
+
+    Table output;
+    output.columns.reserve(left.columns.size() + right.columns.size());
+
+    std::unordered_set<std::string> out_names;
+    out_names.reserve(left.columns.size() + right.columns.size());
+
+    for (const auto& entry : left.columns) {
+        out_names.insert(entry.name);
+        output.add_column(entry.name, make_empty_like(entry.column));
+    }
+
+    struct RightOut {
+        const ColumnValue* column = nullptr;
+        std::size_t out_index = 0;
+    };
+    std::vector<RightOut> right_out;
+    right_out.reserve(right.columns.size());
+    for (const auto& entry : right.columns) {
+        if (key_set.contains(entry.name)) {
+            continue;
+        }
+        std::string name = entry.name;
+        while (out_names.contains(name)) {
+            name += "_right";
+        }
+        out_names.insert(name);
+        output.add_column(name, make_empty_like(entry.column));
+        right_out.push_back(RightOut{&entry.column, output.columns.size() - 1});
+    }
+
+    std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_index;
+    right_index.reserve(right.rows());
+    for (std::size_t r = 0; r < right.rows(); ++r) {
+        Key key;
+        key.values.reserve(keys.size());
+        for (const auto* col : right_keys) {
+            key.values.push_back(scalar_from_column(*col, r));
+        }
+        right_index[key].push_back(r);
+    }
+
+    auto append_left_row = [&](std::size_t row) {
+        for (std::size_t i = 0; i < left.columns.size(); ++i) {
+            append_value(output.columns[i].column, left.columns[i].column, row);
+        }
+    };
+
+    auto append_right_row = [&](std::size_t row) {
+        for (const auto& item : right_out) {
+            append_value(output.columns[item.out_index].column, *item.column, row);
+        }
+    };
+
+    auto append_right_defaults = [&]() {
+        for (const auto& item : right_out) {
+            append_scalar(output.columns[item.out_index].column,
+                          default_scalar_for_column(*item.column));
+        }
+    };
+
+    for (std::size_t l = 0; l < left.rows(); ++l) {
+        Key key;
+        key.values.reserve(keys.size());
+        for (const auto* col : left_keys) {
+            key.values.push_back(scalar_from_column(*col, l));
+        }
+        auto it = right_index.find(key);
+        if (it == right_index.end()) {
+            if (kind == ir::JoinKind::Left) {
+                append_left_row(l);
+                append_right_defaults();
+            }
+            continue;
+        }
+        for (auto r : it->second) {
+            append_left_row(l);
+            append_right_row(r);
+        }
+    }
+
+    return output;
 }
 
 auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
@@ -1590,6 +1734,21 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return std::unexpected("extern function did not return a table: " + ec.callee());
         }
+        case ir::NodeKind::Join: {
+            const auto& join = static_cast<const ir::JoinNode&>(node);
+            if (join.children().size() != 2) {
+                return std::unexpected("join node expects exactly two children");
+            }
+            auto left = interpret_node(*join.children()[0], registry, scalars, externs);
+            if (!left) {
+                return std::unexpected(left.error());
+            }
+            auto right = interpret_node(*join.children()[1], registry, scalars, externs);
+            if (!right) {
+                return std::unexpected(right.error());
+            }
+            return join_table_impl(left.value(), right.value(), join.kind(), join.keys());
+        }
     }
     return std::unexpected("unknown node kind");
 }
@@ -1631,6 +1790,11 @@ auto Table::rows() const noexcept -> std::size_t {
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
                const ExternRegistry* externs) -> std::expected<Table, std::string> {
     return interpret_node(node, registry, scalars, externs);
+}
+
+auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
+                 const std::vector<std::string>& keys) -> std::expected<Table, std::string> {
+    return join_table_impl(left, right, kind, keys);
 }
 
 auto extract_scalar(const Table& table, const std::string& column)

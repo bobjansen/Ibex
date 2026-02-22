@@ -69,6 +69,9 @@ class Lowerer {
         if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
             return lower_identifier(*ident);
         }
+        if (const auto* join = std::get_if<JoinExpr>(&expr.node)) {
+            return lower_join(*join);
+        }
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
             return lower_table_call(*call);
         }
@@ -99,6 +102,35 @@ class Lowerer {
             }
         }
         return builder_.scan(ident.name);
+    }
+
+    auto lower_join(const JoinExpr& join) -> LowerResult {
+        auto left = lower_expr(*join.left);
+        if (!left) {
+            return left;
+        }
+        auto right = lower_expr(*join.right);
+        if (!right) {
+            return right;
+        }
+
+        ir::JoinKind kind = ir::JoinKind::Inner;
+        switch (join.kind) {
+            case JoinKind::Inner:
+                kind = ir::JoinKind::Inner;
+                break;
+            case JoinKind::Left:
+                kind = ir::JoinKind::Left;
+                break;
+            case JoinKind::Asof:
+                kind = ir::JoinKind::Asof;
+                break;
+        }
+
+        auto node = builder_.join(kind, join.keys);
+        node->add_child(std::move(left.value()));
+        node->add_child(std::move(right.value()));
+        return node;
     }
 
     auto lower_block(const BlockExpr& block) -> LowerResult {
@@ -786,6 +818,10 @@ class Lowerer {
             case ir::NodeKind::ExternCall: {
                 const auto& ec = static_cast<const ir::ExternCallNode&>(node);
                 return builder_.extern_call(ec.callee(), ec.args());
+            }
+            case ir::NodeKind::Join: {
+                const auto& join = static_cast<const ir::JoinNode&>(node);
+                return builder_.join(join.kind(), join.keys());
             }
         }
         return nullptr;

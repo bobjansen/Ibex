@@ -94,6 +94,24 @@ auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
     return delegate(std::move(upd_node), t);
 }
 
+auto inner_join(const runtime::Table& left, const runtime::Table& right,
+                const std::vector<std::string>& keys) -> runtime::Table {
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Inner, keys);
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
+auto left_join(const runtime::Table& left, const runtime::Table& right,
+               const std::vector<std::string>& keys) -> runtime::Table {
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Left, keys);
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
 void print(const runtime::Table& t, std::ostream& out) {
     if (t.columns.empty()) {
         out << "(empty table)\n";

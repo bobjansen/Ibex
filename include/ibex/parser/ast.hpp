@@ -80,6 +80,12 @@ enum class BinaryOp : std::uint8_t {
     Or,
 };
 
+enum class JoinKind : std::uint8_t {
+    Inner,
+    Left,
+    Asof,
+};
+
 struct Expr;
 using ExprPtr = std::unique_ptr<Expr>;
 
@@ -136,8 +142,22 @@ struct GroupExpr {
     ExprPtr expr;
 };
 
+struct JoinExpr {
+    JoinKind kind = JoinKind::Inner;
+    ExprPtr left;
+    ExprPtr right;
+    std::vector<std::string> keys;
+};
+
 struct Expr {
-    std::variant<IdentifierExpr, LiteralExpr, CallExpr, UnaryExpr, BinaryExpr, GroupExpr, BlockExpr>
+    std::variant<IdentifierExpr,
+                 LiteralExpr,
+                 CallExpr,
+                 UnaryExpr,
+                 BinaryExpr,
+                 GroupExpr,
+                 BlockExpr,
+                 JoinExpr>
         node;
 };
 

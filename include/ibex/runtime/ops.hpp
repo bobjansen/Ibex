@@ -27,6 +27,12 @@ namespace ibex::ops {
 [[nodiscard]] auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
     -> runtime::Table;
 
+[[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,
+                              const std::vector<std::string>& keys) -> runtime::Table;
+
+[[nodiscard]] auto left_join(const runtime::Table& left, const runtime::Table& right,
+                             const std::vector<std::string>& keys) -> runtime::Table;
+
 void print(const runtime::Table& t, std::ostream& out = std::cout);
 
 //─── Expression builders ──────────────────────────────────────────────────────

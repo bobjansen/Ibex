@@ -179,6 +179,21 @@ TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     CHECK(pos_filter < pos_proj);
 }
 
+// ─── Join ────────────────────────────────────────────────────────────────────
+
+TEST_CASE("emitter: join node — inner join", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Inner, {"id"});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::inner_join("));
+    CHECK(contains(out, "\"id\""));
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: extern headers in config", "[codegen]") {

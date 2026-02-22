@@ -51,3 +51,8 @@ TEST_CASE("REPL loads script with inferred lets") {
 
     REQUIRE(ibex::repl::execute_script(source, registry));
 }
+
+TEST_CASE("REPL accepts scalar expression statements") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("1+1;", registry));
+}

@@ -931,43 +931,21 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::ExprStmt>(stmt)) {
             const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-            if (std::get_if<parser::CallExpr>(&expr_stmt.expr->node) != nullptr) {
-                auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, functions,
-                                             extern_decls, externs);
-                if (!value) {
-                    fmt::print("error: {}\n", value.error());
-                    return false;
-                }
-                if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                    std::visit([](const auto& v) { fmt::print("{}\n", v); }, *scalar);
-                } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
-                    runtime::Table temp;
-                    temp.add_column("column", *col);
-                    print_table(temp);
-                } else {
-                    print_table(std::get<runtime::Table>(std::move(value.value())));
-                }
-                continue;
-            }
-            if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
-                if (auto it = scalars.find(ident->name); it != scalars.end()) {
-                    std::visit([](const auto& value) { fmt::print("{}\n", value); }, it->second);
-                    continue;
-                }
-                if (auto it = columns.find(ident->name); it != columns.end()) {
-                    runtime::Table temp;
-                    temp.add_column(ident->name, it->second);
-                    print_table(temp);
-                    continue;
-                }
-            }
-            auto evaluated = eval_table_expr(*expr_stmt.expr, tables, scalars, columns, functions,
-                                             extern_decls, externs);
-            if (!evaluated) {
-                fmt::print("error: {}\n", evaluated.error());
+            auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, functions,
+                                         extern_decls, externs);
+            if (!value) {
+                fmt::print("error: {}\n", value.error());
                 return false;
             }
-            print_table(evaluated.value());
+            if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+                std::visit([](const auto& v) { fmt::print("{}\n", v); }, *scalar);
+            } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                runtime::Table temp;
+                temp.add_column("column", *col);
+                print_table(temp);
+            } else {
+                print_table(std::get<runtime::Table>(std::move(value.value())));
+            }
         }
     }
     return true;
@@ -1002,7 +980,9 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry) 
 }
 
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
-    spdlog::info("Ibex REPL started (verbose={})", config.verbose);
+    if (config.verbose) {
+        spdlog::info("Ibex REPL started (verbose={})", config.verbose);
+    }
 
     auto tables = build_builtin_tables();
     runtime::ScalarRegistry scalars;

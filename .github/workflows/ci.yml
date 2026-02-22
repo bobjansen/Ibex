@@ -60,22 +60,26 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
+          sudo apt-get install -y clang-20 clang-tidy-20 cmake ninja-build || \
           sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build
 
       - name: Configure
         run: |
+          if command -v clang++-20 >/dev/null 2>&1; then CC=clang-20; CXX=clang++-20; else CC=clang-18; CXX=clang++-18; fi
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_COMPILER=clang++-18
+            -DCMAKE_C_COMPILER=$CC \
+            -DCMAKE_CXX_COMPILER=$CXX
 
       - name: Build (generate compile_commands.json)
         run: cmake --build build --parallel
 
       - name: Run clang-tidy
         run: |
+          if command -v clang-tidy-20 >/dev/null 2>&1; then TIDY=clang-tidy-20; else TIDY=clang-tidy-18; fi
           find src include -name '*.cpp' -o -name '*.hpp' | \
-            xargs clang-tidy-18 -p build
+            xargs $TIDY -p build
 
   format-check:
     runs-on: ubuntu-24.04

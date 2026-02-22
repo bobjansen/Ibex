@@ -17,8 +17,7 @@ int main(int argc, char* argv[]) {
     std::string output_path;
 
     app.add_option("input", input_path, "Input .ibex source file")->required();
-    app.add_option("-o,--output", output_path,
-                   "Output .cpp file (default: stdout)");
+    app.add_option("-o,--output", output_path, "Output .cpp file (default: stdout)");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -33,9 +32,8 @@ int main(int argc, char* argv[]) {
     // Parse
     auto program = ibex::parser::parse(source);
     if (!program) {
-        std::cerr << "ibex_compile: parse error at " << input_path << ":"
-                  << program.error().line << ":" << program.error().column
-                  << ": " << program.error().message << "\n";
+        std::cerr << "ibex_compile: parse error at " << input_path << ":" << program.error().line
+                  << ":" << program.error().column << ": " << program.error().message << "\n";
         return 1;
     }
 

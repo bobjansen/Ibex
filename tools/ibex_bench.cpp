@@ -2,12 +2,11 @@
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
-#include <csv.hpp>
-
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
 
 #include <chrono>
+#include <csv.hpp>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -122,8 +121,8 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
     }
     auto end = std::chrono::steady_clock::now();
 
-    auto total_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end - start)
-                        .count();
+    auto total_ms =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end - start).count();
     auto avg_ms = total_ms / static_cast<double>(iters);
 
     fmt::print("bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, rows={}\n", query.name, iters,
@@ -176,7 +175,8 @@ int main(int argc, char** argv) {
         },
         {
             "ohlc_by_symbol",
-            "prices[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by symbol]",
+            "prices[select {open = first(price), high = max(price), low = min(price), last = "
+            "last(price)}, by symbol]",
         },
         // Parse + lower overhead: same queries timed with parsing included.
         // Run with --include-parse (default) to capture lexer/parser maps.
@@ -186,7 +186,8 @@ int main(int argc, char** argv) {
         },
         {
             "parse_ohlc_by_symbol",
-            "prices[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by symbol]",
+            "prices[select {open = first(price), high = max(price), low = min(price), last = "
+            "last(price)}, by symbol]",
         },
     };
 
@@ -227,7 +228,8 @@ int main(int argc, char** argv) {
             },
             {
                 "ohlc_by_symbol_day",
-                "prices_multi[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by {symbol, day}]",
+                "prices_multi[select {open = first(price), high = max(price), low = min(price), "
+                "last = last(price)}, by {symbol, day}]",
             },
         };
 

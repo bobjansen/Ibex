@@ -53,9 +53,29 @@ auto format_double(double v) -> std::string {
 
 // ─── Public ──────────────────────────────────────────────────────────────────
 
+auto Emitter::indent_code(const std::string& code, int spaces) -> std::string {
+    if (spaces <= 0 || code.empty())
+        return code;
+    std::string prefix(spaces, ' ');
+    std::string result;
+    result.reserve(code.size() + prefix.size() * 16);
+    bool at_start = true;
+    for (char c : code) {
+        if (at_start && c != '\n') {
+            result += prefix;
+            at_start = false;
+        }
+        result += c;
+        if (c == '\n')
+            at_start = true;
+    }
+    return result;
+}
+
 void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config) {
     out_ = &out;
     tmp_counter_ = 0;
+    cached_vars_.clear();
 
     // Preamble
     if (!config.source_name.empty()) {
@@ -67,7 +87,10 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     }
 
     out << "#include <cstdint>\n";
-    out << "#include <iostream>\n";
+    if (config.bench_mode)
+        out << "#include <chrono>\n#include <cstdio>\n";
+    else
+        out << "#include <iostream>\n";
     out << "#include <limits>\n";
     out << "#include <string>\n";
     out << "#include <vector>\n";
@@ -80,15 +103,75 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     out << "\n";
     out << "int main() {\n";
 
-    auto result_var = emit_node(root);
+    if (config.bench_mode) {
+        // Phase 1: emit ExternCall (data loading) nodes into main buffer (setup).
+        collect_extern_calls(root);
 
-    if (config.print_result) {
-        out << "    ibex::ops::print(" << result_var << ");\n";
+        // Phase 2: emit the query into a temporary buffer.
+        std::ostringstream query_buf;
+        auto* saved_out = out_;
+        out_ = &query_buf;
+        auto result_var = emit_node(root);
+        out_ = saved_out;
+
+        // Re-indent query code by 4 extra spaces so it sits inside the loop body.
+        std::string query_code = indent_code(query_buf.str(), 4);
+
+        // Warmup loop
+        out << "\n    // Warmup\n";
+        out << "    for (int _bench_w = 0; _bench_w < " << config.bench_warmup
+            << "; ++_bench_w) {\n";
+        out << query_code;
+        out << "        (void)" << result_var << ";\n";
+        out << "    }\n";
+
+        // Timed loop
+        out << "\n    // Timed iterations\n";
+        out << "    auto _bench_t0 = std::chrono::steady_clock::now();\n";
+        out << "    for (int _bench_i = 0; _bench_i < " << config.bench_iters
+            << "; ++_bench_i) {\n";
+        out << query_code;
+        out << "        (void)" << result_var << ";\n";
+        out << "    }\n";
+        out << "    auto _bench_t1 = std::chrono::steady_clock::now();\n";
+        out << "    double _avg_ms = std::chrono::duration<double, std::milli>"
+               "(_bench_t1 - _bench_t0).count() / "
+            << config.bench_iters << ";\n";
+        out << "    std::fprintf(stderr, \"avg_ms=%.3f\\n\", _avg_ms);\n";
+    } else {
+        auto result_var = emit_node(root);
+        if (config.print_result) {
+            out << "    ibex::ops::print(" << result_var << ");\n";
+        }
     }
+
     out << "    return 0;\n";
     out << "}\n";
 
     out_ = nullptr;
+}
+
+void Emitter::collect_extern_calls(const ir::Node& node) {
+    if (cached_vars_.count(&node))
+        return;
+    if (node.kind() == ir::NodeKind::ExternCall) {
+        const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+        auto var = fresh_var();
+        *out_ << "    auto " << var << " = " << ec.callee() << "(";
+        bool first = true;
+        for (const auto& arg : ec.args()) {
+            if (!first)
+                *out_ << ", ";
+            first = false;
+            *out_ << emit_raw_expr(arg);
+        }
+        *out_ << ");\n";
+        cached_vars_[&node] = var;
+        return;
+    }
+    for (const auto& child : node.children()) {
+        collect_extern_calls(*child);
+    }
 }
 
 // ─── Private helpers ─────────────────────────────────────────────────────────
@@ -184,6 +267,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             throw std::runtime_error("ibex_compile: WindowNode emission is not yet supported");
 
         case ir::NodeKind::ExternCall: {
+            // In bench mode ExternCall nodes were pre-emitted; reuse the var.
+            if (auto it = cached_vars_.find(&node); it != cached_vars_.end())
+                return it->second;
             const auto& ec = static_cast<const ir::ExternCallNode&>(node);
             auto var = fresh_var();
             *out_ << "    auto " << var << " = " << ec.callee() << "(";

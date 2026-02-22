@@ -84,11 +84,8 @@ let prices = read_csv("${CSV}");
 ${query};
 EOF
 
-    if "$IBEX_COMPILE" --help | grep -q -- "--no-print"; then
-        "$IBEX_COMPILE" "$ibex_path" -o "$cpp_path" --no-print
-    else
-        "$IBEX_COMPILE" "$ibex_path" -o "$cpp_path"
-    fi
+    "$IBEX_COMPILE" "$ibex_path" -o "$cpp_path" \
+        --bench --bench-warmup "$WARMUP" --bench-iters "$ITERS"
     if [[ ! -f "$cpp_path" ]]; then
         echo "error: failed to generate $cpp_path" >&2
         exit 1
@@ -126,19 +123,10 @@ EOF
 
 time_bin() {
     local bin="$1"
-    python3 - "$bin" "$WARMUP" "$ITERS" <<'PY'
-import subprocess, sys, time
-bin_path = sys.argv[1]
-warmup = int(sys.argv[2])
-iters = int(sys.argv[3])
-for _ in range(warmup):
-    subprocess.run([bin_path], check=True, stdout=subprocess.DEVNULL)
-t0 = time.perf_counter()
-for _ in range(iters):
-    subprocess.run([bin_path], check=True, stdout=subprocess.DEVNULL)
-avg_ms = (time.perf_counter() - t0) * 1000 / iters
-print(f"{avg_ms:.3f}")
-PY
+    # The binary prints "avg_ms=X.XXX" to stderr (timing is internal).
+    local stderr_out
+    stderr_out="$("$bin" 2>&1 >/dev/null)"
+    echo "$stderr_out" | grep -oP 'avg_ms=\K[0-9.]+' | head -1
 }
 
 declare -a NAMES

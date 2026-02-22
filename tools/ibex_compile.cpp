@@ -16,10 +16,19 @@ int main(int argc, char* argv[]) {
     std::string input_path;
     std::string output_path;
     bool no_print = false;
+    bool bench = false;
+    int bench_warmup = 3;
+    int bench_iters = 10;
 
     app.add_option("input", input_path, "Input .ibex source file")->required();
     app.add_option("-o,--output", output_path, "Output .cpp file (default: stdout)");
     app.add_flag("--no-print", no_print, "Disable ibex::ops::print() in generated code");
+    app.add_flag("--bench", bench,
+                 "Emit a benchmark harness: data loaded once, query timed internally");
+    app.add_option("--bench-warmup", bench_warmup, "Warmup iterations (default: 3)")
+        ->needs("--bench");
+    app.add_option("--bench-iters", bench_iters, "Timed iterations (default: 10)")
+        ->needs("--bench");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -49,7 +58,10 @@ int main(int argc, char* argv[]) {
     // Collect extern headers from the program
     ibex::codegen::Emitter::Config config;
     config.source_name = input_path;
-    config.print_result = !no_print;
+    config.print_result = !no_print && !bench;
+    config.bench_mode = bench;
+    config.bench_warmup = bench_warmup;
+    config.bench_iters = bench_iters;
     for (const auto& stmt : program->statements) {
         if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
             if (!ext->source_path.empty()) {

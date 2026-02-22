@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ibex::codegen {
@@ -21,6 +22,12 @@ class Emitter {
         std::string source_name;
         /// Whether to emit ibex::ops::print() for the final result.
         bool print_result = true;
+        /// Emit a self-contained benchmark harness: data is loaded once
+        /// outside the timing loop; the query runs bench_warmup + bench_iters
+        /// times and prints "avg_ms=X.XXX\n" to stderr.
+        bool bench_mode = false;
+        int bench_warmup = 3;
+        int bench_iters = 10;
     };
 
     /// Emit a complete C++ translation unit to `out`.
@@ -33,8 +40,15 @@ class Emitter {
    private:
     std::ostream* out_{nullptr};
     int tmp_counter_{0};
+    /// Cache of nodes already emitted (used in bench mode to avoid re-emitting
+    /// ExternCall nodes inside the timing loop).
+    std::unordered_map<const ir::Node*, std::string> cached_vars_;
 
     auto fresh_var() -> std::string;
+
+    /// Pre-emit all ExternCall nodes in the subtree to the current output
+    /// stream and cache their variable names in cached_vars_.
+    void collect_extern_calls(const ir::Node& node);
 
     /// Emit code for a node and all its children; returns the variable name
     /// that holds the result.
@@ -52,6 +66,9 @@ class Emitter {
     static auto emit_compare_op(ir::CompareOp op) -> std::string;
     static auto emit_arith_op(ir::ArithmeticOp op) -> std::string;
     static auto emit_agg_func(ir::AggFunc func) -> std::string;
+
+    /// Prefix every line in `code` with `spaces` additional spaces.
+    static auto indent_code(const std::string& code, int spaces) -> std::string;
 };
 
 }  // namespace ibex::codegen

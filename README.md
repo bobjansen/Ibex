@@ -2,6 +2,84 @@
 
 A statically typed DSL for columnar DataFrame manipulation, transpiling to C++23.
 
+```
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let prices = read_csv("prices.csv");
+
+// Filter, then group-by aggregation
+let ohlc = prices[
+    filter price > 1.0,
+    select { open = first(price), high = max(price), low = min(price), close = last(price) },
+    by symbol,
+];
+
+// Add derived columns (all existing columns are preserved)
+let annotated = prices[update { price_k = price / 1000.0 }];
+
+// Join two tables
+let enriched = prices join ohlc on symbol;
+```
+
+## Benchmark
+
+Aggregation benchmarks on 4 M rows (`prices.csv`, 252 symbols).
+Release build (`-O2`), 5 iterations, 1 warmup, WSL2 / clang++.
+
+| query               |   ibex | ibex+parse |  polars |  pandas | data.table |   dplyr |
+|---------------------|-------:|-----------:|--------:|--------:|-----------:|--------:|
+| mean by symbol      | 48 ms  |     49 ms  |  36 ms  | 206 ms  |     27 ms  |  59 ms  |
+| OHLC by symbol      | 55 ms  |     56 ms  |  17 ms  | 225 ms  |     27 ms  |  61 ms  |
+| count by symbol×day | 137 ms |     —      |  58 ms  | 364 ms  |     26 ms  | 108 ms  |
+| mean by symbol×day  | 141 ms |     —      |  60 ms  | 371 ms  |     32 ms  | 131 ms  |
+| OHLC by symbol×day  | 170 ms |     —      |  60 ms  | 392 ms  |     29 ms  | 146 ms  |
+
+**ibex vs. others (geometric mean):** 3.1× faster than pandas, on par with dplyr,
+2.3× slower than polars, 3.5× slower than data.table.
+
+`ibex+parse` includes text parsing and IR lowering; the overhead is negligible.
+See [`benchmarking/`](benchmarking/) for methodology and reproduction instructions.
+
+## Language at a glance
+
+### Load and filter
+
+```
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let iris = read_csv("data/iris.csv");
+
+// Filter rows, select columns
+iris[filter `Sepal.Length` > 5.0, select { Species, `Sepal.Length` }];
+```
+
+### Aggregation
+
+```
+// Mean sepal length per species
+iris[select { mean_sl = mean(`Sepal.Length`) }, by Species];
+```
+
+### Update (add / replace columns)
+
+```
+// Add derived columns — all existing columns are preserved
+iris[update { sl_doubled = `Sepal.Length` * 2.0 }];
+```
+
+### Scalar extraction
+
+```
+let total = scalar(prices[select { total = sum(price) }], total);
+```
+
+### Joins
+
+```
+let enriched = prices join ohlc on symbol;
+let with_meta = prices left join metadata on symbol;
+```
+
 ## Architecture
 
 ```
@@ -44,13 +122,19 @@ ibex/
 Requirements: Clang 17+, CMake 3.26+, Ninja (recommended).
 
 ```bash
+# Debug (with sanitizers)
 cmake -B build -G Ninja \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Debug \
   -DIBEX_ENABLE_SANITIZERS=ON
-
 cmake --build build
 ctest --test-dir build --output-on-failure
+
+# Release
+cmake -B build-release -G Ninja \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
 ```
 
 ### Build Options
@@ -67,14 +151,11 @@ ctest --test-dir build --output-on-failure
 ## Running the REPL
 
 ```bash
-# Without plugins (built-in tables only)
-./build/tools/ibex
+# With the bundled CSV plugin
+IBEX_LIBRARY_PATH=./build-release/libraries ./build-release/tools/ibex
 
-# With a plugin directory (required for extern fn libraries like read_csv)
-./build/tools/ibex --plugin-path ./build/libraries
-
-# Or via environment variable
-IBEX_LIBRARY_PATH=./build/libraries ./build/tools/ibex
+# Or pass the plugin directory explicitly
+./build-release/tools/ibex --plugin-path ./build-release/libraries
 ```
 
 ### REPL Commands
@@ -88,22 +169,10 @@ IBEX_LIBRARY_PATH=./build/libraries ./build/tools/ibex
 :load <file>             Load and execute an .ibex script
 ```
 
-### Built-in Functions
-
-```
-scalar(df, col)               Extract a scalar from a single-row DataFrame
-```
-
-I/O functions such as `read_csv` are provided as plugins (see below).
-
 ## Plugins
 
 Ibex data-source functions (e.g. `read_csv`, `read_parquet`) are **plugins** —
 shared libraries loaded at runtime when a script declares an `extern fn`.
-
-See `INSTALL.md` for build and plugin setup.
-
-### How it works
 
 When the REPL encounters:
 
@@ -113,31 +182,6 @@ extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 
 it looks for `csv.so` in the plugin search path and calls its
 `ibex_register(ExternRegistry*)` entry point to register the function.
-
-### Using the bundled CSV plugin
-
-```bash
-# The plugin is built automatically with the project:
-ls build/libraries/csv.so
-
-# Load it by pointing the REPL at the libraries build directory:
-IBEX_LIBRARY_PATH=./build/libraries ./build/tools/ibex
-```
-
-### Building the Parquet plugin
-
-The Parquet plugin is built **standalone** and does not affect the Ibex build.
-
-```bash
-# Build Ibex first (needed for the runtime libs)
-cmake --build build --parallel
-
-# Build the parquet plugin
-./scripts/ibex-parquet-build.sh
-
-# Run the REPL with plugin path
-IBEX_LIBRARY_PATH=./libraries ./build/tools/ibex
-```
 
 ### Writing your own plugin
 

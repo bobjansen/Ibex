@@ -122,6 +122,21 @@ ls build/libraries/csv.so
 IBEX_LIBRARY_PATH=./build/libraries ./build/tools/ibex
 ```
 
+### Building the Parquet plugin
+
+The Parquet plugin is built **standalone** and does not affect the Ibex build.
+
+```bash
+# Build Ibex first (needed for the runtime libs)
+cmake --build build --parallel
+
+# Build the parquet plugin
+./scripts/ibex-parquet-build.sh
+
+# Run the REPL with plugin path
+IBEX_LIBRARY_PATH=./libraries ./build/tools/ibex
+```
+
 ### Writing your own plugin
 
 1. Create a header (`my_source.hpp`) that implements your function returning

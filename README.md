@@ -101,6 +101,8 @@ I/O functions such as `read_csv` are provided as plugins (see below).
 Ibex data-source functions (e.g. `read_csv`, `read_parquet`) are **plugins** —
 shared libraries loaded at runtime when a script declares an `extern fn`.
 
+See `INSTALL.md` for build and plugin setup.
+
 ### How it works
 
 When the REPL encounters:

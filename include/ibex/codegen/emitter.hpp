@@ -13,7 +13,7 @@ namespace ibex::codegen {
 /// The emitted code uses ibex::ops::* for all table operations and can be
 /// compiled against the ibex runtime library.
 class Emitter {
-public:
+   public:
     struct Config {
         /// Header files to #include (from extern fn declarations).
         std::vector<std::string> extern_headers;
@@ -26,7 +26,7 @@ public:
     /// The last IR node's result is passed to ibex::ops::print().
     void emit(std::ostream& out, const ir::Node& root, const Config& config = {});
 
-private:
+   private:
     std::ostream* out_{nullptr};
     int tmp_counter_{0};
 
@@ -37,17 +37,17 @@ private:
     auto emit_node(const ir::Node& node) -> std::string;
 
     /// Emit a FilterPredicate initialiser (inline, no trailing newline).
-    auto emit_predicate(const ir::FilterPredicate& pred) -> std::string;
+    static auto emit_predicate(const ir::FilterPredicate& pred) -> std::string;
 
     /// Emit an Expr expression builder call (inline).
     auto emit_expr(const ir::Expr& expr) -> std::string;
 
     /// Emit a raw C++ value expression for extern call arguments (literals only).
-    auto emit_raw_expr(const ir::Expr& expr) -> std::string;
+    static auto emit_raw_expr(const ir::Expr& expr) -> std::string;
 
-    auto emit_compare_op(ir::CompareOp op) -> std::string;
-    auto emit_arith_op(ir::ArithmeticOp op) -> std::string;
-    auto emit_agg_func(ir::AggFunc func) -> std::string;
+    static auto emit_compare_op(ir::CompareOp op) -> std::string;
+    static auto emit_arith_op(ir::ArithmeticOp op) -> std::string;
+    static auto emit_agg_func(ir::AggFunc func) -> std::string;
 };
 
 }  // namespace ibex::codegen

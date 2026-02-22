@@ -1,0 +1,3 @@
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+read_csv("data/iris.csv")[select total = count()];

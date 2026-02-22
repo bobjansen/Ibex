@@ -19,6 +19,7 @@ enum class TokenKind : std::uint8_t {
 
     // Identifiers
     Identifier,
+    QuotedIdentifier,
 
     // Hard keywords (SPEC.md Appendix B)
     KeywordLet,

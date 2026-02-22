@@ -438,6 +438,12 @@ class Parser {
             expr->node = IdentifierExpr{.name = std::move(name)};
             return expr;
         }
+        if (match(TokenKind::QuotedIdentifier)) {
+            std::string name = unescape_quoted_identifier(previous().lexeme);
+            auto expr = std::make_unique<Expr>();
+            expr->node = IdentifierExpr{.name = std::move(name)};
+            return expr;
+        }
         if (match(TokenKind::IntLiteral)) {
             auto value = parse_int(previous().lexeme);
             if (!value.has_value()) {
@@ -521,7 +527,7 @@ class Parser {
                 }
                 return ByClause{.keys = std::move(*fields), .is_braced = true};
             }
-            auto ident = consume_identifier("expected identifier after 'by'");
+            auto ident = consume_column_identifier("expected identifier after 'by'");
             if (!ident.has_value()) {
                 return std::nullopt;
             }
@@ -552,7 +558,7 @@ class Parser {
         std::vector<Field> fields;
         if (!check(TokenKind::RBrace)) {
             do {
-                auto name = consume_identifier("expected field name");
+                auto name = consume_column_identifier("expected field name");
                 if (!name.has_value()) {
                     return std::nullopt;
                 }
@@ -642,7 +648,7 @@ class Parser {
         std::vector<SchemaField> fields;
         if (!check(TokenKind::RBrace)) {
             do {
-                auto name = consume_identifier("expected schema field name");
+                auto name = consume_column_identifier("expected schema field name");
                 if (!name.has_value()) {
                     return std::nullopt;
                 }
@@ -703,6 +709,17 @@ class Parser {
     auto consume_identifier(std::string_view message) -> std::optional<std::string> {
         if (match(TokenKind::Identifier)) {
             return std::string(previous().lexeme);
+        }
+        error_ = make_error(peek(), message);
+        return std::nullopt;
+    }
+
+    auto consume_column_identifier(std::string_view message) -> std::optional<std::string> {
+        if (match(TokenKind::Identifier)) {
+            return std::string(previous().lexeme);
+        }
+        if (match(TokenKind::QuotedIdentifier)) {
+            return unescape_quoted_identifier(previous().lexeme);
         }
         error_ = make_error(peek(), message);
         return std::nullopt;
@@ -800,6 +817,35 @@ class Parser {
                         break;
                     case '"':
                         result.push_back('"');
+                        break;
+                    case '\\':
+                        result.push_back('\\');
+                        break;
+                    default:
+                        result.push_back(next);
+                        break;
+                }
+                idx += 1;
+                continue;
+            }
+            result.push_back(ch);
+        }
+        return result;
+    }
+
+    static auto unescape_quoted_identifier(std::string_view text) -> std::string {
+        if (text.size() < 2) {
+            return std::string(text);
+        }
+        std::string result;
+        result.reserve(text.size() - 2);
+        for (std::size_t idx = 1; idx + 1 < text.size(); ++idx) {
+            char ch = text[idx];
+            if (ch == '\\' && idx + 1 < text.size() - 1) {
+                char next = text[idx + 1];
+                switch (next) {
+                    case '`':
+                        result.push_back('`');
                         break;
                     case '\\':
                         result.push_back('\\');

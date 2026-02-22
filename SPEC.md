@@ -115,6 +115,17 @@ DIGIT  = "0".."9" ;
 Identifiers are case-sensitive. Leading underscores are permitted but reserved
 by convention for internal use.
 
+Column names may also be written as **quoted identifiers** using backticks,
+which allows arbitrary characters (including dots and spaces):
+
+```
+`Sepal.Length`
+`foo bar`
+```
+
+Backtick-quoted identifiers can be used wherever a column name is expected
+(field lists, `by` keys, schema fields, and column references in expressions).
+
 ### 2.3 Keywords
 
 The following identifiers are reserved and may not be used as binding names,

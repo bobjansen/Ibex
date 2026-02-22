@@ -203,6 +203,23 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         }
 
         switch (ch) {
+            case '`': {
+                while (!at_end() && peek() != '`') {
+                    if (peek() == '\\' && peek(1) != '\0') {
+                        advance();
+                    }
+                    advance();
+                }
+                if (at_end()) {
+                    add_token(TokenKind::Error, token_start, i - token_start, token_line,
+                              token_column);
+                    continue;
+                }
+                advance();
+                add_token(TokenKind::QuotedIdentifier, token_start, i - token_start, token_line,
+                          token_column);
+                continue;
+            }
             case '"': {
                 while (!at_end() && peek() != '"') {
                     if (peek() == '\\' && peek(1) != '\0') {

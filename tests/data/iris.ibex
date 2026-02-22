@@ -1,0 +1,7 @@
+extern fn read_csv(path: String) -> DataFrame<{}> from "csv.hpp";
+
+let iris = read_csv("data/iris.csv");
+iris[filter `Sepal.Length` > 5.0, select { `Sepal.Length`, `Sepal.Width` }];
+iris[select { m = mean(`Sepal.Length`)}, by Species];
+iris[filter `Sepal.Length` > 5.0, select { m = mean(`Sepal.Length`)}, by Species];
+

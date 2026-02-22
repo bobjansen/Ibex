@@ -9,6 +9,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - `cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug`
 - `cmake --build build --parallel && ctest --test-dir build --output-on-failure`
 - Workflow: run tests after any parser/lexer/AST changes before marking work done.
+- Workflow: add a usage example for new syntax in an `.ibex` file.
 
 ## Architecture
 - `include/ibex/` — public headers (all under `ibex` namespace)

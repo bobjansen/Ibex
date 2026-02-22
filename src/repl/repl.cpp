@@ -143,6 +143,22 @@ std::string_view trim(std::string_view text) {
     return rtrim(ltrim(text));
 }
 
+std::string parse_load_path(std::string_view text) {
+    std::string_view view = trim(text);
+    if (view.empty()) {
+        return {};
+    }
+    if (view.front() == '"' || view.front() == '\'') {
+        char quote = view.front();
+        auto end = view.find(quote, 1);
+        if (end != std::string_view::npos) {
+            return std::string(view.substr(1, end - 1));
+        }
+    }
+    return std::string(view);
+}
+
+
 std::size_t parse_optional_size(std::string_view text, std::size_t default_value) {
     text = trim(text);
     if (text.empty()) {
@@ -889,8 +905,9 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             print_scalars(scalars);
             continue;
         }
-        if (line.starts_with(":schema")) {
-            auto arg = trim(line.substr(std::string_view(":schema").size()));
+        std::string_view line_view(line);
+        if (line_view.starts_with(":schema")) {
+            auto arg = trim(line_view.substr(std::string_view(":schema").size()));
             if (arg.empty()) {
                 fmt::print("usage: :schema <table>\n");
                 continue;
@@ -903,8 +920,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             print_schema(it->second);
             continue;
         }
-        if (line.starts_with(":head")) {
-            auto rest = trim(line.substr(std::string_view(":head").size()));
+        if (line_view.starts_with(":head")) {
+            auto rest = trim(line_view.substr(std::string_view(":head").size()));
             auto space = rest.find(' ');
             std::string_view name = rest;
             std::string_view count_text;
@@ -925,8 +942,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             print_table(it->second, count);
             continue;
         }
-        if (line.starts_with(":describe")) {
-            auto rest = trim(line.substr(std::string_view(":describe").size()));
+        if (line_view.starts_with(":describe")) {
+            auto rest = trim(line_view.substr(std::string_view(":describe").size()));
             auto space = rest.find(' ');
             std::string_view name = rest;
             std::string_view count_text;
@@ -947,15 +964,20 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             describe_table(it->second, count);
             continue;
         }
-        if (line.starts_with(":load")) {
-            auto arg = trim(line.substr(std::string_view(":load").size()));
-            if (arg.empty()) {
+        if (line_view.starts_with(":load")) {
+            auto arg_view = trim(line_view.substr(std::string_view(":load").size()));
+            if (arg_view.empty()) {
                 fmt::print("usage: :load <file>\n");
                 continue;
             }
-            std::ifstream input{std::string(arg)};
+            std::string path = parse_load_path(arg_view);
+            if (path.empty()) {
+                fmt::print("usage: :load <file>\n");
+                continue;
+            }
+            std::ifstream input{path};
             if (!input) {
-                fmt::print("error: failed to open '{}'\n", arg);
+                fmt::print("error: failed to open '{}'\n", path);
                 continue;
             }
             std::string source((std::istreambuf_iterator<char>(input)),

@@ -10,17 +10,14 @@
 
 #include <algorithm>
 #include <charconv>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
-#include <vector>
 #include <variant>
-
-#include <dlfcn.h>
 
 namespace ibex::repl {
 
@@ -245,10 +242,9 @@ std::size_t parse_optional_size(std::string_view text, std::size_t default_value
     return value;
 }
 
-std::size_t temp_table_counter = 0;
-
 auto make_temp_table_name() -> std::string {
-    return "_fn_tmp" + std::to_string(temp_table_counter++);
+    static std::size_t counter = 0;
+    return "_fn_tmp" + std::to_string(counter++);
 }
 
 auto column_name_from_expr(const parser::Expr& expr) -> std::optional<std::string> {
@@ -328,8 +324,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                 }
                 return EvalValue{std::move(scalar.value())};
             }
-            auto table = eval_table_expr(expr, tables, scalars, columns, functions, extern_decls,
-                                         externs);
+            auto table =
+                eval_table_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
             if (!table) {
                 return std::unexpected(table.error());
             }
@@ -374,9 +370,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                 externs);
     }
     if (const auto* unary = std::get_if<parser::UnaryExpr>(&expr.node)) {
-        auto value =
-            eval_scalar_expr(*unary->expr, tables, scalars, columns, functions, extern_decls,
-                             externs);
+        auto value = eval_scalar_expr(*unary->expr, tables, scalars, columns, functions,
+                                      extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -392,15 +387,13 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unsupported unary operand type");
     }
     if (const auto* binary = std::get_if<parser::BinaryExpr>(&expr.node)) {
-        auto left =
-            eval_scalar_expr(*binary->left, tables, scalars, columns, functions, extern_decls,
-                             externs);
+        auto left = eval_scalar_expr(*binary->left, tables, scalars, columns, functions,
+                                     extern_decls, externs);
         if (!left) {
             return std::unexpected(left.error());
         }
-        auto right =
-            eval_scalar_expr(*binary->right, tables, scalars, columns, functions, extern_decls,
-                             externs);
+        auto right = eval_scalar_expr(*binary->right, tables, scalars, columns, functions,
+                                      extern_decls, externs);
         if (!right) {
             return std::unexpected(right.error());
         }
@@ -464,9 +457,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return scalar.value();
         }
         if (functions.contains(call->callee)) {
-            auto value =
-                eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
-                                   externs);
+            auto value = eval_function_call(*call, tables, scalars, columns, functions,
+                                            extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -490,9 +482,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             runtime::ExternArgs args;
             args.reserve(call->args.size());
             for (const auto& arg : call->args) {
-                auto value =
-                    eval_scalar_expr(*arg, tables, scalars, columns, functions, extern_decls,
-                                     externs);
+                auto value = eval_scalar_expr(*arg, tables, scalars, columns, functions,
+                                              extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -518,8 +509,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
                      const runtime::ExternRegistry& externs)
     -> std::expected<runtime::Table, std::string> {
-    auto eval_extern_table_call = [&](parser::CallExpr& call)
-        -> std::expected<runtime::Table, std::string> {
+    auto eval_extern_table_call =
+        [&](parser::CallExpr& call) -> std::expected<runtime::Table, std::string> {
         const auto& decl = extern_decls.at(call.callee);
         if (decl.return_type.kind == parser::Type::Kind::Scalar) {
             return std::unexpected("extern function returns scalar: " + call.callee);
@@ -558,9 +549,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (block->base && std::holds_alternative<parser::CallExpr>(block->base->node)) {
             auto* call = std::get_if<parser::CallExpr>(&block->base->node);
             if (call != nullptr && functions.contains(call->callee)) {
-                auto value =
-                    eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
-                                       externs);
+                auto value = eval_function_call(*call, tables, scalars, columns, functions,
+                                                extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -570,8 +560,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 auto temp_name = make_temp_table_name();
                 tables.insert_or_assign(temp_name,
                                         std::get<runtime::Table>(std::move(value.value())));
-                block->base = std::make_unique<parser::Expr>(
-                    parser::Expr{parser::IdentifierExpr{temp_name}});
+                block->base =
+                    std::make_unique<parser::Expr>(parser::Expr{parser::IdentifierExpr{temp_name}});
             } else if (call != nullptr && extern_decls.contains(call->callee)) {
                 auto table = eval_extern_table_call(*call);
                 if (!table) {
@@ -579,16 +569,15 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 }
                 auto temp_name = make_temp_table_name();
                 tables.insert_or_assign(temp_name, std::move(table.value()));
-                block->base = std::make_unique<parser::Expr>(
-                    parser::Expr{parser::IdentifierExpr{temp_name}});
+                block->base =
+                    std::make_unique<parser::Expr>(parser::Expr{parser::IdentifierExpr{temp_name}});
             }
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (functions.contains(call->callee)) {
-            auto value =
-                eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
-                                   externs);
+            auto value = eval_function_call(*call, tables, scalars, columns, functions,
+                                            extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -603,8 +592,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     }
     if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
         if (scalars.contains(ident->name)) {
-            return std::unexpected("expected table expression (known scalars: " +
-                                   format_scalar_names(scalars) + ")");
+            return std::unexpected(
+                "expected table expression (known scalars: " + format_scalar_names(scalars) + ")");
         }
         if (columns.contains(ident->name)) {
             return std::unexpected("expected table expression (name refers to column)");
@@ -661,8 +650,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             }
             case parser::Type::Kind::DataFrame:
             case parser::Type::Kind::TimeFrame: {
-                auto value = eval_table_expr(arg, tables, scalars, columns, functions,
-                                             extern_decls, externs);
+                auto value = eval_table_expr(arg, tables, scalars, columns, functions, extern_decls,
+                                             externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -678,8 +667,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     }
                     if (auto* table = std::get_if<runtime::Table>(&value.value())) {
                         if (table->columns.size() != 1) {
-                            return std::unexpected(
-                                "Column argument must have exactly one column");
+                            return std::unexpected("Column argument must have exactly one column");
                         }
                         local_columns.insert_or_assign(param.name, table->columns.front().column);
                         break;
@@ -692,15 +680,14 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     }
 
     std::optional<EvalValue> last_value;
-    for (auto& stmt : fn.body) {
+    for (const auto& stmt : fn.body) {
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
             bool type_is_scalar =
                 let_stmt.type.has_value() && let_stmt.type->kind == parser::Type::Kind::Scalar;
-            bool type_is_table =
-                let_stmt.type.has_value() &&
-                (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
-                 let_stmt.type->kind == parser::Type::Kind::TimeFrame);
+            bool type_is_table = let_stmt.type.has_value() &&
+                                 (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
+                                  let_stmt.type->kind == parser::Type::Kind::TimeFrame);
             if (type_is_scalar) {
                 auto value = eval_scalar_expr(*let_stmt.value, local_tables, local_scalars,
                                               local_columns, functions, extern_decls, externs);
@@ -717,9 +704,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 local_tables.insert_or_assign(let_stmt.name, std::move(value.value()));
             } else if (let_stmt.type.has_value() &&
                        let_stmt.type->kind == parser::Type::Kind::Series) {
-                auto value =
-                    eval_expr_value(*let_stmt.value, local_tables, local_scalars, local_columns,
-                                    functions, extern_decls, externs);
+                auto value = eval_expr_value(*let_stmt.value, local_tables, local_scalars,
+                                             local_columns, functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -727,11 +713,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     local_columns.insert_or_assign(let_stmt.name, std::move(*col));
                 } else if (auto* table = std::get_if<runtime::Table>(&value.value())) {
                     if (table->columns.size() != 1) {
-                        return std::unexpected(
-                            "Column binding must have exactly one column");
+                        return std::unexpected("Column binding must have exactly one column");
                     }
-                    local_columns.insert_or_assign(let_stmt.name,
-                                                   table->columns.front().column);
+                    local_columns.insert_or_assign(let_stmt.name, table->columns.front().column);
                 } else {
                     return std::unexpected("Column binding must be a column or table");
                 }
@@ -746,16 +730,15 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                     local_columns.insert_or_assign(let_stmt.name, std::move(*col));
                 } else {
-                    local_tables.insert_or_assign(let_stmt.name, std::get<runtime::Table>(
-                                                                  std::move(value.value())));
+                    local_tables.insert_or_assign(
+                        let_stmt.name, std::get<runtime::Table>(std::move(value.value())));
                 }
             }
             continue;
         }
         const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-        auto value =
-            eval_expr_value(*expr_stmt.expr, local_tables, local_scalars, local_columns, functions,
-                            extern_decls, externs);
+        auto value = eval_expr_value(*expr_stmt.expr, local_tables, local_scalars, local_columns,
+                                     functions, extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -804,15 +787,14 @@ auto plugin_stem(const std::string& source_path) -> std::string {
 
 /// Try to load a plugin shared library for the given stem from the search paths.
 /// Returns true if the plugin was loaded (or was already loaded), false on failure.
-enum class PluginLoadStatus { Loaded, NotFound, LoadError };
+enum class PluginLoadStatus : std::uint8_t { Loaded, NotFound, LoadError };
 
 struct PluginLoadResult {
     PluginLoadStatus status;
     std::string message;
 };
 
-auto try_load_plugin(const std::string& stem,
-                     const std::vector<std::string>& search_paths,
+auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
                      std::unordered_set<std::string>& loaded_plugins,
                      runtime::ExternRegistry& externs) -> PluginLoadResult {
     if (loaded_plugins.contains(stem)) {
@@ -866,8 +848,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             extern_decls.insert_or_assign(decl.name, decl);
             if (!decl.source_path.empty()) {
                 auto stem = plugin_stem(decl.source_path);
-                auto result =
-                    try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
+                auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
                 if (result.status == PluginLoadStatus::NotFound) {
                     fmt::print("warning: could not find plugin '{}.so' in search path\n", stem);
                 } else if (result.status == PluginLoadStatus::LoadError) {
@@ -968,8 +949,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 }
                 continue;
             }
-            if (const auto* ident =
-                    std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
+            if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr_stmt.expr->node)) {
                 if (auto it = scalars.find(ident->name); it != scalars.end()) {
                     std::visit([](const auto& value) { fmt::print("{}\n", value); }, it->second);
                     continue;
@@ -1017,8 +997,8 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry) 
     ExternDeclRegistry extern_decls;
     std::vector<std::string> no_paths;
     std::unordered_set<std::string> loaded_plugins;
-    return execute_statements(parsed->statements, tables, scalars, columns, functions,
-                              extern_decls, registry, no_paths, loaded_plugins);
+    return execute_statements(parsed->statements, tables, scalars, columns, functions, extern_decls,
+                              registry, no_paths, loaded_plugins);
 }
 
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {

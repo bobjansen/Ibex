@@ -1,5 +1,6 @@
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/ops.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -7,11 +8,8 @@ TEST_CASE("Builder creates nodes with unique IDs", "[ir][builder]") {
     ibex::ir::Builder builder;
 
     auto scan = builder.scan("prices");
-    auto filter = builder.filter(ibex::ir::FilterPredicate{
-        .column = {.name = "price"},
-        .op = ibex::ir::CompareOp::Gt,
-        .value = 100.0,
-    });
+    auto filter = builder.filter(ibex::ops::filter_cmp(
+        ibex::ir::CompareOp::Gt, ibex::ops::filter_col("price"), ibex::ops::filter_dbl(100.0)));
 
     REQUIRE(scan->id() != filter->id());
     REQUIRE(scan->kind() == ibex::ir::NodeKind::Scan);
@@ -30,16 +28,17 @@ TEST_CASE("ScanNode stores source name", "[ir][scan]") {
 TEST_CASE("FilterNode stores predicate", "[ir][filter]") {
     ibex::ir::Builder builder;
 
-    auto node = builder.filter(ibex::ir::FilterPredicate{
-        .column = {.name = "volume"},
-        .op = ibex::ir::CompareOp::Ge,
-        .value = std::int64_t{1000},
-    });
+    auto node = builder.filter(ibex::ops::filter_cmp(
+        ibex::ir::CompareOp::Ge, ibex::ops::filter_col("volume"), ibex::ops::filter_int(1000)));
 
     auto* filter_node = dynamic_cast<ibex::ir::FilterNode*>(node.get());
     REQUIRE(filter_node != nullptr);
-    REQUIRE(filter_node->predicate().column.name == "volume");
-    REQUIRE(filter_node->predicate().op == ibex::ir::CompareOp::Ge);
+    const auto* cmp = std::get_if<ibex::ir::FilterCmp>(&filter_node->predicate().node);
+    REQUIRE(cmp != nullptr);
+    REQUIRE(cmp->op == ibex::ir::CompareOp::Ge);
+    const auto* col = std::get_if<ibex::ir::FilterColumn>(&cmp->left->node);
+    REQUIRE(col != nullptr);
+    REQUIRE(col->name == "volume");
 }
 
 TEST_CASE("ProjectNode stores column list", "[ir][project]") {
@@ -131,11 +130,8 @@ TEST_CASE("Nodes can form a tree via add_child", "[ir][tree]") {
     ibex::ir::Builder builder;
 
     auto scan = builder.scan("orders");
-    auto filter = builder.filter(ibex::ir::FilterPredicate{
-        .column = {.name = "status"},
-        .op = ibex::ir::CompareOp::Eq,
-        .value = std::string{"filled"},
-    });
+    auto filter = builder.filter(ibex::ops::filter_cmp(
+        ibex::ir::CompareOp::Eq, ibex::ops::filter_col("status"), ibex::ops::filter_str("filled")));
 
     auto scan_id = scan->id();
     filter->add_child(std::move(scan));

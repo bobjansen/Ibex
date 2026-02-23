@@ -62,26 +62,6 @@ auto format_columns(const Table& table) -> std::string {
     return out;
 }
 
-auto format_scalars(const ScalarRegistry& scalars) -> std::string {
-    if (scalars.empty()) {
-        return "<none>";
-    }
-    std::vector<std::string_view> names;
-    names.reserve(scalars.size());
-    for (const auto& entry : scalars) {
-        names.emplace_back(entry.first);
-    }
-    std::sort(names.begin(), names.end());
-    std::string out;
-    for (std::size_t i = 0; i < names.size(); ++i) {
-        if (i > 0) {
-            out.append(", ");
-        }
-        out.append(names[i]);
-    }
-    return out;
-}
-
 auto format_tables(const TableRegistry& registry) -> std::string {
     if (registry.empty()) {
         return "<none>";
@@ -128,155 +108,205 @@ auto make_empty_like(const ColumnValue& src) -> ColumnValue {
         src);
 }
 
-auto compare_value(const ColumnValue& column, std::size_t index, const ir::FilterPredicate& pred,
-                   const std::variant<std::int64_t, double, std::string>& value) -> bool {
+using ScalarVal = std::variant<std::int64_t, double, std::string>;
+
+auto compare_same_type(ir::CompareOp op, const ScalarVal& lhs, const ScalarVal& rhs) -> bool {
+    if (lhs.index() != rhs.index()) {
+        // Mixed int/double handled above; everything else is false.
+        if (std::holds_alternative<std::int64_t>(lhs) && std::holds_alternative<double>(rhs)) {
+            double l = static_cast<double>(std::get<std::int64_t>(lhs));
+            double r = std::get<double>(rhs);
+            switch (op) {
+                case ir::CompareOp::Eq:
+                    return l == r;
+                case ir::CompareOp::Ne:
+                    return l != r;
+                case ir::CompareOp::Lt:
+                    return l < r;
+                case ir::CompareOp::Le:
+                    return l <= r;
+                case ir::CompareOp::Gt:
+                    return l > r;
+                case ir::CompareOp::Ge:
+                    return l >= r;
+            }
+        }
+        if (std::holds_alternative<double>(lhs) && std::holds_alternative<std::int64_t>(rhs)) {
+            double l = std::get<double>(lhs);
+            double r = static_cast<double>(std::get<std::int64_t>(rhs));
+            switch (op) {
+                case ir::CompareOp::Eq:
+                    return l == r;
+                case ir::CompareOp::Ne:
+                    return l != r;
+                case ir::CompareOp::Lt:
+                    return l < r;
+                case ir::CompareOp::Le:
+                    return l <= r;
+                case ir::CompareOp::Gt:
+                    return l > r;
+                case ir::CompareOp::Ge:
+                    return l >= r;
+            }
+        }
+        return false;
+    }
     return std::visit(
-        [&](const auto& col) -> bool {
-            using ColType = std::decay_t<decltype(col)>;
-            using ValueType = typename ColType::value_type;
-            if constexpr (std::is_same_v<ValueType, std::int64_t>) {
-                if (const auto* v = std::get_if<std::int64_t>(&value)) {
-                    switch (pred.op) {
-                        case ir::CompareOp::Eq:
-                            return col[index] == *v;
-                        case ir::CompareOp::Ne:
-                            return col[index] != *v;
-                        case ir::CompareOp::Lt:
-                            return col[index] < *v;
-                        case ir::CompareOp::Le:
-                            return col[index] <= *v;
-                        case ir::CompareOp::Gt:
-                            return col[index] > *v;
-                        case ir::CompareOp::Ge:
-                            return col[index] >= *v;
-                    }
-                }
-                if (const auto* v = std::get_if<double>(&value)) {
-                    double lhs = static_cast<double>(col[index]);
-                    switch (pred.op) {
-                        case ir::CompareOp::Eq:
-                            return lhs == *v;
-                        case ir::CompareOp::Ne:
-                            return lhs != *v;
-                        case ir::CompareOp::Lt:
-                            return lhs < *v;
-                        case ir::CompareOp::Le:
-                            return lhs <= *v;
-                        case ir::CompareOp::Gt:
-                            return lhs > *v;
-                        case ir::CompareOp::Ge:
-                            return lhs >= *v;
-                    }
-                }
-                return false;
-            } else if constexpr (std::is_same_v<ValueType, double>) {
-                double lhs = col[index];
-                if (const auto* v = std::get_if<double>(&value)) {
-                    switch (pred.op) {
-                        case ir::CompareOp::Eq:
-                            return lhs == *v;
-                        case ir::CompareOp::Ne:
-                            return lhs != *v;
-                        case ir::CompareOp::Lt:
-                            return lhs < *v;
-                        case ir::CompareOp::Le:
-                            return lhs <= *v;
-                        case ir::CompareOp::Gt:
-                            return lhs > *v;
-                        case ir::CompareOp::Ge:
-                            return lhs >= *v;
-                    }
-                }
-                if (const auto* v = std::get_if<std::int64_t>(&value)) {
-                    double rhs = static_cast<double>(*v);
-                    switch (pred.op) {
-                        case ir::CompareOp::Eq:
-                            return lhs == rhs;
-                        case ir::CompareOp::Ne:
-                            return lhs != rhs;
-                        case ir::CompareOp::Lt:
-                            return lhs < rhs;
-                        case ir::CompareOp::Le:
-                            return lhs <= rhs;
-                        case ir::CompareOp::Gt:
-                            return lhs > rhs;
-                        case ir::CompareOp::Ge:
-                            return lhs >= rhs;
-                    }
-                }
-                return false;
-            } else if constexpr (std::is_same_v<ValueType, std::string>) {
-                if (const auto* v = std::get_if<std::string>(&value)) {
-                    switch (pred.op) {
-                        case ir::CompareOp::Eq:
-                            return col[index] == *v;
-                        case ir::CompareOp::Ne:
-                            return col[index] != *v;
-                        case ir::CompareOp::Lt:
-                            return col[index] < *v;
-                        case ir::CompareOp::Le:
-                            return col[index] <= *v;
-                        case ir::CompareOp::Gt:
-                            return col[index] > *v;
-                        case ir::CompareOp::Ge:
-                            return col[index] >= *v;
-                    }
-                }
-                return false;
+        [&](const auto& l) -> bool {
+            using T = std::decay_t<decltype(l)>;
+            const T& r = std::get<T>(rhs);
+            switch (op) {
+                case ir::CompareOp::Eq:
+                    return l == r;
+                case ir::CompareOp::Ne:
+                    return l != r;
+                case ir::CompareOp::Lt:
+                    return l < r;
+                case ir::CompareOp::Le:
+                    return l <= r;
+                case ir::CompareOp::Gt:
+                    return l > r;
+                case ir::CompareOp::Ge:
+                    return l >= r;
+            }
+            return false;
+        },
+        lhs);
+}
+
+auto apply_arith(ir::ArithmeticOp op, const ScalarVal& lhs, const ScalarVal& rhs)
+    -> std::expected<ScalarVal, std::string> {
+    // Arithmetic only on numerics; promote int to double if mixed.
+    auto as_double = [](const ScalarVal& v) -> std::optional<double> {
+        if (const auto* i = std::get_if<std::int64_t>(&v))
+            return static_cast<double>(*i);
+        if (const auto* d = std::get_if<double>(&v))
+            return *d;
+        return std::nullopt;
+    };
+    // Integer arithmetic when both sides are int64.
+    if (std::holds_alternative<std::int64_t>(lhs) && std::holds_alternative<std::int64_t>(rhs)) {
+        std::int64_t l = std::get<std::int64_t>(lhs);
+        std::int64_t r = std::get<std::int64_t>(rhs);
+        switch (op) {
+            case ir::ArithmeticOp::Add:
+                return ScalarVal{l + r};
+            case ir::ArithmeticOp::Sub:
+                return ScalarVal{l - r};
+            case ir::ArithmeticOp::Mul:
+                return ScalarVal{l * r};
+            case ir::ArithmeticOp::Div:
+                if (r == 0)
+                    return std::unexpected("division by zero in filter");
+                return ScalarVal{l / r};
+            case ir::ArithmeticOp::Mod:
+                if (r == 0)
+                    return std::unexpected("modulo by zero in filter");
+                return ScalarVal{l % r};
+        }
+    }
+    // Float arithmetic otherwise.
+    auto l = as_double(lhs);
+    auto r = as_double(rhs);
+    if (!l || !r)
+        return std::unexpected("arithmetic on non-numeric values in filter");
+    switch (op) {
+        case ir::ArithmeticOp::Add:
+            return ScalarVal{*l + *r};
+        case ir::ArithmeticOp::Sub:
+            return ScalarVal{*l - *r};
+        case ir::ArithmeticOp::Mul:
+            return ScalarVal{*l * *r};
+        case ir::ArithmeticOp::Div:
+            return ScalarVal{*l / *r};
+        case ir::ArithmeticOp::Mod:
+            return ScalarVal{std::fmod(*l, *r)};
+    }
+    return std::unexpected("unknown arithmetic op in filter");
+}
+
+auto get_column_val(const Table& table, const std::string& name, std::size_t row,
+                    const ScalarRegistry* scalars) -> std::expected<ScalarVal, std::string> {
+    if (const auto* col = table.find(name)) {
+        return std::visit([row](const auto& c) -> ScalarVal { return c[row]; }, *col);
+    }
+    // Fall back to scalar registry.
+    if (scalars != nullptr) {
+        auto it = scalars->find(name);
+        if (it != scalars->end()) {
+            return std::visit([](const auto& v) -> ScalarVal { return v; }, it->second);
+        }
+    }
+    return std::unexpected("filter: unknown column or scalar '" + name + "'");
+}
+
+// Forward declaration.
+auto eval_filter(const ir::FilterExpr& expr, const Table& table, std::size_t row,
+                 const ScalarRegistry* scalars) -> std::expected<ScalarVal, std::string>;
+
+auto eval_filter(const ir::FilterExpr& expr, const Table& table, std::size_t row,
+                 const ScalarRegistry* scalars) -> std::expected<ScalarVal, std::string> {
+    return std::visit(
+        [&](const auto& node) -> std::expected<ScalarVal, std::string> {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::FilterColumn>) {
+                return get_column_val(table, node.name, row, scalars);
+            } else if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+                return std::visit([](const auto& v) -> ScalarVal { return v; }, node.value);
+            } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
+                auto lhs = eval_filter(*node.left, table, row, scalars);
+                if (!lhs)
+                    return std::unexpected(lhs.error());
+                auto rhs = eval_filter(*node.right, table, row, scalars);
+                if (!rhs)
+                    return std::unexpected(rhs.error());
+                return apply_arith(node.op, *lhs, *rhs);
+            } else if constexpr (std::is_same_v<T, ir::FilterCmp>) {
+                auto lhs = eval_filter(*node.left, table, row, scalars);
+                if (!lhs)
+                    return std::unexpected(lhs.error());
+                auto rhs = eval_filter(*node.right, table, row, scalars);
+                if (!rhs)
+                    return std::unexpected(rhs.error());
+                return ScalarVal{std::int64_t{compare_same_type(node.op, *lhs, *rhs) ? 1 : 0}};
+            } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
+                auto lhs = eval_filter(*node.left, table, row, scalars);
+                if (!lhs)
+                    return std::unexpected(lhs.error());
+                // Short-circuit: if left is false, don't evaluate right.
+                if (const auto* b = std::get_if<std::int64_t>(&*lhs); b && *b == 0)
+                    return ScalarVal{std::int64_t{0}};
+                auto rhs = eval_filter(*node.right, table, row, scalars);
+                if (!rhs)
+                    return std::unexpected(rhs.error());
+                const auto* rb = std::get_if<std::int64_t>(&*rhs);
+                return ScalarVal{std::int64_t{rb && *rb != 0 ? 1 : 0}};
+            } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
+                auto lhs = eval_filter(*node.left, table, row, scalars);
+                if (!lhs)
+                    return std::unexpected(lhs.error());
+                if (const auto* b = std::get_if<std::int64_t>(&*lhs); b && *b != 0)
+                    return ScalarVal{std::int64_t{1}};
+                auto rhs = eval_filter(*node.right, table, row, scalars);
+                if (!rhs)
+                    return std::unexpected(rhs.error());
+                const auto* rb = std::get_if<std::int64_t>(&*rhs);
+                return ScalarVal{std::int64_t{rb && *rb != 0 ? 1 : 0}};
             } else {
-                return false;
+                static_assert(std::is_same_v<T, ir::FilterNot>);
+                auto operand = eval_filter(*node.operand, table, row, scalars);
+                if (!operand)
+                    return std::unexpected(operand.error());
+                const auto* b = std::get_if<std::int64_t>(&*operand);
+                return ScalarVal{std::int64_t{b && *b == 0 ? 1 : 0}};
             }
         },
-        column);
+        expr.node);
 }
 
-auto resolve_filter_value(const ir::FilterPredicate& predicate, const ScalarRegistry* scalars)
-    -> std::expected<std::variant<std::int64_t, double, std::string>, std::string> {
-    if (const auto* literal = std::get_if<std::int64_t>(&predicate.value)) {
-        return *literal;
-    }
-    if (const auto* literal = std::get_if<double>(&predicate.value)) {
-        return *literal;
-    }
-    if (const auto* literal = std::get_if<std::string>(&predicate.value)) {
-        return *literal;
-    }
-    const auto* ref = std::get_if<ir::FilterPredicate::ScalarRef>(&predicate.value);
-    if (ref == nullptr) {
-        return std::unexpected("filter predicate value not supported");
-    }
-    if (scalars == nullptr) {
-        return std::unexpected("unknown scalar in filter: " + ref->name);
-    }
-    auto it = scalars->find(ref->name);
-    if (it == scalars->end()) {
-        return std::unexpected("unknown scalar in filter: " + ref->name +
-                               " (available: " + format_scalars(*scalars) + ")");
-    }
-    if (const auto* int_value = std::get_if<std::int64_t>(&it->second)) {
-        return *int_value;
-    }
-    if (const auto* double_value = std::get_if<double>(&it->second)) {
-        return *double_value;
-    }
-    if (const auto* str_value = std::get_if<std::string>(&it->second)) {
-        return *str_value;
-    }
-    return std::unexpected("scalar type not supported in filter");
-}
-
-auto filter_table(const Table& input, const ir::FilterPredicate& predicate,
+auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                   const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
-    const auto* predicate_column = input.find(predicate.column.name);
-    if (predicate_column == nullptr) {
-        return std::unexpected("filter column not found: " + predicate.column.name +
-                               " (available: " + format_columns(input) + ")");
-    }
-    auto resolved = resolve_filter_value(predicate, scalars);
-    if (!resolved) {
-        return std::unexpected(resolved.error());
-    }
-    std::size_t rows = column_size(*predicate_column);
+    std::size_t rows = input.rows();
 
     Table output;
     for (const auto& entry : input.columns) {
@@ -284,9 +314,12 @@ auto filter_table(const Table& input, const ir::FilterPredicate& predicate,
     }
 
     for (std::size_t row = 0; row < rows; ++row) {
-        if (!compare_value(*predicate_column, row, predicate, resolved.value())) {
+        auto result = eval_filter(predicate, input, row, scalars);
+        if (!result)
+            return std::unexpected(result.error());
+        const auto* b = std::get_if<std::int64_t>(&*result);
+        if (!b || *b == 0)
             continue;
-        }
         for (auto& entry : output.columns) {
             const auto* source = input.find(entry.name);
             if (source == nullptr) {

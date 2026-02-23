@@ -296,44 +296,118 @@ class Lowerer {
         }
     };
 
-    static auto lower_filter(const FilterClause& clause)
-        -> std::expected<ir::FilterPredicate, LowerError> {
-        const auto* binary = std::get_if<BinaryExpr>(&clause.predicate->node);
-        if (binary == nullptr) {
-            return std::unexpected(LowerError{.message = "filter predicate must be a comparison"});
-        }
-        if (!is_compare_op(binary->op)) {
-            return std::unexpected(LowerError{.message = "filter predicate must be a comparison"});
-        }
-        const auto* ident = std::get_if<IdentifierExpr>(&binary->left->node);
-        if (ident == nullptr) {
-            return std::unexpected(
-                LowerError{.message = "filter predicate left side must be a column"});
-        }
-        if (const auto* literal = std::get_if<LiteralExpr>(&binary->right->node)) {
-            auto value = lower_literal(*literal);
-            if (!value.has_value()) {
-                return std::unexpected(value.error());
+    static auto lower_filter_expr(const Expr& expr)
+        -> std::expected<ir::FilterExprPtr, LowerError> {
+        // Logical NOT: !expr
+        if (const auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+            if (unary->op == UnaryOp::Not) {
+                auto operand = lower_filter_expr(*unary->expr);
+                if (!operand)
+                    return std::unexpected(operand.error());
+                return std::make_unique<ir::FilterExpr>(
+                    ir::FilterExpr{ir::FilterNot{.operand = std::move(*operand)}});
             }
+            return std::unexpected(LowerError{.message = "unsupported unary op in filter"});
+        }
+        // Binary ops: And, Or, comparisons, arithmetic
+        if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+            if (binary->op == BinaryOp::And) {
+                auto left = lower_filter_expr(*binary->left);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = lower_filter_expr(*binary->right);
+                if (!right)
+                    return std::unexpected(right.error());
+                return std::make_unique<ir::FilterExpr>(
+                    ir::FilterExpr{ir::FilterAnd{std::move(*left), std::move(*right)}});
+            }
+            if (binary->op == BinaryOp::Or) {
+                auto left = lower_filter_expr(*binary->left);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = lower_filter_expr(*binary->right);
+                if (!right)
+                    return std::unexpected(right.error());
+                return std::make_unique<ir::FilterExpr>(
+                    ir::FilterExpr{ir::FilterOr{std::move(*left), std::move(*right)}});
+            }
+            if (is_compare_op(binary->op)) {
+                auto left = lower_filter_expr(*binary->left);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = lower_filter_expr(*binary->right);
+                if (!right)
+                    return std::unexpected(right.error());
+                return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+                    ir::FilterCmp{to_compare_op(binary->op), std::move(*left), std::move(*right)}});
+            }
+            if (auto arith = to_arithmetic_op(binary->op)) {
+                auto left = lower_filter_expr(*binary->left);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = lower_filter_expr(*binary->right);
+                if (!right)
+                    return std::unexpected(right.error());
+                return std::make_unique<ir::FilterExpr>(
+                    ir::FilterExpr{ir::FilterArith{*arith, std::move(*left), std::move(*right)}});
+            }
+            return std::unexpected(LowerError{.message = "unsupported operator in filter"});
+        }
+        // Identifier → column/scalar reference (resolved at eval time)
+        if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+            return std::make_unique<ir::FilterExpr>(
+                ir::FilterExpr{ir::FilterColumn{.name = ident->name}});
+        }
+        // Literal
+        if (const auto* lit = std::get_if<LiteralExpr>(&expr.node)) {
+            auto value = lower_literal(*lit);
+            if (!value)
+                return std::unexpected(value.error());
             auto wrapped = std::visit(
-                [](const auto& v) -> std::variant<std::int64_t, double, std::string,
-                                                  ir::FilterPredicate::ScalarRef> { return v; },
+                [](const auto& v) -> std::variant<std::int64_t, double, std::string> { return v; },
                 value.value());
-            return ir::FilterPredicate{
-                .column = ir::ColumnRef{.name = ident->name},
-                .op = to_compare_op(binary->op),
-                .value = std::move(wrapped),
-            };
+            return std::make_unique<ir::FilterExpr>(
+                ir::FilterExpr{ir::FilterLiteral{.value = std::move(wrapped)}});
         }
-        if (const auto* rhs_ident = std::get_if<IdentifierExpr>(&binary->right->node)) {
-            return ir::FilterPredicate{
-                .column = ir::ColumnRef{.name = ident->name},
-                .op = to_compare_op(binary->op),
-                .value = ir::FilterPredicate::ScalarRef{.name = rhs_ident->name},
-            };
+        // Parenthesized expression
+        if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+            return lower_filter_expr(*group->expr);
         }
-        return std::unexpected(
-            LowerError{.message = "filter predicate right side must be a literal or scalar"});
+        return std::unexpected(LowerError{.message = "unsupported expression in filter predicate"});
+    }
+
+    static auto lower_filter(const FilterClause& clause)
+        -> std::expected<ir::FilterExprPtr, LowerError> {
+        return lower_filter_expr(*clause.predicate);
+    }
+
+    static auto clone_filter_expr(const ir::FilterExpr& expr) -> ir::FilterExprPtr {
+        return std::visit(
+            [](const auto& node) -> ir::FilterExprPtr {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, ir::FilterColumn>) {
+                    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{node});
+                } else if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+                    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{node});
+                } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
+                    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterArith{
+                        node.op, clone_filter_expr(*node.left), clone_filter_expr(*node.right)}});
+                } else if constexpr (std::is_same_v<T, ir::FilterCmp>) {
+                    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterCmp{
+                        node.op, clone_filter_expr(*node.left), clone_filter_expr(*node.right)}});
+                } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
+                    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterAnd{
+                        clone_filter_expr(*node.left), clone_filter_expr(*node.right)}});
+                } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
+                    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterOr{
+                        clone_filter_expr(*node.left), clone_filter_expr(*node.right)}});
+                } else {
+                    static_assert(std::is_same_v<T, ir::FilterNot>);
+                    return std::make_unique<ir::FilterExpr>(
+                        ir::FilterExpr{ir::FilterNot{clone_filter_expr(*node.operand)}});
+                }
+            },
+            expr.node);
     }
 
     auto lower_select_projection(const std::vector<Field>& clause_fields, ir::NodePtr base)
@@ -842,7 +916,7 @@ class Lowerer {
             }
             case ir::NodeKind::Filter: {
                 const auto& filter = static_cast<const ir::FilterNode&>(node);
-                auto clone = builder_.filter(filter.predicate());
+                auto clone = builder_.filter(clone_filter_expr(filter.predicate()));
                 return clone;
             }
             case ir::NodeKind::Project: {

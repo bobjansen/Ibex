@@ -33,7 +33,12 @@ TEST_CASE("Lower filter and select to IR") {
     REQUIRE(project->children().size() == 1);
     const auto* filter = as_node<ir::FilterNode>(project->children()[0].get());
     REQUIRE(filter != nullptr);
-    REQUIRE(filter->predicate().column.name == "price");
+    // Predicate is a FilterCmp with a FilterColumn on the left referencing "price".
+    const auto* cmp = std::get_if<ibex::ir::FilterCmp>(&filter->predicate().node);
+    REQUIRE(cmp != nullptr);
+    const auto* col = std::get_if<ibex::ir::FilterColumn>(&cmp->left->node);
+    REQUIRE(col != nullptr);
+    REQUIRE(col->name == "price");
 
     REQUIRE(filter->children().size() == 1);
     const auto* scan = as_node<ir::ScanNode>(filter->children()[0].get());

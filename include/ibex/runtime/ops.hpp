@@ -14,7 +14,23 @@ namespace ibex::ops {
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.
 
-[[nodiscard]] auto filter(const runtime::Table& t, ir::FilterPredicate pred) -> runtime::Table;
+[[nodiscard]] auto filter(const runtime::Table& t, ir::FilterExprPtr pred) -> runtime::Table;
+
+// ─── FilterExpr builders ──────────────────────────────────────────────────────
+//  Convenience factories for constructing filter expression trees in emitted
+//  and test code.  Each returns a heap-allocated FilterExprPtr (unique_ptr).
+
+[[nodiscard]] auto filter_col(std::string name) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_int(std::int64_t v) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_dbl(double v) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_str(std::string v) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
+    -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
+    -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_and(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_or(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_not(ir::FilterExprPtr operand) -> ir::FilterExprPtr;
 
 [[nodiscard]] auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
     -> runtime::Table;

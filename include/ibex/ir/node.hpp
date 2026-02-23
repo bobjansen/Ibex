@@ -99,16 +99,46 @@ enum class JoinKind : std::uint8_t {
     Asof,
 };
 
-/// Filter predicate: column <op> literal.
-/// TODO: Extend to support compound predicates and expression trees
-///       per SPEC.md Section 5.3 (filter clause semantics).
-struct FilterPredicate {
-    ColumnRef column;
-    CompareOp op = CompareOp::Eq;
-    struct ScalarRef {
-        std::string name;
-    };
-    std::variant<std::int64_t, double, std::string, ScalarRef> value;
+/// Filter expression tree — unified value and boolean nodes.
+/// See SPEC.md Section 5.3 (filter clause semantics).
+struct FilterExpr;
+using FilterExprPtr = std::unique_ptr<FilterExpr>;
+
+/// Column reference in a filter expression (resolved at runtime as column or bound scalar).
+struct FilterColumn {
+    std::string name;
+};
+/// Literal value in a filter expression.
+struct FilterLiteral {
+    std::variant<std::int64_t, double, std::string> value;
+};
+/// Arithmetic on two value expressions.
+struct FilterArith {
+    ArithmeticOp op;
+    FilterExprPtr left, right;
+};
+/// Comparison between two value expressions — produces a bool.
+struct FilterCmp {
+    CompareOp op;
+    FilterExprPtr left, right;
+};
+/// Logical AND of two boolean expressions.
+struct FilterAnd {
+    FilterExprPtr left, right;
+};
+/// Logical OR of two boolean expressions.
+struct FilterOr {
+    FilterExprPtr left, right;
+};
+/// Logical NOT of a boolean expression.
+struct FilterNot {
+    FilterExprPtr operand;
+};
+
+struct FilterExpr {
+    std::variant<FilterColumn, FilterLiteral, FilterArith, FilterCmp, FilterAnd, FilterOr,
+                 FilterNot>
+        node;
 };
 
 /// Aggregation specification: apply function to column, store as alias.
@@ -177,13 +207,13 @@ class ScanNode final : public Node {
 /// See SPEC.md Section 5.3 (filter clause).
 class FilterNode final : public Node {
    public:
-    FilterNode(NodeId id, FilterPredicate predicate)
+    FilterNode(NodeId id, FilterExprPtr predicate)
         : Node(NodeKind::Filter, id), predicate_(std::move(predicate)) {}
 
-    [[nodiscard]] auto predicate() const noexcept -> const FilterPredicate& { return predicate_; }
+    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
 
    private:
-    FilterPredicate predicate_;
+    FilterExprPtr predicate_;
 };
 
 /// Project node: selects and computes a subset of columns.

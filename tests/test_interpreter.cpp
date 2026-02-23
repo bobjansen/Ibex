@@ -487,3 +487,99 @@ TEST_CASE("Interpret update with double arithmetic") {
     REQUIRE((*col)[1] == Catch::Approx(5.0));
     REQUIRE((*col)[2] == Catch::Approx(7.0));
 }
+
+TEST_CASE("Interpret compound filter: AND") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{5, 15, 25});
+    table.add_column("qty", Column<std::int64_t>{3, 8, 2});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    // price > 10 && qty < 5 → only row with price=25, qty=2 passes
+    auto ir = require_ir("trades[filter price > 10 && qty < 5];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* prices = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE((*prices)[0] == 25);
+}
+
+TEST_CASE("Interpret compound filter: OR") {
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{"A", "B", "C"});
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    // symbol == "A" || symbol == "C"
+    auto ir = require_ir("trades[filter symbol == \"A\" || symbol == \"C\"];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* syms = std::get_if<Column<std::string>>(result->find("symbol"));
+    REQUIRE(syms != nullptr);
+    REQUIRE((*syms)[0] == "A");
+    REQUIRE((*syms)[1] == "C");
+}
+
+TEST_CASE("Interpret compound filter: arithmetic in predicate") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 60, 40});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    // price * 2 > 100 → only price=60 passes
+    auto ir = require_ir("trades[filter price * 2 > 100];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* prices = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE((*prices)[0] == 60);
+}
+
+TEST_CASE("Interpret compound filter: NOT") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    // !(price > 15) → price=10 passes
+    auto ir = require_ir("trades[filter !(price > 15)];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* prices = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE((*prices)[0] == 10);
+}
+
+TEST_CASE("Interpret compound filter: three-way AND") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{5, 15, 25, 35});
+    table.add_column("qty", Column<std::int64_t>{1, 4, 3, 2});
+    table.add_column("flag", Column<std::int64_t>{1, 1, 0, 1});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    // price > 10 && qty < 5 && flag == 1 → price=15 (qty=4,flag=1) and price=35 (qty=2,flag=1)
+    auto ir = require_ir("trades[filter price > 10 && qty < 5 && flag == 1];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* prices = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE((*prices)[0] == 15);
+    REQUIRE((*prices)[1] == 35);
+}

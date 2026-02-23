@@ -194,7 +194,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             auto child = emit_node(*filter.children().front());
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::filter(" << child << ", "
-                  << emit_predicate(filter.predicate()) << ");\n";
+                  << emit_filter_expr(filter.predicate()) << ");\n";
             return var;
         }
 
@@ -346,31 +346,45 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
     throw std::runtime_error("ibex_compile: unknown IR node kind");
 }
 
-auto Emitter::emit_predicate(const ir::FilterPredicate& pred) -> std::string {
-    std::string s = "ibex::ir::FilterPredicate{ibex::ir::ColumnRef{\"";
-    s += escape_string(pred.column.name);
-    s += "\"}, ibex::ir::CompareOp::";
-    s += emit_compare_op(pred.op);
-    s += ", ";
-
-    std::visit(
-        [&](const auto& v) {
-            using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, std::int64_t>) {
-                s += "std::int64_t{" + std::to_string(v) + "}";
-            } else if constexpr (std::is_same_v<T, double>) {
-                s += format_double(v);
-            } else if constexpr (std::is_same_v<T, std::string>) {
-                s += "std::string{\"" + escape_string(v) + "\"}";
+auto Emitter::emit_filter_expr(const ir::FilterExpr& expr) -> std::string {
+    return std::visit(
+        [](const auto& node) -> std::string {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::FilterColumn>) {
+                return "ibex::ops::filter_col(\"" + escape_string(node.name) + "\")";
+            } else if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+                return std::visit(
+                    [](const auto& v) -> std::string {
+                        using V = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<V, std::int64_t>) {
+                            return "ibex::ops::filter_int(std::int64_t{" + std::to_string(v) + "})";
+                        } else if constexpr (std::is_same_v<V, double>) {
+                            return "ibex::ops::filter_dbl(" + format_double(v) + ")";
+                        } else {
+                            return "ibex::ops::filter_str(\"" + escape_string(v) + "\")";
+                        }
+                    },
+                    node.value);
+            } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
+                return "ibex::ops::filter_arith(ibex::ir::ArithmeticOp::" + emit_arith_op(node.op) +
+                       ", " + emit_filter_expr(*node.left) + ", " + emit_filter_expr(*node.right) +
+                       ")";
+            } else if constexpr (std::is_same_v<T, ir::FilterCmp>) {
+                return "ibex::ops::filter_cmp(ibex::ir::CompareOp::" + emit_compare_op(node.op) +
+                       ", " + emit_filter_expr(*node.left) + ", " + emit_filter_expr(*node.right) +
+                       ")";
+            } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
+                return "ibex::ops::filter_and(" + emit_filter_expr(*node.left) + ", " +
+                       emit_filter_expr(*node.right) + ")";
+            } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
+                return "ibex::ops::filter_or(" + emit_filter_expr(*node.left) + ", " +
+                       emit_filter_expr(*node.right) + ")";
             } else {
-                // ScalarRef: a named scalar variable — emit as a runtime lookup
-                s += "ibex::ir::FilterPredicate::ScalarRef{\"" + escape_string(v.name) + "\"}";
+                static_assert(std::is_same_v<T, ir::FilterNot>);
+                return "ibex::ops::filter_not(" + emit_filter_expr(*node.operand) + ")";
             }
         },
-        pred.value);
-
-    s += "}";
-    return s;
+        expr.node);
 }
 
 auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {

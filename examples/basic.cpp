@@ -1,5 +1,6 @@
 #include <ibex/core/column.hpp>
 #include <ibex/ir/builder.hpp>
+#include <ibex/runtime/ops.hpp>
 
 #include <fmt/core.h>
 
@@ -24,11 +25,8 @@ auto main() -> int {
     ibex::ir::Builder builder;
 
     auto scan = builder.scan("trades");
-    auto filter = builder.filter(ibex::ir::FilterPredicate{
-        .column = {.name = "price"},
-        .op = ibex::ir::CompareOp::Gt,
-        .value = 100.0,
-    });
+    auto filter = builder.filter(ibex::ops::filter_cmp(
+        ibex::ir::CompareOp::Gt, ibex::ops::filter_col("price"), ibex::ops::filter_dbl(100.0)));
     filter->add_child(std::move(scan));
 
     auto project = builder.project({

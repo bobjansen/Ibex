@@ -18,7 +18,7 @@ class Builder {
         return std::make_unique<ScanNode>(next_id(), std::move(source_name));
     }
 
-    [[nodiscard]] auto filter(FilterPredicate predicate) -> NodePtr {
+    [[nodiscard]] auto filter(FilterExprPtr predicate) -> NodePtr {
         return std::make_unique<FilterNode>(next_id(), std::move(predicate));
     }
 

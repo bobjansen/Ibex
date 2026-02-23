@@ -1,6 +1,7 @@
 #include <ibex/codegen/emitter.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/ops.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -8,6 +9,7 @@
 #include <string>
 
 using namespace ibex;
+using namespace ibex::ops;
 
 // Helper: emit an IR tree to a string.
 static auto emit_to_string(const ir::Node& root, const codegen::Emitter::Config& cfg)
@@ -50,8 +52,8 @@ TEST_CASE("emitter: extern call node", "[codegen]") {
 
 TEST_CASE("emitter: filter node — int64 predicate", "[codegen]") {
     ir::Builder b;
-    ir::FilterPredicate pred{ir::ColumnRef{"price"}, ir::CompareOp::Gt, std::int64_t{100}};
-    auto filter = b.filter(std::move(pred));
+    auto filter = b.filter(
+        ops::filter_cmp(ir::CompareOp::Gt, ops::filter_col("price"), ops::filter_int(100)));
     filter->add_child(make_source(b, "data.csv"));
 
     auto out = emit_to_string(*filter);
@@ -63,8 +65,8 @@ TEST_CASE("emitter: filter node — int64 predicate", "[codegen]") {
 
 TEST_CASE("emitter: filter node — double predicate", "[codegen]") {
     ir::Builder b;
-    ir::FilterPredicate pred{ir::ColumnRef{"ratio"}, ir::CompareOp::Le, 0.5};
-    auto filter = b.filter(std::move(pred));
+    auto filter = b.filter(
+        ops::filter_cmp(ir::CompareOp::Le, ops::filter_col("ratio"), ops::filter_dbl(0.5)));
     filter->add_child(make_source(b, "data.csv"));
 
     auto out = emit_to_string(*filter);
@@ -74,13 +76,42 @@ TEST_CASE("emitter: filter node — double predicate", "[codegen]") {
 
 TEST_CASE("emitter: filter node — string predicate", "[codegen]") {
     ir::Builder b;
-    ir::FilterPredicate pred{ir::ColumnRef{"symbol"}, ir::CompareOp::Eq, std::string{"AAPL"}};
-    auto filter = b.filter(std::move(pred));
+    auto filter = b.filter(
+        ops::filter_cmp(ir::CompareOp::Eq, ops::filter_col("symbol"), ops::filter_str("AAPL")));
     filter->add_child(make_source(b, "data.csv"));
 
     auto out = emit_to_string(*filter);
     CHECK(contains(out, "ibex::ir::CompareOp::Eq"));
-    CHECK(contains(out, "std::string{\"AAPL\"}"));
+    CHECK(contains(out, "\"AAPL\""));
+}
+
+TEST_CASE("emitter: filter node — AND compound predicate", "[codegen]") {
+    ir::Builder b;
+    // price > 10 && qty < 5
+    auto filter = b.filter(ops::filter_and(
+        ops::filter_cmp(ir::CompareOp::Gt, ops::filter_col("price"), ops::filter_int(10)),
+        ops::filter_cmp(ir::CompareOp::Lt, ops::filter_col("qty"), ops::filter_int(5))));
+    filter->add_child(make_source(b, "data.csv"));
+
+    auto out = emit_to_string(*filter);
+    CHECK(contains(out, "ibex::ops::filter_and("));
+    CHECK(contains(out, "ibex::ir::CompareOp::Gt"));
+    CHECK(contains(out, "ibex::ir::CompareOp::Lt"));
+}
+
+TEST_CASE("emitter: filter node — arithmetic in predicate", "[codegen]") {
+    ir::Builder b;
+    // price * 2 > 100
+    auto filter = b.filter(ops::filter_cmp(
+        ir::CompareOp::Gt,
+        ops::filter_arith(ir::ArithmeticOp::Mul, ops::filter_col("price"), ops::filter_int(2)),
+        ops::filter_int(100)));
+    filter->add_child(make_source(b, "data.csv"));
+
+    auto out = emit_to_string(*filter);
+    CHECK(contains(out, "ibex::ops::filter_arith("));
+    CHECK(contains(out, "ibex::ir::ArithmeticOp::Mul"));
+    CHECK(contains(out, "ibex::ir::CompareOp::Gt"));
 }
 
 // ─── Project ─────────────────────────────────────────────────────────────────
@@ -181,8 +212,7 @@ TEST_CASE("emitter: update node — literal types", "[codegen]") {
 
 TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     ir::Builder b;
-    ir::FilterPredicate pred{ir::ColumnRef{"price"}, ir::CompareOp::Ge, std::int64_t{50}};
-    auto filter = b.filter(std::move(pred));
+    auto filter = b.filter(filter_cmp(ir::CompareOp::Ge, filter_col("price"), filter_int(50)));
     filter->add_child(make_source(b, "trades.csv"));
     auto proj = b.project({ir::ColumnRef{"symbol"}});
     proj->add_child(std::move(filter));

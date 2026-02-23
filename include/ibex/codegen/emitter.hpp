@@ -55,8 +55,8 @@ class Emitter {
     /// that holds the result.
     auto emit_node(const ir::Node& node) -> std::string;
 
-    /// Emit a FilterPredicate initialiser (inline, no trailing newline).
-    static auto emit_predicate(const ir::FilterPredicate& pred) -> std::string;
+    /// Emit a FilterExpr as nested ibex::ops::filter_* builder calls (inline).
+    static auto emit_filter_expr(const ir::FilterExpr& expr) -> std::string;
 
     /// Emit an Expr expression builder call (inline).
     auto emit_expr(const ir::Expr& expr) -> std::string;

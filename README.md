@@ -51,9 +51,6 @@ filter OR           |  11.1 ms | 7.33 ms |  16.3 ms |    26.2 ms |  35.4 ms
 Compiled code speed is comparable to interpreted in these benchmarks and
 parsing overhead is negligble.
 
-**ibex vs. others (geometric mean):** 3.1× faster than pandas, on par with dplyr,
-2.3× slower than polars, 3.5× slower than data.table.
-
 `ibex+parse` includes text parsing and IR lowering; the overhead is negligible.
 See [`benchmarking/`](benchmarking/) for methodology and reproduction instructions.
 

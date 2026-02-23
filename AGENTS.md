@@ -14,6 +14,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - Format tool: `scripts/clang-format.sh` (uses newest available clang-format).
 - Workflow: run tests after any parser/lexer/AST changes before marking work done.
 - Workflow: add a usage example for new syntax in an `.ibex` file.
+- Workflow: rebuild plugins after public header/runtime changes (use `scripts/ibex-plugin-build.sh`).
 
 ## Architecture
 - `include/ibex/` — public headers (all under `ibex` namespace)

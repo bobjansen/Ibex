@@ -60,6 +60,11 @@ if [[ "$SKIP_PARQUET" == false ]]; then
 fi
 
 if [[ "$SKIP_REPL" == false ]]; then
+    echo "▸ building csv plugin"
+    mkdir -p "$BUILD_DIR/libraries"
+    BUILD_DIR="$BUILD_DIR" "$IBEX_ROOT/scripts/ibex-plugin-build.sh" \
+        "$IBEX_ROOT/libraries/csv.cpp" -o "$BUILD_DIR/libraries/csv.so"
+
     echo "▸ REPL smoke (csv plugin)"
     repl_out="$(mktemp)"
     printf ":load tests/data/iris.ibex\n:quit\n" \

@@ -22,11 +22,12 @@ parse_arg <- function(flag, default = NULL) {
     args[i + 1]
 }
 
-csv_path       <- parse_arg("--csv")
-csv_multi_path <- parse_arg("--csv-multi")
-warmup         <- as.integer(parse_arg("--warmup", "1"))
-iters          <- as.integer(parse_arg("--iters",  "5"))
-out_path       <- parse_arg("--out", "results/r.tsv")
+csv_path        <- parse_arg("--csv")
+csv_multi_path  <- parse_arg("--csv-multi")
+csv_trades_path <- parse_arg("--csv-trades")
+warmup          <- as.integer(parse_arg("--warmup", "1"))
+iters           <- as.integer(parse_arg("--iters",  "5"))
+out_path        <- parse_arg("--out", "results/r.tsv")
 
 if (is.null(csv_path)) stop("--csv is required")
 
@@ -138,6 +139,41 @@ if (!is.null(csv_multi_path)) {
                       low  = min(price),
                       last = dplyr::last(price),
                       .groups = "drop"))
+}
+
+# ── Filter benchmarks ─────────────────────────────────────────────────────────
+if (!is.null(csv_trades_path)) {
+    message("\ndata.table: loading trades.csv...")
+    dt_trades <- fread(csv_trades_path)
+    tb_trades <- as_tibble(dt_trades)
+
+    message("\n=== data.table (filter) ===")
+
+    bench("data.table", "filter_simple",
+        function() dt_trades[price > 500.0])
+
+    bench("data.table", "filter_and",
+        function() dt_trades[price > 500.0 & qty < 100])
+
+    bench("data.table", "filter_arith",
+        function() dt_trades[price * qty > 50000.0])
+
+    bench("data.table", "filter_or",
+        function() dt_trades[price > 900.0 | qty < 10])
+
+    message("\n=== dplyr (filter) ===")
+
+    bench("dplyr", "filter_simple",
+        function() tb_trades |> filter(price > 500.0))
+
+    bench("dplyr", "filter_and",
+        function() tb_trades |> filter(price > 500.0, qty < 100))
+
+    bench("dplyr", "filter_arith",
+        function() tb_trades |> filter(price * qty > 50000.0))
+
+    bench("dplyr", "filter_or",
+        function() tb_trades |> filter(price > 900.0 | qty < 10))
 }
 
 # ── Write results ─────────────────────────────────────────────────────────────

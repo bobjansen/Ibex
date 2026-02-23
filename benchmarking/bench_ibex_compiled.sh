@@ -44,16 +44,20 @@ if [[ $lld_ok -ne 1 && "$BUILD_DIR" == "$IBEX_ROOT/build-release" ]]; then
 fi
 
 CSV="$SCRIPT_DIR/data/prices.csv"
+CSV_MULTI="$SCRIPT_DIR/data/prices_multi.csv"
+CSV_TRADES="$SCRIPT_DIR/data/trades.csv"
 WARMUP=1
 ITERS=5
 OUT="$SCRIPT_DIR/results/ibex_compiled.tsv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --csv)    CSV="$2";    shift 2 ;;
-        --warmup) WARMUP="$2"; shift 2 ;;
-        --iters)  ITERS="$2";  shift 2 ;;
-        --out)    OUT="$2";    shift 2 ;;
+        --csv)        CSV="$2";        shift 2 ;;
+        --csv-multi)  CSV_MULTI="$2";  shift 2 ;;
+        --csv-trades) CSV_TRADES="$2"; shift 2 ;;
+        --warmup)     WARMUP="$2";     shift 2 ;;
+        --iters)      ITERS="$2";      shift 2 ;;
+        --out)        OUT="$2";        shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -74,13 +78,15 @@ mkdir -p "$TMP_DIR" "$(dirname "$OUT")"
 compile_query() {
     local name="$1"
     local query="$2"
+    local table_name="${3:-prices}"
+    local csv_file="${4:-$CSV}"
     local ibex_path="$TMP_DIR/$name.ibex"
     local cpp_path="$TMP_DIR/$name.cpp"
     local bin_path="$TMP_DIR/$name"
 
     cat > "$ibex_path" <<EOF
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-let prices = read_csv("${CSV}");
+let ${table_name} = read_csv("${csv_file}");
 ${query};
 EOF
 
@@ -152,6 +158,55 @@ echo "=== ibex (compiled) ===" >&2
         printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
         printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
     done
+
+    if [[ -f "$CSV_MULTI" ]]; then
+        declare -a MULTI_NAMES=()
+        declare -a MULTI_QUERIES=()
+
+        MULTI_NAMES+=("count_by_symbol_day")
+        MULTI_QUERIES+=("prices_multi[select {n = count()}, by {symbol, day}]")
+
+        MULTI_NAMES+=("mean_by_symbol_day")
+        MULTI_QUERIES+=("prices_multi[select {avg_price = mean(price)}, by {symbol, day}]")
+
+        MULTI_NAMES+=("ohlc_by_symbol_day")
+        MULTI_QUERIES+=("prices_multi[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by {symbol, day}]")
+
+        for i in "${!MULTI_NAMES[@]}"; do
+            name="${MULTI_NAMES[$i]}"
+            query="${MULTI_QUERIES[$i]}"
+            bin_path="$(compile_query "$name" "$query" "prices_multi" "$CSV_MULTI")"
+            avg_ms="$(time_bin "$bin_path")"
+            printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
+            printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
+        done
+    fi
+
+    if [[ -f "$CSV_TRADES" ]]; then
+        declare -a FILTER_NAMES=()
+        declare -a FILTER_QUERIES=()
+
+        FILTER_NAMES+=("filter_simple")
+        FILTER_QUERIES+=("trades[filter price > 500.0]")
+
+        FILTER_NAMES+=("filter_and")
+        FILTER_QUERIES+=("trades[filter price > 500.0 && qty < 100]")
+
+        FILTER_NAMES+=("filter_arith")
+        FILTER_QUERIES+=("trades[filter price * qty > 50000.0]")
+
+        FILTER_NAMES+=("filter_or")
+        FILTER_QUERIES+=("trades[filter price > 900.0 || qty < 10]")
+
+        for i in "${!FILTER_NAMES[@]}"; do
+            name="${FILTER_NAMES[$i]}"
+            query="${FILTER_QUERIES[$i]}"
+            bin_path="$(compile_query "$name" "$query" "trades" "$CSV_TRADES")"
+            avg_ms="$(time_bin "$bin_path")"
+            printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
+            printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
+        done
+    fi
 } > "$OUT"
 
 echo "results written to $OUT" >&2

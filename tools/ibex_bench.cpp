@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
 
     std::string csv_path = "prices.csv";
     std::string csv_multi_path;
+    std::string csv_trades_path;
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
@@ -145,6 +146,9 @@ int main(int argc, char** argv) {
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
     app.add_option("--csv-multi", csv_multi_path,
                    "CSV file path for multi-column group-by benchmarks (symbol, price, day)")
+        ->check(CLI::ExistingFile);
+    app.add_option("--csv-trades", csv_trades_path,
+                   "CSV file path for filter benchmarks (symbol, price, qty)")
         ->check(CLI::ExistingFile);
     app.add_option("--warmup", warmup_iters, "Warmup iterations")->check(CLI::NonNegativeNumber);
     app.add_option("--iters", iters, "Measured iterations")->check(CLI::PositiveNumber);
@@ -209,6 +213,38 @@ int main(int argc, char** argv) {
         status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
         if (status != 0) {
             break;
+        }
+    }
+
+    // Compound filter benchmarks: exercises the recursive FilterExpr evaluator.
+    if (status == 0 && !csv_trades_path.empty()) {
+        ibex::runtime::Table trades_table;
+        try {
+            trades_table = read_csv(csv_trades_path);
+        } catch (const std::exception& e) {
+            fmt::print("error: failed to read trades CSV: {}\n", e.what());
+            return 1;
+        }
+        ibex::runtime::TableRegistry trades_tables;
+        trades_tables.emplace("trades", std::move(trades_table));
+
+        // price uniform [1, 1000], qty uniform [1, 500].
+        // filter_simple:  ~50% rows (price > 500)
+        // filter_and:     ~10% rows (price > 500 && qty < 100)
+        // filter_arith:   ~50% rows (price * qty > 50000)
+        // filter_or:      ~12% rows (price > 900 || qty < 10)
+        std::vector<BenchQuery> filter_queries = {
+            {"filter_simple", "trades[filter price > 500.0]"},
+            {"filter_and", "trades[filter price > 500.0 && qty < 100]"},
+            {"filter_arith", "trades[filter price * qty > 50000.0]"},
+            {"filter_or", "trades[filter price > 900.0 || qty < 10]"},
+        };
+
+        for (const auto& query : filter_queries) {
+            status = run_benchmark(query, trades_tables, warmup_iters, iters, saved_include_parse);
+            if (status != 0) {
+                break;
+            }
         }
     }
 

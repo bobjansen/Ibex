@@ -2,12 +2,14 @@
 """Generate synthetic benchmark data.
 
 Outputs (written to the directory of this script by default):
-  prices.csv       — symbol (str), price (f64)              — N rows
-  prices_multi.csv — symbol (str), price (f64), day (str)   — N rows
+  prices.csv       — symbol (str), price (f64)                    — N rows
+  prices_multi.csv — symbol (str), price (f64), day (str)         — N rows
+  trades.csv       — symbol (str), price (f64), qty (int64)       — N rows
 
 Distinct groups:
   prices:       252        (by symbol)
   prices_multi: 1008       (by symbol × day, 252 symbols × 4 days)
+  trades:       252        (by symbol; qty uniform [1, 500])
 
 Usage:
   uv run data/gen_data.py [output_dir]
@@ -65,6 +67,21 @@ def generate(out_dir: pathlib.Path, n: int = N) -> None:
         pd.DataFrame({"symbol": sym2, "price": price2, "day": day}).to_csv(pm, index=False)
         mb = pm.stat().st_size / 1024 / 1024
         print(f"  wrote {pm}  ({n:,} rows, {mb:.0f} MB, {time.perf_counter()-t0:.1f}s)")
+
+
+    # ── trades.csv ───────────────────────────────────────────────────────────
+    tr = out_dir / "trades.csv"
+    if tr.exists():
+        print(f"  {tr} already exists, skipping")
+    else:
+        rng3  = np.random.default_rng(SEED + 2)
+        sym3  = tickers[rng3.integers(0, N_SYMBOLS, size=n)]
+        price3 = np.round(rng3.uniform(1.0, 1000.0, size=n), 4)
+        qty    = rng3.integers(1, 501, size=n)   # uniform [1, 500]
+        t0 = time.perf_counter()
+        pd.DataFrame({"symbol": sym3, "price": price3, "qty": qty}).to_csv(tr, index=False)
+        mb = tr.stat().st_size / 1024 / 1024
+        print(f"  wrote {tr}  ({n:,} rows, {mb:.0f} MB, {time.perf_counter()-t0:.1f}s)")
 
 
 if __name__ == "__main__":

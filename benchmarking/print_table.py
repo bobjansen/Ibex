@@ -25,6 +25,10 @@ QUERY_ORDER = [
     "count_by_symbol_day",
     "mean_by_symbol_day",
     "ohlc_by_symbol_day",
+    "filter_simple",
+    "filter_and",
+    "filter_arith",
+    "filter_or",
 ]
 
 QUERY_LABEL = {
@@ -34,6 +38,10 @@ QUERY_LABEL = {
     "count_by_symbol_day": "count by symbol×day",
     "mean_by_symbol_day":  "mean by symbol×day",
     "ohlc_by_symbol_day":  "OHLC by symbol×day",
+    "filter_simple":       "filter simple",
+    "filter_and":          "filter AND",
+    "filter_arith":        "filter arith",
+    "filter_or":           "filter OR",
 }
 
 

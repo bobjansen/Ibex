@@ -27,7 +27,7 @@ def timer(fn, warmup: int, iters: int):
 
 # ── Benchmark suites ──────────────────────────────────────────────────────────
 
-def bench_pandas(csv_path, csv_multi_path, warmup, iters):
+def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     print("pandas: loading...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_path)
     rows = []
@@ -73,10 +73,26 @@ def bench_pandas(csv_path, csv_multi_path, warmup, iters):
                 last=("price", "last"),
             ).reset_index())
 
+    if csv_trades_path:
+        print("pandas: loading trades...", file=sys.stderr, flush=True)
+        dft = pd.read_csv(csv_trades_path)
+
+        run("filter_simple",
+            lambda: dft[dft["price"] > 500.0])
+
+        run("filter_and",
+            lambda: dft[(dft["price"] > 500.0) & (dft["qty"] < 100)])
+
+        run("filter_arith",
+            lambda: dft[dft["price"] * dft["qty"] > 50000.0])
+
+        run("filter_or",
+            lambda: dft[(dft["price"] > 900.0) | (dft["qty"] < 10)])
+
     return rows
 
 
-def bench_polars(csv_path, csv_multi_path, warmup, iters):
+def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     print("polars: loading...", file=sys.stderr, flush=True)
     df = pl.read_csv(csv_path)
     rows = []
@@ -121,6 +137,22 @@ def bench_polars(csv_path, csv_multi_path, warmup, iters):
                 pl.col("price").last().alias("last"),
             ))
 
+    if csv_trades_path:
+        print("polars: loading trades...", file=sys.stderr, flush=True)
+        dft = pl.read_csv(csv_trades_path)
+
+        run("filter_simple",
+            lambda: dft.filter(pl.col("price") > 500.0))
+
+        run("filter_and",
+            lambda: dft.filter((pl.col("price") > 500.0) & (pl.col("qty") < 100)))
+
+        run("filter_arith",
+            lambda: dft.filter(pl.col("price") * pl.col("qty") > 50000.0))
+
+        run("filter_or",
+            lambda: dft.filter((pl.col("price") > 900.0) | (pl.col("qty") < 10)))
+
     return rows
 
 
@@ -128,16 +160,17 @@ def bench_polars(csv_path, csv_multi_path, warmup, iters):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv",       required=True, help="Path to prices.csv")
-    ap.add_argument("--csv-multi", help="Path to prices_multi.csv")
-    ap.add_argument("--warmup",    type=int, default=1)
-    ap.add_argument("--iters",     type=int, default=5)
-    ap.add_argument("--out",       default="results/python.tsv")
+    ap.add_argument("--csv",        required=True, help="Path to prices.csv")
+    ap.add_argument("--csv-multi",  help="Path to prices_multi.csv")
+    ap.add_argument("--csv-trades", help="Path to trades.csv")
+    ap.add_argument("--warmup",     type=int, default=1)
+    ap.add_argument("--iters",      type=int, default=5)
+    ap.add_argument("--out",        default="results/python.tsv")
     args = ap.parse_args()
 
     all_rows = []
-    all_rows += bench_pandas(args.csv, args.csv_multi, args.warmup, args.iters)
-    all_rows += bench_polars(args.csv, args.csv_multi, args.warmup, args.iters)
+    all_rows += bench_pandas(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
+    all_rows += bench_polars(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

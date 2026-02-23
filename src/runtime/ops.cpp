@@ -75,6 +75,14 @@ auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
     return delegate(std::move(proj_node), t);
 }
 
+auto distinct(const runtime::Table& t) -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto distinct_node = b.distinct();
+    distinct_node->add_child(std::move(scan_node));
+    return delegate(std::move(distinct_node), t);
+}
+
 auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                const std::vector<ir::AggSpec>& aggs) -> runtime::Table {
     ir::Builder b;

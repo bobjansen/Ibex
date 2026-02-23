@@ -30,6 +30,7 @@ enum class TokenKind : std::uint8_t {
     KeywordFilter,
     KeywordSelect,
     KeywordUpdate,
+    KeywordDistinct,
     KeywordBy,
     KeywordWindow,
     KeywordJoin,

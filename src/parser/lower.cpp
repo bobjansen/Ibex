@@ -148,6 +148,13 @@ class Lowerer {
             return std::unexpected(
                 LowerError{.message = "select and update are mutually exclusive"});
         }
+        if (state.distinct && (state.select || state.update)) {
+            return std::unexpected(
+                LowerError{.message = "distinct is mutually exclusive with select/update"});
+        }
+        if (state.distinct && state.by) {
+            return std::unexpected(LowerError{.message = "distinct cannot be used with by"});
+        }
         if (state.by && !state.select && !state.update) {
             return std::unexpected(LowerError{.message = "by requires select or update"});
         }
@@ -171,11 +178,19 @@ class Lowerer {
             }
             node = std::move(aggregate.value());
         } else if (state.select) {
-            auto project = lower_select_projection(*state.select, std::move(node));
+            auto project = lower_select_projection(state.select->fields, std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
             }
             node = std::move(project.value());
+        } else if (state.distinct) {
+            auto project = lower_select_projection(state.distinct->fields, std::move(node));
+            if (!project.has_value()) {
+                return std::unexpected(project.error());
+            }
+            auto distinct = builder_.distinct();
+            distinct->add_child(std::move(project.value()));
+            node = std::move(distinct);
         }
 
         if (state.update) {
@@ -203,6 +218,7 @@ class Lowerer {
     struct ClauseState {
         const FilterClause* filter = nullptr;
         const SelectClause* select = nullptr;
+        const DistinctClause* distinct = nullptr;
         const UpdateClause* update = nullptr;
         const ByClause* by = nullptr;
         const WindowClause* window = nullptr;
@@ -223,6 +239,14 @@ class Lowerer {
                     return false;
                 }
                 select = &std::get<SelectClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<DistinctClause>(clause)) {
+                if (distinct != nullptr) {
+                    error = "duplicate distinct clause";
+                    return false;
+                }
+                distinct = &std::get<DistinctClause>(clause);
                 return true;
             }
             if (std::holds_alternative<UpdateClause>(clause)) {
@@ -293,14 +317,14 @@ class Lowerer {
             LowerError{.message = "filter predicate right side must be a literal or scalar"});
     }
 
-    auto lower_select_projection(const SelectClause& clause, ir::NodePtr base)
+    auto lower_select_projection(const std::vector<Field>& clause_fields, ir::NodePtr base)
         -> std::expected<ir::NodePtr, LowerError> {
         std::vector<ir::FieldSpec> fields;
         std::vector<ir::ColumnRef> columns;
-        fields.reserve(clause.fields.size());
-        columns.reserve(clause.fields.size());
+        fields.reserve(clause_fields.size());
+        columns.reserve(clause_fields.size());
 
-        for (const auto& field : clause.fields) {
+        for (const auto& field : clause_fields) {
             if (field.expr == nullptr) {
                 columns.push_back(ir::ColumnRef{.name = field.name});
                 continue;
@@ -796,6 +820,9 @@ class Lowerer {
                 const auto& project = static_cast<const ir::ProjectNode&>(node);
                 auto clone = builder_.project(project.columns());
                 return clone;
+            }
+            case ir::NodeKind::Distinct: {
+                return builder_.distinct();
             }
             case ir::NodeKind::Aggregate: {
                 const auto& agg = static_cast<const ir::AggregateNode&>(node);

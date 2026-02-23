@@ -96,6 +96,16 @@ TEST_CASE("emitter: project node", "[codegen]") {
     CHECK(contains(out, "\"price\""));
 }
 
+TEST_CASE("emitter: distinct node", "[codegen]") {
+    ir::Builder b;
+    auto distinct = b.distinct();
+    distinct->add_child(make_source(b, "trades.csv"));
+
+    auto out = emit_to_string(*distinct);
+    CHECK(contains(out, "ibex::ops::distinct("));
+    CHECK(contains(out, "read_csv(\"trades.csv\")"));
+}
+
 // ─── Aggregate ───────────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: aggregate node", "[codegen]") {

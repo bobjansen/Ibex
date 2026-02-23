@@ -89,6 +89,20 @@ TEST_CASE("Lower computed select without aggregation") {
     REQUIRE(update->fields()[0].alias == "x");
 }
 
+TEST_CASE("Lower distinct to IR") {
+    auto program = require_parse("df[distinct symbol];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* distinct = as_node<ir::DistinctNode>(result->get());
+    REQUIRE(distinct != nullptr);
+    REQUIRE(distinct->children().size() == 1);
+    const auto* project = as_node<ir::ProjectNode>(distinct->children()[0].get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->columns().size() == 1);
+    REQUIRE(project->columns()[0].name == "symbol");
+}
+
 TEST_CASE("Lowering rejects computed group keys") {
     auto program = require_parse("df[by { yr = year(ts) }];");
     auto result = parser::lower(program);

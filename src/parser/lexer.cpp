@@ -27,6 +27,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"filter", TokenKind::KeywordFilter},
         {"select", TokenKind::KeywordSelect},
         {"update", TokenKind::KeywordUpdate},
+        {"distinct", TokenKind::KeywordDistinct},
         {"by", TokenKind::KeywordBy},
         {"window", TokenKind::KeywordWindow},
         {"join", TokenKind::KeywordJoin},

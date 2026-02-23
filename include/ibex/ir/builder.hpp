@@ -26,6 +26,8 @@ class Builder {
         return std::make_unique<ProjectNode>(next_id(), std::move(columns));
     }
 
+    [[nodiscard]] auto distinct() -> NodePtr { return std::make_unique<DistinctNode>(next_id()); }
+
     [[nodiscard]] auto aggregate(std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
         -> NodePtr {
         return std::make_unique<AggregateNode>(next_id(), std::move(group_by),

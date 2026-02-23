@@ -214,6 +214,13 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Distinct: {
+            auto child = emit_node(*node.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::distinct(" << child << ");\n";
+            return var;
+        }
+
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);
             auto child = emit_node(*agg.children().front());

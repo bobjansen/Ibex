@@ -56,6 +56,15 @@ TEST_CASE("ProjectNode stores column list", "[ir][project]") {
     REQUIRE(proj->columns()[0].name == "symbol");
 }
 
+TEST_CASE("DistinctNode kind", "[ir][distinct]") {
+    ibex::ir::Builder builder;
+    auto node = builder.distinct();
+
+    auto* distinct = dynamic_cast<ibex::ir::DistinctNode*>(node.get());
+    REQUIRE(distinct != nullptr);
+    REQUIRE(distinct->kind() == ibex::ir::NodeKind::Distinct);
+}
+
 TEST_CASE("AggregateNode stores group-by and aggregations", "[ir][aggregate]") {
     ibex::ir::Builder builder;
 

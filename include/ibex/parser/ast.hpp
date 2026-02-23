@@ -102,6 +102,10 @@ struct SelectClause {
     std::vector<Field> fields;
 };
 
+struct DistinctClause {
+    std::vector<Field> fields;
+};
+
 struct UpdateClause {
     std::vector<Field> fields;
 };
@@ -115,7 +119,8 @@ struct WindowClause {
     DurationLiteral duration;
 };
 
-using Clause = std::variant<FilterClause, SelectClause, UpdateClause, ByClause, WindowClause>;
+using Clause =
+    std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, ByClause, WindowClause>;
 
 struct BlockExpr {
     ExprPtr base;

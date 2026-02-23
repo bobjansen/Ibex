@@ -118,6 +118,35 @@ TEST_CASE("Interpret update with arithmetic") {
     REQUIRE((*price_ints)[2] == 4);
 }
 
+TEST_CASE("Interpret distinct") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 10, 20, 20});
+    table.add_column("symbol", Column<std::string>{"A", "A", "B", "B"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[distinct { symbol, price }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 2);
+
+    const auto* symbol_col = result->find("symbol");
+    const auto* price_col = result->find("price");
+    REQUIRE(symbol_col != nullptr);
+    REQUIRE(price_col != nullptr);
+    const auto* symbols = std::get_if<Column<std::string>>(symbol_col);
+    const auto* prices = std::get_if<Column<std::int64_t>>(price_col);
+    REQUIRE(symbols != nullptr);
+    REQUIRE(prices != nullptr);
+    REQUIRE(symbols->size() == 2);
+    REQUIRE(prices->size() == 2);
+    REQUIRE((*symbols)[0] == "A");
+    REQUIRE((*prices)[0] == 10);
+    REQUIRE((*symbols)[1] == "B");
+    REQUIRE((*prices)[1] == 20);
+}
+
 TEST_CASE("Interpret select with function call") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{2, 3});

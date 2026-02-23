@@ -586,6 +586,13 @@ class Parser {
             }
             return SelectClause{.fields = std::move(*fields)};
         }
+        if (match(TokenKind::KeywordDistinct)) {
+            auto fields = parse_field_list_or_single();
+            if (!fields.has_value()) {
+                return std::nullopt;
+            }
+            return DistinctClause{.fields = std::move(*fields)};
+        }
         if (match(TokenKind::KeywordUpdate)) {
             auto fields = parse_field_list_or_single();
             if (!fields.has_value()) {

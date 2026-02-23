@@ -373,6 +373,39 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
     return std::visit([&](const auto& col) -> ScalarValue { return col[row]; }, column);
 }
 
+auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
+    if (input.columns.empty()) {
+        return input;
+    }
+    std::size_t rows = input.rows();
+    Table output;
+    output.columns.reserve(input.columns.size());
+    for (const auto& entry : input.columns) {
+        output.add_column(entry.name, make_empty_like(*entry.column));
+    }
+    for (auto& entry : output.columns) {
+        std::visit([&](auto& col) { col.reserve(rows); }, *entry.column);
+    }
+
+    robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen;
+    seen.reserve(rows);
+
+    for (std::size_t row = 0; row < rows; ++row) {
+        Key key;
+        key.values.reserve(input.columns.size());
+        for (const auto& entry : input.columns) {
+            key.values.push_back(scalar_from_column(*entry.column, row));
+        }
+        if (!seen.insert(std::move(key)).second) {
+            continue;
+        }
+        for (std::size_t col = 0; col < input.columns.size(); ++col) {
+            append_value(*output.columns[col].column, *input.columns[col].column, row);
+        }
+    }
+    return output;
+}
+
 auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
     std::visit(
         [&](auto& col) {
@@ -1937,6 +1970,16 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             return project_table(child.value(), project.columns());
+        }
+        case ir::NodeKind::Distinct: {
+            if (node.children().empty()) {
+                return std::unexpected("distinct node missing child");
+            }
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return distinct_table(child.value());
         }
         case ir::NodeKind::Update: {
             const auto& update = static_cast<const ir::UpdateNode&>(node);

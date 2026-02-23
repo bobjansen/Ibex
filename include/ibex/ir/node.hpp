@@ -119,6 +119,7 @@ enum class NodeKind : std::uint8_t {
     Scan,
     Filter,
     Project,
+    Distinct,
     Aggregate,
     Update,
     Window,
@@ -192,6 +193,12 @@ class ProjectNode final : public Node {
 
    private:
     std::vector<ColumnRef> columns_;
+};
+
+/// Distinct node: drops duplicate rows.
+class DistinctNode final : public Node {
+   public:
+    explicit DistinctNode(NodeId id) : Node(NodeKind::Distinct, id) {}
 };
 
 /// Aggregate node: groups and aggregates.

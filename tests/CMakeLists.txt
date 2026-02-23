@@ -23,6 +23,7 @@ target_link_libraries(ibex_tests
         Ibex::codegen
         Ibex::CompilerOptions
         Catch2::Catch2WithMain
+        rapidcsv
 )
 
 target_compile_definitions(ibex_tests

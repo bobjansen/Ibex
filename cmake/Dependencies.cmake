@@ -40,6 +40,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(robin_hood)
 
+# rapidcsv — header-only RFC 4180 CSV parser (MIT)
+FetchContent_Declare(
+    rapidcsv
+    GIT_REPOSITORY https://github.com/d99kris/rapidcsv.git
+    GIT_TAG        v8.83
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(rapidcsv)
+
 # Catch2 — testing framework (only when tests enabled)
 if(IBEX_BUILD_TESTS)
     FetchContent_Declare(

@@ -105,7 +105,6 @@ TEST_CASE("Read CSV - single data row") {
 
 TEST_CASE("Read CSV - trailing comma produces empty last field") {
     auto path = tmp("ibex_test_trailing.csv");
-    // csv_split_line explicitly handles trailing comma → empty string field
     write_csv(path, "a,b,c\n1,2,\n3,4,\n");
 
     auto table = read_csv(path.string());
@@ -115,4 +114,36 @@ TEST_CASE("Read CSV - trailing comma produces empty last field") {
     REQUIRE(c != nullptr);
     REQUIRE((*c)[0] == "");
     REQUIRE((*c)[1] == "");
+}
+
+TEST_CASE("Read CSV - RFC 4180 quoted fields with embedded commas") {
+    auto path = tmp("ibex_test_quoted.csv");
+    // "name" column has commas inside quotes — old parser would split incorrectly
+    write_csv(path, "id,name,score\n1,\"Smith, John\",95\n2,\"Doe, Jane\",87\n");
+
+    auto table = read_csv(path.string());
+    REQUIRE(table.rows() == 2);
+    const auto* ids = std::get_if<ibex::Column<std::int64_t>>(table.find("id"));
+    const auto* names = std::get_if<ibex::Column<std::string>>(table.find("name"));
+    const auto* scores = std::get_if<ibex::Column<std::int64_t>>(table.find("score"));
+    REQUIRE(ids != nullptr);
+    REQUIRE(names != nullptr);
+    REQUIRE(scores != nullptr);
+    REQUIRE((*names)[0] == "Smith, John");
+    REQUIRE((*names)[1] == "Doe, Jane");
+    REQUIRE((*ids)[0] == 1);
+    REQUIRE((*scores)[0] == 95);
+}
+
+TEST_CASE("Read CSV - RFC 4180 escaped quotes inside quoted field") {
+    auto path = tmp("ibex_test_escaped_quotes.csv");
+    // "" inside a quoted field represents a literal quote character
+    write_csv(path, "msg\n\"say \"\"hello\"\"\"\n\"world\"\n");
+
+    auto table = read_csv(path.string());
+    REQUIRE(table.rows() == 2);
+    const auto* msgs = std::get_if<ibex::Column<std::string>>(table.find("msg"));
+    REQUIRE(msgs != nullptr);
+    REQUIRE((*msgs)[0] == "say \"hello\"");
+    REQUIRE((*msgs)[1] == "world");
 }

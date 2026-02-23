@@ -32,6 +32,7 @@ target_link_libraries(ibex_bench
         Ibex::CompilerOptions
         CLI11::CLI11
         fmt::fmt
+        rapidcsv
 )
 
 if(TARGET Ibex::Sanitizers)

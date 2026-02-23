@@ -2253,16 +2253,23 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     const std::size_t n_keys = group_columns.size();
 
     // ── Pass 1a: per-column uint32_t code arrays ─────────────────────────────
+    // Categorical key columns are handled zero-copy: cat_raw points directly into
+    // the column's existing codes array; cc.codes is left empty. code_at() picks
+    // the right source so pass 1b and output reconstruction need no special-casing.
     struct ColCodes {
-        std::vector<std::uint32_t> codes;  // codes[row]
+        std::vector<std::uint32_t> codes;  // codes[row]; empty for categorical
         std::uint32_t n_distinct{0};
         std::vector<ScalarValue> vals;  // distinct values in insertion order
+        const Column<Categorical>::code_type* cat_raw{nullptr};  // non-null → categorical
+
+        [[nodiscard]] std::uint32_t code_at(std::size_t row) const noexcept {
+            return cat_raw ? static_cast<std::uint32_t>(cat_raw[row]) : codes[row];
+        }
     };
     std::vector<ColCodes> per_col(n_keys);
 
     for (std::size_t ci = 0; ci < n_keys; ++ci) {
         ColCodes& cc = per_col[ci];
-        cc.codes.resize(rows);
         std::visit(
             [&](const auto& col) {
                 using ColType = std::decay_t<decltype(col)>;
@@ -2274,11 +2281,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     for (const auto& entry : dict) {
                         cc.vals.emplace_back(entry);
                     }
-                    const auto* codes = col.codes_data();
-                    for (std::size_t row = 0; row < rows; ++row) {
-                        cc.codes[row] = static_cast<std::uint32_t>(codes[row]);
-                    }
+                    // Zero-copy: borrow the column's own codes array.
+                    cc.cat_raw = col.codes_data();
                 } else if constexpr (is_string_like_v<T>) {
+                    cc.codes.resize(rows);
                     robin_hood::unordered_flat_map<std::string_view, std::uint32_t> map;
                     map.reserve(64);
                     std::string_view prev_key;
@@ -2303,6 +2309,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         cc.codes[row] = code;
                     }
                 } else {
+                    cc.codes.resize(rows);
                     robin_hood::unordered_flat_map<T, std::uint32_t> map;
                     map.reserve(64);
                     for (std::size_t row = 0; row < rows; ++row) {
@@ -2352,14 +2359,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         for (std::size_t row = 0; row < rows; ++row) {
             std::uint32_t cell = 0;
             for (std::size_t ci = 0; ci < n_keys; ++ci)
-                cell += per_col[ci].codes[row] * static_cast<std::uint32_t>(strides[ci]);
+                cell += per_col[ci].code_at(row) * static_cast<std::uint32_t>(strides[ci]);
             std::uint32_t gid = cell_to_gid[cell];
             if (gid == std::numeric_limits<std::uint32_t>::max()) {
                 gid = n_groups_m++;
                 cell_to_gid[cell] = gid;
                 states.push_back(make_state());
                 for (std::size_t ci = 0; ci < n_keys; ++ci)
-                    group_col_codes_flat.push_back(per_col[ci].codes[row]);
+                    group_col_codes_flat.push_back(per_col[ci].code_at(row));
             }
             compound_gids[row] = gid;
         }
@@ -2372,13 +2379,13 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         for (std::size_t row = 0; row < rows; ++row) {
             std::uint64_t cell = 0;
             for (std::size_t ci = 0; ci < n_keys; ++ci)
-                cell += static_cast<std::uint64_t>(per_col[ci].codes[row]) * strides[ci];
+                cell += static_cast<std::uint64_t>(per_col[ci].code_at(row)) * strides[ci];
             auto [it, inserted] = cell_to_gid.emplace(cell, n_groups_m);
             if (inserted) {
                 ++n_groups_m;
                 states.push_back(make_state());
                 for (std::size_t ci = 0; ci < n_keys; ++ci)
-                    group_col_codes_flat.push_back(per_col[ci].codes[row]);
+                    group_col_codes_flat.push_back(per_col[ci].code_at(row));
             }
             compound_gids[row] = it->second;
         }

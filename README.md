@@ -68,6 +68,29 @@ iris[select { mean_sl = mean(`Sepal.Length`) }, by Species];
 iris[update { sl_doubled = `Sepal.Length` * 2.0 }];
 ```
 
+### Distinct
+
+```
+// Unique species values
+iris[distinct `Species`];
+
+// Unique (Species, Sepal.Length) pairs
+iris[distinct { `Species`, `Sepal.Length` }];
+```
+
+### Order
+
+```
+// Order by a single key (ascending by default)
+iris[order `Species`];
+
+// Order by multiple keys with explicit directions
+iris[order { `Species` asc, `Sepal.Length` desc }];
+
+// Order by all columns (schema order)
+iris[order];
+```
+
 ### Scalar extraction
 
 ```

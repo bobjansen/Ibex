@@ -10,6 +10,7 @@
 #include <robin_hood.h>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -547,27 +548,75 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
     for (std::size_t i = 0; i < n; ++i)
         out_n += mp[i];
 
+    std::vector<std::size_t> selected;
+    selected.resize(out_n);
+    {
+        std::size_t j = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (mp[i]) {
+                selected[j++] = i;
+            }
+        }
+    }
+
     // Gather: for each column, copy only the matching rows.
     Table output;
     output.columns.reserve(input.columns.size());
     for (const auto& entry : input.columns) {
-        ColumnValue out_col = std::visit(
-            [&](const auto& src) -> ColumnValue {
+        output.add_column(entry.name, make_empty_like(*entry.column));
+    }
+
+    constexpr std::size_t kParallelRows = 200'000;
+    const bool use_parallel = out_n >= kParallelRows && input.columns.size() >= 2 &&
+                              std::thread::hardware_concurrency() > 1;
+
+    auto copy_column = [&](std::size_t col_idx) {
+        const auto& src_entry = input.columns[col_idx];
+        auto& dst_entry = output.columns[col_idx];
+        std::visit(
+            [&](const auto& src) {
                 using ColT = std::decay_t<decltype(src)>;
                 using T = typename ColT::value_type;
-                Column<T> out;
-                out.resize(out_n);
-                const T* sp = src.data();
-                T* dp = out.data();
-                std::size_t j = 0;
-                for (std::size_t i = 0; i < n; ++i) {
-                    if (mp[i])
-                        dp[j++] = sp[i];
+                auto* dst = std::get_if<ColT>(dst_entry.column.get());
+                if (dst == nullptr) {
+                    throw std::runtime_error("filter: column type mismatch");
                 }
-                return ColumnValue{std::move(out)};
+                dst->resize(out_n);
+                const T* sp = src.data();
+                T* dp = dst->data();
+                for (std::size_t j = 0; j < out_n; ++j) {
+                    dp[j] = sp[selected[j]];
+                }
             },
-            *entry.column);
-        output.add_column(entry.name, std::move(out_col));
+            *src_entry.column);
+    };
+
+    if (use_parallel) {
+        const std::size_t cols = input.columns.size();
+        const std::size_t hw = std::max<unsigned>(1, std::thread::hardware_concurrency());
+        const std::size_t threads = std::min(cols, hw);
+        const std::size_t chunk = (cols + threads - 1) / threads;
+        std::vector<std::thread> workers;
+        workers.reserve(threads);
+        for (std::size_t t = 0; t < threads; ++t) {
+            std::size_t start = t * chunk;
+            if (start >= cols) {
+                break;
+            }
+            std::size_t end = std::min(cols, start + chunk);
+            workers.emplace_back([&, start, end] {
+                for (std::size_t c = start; c < end; ++c) {
+                    copy_column(c);
+                }
+            });
+        }
+        for (auto& th : workers) {
+            th.join();
+        }
+    } else {
+        for (std::size_t c = 0; c < input.columns.size(); ++c) {
+            copy_column(c);
+        }
     }
     return output;
 }

@@ -7,8 +7,10 @@
 
 #include <chrono>
 #include <csv.hpp>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -35,6 +37,513 @@ struct BenchQuery {
     std::string name;
     std::string source;
 };
+
+auto column_type_name(const ibex::runtime::ColumnValue& column) -> std::string_view {
+    if (std::holds_alternative<ibex::Column<std::int64_t>>(column)) {
+        return "Int";
+    }
+    if (std::holds_alternative<ibex::Column<double>>(column)) {
+        return "Double";
+    }
+    if (std::holds_alternative<ibex::Column<std::string>>(column)) {
+        return "String";
+    }
+    if (std::holds_alternative<ibex::Column<ibex::Categorical>>(column)) {
+        return "Categorical";
+    }
+    return "Unknown";
+}
+
+void print_table_types(const std::string_view name, const ibex::runtime::Table& table) {
+    fmt::print("table {}: rows={}\n", name, table.rows());
+    for (const auto& entry : table.columns) {
+        fmt::print("  {}: {}\n", entry.name, column_type_name(*entry.column));
+    }
+}
+
+auto string_view_at(const ibex::runtime::ColumnValue& column, std::size_t row) -> std::string_view {
+    if (const auto* str_col = std::get_if<ibex::Column<std::string>>(&column)) {
+        return std::string_view((*str_col)[row]);
+    }
+    if (const auto* cat_col = std::get_if<ibex::Column<ibex::Categorical>>(&column)) {
+        return (*cat_col)[row];
+    }
+    return {};
+}
+
+auto double_at(const ibex::runtime::ColumnValue& column, std::size_t row) -> double {
+    if (const auto* dbl_col = std::get_if<ibex::Column<double>>(&column)) {
+        return (*dbl_col)[row];
+    }
+    if (const auto* int_col = std::get_if<ibex::Column<std::int64_t>>(&column)) {
+        return static_cast<double>((*int_col)[row]);
+    }
+    return 0.0;
+}
+
+auto int_at(const ibex::runtime::ColumnValue& column, std::size_t row) -> std::int64_t {
+    if (const auto* int_col = std::get_if<ibex::Column<std::int64_t>>(&column)) {
+        return (*int_col)[row];
+    }
+    if (const auto* dbl_col = std::get_if<ibex::Column<double>>(&column)) {
+        return static_cast<std::int64_t>((*dbl_col)[row]);
+    }
+    return 0;
+}
+
+auto verify_mean_by_symbol(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                           std::size_t rows) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* price_col = table.find("price");
+    const auto* out_sym = result.find("symbol");
+    const auto* out_avg = result.find("avg_price");
+    if (sym_col == nullptr || price_col == nullptr || out_sym == nullptr || out_avg == nullptr) {
+        return false;
+    }
+    std::unordered_map<std::string, std::size_t> index;
+    std::vector<std::string> order;
+    std::vector<double> sum;
+    std::vector<std::int64_t> count;
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::string key(string_view_at(*sym_col, row));
+        auto it = index.find(key);
+        std::size_t gid = 0;
+        if (it == index.end()) {
+            gid = order.size();
+            index.emplace(key, gid);
+            order.push_back(key);
+            sum.push_back(0.0);
+            count.push_back(0);
+        } else {
+            gid = it->second;
+        }
+        sum[gid] += double_at(*price_col, row);
+        count[gid] += 1;
+    }
+    if (result.rows() != order.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        if (string_view_at(*out_sym, i) != order[i]) {
+            return false;
+        }
+        double expected = count[i] == 0 ? 0.0 : sum[i] / static_cast<double>(count[i]);
+        double actual = double_at(*out_avg, i);
+        if (std::abs(actual - expected) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto verify_ohlc_by_symbol(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                           std::size_t rows) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* price_col = table.find("price");
+    const auto* out_sym = result.find("symbol");
+    const auto* out_open = result.find("open");
+    const auto* out_high = result.find("high");
+    const auto* out_low = result.find("low");
+    const auto* out_last = result.find("last");
+    if (sym_col == nullptr || price_col == nullptr || out_sym == nullptr || out_open == nullptr ||
+        out_high == nullptr || out_low == nullptr || out_last == nullptr) {
+        return false;
+    }
+    std::unordered_map<std::string, std::size_t> index;
+    std::vector<std::string> order;
+    std::vector<double> open;
+    std::vector<double> high;
+    std::vector<double> low;
+    std::vector<double> last;
+    std::vector<bool> seen;
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::string key(string_view_at(*sym_col, row));
+        auto it = index.find(key);
+        std::size_t gid = 0;
+        if (it == index.end()) {
+            gid = order.size();
+            index.emplace(key, gid);
+            order.push_back(key);
+            open.push_back(0.0);
+            high.push_back(-std::numeric_limits<double>::infinity());
+            low.push_back(std::numeric_limits<double>::infinity());
+            last.push_back(0.0);
+            seen.push_back(false);
+        } else {
+            gid = it->second;
+        }
+        double v = double_at(*price_col, row);
+        if (!seen[gid]) {
+            open[gid] = v;
+            seen[gid] = true;
+        }
+        if (v > high[gid]) {
+            high[gid] = v;
+        }
+        if (v < low[gid]) {
+            low[gid] = v;
+        }
+        last[gid] = v;
+    }
+    if (result.rows() != order.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        if (string_view_at(*out_sym, i) != order[i]) {
+            return false;
+        }
+        if (std::abs(double_at(*out_open, i) - open[i]) > 1e-9) {
+            return false;
+        }
+        if (std::abs(double_at(*out_high, i) - high[i]) > 1e-9) {
+            return false;
+        }
+        if (std::abs(double_at(*out_low, i) - low[i]) > 1e-9) {
+            return false;
+        }
+        if (std::abs(double_at(*out_last, i) - last[i]) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct Key2 {
+    std::string a;
+    std::string b;
+    bool operator==(const Key2& other) const { return a == other.a && b == other.b; }
+};
+
+struct Key2Hash {
+    std::size_t operator()(const Key2& k) const noexcept {
+        return std::hash<std::string>()(k.a) ^ (std::hash<std::string>()(k.b) << 1);
+    }
+};
+
+auto verify_group_by_symbol_day(const ibex::runtime::Table& table,
+                                const ibex::runtime::Table& result, std::size_t rows,
+                                const std::string_view mode) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* day_col = table.find("day");
+    const auto* price_col = table.find("price");
+    const auto* out_sym = result.find("symbol");
+    const auto* out_day = result.find("day");
+    if (sym_col == nullptr || day_col == nullptr || out_sym == nullptr || out_day == nullptr) {
+        return false;
+    }
+
+    std::unordered_map<Key2, std::size_t, Key2Hash> index;
+    std::vector<Key2> order;
+    std::vector<std::int64_t> count;
+    std::vector<double> sum;
+    std::vector<double> open;
+    std::vector<double> high;
+    std::vector<double> low;
+    std::vector<double> last;
+    std::vector<bool> seen;
+
+    for (std::size_t row = 0; row < rows; ++row) {
+        Key2 key{std::string(string_view_at(*sym_col, row)),
+                 std::string(string_view_at(*day_col, row))};
+        auto it = index.find(key);
+        std::size_t gid = 0;
+        if (it == index.end()) {
+            gid = order.size();
+            index.emplace(key, gid);
+            order.push_back(key);
+            count.push_back(0);
+            sum.push_back(0.0);
+            open.push_back(0.0);
+            high.push_back(-std::numeric_limits<double>::infinity());
+            low.push_back(std::numeric_limits<double>::infinity());
+            last.push_back(0.0);
+            seen.push_back(false);
+        } else {
+            gid = it->second;
+        }
+        count[gid] += 1;
+        if (price_col != nullptr) {
+            double v = double_at(*price_col, row);
+            sum[gid] += v;
+            if (!seen[gid]) {
+                open[gid] = v;
+                seen[gid] = true;
+            }
+            if (v > high[gid]) {
+                high[gid] = v;
+            }
+            if (v < low[gid]) {
+                low[gid] = v;
+            }
+            last[gid] = v;
+        }
+    }
+
+    if (result.rows() != order.size()) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        if (string_view_at(*out_sym, i) != order[i].a) {
+            return false;
+        }
+        if (string_view_at(*out_day, i) != order[i].b) {
+            return false;
+        }
+        if (mode == "count") {
+            const auto* out_n = result.find("n");
+            if (out_n == nullptr) {
+                return false;
+            }
+            if (int_at(*out_n, i) != count[i]) {
+                return false;
+            }
+        } else if (mode == "mean") {
+            const auto* out_avg = result.find("avg_price");
+            if (out_avg == nullptr) {
+                return false;
+            }
+            double expected = count[i] == 0 ? 0.0 : sum[i] / static_cast<double>(count[i]);
+            if (std::abs(double_at(*out_avg, i) - expected) > 1e-9) {
+                return false;
+            }
+        } else if (mode == "ohlc") {
+            const auto* out_open = result.find("open");
+            const auto* out_high = result.find("high");
+            const auto* out_low = result.find("low");
+            const auto* out_last = result.find("last");
+            if (out_open == nullptr || out_high == nullptr || out_low == nullptr ||
+                out_last == nullptr) {
+                return false;
+            }
+            if (std::abs(double_at(*out_open, i) - open[i]) > 1e-9) {
+                return false;
+            }
+            if (std::abs(double_at(*out_high, i) - high[i]) > 1e-9) {
+                return false;
+            }
+            if (std::abs(double_at(*out_low, i) - low[i]) > 1e-9) {
+                return false;
+            }
+            if (std::abs(double_at(*out_last, i) - last[i]) > 1e-9) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+auto verify_update_price_x2(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                            std::size_t rows) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* price_x2 = result.find("price_x2");
+    if (price_col == nullptr || price_x2 == nullptr) {
+        return false;
+    }
+    if (result.rows() != table.rows()) {
+        return false;
+    }
+    for (std::size_t row = 0; row < rows; ++row) {
+        double expected = double_at(*price_col, row) * 2.0;
+        double actual = double_at(*price_x2, row);
+        if (std::abs(actual - expected) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto verify_filter(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                   std::size_t rows, const std::string_view mode) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* qty_col = table.find("qty");
+    if (price_col == nullptr || qty_col == nullptr) {
+        return false;
+    }
+    std::size_t expected = 0;
+    for (std::size_t row = 0; row < rows; ++row) {
+        double price = double_at(*price_col, row);
+        std::int64_t qty = int_at(*qty_col, row);
+        bool keep = false;
+        if (mode == "simple") {
+            keep = price > 500.0;
+        } else if (mode == "and") {
+            keep = price > 500.0 && qty < 100;
+        } else if (mode == "arith") {
+            keep = price * static_cast<double>(qty) > 50000.0;
+        } else if (mode == "or") {
+            keep = price > 900.0 || qty < 10;
+        }
+        if (keep) {
+            expected++;
+        }
+    }
+    return result.rows() == expected;
+}
+
+auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::runtime::Table {
+    ibex::runtime::Table out;
+    std::size_t n = std::min(rows, table.rows());
+    out.columns.reserve(table.columns.size());
+    for (const auto& entry : table.columns) {
+        const auto& column = *entry.column;
+        ibex::runtime::ColumnValue sliced = std::visit(
+            [&](const auto& col) -> ibex::runtime::ColumnValue {
+                using ColType = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColType, ibex::Column<std::int64_t>>) {
+                    std::vector<std::int64_t> data;
+                    data.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        data.push_back(col[i]);
+                    }
+                    return ibex::Column<std::int64_t>(std::move(data));
+                } else if constexpr (std::is_same_v<ColType, ibex::Column<double>>) {
+                    std::vector<double> data;
+                    data.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        data.push_back(col[i]);
+                    }
+                    return ibex::Column<double>(std::move(data));
+                } else if constexpr (std::is_same_v<ColType, ibex::Column<std::string>>) {
+                    std::vector<std::string> data;
+                    data.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        data.push_back(col[i]);
+                    }
+                    return ibex::Column<std::string>(std::move(data));
+                } else {
+                    std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
+                    codes.reserve(n);
+                    const auto* src = col.codes_data();
+                    for (std::size_t i = 0; i < n; ++i) {
+                        codes.push_back(src[i]);
+                    }
+                    return ibex::Column<ibex::Categorical>(col.dictionary_ptr(), col.index_ptr(),
+                                                           std::move(codes));
+                }
+            },
+            column);
+        out.add_column(entry.name, std::move(sliced));
+    }
+    return out;
+}
+
+auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
+                      std::size_t max_rows) -> std::optional<std::string> {
+    auto normalized = normalize_input(query.source);
+    ibex::runtime::ScalarRegistry scalars;
+    auto parsed = ibex::parser::parse(normalized);
+    if (!parsed) {
+        return "parse failed: " + parsed.error().format();
+    }
+    auto lowered = ibex::parser::lower(*parsed);
+    if (!lowered) {
+        return "lower failed: " + lowered.error().message;
+    }
+    ibex::runtime::TableRegistry sliced;
+    const ibex::runtime::Table* table = nullptr;
+    if (tables.find("prices") != tables.end()) {
+        table = &tables.at("prices");
+        sliced.emplace("prices", slice_table(*table, max_rows));
+    }
+    const ibex::runtime::Table* trades = nullptr;
+    if (tables.find("trades") != tables.end()) {
+        trades = &tables.at("trades");
+        sliced.emplace("trades", slice_table(*trades, max_rows));
+    }
+    const ibex::runtime::Table* multi = nullptr;
+    if (tables.find("prices_multi") != tables.end()) {
+        multi = &tables.at("prices_multi");
+        sliced.emplace("prices_multi", slice_table(*multi, max_rows));
+    }
+
+    auto result = ibex::runtime::interpret(*lowered.value(), sliced, &scalars);
+    if (!result) {
+        return "interpret failed: " + result.error();
+    }
+    if (query.name == "mean_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_mean_by_symbol(sliced.at("prices"), *result, rows)) {
+            return "mean_by_symbol verification failed";
+        }
+    } else if (query.name == "ohlc_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_ohlc_by_symbol(sliced.at("prices"), *result, rows)) {
+            return "ohlc_by_symbol verification failed";
+        }
+    } else if (query.name == "update_price_x2") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_update_price_x2(sliced.at("prices"), *result, rows)) {
+            return "update_price_x2 verification failed";
+        }
+    } else if (query.name == "count_by_symbol_day") {
+        if (multi == nullptr) {
+            return "missing prices_multi table";
+        }
+        std::size_t rows = sliced.at("prices_multi").rows();
+        if (!verify_group_by_symbol_day(sliced.at("prices_multi"), *result, rows, "count")) {
+            return "count_by_symbol_day verification failed";
+        }
+    } else if (query.name == "mean_by_symbol_day") {
+        if (multi == nullptr) {
+            return "missing prices_multi table";
+        }
+        std::size_t rows = sliced.at("prices_multi").rows();
+        if (!verify_group_by_symbol_day(sliced.at("prices_multi"), *result, rows, "mean")) {
+            return "mean_by_symbol_day verification failed";
+        }
+    } else if (query.name == "ohlc_by_symbol_day") {
+        if (multi == nullptr) {
+            return "missing prices_multi table";
+        }
+        std::size_t rows = sliced.at("prices_multi").rows();
+        if (!verify_group_by_symbol_day(sliced.at("prices_multi"), *result, rows, "ohlc")) {
+            return "ohlc_by_symbol_day verification failed";
+        }
+    } else if (query.name == "filter_simple") {
+        if (trades == nullptr) {
+            return "missing trades table";
+        }
+        std::size_t rows = sliced.at("trades").rows();
+        if (!verify_filter(sliced.at("trades"), *result, rows, "simple")) {
+            return "filter_simple verification failed";
+        }
+    } else if (query.name == "filter_and") {
+        if (trades == nullptr) {
+            return "missing trades table";
+        }
+        std::size_t rows = sliced.at("trades").rows();
+        if (!verify_filter(sliced.at("trades"), *result, rows, "and")) {
+            return "filter_and verification failed";
+        }
+    } else if (query.name == "filter_arith") {
+        if (trades == nullptr) {
+            return "missing trades table";
+        }
+        std::size_t rows = sliced.at("trades").rows();
+        if (!verify_filter(sliced.at("trades"), *result, rows, "arith")) {
+            return "filter_arith verification failed";
+        }
+    } else if (query.name == "filter_or") {
+        if (trades == nullptr) {
+            return "missing trades table";
+        }
+        std::size_t rows = sliced.at("trades").rows();
+        if (!verify_filter(sliced.at("trades"), *result, rows, "or")) {
+            return "filter_or verification failed";
+        }
+    }
+    return std::nullopt;
+}
 
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
                    std::size_t warmup_iters, std::size_t iters, bool include_parse) -> int {
@@ -142,6 +651,9 @@ int main(int argc, char** argv) {
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
+    bool print_types = false;
+    bool verify = false;
+    std::size_t verify_rows = 10000;
 
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
     app.add_option("--csv-multi", csv_multi_path,
@@ -157,6 +669,11 @@ int main(int argc, char** argv) {
     app.add_flag("--no-include-parse", include_parse,
                  "Exclude parse + lower from timing (legacy mode)")
         ->excludes("--include-parse");
+    app.add_flag("--print-types", print_types, "Print column types for loaded benchmark tables");
+    app.add_flag("--verify", verify, "Verify benchmark outputs on a sample of rows");
+    app.add_option("--verify-rows", verify_rows,
+                   "Rows to sample per table during verification (default: 10000)")
+        ->check(CLI::PositiveNumber);
 
     CLI11_PARSE(app, argc, argv);
 
@@ -170,6 +687,9 @@ int main(int argc, char** argv) {
 
     ibex::runtime::TableRegistry tables;
     tables.emplace("prices", std::move(table));
+    if (print_types) {
+        print_table_types("prices", tables.find("prices")->second);
+    }
 
     // Single-column group-by: exercises the string fast path (robin_hood).
     std::vector<BenchQuery> queries = {
@@ -210,6 +730,12 @@ int main(int argc, char** argv) {
     for (std::size_t qi = 0; qi < queries.size(); ++qi) {
         // parse_* queries always include parsing in the timing
         bool this_include_parse = (qi >= 3) ? true : saved_include_parse;
+        if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
+            if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
+                fmt::print("error: verify failed for {}: {}\n", queries[qi].name, *err);
+                return 1;
+            }
+        }
         status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
         if (status != 0) {
             break;
@@ -227,6 +753,9 @@ int main(int argc, char** argv) {
         }
         ibex::runtime::TableRegistry trades_tables;
         trades_tables.emplace("trades", std::move(trades_table));
+        if (print_types) {
+            print_table_types("trades", trades_tables.find("trades")->second);
+        }
 
         // price uniform [1, 1000], qty uniform [1, 500].
         // filter_simple:  ~50% rows (price > 500)
@@ -241,6 +770,12 @@ int main(int argc, char** argv) {
         };
 
         for (const auto& query : filter_queries) {
+            if (verify) {
+                if (auto err = verify_benchmark(query, trades_tables, verify_rows)) {
+                    fmt::print("error: verify failed for {}: {}\n", query.name, *err);
+                    return 1;
+                }
+            }
             status = run_benchmark(query, trades_tables, warmup_iters, iters, saved_include_parse);
             if (status != 0) {
                 break;
@@ -259,6 +794,9 @@ int main(int argc, char** argv) {
         }
         ibex::runtime::TableRegistry multi_tables;
         multi_tables.emplace("prices_multi", std::move(multi_table));
+        if (print_types) {
+            print_table_types("prices_multi", multi_tables.find("prices_multi")->second);
+        }
 
         // ~1008 distinct (symbol, day) groups across 4M rows.
         std::vector<BenchQuery> multi_queries = {
@@ -278,6 +816,12 @@ int main(int argc, char** argv) {
         };
 
         for (const auto& query : multi_queries) {
+            if (verify) {
+                if (auto err = verify_benchmark(query, multi_tables, verify_rows)) {
+                    fmt::print("error: verify failed for {}: {}\n", query.name, *err);
+                    return 1;
+                }
+            }
             status = run_benchmark(query, multi_tables, warmup_iters, iters, saved_include_parse);
             if (status != 0) {
                 break;

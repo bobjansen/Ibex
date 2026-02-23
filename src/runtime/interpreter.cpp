@@ -95,7 +95,11 @@ auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t index) -
             if (src_col == nullptr) {
                 throw std::runtime_error("column type mismatch");
             }
-            dst_col.push_back((*src_col)[index]);
+            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                dst_col.push_code(src_col->code_at(index));
+            } else {
+                dst_col.push_back((*src_col)[index]);
+            }
         },
         out);
 }
@@ -104,6 +108,9 @@ auto make_empty_like(const ColumnValue& src) -> ColumnValue {
     return std::visit(
         [](const auto& col) -> ColumnValue {
             using ColType = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                return Column<Categorical>{col.dictionary_ptr(), col.index_ptr(), {}};
+            }
             return ColType{};
         },
         src);
@@ -261,60 +268,128 @@ auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict__ cp, LitT rv,
 
 // Dispatch column-vs-scalar comparison over all type combinations.
 using LitVal = std::variant<std::int64_t, double, std::string>;
+template <typename T>
+constexpr bool is_string_like_v =
+    std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>;
 auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit, std::size_t n)
     -> std::expected<std::vector<uint8_t>, std::string> {
     std::vector<uint8_t> mask(n);
     uint8_t* mp = mask.data();
-    bool ok = std::visit(
-        [&](const auto& col_data) -> bool {
-            using ColT = typename std::decay_t<decltype(col_data)>::value_type;
-            const ColT* cp = col_data.data();
-            return std::visit(
-                [&](const auto& rv) -> bool {
-                    using LitT = std::decay_t<decltype(rv)>;
-                    if constexpr (std::is_same_v<ColT, std::string> &&
-                                  std::is_same_v<LitT, std::string>) {
-                        // String vs string literal: compare element-wise.
-                        switch (op) {
-                            case ir::CompareOp::Eq:
-                                for (std::size_t i = 0; i < n; ++i)
-                                    mp[i] = cp[i] == rv;
-                                break;
-                            case ir::CompareOp::Ne:
-                                for (std::size_t i = 0; i < n; ++i)
-                                    mp[i] = cp[i] != rv;
-                                break;
-                            case ir::CompareOp::Lt:
-                                for (std::size_t i = 0; i < n; ++i)
-                                    mp[i] = cp[i] < rv;
-                                break;
-                            case ir::CompareOp::Le:
-                                for (std::size_t i = 0; i < n; ++i)
-                                    mp[i] = cp[i] <= rv;
-                                break;
-                            case ir::CompareOp::Gt:
-                                for (std::size_t i = 0; i < n; ++i)
-                                    mp[i] = cp[i] > rv;
-                                break;
-                            case ir::CompareOp::Ge:
-                                for (std::size_t i = 0; i < n; ++i)
-                                    mp[i] = cp[i] >= rv;
-                                break;
-                        }
-                        return true;
-                    } else if constexpr (!std::is_same_v<ColT, std::string> &&
-                                         !std::is_same_v<LitT, std::string>) {
-                        cmp_col_scalar_into(op, cp, rv, mp, n);
-                        return true;
-                    }
-                    return false;
-                },
-                lit);
-        },
-        col);
-    if (!ok)
+    if (const auto* s = std::get_if<std::string>(&lit)) {
+        if (const auto* str_col = std::get_if<Column<std::string>>(&col)) {
+            switch (op) {
+                case ir::CompareOp::Eq:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = std::string_view((*str_col)[i]) == *s;
+                    break;
+                case ir::CompareOp::Ne:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = std::string_view((*str_col)[i]) != *s;
+                    break;
+                case ir::CompareOp::Lt:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = std::string_view((*str_col)[i]) < *s;
+                    break;
+                case ir::CompareOp::Le:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = std::string_view((*str_col)[i]) <= *s;
+                    break;
+                case ir::CompareOp::Gt:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = std::string_view((*str_col)[i]) > *s;
+                    break;
+                case ir::CompareOp::Ge:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = std::string_view((*str_col)[i]) >= *s;
+                    break;
+            }
+            return mask;
+        }
+        if (const auto* cat_col = std::get_if<Column<Categorical>>(&col)) {
+            if (auto code = cat_col->find_code(*s)) {
+                const auto* codes = cat_col->codes().data();
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = codes[i] == *code;
+                        break;
+                    case ir::CompareOp::Ne:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = codes[i] != *code;
+                        break;
+                    case ir::CompareOp::Lt:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = std::string_view((*cat_col)[i]) < *s;
+                        break;
+                    case ir::CompareOp::Le:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = std::string_view((*cat_col)[i]) <= *s;
+                        break;
+                    case ir::CompareOp::Gt:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = std::string_view((*cat_col)[i]) > *s;
+                        break;
+                    case ir::CompareOp::Ge:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = std::string_view((*cat_col)[i]) >= *s;
+                        break;
+                }
+                return mask;
+            }
+            if (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne) {
+                uint8_t v = (op == ir::CompareOp::Ne) ? 1 : 0;
+                std::fill(mp, mp + n, v);
+                return mask;
+            }
+            for (std::size_t i = 0; i < n; ++i) {
+                std::string_view cv = (*cat_col)[i];
+                switch (op) {
+                    case ir::CompareOp::Lt:
+                        mp[i] = cv < *s;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[i] = cv <= *s;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[i] = cv > *s;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[i] = cv >= *s;
+                        break;
+                    default:
+                        mp[i] = 0;
+                        break;
+                }
+            }
+            return mask;
+        }
         return std::unexpected("filter: cannot compare string and numeric");
-    return mask;
+    }
+
+    if (const auto* int_col = std::get_if<Column<std::int64_t>>(&col)) {
+        const std::int64_t* cp = int_col->data();
+        if (const auto* i = std::get_if<std::int64_t>(&lit)) {
+            cmp_col_scalar_into(op, cp, *i, mp, n);
+            return mask;
+        }
+        if (const auto* d = std::get_if<double>(&lit)) {
+            cmp_col_scalar_into(op, cp, *d, mp, n);
+            return mask;
+        }
+    }
+    if (const auto* dbl_col = std::get_if<Column<double>>(&col)) {
+        const double* cp = dbl_col->data();
+        if (const auto* i = std::get_if<std::int64_t>(&lit)) {
+            cmp_col_scalar_into(op, cp, *i, mp, n);
+            return mask;
+        }
+        if (const auto* d = std::get_if<double>(&lit)) {
+            cmp_col_scalar_into(op, cp, *d, mp, n);
+            return mask;
+        }
+    }
+
+    return std::unexpected("filter: cannot compare string and numeric");
 }
 
 // Element-wise comparison between two full columns.
@@ -375,35 +450,81 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
             return mask;
         }
     }
+    auto cmp_string_views = [&](auto&& lcol, auto&& rcol) -> std::vector<uint8_t> {
+        switch (op) {
+            case ir::CompareOp::Eq:
+                for (std::size_t i = 0; i < n; ++i)
+                    mp[i] = std::string_view(lcol[i]) == std::string_view(rcol[i]);
+                break;
+            case ir::CompareOp::Ne:
+                for (std::size_t i = 0; i < n; ++i)
+                    mp[i] = std::string_view(lcol[i]) != std::string_view(rcol[i]);
+                break;
+            case ir::CompareOp::Lt:
+                for (std::size_t i = 0; i < n; ++i)
+                    mp[i] = std::string_view(lcol[i]) < std::string_view(rcol[i]);
+                break;
+            case ir::CompareOp::Le:
+                for (std::size_t i = 0; i < n; ++i)
+                    mp[i] = std::string_view(lcol[i]) <= std::string_view(rcol[i]);
+                break;
+            case ir::CompareOp::Gt:
+                for (std::size_t i = 0; i < n; ++i)
+                    mp[i] = std::string_view(lcol[i]) > std::string_view(rcol[i]);
+                break;
+            case ir::CompareOp::Ge:
+                for (std::size_t i = 0; i < n; ++i)
+                    mp[i] = std::string_view(lcol[i]) >= std::string_view(rcol[i]);
+                break;
+        }
+        return mask;
+    };
+
     if (const auto* l = std::get_if<Column<std::string>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::string>>(&rhs)) {
-            switch (op) {
-                case ir::CompareOp::Eq:
-                    for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = l->data()[i] == r->data()[i];
-                    break;
-                case ir::CompareOp::Ne:
-                    for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = l->data()[i] != r->data()[i];
-                    break;
-                case ir::CompareOp::Lt:
-                    for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = l->data()[i] < r->data()[i];
-                    break;
-                case ir::CompareOp::Le:
-                    for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = l->data()[i] <= r->data()[i];
-                    break;
-                case ir::CompareOp::Gt:
-                    for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = l->data()[i] > r->data()[i];
-                    break;
-                case ir::CompareOp::Ge:
-                    for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = l->data()[i] >= r->data()[i];
-                    break;
+            return cmp_string_views(*l, *r);
+        }
+        if (const auto* r = std::get_if<Column<Categorical>>(&rhs)) {
+            return cmp_string_views(*l, *r);
+        }
+    }
+    if (const auto* l = std::get_if<Column<Categorical>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<Categorical>>(&rhs)) {
+            if (l->dictionary_ptr() == r->dictionary_ptr()) {
+                const auto* lc = l->codes().data();
+                const auto* rc = r->codes().data();
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = lc[i] == rc[i];
+                        break;
+                    case ir::CompareOp::Ne:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = lc[i] != rc[i];
+                        break;
+                    case ir::CompareOp::Lt:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = lc[i] < rc[i];
+                        break;
+                    case ir::CompareOp::Le:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = lc[i] <= rc[i];
+                        break;
+                    case ir::CompareOp::Gt:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = lc[i] > rc[i];
+                        break;
+                    case ir::CompareOp::Ge:
+                        for (std::size_t i = 0; i < n; ++i)
+                            mp[i] = lc[i] >= rc[i];
+                        break;
+                }
+                return mask;
             }
-            return mask;
+            return cmp_string_views(*l, *r);
+        }
+        if (const auto* r = std::get_if<Column<std::string>>(&rhs)) {
+            return cmp_string_views(*l, *r);
         }
     }
     return std::unexpected("filter: incompatible column types in comparison");
@@ -576,16 +697,25 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
         std::visit(
             [&](const auto& src) {
                 using ColT = std::decay_t<decltype(src)>;
-                using T = typename ColT::value_type;
                 auto* dst = std::get_if<ColT>(dst_entry.column.get());
                 if (dst == nullptr) {
                     throw std::runtime_error("filter: column type mismatch");
                 }
-                dst->resize(out_n);
-                const T* sp = src.data();
-                T* dp = dst->data();
-                for (std::size_t j = 0; j < out_n; ++j) {
-                    dp[j] = sp[selected[j]];
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    dst->resize(out_n);
+                    const auto* sp = src.codes_data();
+                    auto* dp = dst->codes_data();
+                    for (std::size_t j = 0; j < out_n; ++j) {
+                        dp[j] = sp[selected[j]];
+                    }
+                } else {
+                    using T = typename ColT::value_type;
+                    dst->resize(out_n);
+                    const T* sp = src.data();
+                    T* dp = dst->data();
+                    for (std::size_t j = 0; j < out_n; ++j) {
+                        dp[j] = sp[selected[j]];
+                    }
                 }
             },
             *src_entry.column);
@@ -695,7 +825,26 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
 }
 
 auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarValue {
-    return std::visit([&](const auto& col) -> ScalarValue { return col[row]; }, column);
+    return std::visit(
+        [&](const auto& col) -> ScalarValue {
+            using ColType = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                return std::string(col[row]);
+            } else {
+                return col[row];
+            }
+        },
+        column);
+}
+
+auto string_view_at(const ColumnValue& column, std::size_t row) -> std::string_view {
+    if (const auto* str_col = std::get_if<Column<std::string>>(&column)) {
+        return (*str_col)[row];
+    }
+    if (const auto* cat_col = std::get_if<Column<Categorical>>(&column)) {
+        return (*cat_col)[row];
+    }
+    return std::string_view{};
 }
 
 auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
@@ -787,8 +936,8 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                     return col.ascending ? (lv < rv) : (lv > rv);
                 }
                 case ExprType::String: {
-                    const auto& lv = std::get<Column<std::string>>(*col.column)[lhs];
-                    const auto& rv = std::get<Column<std::string>>(*col.column)[rhs];
+                    auto lv = string_view_at(*col.column, lhs);
+                    auto rv = string_view_at(*col.column, rhs);
                     if (lv == rv) {
                         break;
                     }
@@ -840,6 +989,12 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                     throw std::runtime_error("type mismatch");
                 }
             } else if constexpr (std::is_same_v<ValueType, std::string>) {
+                if (const auto* str_value = std::get_if<std::string>(&value)) {
+                    col.push_back(*str_value);
+                } else {
+                    throw std::runtime_error("type mismatch");
+                }
+            } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
                 if (const auto* str_value = std::get_if<std::string>(&value)) {
                     col.push_back(*str_value);
                 } else {
@@ -1260,6 +1415,16 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         group_columns.push_back(column);
     }
 
+    std::vector<const Column<Categorical>*> group_cats;
+    group_cats.reserve(group_columns.size());
+    for (const auto* col : group_columns) {
+        if (const auto* cat = std::get_if<Column<Categorical>>(col)) {
+            group_cats.push_back(cat);
+        } else {
+            group_cats.push_back(nullptr);
+        }
+    }
+
     std::vector<const ColumnValue*> agg_columns;
     agg_columns.reserve(aggregations.size());
     for (const auto& agg : aggregations) {
@@ -1281,6 +1446,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         const Column<std::int64_t>* int_col = nullptr;
         const Column<double>* dbl_col = nullptr;
         const Column<std::string>* str_col = nullptr;
+        const Column<Categorical>* cat_col = nullptr;
     };
 
     std::vector<AggPlanItem> plan;
@@ -1300,6 +1466,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 item.dbl_col = dbl_col;
             } else if (const auto* str_col = std::get_if<Column<std::string>>(agg_columns[i])) {
                 item.str_col = str_col;
+            } else if (const auto* cat_col = std::get_if<Column<Categorical>>(agg_columns[i])) {
+                item.cat_col = cat_col;
             }
         }
 
@@ -1529,12 +1697,18 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
     auto build_output = [&]() -> std::expected<Table, std::string> {
         Table output;
-        for (const auto& key : group_by) {
-            const auto* column = input.find(key.name);
+        for (std::size_t i = 0; i < group_by.size(); ++i) {
+            const auto* column = input.find(group_by[i].name);
             if (column == nullptr) {
-                return std::unexpected("group-by column not found: " + key.name);
+                return std::unexpected("group-by column not found: " + group_by[i].name);
             }
-            output.add_column(key.name, make_empty_like(*column));
+            if (group_cats[i] != nullptr) {
+                output.add_column(group_by[i].name,
+                                  Column<Categorical>(group_cats[i]->dictionary_ptr(),
+                                                      group_cats[i]->index_ptr(), {}));
+            } else {
+                output.add_column(group_by[i].name, make_empty_like(*column));
+            }
         }
         for (const auto& agg : aggregations) {
             ColumnValue column;
@@ -1629,23 +1803,24 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     std::size_t rows = input.rows();
     if (group_by.size() == 1) {
         const ColumnValue& key_column = *group_columns.front();
-        if (std::holds_alternative<Column<std::string>>(key_column)) {
-            const auto& col = std::get<Column<std::string>>(key_column);
+        if (group_cats.front() != nullptr) {
+            const auto& col = *group_cats.front();
+            const auto* codes = col.codes_data();
 
             // Pass 1: Assign group IDs. One hash lookup per row, with a sorted-run shortcut
             // that skips the lookup whenever the current key equals the previous one.
-            robin_hood::unordered_flat_map<std::string_view, std::uint32_t> key_to_id;
+            robin_hood::unordered_flat_map<Column<Categorical>::code_type, std::uint32_t> key_to_id;
             key_to_id.reserve(64);
-            std::vector<std::string_view> order;
+            std::vector<Column<Categorical>::code_type> order;
             order.reserve(64);
             std::vector<AggState> states;
             states.reserve(64);
             std::vector<std::uint32_t> group_ids(rows);
             {
-                std::string_view prev_key;
+                Column<Categorical>::code_type prev_key = -1;
                 std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
                 for (std::size_t row = 0; row < rows; ++row) {
-                    std::string_view key{col[row]};
+                    auto key = codes[row];
                     std::uint32_t gid;
                     if (key == prev_key) {
                         gid = prev_gid;
@@ -1728,6 +1903,19 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             states[g].slots[agg_i].first_value = std::move(acc[g]);
                             states[g].slots[agg_i].has_value = true;
                         }
+                    } else if (item.cat_col != nullptr) {
+                        std::vector<std::string> acc(n_groups);
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            std::uint32_t g = gids[row];
+                            if (!found[g]) {
+                                acc[g] = std::string((*item.cat_col)[row]);
+                                found[g] = true;
+                            }
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].first_value = std::move(acc[g]);
+                            states[g].slots[agg_i].has_value = true;
+                        }
                     }
                     continue;
                 }
@@ -1756,6 +1944,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<std::string> acc(n_groups);
                         for (std::size_t row = 0; row < rows; ++row) {
                             acc[gids[row]] = (*item.str_col)[row];
+                        }
+                        for (std::uint32_t g = 0; g < n_groups; ++g) {
+                            states[g].slots[agg_i].last_value = std::move(acc[g]);
+                            states[g].slots[agg_i].has_value = true;
+                        }
+                    } else if (item.cat_col != nullptr) {
+                        std::vector<std::string> acc(n_groups);
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            acc[gids[row]] = std::string((*item.cat_col)[row]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
                             states[g].slots[agg_i].last_value = std::move(acc[g]);
@@ -1894,12 +2091,66 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (!output.has_value()) {
                 return std::unexpected(output.error());
             }
+            if (auto* out_col = output->find(group_by.front().name);
+                out_col != nullptr && std::holds_alternative<Column<Categorical>>(*out_col)) {
+                auto& out_cat = std::get<Column<Categorical>>(*out_col);
+                out_cat.reserve(order.size());
+                for (auto code : order) {
+                    out_cat.push_code(code);
+                }
+            } else {
+                for (std::size_t i = 0; i < order.size(); ++i) {
+                    auto* column = output->find(group_by.front().name);
+                    if (column == nullptr) {
+                        return std::unexpected("missing group-by column in output");
+                    }
+                    append_scalar(
+                        *column, std::string(col.dictionary()[static_cast<std::size_t>(order[i])]));
+                }
+            }
+            for (std::size_t i = 0; i < order.size(); ++i) {
+                if (auto err = append_agg_values(*output, states[i])) {
+                    return std::unexpected(*err);
+                }
+            }
+            return output;
+        }
+        if (std::holds_alternative<Column<Categorical>>(key_column)) {
+            const auto& col = std::get<Column<Categorical>>(key_column);
+            robin_hood::unordered_flat_map<Column<Categorical>::code_type, std::size_t> index;
+            index.reserve(rows);
+            std::vector<Column<Categorical>::code_type> order;
+            order.reserve(rows);
+            std::vector<AggState> states;
+            states.reserve(rows);
+            for (std::size_t row = 0; row < rows; ++row) {
+                auto key = col.code_at(row);
+                auto it = index.find(key);
+                std::size_t slot_index = 0;
+                if (it == index.end()) {
+                    slot_index = states.size();
+                    index.emplace(key, slot_index);
+                    order.push_back(key);
+                    states.push_back(make_state());
+                } else {
+                    slot_index = it->second;
+                }
+                if (auto err = (numeric_only ? update_state_numeric(states[slot_index], row)
+                                             : update_state(states[slot_index], row))) {
+                    return std::unexpected(*err);
+                }
+            }
+            auto output = build_output();
+            if (!output.has_value()) {
+                return std::unexpected(output.error());
+            }
             for (std::size_t i = 0; i < order.size(); ++i) {
                 auto* column = output->find(group_by.front().name);
                 if (column == nullptr) {
                     return std::unexpected("missing group-by column in output");
                 }
-                append_scalar(*column, std::string(order[i]));
+                const auto& dict = col.dictionary();
+                append_scalar(*column, dict[static_cast<std::size_t>(order[i])]);
                 if (auto err = append_agg_values(*output, states[i])) {
                     return std::unexpected(*err);
                 }
@@ -2014,8 +2265,20 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         cc.codes.resize(rows);
         std::visit(
             [&](const auto& col) {
-                using T = typename std::decay_t<decltype(col)>::value_type;
-                if constexpr (std::is_same_v<T, std::string>) {
+                using ColType = std::decay_t<decltype(col)>;
+                using T = typename ColType::value_type;
+                if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                    const auto& dict = col.dictionary();
+                    cc.n_distinct = static_cast<std::uint32_t>(dict.size());
+                    cc.vals.reserve(dict.size());
+                    for (const auto& entry : dict) {
+                        cc.vals.emplace_back(entry);
+                    }
+                    const auto* codes = col.codes_data();
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        cc.codes[row] = static_cast<std::uint32_t>(codes[row]);
+                    }
+                } else if constexpr (is_string_like_v<T>) {
                     robin_hood::unordered_flat_map<std::string_view, std::uint32_t> map;
                     map.reserve(64);
                     std::string_view prev_key;
@@ -2030,7 +2293,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             if (it == map.end()) {
                                 code = cc.n_distinct++;
                                 map.emplace(key, code);
-                                cc.vals.emplace_back(std::string(col[row]));
+                                cc.vals.emplace_back(std::string(key));
                             } else {
                                 code = it->second;
                             }
@@ -2178,6 +2441,19 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     states[g].slots[agg_i].first_value = std::move(acc[g]);
                     states[g].slots[agg_i].has_value = true;
                 }
+            } else if (item.cat_col != nullptr) {
+                std::vector<std::string> acc(n_groups_m);
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::uint32_t g = gids[row];
+                    if (!found[g]) {
+                        acc[g] = std::string((*item.cat_col)[row]);
+                        found[g] = true;
+                    }
+                }
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].first_value = std::move(acc[g]);
+                    states[g].slots[agg_i].has_value = true;
+                }
             }
             continue;
         }
@@ -2204,6 +2480,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::vector<std::string> acc(n_groups_m);
                 for (std::size_t row = 0; row < rows; ++row)
                     acc[gids[row]] = (*item.str_col)[row];
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].last_value = std::move(acc[g]);
+                    states[g].slots[agg_i].has_value = true;
+                }
+            } else if (item.cat_col != nullptr) {
+                std::vector<std::string> acc(n_groups_m);
+                for (std::size_t row = 0; row < rows; ++row)
+                    acc[gids[row]] = std::string((*item.cat_col)[row]);
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
                     states[g].slots[agg_i].last_value = std::move(acc[g]);
                     states[g].slots[agg_i].has_value = true;
@@ -2342,7 +2626,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (column == nullptr) {
                 return std::unexpected("missing group-by column in output");
             }
-            append_scalar(*column, per_col[ci].vals[gc[ci]]);
+            if (group_cats[ci] != nullptr && std::holds_alternative<Column<Categorical>>(*column)) {
+                auto& out_cat = std::get<Column<Categorical>>(*column);
+                out_cat.push_code(static_cast<Column<Categorical>::code_type>(gc[ci]));
+            } else {
+                append_scalar(*column, per_col[ci].vals[gc[ci]]);
+            }
         }
         if (auto err = append_agg_values(*output, states[g])) {
             return std::unexpected(*err);
@@ -2445,7 +2734,16 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             return std::unexpected("unknown column in expression: " + col->name +
                                    " (available: " + format_columns(input) + ")");
         }
-        return std::visit([&](const auto& column) -> ExprValue { return column[row]; }, *source);
+        return std::visit(
+            [&](const auto& column) -> ExprValue {
+                using ColType = std::decay_t<decltype(column)>;
+                if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                    return std::string(column[row]);
+                } else {
+                    return column[row];
+                }
+            },
+            *source);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         return lit->value;

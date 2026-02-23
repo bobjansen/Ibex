@@ -8,13 +8,16 @@
 #include <ibex/core/column.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <rapidcsv.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -42,6 +45,8 @@ inline auto read_csv(std::string_view path) -> ibex::runtime::Table {
 
     auto col_names = doc.GetColumnNames();
     ibex::runtime::Table table;
+    constexpr std::size_t kMaxCategoricalUniques = 4096;
+    constexpr double kMaxCategoricalRatio = 0.05;
 
     for (const auto& name : col_names) {
         std::vector<std::string> vals = doc.GetColumn<std::string>(name);
@@ -88,7 +93,41 @@ inline auto read_csv(std::string_view path) -> ibex::runtime::Table {
             continue;
         }
 
-        // String fallback
+        // String fallback (with categorical detection)
+        const std::size_t n = vals.size();
+        if (n > 0) {
+            const std::size_t ratio_limit = std::max<std::size_t>(
+                1, static_cast<std::size_t>(static_cast<double>(n) * kMaxCategoricalRatio));
+            const std::size_t max_uniques = std::min(kMaxCategoricalUniques, ratio_limit);
+            std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
+            codes.reserve(n);
+            std::vector<std::string> dict;
+            dict.reserve(std::min(n, max_uniques));
+            std::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type> index;
+            index.reserve(std::min(n, max_uniques));
+            bool ok = true;
+            for (const auto& v : vals) {
+                std::string_view key{v};
+                auto it = index.find(key);
+                if (it != index.end()) {
+                    codes.push_back(it->second);
+                    continue;
+                }
+                if (index.size() + 1 > max_uniques) {
+                    ok = false;
+                    break;
+                }
+                auto code = static_cast<ibex::Column<ibex::Categorical>::code_type>(dict.size());
+                dict.push_back(v);
+                index.emplace(dict.back(), code);
+                codes.push_back(code);
+            }
+            if (ok) {
+                table.add_column(
+                    name, ibex::Column<ibex::Categorical>(std::move(dict), std::move(codes)));
+                continue;
+            }
+        }
         table.add_column(name, ibex::Column<std::string>(std::move(vals)));
     }
 

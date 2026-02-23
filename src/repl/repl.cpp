@@ -179,6 +179,9 @@ std::string column_type_name(const runtime::ColumnValue& column) {
     if (std::holds_alternative<Column<std::string>>(column)) {
         return "String";
     }
+    if (std::holds_alternative<Column<Categorical>>(column)) {
+        return "Categorical";
+    }
     return "Unknown";
 }
 

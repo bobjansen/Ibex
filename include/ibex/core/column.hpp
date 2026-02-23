@@ -2,7 +2,12 @@
 
 #include <algorithm>
 #include <concepts>
+#include <memory>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace ibex {
@@ -11,15 +16,21 @@ namespace ibex {
 template <typename T>
 concept ColumnElement = std::regular<T> && std::totally_ordered<T>;
 
+/// Tag type for dictionary-encoded categorical columns.
+struct Categorical {};
+
 /// A typed, owning columnar storage container.
 ///
 /// Column<T> owns a contiguous vector of homogeneously typed values
 /// and exposes span-based access for zero-copy interop.
-template <ColumnElement T>
+template <typename T>
 class Column {
    public:
     using value_type = T;
     using size_type = std::size_t;
+
+    static_assert(ColumnElement<T>,
+                  "Column<T> requires T to satisfy ColumnElement (regular + totally ordered).");
 
     Column() = default;
 
@@ -193,6 +204,118 @@ class Column {
 
    private:
     std::vector<T> data_;
+};
+
+/// Specialization for categorical columns (dictionary-encoded strings).
+template <>
+class Column<Categorical> {
+   public:
+    using value_type = std::string_view;
+    using size_type = std::size_t;
+    using code_type = std::int32_t;
+
+    Column()
+        : dict_(std::make_shared<std::vector<std::string>>()),
+          index_(std::make_shared<std::unordered_map<std::string, code_type>>()) {}
+
+    explicit Column(std::vector<std::string> dict)
+        : dict_(std::make_shared<std::vector<std::string>>(std::move(dict))),
+          index_(std::make_shared<std::unordered_map<std::string, code_type>>()) {
+        rebuild_index();
+    }
+
+    Column(std::vector<std::string> dict, std::vector<code_type> codes)
+        : dict_(std::make_shared<std::vector<std::string>>(std::move(dict))),
+          index_(std::make_shared<std::unordered_map<std::string, code_type>>()),
+          codes_(std::move(codes)) {
+        rebuild_index();
+    }
+
+    Column(std::shared_ptr<std::vector<std::string>> dict,
+           std::shared_ptr<std::unordered_map<std::string, code_type>> index,
+           std::vector<code_type> codes = {})
+        : dict_(std::move(dict)), index_(std::move(index)), codes_(std::move(codes)) {}
+
+    [[nodiscard]] auto size() const noexcept -> size_type { return codes_.size(); }
+    [[nodiscard]] auto empty() const noexcept -> bool { return codes_.empty(); }
+
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> value_type {
+        if (dict_ == nullptr || dict_->empty()) {
+            return std::string_view{};
+        }
+        return (*dict_)[static_cast<std::size_t>(codes_[idx])];
+    }
+
+    [[nodiscard]] auto code_at(size_type idx) const noexcept -> code_type { return codes_[idx]; }
+
+    void push_code(code_type code) { codes_.push_back(code); }
+
+    void push_back(value_type value) {
+        auto code = find_or_insert(value);
+        codes_.push_back(code);
+    }
+
+    void reserve(size_type capacity) { codes_.reserve(capacity); }
+    void clear() noexcept { codes_.clear(); }
+
+    void resize(size_type count) { codes_.resize(count, 0); }
+
+    [[nodiscard]] auto dictionary() const noexcept -> const std::vector<std::string>& {
+        return *dict_;
+    }
+
+    [[nodiscard]] auto dictionary_ptr() const noexcept
+        -> const std::shared_ptr<std::vector<std::string>>& {
+        return dict_;
+    }
+
+    [[nodiscard]] auto index_ptr() const noexcept
+        -> const std::shared_ptr<std::unordered_map<std::string, code_type>>& {
+        return index_;
+    }
+
+    [[nodiscard]] auto codes() const noexcept -> const std::vector<code_type>& { return codes_; }
+
+    [[nodiscard]] auto codes_data() noexcept -> code_type* { return codes_.data(); }
+    [[nodiscard]] auto codes_data() const noexcept -> const code_type* { return codes_.data(); }
+
+    [[nodiscard]] auto find_code(value_type value) const -> std::optional<code_type> {
+        if (index_ == nullptr) {
+            return std::nullopt;
+        }
+        auto it = index_->find(std::string(value));
+        if (it == index_->end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+   private:
+    void rebuild_index() {
+        index_->clear();
+        index_->reserve(dict_->size());
+        for (std::size_t i = 0; i < dict_->size(); ++i) {
+            index_->emplace((*dict_)[i], static_cast<code_type>(i));
+        }
+    }
+
+    auto find_or_insert(value_type value) -> code_type {
+        if (index_ == nullptr) {
+            index_ = std::make_shared<std::unordered_map<std::string, code_type>>();
+        }
+        auto it = index_->find(std::string(value));
+        if (it != index_->end()) {
+            return it->second;
+        }
+        code_type code = static_cast<code_type>(dict_->size());
+        dict_->emplace_back(value);
+        index_->emplace(dict_->back(), code);
+        return code;
+    }
+
+    std::shared_ptr<std::vector<std::string>> dict_;
+    std::shared_ptr<std::unordered_map<std::string, code_type>> index_;
+    std::vector<code_type> codes_;
 };
 
 }  // namespace ibex

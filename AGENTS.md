@@ -34,6 +34,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 ## Benchmarking Notes
 - For mutating benchmarks (e.g., `data.table` updates), exclude input-copy cost from timing by preparing copies outside the timed section.
 - Built-ins should remain minimal; prefer `extern fn` hooks for functionality implemented in C++
+- Workflow: when loading string columns (CSV/parquet), auto-detect categorical encoding where possible.
 
 ## Recent REPL Features
 - `:schema`, `:head`, `:describe`, `:scalars`, `:tables`, `:load <file>`

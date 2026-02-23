@@ -40,6 +40,8 @@ auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::stri
             using T = typename std::decay_t<decltype(c)>::value_type;
             if constexpr (std::is_same_v<T, std::string>) {
                 return c[row];
+            } else if constexpr (std::is_same_v<T, std::string_view>) {
+                return std::string(c[row]);
             } else if constexpr (std::is_same_v<T, double>) {
                 double v = c[row];
                 if (std::isnan(v))

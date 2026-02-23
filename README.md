@@ -27,21 +27,29 @@ Aggregation benchmarks on 4 M rows (`prices.csv`, 252 symbols).
 Release build (`-O2`), 5 iterations, 1 warmup, WSL2 / clang++.
 
 ```
-query               |     ibex |   polars |   pandas | data.table |    dplyr
---------------------+----------+----------+----------+------------+---------
-mean by symbol      |  50.1 ms |  31.8 ms | 180.9 ms |    26.2 ms |  60.0 ms
-OHLC by symbol      |  54.9 ms |  29.6 ms | 198.0 ms |    23.8 ms |  52.2 ms
-update price×2      |  3.10 ms |  3.15 ms |  4.53 ms |    16.2 ms |  6.80 ms
-count by symbol×day |  90.3 ms |  51.5 ms | 333.6 ms |    28.0 ms |  92.0 ms
-mean by symbol×day  |  89.5 ms |  53.5 ms | 329.0 ms |    31.4 ms | 131.8 ms
-OHLC by symbol×day  |  98.0 ms |  55.2 ms | 343.9 ms |    33.6 ms | 126.6 ms
-filter simple       |  53.9 ms |  7.62 ms |  23.7 ms |    30.2 ms |  25.4 ms
-filter AND          |  22.3 ms |  4.34 ms |  16.8 ms |    29.2 ms |  35.8 ms
-filter arith        |  50.2 ms |  7.65 ms |  37.0 ms |    35.4 ms |  31.4 ms
-filter OR           |  23.0 ms |  4.81 ms |  14.1 ms |    26.4 ms |  30.8 ms
+query               |     ibex |  polars |   pandas | data.table |    dplyr
+--------------------+----------+---------+----------+------------+---------
+mean by symbol      |  28.4 ms | 40.1 ms | 180.7 ms |    36.0 ms |  70.6 ms
+OHLC by symbol      |  34.9 ms | 48.0 ms | 248.7 ms |    34.6 ms |  56.4 ms
+update price×2      |  3.27 ms | 3.33 ms |  5.01 ms |    18.8 ms |  7.20 ms
+count by symbol×day |  12.6 ms | 66.2 ms | 328.3 ms |    43.8 ms | 101.6 ms
+mean by symbol×day  |  14.0 ms | 76.8 ms | 367.4 ms |    32.2 ms | 155.0 ms
+OHLC by symbol×day  |  20.6 ms | 73.9 ms | 400.0 ms |    30.2 ms | 160.8 ms
+filter simple       |  19.5 ms | 8.40 ms |  30.7 ms |    29.6 ms |  32.0 ms
+filter AND          |  10.5 ms | 5.48 ms |  23.1 ms |    30.0 ms |  46.4 ms
+filter arith        |  21.1 ms | 10.9 ms |  47.8 ms |    35.8 ms |  42.4 ms
+filter OR           |  11.1 ms | 7.33 ms |  16.3 ms |    26.2 ms |  35.4 ms
 ```
 
-Compiled code speed is comparable to interpreted in these benchmarks and parsing overhead is negligble.
+## Speedup over ibex (geometric mean across available queries)
+
+- polars: ibex is 1.3× faster than polars  (over 10 queries)
+- pandas: ibex is 5.0× faster than pandas  (over 10 queries)
+- data.table: ibex is 2.1× faster than data.table  (over 10 queries)
+- dplyr: ibex is 3.5× faster than dplyr  (over 10 queries)
+
+Compiled code speed is comparable to interpreted in these benchmarks and
+parsing overhead is negligble.
 
 **ibex vs. others (geometric mean):** 3.1× faster than pandas, on par with dplyr,
 2.3× slower than polars, 3.5× slower than data.table.

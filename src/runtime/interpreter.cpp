@@ -1941,104 +1941,361 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
     }
 
-    // Multi-column GROUP BY: reuse a single Key vector across rows (no per-row
-    // heap allocation), reserve a sensible up-front capacity rather than rows,
-    // and use a robin_hood flat map (Key → AggState) so the map stays in L2.
+    // Multi-column GROUP BY: 2-pass integer-coding (mirrors the single-key string path).
     //
-    // Precompute typed column pointers so the hot loop uses direct typed access
-    // instead of a ColumnValue variant dispatch (std::visit) per row × column.
-    enum class ColKind : std::uint8_t { Int, Double, Str };
-    struct ColPtr {
-        ColKind kind;
-        union {
-            const std::int64_t* int_ptr;
-            const double* dbl_ptr;
-            const Column<std::string>* str_ptr;
-        };
+    // Pass 1a: per-column code assignment — one hash-map lookup per row per column,
+    //          each on a small per-column map. No heap allocation per row.
+    // Pass 1b: compound group ID assignment. Cartesian encoding (code0*n1 + code1 + …)
+    //          produces a unique uint64_t per combination; flat array lookup when the
+    //          total Cartesian cells ≤ 4M, otherwise a robin_hood<uint64_t> map.
+    // Pass 2:  Per-aggregation scatter-accumulate into flat AggState[] indexed by gid
+    //          — same pattern as the single-key string path.
+    const std::size_t n_keys = group_columns.size();
+
+    // ── Pass 1a: per-column uint32_t code arrays ─────────────────────────────
+    struct ColCodes {
+        std::vector<std::uint32_t> codes;  // codes[row]
+        std::uint32_t n_distinct{0};
+        std::vector<ScalarValue> vals;  // distinct values in insertion order
     };
-    std::vector<ColPtr> col_ptrs(group_columns.size());
-    for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+    std::vector<ColCodes> per_col(n_keys);
+
+    for (std::size_t ci = 0; ci < n_keys; ++ci) {
+        ColCodes& cc = per_col[ci];
+        cc.codes.resize(rows);
         std::visit(
             [&](const auto& col) {
                 using T = typename std::decay_t<decltype(col)>::value_type;
-                if constexpr (std::is_same_v<T, std::int64_t>) {
-                    col_ptrs[ci] = {ColKind::Int, {}};
-                    col_ptrs[ci].int_ptr = col.data();
-                } else if constexpr (std::is_same_v<T, double>) {
-                    col_ptrs[ci] = {ColKind::Double, {}};
-                    col_ptrs[ci].dbl_ptr = col.data();
+                if constexpr (std::is_same_v<T, std::string>) {
+                    robin_hood::unordered_flat_map<std::string_view, std::uint32_t> map;
+                    map.reserve(64);
+                    std::string_view prev_key;
+                    std::uint32_t prev_code = std::numeric_limits<std::uint32_t>::max();
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::string_view key{col[row]};
+                        std::uint32_t code;
+                        if (key == prev_key) {
+                            code = prev_code;
+                        } else {
+                            auto it = map.find(key);
+                            if (it == map.end()) {
+                                code = cc.n_distinct++;
+                                map.emplace(key, code);
+                                cc.vals.emplace_back(std::string(col[row]));
+                            } else {
+                                code = it->second;
+                            }
+                            prev_key = key;
+                            prev_code = code;
+                        }
+                        cc.codes[row] = code;
+                    }
                 } else {
-                    col_ptrs[ci] = {ColKind::Str, {}};
-                    col_ptrs[ci].str_ptr = &col;
+                    robin_hood::unordered_flat_map<T, std::uint32_t> map;
+                    map.reserve(64);
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        T key = col[row];
+                        auto it = map.find(key);
+                        std::uint32_t code;
+                        if (it == map.end()) {
+                            code = cc.n_distinct++;
+                            map.emplace(key, code);
+                            cc.vals.emplace_back(key);
+                        } else {
+                            code = it->second;
+                        }
+                        cc.codes[row] = code;
+                    }
                 }
             },
             *group_columns[ci]);
     }
 
-    // Pre-initialise reuse_key slots to the correct variant alternative so the
-    // hot loop can use std::get<T> assignment (in-place overwrite, no
-    // destroy+construct) instead of emplace<T>.
-    robin_hood::unordered_flat_map<Key, AggState, KeyHash, KeyEq> groups;
-    std::vector<Key> order;
-    groups.reserve(1024);
-    order.reserve(1024);
-    Key reuse_key;
-    reuse_key.values.resize(group_columns.size());
-    for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-        switch (col_ptrs[ci].kind) {
-            case ColKind::Int:
-                reuse_key.values[ci].emplace<std::int64_t>();
-                break;
-            case ColKind::Double:
-                reuse_key.values[ci].emplace<double>();
-                break;
-            case ColKind::Str:
-                reuse_key.values[ci].emplace<std::string>();
-                break;
+    // ── Pass 1b: compound group ID assignment ────────────────────────────────
+    // Cartesian strides: cell = code[0]*strides[0] + code[1]*strides[1] + …
+    std::vector<std::uint64_t> strides(n_keys);
+    std::uint64_t total_cells = 1;
+    {
+        std::uint64_t s = 1;
+        for (int ci = static_cast<int>(n_keys) - 1; ci >= 0; --ci) {
+            strides[static_cast<std::size_t>(ci)] = s;
+            s *= per_col[static_cast<std::size_t>(ci)]
+                     .n_distinct;  // uint64_t; wraps only at 2^64 distinct groups
+        }
+        total_cells = s;
+    }
+
+    std::vector<std::uint32_t> compound_gids(rows);
+    std::vector<AggState> states;
+    // group_col_codes_flat[g*n_keys + ci] = per-column code for group g
+    std::vector<std::uint32_t> group_col_codes_flat;
+    std::uint32_t n_groups_m = 0;
+
+    if (total_cells <= 4'000'000ULL) {
+        // Fast path: plain array lookup — no hashing at all in the hot loop.
+        std::vector<std::uint32_t> cell_to_gid(static_cast<std::size_t>(total_cells),
+                                               std::numeric_limits<std::uint32_t>::max());
+        states.reserve(256);
+        group_col_codes_flat.reserve(256 * n_keys);
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::uint32_t cell = 0;
+            for (std::size_t ci = 0; ci < n_keys; ++ci)
+                cell += per_col[ci].codes[row] * static_cast<std::uint32_t>(strides[ci]);
+            std::uint32_t gid = cell_to_gid[cell];
+            if (gid == std::numeric_limits<std::uint32_t>::max()) {
+                gid = n_groups_m++;
+                cell_to_gid[cell] = gid;
+                states.push_back(make_state());
+                for (std::size_t ci = 0; ci < n_keys; ++ci)
+                    group_col_codes_flat.push_back(per_col[ci].codes[row]);
+            }
+            compound_gids[row] = gid;
+        }
+    } else {
+        // Fallback: hash map on the uint64_t Cartesian cell key.
+        robin_hood::unordered_flat_map<std::uint64_t, std::uint32_t> cell_to_gid;
+        cell_to_gid.reserve(1024);
+        states.reserve(1024);
+        group_col_codes_flat.reserve(1024 * n_keys);
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::uint64_t cell = 0;
+            for (std::size_t ci = 0; ci < n_keys; ++ci)
+                cell += static_cast<std::uint64_t>(per_col[ci].codes[row]) * strides[ci];
+            auto [it, inserted] = cell_to_gid.emplace(cell, n_groups_m);
+            if (inserted) {
+                ++n_groups_m;
+                states.push_back(make_state());
+                for (std::size_t ci = 0; ci < n_keys; ++ci)
+                    group_col_codes_flat.push_back(per_col[ci].codes[row]);
+            }
+            compound_gids[row] = it->second;
         }
     }
-    for (std::size_t row = 0; row < rows; ++row) {
-        for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-            const ColPtr& cp = col_ptrs[ci];
-            switch (cp.kind) {
-                case ColKind::Int:
-                    std::get<std::int64_t>(reuse_key.values[ci]) = cp.int_ptr[row];
+
+    const std::uint32_t* gids = compound_gids.data();
+
+    // ── Pass 2: per-aggregation scatter-accumulate into flat AggState[] ──────
+    for (std::size_t agg_i = 0; agg_i < plan.size(); ++agg_i) {
+        const auto& item = plan[agg_i];
+
+        if (item.func == ir::AggFunc::Count) {
+            std::vector<std::int64_t> acc(n_groups_m, 0);
+            for (std::size_t row = 0; row < rows; ++row)
+                acc[gids[row]]++;
+            for (std::uint32_t g = 0; g < n_groups_m; ++g)
+                states[g].slots[agg_i].count = acc[g];
+            continue;
+        }
+
+        if (item.func == ir::AggFunc::First) {
+            std::vector<bool> found(n_groups_m, false);
+            if (item.int_col != nullptr) {
+                std::vector<std::int64_t> acc(n_groups_m, 0);
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::uint32_t g = gids[row];
+                    if (!found[g]) {
+                        acc[g] = (*item.int_col)[row];
+                        found[g] = true;
+                    }
+                }
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].int_value = acc[g];
+                    states[g].slots[agg_i].has_value = true;
+                }
+            } else if (item.dbl_col != nullptr) {
+                std::vector<double> acc(n_groups_m, 0.0);
+                const double* data = item.dbl_col->data();
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::uint32_t g = gids[row];
+                    if (!found[g]) {
+                        acc[g] = data[row];
+                        found[g] = true;
+                    }
+                }
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].double_value = acc[g];
+                    states[g].slots[agg_i].has_value = true;
+                }
+            } else if (item.str_col != nullptr) {
+                std::vector<std::string> acc(n_groups_m);
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::uint32_t g = gids[row];
+                    if (!found[g]) {
+                        acc[g] = (*item.str_col)[row];
+                        found[g] = true;
+                    }
+                }
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].first_value = std::move(acc[g]);
+                    states[g].slots[agg_i].has_value = true;
+                }
+            }
+            continue;
+        }
+
+        if (item.func == ir::AggFunc::Last) {
+            if (item.int_col != nullptr) {
+                std::vector<std::int64_t> acc(n_groups_m, 0);
+                for (std::size_t row = 0; row < rows; ++row)
+                    acc[gids[row]] = (*item.int_col)[row];
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].int_value = acc[g];
+                    states[g].slots[agg_i].has_value = true;
+                }
+            } else if (item.dbl_col != nullptr) {
+                std::vector<double> acc(n_groups_m, 0.0);
+                const double* data = item.dbl_col->data();
+                for (std::size_t row = 0; row < rows; ++row)
+                    acc[gids[row]] = data[row];
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].double_value = acc[g];
+                    states[g].slots[agg_i].has_value = true;
+                }
+            } else if (item.str_col != nullptr) {
+                std::vector<std::string> acc(n_groups_m);
+                for (std::size_t row = 0; row < rows; ++row)
+                    acc[gids[row]] = (*item.str_col)[row];
+                for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                    states[g].slots[agg_i].last_value = std::move(acc[g]);
+                    states[g].slots[agg_i].has_value = true;
+                }
+            }
+            continue;
+        }
+
+        if (item.dbl_col != nullptr) {
+            const double* data = item.dbl_col->data();
+            switch (item.func) {
+                case ir::AggFunc::Sum: {
+                    std::vector<double> acc(n_groups_m, 0.0);
+                    for (std::size_t row = 0; row < rows; ++row)
+                        acc[gids[row]] += data[row];
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].double_value = acc[g];
+                        states[g].slots[agg_i].has_value = true;
+                    }
                     break;
-                case ColKind::Double:
-                    std::get<double>(reuse_key.values[ci]) = cp.dbl_ptr[row];
+                }
+                case ir::AggFunc::Mean: {
+                    std::vector<double> acc(n_groups_m, 0.0);
+                    std::vector<std::int64_t> counts(n_groups_m, 0);
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::uint32_t g = gids[row];
+                        acc[g] += data[row];
+                        counts[g]++;
+                    }
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].sum = acc[g];
+                        states[g].slots[agg_i].count = counts[g];
+                    }
                     break;
-                case ColKind::Str:
-                    std::get<std::string>(reuse_key.values[ci]) = (*cp.str_ptr)[row];
+                }
+                case ir::AggFunc::Min: {
+                    std::vector<double> acc(n_groups_m, std::numeric_limits<double>::infinity());
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::uint32_t g = gids[row];
+                        if (data[row] < acc[g])
+                            acc[g] = data[row];
+                    }
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].double_value = acc[g];
+                        states[g].slots[agg_i].has_value = true;
+                    }
+                    break;
+                }
+                case ir::AggFunc::Max: {
+                    std::vector<double> acc(n_groups_m, -std::numeric_limits<double>::infinity());
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::uint32_t g = gids[row];
+                        if (data[row] > acc[g])
+                            acc[g] = data[row];
+                    }
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].double_value = acc[g];
+                        states[g].slots[agg_i].has_value = true;
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        } else if (item.int_col != nullptr) {
+            const std::int64_t* data = item.int_col->data();
+            switch (item.func) {
+                case ir::AggFunc::Sum: {
+                    std::vector<std::int64_t> acc(n_groups_m, 0);
+                    for (std::size_t row = 0; row < rows; ++row)
+                        acc[gids[row]] += data[row];
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].int_value = acc[g];
+                        states[g].slots[agg_i].has_value = true;
+                    }
+                    break;
+                }
+                case ir::AggFunc::Mean: {
+                    std::vector<double> acc(n_groups_m, 0.0);
+                    std::vector<std::int64_t> counts(n_groups_m, 0);
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::uint32_t g = gids[row];
+                        acc[g] += static_cast<double>(data[row]);
+                        counts[g]++;
+                    }
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].sum = acc[g];
+                        states[g].slots[agg_i].count = counts[g];
+                    }
+                    break;
+                }
+                case ir::AggFunc::Min: {
+                    std::vector<std::int64_t> acc(n_groups_m,
+                                                  std::numeric_limits<std::int64_t>::max());
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::uint32_t g = gids[row];
+                        if (data[row] < acc[g])
+                            acc[g] = data[row];
+                    }
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].int_value = acc[g];
+                        states[g].slots[agg_i].has_value = true;
+                    }
+                    break;
+                }
+                case ir::AggFunc::Max: {
+                    std::vector<std::int64_t> acc(n_groups_m,
+                                                  std::numeric_limits<std::int64_t>::min());
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::uint32_t g = gids[row];
+                        if (data[row] > acc[g])
+                            acc[g] = data[row];
+                    }
+                    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+                        states[g].slots[agg_i].int_value = acc[g];
+                        states[g].slots[agg_i].has_value = true;
+                    }
+                    break;
+                }
+                default:
                     break;
             }
         }
-
-        auto it = groups.find(reuse_key);
-        if (it == groups.end()) {
-            order.push_back(reuse_key);
-            it = groups.emplace(reuse_key, make_state()).first;
-        }
-
-        if (auto err = (numeric_only ? update_state_numeric(it->second, row)
-                                     : update_state(it->second, row))) {
-            return std::unexpected(*err);
-        }
     }
 
+    // ── Output reconstruction ─────────────────────────────────────────────────
     auto output = build_output();
     if (!output.has_value()) {
         return std::unexpected(output.error());
     }
-    for (const auto& key : order) {
-        for (std::size_t i = 0; i < group_by.size(); ++i) {
-            auto* column = output->find(group_by[i].name);
+    for (std::uint32_t g = 0; g < n_groups_m; ++g) {
+        const std::uint32_t* gc =
+            group_col_codes_flat.data() + static_cast<std::size_t>(g) * n_keys;
+        for (std::size_t ci = 0; ci < n_keys; ++ci) {
+            auto* column = output->find(group_by[ci].name);
             if (column == nullptr) {
                 return std::unexpected("missing group-by column in output");
             }
-            append_scalar(*column, key.values[i]);
+            append_scalar(*column, per_col[ci].vals[gc[ci]]);
         }
-        const AggState& state = groups.find(key)->second;
-        if (auto err = append_agg_values(*output, state)) {
+        if (auto err = append_agg_values(*output, states[g])) {
             return std::unexpected(*err);
         }
     }

@@ -221,6 +221,23 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Order: {
+            const auto& order = static_cast<const ir::OrderNode&>(node);
+            auto child = emit_node(*order.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::order(" << child << ", {";
+            bool first = true;
+            for (const auto& key : order.keys()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << "ibex::ir::OrderKey{\"" << escape_string(key.name) << "\", "
+                      << (key.ascending ? "true" : "false") << "}";
+            }
+            *out_ << "});\n";
+            return var;
+        }
+
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);
             auto child = emit_node(*agg.children().front());

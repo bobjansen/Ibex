@@ -65,6 +65,18 @@ TEST_CASE("DistinctNode kind", "[ir][distinct]") {
     REQUIRE(distinct->kind() == ibex::ir::NodeKind::Distinct);
 }
 
+TEST_CASE("OrderNode kind", "[ir][order]") {
+    ibex::ir::Builder builder;
+    auto node = builder.order({ibex::ir::OrderKey{.name = "price", .ascending = false}});
+
+    auto* order = dynamic_cast<ibex::ir::OrderNode*>(node.get());
+    REQUIRE(order != nullptr);
+    REQUIRE(order->kind() == ibex::ir::NodeKind::Order);
+    REQUIRE(order->keys().size() == 1);
+    REQUIRE(order->keys()[0].name == "price");
+    REQUIRE(order->keys()[0].ascending == false);
+}
+
 TEST_CASE("AggregateNode stores group-by and aggregations", "[ir][aggregate]") {
     ibex::ir::Builder builder;
 

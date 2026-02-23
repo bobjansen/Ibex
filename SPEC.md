@@ -44,8 +44,9 @@ normalizes all blocks to the canonical evaluation order:
 
 1. `filter` — row selection (relational σ)
 2. `by` — grouping key computation
-3. `select` or `update` — column projection / mutation (relational π or ε)
-4. `window` — temporal windowing (relational ω)
+3. `select`, `update`, or `distinct` — column projection / mutation (relational π or ε)
+4. `order` — row ordering (relational τ)
+5. `window` — temporal windowing (relational ω)
 
 The following two expressions are equivalent:
 
@@ -62,6 +63,8 @@ The canonical order is recommended for readability but not enforced.
 |---------------------|---------------------------|-----------------|
 | `filter`            | σ (selection)             | `FilterNode`    |
 | `select`            | π (projection)            | `ProjectNode`   |
+| `distinct`          | δ (duplicate removal)     | `DistinctNode`  |
+| `order`             | τ (ordering)              | `OrderNode`     |
 | `select` + `by`     | γ (aggregation)           | `AggregateNode` |
 | `update`            | ε (extended projection)   | `UpdateNode`    |
 | `update` + `by`     | grouped ε (window-like)   | `UpdateNode`    |
@@ -133,8 +136,9 @@ column names, or function names:
 
 ```
 let    mut    extern  fn     from
-filter select update  by     window
+filter select update  distinct order by window
 join   left   asof    on
+asc    desc
 true   false
 Int32  Int64  Float32 Float64
 Bool   String Timestamp
@@ -368,7 +372,9 @@ clause_list     = clause { "," clause } [ "," ] ;
 
 clause          = filter_clause
                 | select_clause
+                | distinct_clause
                 | update_clause
+                | order_clause
                 | by_clause
                 | window_clause ;
 
@@ -376,7 +382,17 @@ filter_clause   = "filter" expr ;
 
 select_clause   = "select" field_or_list ;
 
+distinct_clause = "distinct" field_or_list ;
+
 update_clause   = "update" field_or_list ;
+
+order_clause    = "order"
+                | "order" order_keys ;
+
+order_keys      = order_key
+                | "{" order_key { "," order_key } [ "," ] "}" ;
+
+order_key       = IDENT [ "asc" | "desc" ] ;
 
 by_clause       = "by" IDENT
                 | "by" "{" field_list "}" ;
@@ -483,12 +499,14 @@ Within a single block:
 |------|-----------|
 | C1 | At most **one** `filter` clause. |
 | C2 | At most **one** `select` clause. |
-| C3 | At most **one** `update` clause. |
-| C4 | `select` and `update` are **mutually exclusive**. |
-| C5 | At most **one** `by` clause. |
-| C6 | At most **one** `window` clause. |
-| C7 | `by` requires either `select` or `update`. |
-| C8 | `window` requires the operand to be a `TimeFrame`. |
+| C3 | At most **one** `distinct` clause. |
+| C4 | At most **one** `update` clause. |
+| C5 | `select`, `distinct`, and `update` are **mutually exclusive**. |
+| C6 | At most **one** `order` clause. |
+| C7 | At most **one** `by` clause. |
+| C8 | At most **one** `window` clause. |
+| C9 | `by` requires either `select` or `update`. |
+| C10 | `window` requires the operand to be a `TimeFrame`. |
 
 Violation of any constraint is a **compile-time error**.
 
@@ -527,6 +545,13 @@ trades[select { doubled = price * 2 }]  // OK
 
 The output schema contains exactly the fields listed, in the order listed.
 
+**`distinct { field, ... }`**
+
+`distinct` projects the listed fields (same rules as `select`), then removes
+duplicate rows. Two rows are considered equal if all projected field values
+are equal. The output schema contains exactly the fields listed, in the order
+listed.
+
 **`update { field, ... }`**
 
 Adds or replaces columns in the DataFrame while retaining all existing columns.
@@ -560,6 +585,19 @@ Interaction with `select` and `update`:
   group, and the result is broadcast back to every row in that group (similar
   to SQL window functions without explicit framing).
 
+**`order [keys]`**
+
+Sorts rows by one or more keys in ascending order by default. Keys are column
+names, optionally followed by `asc` or `desc`. Examples:
+
+```
+trades[order symbol]
+trades[order { symbol desc, price asc }]
+```
+
+If no keys are provided (`order` or `order {}`), all columns in schema order
+are used as keys with ascending order.
+
 **`window <duration>`**
 
 Specifies a time-based window for rolling computations. Only valid when the
@@ -571,7 +609,9 @@ operand is a `TimeFrame`. See Section 8.
 |----------------------|-------------|-------------------|
 | `filter` only         | Same as input | Identical schema |
 | `select` only         | `DataFrame<S'>` | S' = listed fields |
+| `distinct` only       | `DataFrame<S'>` | S' = listed fields |
 | `update` only         | `DataFrame<S'>` | S' = S ∪ new fields |
+| `order` only          | Same as input | Identical schema |
 | `select` + `by`       | `DataFrame<S'>` | S' = listed fields (one row per group) |
 | `update` + `by`       | `DataFrame<S'>` | S' = S ∪ new fields (same row count) |
 | `window` + `update`   | `TimeFrame<S'>` | S' = S ∪ new fields |
@@ -1080,12 +1120,16 @@ apply equality matching in addition to the time-based match. Join expressions
 
 ### 11.4 Ordering
 
+The surface syntax uses the `order` clause (Section 5.3). Implementations may
+also provide an equivalent built-in:
+
 ```
-sort(df: DataFrame<S>, col: Ident) -> DataFrame<S>
+order(df: DataFrame<S>, key1, ..., keyN) -> DataFrame<S>
 ```
 
-Returns a new DataFrame sorted by the named column in ascending order. Sorting
-a `TimeFrame` by its index column is a no-op (already sorted).
+Returns a new DataFrame sorted by the named keys in ascending order unless
+explicit directions are provided in the `order` clause. Sorting a `TimeFrame`
+by its index column is a no-op (already sorted).
 
 ### 11.5 Display
 
@@ -1235,7 +1279,8 @@ Highest precedence at top.
 **Hard keywords** (always reserved, used by grammar):
 
 ```
-let  mut  extern  fn  from  filter  select  update  by  window  join  left  asof  on  true  false
+let  mut  extern  fn  from  filter  select  update  distinct  order  by  window  join  left  asof  on
+asc  desc  true  false
 ```
 
 **Type keywords** (reserved in type position and as identifiers):

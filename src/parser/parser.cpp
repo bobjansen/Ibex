@@ -593,6 +593,13 @@ class Parser {
             }
             return DistinctClause{.fields = std::move(*fields)};
         }
+        if (match(TokenKind::KeywordOrder)) {
+            auto keys = parse_order_keys();
+            if (!keys.has_value()) {
+                return std::nullopt;
+            }
+            return OrderClause{.keys = std::move(keys->first), .is_braced = keys->second};
+        }
         if (match(TokenKind::KeywordUpdate)) {
             auto fields = parse_field_list_or_single();
             if (!fields.has_value()) {
@@ -626,6 +633,53 @@ class Parser {
         }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
+    }
+
+    auto parse_order_keys() -> std::optional<std::pair<std::vector<OrderKey>, bool>> {
+        std::vector<OrderKey> keys;
+        bool is_braced = false;
+
+        if (check(TokenKind::Comma) || check(TokenKind::RBracket)) {
+            return std::make_pair(std::move(keys), is_braced);
+        }
+
+        if (match(TokenKind::LBrace)) {
+            is_braced = true;
+            if (!check(TokenKind::RBrace)) {
+                do {
+                    auto key = parse_order_key();
+                    if (!key.has_value()) {
+                        return std::nullopt;
+                    }
+                    keys.push_back(std::move(*key));
+                } while (match(TokenKind::Comma));
+            }
+            if (!consume(TokenKind::RBrace, "expected '}' after order list")) {
+                return std::nullopt;
+            }
+            return std::make_pair(std::move(keys), is_braced);
+        }
+
+        auto key = parse_order_key();
+        if (!key.has_value()) {
+            return std::nullopt;
+        }
+        keys.push_back(std::move(*key));
+        return std::make_pair(std::move(keys), is_braced);
+    }
+
+    auto parse_order_key() -> std::optional<OrderKey> {
+        auto name = consume_column_identifier("expected order key");
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        bool ascending = true;
+        if (match(TokenKind::KeywordAsc)) {
+            ascending = true;
+        } else if (match(TokenKind::KeywordDesc)) {
+            ascending = false;
+        }
+        return OrderKey{.name = std::move(*name), .ascending = ascending};
     }
 
     auto parse_field_list_or_single() -> std::optional<std::vector<Field>> {

@@ -31,12 +31,15 @@ enum class TokenKind : std::uint8_t {
     KeywordSelect,
     KeywordUpdate,
     KeywordDistinct,
+    KeywordOrder,
     KeywordBy,
     KeywordWindow,
     KeywordJoin,
     KeywordLeft,
     KeywordAsof,
     KeywordOn,
+    KeywordAsc,
+    KeywordDesc,
 
     // Type keywords
     KeywordInt,

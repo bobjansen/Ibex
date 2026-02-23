@@ -83,6 +83,14 @@ auto distinct(const runtime::Table& t) -> runtime::Table {
     return delegate(std::move(distinct_node), t);
 }
 
+auto order(const runtime::Table& t, const std::vector<ir::OrderKey>& keys) -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto order_node = b.order(keys);
+    order_node->add_child(std::move(scan_node));
+    return delegate(std::move(order_node), t);
+}
+
 auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                const std::vector<ir::AggSpec>& aggs) -> runtime::Table {
     ir::Builder b;

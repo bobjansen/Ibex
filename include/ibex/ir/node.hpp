@@ -64,6 +64,11 @@ struct FieldSpec {
     Expr expr;
 };
 
+struct OrderKey {
+    std::string name;
+    bool ascending = true;
+};
+
 /// Supported comparison operators for filter predicates.
 /// See SPEC.md Section 2.5 (Operators).
 enum class CompareOp : std::uint8_t {
@@ -120,6 +125,7 @@ enum class NodeKind : std::uint8_t {
     Filter,
     Project,
     Distinct,
+    Order,
     Aggregate,
     Update,
     Window,
@@ -199,6 +205,18 @@ class ProjectNode final : public Node {
 class DistinctNode final : public Node {
    public:
     explicit DistinctNode(NodeId id) : Node(NodeKind::Distinct, id) {}
+};
+
+/// Order node: sorts rows by one or more keys.
+class OrderNode final : public Node {
+   public:
+    OrderNode(NodeId id, std::vector<OrderKey> keys)
+        : Node(NodeKind::Order, id), keys_(std::move(keys)) {}
+
+    [[nodiscard]] auto keys() const noexcept -> const std::vector<OrderKey>& { return keys_; }
+
+   private:
+    std::vector<OrderKey> keys_;
 };
 
 /// Aggregate node: groups and aggregates.

@@ -94,6 +94,11 @@ struct Field {
     ExprPtr expr;
 };
 
+struct OrderKey {
+    std::string name;
+    bool ascending = true;
+};
+
 struct FilterClause {
     ExprPtr predicate;
 };
@@ -110,6 +115,11 @@ struct UpdateClause {
     std::vector<Field> fields;
 };
 
+struct OrderClause {
+    std::vector<OrderKey> keys;
+    bool is_braced = false;
+};
+
 struct ByClause {
     std::vector<Field> keys;
     bool is_braced = false;
@@ -119,8 +129,8 @@ struct WindowClause {
     DurationLiteral duration;
 };
 
-using Clause =
-    std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, ByClause, WindowClause>;
+using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, OrderClause,
+                            ByClause, WindowClause>;
 
 struct BlockExpr {
     ExprPtr base;

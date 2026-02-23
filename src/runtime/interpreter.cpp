@@ -1,9 +1,11 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <robin_hood.h>
 #include <stdexcept>
@@ -399,6 +401,93 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
         if (!seen.insert(std::move(key)).second) {
             continue;
         }
+        for (std::size_t col = 0; col < input.columns.size(); ++col) {
+            append_value(*output.columns[col].column, *input.columns[col].column, row);
+        }
+    }
+    return output;
+}
+
+struct OrderColumn {
+    const ColumnValue* column = nullptr;
+    bool ascending = true;
+    ExprType kind = ExprType::Int;
+};
+
+auto column_kind(const ColumnValue& column) -> ExprType;
+
+auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
+    -> std::expected<Table, std::string> {
+    std::size_t rows = input.rows();
+    if (rows <= 1 || input.columns.empty()) {
+        return input;
+    }
+
+    std::vector<OrderColumn> order_cols;
+    if (keys.empty()) {
+        order_cols.reserve(input.columns.size());
+        for (const auto& entry : input.columns) {
+            order_cols.push_back(OrderColumn{entry.column.get(), true, column_kind(*entry.column)});
+        }
+    } else {
+        order_cols.reserve(keys.size());
+        for (const auto& key : keys) {
+            const auto* column = input.find(key.name);
+            if (column == nullptr) {
+                return std::unexpected("order column not found: " + key.name +
+                                       " (available: " + format_columns(input) + ")");
+            }
+            order_cols.push_back(OrderColumn{column, key.ascending, column_kind(*column)});
+        }
+    }
+
+    std::vector<std::size_t> idx(rows);
+    std::iota(idx.begin(), idx.end(), 0);
+
+    auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
+        for (const auto& col : order_cols) {
+            switch (col.kind) {
+                case ExprType::Int: {
+                    auto lv = std::get<Column<std::int64_t>>(*col.column)[lhs];
+                    auto rv = std::get<Column<std::int64_t>>(*col.column)[rhs];
+                    if (lv == rv) {
+                        break;
+                    }
+                    return col.ascending ? (lv < rv) : (lv > rv);
+                }
+                case ExprType::Double: {
+                    auto lv = std::get<Column<double>>(*col.column)[lhs];
+                    auto rv = std::get<Column<double>>(*col.column)[rhs];
+                    if (lv == rv) {
+                        break;
+                    }
+                    return col.ascending ? (lv < rv) : (lv > rv);
+                }
+                case ExprType::String: {
+                    const auto& lv = std::get<Column<std::string>>(*col.column)[lhs];
+                    const auto& rv = std::get<Column<std::string>>(*col.column)[rhs];
+                    if (lv == rv) {
+                        break;
+                    }
+                    return col.ascending ? (lv < rv) : (lv > rv);
+                }
+            }
+        }
+        return lhs < rhs;
+    };
+
+    std::stable_sort(idx.begin(), idx.end(), compare_row);
+
+    Table output;
+    output.columns.reserve(input.columns.size());
+    for (const auto& entry : input.columns) {
+        output.add_column(entry.name, make_empty_like(*entry.column));
+    }
+    for (auto& entry : output.columns) {
+        std::visit([&](auto& col) { col.reserve(rows); }, *entry.column);
+    }
+    for (std::size_t pos = 0; pos < rows; ++pos) {
+        std::size_t row = idx[pos];
         for (std::size_t col = 0; col < input.columns.size(); ++col) {
             append_value(*output.columns[col].column, *input.columns[col].column, row);
         }
@@ -1980,6 +2069,17 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             return distinct_table(child.value());
+        }
+        case ir::NodeKind::Order: {
+            const auto& order = static_cast<const ir::OrderNode&>(node);
+            if (order.children().empty()) {
+                return std::unexpected("order node missing child");
+            }
+            auto child = interpret_node(*order.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return order_table(child.value(), order.keys());
         }
         case ir::NodeKind::Update: {
             const auto& update = static_cast<const ir::UpdateNode&>(node);

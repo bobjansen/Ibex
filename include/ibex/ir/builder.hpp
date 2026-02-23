@@ -28,6 +28,10 @@ class Builder {
 
     [[nodiscard]] auto distinct() -> NodePtr { return std::make_unique<DistinctNode>(next_id()); }
 
+    [[nodiscard]] auto order(std::vector<OrderKey> keys) -> NodePtr {
+        return std::make_unique<OrderNode>(next_id(), std::move(keys));
+    }
+
     [[nodiscard]] auto aggregate(std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
         -> NodePtr {
         return std::make_unique<AggregateNode>(next_id(), std::move(group_by),

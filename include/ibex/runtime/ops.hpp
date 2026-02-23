@@ -21,6 +21,9 @@ namespace ibex::ops {
 
 [[nodiscard]] auto distinct(const runtime::Table& t) -> runtime::Table;
 
+[[nodiscard]] auto order(const runtime::Table& t, const std::vector<ir::OrderKey>& keys)
+    -> runtime::Table;
+
 [[nodiscard]] auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                              const std::vector<ir::AggSpec>& aggs) -> runtime::Table;
 

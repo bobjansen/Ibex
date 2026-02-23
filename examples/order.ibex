@@ -1,0 +1,12 @@
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let iris = read_csv("data/iris.csv");
+
+// Order by a single key (ascending by default).
+iris[order `Species`];
+
+// Order by multiple keys with explicit directions.
+iris[order { `Species` asc, `Sepal.Length` desc }];
+
+// Order by all columns (schema order).
+iris[order];

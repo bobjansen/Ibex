@@ -106,6 +106,16 @@ TEST_CASE("emitter: distinct node", "[codegen]") {
     CHECK(contains(out, "read_csv(\"trades.csv\")"));
 }
 
+TEST_CASE("emitter: order node", "[codegen]") {
+    ir::Builder b;
+    auto order = b.order({ir::OrderKey{.name = "symbol", .ascending = false}});
+    order->add_child(make_source(b, "trades.csv"));
+
+    auto out = emit_to_string(*order);
+    CHECK(contains(out, "ibex::ops::order("));
+    CHECK(contains(out, "OrderKey{\"symbol\", false}"));
+}
+
 // ─── Aggregate ───────────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: aggregate node", "[codegen]") {

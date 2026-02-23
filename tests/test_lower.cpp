@@ -103,6 +103,21 @@ TEST_CASE("Lower distinct to IR") {
     REQUIRE(project->columns()[0].name == "symbol");
 }
 
+TEST_CASE("Lower order to IR") {
+    auto program = require_parse("df[order symbol];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* order = as_node<ir::OrderNode>(result->get());
+    REQUIRE(order != nullptr);
+    REQUIRE(order->keys().size() == 1);
+    REQUIRE(order->keys()[0].name == "symbol");
+    REQUIRE(order->keys()[0].ascending);
+    REQUIRE(order->children().size() == 1);
+    const auto* scan = as_node<ir::ScanNode>(order->children()[0].get());
+    REQUIRE(scan != nullptr);
+}
+
 TEST_CASE("Lowering rejects computed group keys") {
     auto program = require_parse("df[by { yr = year(ts) }];");
     auto result = parser::lower(program);

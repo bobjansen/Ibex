@@ -202,6 +202,16 @@ class Lowerer {
             node = std::move(update.value());
         }
 
+        if (state.order) {
+            auto keys = lower_order(*state.order);
+            if (!keys.has_value()) {
+                return std::unexpected(keys.error());
+            }
+            auto order_node = builder_.order(std::move(keys.value()));
+            order_node->add_child(std::move(node));
+            node = std::move(order_node);
+        }
+
         if (state.window) {
             auto duration = parse_duration(state.window->duration.text);
             if (!duration.has_value()) {
@@ -220,6 +230,7 @@ class Lowerer {
         const SelectClause* select = nullptr;
         const DistinctClause* distinct = nullptr;
         const UpdateClause* update = nullptr;
+        const OrderClause* order = nullptr;
         const ByClause* by = nullptr;
         const WindowClause* window = nullptr;
         std::string error;
@@ -255,6 +266,14 @@ class Lowerer {
                     return false;
                 }
                 update = &std::get<UpdateClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<OrderClause>(clause)) {
+                if (order != nullptr) {
+                    error = "duplicate order clause";
+                    return false;
+                }
+                order = &std::get<OrderClause>(clause);
                 return true;
             }
             if (std::holds_alternative<ByClause>(clause)) {
@@ -379,6 +398,16 @@ class Lowerer {
             group_by = std::move(keys.value());
         }
         return builder_.update(std::move(fields), std::move(group_by));
+    }
+
+    auto lower_order(const OrderClause& clause)
+        -> std::expected<std::vector<ir::OrderKey>, LowerError> {
+        std::vector<ir::OrderKey> keys;
+        keys.reserve(clause.keys.size());
+        for (const auto& key : clause.keys) {
+            keys.push_back(ir::OrderKey{.name = key.name, .ascending = key.ascending});
+        }
+        return keys;
     }
 
     auto lower_expr_to_ir(const Expr& expr) -> std::expected<ir::Expr, LowerError> {
@@ -823,6 +852,10 @@ class Lowerer {
             }
             case ir::NodeKind::Distinct: {
                 return builder_.distinct();
+            }
+            case ir::NodeKind::Order: {
+                const auto& order = static_cast<const ir::OrderNode&>(node);
+                return builder_.order(order.keys());
             }
             case ir::NodeKind::Aggregate: {
                 const auto& agg = static_cast<const ir::AggregateNode&>(node);

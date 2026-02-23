@@ -225,6 +225,42 @@ TEST_CASE("Parse distinct without braces") {
     REQUIRE(distinct.fields[0].expr == nullptr);
 }
 
+TEST_CASE("Parse order clause with keys") {
+    const char* source = "df[order { symbol desc, price asc }];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& order = std::get<OrderClause>(block.clauses[0]);
+    REQUIRE(order.keys.size() == 2);
+    REQUIRE(order.keys[0].name == "symbol");
+    REQUIRE(order.keys[0].ascending == false);
+    REQUIRE(order.keys[1].name == "price");
+    REQUIRE(order.keys[1].ascending == true);
+}
+
+TEST_CASE("Parse order clause with no keys") {
+    const char* source = "df[order];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& order = std::get<OrderClause>(block.clauses[0]);
+    REQUIRE(order.keys.empty());
+}
+
 TEST_CASE("Parse select assignment without braces") {
     const char* source = "df[select total = price * 2];";
 

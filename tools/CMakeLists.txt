@@ -23,7 +23,7 @@ install(TARGETS ibex_repl_bin
 
 add_executable(ibex_bench ibex_bench.cpp)
 
-target_include_directories(ibex_bench PRIVATE "${PROJECT_SOURCE_DIR}/libraries")
+target_include_directories(ibex_bench PRIVATE "${PROJECT_SOURCE_DIR}/libs/csv")
 
 target_link_libraries(ibex_bench
     PRIVATE

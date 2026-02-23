@@ -11,7 +11,7 @@ add_executable(ibex_tests
     test_codegen.cpp
 )
 
-target_include_directories(ibex_tests PRIVATE "${PROJECT_SOURCE_DIR}/libraries")
+target_include_directories(ibex_tests PRIVATE "${PROJECT_SOURCE_DIR}/libs/csv")
 
 target_link_libraries(ibex_tests
     PRIVATE

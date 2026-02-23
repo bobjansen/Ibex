@@ -111,7 +111,7 @@ EOF
 
     "$CXX" $CXXFLAGS \
         -I"$IBEX_ROOT/include" \
-        -I"$IBEX_ROOT/libraries" \
+        -I"$IBEX_ROOT/libs/csv" \
         -I"$BUILD_DIR/_deps/fmt-src/include" \
         "$cpp_path" \
         "$BUILD_DIR/src/runtime/libibex_runtime.a" \

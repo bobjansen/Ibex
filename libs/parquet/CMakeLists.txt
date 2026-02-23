@@ -68,7 +68,7 @@ set(BOOST_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(arrow)
 
 add_library(ibex_parquet_plugin SHARED
-    ${IBEX_ROOT}/libraries/parquet.cpp
+    ${IBEX_ROOT}/libs/parquet/parquet.cpp
 )
 
 set_target_properties(ibex_parquet_plugin PROPERTIES
@@ -79,7 +79,7 @@ set_target_properties(ibex_parquet_plugin PROPERTIES
 
 target_include_directories(ibex_parquet_plugin
     PRIVATE
-        "${IBEX_ROOT}/libraries"
+        "${IBEX_ROOT}/libs/parquet"
         "${IBEX_ROOT}/include"
         "${IBEX_BUILD_DIR}/_deps/fmt-src/include"
         "${IBEX_BUILD_DIR}/_deps/spdlog-src/include"

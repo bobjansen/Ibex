@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ibex-plugin-build.sh <plugin.cpp> [-o output.so]
-#   ibex-plugin-build.sh libraries/csv.cpp
+#   ibex-plugin-build.sh libs/csv/csv.cpp
 #   ibex-plugin-build.sh my_parquet.cpp -o /path/to/parquet.so
 #
 # Without -o, the .so is written next to the source file (stem + ".so").
@@ -56,11 +56,14 @@ fi
 # ── Include paths ─────────────────────────────────────────────────────────────
 IBEX_INCS=(
     "-I$IBEX_ROOT/include"
-    "-I$IBEX_ROOT/libraries"
     "-I$BUILD_DIR/_deps/fmt-src/include"
     "-I$BUILD_DIR/_deps/spdlog-src/include"
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
+# Add each plugin source directory so plugins can include sibling headers
+for _lib_dir in "$IBEX_ROOT/libs"/*/; do
+    [[ -d "$_lib_dir" ]] && IBEX_INCS+=("-I$_lib_dir")
+done
 
 # ── Runtime libraries ─────────────────────────────────────────────────────────
 _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"

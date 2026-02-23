@@ -7,7 +7,7 @@ set_target_properties(ibex_csv_plugin PROPERTIES
 
 target_include_directories(ibex_csv_plugin
     PRIVATE
-        "${PROJECT_SOURCE_DIR}/libraries"
+        "${CMAKE_CURRENT_SOURCE_DIR}"
         "${PROJECT_SOURCE_DIR}/include"
 )
 

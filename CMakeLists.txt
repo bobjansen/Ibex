@@ -53,7 +53,7 @@ target_link_libraries(ibex_lib
 )
 
 # Plugin libraries
-add_subdirectory(libraries)
+add_subdirectory(libs/csv)
 
 # Tools
 if(IBEX_BUILD_TOOLS)

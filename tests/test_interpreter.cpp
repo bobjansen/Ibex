@@ -348,3 +348,142 @@ TEST_CASE("Interpret update with scalar reference") {
     REQUIRE((*price_ints)[1] == 12);
     REQUIRE((*price_ints)[2] == 13);
 }
+
+TEST_CASE("Interpret order descending") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 30, 20});
+    table.add_column("symbol", Column<std::string>{"A", "B", "C"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[order { price desc }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* prices = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE(prices->size() == 3);
+    REQUIRE((*prices)[0] == 30);
+    REQUIRE((*prices)[1] == 20);
+    REQUIRE((*prices)[2] == 10);
+}
+
+TEST_CASE("Interpret order on empty table") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[order { price asc }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 0);
+}
+
+TEST_CASE("Interpret distinct on empty table") {
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[distinct { symbol }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 0);
+}
+
+TEST_CASE("Interpret order then distinct") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{20, 10, 20, 10});
+    table.add_column("symbol", Column<std::string>{"B", "A", "B", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    // order first so distinct result order is deterministic
+    auto ir = require_ir("trades[order { price asc, symbol asc }, distinct { price, symbol }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* prices = std::get_if<Column<std::int64_t>>(result->find("price"));
+    const auto* symbols = std::get_if<Column<std::string>>(result->find("symbol"));
+    REQUIRE(prices != nullptr);
+    REQUIRE(symbols != nullptr);
+    REQUIRE(prices->size() == 2);
+    REQUIRE((*prices)[0] == 10);
+    REQUIRE((*symbols)[0] == "A");
+    REQUIRE((*prices)[1] == 20);
+    REQUIRE((*symbols)[1] == "B");
+}
+
+TEST_CASE("Interpret distinct preserves first occurrence without order") {
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "C", "B"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[distinct { symbol }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbols = std::get_if<Column<std::string>>(result->find("symbol"));
+    REQUIRE(symbols != nullptr);
+    REQUIRE(symbols->size() == 3);
+    REQUIRE((*symbols)[0] == "A");
+    REQUIRE((*symbols)[1] == "B");
+    REQUIRE((*symbols)[2] == "C");
+}
+
+TEST_CASE("Interpret filter on empty table") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[filter price > 10];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 0);
+}
+
+TEST_CASE("Interpret aggregate on single row") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{42});
+    table.add_column("symbol", Column<std::string>{"X"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { symbol, total = sum(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* totals = std::get_if<Column<std::int64_t>>(result->find("total"));
+    REQUIRE(totals != nullptr);
+    REQUIRE(totals->size() == 1);
+    REQUIRE((*totals)[0] == 42);
+}
+
+TEST_CASE("Interpret update with double arithmetic") {
+    runtime::Table table;
+    table.add_column("price", Column<double>{1.5, 2.5, 3.5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[update { price_x2 = price * 2 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = std::get_if<Column<double>>(result->find("price_x2"));
+    REQUIRE(col != nullptr);
+    REQUIRE(col->size() == 3);
+    REQUIRE((*col)[0] == Catch::Approx(3.0));
+    REQUIRE((*col)[1] == Catch::Approx(5.0));
+    REQUIRE((*col)[2] == Catch::Approx(7.0));
+}

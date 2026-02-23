@@ -26,14 +26,20 @@ let enriched = prices join ohlc on symbol;
 Aggregation benchmarks on 4 M rows (`prices.csv`, 252 symbols).
 Release build (`-O2`), 5 iterations, 1 warmup, WSL2 / clang++.
 
-| query               |     ibex | ibex+parse |   polars |   pandas | data.table |    dplyr
-|---------------------+----------+------------+----------+----------+------------+---------
-| mean by symbol      |  46.6 ms |    44.9 ms |  34.9 ms | 180.2 ms |    24.0 ms |  51.6 ms
-| OHLC by symbol      |  51.2 ms |    50.5 ms |  28.7 ms | 195.7 ms |    27.4 ms |  50.6 ms
-| update price×2      |  3.54 ms |    3.21 ms |  2.77 ms |  5.42 ms |    40.0 ms |  5.40 ms
-| count by symbol×day | 137.8 ms |          — |  51.8 ms | 314.5 ms |    24.6 ms | 103.4 ms
-| mean by symbol×day  | 138.3 ms |          — |  53.5 ms | 318.3 ms |    23.2 ms | 116.0 ms
-| OHLC by symbol×day  | 154.5 ms |          — |  57.5 ms | 338.0 ms |    27.4 ms | 137.2 ms
+```
+query               |     ibex | ibex+parse | ibex-compiled |   polars |   pandas | data.table |    dplyr
+--------------------+----------+------------+---------------+----------+----------+------------+---------
+mean by symbol      |  50.1 ms |    52.8 ms |       50.2 ms |  31.8 ms | 180.9 ms |    26.2 ms |  60.0 ms
+OHLC by symbol      |  54.9 ms |    56.1 ms |       56.5 ms |  29.6 ms | 198.0 ms |    23.8 ms |  52.2 ms
+update price×2      |  3.10 ms |    3.15 ms |       3.31 ms |  3.15 ms |  4.53 ms |    16.2 ms |  6.80 ms
+count by symbol×day |  90.3 ms |          — |       98.5 ms |  51.5 ms | 333.6 ms |    28.0 ms |  92.0 ms
+mean by symbol×day  |  89.5 ms |          — |       91.8 ms |  53.5 ms | 329.0 ms |    31.4 ms | 131.8 ms
+OHLC by symbol×day  |  98.0 ms |          — |      104.0 ms |  55.2 ms | 343.9 ms |    33.6 ms | 126.6 ms
+filter simple       |  53.9 ms |          — |       54.6 ms |  7.62 ms |  23.7 ms |    30.2 ms |  25.4 ms
+filter AND          |  22.3 ms |          — |       22.4 ms |  4.34 ms |  16.8 ms |    29.2 ms |  35.8 ms
+filter arith        |  50.2 ms |          — |       56.8 ms |  7.65 ms |  37.0 ms |    35.4 ms |  31.4 ms
+filter OR           |  23.0 ms |          — |       22.7 ms |  4.81 ms |  14.1 ms |    26.4 ms |  30.8 ms
+```
 
 **ibex vs. others (geometric mean):** 3.1× faster than pandas, on par with dplyr,
 2.3× slower than polars, 3.5× slower than data.table.

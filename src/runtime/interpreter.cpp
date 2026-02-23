@@ -108,197 +108,426 @@ auto make_empty_like(const ColumnValue& src) -> ColumnValue {
         src);
 }
 
-using ScalarVal = std::variant<std::int64_t, double, std::string>;
+// ─── Vectorized filter ────────────────────────────────────────────────────────
+//
+// Instead of evaluating the FilterExpr tree once per row (N × tree-depth
+// variant dispatches), we:
+//   1. compute_mask()  — walk the tree once, producing a uint8_t[N] mask via
+//                        tight typed loops the compiler can auto-vectorize.
+//   2. gather()        — a single pass over each column, copying only the rows
+//                        where mask[i] != 0.
+//
+// For the common column-vs-literal case (e.g. price > 500.0) the literal is
+// held as a scalar — no broadcast allocation, just a hoisted constant in the
+// comparison loop.
 
-auto compare_same_type(ir::CompareOp op, const ScalarVal& lhs, const ScalarVal& rhs) -> bool {
-    if (lhs.index() != rhs.index()) {
-        // Mixed int/double handled above; everything else is false.
-        if (std::holds_alternative<std::int64_t>(lhs) && std::holds_alternative<double>(rhs)) {
-            double l = static_cast<double>(std::get<std::int64_t>(lhs));
-            double r = std::get<double>(rhs);
-            switch (op) {
-                case ir::CompareOp::Eq:
-                    return l == r;
-                case ir::CompareOp::Ne:
-                    return l != r;
-                case ir::CompareOp::Lt:
-                    return l < r;
-                case ir::CompareOp::Le:
-                    return l <= r;
-                case ir::CompareOp::Gt:
-                    return l > r;
-                case ir::CompareOp::Ge:
-                    return l >= r;
-            }
-        }
-        if (std::holds_alternative<double>(lhs) && std::holds_alternative<std::int64_t>(rhs)) {
-            double l = std::get<double>(lhs);
-            double r = static_cast<double>(std::get<std::int64_t>(rhs));
-            switch (op) {
-                case ir::CompareOp::Eq:
-                    return l == r;
-                case ir::CompareOp::Ne:
-                    return l != r;
-                case ir::CompareOp::Lt:
-                    return l < r;
-                case ir::CompareOp::Le:
-                    return l <= r;
-                case ir::CompareOp::Gt:
-                    return l > r;
-                case ir::CompareOp::Ge:
-                    return l >= r;
-            }
-        }
-        return false;
-    }
+// Either a pointer into the table (zero-copy) or an owned computed column.
+using ColResult = std::variant<const ColumnValue*, ColumnValue>;
+
+auto deref_col(const ColResult& r) -> const ColumnValue& {
     return std::visit(
-        [&](const auto& l) -> bool {
-            using T = std::decay_t<decltype(l)>;
-            const T& r = std::get<T>(rhs);
-            switch (op) {
-                case ir::CompareOp::Eq:
-                    return l == r;
-                case ir::CompareOp::Ne:
-                    return l != r;
-                case ir::CompareOp::Lt:
-                    return l < r;
-                case ir::CompareOp::Le:
-                    return l <= r;
-                case ir::CompareOp::Gt:
-                    return l > r;
-                case ir::CompareOp::Ge:
-                    return l >= r;
-            }
-            return false;
+        [](const auto& v) -> const ColumnValue& {
+            if constexpr (std::is_same_v<std::decay_t<decltype(v)>, const ColumnValue*>)
+                return *v;
+            else
+                return v;
         },
-        lhs);
+        r);
 }
 
-auto apply_arith(ir::ArithmeticOp op, const ScalarVal& lhs, const ScalarVal& rhs)
-    -> std::expected<ScalarVal, std::string> {
-    // Arithmetic only on numerics; promote int to double if mixed.
-    auto as_double = [](const ScalarVal& v) -> std::optional<double> {
-        if (const auto* i = std::get_if<std::int64_t>(&v))
-            return static_cast<double>(*i);
-        if (const auto* d = std::get_if<double>(&v))
-            return *d;
-        return std::nullopt;
-    };
-    // Integer arithmetic when both sides are int64.
-    if (std::holds_alternative<std::int64_t>(lhs) && std::holds_alternative<std::int64_t>(rhs)) {
-        std::int64_t l = std::get<std::int64_t>(lhs);
-        std::int64_t r = std::get<std::int64_t>(rhs);
-        switch (op) {
-            case ir::ArithmeticOp::Add:
-                return ScalarVal{l + r};
-            case ir::ArithmeticOp::Sub:
-                return ScalarVal{l - r};
-            case ir::ArithmeticOp::Mul:
-                return ScalarVal{l * r};
-            case ir::ArithmeticOp::Div:
-                if (r == 0)
-                    return std::unexpected("division by zero in filter");
-                return ScalarVal{l / r};
-            case ir::ArithmeticOp::Mod:
-                if (r == 0)
-                    return std::unexpected("modulo by zero in filter");
-                return ScalarVal{l % r};
-        }
+// Flip a comparison operator (swap lhs and rhs).
+auto flip_cmp(ir::CompareOp op) -> ir::CompareOp {
+    switch (op) {
+        case ir::CompareOp::Lt:
+            return ir::CompareOp::Gt;
+        case ir::CompareOp::Le:
+            return ir::CompareOp::Ge;
+        case ir::CompareOp::Gt:
+            return ir::CompareOp::Lt;
+        case ir::CompareOp::Ge:
+            return ir::CompareOp::Le;
+        default:
+            return op;  // Eq, Ne are symmetric
     }
-    // Float arithmetic otherwise.
-    auto l = as_double(lhs);
-    auto r = as_double(rhs);
-    if (!l || !r)
-        return std::unexpected("arithmetic on non-numeric values in filter");
+}
+
+// Element-wise arithmetic: result type = common_type<L, R>.
+template <typename L, typename R>
+auto arith_into(ir::ArithmeticOp op, const L* __restrict__ lp, const R* __restrict__ rp,
+                std::common_type_t<L, R>* __restrict__ dp, std::size_t n) -> void {
+    using Out = std::common_type_t<L, R>;
     switch (op) {
         case ir::ArithmeticOp::Add:
-            return ScalarVal{*l + *r};
+            for (std::size_t i = 0; i < n; ++i)
+                dp[i] = static_cast<Out>(lp[i]) + static_cast<Out>(rp[i]);
+            break;
         case ir::ArithmeticOp::Sub:
-            return ScalarVal{*l - *r};
+            for (std::size_t i = 0; i < n; ++i)
+                dp[i] = static_cast<Out>(lp[i]) - static_cast<Out>(rp[i]);
+            break;
         case ir::ArithmeticOp::Mul:
-            return ScalarVal{*l * *r};
+            for (std::size_t i = 0; i < n; ++i)
+                dp[i] = static_cast<Out>(lp[i]) * static_cast<Out>(rp[i]);
+            break;
         case ir::ArithmeticOp::Div:
-            return ScalarVal{*l / *r};
+            if constexpr (std::is_integral_v<Out>)
+                for (std::size_t i = 0; i < n; ++i)
+                    dp[i] = rp[i] ? static_cast<Out>(lp[i]) / static_cast<Out>(rp[i]) : Out{0};
+            else
+                for (std::size_t i = 0; i < n; ++i)
+                    dp[i] = static_cast<Out>(lp[i]) / static_cast<Out>(rp[i]);
+            break;
         case ir::ArithmeticOp::Mod:
-            return ScalarVal{std::fmod(*l, *r)};
+            if constexpr (std::is_integral_v<Out>)
+                for (std::size_t i = 0; i < n; ++i)
+                    dp[i] = rp[i] ? static_cast<Out>(lp[i]) % static_cast<Out>(rp[i]) : Out{0};
+            else
+                for (std::size_t i = 0; i < n; ++i)
+                    dp[i] = std::fmod(static_cast<Out>(lp[i]), static_cast<Out>(rp[i]));
+            break;
     }
-    return std::unexpected("unknown arithmetic op in filter");
 }
 
-auto get_column_val(const Table& table, const std::string& name, std::size_t row,
-                    const ScalarRegistry* scalars) -> std::expected<ScalarVal, std::string> {
-    if (const auto* col = table.find(name)) {
-        return std::visit([row](const auto& c) -> ScalarVal { return c[row]; }, *col);
-    }
-    // Fall back to scalar registry.
-    if (scalars != nullptr) {
-        auto it = scalars->find(name);
-        if (it != scalars->end()) {
-            return std::visit([](const auto& v) -> ScalarVal { return v; }, it->second);
+// Dispatch arith_into over all numeric column-type combinations.
+auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n)
+    -> std::expected<ColumnValue, std::string> {
+    // int64 × int64 → int64
+    if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
+            Column<std::int64_t> out;
+            out.resize(n);
+            arith_into(op, l->data(), r->data(), out.data(), n);
+            return ColumnValue{std::move(out)};
+        }
+        if (const auto* r = std::get_if<Column<double>>(&rhs)) {  // int64 × double → double
+            Column<double> out;
+            out.resize(n);
+            arith_into(op, l->data(), r->data(), out.data(), n);
+            return ColumnValue{std::move(out)};
         }
     }
-    return std::unexpected("filter: unknown column or scalar '" + name + "'");
+    if (const auto* l = std::get_if<Column<double>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {  // double × int64 → double
+            Column<double> out;
+            out.resize(n);
+            arith_into(op, l->data(), r->data(), out.data(), n);
+            return ColumnValue{std::move(out)};
+        }
+        if (const auto* r = std::get_if<Column<double>>(&rhs)) {  // double × double → double
+            Column<double> out;
+            out.resize(n);
+            arith_into(op, l->data(), r->data(), out.data(), n);
+            return ColumnValue{std::move(out)};
+        }
+    }
+    return std::unexpected("filter: arithmetic on string column");
 }
 
-// Forward declaration.
-auto eval_filter(const ir::FilterExpr& expr, const Table& table, std::size_t row,
-                 const ScalarRegistry* scalars) -> std::expected<ScalarVal, std::string>;
+// Element-wise comparison between a column and a scalar literal.
+// The scalar is hoisted out of the loop — no broadcast allocation.
+template <typename ColT, typename LitT>
+auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict__ cp, LitT rv,
+                         uint8_t* __restrict__ mp, std::size_t n) -> void {
+    using Common = std::common_type_t<ColT, LitT>;
+    const Common crv = static_cast<Common>(rv);
+    switch (op) {
+        case ir::CompareOp::Eq:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(cp[i]) == crv;
+            break;
+        case ir::CompareOp::Ne:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(cp[i]) != crv;
+            break;
+        case ir::CompareOp::Lt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(cp[i]) < crv;
+            break;
+        case ir::CompareOp::Le:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(cp[i]) <= crv;
+            break;
+        case ir::CompareOp::Gt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(cp[i]) > crv;
+            break;
+        case ir::CompareOp::Ge:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(cp[i]) >= crv;
+            break;
+    }
+}
 
-auto eval_filter(const ir::FilterExpr& expr, const Table& table, std::size_t row,
-                 const ScalarRegistry* scalars) -> std::expected<ScalarVal, std::string> {
+// Dispatch column-vs-scalar comparison over all type combinations.
+using LitVal = std::variant<std::int64_t, double, std::string>;
+auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit, std::size_t n)
+    -> std::expected<std::vector<uint8_t>, std::string> {
+    std::vector<uint8_t> mask(n);
+    uint8_t* mp = mask.data();
+    bool ok = std::visit(
+        [&](const auto& col_data) -> bool {
+            using ColT = typename std::decay_t<decltype(col_data)>::value_type;
+            const ColT* cp = col_data.data();
+            return std::visit(
+                [&](const auto& rv) -> bool {
+                    using LitT = std::decay_t<decltype(rv)>;
+                    if constexpr (std::is_same_v<ColT, std::string> &&
+                                  std::is_same_v<LitT, std::string>) {
+                        // String vs string literal: compare element-wise.
+                        switch (op) {
+                            case ir::CompareOp::Eq:
+                                for (std::size_t i = 0; i < n; ++i)
+                                    mp[i] = cp[i] == rv;
+                                break;
+                            case ir::CompareOp::Ne:
+                                for (std::size_t i = 0; i < n; ++i)
+                                    mp[i] = cp[i] != rv;
+                                break;
+                            case ir::CompareOp::Lt:
+                                for (std::size_t i = 0; i < n; ++i)
+                                    mp[i] = cp[i] < rv;
+                                break;
+                            case ir::CompareOp::Le:
+                                for (std::size_t i = 0; i < n; ++i)
+                                    mp[i] = cp[i] <= rv;
+                                break;
+                            case ir::CompareOp::Gt:
+                                for (std::size_t i = 0; i < n; ++i)
+                                    mp[i] = cp[i] > rv;
+                                break;
+                            case ir::CompareOp::Ge:
+                                for (std::size_t i = 0; i < n; ++i)
+                                    mp[i] = cp[i] >= rv;
+                                break;
+                        }
+                        return true;
+                    } else if constexpr (!std::is_same_v<ColT, std::string> &&
+                                         !std::is_same_v<LitT, std::string>) {
+                        cmp_col_scalar_into(op, cp, rv, mp, n);
+                        return true;
+                    }
+                    return false;
+                },
+                lit);
+        },
+        col);
+    if (!ok)
+        return std::unexpected("filter: cannot compare string and numeric");
+    return mask;
+}
+
+// Element-wise comparison between two full columns.
+template <typename L, typename R>
+auto cmp_into(ir::CompareOp op, const L* __restrict__ lp, const R* __restrict__ rp,
+              uint8_t* __restrict__ mp, std::size_t n) -> void {
+    using Common = std::common_type_t<L, R>;
+    switch (op) {
+        case ir::CompareOp::Eq:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(lp[i]) == static_cast<Common>(rp[i]);
+            break;
+        case ir::CompareOp::Ne:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(lp[i]) != static_cast<Common>(rp[i]);
+            break;
+        case ir::CompareOp::Lt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(lp[i]) < static_cast<Common>(rp[i]);
+            break;
+        case ir::CompareOp::Le:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(lp[i]) <= static_cast<Common>(rp[i]);
+            break;
+        case ir::CompareOp::Gt:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(lp[i]) > static_cast<Common>(rp[i]);
+            break;
+        case ir::CompareOp::Ge:
+            for (std::size_t i = 0; i < n; ++i)
+                mp[i] = static_cast<Common>(lp[i]) >= static_cast<Common>(rp[i]);
+            break;
+    }
+}
+
+// Dispatch column-vs-column comparison over all type combinations.
+auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n)
+    -> std::expected<std::vector<uint8_t>, std::string> {
+    std::vector<uint8_t> mask(n);
+    uint8_t* mp = mask.data();
+    if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
+            cmp_into(op, l->data(), r->data(), mp, n);
+            return mask;
+        }
+        if (const auto* r = std::get_if<Column<double>>(&rhs)) {
+            cmp_into(op, l->data(), r->data(), mp, n);
+            return mask;
+        }
+    }
+    if (const auto* l = std::get_if<Column<double>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<double>>(&rhs)) {
+            cmp_into(op, l->data(), r->data(), mp, n);
+            return mask;
+        }
+        if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
+            cmp_into(op, l->data(), r->data(), mp, n);
+            return mask;
+        }
+    }
+    if (const auto* l = std::get_if<Column<std::string>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<std::string>>(&rhs)) {
+            switch (op) {
+                case ir::CompareOp::Eq:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = l->data()[i] == r->data()[i];
+                    break;
+                case ir::CompareOp::Ne:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = l->data()[i] != r->data()[i];
+                    break;
+                case ir::CompareOp::Lt:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = l->data()[i] < r->data()[i];
+                    break;
+                case ir::CompareOp::Le:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = l->data()[i] <= r->data()[i];
+                    break;
+                case ir::CompareOp::Gt:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = l->data()[i] > r->data()[i];
+                    break;
+                case ir::CompareOp::Ge:
+                    for (std::size_t i = 0; i < n; ++i)
+                        mp[i] = l->data()[i] >= r->data()[i];
+                    break;
+            }
+            return mask;
+        }
+    }
+    return std::unexpected("filter: incompatible column types in comparison");
+}
+
+// Evaluate a value sub-expression over all n rows, returning a column.
+// Returns a pointer into the table for simple column references (zero-copy),
+// or an owned ColumnValue for computed intermediates.
+auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const ScalarRegistry* scalars,
+                    std::size_t n) -> std::expected<ColResult, std::string> {
     return std::visit(
-        [&](const auto& node) -> std::expected<ScalarVal, std::string> {
+        [&](const auto& node) -> std::expected<ColResult, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::FilterColumn>) {
-                return get_column_val(table, node.name, row, scalars);
+                if (const auto* col = table.find(node.name))
+                    return ColResult{col};
+                if (scalars != nullptr) {
+                    auto it = scalars->find(node.name);
+                    if (it != scalars->end()) {
+                        // Broadcast scalar into a full column.
+                        ColumnValue cv = std::visit(
+                            [n](const auto& v) -> ColumnValue {
+                                using U = std::decay_t<decltype(v)>;
+                                Column<U> col;
+                                col.resize(n, v);
+                                return ColumnValue{std::move(col)};
+                            },
+                            it->second);
+                        return ColResult{std::move(cv)};
+                    }
+                }
+                return std::unexpected("filter: unknown column '" + node.name + "'");
             } else if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
-                return std::visit([](const auto& v) -> ScalarVal { return v; }, node.value);
+                // Broadcast literal into a full column (fallback; common path avoids this).
+                ColumnValue cv = std::visit(
+                    [n](const auto& v) -> ColumnValue {
+                        using U = std::decay_t<decltype(v)>;
+                        Column<U> col;
+                        col.resize(n, v);
+                        return ColumnValue{std::move(col)};
+                    },
+                    node.value);
+                return ColResult{std::move(cv)};
             } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
-                auto lhs = eval_filter(*node.left, table, row, scalars);
+                auto lhs = eval_value_vec(*node.left, table, scalars, n);
                 if (!lhs)
                     return std::unexpected(lhs.error());
-                auto rhs = eval_filter(*node.right, table, row, scalars);
+                auto rhs = eval_value_vec(*node.right, table, scalars, n);
                 if (!rhs)
                     return std::unexpected(rhs.error());
-                return apply_arith(node.op, *lhs, *rhs);
-            } else if constexpr (std::is_same_v<T, ir::FilterCmp>) {
-                auto lhs = eval_filter(*node.left, table, row, scalars);
-                if (!lhs)
-                    return std::unexpected(lhs.error());
-                auto rhs = eval_filter(*node.right, table, row, scalars);
-                if (!rhs)
-                    return std::unexpected(rhs.error());
-                return ScalarVal{std::int64_t{compare_same_type(node.op, *lhs, *rhs) ? 1 : 0}};
-            } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
-                auto lhs = eval_filter(*node.left, table, row, scalars);
-                if (!lhs)
-                    return std::unexpected(lhs.error());
-                // Short-circuit: if left is false, don't evaluate right.
-                if (const auto* b = std::get_if<std::int64_t>(&*lhs); b && *b == 0)
-                    return ScalarVal{std::int64_t{0}};
-                auto rhs = eval_filter(*node.right, table, row, scalars);
-                if (!rhs)
-                    return std::unexpected(rhs.error());
-                const auto* rb = std::get_if<std::int64_t>(&*rhs);
-                return ScalarVal{std::int64_t{rb && *rb != 0 ? 1 : 0}};
-            } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
-                auto lhs = eval_filter(*node.left, table, row, scalars);
-                if (!lhs)
-                    return std::unexpected(lhs.error());
-                if (const auto* b = std::get_if<std::int64_t>(&*lhs); b && *b != 0)
-                    return ScalarVal{std::int64_t{1}};
-                auto rhs = eval_filter(*node.right, table, row, scalars);
-                if (!rhs)
-                    return std::unexpected(rhs.error());
-                const auto* rb = std::get_if<std::int64_t>(&*rhs);
-                return ScalarVal{std::int64_t{rb && *rb != 0 ? 1 : 0}};
+                auto result = arith_vec(node.op, deref_col(*lhs), deref_col(*rhs), n);
+                if (!result)
+                    return std::unexpected(result.error());
+                return ColResult{std::move(*result)};
             } else {
-                static_assert(std::is_same_v<T, ir::FilterNot>);
-                auto operand = eval_filter(*node.operand, table, row, scalars);
-                if (!operand)
-                    return std::unexpected(operand.error());
-                const auto* b = std::get_if<std::int64_t>(&*operand);
-                return ScalarVal{std::int64_t{b && *b == 0 ? 1 : 0}};
+                return std::unexpected("filter: not a value expression");
+            }
+        },
+        expr.node);
+}
+
+// Compute a uint8_t boolean mask for all n rows.
+// For FilterCmp with a literal on either side, uses the scalar fast-path
+// (compare_col_scalar) which avoids allocating a broadcast column.
+auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRegistry* scalars,
+                  std::size_t n) -> std::expected<std::vector<uint8_t>, std::string> {
+    return std::visit(
+        [&](const auto& node) -> std::expected<std::vector<uint8_t>, std::string> {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::FilterCmp>) {
+                // Fast path: column/expr op literal (no broadcast needed).
+                if (const auto* lit = std::get_if<ir::FilterLiteral>(&node.right->node)) {
+                    auto lhs = eval_value_vec(*node.left, table, scalars, n);
+                    if (!lhs)
+                        return std::unexpected(lhs.error());
+                    return compare_col_scalar(node.op, deref_col(*lhs), lit->value, n);
+                }
+                // Fast path: literal op column/expr (flip the operator).
+                if (const auto* lit = std::get_if<ir::FilterLiteral>(&node.left->node)) {
+                    auto rhs = eval_value_vec(*node.right, table, scalars, n);
+                    if (!rhs)
+                        return std::unexpected(rhs.error());
+                    return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), lit->value, n);
+                }
+                // General: both sides are column expressions.
+                auto lhs = eval_value_vec(*node.left, table, scalars, n);
+                if (!lhs)
+                    return std::unexpected(lhs.error());
+                auto rhs = eval_value_vec(*node.right, table, scalars, n);
+                if (!rhs)
+                    return std::unexpected(rhs.error());
+                return compare_vec(node.op, deref_col(*lhs), deref_col(*rhs), n);
+            } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
+                auto left = compute_mask(*node.left, table, scalars, n);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = compute_mask(*node.right, table, scalars, n);
+                if (!right)
+                    return std::unexpected(right.error());
+                uint8_t* lp = left->data();
+                const uint8_t* rp = right->data();
+                for (std::size_t i = 0; i < n; ++i)
+                    lp[i] &= rp[i];
+                return std::move(*left);
+            } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
+                auto left = compute_mask(*node.left, table, scalars, n);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = compute_mask(*node.right, table, scalars, n);
+                if (!right)
+                    return std::unexpected(right.error());
+                uint8_t* lp = left->data();
+                const uint8_t* rp = right->data();
+                for (std::size_t i = 0; i < n; ++i)
+                    lp[i] |= rp[i];
+                return std::move(*left);
+            } else if constexpr (std::is_same_v<T, ir::FilterNot>) {
+                auto mask = compute_mask(*node.operand, table, scalars, n);
+                if (!mask)
+                    return std::unexpected(mask.error());
+                for (auto& v : *mask)
+                    v ^= 1;
+                return std::move(*mask);
+            } else {
+                return std::unexpected("filter: not a boolean expression");
             }
         },
         expr.node);
@@ -306,27 +535,39 @@ auto eval_filter(const ir::FilterExpr& expr, const Table& table, std::size_t row
 
 auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                   const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
-    std::size_t rows = input.rows();
+    const std::size_t n = input.rows();
 
+    auto mask_result = compute_mask(predicate, input, scalars, n);
+    if (!mask_result)
+        return std::unexpected(mask_result.error());
+    const uint8_t* mp = mask_result->data();
+
+    // Count matching rows for pre-allocation.
+    std::size_t out_n = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        out_n += mp[i];
+
+    // Gather: for each column, copy only the matching rows.
     Table output;
+    output.columns.reserve(input.columns.size());
     for (const auto& entry : input.columns) {
-        output.add_column(entry.name, make_empty_like(*entry.column));
-    }
-
-    for (std::size_t row = 0; row < rows; ++row) {
-        auto result = eval_filter(predicate, input, row, scalars);
-        if (!result)
-            return std::unexpected(result.error());
-        const auto* b = std::get_if<std::int64_t>(&*result);
-        if (!b || *b == 0)
-            continue;
-        for (auto& entry : output.columns) {
-            const auto* source = input.find(entry.name);
-            if (source == nullptr) {
-                return std::unexpected("filter column missing: " + entry.name);
-            }
-            append_value(*entry.column, *source, row);
-        }
+        ColumnValue out_col = std::visit(
+            [&](const auto& src) -> ColumnValue {
+                using ColT = std::decay_t<decltype(src)>;
+                using T = typename ColT::value_type;
+                Column<T> out;
+                out.resize(out_n);
+                const T* sp = src.data();
+                T* dp = out.data();
+                std::size_t j = 0;
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (mp[i])
+                        dp[j++] = sp[i];
+                }
+                return ColumnValue{std::move(out)};
+            },
+            *entry.column);
+        output.add_column(entry.name, std::move(out_col));
     }
     return output;
 }

@@ -1,0 +1,57 @@
+// Quantitative finance demo — Ibex DSL
+// 30 synthetic S&P-like symbols, 252 trading days (2023)
+
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let ohlcv = read_csv("examples/data/ohlcv.csv");
+
+// ── 1. Yearly OHLC summary by symbol ────────────────────────────────────────
+ohlcv[select {
+    open  = first(open),
+    high  = max(high),
+    low   = min(low),
+    close = last(close),
+    avg_vol = mean(volume)
+}, by symbol];
+
+// ── 2. Sector aggregates ─────────────────────────────────────────────────────
+ohlcv[select {
+    avg_close    = mean(close),
+    total_volume = sum(volume),
+    n_sessions   = count()
+}, by sector];
+
+// ── 3. Daily return and up-day frequency per symbol ──────────────────────────
+let with_ret = ohlcv[update { day_ret = (close - open) / open }];
+
+with_ret[filter day_ret > 0.0,
+         select { up_days = count(), avg_up_ret = mean(day_ret) },
+         by symbol];
+
+// ── 4. Intraday range > 0.8% — high-vol sessions ────────────────────────────
+let with_range = ohlcv[update { range_pct = (high - low) / open }];
+
+with_range[filter range_pct > 0.008,
+           select { n_days = count(), avg_range = mean(range_pct) },
+           by symbol];
+
+// ── 5. VWAP proxy per symbol: sum(close * volume) / sum(volume) ──────────────
+let with_notional = ohlcv[update { notional = close * volume }];
+
+with_notional[select {
+    total_notional = sum(notional),
+    total_volume   = sum(volume)
+}, by symbol];
+
+// ── 6. Tech sector — ranked by best close ────────────────────────────────────
+ohlcv[filter sector == "Tech",
+      select { high = max(close), low = min(close) },
+      by symbol]
+[order { high desc }];
+
+// ── 7. Momentum screen: symbols up > 130 of 252 days ─────────────────────────
+let up_counts = with_ret[filter day_ret > 0.0,
+                         select { up_days = count() },
+                         by symbol];
+
+up_counts[filter up_days > 130];

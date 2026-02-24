@@ -25,3 +25,6 @@ benchmarking/results/compiled/**
 *.parquet
 *.so
 tests/data/iris
+
+# Python
+**/__pycache__/**

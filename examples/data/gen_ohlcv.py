@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Generate synthetic OHLCV data for quant finance examples.
+"""Generate synthetic market data for Ibex quant finance demo.
 
 Outputs (written to the directory of this script):
-  ohlcv.csv   — symbol, date, open, high, low, close, volume
+  ohlcv.csv        — symbol, sector, date, open, high, low, close, volume
+  fundamentals.csv — symbol, market_cap_bn, beta, pe_ratio, div_yield, analyst_rating
 
-30 symbols × 252 trading days ≈ 7,560 rows.
+30 symbols × 252 trading days ≈ 7,560 OHLCV rows + 30 fundamentals rows.
 Prices follow correlated GBM; volumes follow log-normal.
 """
 
@@ -28,6 +29,40 @@ SECTORS = {
     "PG":   "Staples","HD":   "Retail", "MRK":  "Health", "COST": "Retail","ABBV":  "Health",
     "CVX":  "Energy", "KO":   "Staples","WMT":  "Retail", "BAC":  "Fin",   "CRM":  "Tech",
     "PEP":  "Staples","TMO":  "Health", "ACN":  "Tech",   "AMD":  "Tech",  "DHR":  "Health",
+}
+
+# Static fundamentals: (market_cap_bn, beta, pe_ratio, div_yield_pct, analyst_rating_1to5)
+FUNDAMENTALS = {
+    "AAPL":  (2800, 1.20, 29.0, 0.5, 4.2),
+    "MSFT":  (2600, 0.90, 35.0, 0.8, 4.5),
+    "AMZN":  (1500, 1.30, 60.0, 0.0, 4.3),
+    "NVDA":  (1200, 1.70, 65.0, 0.1, 4.6),
+    "GOOGL": (1600, 1.10, 25.0, 0.0, 4.1),
+    "META":  ( 900, 1.40, 20.0, 0.0, 3.9),
+    "TSLA":  ( 700, 2.00, 75.0, 0.0, 3.2),
+    "BRK":   ( 800, 0.85, 15.0, 0.0, 4.0),
+    "LLY":   ( 450, 0.50, 55.0, 1.0, 4.4),
+    "JPM":   ( 450, 1.10, 11.0, 2.5, 3.8),
+    "V":     ( 500, 0.95, 30.0, 0.7, 4.2),
+    "UNH":   ( 450, 0.60, 22.0, 1.3, 4.1),
+    "XOM":   ( 400, 1.20, 10.0, 3.5, 3.5),
+    "MA":    ( 400, 1.00, 32.0, 0.6, 4.3),
+    "AVGO":  ( 350, 1.30, 28.0, 2.0, 4.2),
+    "PG":    ( 350, 0.55, 24.0, 2.4, 3.7),
+    "HD":    ( 300, 1.05, 19.0, 2.6, 3.8),
+    "MRK":   ( 270, 0.65, 16.0, 2.8, 3.9),
+    "COST":  ( 260, 0.80, 38.0, 0.7, 4.0),
+    "ABBV":  ( 250, 0.60, 18.0, 4.2, 3.6),
+    "CVX":   ( 280, 1.15, 11.0, 3.8, 3.4),
+    "KO":    ( 260, 0.55, 23.0, 3.1, 3.5),
+    "WMT":   ( 420, 0.60, 27.0, 1.5, 3.9),
+    "BAC":   ( 280, 1.35, 12.0, 2.2, 3.6),
+    "CRM":   ( 200, 1.25, 45.0, 0.0, 3.7),
+    "PEP":   ( 230, 0.60, 26.0, 2.8, 3.6),
+    "TMO":   ( 200, 0.85, 30.0, 0.3, 4.0),
+    "ACN":   ( 190, 1.05, 28.0, 1.4, 3.8),
+    "AMD":   ( 180, 1.90, 55.0, 0.0, 4.1),
+    "DHR":   ( 170, 0.80, 32.0, 0.4, 3.9),
 }
 
 N_DAYS   = 252
@@ -93,6 +128,21 @@ def make_ohlcv(rng, prices: np.ndarray, n_sym: int, n_days: int) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
+def make_fundamentals() -> pd.DataFrame:
+    rows = []
+    for sym in TICKERS:
+        market_cap, beta, pe, div, rating = FUNDAMENTALS[sym]
+        rows.append({
+            "symbol":          sym,
+            "market_cap_bn":   float(market_cap),
+            "beta":            beta,
+            "pe_ratio":        pe,
+            "div_yield":       div,
+            "analyst_rating":  rating,
+        })
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     out_dir = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +159,12 @@ def main() -> None:
     print(f"  symbols: {n_sym}, days: {N_DAYS}")
     print(f"  price range: {df['close'].min():.2f} – {df['close'].max():.2f}")
     print(f"  avg daily volume: {df['volume'].mean():,.0f}")
+
+    fund = make_fundamentals()
+    fpath = out_dir / "fundamentals.csv"
+    fund.to_csv(fpath, index=False)
+    print(f"wrote {fpath}  ({len(fund)} rows)")
+    print(f"  market cap range: {fund['market_cap_bn'].min():.0f}bn – {fund['market_cap_bn'].max():.0f}bn")
 
 
 if __name__ == "__main__":

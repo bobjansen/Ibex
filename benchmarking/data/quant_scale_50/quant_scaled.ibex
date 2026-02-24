@@ -14,8 +14,8 @@
 
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 
-let ohlcv = read_csv("examples/data/ohlcv.csv");
-let fund   = read_csv("examples/data/fundamentals.csv");
+let ohlcv = read_csv("/home/brj/ibex/benchmarking/data/quant_scale_50/ohlcv.csv");
+let fund   = read_csv("/home/brj/ibex/examples/data/fundamentals.csv");
 
 // ── 1. Enrich every row: daily return, intraday range, notional traded ────────
 let daily = ohlcv[update {

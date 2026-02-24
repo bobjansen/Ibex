@@ -21,6 +21,69 @@ let annotated = prices[update { price_k = price / 1000.0 }];
 let enriched = prices join ohlc on symbol;
 ```
 
+## Language at a glance
+
+### Load and filter
+
+```
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let iris = read_csv("data/iris.csv");
+
+// Filter rows, select columns
+iris[filter `Sepal.Length` > 5.0, select { Species, `Sepal.Length` }];
+```
+
+### Aggregation
+
+```
+// Mean sepal length per species
+iris[select { mean_sl = mean(`Sepal.Length`) }, by Species];
+```
+
+### Update (add / replace columns)
+
+```
+// Add derived columns — all existing columns are preserved
+iris[update { sl_doubled = `Sepal.Length` * 2.0 }];
+```
+
+### Distinct
+
+```
+// Unique species values
+iris[distinct `Species`];
+
+// Unique (Species, Sepal.Length) pairs
+iris[distinct { `Species`, `Sepal.Length` }];
+```
+
+### Order
+
+```
+// Order by a single key (ascending by default)
+iris[order `Species`];
+
+// Order by multiple keys with explicit directions
+iris[order { `Species` asc, `Sepal.Length` desc }];
+
+// Order by all columns (schema order)
+iris[order];
+```
+
+### Scalar extraction
+
+```
+let total = scalar(prices[select { total = sum(price) }], total);
+```
+
+### Joins
+
+```
+let enriched = prices join ohlc on symbol;
+let with_meta = prices left join metadata on symbol;
+```
+
 ## Benchmark
 
 Aggregation benchmarks on 4 M rows (`prices.csv`, 252 symbols).
@@ -93,69 +156,6 @@ ibex           132      3.614      27.38      1.00x
 polars-mt       40      3.040      75.99      2.78x
 polars-st      112      3.006      26.84      0.98x
 pandas          35      3.034      86.70      3.17x
-```
-
-## Language at a glance
-
-### Load and filter
-
-```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-
-let iris = read_csv("data/iris.csv");
-
-// Filter rows, select columns
-iris[filter `Sepal.Length` > 5.0, select { Species, `Sepal.Length` }];
-```
-
-### Aggregation
-
-```
-// Mean sepal length per species
-iris[select { mean_sl = mean(`Sepal.Length`) }, by Species];
-```
-
-### Update (add / replace columns)
-
-```
-// Add derived columns — all existing columns are preserved
-iris[update { sl_doubled = `Sepal.Length` * 2.0 }];
-```
-
-### Distinct
-
-```
-// Unique species values
-iris[distinct `Species`];
-
-// Unique (Species, Sepal.Length) pairs
-iris[distinct { `Species`, `Sepal.Length` }];
-```
-
-### Order
-
-```
-// Order by a single key (ascending by default)
-iris[order `Species`];
-
-// Order by multiple keys with explicit directions
-iris[order { `Species` asc, `Sepal.Length` desc }];
-
-// Order by all columns (schema order)
-iris[order];
-```
-
-### Scalar extraction
-
-```
-let total = scalar(prices[select { total = sum(price) }], total);
-```
-
-### Joins
-
-```
-let enriched = prices join ohlc on symbol;
-let with_meta = prices left join metadata on symbol;
 ```
 
 ## Architecture

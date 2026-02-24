@@ -20,6 +20,7 @@ compile_commands.json
 Thumbs.db
 
 # Data
+benchmarking/data/**
 benchmarking/results/compiled/**
 *.csv
 *.parquet

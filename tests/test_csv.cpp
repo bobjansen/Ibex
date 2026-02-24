@@ -19,7 +19,7 @@ auto tmp(const char* name) -> std::filesystem::path {
 auto get_string_at(const ibex::runtime::Table& table, const char* name, std::size_t row)
     -> std::string {
     if (const auto* col = std::get_if<ibex::Column<std::string>>(table.find(name))) {
-        return (*col)[row];
+        return std::string((*col)[row]);
     }
     if (const auto* col = std::get_if<ibex::Column<ibex::Categorical>>(table.find(name))) {
         return std::string((*col)[row]);

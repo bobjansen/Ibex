@@ -408,7 +408,7 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                     std::vector<std::string> data;
                     data.reserve(n);
                     for (std::size_t i = 0; i < n; ++i) {
-                        data.push_back(col[i]);
+                        data.emplace_back(col[i]);
                     }
                     return ibex::Column<std::string>(std::move(data));
                 } else {

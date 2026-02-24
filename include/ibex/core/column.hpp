@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <concepts>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -31,6 +32,8 @@ class Column {
 
     static_assert(ColumnElement<T>,
                   "Column<T> requires T to satisfy ColumnElement (regular + totally ordered).");
+    static_assert(!std::is_same_v<T, std::string>,
+                  "Use the Column<std::string> specialization (flat buffer).");
 
     Column() = default;
 
@@ -316,6 +319,120 @@ class Column<Categorical> {
     std::shared_ptr<std::vector<std::string>> dict_;
     std::shared_ptr<std::unordered_map<std::string, code_type>> index_;
     std::vector<code_type> codes_;
+};
+
+/// Specialization for non-categorical strings using an Arrow-style flat buffer.
+///
+/// Storage layout:
+///   offsets_: n+1 uint32_t values; offsets_[i..i+1) is the char range of row i
+///   chars_:   all string bytes concatenated contiguously
+///
+/// Benefits over vector<string>:
+///   - No per-string heap allocation regardless of length
+///   - Filter gather is 2-pass memcpy (sequential reads on sorted indices)
+///   - Zero SSO overhead for large-cardinality string columns
+template <>
+class Column<std::string> {
+    std::vector<std::uint32_t> offsets_;  // size = rows+1; offsets_[0]=0 always
+    std::vector<char> chars_;             // all string bytes concatenated
+
+   public:
+    using value_type = std::string_view;
+    using size_type = std::size_t;
+
+    // Default: empty column ready to receive push_backs.
+    Column() { offsets_.push_back(0); }
+
+    // From vector<string> (used by CSV reader).
+    explicit Column(std::vector<std::string> vals) {
+        offsets_.reserve(vals.size() + 1);
+        offsets_.push_back(0);
+        std::size_t total = 0;
+        for (const auto& s : vals)
+            total += s.size();
+        chars_.reserve(total);
+        for (const auto& s : vals) {
+            chars_.insert(chars_.end(), s.begin(), s.end());
+            offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
+        }
+    }
+
+    // Initializer list (used in REPL, tests); const char* → string_view is implicit.
+    Column(std::initializer_list<std::string_view> init) : Column() {
+        for (auto sv : init)
+            push_back(sv);
+    }
+
+    [[nodiscard]] auto size() const noexcept -> size_type { return offsets_.size() - 1; }
+    [[nodiscard]] auto empty() const noexcept -> bool { return offsets_.size() == 1; }
+
+    [[nodiscard]] auto operator[](size_type i) const noexcept -> std::string_view {
+        return {chars_.data() + offsets_[i], offsets_[i + 1] - offsets_[i]};
+    }
+
+    [[nodiscard]] auto at(size_type i) const -> std::string_view {
+        if (i >= size())
+            throw std::out_of_range("Column<std::string>::at");
+        return (*this)[i];
+    }
+
+    void push_back(std::string_view sv) {
+        chars_.insert(chars_.end(), sv.begin(), sv.end());
+        offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
+    }
+
+    void reserve(size_type n, size_type chars_hint = 0) {
+        offsets_.reserve(n + 1);
+        if (chars_hint)
+            chars_.reserve(chars_hint);
+    }
+
+    void clear() noexcept {
+        offsets_.clear();
+        offsets_.push_back(0);
+        chars_.clear();
+    }
+
+    // Raw access for optimized gather in filter_table.
+    [[nodiscard]] const std::uint32_t* offsets_data() const noexcept { return offsets_.data(); }
+    [[nodiscard]] const char* chars_data() const noexcept { return chars_.data(); }
+    [[nodiscard]] std::uint32_t* offsets_data() noexcept { return offsets_.data(); }
+    [[nodiscard]] char* chars_data() noexcept { return chars_.data(); }
+
+    // Resize to n rows, all filled with the same value.
+    void resize(size_type n, std::string_view fill = {}) {
+        offsets_.clear();
+        chars_.clear();
+        offsets_.reserve(n + 1);
+        offsets_.push_back(0);
+        if (n > 0 && !fill.empty())
+            chars_.reserve(n * fill.size());
+        for (size_type i = 0; i < n; ++i) {
+            chars_.insert(chars_.end(), fill.begin(), fill.end());
+            offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
+        }
+    }
+
+    // Allocate output storage for a gather of n_rows rows with total_chars bytes.
+    void resize_for_gather(size_type n_rows, size_type total_chars) {
+        offsets_.resize(n_rows + 1);
+        chars_.resize(total_chars);
+    }
+
+    // Iterator: yields string_view per row.
+    struct Iterator {
+        const Column* col;
+        size_type i;
+        auto operator*() const -> std::string_view { return (*col)[i]; }
+        auto operator++() -> Iterator& {
+            ++i;
+            return *this;
+        }
+        auto operator==(const Iterator& o) const -> bool { return i == o.i; }
+        auto operator!=(const Iterator& o) const -> bool { return i != o.i; }
+    };
+    [[nodiscard]] auto begin() const noexcept -> Iterator { return {this, 0}; }
+    [[nodiscard]] auto end() const noexcept -> Iterator { return {this, size()}; }
 };
 
 }  // namespace ibex

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -708,6 +709,27 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                     for (std::size_t j = 0; j < out_n; ++j) {
                         dp[j] = sp[selected[j]];
                     }
+                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    // Two-pass flat-buffer gather: compute total bytes, then bulk-memcpy slabs.
+                    const uint32_t* src_off = src.offsets_data();
+                    std::size_t total_chars = 0;
+                    for (std::size_t j = 0; j < out_n; ++j) {
+                        std::size_t si = selected[j];
+                        total_chars += src_off[si + 1] - src_off[si];
+                    }
+                    dst->resize_for_gather(out_n, total_chars);
+                    uint32_t* dst_off = dst->offsets_data();
+                    char* dst_char = dst->chars_data();
+                    const char* src_char = src.chars_data();
+                    dst_off[0] = 0;
+                    uint32_t cur = 0;
+                    for (std::size_t j = 0; j < out_n; ++j) {
+                        std::size_t si = selected[j];
+                        uint32_t len = src_off[si + 1] - src_off[si];
+                        std::memcpy(dst_char + cur, src_char + src_off[si], len);
+                        cur += len;
+                        dst_off[j + 1] = cur;
+                    }
                 } else {
                     using T = typename ColT::value_type;
                     dst->resize(out_n);
@@ -828,7 +850,8 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
     return std::visit(
         [&](const auto& col) -> ScalarValue {
             using ColType = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+            if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
+                          std::is_same_v<ColType, Column<std::string>>) {
                 return std::string(col[row]);
             } else {
                 return col[row];
@@ -988,7 +1011,8 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 } else {
                     throw std::runtime_error("type mismatch");
                 }
-            } else if constexpr (std::is_same_v<ValueType, std::string>) {
+            } else if constexpr (std::is_same_v<ValueType, std::string_view>) {
+                // Column<std::string> flat-buffer specialization uses value_type=string_view.
                 if (const auto* str_value = std::get_if<std::string>(&value)) {
                     col.push_back(*str_value);
                 } else {
@@ -2744,7 +2768,8 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         return std::visit(
             [&](const auto& column) -> ExprValue {
                 using ColType = std::decay_t<decltype(column)>;
-                if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
+                              std::is_same_v<ColType, Column<std::string>>) {
                     return std::string(column[row]);
                 } else {
                     return column[row];

@@ -54,6 +54,47 @@ parsing overhead is negligble.
 `ibex+parse` includes text parsing and IR lowering; the overhead is negligible.
 See [`benchmarking/`](benchmarking/) for methodology and reproduction instructions.
 
+## Quant Example Benchmark (Compute-Only)
+
+`examples/quant.ibex` has equivalent pandas/polars scripts:
+- `examples/quant_pandas.py`
+- `examples/quant_polars.py`
+
+For fair comparison, use the compute-only harness:
+
+```bash
+uv run --project benchmarking benchmarking/bench_quant.py \
+  --min-seconds 3 --scale 50
+```
+
+This runs:
+- ibex (compute-only generated script, calibrated repeats)
+- polars multi-threaded (`polars-mt`)
+- polars single-threaded (`polars-st`, `POLARS_MAX_THREADS=1`)
+- pandas
+
+Recent run on this repo:
+
+```
+framework    iters    total_s     avg_ms    vs_ibex
+--------------------------------------------------------
+ibex            21      2.881     137.17      1.00x
+polars-mt       29      3.054     105.31      0.77x
+polars-st       26      3.070     118.06      0.86x
+pandas          10      3.005     300.48      2.19x
+```
+
+At smaller scale (`--scale 10`), ibex and single-threaded polars are near parity:
+
+```
+framework    iters    total_s     avg_ms    vs_ibex
+--------------------------------------------------------
+ibex           132      3.614      27.38      1.00x
+polars-mt       40      3.040      75.99      2.78x
+polars-st      112      3.006      26.84      0.98x
+pandas          35      3.034      86.70      3.17x
+```
+
 ## Language at a glance
 
 ### Load and filter

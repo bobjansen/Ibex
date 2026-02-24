@@ -360,8 +360,15 @@ auto Emitter::emit_filter_expr(const ir::FilterExpr& expr) -> std::string {
                             return "ibex::ops::filter_int(std::int64_t{" + std::to_string(v) + "})";
                         } else if constexpr (std::is_same_v<V, double>) {
                             return "ibex::ops::filter_dbl(" + format_double(v) + ")";
-                        } else {
+                        } else if constexpr (std::is_same_v<V, std::string>) {
                             return "ibex::ops::filter_str(\"" + escape_string(v) + "\")";
+                        } else if constexpr (std::is_same_v<V, Date>) {
+                            return "ibex::ops::filter_date(ibex::Date{std::int32_t{" +
+                                   std::to_string(v.days) + "}})";
+                        } else {
+                            static_assert(std::is_same_v<V, Timestamp>);
+                            return "ibex::ops::filter_timestamp(ibex::Timestamp{std::int64_t{" +
+                                   std::to_string(v.nanos) + "}})";
                         }
                     },
                     node.value);
@@ -401,8 +408,15 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                             return "ibex::ops::int_lit(std::int64_t{" + std::to_string(v) + "})";
                         } else if constexpr (std::is_same_v<V, double>) {
                             return "ibex::ops::dbl_lit(" + format_double(v) + ")";
-                        } else {
+                        } else if constexpr (std::is_same_v<V, std::string>) {
                             return "ibex::ops::str_lit(\"" + escape_string(v) + "\")";
+                        } else if constexpr (std::is_same_v<V, Date>) {
+                            return "ibex::ops::date_lit(ibex::Date{std::int32_t{" +
+                                   std::to_string(v.days) + "}})";
+                        } else {
+                            static_assert(std::is_same_v<V, Timestamp>);
+                            return "ibex::ops::timestamp_lit(ibex::Timestamp{std::int64_t{" +
+                                   std::to_string(v.nanos) + "}})";
                         }
                     },
                     node.value);
@@ -472,8 +486,14 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                             return std::to_string(v);
                         } else if constexpr (std::is_same_v<V, double>) {
                             return format_double(v);
-                        } else {
+                        } else if constexpr (std::is_same_v<V, std::string>) {
                             return "\"" + escape_string(v) + "\"";
+                        } else if constexpr (std::is_same_v<V, Date>) {
+                            return "ibex::Date{std::int32_t{" + std::to_string(v.days) + "}}";
+                        } else {
+                            static_assert(std::is_same_v<V, Timestamp>);
+                            return "ibex::Timestamp{std::int64_t{" + std::to_string(v.nanos) +
+                                   "}}";
                         }
                     },
                     node.value);

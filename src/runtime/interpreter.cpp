@@ -64,6 +64,41 @@ auto format_columns(const Table& table) -> std::string {
     return out;
 }
 
+auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
+                           const std::unordered_map<std::string, std::size_t>& index) -> bool {
+    for (const auto& key : keys) {
+        if (!index.contains(key.name)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto ordering_keys_for_table(const Table& input, const std::vector<ir::OrderKey>& keys)
+    -> std::vector<ir::OrderKey> {
+    if (!keys.empty()) {
+        return keys;
+    }
+    std::vector<ir::OrderKey> resolved;
+    resolved.reserve(input.columns.size());
+    for (const auto& entry : input.columns) {
+        resolved.push_back(ir::OrderKey{.name = entry.name, .ascending = true});
+    }
+    return resolved;
+}
+
+auto normalize_time_index(Table& table) -> void {
+    if (!table.time_index.has_value()) {
+        return;
+    }
+    if (table.ordering.has_value() && table.ordering->size() == 1 &&
+        table.ordering->front().name == *table.time_index &&
+        table.ordering->front().ascending) {
+        return;
+    }
+    table.ordering = std::vector<ir::OrderKey>{{.name = *table.time_index, .ascending = true}};
+}
+
 auto format_tables(const TableRegistry& registry) -> std::string {
     if (registry.empty()) {
         return "<none>";
@@ -268,7 +303,7 @@ auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict__ cp, LitT rv,
 }
 
 // Dispatch column-vs-scalar comparison over all type combinations.
-using LitVal = std::variant<std::int64_t, double, std::string>;
+using LitVal = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 template <typename T>
 constexpr bool is_string_like_v =
     std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>;
@@ -367,6 +402,68 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
         return std::unexpected("filter: cannot compare string and numeric");
     }
 
+    if (const auto* date_value = std::get_if<Date>(&lit)) {
+        if (const auto* date_col = std::get_if<Column<Date>>(&col)) {
+            const auto rhs = date_value->days;
+            for (std::size_t idx = 0; idx < n; ++idx) {
+                const auto lhs = date_col->data()[idx].days;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[idx] = lhs == rhs;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[idx] = lhs != rhs;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[idx] = lhs < rhs;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[idx] = lhs <= rhs;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[idx] = lhs > rhs;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[idx] = lhs >= rhs;
+                        break;
+                }
+            }
+            return mask;
+        }
+        return std::unexpected("filter: cannot compare date and non-date");
+    }
+
+    if (const auto* ts_value = std::get_if<Timestamp>(&lit)) {
+        if (const auto* ts_col = std::get_if<Column<Timestamp>>(&col)) {
+            const auto rhs = ts_value->nanos;
+            for (std::size_t idx = 0; idx < n; ++idx) {
+                const auto lhs = ts_col->data()[idx].nanos;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[idx] = lhs == rhs;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[idx] = lhs != rhs;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[idx] = lhs < rhs;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[idx] = lhs <= rhs;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[idx] = lhs > rhs;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[idx] = lhs >= rhs;
+                        break;
+                }
+            }
+            return mask;
+        }
+        return std::unexpected("filter: cannot compare timestamp and non-timestamp");
+    }
+
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(&col)) {
         const std::int64_t* cp = int_col->data();
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
@@ -386,6 +483,118 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             cmp_col_scalar_into(op, cp, *d, mp, n);
+            return mask;
+        }
+    }
+    if (const auto* date_col = std::get_if<Column<Date>>(&col)) {
+        if (const auto* i = std::get_if<std::int64_t>(&lit)) {
+            const std::int64_t rhs = *i;
+            for (std::size_t idx = 0; idx < n; ++idx) {
+                const std::int64_t lhs = date_col->data()[idx].days;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[idx] = lhs == rhs;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[idx] = lhs != rhs;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[idx] = lhs < rhs;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[idx] = lhs <= rhs;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[idx] = lhs > rhs;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[idx] = lhs >= rhs;
+                        break;
+                }
+            }
+            return mask;
+        }
+        if (const auto* d = std::get_if<double>(&lit)) {
+            const double rhs = *d;
+            for (std::size_t idx = 0; idx < n; ++idx) {
+                const double lhs = static_cast<double>(date_col->data()[idx].days);
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[idx] = lhs == rhs;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[idx] = lhs != rhs;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[idx] = lhs < rhs;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[idx] = lhs <= rhs;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[idx] = lhs > rhs;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[idx] = lhs >= rhs;
+                        break;
+                }
+            }
+            return mask;
+        }
+    }
+    if (const auto* ts_col = std::get_if<Column<Timestamp>>(&col)) {
+        if (const auto* i = std::get_if<std::int64_t>(&lit)) {
+            const std::int64_t rhs = *i;
+            for (std::size_t idx = 0; idx < n; ++idx) {
+                const std::int64_t lhs = ts_col->data()[idx].nanos;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[idx] = lhs == rhs;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[idx] = lhs != rhs;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[idx] = lhs < rhs;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[idx] = lhs <= rhs;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[idx] = lhs > rhs;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[idx] = lhs >= rhs;
+                        break;
+                }
+            }
+            return mask;
+        }
+        if (const auto* d = std::get_if<double>(&lit)) {
+            const double rhs = *d;
+            for (std::size_t idx = 0; idx < n; ++idx) {
+                const double lhs = static_cast<double>(ts_col->data()[idx].nanos);
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[idx] = lhs == rhs;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[idx] = lhs != rhs;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[idx] = lhs < rhs;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[idx] = lhs <= rhs;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[idx] = lhs > rhs;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[idx] = lhs >= rhs;
+                        break;
+                }
+            }
             return mask;
         }
     }
@@ -448,6 +657,64 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
         }
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
             cmp_into(op, l->data(), r->data(), mp, n);
+            return mask;
+        }
+    }
+    if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<Date>>(&rhs)) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto lv = l->data()[i].days;
+                const auto rv = r->data()[i].days;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[i] = lv == rv;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[i] = lv != rv;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[i] = lv < rv;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[i] = lv <= rv;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[i] = lv > rv;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[i] = lv >= rv;
+                        break;
+                }
+            }
+            return mask;
+        }
+    }
+    if (const auto* l = std::get_if<Column<Timestamp>>(&lhs)) {
+        if (const auto* r = std::get_if<Column<Timestamp>>(&rhs)) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto lv = l->data()[i].nanos;
+                const auto rv = r->data()[i].nanos;
+                switch (op) {
+                    case ir::CompareOp::Eq:
+                        mp[i] = lv == rv;
+                        break;
+                    case ir::CompareOp::Ne:
+                        mp[i] = lv != rv;
+                        break;
+                    case ir::CompareOp::Lt:
+                        mp[i] = lv < rv;
+                        break;
+                    case ir::CompareOp::Le:
+                        mp[i] = lv <= rv;
+                        break;
+                    case ir::CompareOp::Gt:
+                        mp[i] = lv > rv;
+                        break;
+                    case ir::CompareOp::Ge:
+                        mp[i] = lv >= rv;
+                        break;
+                }
+            }
             return mask;
         }
     }
@@ -770,6 +1037,9 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
             copy_column(c);
         }
     }
+    output.ordering = input.ordering;
+    output.time_index = input.time_index;
+    normalize_time_index(output);
     return output;
 }
 
@@ -784,10 +1054,20 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
         }
         output.add_column(col.name, *source);
     }
+    if (input.ordering.has_value() && ordering_keys_present(*input.ordering, output.index)) {
+        output.ordering = input.ordering;
+    }
+    if (input.time_index.has_value()) {
+        if (output.index.contains(*input.time_index)) {
+            output.time_index = input.time_index;
+        } else {
+            output.time_index.reset();
+            output.ordering.reset();
+        }
+    }
+    normalize_time_index(output);
     return output;
 }
-
-using ScalarValue = std::variant<std::int64_t, double, std::string>;
 
 struct Key {
     std::vector<ScalarValue> values;
@@ -816,9 +1096,11 @@ enum class ExprType : std::uint8_t {
     Int,
     Double,
     String,
+    Date,
+    Timestamp,
 };
 
-using ExprValue = std::variant<std::int64_t, double, std::string>;
+using ExprValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 
 struct AggSlot {
     ir::AggFunc func = ir::AggFunc::Sum;
@@ -843,6 +1125,12 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     if (std::holds_alternative<Column<double>>(column)) {
         return ExprType::Double;
     }
+    if (std::holds_alternative<Column<Date>>(column)) {
+        return ExprType::Date;
+    }
+    if (std::holds_alternative<Column<Timestamp>>(column)) {
+        return ExprType::Timestamp;
+    }
     return ExprType::String;
 }
 
@@ -853,6 +1141,9 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
             if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
                           std::is_same_v<ColType, Column<std::string>>) {
                 return std::string(col[row]);
+            } else if constexpr (std::is_same_v<ColType, Column<Date>> ||
+                                 std::is_same_v<ColType, Column<Timestamp>>) {
+                return col[row];
             } else {
                 return col[row];
             }
@@ -872,7 +1163,10 @@ auto string_view_at(const ColumnValue& column, std::size_t row) -> std::string_v
 
 auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
     if (input.columns.empty()) {
-        return input;
+        Table output = input;
+        output.ordering.reset();
+        output.time_index.reset();
+        return output;
     }
     std::size_t rows = input.rows();
     Table output;
@@ -900,6 +1194,8 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
             append_value(*output.columns[col].column, *input.columns[col].column, row);
         }
     }
+    output.ordering.reset();
+    output.time_index.reset();
     return output;
 }
 
@@ -914,26 +1210,30 @@ auto column_kind(const ColumnValue& column) -> ExprType;
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     -> std::expected<Table, std::string> {
     std::size_t rows = input.rows();
+    if (input.time_index.has_value()) {
+        if (keys.size() != 1 || keys[0].name != *input.time_index || !keys[0].ascending) {
+            return std::unexpected(
+                "order on TimeFrame must be by time index ascending");
+        }
+    }
+    auto resolved_keys = ordering_keys_for_table(input, keys);
     if (rows <= 1 || input.columns.empty()) {
-        return input;
+        Table output = input;
+        output.ordering = resolved_keys;
+        output.time_index = input.time_index;
+        normalize_time_index(output);
+        return output;
     }
 
     std::vector<OrderColumn> order_cols;
-    if (keys.empty()) {
-        order_cols.reserve(input.columns.size());
-        for (const auto& entry : input.columns) {
-            order_cols.push_back(OrderColumn{entry.column.get(), true, column_kind(*entry.column)});
+    order_cols.reserve(resolved_keys.size());
+    for (const auto& key : resolved_keys) {
+        const auto* column = input.find(key.name);
+        if (column == nullptr) {
+            return std::unexpected("order column not found: " + key.name +
+                                   " (available: " + format_columns(input) + ")");
         }
-    } else {
-        order_cols.reserve(keys.size());
-        for (const auto& key : keys) {
-            const auto* column = input.find(key.name);
-            if (column == nullptr) {
-                return std::unexpected("order column not found: " + key.name +
-                                       " (available: " + format_columns(input) + ")");
-            }
-            order_cols.push_back(OrderColumn{column, key.ascending, column_kind(*column)});
-        }
+        order_cols.push_back(OrderColumn{column, key.ascending, column_kind(*column)});
     }
 
     std::vector<std::size_t> idx(rows);
@@ -966,6 +1266,22 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                     }
                     return col.ascending ? (lv < rv) : (lv > rv);
                 }
+                case ExprType::Date: {
+                    auto lv = std::get<Column<Date>>(*col.column)[lhs].days;
+                    auto rv = std::get<Column<Date>>(*col.column)[rhs].days;
+                    if (lv == rv) {
+                        break;
+                    }
+                    return col.ascending ? (lv < rv) : (lv > rv);
+                }
+                case ExprType::Timestamp: {
+                    auto lv = std::get<Column<Timestamp>>(*col.column)[lhs].nanos;
+                    auto rv = std::get<Column<Timestamp>>(*col.column)[rhs].nanos;
+                    if (lv == rv) {
+                        break;
+                    }
+                    return col.ascending ? (lv < rv) : (lv > rv);
+                }
             }
         }
         return lhs < rhs;
@@ -987,6 +1303,9 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
             append_value(*output.columns[col].column, *input.columns[col].column, row);
         }
     }
+    output.ordering = std::move(resolved_keys);
+    output.time_index = input.time_index;
+    normalize_time_index(output);
     return output;
 }
 
@@ -1018,6 +1337,22 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 } else {
                     throw std::runtime_error("type mismatch");
                 }
+            } else if constexpr (std::is_same_v<ValueType, Date>) {
+                if (const auto* date_value = std::get_if<Date>(&value)) {
+                    col.push_back(*date_value);
+                } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(Date{static_cast<std::int32_t>(*int_value)});
+                } else {
+                    throw std::runtime_error("type mismatch");
+                }
+            } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
+                if (const auto* ts_value = std::get_if<Timestamp>(&value)) {
+                    col.push_back(*ts_value);
+                } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(Timestamp{*int_value});
+                } else {
+                    throw std::runtime_error("type mismatch");
+                }
             } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
                 if (const auto* str_value = std::get_if<std::string>(&value)) {
                     col.push_back(*str_value);
@@ -1043,7 +1378,19 @@ auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {
     if (std::holds_alternative<double>(value)) {
         return ExprType::Double;
     }
+    if (std::holds_alternative<Date>(value)) {
+        return ExprType::Date;
+    }
+    if (std::holds_alternative<Timestamp>(value)) {
+        return ExprType::Timestamp;
+    }
     return ExprType::String;
+}
+
+auto scalar_from_literal(const ir::Literal& literal) -> ScalarValue {
+    return std::visit(
+        [](const auto& v) -> ScalarValue { return v; },
+        literal.value);
 }
 
 auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
@@ -1060,7 +1407,8 @@ auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const Scalar
         return std::nullopt;
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        return FastOperand{false, nullptr, lit->value, scalar_kind_from_value(lit->value)};
+        ScalarValue value = scalar_from_literal(*lit);
+        return FastOperand{false, nullptr, value, scalar_kind_from_value(value)};
     }
     return std::nullopt;
 }
@@ -1102,6 +1450,12 @@ auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
         if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
             return *int_value;
         }
+        if (const auto* date_value = std::get_if<Date>(&op.literal)) {
+            return date_value->days;
+        }
+        if (const auto* ts_value = std::get_if<Timestamp>(&op.literal)) {
+            return ts_value->nanos;
+        }
         return static_cast<std::int64_t>(std::get<double>(op.literal));
     }
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(op.column)) {
@@ -1109,6 +1463,12 @@ auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
     }
     if (const auto* double_col = std::get_if<Column<double>>(op.column)) {
         return static_cast<std::int64_t>((*double_col)[row]);
+    }
+    if (const auto* date_col = std::get_if<Column<Date>>(op.column)) {
+        return date_col->operator[](row).days;
+    }
+    if (const auto* ts_col = std::get_if<Column<Timestamp>>(op.column)) {
+        return ts_col->operator[](row).nanos;
     }
     throw std::runtime_error("type mismatch");
 }
@@ -1118,6 +1478,12 @@ auto get_double_value(const FastOperand& op, std::size_t row) -> double {
         if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
             return static_cast<double>(*int_value);
         }
+        if (const auto* date_value = std::get_if<Date>(&op.literal)) {
+            return static_cast<double>(date_value->days);
+        }
+        if (const auto* ts_value = std::get_if<Timestamp>(&op.literal)) {
+            return static_cast<double>(ts_value->nanos);
+        }
         return std::get<double>(op.literal);
     }
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(op.column)) {
@@ -1125,6 +1491,12 @@ auto get_double_value(const FastOperand& op, std::size_t row) -> double {
     }
     if (const auto* double_col = std::get_if<Column<double>>(op.column)) {
         return (*double_col)[row];
+    }
+    if (const auto* date_col = std::get_if<Column<Date>>(op.column)) {
+        return static_cast<double>(date_col->operator[](row).days);
+    }
+    if (const auto* ts_col = std::get_if<Column<Timestamp>>(op.column)) {
+        return static_cast<double>(ts_col->operator[](row).nanos);
     }
     throw std::runtime_error("type mismatch");
 }
@@ -1144,7 +1516,9 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
     if (!right) {
         return std::nullopt;
     }
-    if (left->kind == ExprType::String || right->kind == ExprType::String) {
+    if (left->kind == ExprType::String || right->kind == ExprType::String ||
+        left->kind == ExprType::Date || right->kind == ExprType::Date ||
+        left->kind == ExprType::Timestamp || right->kind == ExprType::Timestamp) {
         return std::nullopt;
     }
     // Helper: dispatch on (op × layout) OUTSIDE the inner loop so each resulting
@@ -1292,6 +1666,10 @@ auto default_scalar_for_column(const ColumnValue& column) -> ScalarValue {
                 return std::int64_t{0};
             } else if constexpr (std::is_same_v<ValueType, double>) {
                 return 0.0;
+            } else if constexpr (std::is_same_v<ValueType, Date>) {
+                return Date{};
+            } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
+                return Timestamp{};
             } else {
                 return std::string{};
             }
@@ -1305,6 +1683,12 @@ auto column_kind(const ColumnValue& column) -> ExprType {
     }
     if (std::holds_alternative<Column<double>>(column)) {
         return ExprType::Double;
+    }
+    if (std::holds_alternative<Column<Date>>(column)) {
+        return ExprType::Date;
+    }
+    if (std::holds_alternative<Column<Timestamp>>(column)) {
+        return ExprType::Timestamp;
     }
     return ExprType::String;
 }
@@ -1493,6 +1877,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             } else if (const auto* cat_col = std::get_if<Column<Categorical>>(agg_columns[i])) {
                 item.cat_col = cat_col;
             }
+        }
+
+        if (item.kind == ExprType::Date || item.kind == ExprType::Timestamp) {
+            return std::unexpected("date/time aggregation not supported");
         }
 
         if (item.kind == ExprType::String &&
@@ -2685,6 +3073,12 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                     if (std::holds_alternative<double>(it->second)) {
                         return ExprType::Double;
                     }
+                    if (std::holds_alternative<Date>(it->second)) {
+                        return ExprType::Date;
+                    }
+                    if (std::holds_alternative<Timestamp>(it->second)) {
+                        return ExprType::Timestamp;
+                    }
                     return ExprType::String;
                 }
             }
@@ -2713,6 +3107,10 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         }
         if (left.value() == ExprType::String || right.value() == ExprType::String) {
             return std::unexpected("string arithmetic not supported");
+        }
+        if (left.value() == ExprType::Date || right.value() == ExprType::Date ||
+            left.value() == ExprType::Timestamp || right.value() == ExprType::Timestamp) {
+            return std::unexpected("date/time arithmetic not supported");
         }
         if (bin->op == ir::ArithmeticOp::Div) {
             return ExprType::Double;
@@ -2746,6 +3144,10 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 return ExprType::Double;
             case ScalarKind::String:
                 return ExprType::String;
+            case ScalarKind::Date:
+                return ExprType::Date;
+            case ScalarKind::Timestamp:
+                return ExprType::Timestamp;
         }
     }
     return std::unexpected("unsupported expression");
@@ -2778,7 +3180,9 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             *source);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        return lit->value;
+        return std::visit(
+            [](const auto& v) -> ExprValue { return v; },
+            lit->value);
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
         auto left = eval_expr(*bin->left, input, row, scalars, externs);
@@ -2792,6 +3196,12 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         if (std::holds_alternative<std::string>(left.value()) ||
             std::holds_alternative<std::string>(right.value())) {
             return std::unexpected("string arithmetic not supported");
+        }
+        if (std::holds_alternative<Date>(left.value()) ||
+            std::holds_alternative<Date>(right.value()) ||
+            std::holds_alternative<Timestamp>(left.value()) ||
+            std::holds_alternative<Timestamp>(right.value())) {
+            return std::unexpected("date/time arithmetic not supported");
         }
         auto to_double = [](const ExprValue& v) -> double {
             if (const auto* i = std::get_if<std::int64_t>(&v)) {
@@ -2870,6 +3280,27 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<Table, std::string> {
     Table output = std::move(input);
+    if (output.time_index.has_value()) {
+        for (const auto& field : fields) {
+            if (field.alias == *output.time_index) {
+                return std::unexpected("cannot update time index column: " + field.alias);
+            }
+        }
+    }
+    bool drop_ordering = false;
+    if (output.ordering.has_value()) {
+        for (const auto& field : fields) {
+            for (const auto& key : *output.ordering) {
+                if (field.alias == key.name) {
+                    drop_ordering = true;
+                    break;
+                }
+            }
+            if (drop_ordering) {
+                break;
+            }
+        }
+    }
     std::size_t rows = output.rows();
     for (const auto& field : fields) {
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);
@@ -2891,6 +3322,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 break;
             case ExprType::String:
                 new_column = Column<std::string>{};
+                break;
+            case ExprType::Date:
+                new_column = Column<Date>{};
+                break;
+            case ExprType::Timestamp:
+                new_column = Column<Timestamp>{};
                 break;
         }
         std::visit([&](auto& col) { col.reserve(rows); }, new_column);
@@ -2925,12 +3362,34 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                         } else {
                             throw std::runtime_error("type mismatch");
                         }
+                    } else if constexpr (std::is_same_v<ValueType, Date>) {
+                        if (const auto* v = std::get_if<Date>(&value.value())) {
+                            col.push_back(*v);
+                        } else if (const auto* int_value =
+                                       std::get_if<std::int64_t>(&value.value())) {
+                            col.push_back(Date{static_cast<std::int32_t>(*int_value)});
+                        } else {
+                            throw std::runtime_error("type mismatch");
+                        }
+                    } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
+                        if (const auto* v = std::get_if<Timestamp>(&value.value())) {
+                            col.push_back(*v);
+                        } else if (const auto* int_value =
+                                       std::get_if<std::int64_t>(&value.value())) {
+                            col.push_back(Timestamp{*int_value});
+                        } else {
+                            throw std::runtime_error("type mismatch");
+                        }
                     }
                 },
                 new_column);
         }
         output.add_column(field.alias, std::move(new_column));
     }
+    if (drop_ordering) {
+        output.ordering.reset();
+    }
+    normalize_time_index(output);
     return output;
 }
 
@@ -2946,7 +3405,9 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected("unknown table: " + scan.source_name() +
                                        " (available: " + format_tables(registry) + ")");
             }
-            return it->second;
+            Table output = it->second;
+            normalize_time_index(output);
+            return output;
         }
         case ir::NodeKind::Filter: {
             const auto& filter = static_cast<const ir::FilterNode&>(node);

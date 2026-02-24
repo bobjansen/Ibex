@@ -6,6 +6,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+
 namespace {
 
 using namespace ibex;
@@ -21,6 +23,12 @@ auto require_ir(const char* source) -> ir::NodePtr {
     auto lowered = parser::lower(program);
     REQUIRE(lowered.has_value());
     return std::move(lowered.value());
+}
+
+auto date_from_ymd(int y, unsigned m, unsigned d) -> Date {
+    using namespace std::chrono;
+    auto day_point = sys_days{year{y} / month{m} / std::chrono::day{d}};
+    return Date{static_cast<std::int32_t>(day_point.time_since_epoch().count())};
 }
 
 }  // namespace
@@ -70,6 +78,29 @@ TEST_CASE("Interpret filter with scalar predicate") {
     REQUIRE(price_ints->size() == 2);
     REQUIRE((*price_ints)[0] == 20);
     REQUIRE((*price_ints)[1] == 30);
+}
+
+TEST_CASE("Interpret filter with date literal") {
+    runtime::Table table;
+    table.add_column("day", Column<Date>{
+                                date_from_ymd(2024, 1, 1),
+                                date_from_ymd(2024, 1, 2),
+                                date_from_ymd(2024, 1, 3),
+                            });
+
+    runtime::TableRegistry registry;
+    registry.emplace("calendar", table);
+
+    auto ir = require_ir("calendar[filter day >= date\"2024-01-02\", select { day }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* day_col = result->find("day");
+    REQUIRE(day_col != nullptr);
+    const auto* days = std::get_if<Column<Date>>(day_col);
+    REQUIRE(days != nullptr);
+    REQUIRE(days->size() == 2);
+    REQUIRE((*days)[0].days == date_from_ymd(2024, 1, 2).days);
+    REQUIRE((*days)[1].days == date_from_ymd(2024, 1, 3).days);
 }
 
 TEST_CASE("Interpret update alias") {

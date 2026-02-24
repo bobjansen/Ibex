@@ -44,6 +44,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"Float64", TokenKind::KeywordFloat64},
         {"Bool", TokenKind::KeywordBool},
         {"String", TokenKind::KeywordString},
+        {"Date", TokenKind::KeywordDate},
         {"Timestamp", TokenKind::KeywordTimestamp},
         {"Column", TokenKind::KeywordColumn},
         {"Series", TokenKind::KeywordSeries},

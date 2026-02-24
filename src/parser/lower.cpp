@@ -364,7 +364,10 @@ class Lowerer {
             if (!value)
                 return std::unexpected(value.error());
             auto wrapped = std::visit(
-                [](const auto& v) -> std::variant<std::int64_t, double, std::string> { return v; },
+                [](const auto& v)
+                    -> std::variant<std::int64_t, double, std::string, Date, Timestamp> {
+                    return v;
+                },
                 value.value());
             return std::make_unique<ir::FilterExpr>(
                 ir::FilterExpr{ir::FilterLiteral{.value = std::move(wrapped)}});
@@ -497,6 +500,12 @@ class Lowerer {
             }
             if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
                 return ir::Expr{.node = ir::Literal{.value = *str_value}};
+            }
+            if (const auto* date_value = std::get_if<Date>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *date_value}};
+            }
+            if (const auto* ts_value = std::get_if<Timestamp>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *ts_value}};
             }
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
         }
@@ -772,7 +781,8 @@ class Lowerer {
     }
 
     static auto lower_literal(const LiteralExpr& literal)
-        -> std::expected<std::variant<std::int64_t, double, std::string>, LowerError> {
+        -> std::expected<std::variant<std::int64_t, double, std::string, Date, Timestamp>,
+                         LowerError> {
         if (const auto* int_value = std::get_if<std::int64_t>(&literal.value)) {
             return *int_value;
         }
@@ -781,6 +791,12 @@ class Lowerer {
         }
         if (const auto* str_value = std::get_if<std::string>(&literal.value)) {
             return *str_value;
+        }
+        if (const auto* date_value = std::get_if<Date>(&literal.value)) {
+            return *date_value;
+        }
+        if (const auto* ts_value = std::get_if<Timestamp>(&literal.value)) {
+            return *ts_value;
         }
         return std::unexpected(LowerError{.message = "literal type not supported in filter"});
     }

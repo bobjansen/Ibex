@@ -1,10 +1,12 @@
 #pragma once
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -15,11 +17,14 @@ enum class ScalarKind : std::uint8_t {
     Int,
     Double,
     String,
+    Date,
+    Timestamp,
 };
 
 using ColumnValue =
-    std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>>;
-using ScalarValue = std::variant<std::int64_t, double, std::string>;
+    std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
+                 Column<Date>, Column<Timestamp>>;
+using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 
 struct ColumnEntry {
     std::string name;
@@ -29,6 +34,8 @@ struct ColumnEntry {
 struct Table {
     std::vector<ColumnEntry> columns;
     std::unordered_map<std::string, std::size_t> index;
+    std::optional<std::vector<ir::OrderKey>> ordering;
+    std::optional<std::string> time_index;
 
     void add_column(std::string name, ColumnValue column);
     [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;

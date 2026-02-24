@@ -24,6 +24,8 @@ namespace ibex::ops {
 [[nodiscard]] auto filter_int(std::int64_t v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_dbl(double v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_str(std::string v) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_date(Date v) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
     -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
@@ -61,6 +63,8 @@ void print(const runtime::Table& t, std::ostream& out = std::cout);
 [[nodiscard]] auto int_lit(std::int64_t v) -> ir::Expr;
 [[nodiscard]] auto dbl_lit(double v) -> ir::Expr;
 [[nodiscard]] auto str_lit(std::string v) -> ir::Expr;
+[[nodiscard]] auto date_lit(Date v) -> ir::Expr;
+[[nodiscard]] auto timestamp_lit(Timestamp v) -> ir::Expr;
 [[nodiscard]] auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr;
 [[nodiscard]] auto fn_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr;
 

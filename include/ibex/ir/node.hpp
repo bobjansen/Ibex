@@ -7,6 +7,8 @@
 #include <variant>
 #include <vector>
 
+#include <ibex/core/time.hpp>
+
 namespace ibex::ir {
 
 /// Unique identifier for IR nodes.
@@ -30,7 +32,7 @@ struct Expr;
 using ExprPtr = std::shared_ptr<Expr>;
 
 struct Literal {
-    std::variant<std::int64_t, double, std::string> value;
+    std::variant<std::int64_t, double, std::string, Date, Timestamp> value;
 };
 
 enum class ArithmeticOp : std::uint8_t {
@@ -110,7 +112,7 @@ struct FilterColumn {
 };
 /// Literal value in a filter expression.
 struct FilterLiteral {
-    std::variant<std::int64_t, double, std::string> value;
+    std::variant<std::int64_t, double, std::string, Date, Timestamp> value;
 };
 /// Arithmetic on two value expressions.
 struct FilterArith {

@@ -199,13 +199,17 @@ TEST_CASE("emitter: update node — literal types", "[codegen]") {
 
     ir::FieldSpec f1{"label", ir::Expr{ir::Literal{std::string{"hello"}}}};
     ir::FieldSpec f2{"count", ir::Expr{ir::Literal{std::int64_t{42}}}};
+    ir::FieldSpec f3{"day", ir::Expr{ir::Literal{Date{1}}}};
+    ir::FieldSpec f4{"ts", ir::Expr{ir::Literal{Timestamp{1000}}}};
 
-    auto upd = b.update({std::move(f1), std::move(f2)});
+    auto upd = b.update({std::move(f1), std::move(f2), std::move(f3), std::move(f4)});
     upd->add_child(make_source(b, "t.csv"));
 
     auto out = emit_to_string(*upd);
     CHECK(contains(out, "ibex::ops::str_lit(\"hello\")"));
     CHECK(contains(out, "ibex::ops::int_lit(std::int64_t{42})"));
+    CHECK(contains(out, "ibex::ops::date_lit(ibex::Date{std::int32_t{1}})"));
+    CHECK(contains(out, "ibex::ops::timestamp_lit(ibex::Timestamp{std::int64_t{1000}})"));
 }
 
 // ─── Chained pipeline ────────────────────────────────────────────────────────

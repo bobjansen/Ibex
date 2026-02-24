@@ -411,7 +411,21 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                         data.emplace_back(col[i]);
                     }
                     return ibex::Column<std::string>(std::move(data));
-                } else {
+                } else if constexpr (std::is_same_v<ColType, ibex::Column<ibex::Date>>) {
+                    std::vector<ibex::Date> data;
+                    data.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        data.push_back(col[i]);
+                    }
+                    return ibex::Column<ibex::Date>(std::move(data));
+                } else if constexpr (std::is_same_v<ColType, ibex::Column<ibex::Timestamp>>) {
+                    std::vector<ibex::Timestamp> data;
+                    data.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        data.push_back(col[i]);
+                    }
+                    return ibex::Column<ibex::Timestamp>(std::move(data));
+                } else if constexpr (std::is_same_v<ColType, ibex::Column<ibex::Categorical>>) {
                     std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
                     codes.reserve(n);
                     const auto* src = col.codes_data();
@@ -420,6 +434,8 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                     }
                     return ibex::Column<ibex::Categorical>(col.dictionary_ptr(), col.index_ptr(),
                                                            std::move(codes));
+                } else {
+                    static_assert(std::is_same_v<ColType, void>, "Unhandled column type");
                 }
             },
             column);

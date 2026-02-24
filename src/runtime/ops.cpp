@@ -4,6 +4,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -34,6 +35,29 @@ auto to_col_refs(const std::vector<std::string>& names) -> std::vector<ir::Colum
     return refs;
 }
 
+auto format_date(ibex::Date date) -> std::string {
+    using namespace std::chrono;
+    sys_days day = sys_days{days{date.days}};
+    year_month_day ymd{day};
+    return fmt::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
+                       static_cast<unsigned>(ymd.month()),
+                       static_cast<unsigned>(ymd.day()));
+}
+
+auto format_timestamp(ibex::Timestamp ts) -> std::string {
+    using namespace std::chrono;
+    sys_time<nanoseconds> tp{nanoseconds{ts.nanos}};
+    auto day = floor<days>(tp);
+    year_month_day ymd{day};
+    auto tod = tp - day;
+    hh_mm_ss<nanoseconds> hms{tod};
+    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}",
+                       static_cast<int>(ymd.year()), static_cast<unsigned>(ymd.month()),
+                       static_cast<unsigned>(ymd.day()), hms.hours().count(),
+                       hms.minutes().count(), hms.seconds().count(),
+                       hms.subseconds().count());
+}
+
 auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::string {
     return std::visit(
         [row](const auto& c) -> std::string {
@@ -42,6 +66,10 @@ auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::stri
                 return c[row];
             } else if constexpr (std::is_same_v<T, std::string_view>) {
                 return std::string(c[row]);
+            } else if constexpr (std::is_same_v<T, ibex::Date>) {
+                return format_date(c[row]);
+            } else if constexpr (std::is_same_v<T, ibex::Timestamp>) {
+                return format_timestamp(c[row]);
             } else if constexpr (std::is_same_v<T, double>) {
                 double v = c[row];
                 if (std::isnan(v))
@@ -195,6 +223,14 @@ auto str_lit(std::string v) -> ir::Expr {
     return ir::Expr{ir::Literal{std::move(v)}};
 }
 
+auto date_lit(Date v) -> ir::Expr {
+    return ir::Expr{ir::Literal{v}};
+}
+
+auto timestamp_lit(Timestamp v) -> ir::Expr {
+    return ir::Expr{ir::Literal{v}};
+}
+
 auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr {
     return ir::Expr{ir::BinaryExpr{
         op,
@@ -221,17 +257,32 @@ auto filter_col(std::string name) -> ir::FilterExprPtr {
 
 auto filter_int(std::int64_t v) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterLiteral{std::variant<std::int64_t, double, std::string>{v}}});
+        ir::FilterExpr{ir::FilterLiteral{
+            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_dbl(double v) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterLiteral{std::variant<std::int64_t, double, std::string>{v}}});
+        ir::FilterExpr{ir::FilterLiteral{
+            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_str(std::string v) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        ir::FilterLiteral{std::variant<std::int64_t, double, std::string>{std::move(v)}}});
+        ir::FilterLiteral{
+            std::variant<std::int64_t, double, std::string, Date, Timestamp>{std::move(v)}}});
+}
+
+auto filter_date(Date v) -> ir::FilterExprPtr {
+    return std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{ir::FilterLiteral{
+            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+}
+
+auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr {
+    return std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{ir::FilterLiteral{
+            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)

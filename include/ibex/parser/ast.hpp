@@ -7,6 +7,8 @@
 #include <variant>
 #include <vector>
 
+#include <ibex/core/time.hpp>
+
 namespace ibex::parser {
 
 enum class ScalarType : std::uint8_t {
@@ -16,6 +18,7 @@ enum class ScalarType : std::uint8_t {
     Float64,
     Bool,
     String,
+    Date,
     Timestamp,
 };
 
@@ -56,7 +59,7 @@ struct IdentifierExpr {
 };
 
 struct LiteralExpr {
-    std::variant<std::int64_t, double, bool, std::string, DurationLiteral> value;
+    std::variant<std::int64_t, double, bool, std::string, DurationLiteral, Date, Timestamp> value;
 };
 
 enum class UnaryOp : std::uint8_t {

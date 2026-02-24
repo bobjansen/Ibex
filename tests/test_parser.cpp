@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <variant>
 
 namespace {
@@ -140,6 +141,36 @@ TEST_CASE("Parse let binding with precedence") {
     const auto& mul = require_binary(require_expr(add.right), BinaryOp::Mul);
     REQUIRE(std::get<std::int64_t>(require_literal(require_expr(mul.left)).value) == 2);
     REQUIRE(std::get<std::int64_t>(require_literal(require_expr(mul.right)).value) == 3);
+}
+
+TEST_CASE("Parse date and timestamp literals") {
+    using namespace std::chrono;
+
+    {
+        auto result = parse("date\"2024-01-02\";");
+        REQUIRE(result.has_value());
+        const auto& stmt = result->statements.front();
+        REQUIRE(std::holds_alternative<ExprStmt>(stmt));
+        const auto& expr_stmt = std::get<ExprStmt>(stmt);
+        const auto& lit = require_literal(require_expr(expr_stmt.expr));
+        const auto& date = std::get<ibex::Date>(lit.value);
+        auto expected =
+            sys_days{year{2024} / month{1} / std::chrono::day{2}}.time_since_epoch().count();
+        REQUIRE(date.days == expected);
+    }
+
+    {
+        auto result = parse("timestamp\"2024-01-02T03:04:05.123456789Z\";");
+        REQUIRE(result.has_value());
+        const auto& stmt = result->statements.front();
+        REQUIRE(std::holds_alternative<ExprStmt>(stmt));
+        const auto& expr_stmt = std::get<ExprStmt>(stmt);
+        const auto& lit = require_literal(require_expr(expr_stmt.expr));
+        const auto& ts = std::get<ibex::Timestamp>(lit.value);
+        auto day_point = sys_days{year{2024} / month{1} / std::chrono::day{2}};
+        auto tp = day_point + hours{3} + minutes{4} + seconds{5} + nanoseconds{123'456'789};
+        REQUIRE(ts.nanos == tp.time_since_epoch().count());
+    }
 }
 
 TEST_CASE("Parse expression statement with call") {

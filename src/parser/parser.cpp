@@ -4,7 +4,9 @@
 #include <fmt/core.h>
 
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -490,6 +492,23 @@ class Parser {
     auto parse_primary() -> ExprPtr {
         if (match(TokenKind::Identifier)) {
             std::string name(previous().lexeme);
+            if ((name == "date" || name == "timestamp" || name == "ts") &&
+                check(TokenKind::StringLiteral)) {
+                advance();
+                std::string literal = unescape_string(previous().lexeme);
+                if (name == "date") {
+                    auto value = parse_date_literal(literal);
+                    if (!value.has_value()) {
+                        return fail_expr(previous(), "invalid date literal");
+                    }
+                    return make_literal(*value);
+                }
+                auto value = parse_timestamp_literal(literal);
+                if (!value.has_value()) {
+                    return fail_expr(previous(), "invalid timestamp literal");
+                }
+                return make_literal(*value);
+            }
             if (match(TokenKind::LParen)) {
                 std::vector<ExprPtr> args;
                 if (!check(TokenKind::RParen)) {
@@ -851,6 +870,9 @@ class Parser {
         if (match(TokenKind::KeywordString)) {
             return ScalarType::String;
         }
+        if (match(TokenKind::KeywordDate)) {
+            return ScalarType::Date;
+        }
         if (match(TokenKind::KeywordTimestamp)) {
             return ScalarType::Timestamp;
         }
@@ -1022,6 +1044,108 @@ class Parser {
         return result;
     }
 
+    static auto parse_date_literal(std::string_view text) -> std::optional<Date> {
+        if (text.size() != 10 || text[4] != '-' || text[7] != '-') {
+            return std::nullopt;
+        }
+        auto parse_int = [](std::string_view part) -> std::optional<int> {
+            int value = 0;
+            auto result = std::from_chars(part.data(), part.data() + part.size(), value);
+            if (result.ec != std::errc()) {
+                return std::nullopt;
+            }
+            return value;
+        };
+        auto year = parse_int(text.substr(0, 4));
+        auto month = parse_int(text.substr(5, 2));
+        auto day = parse_int(text.substr(8, 2));
+        if (!year || !month || !day) {
+            return std::nullopt;
+        }
+        using namespace std::chrono;
+        year_month_day ymd{std::chrono::year{*year},
+                           std::chrono::month{static_cast<unsigned>(*month)},
+                           std::chrono::day{static_cast<unsigned>(*day)}};
+        if (!ymd.ok()) {
+            return std::nullopt;
+        }
+        sys_days days_since = sys_days{ymd};
+        auto days = days_since.time_since_epoch().count();
+        if (days < std::numeric_limits<std::int32_t>::min() ||
+            days > std::numeric_limits<std::int32_t>::max()) {
+            return std::nullopt;
+        }
+        return Date{static_cast<std::int32_t>(days)};
+    }
+
+    static auto parse_timestamp_literal(std::string_view text) -> std::optional<Timestamp> {
+        if (text.size() < 19 || text[4] != '-' || text[7] != '-' ||
+            (text[10] != 'T' && text[10] != ' ') || text[13] != ':' || text[16] != ':') {
+            return std::nullopt;
+        }
+        auto parse_int = [](std::string_view part) -> std::optional<int> {
+            int value = 0;
+            auto result = std::from_chars(part.data(), part.data() + part.size(), value);
+            if (result.ec != std::errc()) {
+                return std::nullopt;
+            }
+            return value;
+        };
+        auto year = parse_int(text.substr(0, 4));
+        auto month = parse_int(text.substr(5, 2));
+        auto day = parse_int(text.substr(8, 2));
+        auto hour = parse_int(text.substr(11, 2));
+        auto minute = parse_int(text.substr(14, 2));
+        auto second = parse_int(text.substr(17, 2));
+        if (!year || !month || !day || !hour || !minute || !second) {
+            return std::nullopt;
+        }
+        if (*hour > 23 || *minute > 59 || *second > 59 || *hour < 0 || *minute < 0 ||
+            *second < 0) {
+            return std::nullopt;
+        }
+        std::size_t pos = 19;
+        std::int64_t nanos = 0;
+        if (pos < text.size() && text[pos] == '.') {
+            pos += 1;
+            std::size_t start = pos;
+            while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
+                pos += 1;
+            }
+            std::size_t digits = pos - start;
+            if (digits == 0 || digits > 9) {
+                return std::nullopt;
+            }
+            std::int64_t frac = 0;
+            auto result = std::from_chars(text.data() + start, text.data() + pos, frac);
+            if (result.ec != std::errc()) {
+                return std::nullopt;
+            }
+            for (std::size_t i = digits; i < 9; ++i) {
+                frac *= 10;
+            }
+            nanos = frac;
+        }
+        if (pos < text.size() && text[pos] == 'Z') {
+            pos += 1;
+        }
+        if (pos != text.size()) {
+            return std::nullopt;
+        }
+        using namespace std::chrono;
+        year_month_day ymd{std::chrono::year{*year},
+                           std::chrono::month{static_cast<unsigned>(*month)},
+                           std::chrono::day{static_cast<unsigned>(*day)}};
+        if (!ymd.ok()) {
+            return std::nullopt;
+        }
+        sys_days day_point{ymd};
+        auto tp = day_point + hours{*hour} + minutes{*minute} + seconds{*second} +
+                  nanoseconds{nanos};
+        auto total = duration_cast<nanoseconds>(tp.time_since_epoch()).count();
+        return Timestamp{total};
+    }
+
     static auto make_literal(std::int64_t value) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
         expr->node = LiteralExpr{.value = value};
@@ -1049,6 +1173,18 @@ class Parser {
     static auto make_literal(DurationLiteral value) -> ExprPtr {
         auto expr = std::make_unique<Expr>();
         expr->node = LiteralExpr{.value = std::move(value)};
+        return expr;
+    }
+
+    static auto make_literal(Date value) -> ExprPtr {
+        auto expr = std::make_unique<Expr>();
+        expr->node = LiteralExpr{.value = value};
+        return expr;
+    }
+
+    static auto make_literal(Timestamp value) -> ExprPtr {
+        auto expr = std::make_unique<Expr>();
+        expr->node = LiteralExpr{.value = value};
         return expr;
     }
 

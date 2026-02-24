@@ -141,7 +141,7 @@ join   left   asof    on
 asc    desc
 true   false
 Int32  Int64  Float32 Float64
-Bool   String Timestamp
+Bool   String Date    Timestamp
 Int    Column  Series DataFrame TimeFrame
 ```
 
@@ -196,6 +196,27 @@ DURATION_UNIT = "ns" | "us" | "ms" | "s" | "m" | "h" | "d" | "w" | "mo" | "y" ;
 No whitespace is permitted between the integer and the unit suffix. Examples:
 `5m`, `100ms`, `1h`, `30s`, `7d`.
 
+**Dates:**
+
+```
+DATE_LIT = date"YYYY-MM-DD" ;
+```
+
+Dates are parsed as calendar days in the proleptic Gregorian calendar and are
+stored as signed days since `1970-01-01`.
+
+**Timestamps:**
+
+```
+TIMESTAMP_LIT = ("timestamp" | "ts") "\"" YYYY "-" MM "-" DD ( "T" | " " )
+                HH ":" MM ":" SS [ "." FRACTION ] [ "Z" ] "\"" ;
+FRACTION = DIGIT { DIGIT } ;  // 1..9 digits, interpreted as fractional seconds
+```
+
+Timestamps are parsed as instants in UTC and stored as signed nanoseconds since
+`1970-01-01T00:00:00Z`. Fractional seconds are truncated to nanosecond
+precision.
+
 ### 2.5 Operators
 
 **Binary (in precedence order, lowest first):**
@@ -248,11 +269,16 @@ binary operators and associate **left**.
 | `Float64`   | 64-bit IEEE 754 float        | `double`           |
 | `Bool`      | Boolean                      | `bool`             |
 | `String`    | UTF-8 string                 | `std::string`      |
-| `Timestamp` | Nanosecond-precision instant | `std::chrono::...` |
+| `Date`      | Calendar day                 | `std::int32_t`     |
+| `Timestamp` | Nanosecond-precision instant | `std::int64_t`     |
 
 Integer literals default to `Int64`. Float literals default to `Float64`.
 Implicit narrowing conversions are prohibited; explicit widening is permitted
 (`Int32` → `Int64`, `Float32` → `Float64`).
+
+`Date` values are stored as signed days since `1970-01-01` (Unix epoch).
+`Timestamp` values are stored as signed nanoseconds since
+`1970-01-01T00:00:00Z`.
 
 ### 3.2 Compound Types
 
@@ -266,6 +292,13 @@ TimeFrame<S>      — a time-indexed relation with schema S
 `TimeFrame<S>` is a `DataFrame<S>` with the additional invariant that exactly
 one column of type `Timestamp` is designated as the time index, and rows are
 sorted by that index in ascending order.
+
+DataFrame values may carry an **ordering constraint**: an optional declaration
+that rows are ordered by a list of keys with directions (e.g. `{ symbol asc,
+time desc }`). Ordering constraints are **not part of the static type**; they
+are metadata used for optimization and for validating operations that require
+ordering. A `TimeFrame` always carries the ordering constraint on its time
+index column in ascending order.
 
 When a `DataFrame` or `TimeFrame` type omits its schema argument (e.g.
 `DataFrame`), the schema is inferred by the implementation (for example, from
@@ -336,7 +369,7 @@ type            = scalar_type
                 | type_ctor [ "<" type_arg ">" ] ;
 
 scalar_type     = "Int" | "Int32" | "Int64" | "Float32" | "Float64"
-                | "Bool"  | "String" | "Timestamp" ;
+                | "Bool"  | "String" | "Date" | "Timestamp" ;
 
 type_ctor       = "Series" | "DataFrame" | "TimeFrame" ;
 
@@ -597,6 +630,28 @@ trades[order { symbol desc, price asc }]
 
 If no keys are provided (`order` or `order {}`), all columns in schema order
 are used as keys with ascending order.
+
+**Ordering constraints**
+
+An ordering constraint is a property of a DataFrame value, not a distinct type.
+The `order` clause **establishes** the ordering constraint to match its key
+list. Implementations may exploit ordering for optimized joins, windowing, and
+scans, but are not required to do so.
+
+Preservation rules (normative minimums):
+
+- `filter` preserves ordering.
+- `select` preserves ordering only if all ordering keys are passed through
+  unchanged (no computed replacement) and remain in the output schema.
+- `update` preserves ordering only if it does not update any ordering key.
+- `distinct`, `by` (aggregation or grouped update), and any `join` drop ordering
+  unless the implementation can prove a specific order.
+- `order` always sets the ordering constraint to its key list (or schema order
+  if no keys are provided).
+
+For `TimeFrame`, the only valid ordering constraint is ascending order on the
+time index column. Using `order` with any other key list is a compile-time
+error; ordering by the time index is a no-op.
 
 **`window <duration>`**
 
@@ -942,7 +997,7 @@ Rolling functions are **aggregate-like**: they produce one scalar per row
 
 `n` must be a non-negative integer literal. If the offset exceeds the available
 range, the result is the type's default value (0 for numerics, empty string for
-`String`, epoch for `Timestamp`).
+`String`, epoch for `Date` and `Timestamp`).
 
 `lag` and `lead` respect the TimeFrame's index ordering. They are valid in any
 TimeFrame block, with or without a `window` clause.
@@ -956,6 +1011,9 @@ is a compile-time error.
 ```
 tf[update { timestamp = timestamp + 1s }]  // ERROR: cannot mutate time index
 ```
+
+This invariant is represented as an ordering constraint on the time index
+column in ascending order, preserved across all TimeFrame operations.
 
 ---
 
@@ -1010,8 +1068,8 @@ output.
 ### 10.2 Parameter Types
 
 Extern function parameters may be any scalar type (`Int`, `Int64`, `Float64`,
-`Bool`, `String`, `Timestamp`). Series/column parameters are not supported in
-the current runtime.
+`Bool`, `String`, `Date`, `Timestamp`). Series/column parameters are not
+supported in the current runtime.
 
 Return types may be scalar or table types (`DataFrame`, `TimeFrame`). Extern
 functions cannot return `Series`.
@@ -1151,9 +1209,9 @@ extern implementations. The recommended path for custom scalar logic is
 | `abs(x)`        | `Numeric -> Numeric`               |
 | `log(x)`        | `Numeric -> Float64`               |
 | `sqrt(x)`       | `Numeric -> Float64`               |
-| `year(t)`       | `Timestamp -> Int32`               |
-| `month(t)`      | `Timestamp -> Int32`               |
-| `day(t)`        | `Timestamp -> Int32`               |
+| `year(t)`       | `Date|Timestamp -> Int32`          |
+| `month(t)`      | `Date|Timestamp -> Int32`          |
+| `day(t)`        | `Date|Timestamp -> Int32`          |
 | `hour(t)`       | `Timestamp -> Int32`               |
 | `minute(t)`     | `Timestamp -> Int32`               |
 | `second(t)`     | `Timestamp -> Int32`               |
@@ -1286,7 +1344,7 @@ asc  desc  true  false
 **Type keywords** (reserved in type position and as identifiers):
 
 ```
-Int  Int32  Int64  Float32  Float64  Bool  String  Timestamp
+Int  Int32  Int64  Float32  Float64  Bool  String  Date  Timestamp
 Column  Series  DataFrame  TimeFrame
 ```
 
@@ -1294,6 +1352,7 @@ Column  Series  DataFrame  TimeFrame
 
 ```
 scalar
+date  timestamp  ts
 sum  mean  min  max  count  first  last
 ```
 

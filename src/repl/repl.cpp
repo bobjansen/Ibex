@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
@@ -27,6 +28,59 @@ using FunctionRegistry = std::unordered_map<std::string, parser::FunctionDecl>;
 using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
 using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
+
+auto format_date(Date date) -> std::string {
+    using namespace std::chrono;
+    sys_days day = sys_days{days{date.days}};
+    year_month_day ymd{day};
+    return fmt::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
+                       static_cast<unsigned>(ymd.month()),
+                       static_cast<unsigned>(ymd.day()));
+}
+
+auto format_timestamp(Timestamp ts) -> std::string {
+    using namespace std::chrono;
+    sys_time<nanoseconds> tp{nanoseconds{ts.nanos}};
+    auto day = floor<days>(tp);
+    year_month_day ymd{day};
+    auto tod = tp - day;
+    hh_mm_ss<nanoseconds> hms{tod};
+    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}",
+                       static_cast<int>(ymd.year()), static_cast<unsigned>(ymd.month()),
+                       static_cast<unsigned>(ymd.day()), hms.hours().count(),
+                       hms.minutes().count(), hms.seconds().count(),
+                       hms.subseconds().count());
+}
+
+auto format_scalar(const runtime::ScalarValue& value) -> std::string {
+    return std::visit(
+        [](const auto& v) -> std::string {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, Date>) {
+                return format_date(v);
+            } else if constexpr (std::is_same_v<T, Timestamp>) {
+                return format_timestamp(v);
+            } else {
+                return fmt::format("{}", v);
+            }
+        },
+        value);
+}
+
+auto format_cell(const runtime::ColumnValue& column, std::size_t row) -> std::string {
+    return std::visit(
+        [row](const auto& col) -> std::string {
+            using T = typename std::decay_t<decltype(col)>::value_type;
+            if constexpr (std::is_same_v<T, Date>) {
+                return format_date(col[row]);
+            } else if constexpr (std::is_same_v<T, Timestamp>) {
+                return format_timestamp(col[row]);
+            } else {
+                return fmt::format("{}", col[row]);
+            }
+        },
+        column);
+}
 
 auto build_builtin_tables() -> runtime::TableRegistry {
     runtime::TableRegistry registry;
@@ -54,7 +108,7 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
         fmt::print("  ");
         for (std::size_t col = 0; col < table.columns.size(); ++col) {
             const auto& entry = table.columns[col];
-            std::visit([&](const auto& column) { fmt::print("{}", column[row]); }, *entry.column);
+            fmt::print("{}", format_cell(*entry.column, row));
             if (col + 1 < table.columns.size()) {
                 fmt::print("\t");
             }
@@ -99,7 +153,7 @@ void print_scalars(const runtime::ScalarRegistry& scalars) {
     for (const auto& name : names) {
         fmt::print("  {} = ", name);
         const auto& value = scalars.at(name);
-        std::visit([](const auto& v) { fmt::print("{}", v); }, value);
+        fmt::print("{}", format_scalar(value));
         fmt::print("\n");
     }
 }
@@ -181,6 +235,12 @@ std::string column_type_name(const runtime::ColumnValue& column) {
     }
     if (std::holds_alternative<Column<Categorical>>(column)) {
         return "Categorical";
+    }
+    if (std::holds_alternative<Column<Date>>(column)) {
+        return "Date";
+    }
+    if (std::holds_alternative<Column<Timestamp>>(column)) {
+        return "Timestamp";
     }
     return "Unknown";
 }
@@ -381,6 +441,10 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (unary->op != parser::UnaryOp::Negate) {
             return std::unexpected("unsupported unary operator in scalar expression");
         }
+        if (std::holds_alternative<Date>(value.value()) ||
+            std::holds_alternative<Timestamp>(value.value())) {
+            return std::unexpected("date/time arithmetic not supported");
+        }
         if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
             return runtime::ScalarValue{-(*int_value)};
         }
@@ -399,6 +463,12 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                       extern_decls, externs);
         if (!right) {
             return std::unexpected(right.error());
+        }
+        if (std::holds_alternative<Date>(left.value()) ||
+            std::holds_alternative<Date>(right.value()) ||
+            std::holds_alternative<Timestamp>(left.value()) ||
+            std::holds_alternative<Timestamp>(right.value())) {
+            return std::unexpected("date/time arithmetic not supported");
         }
         bool left_double = std::holds_alternative<double>(left.value());
         bool right_double = std::holds_alternative<double>(right.value());
@@ -941,7 +1011,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 return false;
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                std::visit([](const auto& v) { fmt::print("{}\n", v); }, *scalar);
+                fmt::print("{}\n", format_scalar(*scalar));
             } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                 runtime::Table temp;
                 temp.add_column("column", *col);

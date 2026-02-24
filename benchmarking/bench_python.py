@@ -158,19 +158,64 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def bench_pandas_events(csv_events_path, warmup, iters):
+    print("pandas: loading events...", file=sys.stderr, flush=True)
+    df = pd.read_csv(csv_events_path)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+
+    run("sum_by_user",
+        lambda: df.groupby("user_id", sort=False).agg(
+            total=("amount", "sum")).reset_index())
+
+    run("filter_events",
+        lambda: df[df["amount"] > 500.0])
+
+    return rows
+
+
+def bench_polars_events(csv_events_path, warmup, iters):
+    print("polars: loading events...", file=sys.stderr, flush=True)
+    df = pl.read_csv(csv_events_path)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+
+    run("sum_by_user",
+        lambda: df.group_by("user_id").agg(pl.col("amount").sum().alias("total")))
+
+    run("filter_events",
+        lambda: df.filter(pl.col("amount") > 500.0))
+
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv",        required=True, help="Path to prices.csv")
-    ap.add_argument("--csv-multi",  help="Path to prices_multi.csv")
-    ap.add_argument("--csv-trades", help="Path to trades.csv")
-    ap.add_argument("--warmup",     type=int, default=1)
-    ap.add_argument("--iters",      type=int, default=5)
-    ap.add_argument("--out",        default="results/python.tsv")
+    ap.add_argument("--csv",         required=True, help="Path to prices.csv")
+    ap.add_argument("--csv-multi",   help="Path to prices_multi.csv")
+    ap.add_argument("--csv-trades",  help="Path to trades.csv")
+    ap.add_argument("--csv-events",  help="Path to events.csv")
+    ap.add_argument("--warmup",      type=int, default=1)
+    ap.add_argument("--iters",       type=int, default=5)
+    ap.add_argument("--out",         default="results/python.tsv")
     args = ap.parse_args()
 
     all_rows = []
     all_rows += bench_pandas(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
     all_rows += bench_polars(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
+    if args.csv_events:
+        all_rows += bench_pandas_events(args.csv_events, args.warmup, args.iters)
+        all_rows += bench_polars_events(args.csv_events, args.warmup, args.iters)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

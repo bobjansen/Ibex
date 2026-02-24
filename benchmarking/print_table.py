@@ -29,6 +29,8 @@ QUERY_ORDER = [
     "filter_and",
     "filter_arith",
     "filter_or",
+    "sum_by_user",
+    "filter_events",
 ]
 
 QUERY_LABEL = {
@@ -42,6 +44,8 @@ QUERY_LABEL = {
     "filter_and":          "filter AND",
     "filter_arith":        "filter arith",
     "filter_or":           "filter OR",
+    "sum_by_user":         "sum by user (100K)",
+    "filter_events":       "filter events (str)",
 }
 
 

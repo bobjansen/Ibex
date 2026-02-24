@@ -24,18 +24,20 @@ IBEX_BENCH="$BUILD_DIR/tools/ibex_bench"
 CSV="$SCRIPT_DIR/data/prices.csv"
 CSV_MULTI="$SCRIPT_DIR/data/prices_multi.csv"
 CSV_TRADES="$SCRIPT_DIR/data/trades.csv"
+CSV_EVENTS="$SCRIPT_DIR/data/events.csv"
 WARMUP=1
 ITERS=5
 OUT="$SCRIPT_DIR/results/ibex.tsv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --csv)        CSV="$2";        shift 2 ;;
-        --csv-multi)  CSV_MULTI="$2";  shift 2 ;;
-        --csv-trades) CSV_TRADES="$2"; shift 2 ;;
-        --warmup)     WARMUP="$2";     shift 2 ;;
-        --iters)      ITERS="$2";      shift 2 ;;
-        --out)        OUT="$2";        shift 2 ;;
+        --csv)         CSV="$2";         shift 2 ;;
+        --csv-multi)   CSV_MULTI="$2";   shift 2 ;;
+        --csv-trades)  CSV_TRADES="$2";  shift 2 ;;
+        --csv-events)  CSV_EVENTS="$2";  shift 2 ;;
+        --warmup)      WARMUP="$2";      shift 2 ;;
+        --iters)       ITERS="$2";       shift 2 ;;
+        --out)         OUT="$2";         shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -62,6 +64,7 @@ BENCH_ARGS=(
 )
 [[ -f "$CSV_MULTI" ]]   && BENCH_ARGS+=(--csv-multi   "$CSV_MULTI")
 [[ -f "$CSV_TRADES" ]]  && BENCH_ARGS+=(--csv-trades  "$CSV_TRADES")
+[[ -f "$CSV_EVENTS" ]]  && BENCH_ARGS+=(--csv-events  "$CSV_EVENTS")
 
 echo "=== ibex ===" >&2
 raw="$("$IBEX_BENCH" "${BENCH_ARGS[@]}")"

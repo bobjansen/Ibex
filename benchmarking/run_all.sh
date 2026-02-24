@@ -45,6 +45,7 @@ DATA="$SCRIPT_DIR/data"
 CSV="$DATA/prices.csv"
 CSV_MULTI="$DATA/prices_multi.csv"
 CSV_TRADES="$DATA/trades.csv"
+CSV_EVENTS="$DATA/events.csv"
 RESULTS="$SCRIPT_DIR/results"
 
 # ── 1. Generate data ──────────────────────────────────────────────────────────
@@ -58,6 +59,7 @@ if [[ $SKIP_IBEX -eq 0 ]]; then
     IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
         bash "$SCRIPT_DIR/bench_ibex.sh" \
             --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+            --csv-events "$CSV_EVENTS" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$RESULTS/ibex.tsv"
     echo ""
@@ -69,6 +71,7 @@ if [[ $SKIP_IBEX_COMPILED -eq 0 ]]; then
     IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
         bash "$SCRIPT_DIR/bench_ibex_compiled.sh" \
             --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+            --csv-events "$CSV_EVENTS" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$RESULTS/ibex_compiled.tsv"
     echo ""
@@ -79,6 +82,7 @@ if [[ $SKIP_PYTHON -eq 0 ]]; then
     echo "━━━ Python (pandas + polars) ━━━"
     uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_python.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+        --csv-events "$CSV_EVENTS" \
         --warmup "$WARMUP" --iters "$ITERS" \
         --out "$RESULTS/python.tsv"
     echo ""
@@ -89,6 +93,7 @@ if [[ $SKIP_R -eq 0 ]]; then
     echo "━━━ R (data.table + dplyr) ━━━"
     Rscript "$SCRIPT_DIR/bench_r.R" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+        --csv-events "$CSV_EVENTS" \
         --warmup "$WARMUP" --iters "$ITERS" \
         --out "$RESULTS/r.tsv"
     echo ""

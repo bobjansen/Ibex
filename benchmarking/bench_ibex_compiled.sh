@@ -46,18 +46,20 @@ fi
 CSV="$SCRIPT_DIR/data/prices.csv"
 CSV_MULTI="$SCRIPT_DIR/data/prices_multi.csv"
 CSV_TRADES="$SCRIPT_DIR/data/trades.csv"
+CSV_EVENTS="$SCRIPT_DIR/data/events.csv"
 WARMUP=1
 ITERS=5
 OUT="$SCRIPT_DIR/results/ibex_compiled.tsv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --csv)        CSV="$2";        shift 2 ;;
-        --csv-multi)  CSV_MULTI="$2";  shift 2 ;;
-        --csv-trades) CSV_TRADES="$2"; shift 2 ;;
-        --warmup)     WARMUP="$2";     shift 2 ;;
-        --iters)      ITERS="$2";      shift 2 ;;
-        --out)        OUT="$2";        shift 2 ;;
+        --csv)         CSV="$2";         shift 2 ;;
+        --csv-multi)   CSV_MULTI="$2";   shift 2 ;;
+        --csv-trades)  CSV_TRADES="$2";  shift 2 ;;
+        --csv-events)  CSV_EVENTS="$2";  shift 2 ;;
+        --warmup)      WARMUP="$2";      shift 2 ;;
+        --iters)       ITERS="$2";       shift 2 ;;
+        --out)         OUT="$2";         shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -202,6 +204,26 @@ echo "=== ibex (compiled) ===" >&2
             name="${FILTER_NAMES[$i]}"
             query="${FILTER_QUERIES[$i]}"
             bin_path="$(compile_query "$name" "$query" "trades" "$CSV_TRADES")"
+            avg_ms="$(time_bin "$bin_path")"
+            printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
+            printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
+        done
+    fi
+
+    if [[ -f "$CSV_EVENTS" ]]; then
+        declare -a EVENTS_NAMES=()
+        declare -a EVENTS_QUERIES=()
+
+        EVENTS_NAMES+=("sum_by_user")
+        EVENTS_QUERIES+=("events[select {total = sum(amount)}, by user_id]")
+
+        EVENTS_NAMES+=("filter_events")
+        EVENTS_QUERIES+=("events[filter amount > 500.0]")
+
+        for i in "${!EVENTS_NAMES[@]}"; do
+            name="${EVENTS_NAMES[$i]}"
+            query="${EVENTS_QUERIES[$i]}"
+            bin_path="$(compile_query "$name" "$query" "events" "$CSV_EVENTS")"
             avg_ms="$(time_bin "$bin_path")"
             printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
             printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2

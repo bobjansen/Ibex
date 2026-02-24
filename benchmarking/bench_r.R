@@ -25,6 +25,7 @@ parse_arg <- function(flag, default = NULL) {
 csv_path        <- parse_arg("--csv")
 csv_multi_path  <- parse_arg("--csv-multi")
 csv_trades_path <- parse_arg("--csv-trades")
+csv_events_path <- parse_arg("--csv-events")
 warmup          <- as.integer(parse_arg("--warmup", "1"))
 iters           <- as.integer(parse_arg("--iters",  "5"))
 out_path        <- parse_arg("--out", "results/r.tsv")
@@ -174,6 +175,30 @@ if (!is.null(csv_trades_path)) {
 
     bench("dplyr", "filter_or",
         function() tb_trades |> filter(price > 900.0 | qty < 10))
+}
+
+# ── High-cardinality group-by + string-gather filter ─────────────────────────
+if (!is.null(csv_events_path)) {
+    message("\ndata.table: loading events.csv...")
+    dt_ev <- fread(csv_events_path)
+    tb_ev <- as_tibble(dt_ev)
+
+    message("\n=== data.table (events) ===")
+
+    bench("data.table", "sum_by_user",
+        function() dt_ev[, .(total = sum(amount)), by = user_id])
+
+    bench("data.table", "filter_events",
+        function() dt_ev[amount > 500.0])
+
+    message("\n=== dplyr (events) ===")
+
+    bench("dplyr", "sum_by_user",
+        function() tb_ev |> group_by(user_id) |>
+            summarise(total = sum(amount), .groups = "drop"))
+
+    bench("dplyr", "filter_events",
+        function() tb_ev |> filter(amount > 500.0))
 }
 
 # ── Write results ─────────────────────────────────────────────────────────────

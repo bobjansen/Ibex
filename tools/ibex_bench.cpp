@@ -648,6 +648,7 @@ int main(int argc, char** argv) {
     std::string csv_path = "prices.csv";
     std::string csv_multi_path;
     std::string csv_trades_path;
+    std::string csv_events_path;
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
@@ -661,6 +662,9 @@ int main(int argc, char** argv) {
         ->check(CLI::ExistingFile);
     app.add_option("--csv-trades", csv_trades_path,
                    "CSV file path for filter benchmarks (symbol, price, qty)")
+        ->check(CLI::ExistingFile);
+    app.add_option("--csv-events", csv_events_path,
+                   "CSV file path for high-cardinality benchmarks (user_id, amount, quantity)")
         ->check(CLI::ExistingFile);
     app.add_option("--warmup", warmup_iters, "Warmup iterations")->check(CLI::NonNegativeNumber);
     app.add_option("--iters", iters, "Measured iterations")->check(CLI::PositiveNumber);
@@ -823,6 +827,41 @@ int main(int argc, char** argv) {
                 }
             }
             status = run_benchmark(query, multi_tables, warmup_iters, iters, saved_include_parse);
+            if (status != 0) {
+                break;
+            }
+        }
+    }
+
+    // High-cardinality group-by + string-gather filter: exercises ibex's limits.
+    // user_id has 100 000 distinct values (> 4096 categorical threshold) so the
+    // column stays as Column<std::string>.  This stresses:
+    //   sum_by_user   — hash-map pass over 100K string keys; flat accumulator too
+    //                   large for L2, revealing the parallelism gap vs polars.
+    //   filter_events — gather copies 2M SSO std::string objects; polars copies
+    //                   Arrow offset pairs (8 bytes each, done in parallel).
+    if (status == 0 && !csv_events_path.empty()) {
+        ibex::runtime::Table events_table;
+        try {
+            events_table = read_csv(csv_events_path);
+        } catch (const std::exception& e) {
+            fmt::print("error: failed to read events CSV: {}\n", e.what());
+            return 1;
+        }
+        ibex::runtime::TableRegistry events_tables;
+        events_tables.emplace("events", std::move(events_table));
+        if (print_types) {
+            print_table_types("events", events_tables.find("events")->second);
+        }
+
+        // amount uniform [1, 1000]: filter_events selects ~50% of rows.
+        std::vector<BenchQuery> events_queries = {
+            {"sum_by_user", "events[select {total = sum(amount)}, by user_id]"},
+            {"filter_events", "events[filter amount > 500.0]"},
+        };
+
+        for (const auto& query : events_queries) {
+            status = run_benchmark(query, events_tables, warmup_iters, iters, saved_include_parse);
             if (status != 0) {
                 break;
             }

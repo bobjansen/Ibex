@@ -14,9 +14,13 @@ namespace ibex::ops {
 
 namespace {
 
+// Scratch table name used when we wrap an in-memory table in a one-node IR plan.
+// It is intentionally internal and never exposed to users.
 constexpr const char* kSrcKey = "__ibex__";
 
 auto delegate(ir::NodePtr node, const runtime::Table& src) -> runtime::Table {
+    // Route all convenience ops (filter/project/order/...) through the same
+    // interpreter entry point so behavior stays aligned with the query engine.
     runtime::TableRegistry reg;
     reg.emplace(kSrcKey, src);
     auto result = runtime::interpret(*node, reg, nullptr, nullptr);
@@ -30,7 +34,7 @@ auto to_col_refs(const std::vector<std::string>& names) -> std::vector<ir::Colum
     std::vector<ir::ColumnRef> refs;
     refs.reserve(names.size());
     for (const auto& n : names) {
-        refs.push_back(ir::ColumnRef{n});
+        refs.push_back(ir::ColumnRef{.name = n});
     }
     return refs;
 }
@@ -40,8 +44,7 @@ auto format_date(ibex::Date date) -> std::string {
     sys_days day = sys_days{days{date.days}};
     year_month_day ymd{day};
     return fmt::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
-                       static_cast<unsigned>(ymd.month()),
-                       static_cast<unsigned>(ymd.day()));
+                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
 }
 
 auto format_timestamp(ibex::Timestamp ts) -> std::string {
@@ -51,14 +54,17 @@ auto format_timestamp(ibex::Timestamp ts) -> std::string {
     year_month_day ymd{day};
     auto tod = tp - day;
     hh_mm_ss<nanoseconds> hms{tod};
-    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}",
-                       static_cast<int>(ymd.year()), static_cast<unsigned>(ymd.month()),
-                       static_cast<unsigned>(ymd.day()), hms.hours().count(),
-                       hms.minutes().count(), hms.seconds().count(),
+    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
+                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()),
+                       hms.hours().count(), hms.minutes().count(), hms.seconds().count(),
                        hms.subseconds().count());
 }
 
 auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::string {
+    // Table printer normalization:
+    // - keep temporal types human-readable,
+    // - keep NaN/Inf explicit,
+    // - avoid surprising std::to_string formatting for doubles.
     return std::visit(
         [row](const auto& c) -> std::string {
             using T = typename std::decay_t<decltype(c)>::value_type;
@@ -140,6 +146,7 @@ auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -
 
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
+    // Joins already have a dedicated runtime path; call it directly.
     auto result = runtime::join_tables(left, right, ir::JoinKind::Inner, keys);
     if (!result) {
         throw std::runtime_error(result.error());
@@ -149,6 +156,7 @@ auto inner_join(const runtime::Table& left, const runtime::Table& right,
 
 auto left_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<std::string>& keys) -> runtime::Table {
+    // Joins already have a dedicated runtime path; call it directly.
     auto result = runtime::join_tables(left, right, ir::JoinKind::Left, keys);
     if (!result) {
         throw std::runtime_error(result.error());
@@ -208,7 +216,7 @@ void print(const runtime::Table& t, std::ostream& out) {
 // ─── Expression builders ──────────────────────────────────────────────────────
 
 auto col_ref(std::string name) -> ir::Expr {
-    return ir::Expr{ir::ColumnRef{std::move(name)}};
+    return ir::Expr{ir::ColumnRef{.name = std::move(name)}};
 }
 
 auto int_lit(std::int64_t v) -> ir::Expr {
@@ -233,9 +241,9 @@ auto timestamp_lit(Timestamp v) -> ir::Expr {
 
 auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr {
     return ir::Expr{ir::BinaryExpr{
-        op,
-        std::make_shared<ir::Expr>(std::move(lhs)),
-        std::make_shared<ir::Expr>(std::move(rhs)),
+        .op = op,
+        .left = std::make_shared<ir::Expr>(std::move(lhs)),
+        .right = std::make_shared<ir::Expr>(std::move(rhs)),
     }};
 }
 
@@ -256,54 +264,49 @@ auto filter_col(std::string name) -> ir::FilterExprPtr {
 }
 
 auto filter_int(std::int64_t v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterLiteral{
-            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_dbl(double v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterLiteral{
-            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_str(std::string v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        ir::FilterLiteral{
-            std::variant<std::int64_t, double, std::string, Date, Timestamp>{std::move(v)}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
+        std::variant<std::int64_t, double, std::string, Date, Timestamp>{std::move(v)}}});
 }
 
 auto filter_date(Date v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterLiteral{
-            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterLiteral{
-            std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
     -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterArith{op, std::move(l), std::move(r)}});
+        ir::FilterExpr{ir::FilterArith{.op = op, .left = std::move(l), .right = std::move(r)}});
 }
 
 auto filter_cmp(ir::CompareOp op, ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterCmp{op, std::move(l), std::move(r)}});
+        ir::FilterExpr{ir::FilterCmp{.op = op, .left = std::move(l), .right = std::move(r)}});
 }
 
 auto filter_and(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterAnd{std::move(l), std::move(r)}});
+        ir::FilterExpr{ir::FilterAnd{.left = std::move(l), .right = std::move(r)}});
 }
 
 auto filter_or(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterOr{std::move(l), std::move(r)}});
+        ir::FilterExpr{ir::FilterOr{.left = std::move(l), .right = std::move(r)}});
 }
 
 auto filter_not(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
@@ -313,11 +316,13 @@ auto filter_not(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
 // ─── Compound builders ────────────────────────────────────────────────────────
 
 auto make_field(std::string alias, ir::Expr expr) -> ir::FieldSpec {
-    return ir::FieldSpec{std::move(alias), std::move(expr)};
+    return ir::FieldSpec{.alias = std::move(alias), .expr = std::move(expr)};
 }
 
 auto make_agg(ir::AggFunc func, std::string col_name, std::string alias) -> ir::AggSpec {
-    return ir::AggSpec{func, ir::ColumnRef{std::move(col_name)}, std::move(alias)};
+    return ir::AggSpec{.func = func,
+                       .column = ir::ColumnRef{.name = std::move(col_name)},
+                       .alias = std::move(alias)};
 }
 
 }  // namespace ibex::ops

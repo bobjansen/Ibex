@@ -355,7 +355,7 @@ class Column<std::string> {
     Column() { offsets_.push_back(0); }
 
     // From vector<string> (used by CSV reader).
-    explicit Column(std::vector<std::string> vals) {
+    explicit Column(const std::vector<std::string>& vals) {
         offsets_.reserve(vals.size() + 1);
         offsets_.push_back(0);
         std::size_t total = 0;
@@ -378,7 +378,11 @@ class Column<std::string> {
     [[nodiscard]] auto empty() const noexcept -> bool { return offsets_.size() == 1; }
 
     [[nodiscard]] auto operator[](size_type i) const noexcept -> std::string_view {
-        return {chars_.data() + offsets_[i], offsets_[i + 1] - offsets_[i]};
+        const auto start = static_cast<size_type>(offsets_[i]);
+        const auto end = static_cast<size_type>(offsets_[i + 1]);
+
+        auto slice = std::span<const char>(chars_).subspan(start, end - start);
+        return {slice.data(), slice.size()};
     }
 
     [[nodiscard]] auto at(size_type i) const -> std::string_view {

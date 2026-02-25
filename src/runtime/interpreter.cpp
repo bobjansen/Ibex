@@ -98,6 +98,14 @@ auto normalize_time_index(Table& table) -> void {
     table.ordering = std::vector<ir::OrderKey>{{.name = *table.time_index, .ascending = true}};
 }
 
+auto int64_to_date_checked(std::int64_t value) -> Date {
+    if (value < std::numeric_limits<std::int32_t>::min() ||
+        value > std::numeric_limits<std::int32_t>::max()) {
+        throw std::runtime_error("date out of range");
+    }
+    return Date{static_cast<std::int32_t>(value)};
+}
+
 auto format_tables(const TableRegistry& registry) -> std::string {
     if (registry.empty()) {
         return "<none>";
@@ -1339,7 +1347,7 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 if (const auto* date_value = std::get_if<Date>(&value)) {
                     col.push_back(*date_value);
                 } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
-                    col.push_back(Date{static_cast<std::int32_t>(*int_value)});
+                    col.push_back(int64_to_date_checked(*int_value));
                 } else {
                     throw std::runtime_error("type mismatch");
                 }
@@ -3748,7 +3756,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                             col.push_back(*v);
                         } else if (const auto* int_value =
                                        std::get_if<std::int64_t>(&value.value())) {
-                            col.push_back(Date{static_cast<std::int32_t>(*int_value)});
+                            col.push_back(int64_to_date_checked(*int_value));
                         } else {
                             throw std::runtime_error("type mismatch");
                         }

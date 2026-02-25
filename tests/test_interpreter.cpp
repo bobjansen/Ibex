@@ -32,6 +32,10 @@ auto date_from_ymd(int y, unsigned m, unsigned d) -> Date {
     return Date{static_cast<std::int32_t>(day_point.time_since_epoch().count())};
 }
 
+auto ts_from_nanos(std::int64_t nanos) -> Timestamp {
+    return Timestamp{nanos};
+}
+
 }  // namespace
 
 TEST_CASE("Interpret filter + select") {
@@ -633,4 +637,166 @@ TEST_CASE("Interpret compound filter: three-way AND") {
     REQUIRE(prices != nullptr);
     REQUIRE((*prices)[0] == 15);
     REQUIRE((*prices)[1] == 35);
+}
+
+// ─── TimeFrame / as_timeframe tests ──────────────────────────────────────────
+
+TEST_CASE("as_timeframe on Timestamp column sets time_index and sorts ascending") {
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(300), ts_from_nanos(100), ts_from_nanos(200)});
+    table.add_column("val", Column<std::int64_t>{30, 10, 20});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(R"(as_timeframe(data, "ts");)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+
+    const auto* ts_col = std::get_if<Column<Timestamp>>(result->find("ts"));
+    REQUIRE(ts_col != nullptr);
+    REQUIRE((*ts_col)[0].nanos == 100);
+    REQUIRE((*ts_col)[1].nanos == 200);
+    REQUIRE((*ts_col)[2].nanos == 300);
+}
+
+TEST_CASE("as_timeframe on Date column sets time_index and sorts ascending") {
+    runtime::Table table;
+    table.add_column("day", Column<Date>{date_from_ymd(2024, 1, 3), date_from_ymd(2024, 1, 1),
+                                         date_from_ymd(2024, 1, 2)});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(R"(as_timeframe(data, "day");)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "day");
+
+    const auto* day_col = std::get_if<Column<Date>>(result->find("day"));
+    REQUIRE(day_col != nullptr);
+    REQUIRE((*day_col)[0].days == date_from_ymd(2024, 1, 1).days);
+    REQUIRE((*day_col)[1].days == date_from_ymd(2024, 1, 2).days);
+    REQUIRE((*day_col)[2].days == date_from_ymd(2024, 1, 3).days);
+}
+
+TEST_CASE("as_timeframe on non-existent column returns error") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(R"(as_timeframe(data, "missing");)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("not found") != std::string::npos);
+}
+
+TEST_CASE("as_timeframe on non-timestamp column returns error") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(R"(as_timeframe(data, "price");)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("must be Timestamp or Date") != std::string::npos);
+}
+
+TEST_CASE("Filter on TimeFrame preserves time_index") {
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200), ts_from_nanos(300)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[filter val > 15];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->rows() == 2);
+}
+
+TEST_CASE("Project keeping timestamp col preserves time_index") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
+    table.add_column("val", Column<std::int64_t>{10, 20});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[select { ts, val }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+}
+
+TEST_CASE("Project dropping timestamp col clears time_index") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
+    table.add_column("val", Column<std::int64_t>{10, 20});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[select { val }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE_FALSE(result->time_index.has_value());
+}
+
+TEST_CASE("Order by non-time-col on TimeFrame returns error") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
+    table.add_column("val", Column<std::int64_t>{10, 20});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[order val asc];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("order on TimeFrame") != std::string::npos);
+}
+
+TEST_CASE("Window on plain DataFrame returns TimeFrame error") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 5m];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
+}
+
+TEST_CASE("Window on TimeFrame returns not-yet-implemented error") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 5m];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("not yet implemented") != std::string::npos);
 }

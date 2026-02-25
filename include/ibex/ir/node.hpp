@@ -1,13 +1,13 @@
 #pragma once
 
+#include <ibex/core/time.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <variant>
 #include <vector>
-
-#include <ibex/core/time.hpp>
 
 namespace ibex::ir {
 
@@ -161,6 +161,7 @@ enum class NodeKind : std::uint8_t {
     Aggregate,
     Update,
     Window,
+    AsTimeframe,
     ExternCall,
     Join,
 };
@@ -290,6 +291,19 @@ class UpdateNode final : public Node {
    private:
     std::vector<FieldSpec> fields_;
     std::vector<ColumnRef> group_by_;
+};
+
+/// AsTimeframe node: promotes a DataFrame to a TimeFrame by designating a timestamp column.
+/// See SPEC.md Section 8 (TimeFrame Extensions).
+class AsTimeframeNode final : public Node {
+   public:
+    AsTimeframeNode(NodeId id, std::string column)
+        : Node(NodeKind::AsTimeframe, id), column_(std::move(column)) {}
+
+    [[nodiscard]] auto column() const noexcept -> const std::string& { return column_; }
+
+   private:
+    std::string column_;
 };
 
 /// ExternCall node: calls a table-returning extern C++ function.

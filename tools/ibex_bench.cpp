@@ -655,7 +655,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
 int main(int argc, char** argv) {
     CLI::App app{"Ibex benchmark harness"};
 
-    std::string csv_path = "prices.csv";
+    std::string csv_path;
     std::string csv_multi_path;
     std::string csv_trades_path;
     std::string csv_events_path;
@@ -665,6 +665,7 @@ int main(int argc, char** argv) {
     bool print_types = false;
     bool verify = false;
     std::size_t verify_rows = 10000;
+    std::size_t timeframe_rows = 0;
 
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
     app.add_option("--csv-multi", csv_multi_path,
@@ -688,71 +689,78 @@ int main(int argc, char** argv) {
     app.add_option("--verify-rows", verify_rows,
                    "Rows to sample per table during verification (default: 10000)")
         ->check(CLI::PositiveNumber);
+    app.add_option(
+           "--timeframe-rows", timeframe_rows,
+           "Row count for in-memory TimeFrame benchmarks (lag, rolling_*). 0 = skip (default).")
+        ->check(CLI::NonNegativeNumber);
 
     CLI11_PARSE(app, argc, argv);
 
-    ibex::runtime::Table table;
-    try {
-        table = read_csv(csv_path);
-    } catch (const std::exception& e) {
-        fmt::print("error: failed to read CSV: {}\n", e.what());
-        return 1;
-    }
-
-    ibex::runtime::TableRegistry tables;
-    tables.emplace("prices", std::move(table));
-    if (print_types) {
-        print_table_types("prices", tables.find("prices")->second);
-    }
-
-    // Single-column group-by: exercises the string fast path (robin_hood).
-    std::vector<BenchQuery> queries = {
-        {
-            "mean_by_symbol",
-            "prices[select {avg_price = mean(price)}, by symbol]",
-        },
-        {
-            "ohlc_by_symbol",
-            "prices[select {open = first(price), high = max(price), low = min(price), last = "
-            "last(price)}, by symbol]",
-        },
-        {
-            "update_price_x2",
-            "prices[update {price_x2 = price * 2}]",
-        },
-        // Parse + lower overhead: same queries timed with parsing included.
-        // Run with --include-parse (default) to capture lexer/parser maps.
-        {
-            "parse_mean_by_symbol",
-            "prices[select {avg_price = mean(price)}, by symbol]",
-        },
-        {
-            "parse_ohlc_by_symbol",
-            "prices[select {open = first(price), high = max(price), low = min(price), last = "
-            "last(price)}, by symbol]",
-        },
-        {
-            "parse_update_price_x2",
-            "prices[update {price_x2 = price * 2}]",
-        },
-    };
-
     int status = 0;
-    // The first two queries benchmark pure execution (use --no-include-parse for isolation).
-    // The last two use default include_parse to measure parsing cost.
     bool saved_include_parse = include_parse;
-    for (std::size_t qi = 0; qi < queries.size(); ++qi) {
-        // parse_* queries always include parsing in the timing
-        bool this_include_parse = (qi >= 3) ? true : saved_include_parse;
-        if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
-            if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
-                fmt::print("error: verify failed for {}: {}\n", queries[qi].name, *err);
-                return 1;
-            }
+
+    if (!csv_path.empty()) {
+        ibex::runtime::Table table;
+        try {
+            table = read_csv(csv_path);
+        } catch (const std::exception& e) {
+            fmt::print("error: failed to read CSV: {}\n", e.what());
+            return 1;
         }
-        status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
-        if (status != 0) {
-            break;
+
+        ibex::runtime::TableRegistry tables;
+        tables.emplace("prices", std::move(table));
+        if (print_types) {
+            print_table_types("prices", tables.find("prices")->second);
+        }
+
+        // Single-column group-by: exercises the string fast path (robin_hood).
+        std::vector<BenchQuery> queries = {
+            {
+                "mean_by_symbol",
+                "prices[select {avg_price = mean(price)}, by symbol]",
+            },
+            {
+                "ohlc_by_symbol",
+                "prices[select {open = first(price), high = max(price), low = min(price), last = "
+                "last(price)}, by symbol]",
+            },
+            {
+                "update_price_x2",
+                "prices[update {price_x2 = price * 2}]",
+            },
+            // Parse + lower overhead: same queries timed with parsing included.
+            // Run with --include-parse (default) to capture lexer/parser maps.
+            {
+                "parse_mean_by_symbol",
+                "prices[select {avg_price = mean(price)}, by symbol]",
+            },
+            {
+                "parse_ohlc_by_symbol",
+                "prices[select {open = first(price), high = max(price), low = min(price), last = "
+                "last(price)}, by symbol]",
+            },
+            {
+                "parse_update_price_x2",
+                "prices[update {price_x2 = price * 2}]",
+            },
+        };
+
+        // The first three queries benchmark pure execution (use --no-include-parse for isolation).
+        // The last three use default include_parse to measure parsing cost.
+        for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+            // parse_* queries always include parsing in the timing
+            bool this_include_parse = (qi >= 3) ? true : saved_include_parse;
+            if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
+                if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
+                    fmt::print("error: verify failed for {}: {}\n", queries[qi].name, *err);
+                    return 1;
+                }
+            }
+            status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
+            if (status != 0) {
+                break;
+            }
         }
     }
 
@@ -872,6 +880,63 @@ int main(int argc, char** argv) {
 
         for (const auto& query : events_queries) {
             status = run_benchmark(query, events_tables, warmup_iters, iters, saved_include_parse);
+            if (status != 0) {
+                break;
+            }
+        }
+    }
+
+    // TimeFrame benchmarks: synthetic in-memory data, no CSV required.
+    // Pass --timeframe-rows N (e.g. 1000000) to enable.
+    //
+    // Data layout: N rows, 1-second spacing.
+    //   ts:    Timestamp{i * 1_000_000_000}  (0 s, 1 s, 2 s, ...)
+    //   price: 100.0 + (i % 100)             (sawtooth double)
+    //
+    // Window sizes and expected work per row:
+    //   1m  (60 s)  → ~60 rows in window
+    //   5m (300 s)  → ~300 rows in window
+    if (status == 0 && timeframe_rows > 0) {
+        ibex::runtime::Table tf_table;
+        {
+            ibex::Column<ibex::Timestamp> ts_col;
+            ibex::Column<double> price_col;
+            ts_col.reserve(timeframe_rows);
+            price_col.reserve(timeframe_rows);
+            for (std::size_t i = 0; i < timeframe_rows; ++i) {
+                ts_col.push_back(ibex::Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL});
+                price_col.push_back(100.0 + static_cast<double>(i % 100));
+            }
+            tf_table.add_column("ts", std::move(ts_col));
+            tf_table.add_column("price", std::move(price_col));
+        }
+        ibex::runtime::TableRegistry tf_tables;
+        tf_tables.emplace("tf_data", std::move(tf_table));
+        if (print_types) {
+            print_table_types("tf_data", tf_tables.find("tf_data")->second);
+        }
+
+        fmt::print("\n-- TimeFrame benchmarks ({} rows, 1s spacing) --\n", timeframe_rows);
+
+        // Queries listed from cheapest to most expensive.
+        // as_timeframe:       sort + time_index assignment — O(n log n)
+        // tf_lag1:            vectorized shift — O(n)
+        // tf_rolling_count_1m: binary search per row — O(n log n)
+        // tf_rolling_sum_1m:   binary search + 60-row accumulate per row — O(60n)
+        // tf_rolling_mean_5m:  binary search + 300-row accumulate per row — O(300n)
+        std::vector<BenchQuery> tf_queries = {
+            {"as_timeframe", R"(as_timeframe(tf_data, "ts"))"},
+            {"tf_lag1", R"(as_timeframe(tf_data, "ts")[update { prev = lag(price, 1) }])"},
+            {"tf_rolling_count_1m",
+             R"(as_timeframe(tf_data, "ts")[window 1m, update { c = rolling_count() }])"},
+            {"tf_rolling_sum_1m",
+             R"(as_timeframe(tf_data, "ts")[window 1m, update { s = rolling_sum(price) }])"},
+            {"tf_rolling_mean_5m",
+             R"(as_timeframe(tf_data, "ts")[window 5m, update { m = rolling_mean(price) }])"},
+        };
+
+        for (const auto& query : tf_queries) {
+            status = run_benchmark(query, tf_tables, warmup_iters, iters, saved_include_parse);
             if (status != 0) {
                 break;
             }

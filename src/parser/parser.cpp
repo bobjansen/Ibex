@@ -1100,8 +1100,7 @@ class Parser {
         if (!year || !month || !day || !hour || !minute || !second) {
             return std::nullopt;
         }
-        if (*hour > 23 || *minute > 59 || *second > 59 || *hour < 0 || *minute < 0 ||
-            *second < 0) {
+        if (*hour > 23 || *minute > 59 || *second > 59 || *hour < 0 || *minute < 0 || *second < 0) {
             return std::nullopt;
         }
         std::size_t pos = 19;
@@ -1140,10 +1139,61 @@ class Parser {
             return std::nullopt;
         }
         sys_days day_point{ymd};
-        auto tp = day_point + hours{*hour} + minutes{*minute} + seconds{*second} +
-                  nanoseconds{nanos};
-        auto total = duration_cast<nanoseconds>(tp.time_since_epoch()).count();
-        return Timestamp{total};
+
+        constexpr std::int64_t kNanosPerSecond = 1'000'000'000;
+        constexpr std::int64_t kNanosPerDay = 86'400 * kNanosPerSecond;
+        const auto day_count_raw = day_point.time_since_epoch().count();
+        if (day_count_raw < std::numeric_limits<std::int64_t>::min() ||
+            day_count_raw > std::numeric_limits<std::int64_t>::max()) {
+            return std::nullopt;
+        }
+        const auto day_count = static_cast<std::int64_t>(day_count_raw);
+        const auto time_of_day_nanos =
+            (static_cast<std::int64_t>(*hour) * 3600 + static_cast<std::int64_t>(*minute) * 60 +
+             static_cast<std::int64_t>(*second)) *
+                kNanosPerSecond +
+            nanos;
+
+        auto checked_mul = [](std::int64_t lhs, std::int64_t rhs) -> std::optional<std::int64_t> {
+            if (lhs == 0 || rhs == 0) {
+                return std::int64_t{0};
+            }
+            if (lhs > 0) {
+                if (rhs > 0) {
+                    if (lhs > std::numeric_limits<std::int64_t>::max() / rhs) {
+                        return std::nullopt;
+                    }
+                } else if (rhs < std::numeric_limits<std::int64_t>::min() / lhs) {
+                    return std::nullopt;
+                }
+            } else if (rhs > 0) {
+                if (lhs < std::numeric_limits<std::int64_t>::min() / rhs) {
+                    return std::nullopt;
+                }
+            } else if (lhs != 0 && rhs < std::numeric_limits<std::int64_t>::max() / lhs) {
+                return std::nullopt;
+            }
+            return lhs * rhs;
+        };
+        auto checked_add = [](std::int64_t lhs, std::int64_t rhs) -> std::optional<std::int64_t> {
+            if (rhs > 0 && lhs > std::numeric_limits<std::int64_t>::max() - rhs) {
+                return std::nullopt;
+            }
+            if (rhs < 0 && lhs < std::numeric_limits<std::int64_t>::min() - rhs) {
+                return std::nullopt;
+            }
+            return lhs + rhs;
+        };
+
+        auto day_nanos = checked_mul(day_count, kNanosPerDay);
+        if (!day_nanos.has_value()) {
+            return std::nullopt;
+        }
+        auto total = checked_add(*day_nanos, time_of_day_nanos);
+        if (!total.has_value()) {
+            return std::nullopt;
+        }
+        return Timestamp{*total};
     }
 
     static auto make_literal(std::int64_t value) -> ExprPtr {

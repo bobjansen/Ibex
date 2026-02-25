@@ -173,6 +173,12 @@ TEST_CASE("Parse date and timestamp literals") {
     }
 }
 
+TEST_CASE("Parse timestamp literal rejects out-of-range epoch nanos") {
+    // 2262-04-12 exceeds int64 nanoseconds since Unix epoch.
+    auto result = parse("timestamp\"2262-04-12T00:00:00Z\";");
+    REQUIRE_FALSE(result.has_value());
+}
+
 TEST_CASE("Parse expression statement with call") {
     const char* source = "foo(1, 2 + 3);";
 

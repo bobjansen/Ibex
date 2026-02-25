@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <limits>
 
 namespace {
 
@@ -517,6 +518,25 @@ TEST_CASE("Interpret update with double arithmetic") {
     REQUIRE((*col)[0] == Catch::Approx(3.0));
     REQUIRE((*col)[1] == Catch::Approx(5.0));
     REQUIRE((*col)[2] == Catch::Approx(7.0));
+}
+
+TEST_CASE("Interpret update rejects out-of-range int64 to Date coercion") {
+    runtime::Table table;
+    table.add_column("id", Column<std::int64_t>{1});
+
+    runtime::TableRegistry registry;
+    registry.emplace("rows", table);
+
+    runtime::ExternRegistry externs;
+    externs.register_scalar(
+        "bad_date", runtime::ScalarKind::Date,
+        [](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{runtime::ScalarValue{
+                static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) + 1}};
+        });
+
+    auto ir = require_ir("rows[update { d = bad_date() }];");
+    REQUIRE_THROWS(runtime::interpret(*ir, registry, nullptr, &externs));
 }
 
 TEST_CASE("Interpret compound filter: AND") {

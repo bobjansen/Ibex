@@ -3493,6 +3493,44 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         return ExprType::Int;
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        // Built-in temporal shift functions
+        if (call->callee == "lag" || call->callee == "lead") {
+            if (call->args.size() != 2) {
+                return std::unexpected(call->callee + ": expected 2 arguments");
+            }
+            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+            if (!col_ref) {
+                return std::unexpected(call->callee + ": first argument must be a column name");
+            }
+            const auto* source = input.find(col_ref->name);
+            if (!source) {
+                return std::unexpected(call->callee + ": unknown column '" + col_ref->name + "'");
+            }
+            return expr_type_for_column(*source);
+        }
+        // Built-in rolling aggregate functions
+        if (call->callee == "rolling_mean") {
+            return ExprType::Double;
+        }
+        if (call->callee == "rolling_count") {
+            return ExprType::Int;
+        }
+        if (call->callee == "rolling_sum" || call->callee == "rolling_min" ||
+            call->callee == "rolling_max") {
+            if (call->args.size() != 1) {
+                return std::unexpected(call->callee + ": expected 1 argument");
+            }
+            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+            if (!col_ref) {
+                return std::unexpected(call->callee + ": argument must be a column name");
+            }
+            const auto* source = input.find(col_ref->name);
+            if (!source) {
+                return std::unexpected(call->callee + ": unknown column '" + col_ref->name + "'");
+            }
+            return expr_type_for_column(*source);
+        }
+        // Extern scalar function lookup
         if (externs == nullptr) {
             return std::unexpected("unknown function in expression: " + call->callee);
         }
@@ -3646,6 +3684,329 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
     return std::unexpected("unsupported expression");
 }
 
+// Evaluate a single field expression against a (potentially growing) table,
+// returning the resulting column. Handles fast-path binary ops and row-by-row eval.
+auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
+                           const ExternRegistry* externs)
+    -> std::expected<ColumnValue, std::string> {
+    std::size_t rows = input.rows();
+    auto inferred = infer_expr_type(expr, input, scalars, externs);
+    if (!inferred) {
+        return std::unexpected(inferred.error());
+    }
+    if (auto fast = try_fast_update_binary(expr, input, rows, inferred.value(), scalars);
+        fast.has_value()) {
+        return std::move(fast.value());
+    }
+    ColumnValue new_column;
+    switch (inferred.value()) {
+        case ExprType::Int:
+            new_column = Column<std::int64_t>{};
+            break;
+        case ExprType::Double:
+            new_column = Column<double>{};
+            break;
+        case ExprType::String:
+            new_column = Column<std::string>{};
+            break;
+        case ExprType::Date:
+            new_column = Column<Date>{};
+            break;
+        case ExprType::Timestamp:
+            new_column = Column<Timestamp>{};
+            break;
+    }
+    std::visit([&](auto& col) { col.reserve(rows); }, new_column);
+    for (std::size_t row = 0; row < rows; ++row) {
+        auto value = eval_expr(expr, input, row, scalars, externs);
+        if (!value) {
+            return std::unexpected(value.error());
+        }
+        std::visit(
+            [&](auto& col) {
+                using ColType = std::decay_t<decltype(col)>;
+                using ValueType = typename ColType::value_type;
+                if constexpr (std::is_same_v<ValueType, std::int64_t>) {
+                    if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(*v);
+                    } else if (const auto* v = std::get_if<double>(&value.value())) {
+                        col.push_back(static_cast<std::int64_t>(*v));
+                    } else {
+                        throw std::runtime_error("type mismatch");
+                    }
+                } else if constexpr (std::is_same_v<ValueType, double>) {
+                    if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(static_cast<double>(*v));
+                    } else if (const auto* v = std::get_if<double>(&value.value())) {
+                        col.push_back(*v);
+                    } else {
+                        throw std::runtime_error("type mismatch");
+                    }
+                } else if constexpr (std::is_same_v<ValueType, std::string>) {
+                    if (const auto* v = std::get_if<std::string>(&value.value())) {
+                        col.push_back(*v);
+                    } else {
+                        throw std::runtime_error("type mismatch");
+                    }
+                } else if constexpr (std::is_same_v<ValueType, Date>) {
+                    if (const auto* v = std::get_if<Date>(&value.value())) {
+                        col.push_back(*v);
+                    } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(int64_to_date_checked(*v));
+                    } else {
+                        throw std::runtime_error("type mismatch");
+                    }
+                } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
+                    if (const auto* v = std::get_if<Timestamp>(&value.value())) {
+                        col.push_back(*v);
+                    } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(Timestamp{*v});
+                    } else {
+                        throw std::runtime_error("type mismatch");
+                    }
+                }
+            },
+            new_column);
+    }
+    return new_column;
+}
+
+// Produce a shifted copy of a column: lag(col, n)[i] = col[i-n], lead(col, n)[i] = col[i+n].
+// Out-of-bounds entries are filled with type-appropriate zero/default values.
+auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag)
+    -> std::expected<ColumnValue, std::string> {
+    const std::string fname = is_lag ? "lag" : "lead";
+    if (call.args.size() != 2) {
+        return std::unexpected(fname + ": expected 2 arguments");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected(fname + ": first argument must be a column name");
+    }
+    const auto* offset_lit = std::get_if<ir::Literal>(&call.args[1]->node);
+    const std::int64_t* offset_val =
+        offset_lit ? std::get_if<std::int64_t>(&offset_lit->value) : nullptr;
+    if (offset_val == nullptr || *offset_val < 0) {
+        return std::unexpected(fname + ": second argument must be a non-negative integer literal");
+    }
+    const auto* src = input.find(col_ref->name);
+    if (!src) {
+        return std::unexpected(fname + ": unknown column '" + col_ref->name + "'");
+    }
+    std::size_t n = static_cast<std::size_t>(*offset_val);
+    std::size_t rows = input.rows();
+    return std::visit(
+        [&](const auto& col) -> ColumnValue {
+            using ColT = std::decay_t<decltype(col)>;
+            ColT result;
+            result.reserve(rows);
+            for (std::size_t i = 0; i < rows; ++i) {
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    if (is_lag) {
+                        result.push_back(i >= n ? col[i - n] : std::string_view{});
+                    } else {
+                        result.push_back(i + n < rows ? col[i + n] : std::string_view{});
+                    }
+                } else {
+                    using T = typename ColT::value_type;
+                    if (is_lag) {
+                        result.push_back(i >= n ? col[i - n] : T{});
+                    } else {
+                        result.push_back(i + n < rows ? col[i + n] : T{});
+                    }
+                }
+            }
+            return result;
+        },
+        *src);
+}
+
+// Find the first row index lo in [0, row] where time[lo] >= time[row] - duration.
+// The time index column must be Timestamp or Date and sorted ascending.
+auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration duration) -> std::size_t {
+    if (const auto* ts_col = std::get_if<Column<Timestamp>>(&time_col)) {
+        std::int64_t threshold = (*ts_col)[row].nanos - duration.count();
+        std::size_t lo = 0, hi = row;
+        while (lo < hi) {
+            std::size_t mid = lo + (hi - lo) / 2;
+            if ((*ts_col)[mid].nanos < threshold) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+    // Date column: convert duration (nanoseconds) to days
+    const auto& date_col = std::get<Column<Date>>(time_col);
+    static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
+    auto duration_days = static_cast<std::int32_t>(duration.count() / kNsPerDay);
+    std::int32_t threshold = date_col[row].days - duration_days;
+    std::size_t lo = 0, hi = row;
+    while (lo < hi) {
+        std::size_t mid = lo + (hi - lo) / 2;
+        if (date_col[mid].days < threshold) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// Compute a rolling aggregate column over a time-indexed window.
+// The table must be a TimeFrame (time_index set, sorted ascending).
+auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Duration duration)
+    -> std::expected<ColumnValue, std::string> {
+    const auto& time_col = *table.find(*table.time_index);
+    std::size_t rows = table.rows();
+
+    if (call.callee == "rolling_count") {
+        Column<std::int64_t> result;
+        result.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) {
+            std::size_t lo = window_lo(time_col, i, duration);
+            result.push_back(static_cast<std::int64_t>(i - lo + 1));
+        }
+        return result;
+    }
+
+    if (call.args.empty()) {
+        return std::unexpected(call.callee + ": expected column argument");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected(call.callee + ": argument must be a column name");
+    }
+    const auto* src = table.find(col_ref->name);
+    if (!src) {
+        return std::unexpected(call.callee + ": unknown column '" + col_ref->name + "'");
+    }
+
+    if (call.callee == "rolling_mean") {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected("rolling_mean: column must be numeric (Int or Float)");
+                } else {
+                    Column<double> result;
+                    result.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        double sum = 0.0;
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            sum += static_cast<double>(col[j]);
+                        }
+                        result.push_back(sum / static_cast<double>(i - lo + 1));
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
+    if (call.callee == "rolling_sum") {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using ColT = std::decay_t<decltype(col)>;
+                using T = typename ColT::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected("rolling_sum: column must be numeric (Int or Float)");
+                } else {
+                    ColT result;
+                    result.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        T sum{};
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            sum += col[j];
+                        }
+                        result.push_back(sum);
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
+    // rolling_min / rolling_max — numeric and ordered scalar types
+    bool is_min = call.callee == "rolling_min";
+    return std::visit(
+        [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            using ColT = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
+                          std::is_same_v<ColT, Column<std::string>>) {
+                return std::unexpected(call.callee + ": string columns not supported");
+            } else {
+                using T = typename ColT::value_type;
+                ColT result;
+                result.reserve(rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    std::size_t lo = window_lo(time_col, i, duration);
+                    T best = col[lo];
+                    for (std::size_t j = lo + 1; j <= i; ++j) {
+                        if (is_min ? (col[j] < best) : (col[j] > best)) {
+                            best = col[j];
+                        }
+                    }
+                    result.push_back(best);
+                }
+                return result;
+            }
+        },
+        *src);
+}
+
+constexpr auto is_rolling_func(std::string_view name) -> bool {
+    return name == "rolling_sum" || name == "rolling_mean" || name == "rolling_min" ||
+           name == "rolling_max" || name == "rolling_count";
+}
+
+// Like update_table but evaluates rolling aggregate expressions using the given window duration.
+// Non-rolling fields are evaluated via evaluate_field_column (same as regular update_table).
+auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
+                           ir::Duration duration, const ScalarRegistry* scalars,
+                           const ExternRegistry* externs) -> std::expected<Table, std::string> {
+    Table output = std::move(input);
+    if (!output.time_index.has_value()) {
+        return std::unexpected("window: requires a TimeFrame");
+    }
+    // Reject mutation of the time index column
+    for (const auto& field : fields) {
+        if (field.alias == *output.time_index) {
+            return std::unexpected("cannot update time index column: " + field.alias);
+        }
+    }
+    for (const auto& field : fields) {
+        if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
+            if (is_rolling_func(call->callee)) {
+                auto col = apply_rolling_func(*call, output, duration);
+                if (!col) {
+                    return std::unexpected(col.error());
+                }
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
+            if (call->callee == "lag" || call->callee == "lead") {
+                auto col = eval_lag_lead_column(*call, output, call->callee == "lag");
+                if (!col) {
+                    return std::unexpected(col.error());
+                }
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
+        }
+        auto col = evaluate_field_column(field.expr, output, scalars, externs);
+        if (!col) {
+            return std::unexpected(col.error());
+        }
+        output.add_column(field.alias, std::move(col.value()));
+    }
+    normalize_time_index(output);
+    return output;
+}
+
 auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<Table, std::string> {
@@ -3673,6 +4034,22 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     }
     std::size_t rows = output.rows();
     for (const auto& field : fields) {
+        if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
+            if (call->callee == "lag" || call->callee == "lead") {
+                if (!output.time_index.has_value()) {
+                    return std::unexpected(call->callee + ": requires a TimeFrame");
+                }
+                auto col = eval_lag_lead_column(*call, output, call->callee == "lag");
+                if (!col) {
+                    return std::unexpected(col.error());
+                }
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
+            if (is_rolling_func(call->callee)) {
+                return std::unexpected(call->callee + ": requires a window clause");
+            }
+        }
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);
         if (!inferred) {
             return std::unexpected(inferred.error());
@@ -3858,16 +4235,27 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return aggregate_table(child.value(), agg.group_by(), agg.aggregations());
         }
         case ir::NodeKind::Window: {
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
-            if (!child.has_value()) {
-                return child;
+            const auto& win = static_cast<const ir::WindowNode&>(node);
+            const ir::Node& child_node = *node.children().front();
+            // The child must be an UpdateNode produced by the `update` clause.
+            if (child_node.kind() != ir::NodeKind::Update) {
+                return std::unexpected(
+                    "window: only 'update' is currently supported inside a window block");
             }
-            if (!child->time_index.has_value()) {
+            const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
+            // Evaluate the source (grandchild) without the window context.
+            auto source =
+                interpret_node(*child_node.children().front(), registry, scalars, externs);
+            if (!source.has_value()) {
+                return source;
+            }
+            if (!source->time_index.has_value()) {
                 return std::unexpected(
                     "window requires a TimeFrame — use as_timeframe() to designate a timestamp "
                     "column");
             }
-            return std::unexpected("window: rolling aggregations not yet implemented");
+            return windowed_update_table(std::move(source.value()), update_node.fields(),
+                                         win.duration(), scalars, externs);
         }
         case ir::NodeKind::AsTimeframe: {
             const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);

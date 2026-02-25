@@ -781,13 +781,14 @@ TEST_CASE("Window on plain DataFrame returns TimeFrame error") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 5m];");
+    // window + update on a plain DataFrame (no time_index) → error
+    auto ir = require_ir("data[window 5m, update { s = rolling_sum(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
 }
 
-TEST_CASE("Window on TimeFrame returns not-yet-implemented error") {
+TEST_CASE("Window with no update clause returns unsupported error") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
     table.time_index = "ts";
@@ -795,8 +796,215 @@ TEST_CASE("Window on TimeFrame returns not-yet-implemented error") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
+    // window without any update node → "only 'update' is currently supported"
     auto ir = require_ir("data[window 5m];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().find("not yet implemented") != std::string::npos);
+    REQUIRE(result.error().find("only 'update'") != std::string::npos);
+}
+
+// ─── lag / lead tests ─────────────────────────────────────────────────────────
+
+TEST_CASE("lag(val, 1) on TimeFrame shifts values and fills default at start") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { prev = lag(val, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* prev = std::get_if<Column<std::int64_t>>(result->find("prev"));
+    REQUIRE(prev != nullptr);
+    REQUIRE((*prev)[0] == 0);  // default
+    REQUIRE((*prev)[1] == 10);
+    REQUIRE((*prev)[2] == 20);
+}
+
+TEST_CASE("lead(val, 1) on TimeFrame shifts values and fills default at end") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { nxt = lead(val, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* nxt = std::get_if<Column<std::int64_t>>(result->find("nxt"));
+    REQUIRE(nxt != nullptr);
+    REQUIRE((*nxt)[0] == 20);
+    REQUIRE((*nxt)[1] == 30);
+    REQUIRE((*nxt)[2] == 0);  // default
+}
+
+TEST_CASE("lag(val, 0) is identity") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1)});
+    table.add_column("val", Column<std::int64_t>{42, 99});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { same = lag(val, 0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* same = std::get_if<Column<std::int64_t>>(result->find("same"));
+    REQUIRE(same != nullptr);
+    REQUIRE((*same)[0] == 42);
+    REQUIRE((*same)[1] == 99);
+}
+
+TEST_CASE("lag on non-TimeFrame returns error") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { prev = lag(val, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
+}
+
+TEST_CASE("rolling_sum outside window clause returns error") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1)});
+    table.add_column("val", Column<std::int64_t>{10, 20});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { s = rolling_sum(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("requires a window clause") != std::string::npos);
+}
+
+// ─── rolling aggregate tests ──────────────────────────────────────────────────
+// Timestamps: 0ns, 1ns, 2ns  Values: 10, 20, 30
+// Window 1ns: [t-1, t]
+//   row 0 (t=0): [0-1,0]=[-1,0] → only row 0
+//   row 1 (t=1): [0,1]          → rows 0,1
+//   row 2 (t=2): [1,2]          → rows 1,2
+
+TEST_CASE("rolling_sum with 1ns window") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { s = rolling_sum(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(*result->time_index == "ts");
+
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    REQUIRE(s != nullptr);
+    REQUIRE((*s)[0] == 10);  // row 0 only
+    REQUIRE((*s)[1] == 30);  // rows 0+1
+    REQUIRE((*s)[2] == 50);  // rows 1+2
+}
+
+TEST_CASE("rolling_mean with 1ns window") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    REQUIRE((*m)[0] == Catch::Approx(10.0));
+    REQUIRE((*m)[1] == Catch::Approx(15.0));
+    REQUIRE((*m)[2] == Catch::Approx(25.0));
+}
+
+TEST_CASE("rolling_count with 1ns window") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { c = rolling_count() }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* c = std::get_if<Column<std::int64_t>>(result->find("c"));
+    REQUIRE(c != nullptr);
+    REQUIRE((*c)[0] == 1);
+    REQUIRE((*c)[1] == 2);
+    REQUIRE((*c)[2] == 2);
+}
+
+TEST_CASE("rolling_min and rolling_max with 1ns window") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{30, 10, 20});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir_min = require_ir("data[window 1ns, update { mn = rolling_min(val) }];");
+    auto res_min = runtime::interpret(*ir_min, registry);
+    REQUIRE(res_min.has_value());
+    const auto* mn = std::get_if<Column<std::int64_t>>(res_min->find("mn"));
+    REQUIRE(mn != nullptr);
+    REQUIRE((*mn)[0] == 30);  // row 0 only
+    REQUIRE((*mn)[1] == 10);  // min(30,10)
+    REQUIRE((*mn)[2] == 10);  // min(10,20)
+
+    auto ir_max = require_ir("data[window 1ns, update { mx = rolling_max(val) }];");
+    auto res_max = runtime::interpret(*ir_max, registry);
+    REQUIRE(res_max.has_value());
+    const auto* mx = std::get_if<Column<std::int64_t>>(res_max->find("mx"));
+    REQUIRE(mx != nullptr);
+    REQUIRE((*mx)[0] == 30);  // row 0 only
+    REQUIRE((*mx)[1] == 30);  // max(30,10)
+    REQUIRE((*mx)[2] == 20);  // max(10,20)
+}
+
+TEST_CASE("rolling_sum preserves other columns and time_index") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{1, 2, 3});
+    table.add_column("label", Column<std::string>{"a", "b", "c"});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { s = rolling_sum(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+    // original columns still present
+    REQUIRE(result->find("val") != nullptr);
+    REQUIRE(result->find("label") != nullptr);
+    REQUIRE(result->find("s") != nullptr);
 }

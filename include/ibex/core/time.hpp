@@ -2,6 +2,7 @@
 
 #include <compare>
 #include <cstdint>
+#include <functional>
 
 namespace ibex {
 

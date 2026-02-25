@@ -40,11 +40,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def ensure_scaled_ohlcv(src: pathlib.Path, dst: pathlib.Path, scale: int) -> None:
+def regenerate_scaled_ohlcv(src: pathlib.Path, dst: pathlib.Path, scale: int) -> None:
     if scale < 1:
         raise ValueError("--scale must be >= 1")
-    if dst.exists():
-        return
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     with src.open("r", encoding="utf-8") as f:
@@ -54,18 +52,11 @@ def ensure_scaled_ohlcv(src: pathlib.Path, dst: pathlib.Path, scale: int) -> Non
 
     header = lines[0]
     rows = lines[1:]
+    # Always regenerate to avoid stale benchmark inputs when source CSV changes.
     with dst.open("w", encoding="utf-8") as out:
         out.write(header)
         for _ in range(scale):
             out.writelines(rows)
-
-
-def create_scaled_ibex_script(src_ibex: pathlib.Path, dst_ibex: pathlib.Path, ohlcv: pathlib.Path, fund: pathlib.Path) -> None:
-    text = src_ibex.read_text(encoding="utf-8")
-    text = text.replace("examples/data/ohlcv.csv", str(ohlcv))
-    text = text.replace("examples/data/fundamentals.csv", str(fund))
-    dst_ibex.parent.mkdir(parents=True, exist_ok=True)
-    dst_ibex.write_text(text, encoding="utf-8")
 
 
 IBEX_QUANT_STEPS = [
@@ -326,10 +317,8 @@ def main() -> int:
     ohlcv_src = repo_root / "examples" / "data" / "ohlcv.csv"
     fund_src = repo_root / "examples" / "data" / "fundamentals.csv"
     ohlcv_scaled = scaled_dir / "ohlcv.csv"
-    ibex_script = scaled_dir / "quant_scaled.ibex"
 
-    ensure_scaled_ohlcv(ohlcv_src, ohlcv_scaled, args.scale)
-    create_scaled_ibex_script(repo_root / "examples" / "quant.ibex", ibex_script, ohlcv_scaled, fund_src)
+    regenerate_scaled_ohlcv(ohlcv_src, ohlcv_scaled, args.scale)
 
     polars_cmd = [
         uv,

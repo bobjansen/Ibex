@@ -11,6 +11,17 @@
 #include <unordered_map>
 #include <vector>
 
+namespace ibex::detail {
+/// Transparent hasher that accepts std::string, std::string_view, and const char*,
+/// enabling std::unordered_map::find(string_view) without constructing a std::string.
+struct StringHash {
+    using is_transparent = void;
+    auto operator()(std::string_view sv) const noexcept -> std::size_t {
+        return std::hash<std::string_view>{}(sv);
+    }
+};
+}  // namespace ibex::detail
+
 namespace ibex {
 
 /// Concept constraining valid column element types.
@@ -216,26 +227,27 @@ class Column<Categorical> {
     using value_type = std::string_view;
     using size_type = std::size_t;
     using code_type = std::int32_t;
+    using index_map =
+        std::unordered_map<std::string, code_type, detail::StringHash, std::equal_to<>>;
 
     Column()
         : dict_(std::make_shared<std::vector<std::string>>()),
-          index_(std::make_shared<std::unordered_map<std::string, code_type>>()) {}
+          index_(std::make_shared<index_map>()) {}
 
     explicit Column(std::vector<std::string> dict)
         : dict_(std::make_shared<std::vector<std::string>>(std::move(dict))),
-          index_(std::make_shared<std::unordered_map<std::string, code_type>>()) {
+          index_(std::make_shared<index_map>()) {
         rebuild_index();
     }
 
     Column(std::vector<std::string> dict, std::vector<code_type> codes)
         : dict_(std::make_shared<std::vector<std::string>>(std::move(dict))),
-          index_(std::make_shared<std::unordered_map<std::string, code_type>>()),
+          index_(std::make_shared<index_map>()),
           codes_(std::move(codes)) {
         rebuild_index();
     }
 
-    Column(std::shared_ptr<std::vector<std::string>> dict,
-           std::shared_ptr<std::unordered_map<std::string, code_type>> index,
+    Column(std::shared_ptr<std::vector<std::string>> dict, std::shared_ptr<index_map> index,
            std::vector<code_type> codes = {})
         : dict_(std::move(dict)), index_(std::move(index)), codes_(std::move(codes)) {}
 
@@ -272,8 +284,7 @@ class Column<Categorical> {
         return dict_;
     }
 
-    [[nodiscard]] auto index_ptr() const noexcept
-        -> const std::shared_ptr<std::unordered_map<std::string, code_type>>& {
+    [[nodiscard]] auto index_ptr() const noexcept -> const std::shared_ptr<index_map>& {
         return index_;
     }
 
@@ -286,7 +297,7 @@ class Column<Categorical> {
         if (index_ == nullptr) {
             return std::nullopt;
         }
-        auto it = index_->find(std::string(value));
+        auto it = index_->find(value);
         if (it == index_->end()) {
             return std::nullopt;
         }
@@ -304,20 +315,20 @@ class Column<Categorical> {
 
     auto find_or_insert(value_type value) -> code_type {
         if (index_ == nullptr) {
-            index_ = std::make_shared<std::unordered_map<std::string, code_type>>();
+            index_ = std::make_shared<index_map>();
         }
-        auto it = index_->find(std::string(value));
+        auto it = index_->find(value);
         if (it != index_->end()) {
             return it->second;
         }
-        code_type code = static_cast<code_type>(dict_->size());
+        auto code = static_cast<code_type>(dict_->size());
         dict_->emplace_back(value);
         index_->emplace(dict_->back(), code);
         return code;
     }
 
     std::shared_ptr<std::vector<std::string>> dict_;
-    std::shared_ptr<std::unordered_map<std::string, code_type>> index_;
+    std::shared_ptr<index_map> index_;
     std::vector<code_type> codes_;
 };
 

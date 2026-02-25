@@ -47,6 +47,10 @@ class Builder {
         return std::make_unique<WindowNode>(next_id(), duration);
     }
 
+    [[nodiscard]] auto as_timeframe(std::string column) -> NodePtr {
+        return std::make_unique<AsTimeframeNode>(next_id(), std::move(column));
+    }
+
     [[nodiscard]] auto extern_call(std::string callee, std::vector<Expr> args) -> NodePtr {
         return std::make_unique<ExternCallNode>(next_id(), std::move(callee), std::move(args));
     }

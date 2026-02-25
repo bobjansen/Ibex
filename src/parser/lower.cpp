@@ -79,6 +79,25 @@ class Lowerer {
     }
 
     auto lower_table_call(const CallExpr& call) -> LowerResult {
+        if (call.callee == "as_timeframe") {
+            if (call.args.size() != 2) {
+                return std::unexpected(LowerError{.message = "as_timeframe expects 2 arguments"});
+            }
+            auto base = lower_expr(*call.args[0]);
+            if (!base.has_value()) {
+                return base;
+            }
+            const auto* lit = std::get_if<LiteralExpr>(&call.args[1]->node);
+            const std::string* col_name = lit ? std::get_if<std::string>(&lit->value) : nullptr;
+            if (col_name == nullptr) {
+                return std::unexpected(LowerError{
+                    .message =
+                        "as_timeframe: second argument must be a string literal column name"});
+            }
+            auto node = builder_.as_timeframe(*col_name);
+            node->add_child(std::move(base.value()));
+            return node;
+        }
         if (!table_externs_.contains(call.callee)) {
             return std::unexpected(LowerError{.message = "unknown table function: " + call.callee});
         }
@@ -960,6 +979,10 @@ class Lowerer {
                 const auto& window = static_cast<const ir::WindowNode&>(node);
                 auto clone = builder_.window(window.duration());
                 return clone;
+            }
+            case ir::NodeKind::AsTimeframe: {
+                const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
+                return builder_.as_timeframe(atf.column());
             }
             case ir::NodeKind::ExternCall: {
                 const auto& ec = static_cast<const ir::ExternCallNode&>(node);

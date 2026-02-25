@@ -291,6 +291,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         case ir::NodeKind::Window:
             throw std::runtime_error("ibex_compile: WindowNode emission is not yet supported");
 
+        case ir::NodeKind::AsTimeframe:
+            throw std::runtime_error("ibex_compile: AsTimeframeNode emission is not yet supported");
+
         case ir::NodeKind::ExternCall: {
             // In bench mode ExternCall nodes were pre-emitted; reuse the var.
             if (auto it = cached_vars_.find(&node); it != cached_vars_.end())
@@ -492,8 +495,7 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                             return "ibex::Date{std::int32_t{" + std::to_string(v.days) + "}}";
                         } else {
                             static_assert(std::is_same_v<V, Timestamp>);
-                            return "ibex::Timestamp{std::int64_t{" + std::to_string(v.nanos) +
-                                   "}}";
+                            return "ibex::Timestamp{std::int64_t{" + std::to_string(v.nanos) + "}}";
                         }
                     },
                     node.value);

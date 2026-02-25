@@ -3857,8 +3857,42 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return aggregate_table(child.value(), agg.group_by(), agg.aggregations());
         }
-        case ir::NodeKind::Window:
-            return std::unexpected("window not supported in interpreter");
+        case ir::NodeKind::Window: {
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child.has_value()) {
+                return child;
+            }
+            if (!child->time_index.has_value()) {
+                return std::unexpected(
+                    "window requires a TimeFrame — use as_timeframe() to designate a timestamp "
+                    "column");
+            }
+            return std::unexpected("window: rolling aggregations not yet implemented");
+        }
+        case ir::NodeKind::AsTimeframe: {
+            const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child.has_value()) {
+                return child;
+            }
+            Table& t = child.value();
+            const auto* col = t.find(atf.column());
+            if (col == nullptr) {
+                return std::unexpected("as_timeframe: column '" + atf.column() + "' not found");
+            }
+            if (!std::holds_alternative<Column<Timestamp>>(*col) &&
+                !std::holds_alternative<Column<Date>>(*col)) {
+                return std::unexpected("as_timeframe: column '" + atf.column() +
+                                       "' must be Timestamp or Date");
+            }
+            auto sorted = order_table(t, {{.name = atf.column(), .ascending = true}});
+            if (!sorted.has_value()) {
+                return sorted;
+            }
+            sorted->time_index = atf.column();
+            normalize_time_index(*sorted);
+            return sorted;
+        }
         case ir::NodeKind::ExternCall: {
             const auto& ec = static_cast<const ir::ExternCallNode&>(node);
             if (externs == nullptr) {

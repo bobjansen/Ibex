@@ -388,9 +388,8 @@ class Lowerer {
         return std::visit(
             [](const auto& node) -> ir::FilterExprPtr {
                 using T = std::decay_t<decltype(node)>;
-                if constexpr (std::is_same_v<T, ir::FilterColumn>) {
-                    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{node});
-                } else if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+                if constexpr (std::is_same_v<T, ir::FilterColumn> ||
+                              std::is_same_v<T, ir::FilterLiteral>) {
                     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{node});
                 } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
                     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterArith{
@@ -477,7 +476,7 @@ class Lowerer {
         return builder_.update(std::move(fields), std::move(group_by));
     }
 
-    auto lower_order(const OrderClause& clause)
+    static auto lower_order(const OrderClause& clause)
         -> std::expected<std::vector<ir::OrderKey>, LowerError> {
         std::vector<ir::OrderKey> keys;
         keys.reserve(clause.keys.size());

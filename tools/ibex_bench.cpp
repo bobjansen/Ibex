@@ -5,6 +5,7 @@
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
 
+#include <algorithm>
 #include <chrono>
 #include <csv.hpp>
 #include <limits>
@@ -177,12 +178,9 @@ auto verify_ohlc_by_symbol(const ibex::runtime::Table& table, const ibex::runtim
             open[gid] = v;
             seen[gid] = true;
         }
-        if (v > high[gid]) {
-            high[gid] = v;
-        }
-        if (v < low[gid]) {
-            low[gid] = v;
-        }
+        high[gid] = std::max(v, high[gid]);
+
+        low[gid] = std::min(v, low[gid]);
         last[gid] = v;
     }
     if (result.rows() != order.size()) {
@@ -269,12 +267,8 @@ auto verify_group_by_symbol_day(const ibex::runtime::Table& table,
                 open[gid] = v;
                 seen[gid] = true;
             }
-            if (v > high[gid]) {
-                high[gid] = v;
-            }
-            if (v < low[gid]) {
-                low[gid] = v;
-            }
+            high[gid] = std::max(v, high[gid]);
+            low[gid] = std::min(v, low[gid]);
             last[gid] = v;
         }
     }
@@ -458,17 +452,17 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
     }
     ibex::runtime::TableRegistry sliced;
     const ibex::runtime::Table* table = nullptr;
-    if (tables.find("prices") != tables.end()) {
+    if (tables.contains("prices")) {
         table = &tables.at("prices");
         sliced.emplace("prices", slice_table(*table, max_rows));
     }
     const ibex::runtime::Table* trades = nullptr;
-    if (tables.find("trades") != tables.end()) {
+    if (tables.contains("trades")) {
         trades = &tables.at("trades");
         sliced.emplace("trades", slice_table(*trades, max_rows));
     }
     const ibex::runtime::Table* multi = nullptr;
-    if (tables.find("prices_multi") != tables.end()) {
+    if (tables.contains("prices_multi")) {
         multi = &tables.at("prices_multi");
         sliced.emplace("prices_multi", slice_table(*multi, max_rows));
     }

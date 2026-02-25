@@ -1149,9 +1149,9 @@ class Parser {
         }
         const auto day_count = static_cast<std::int64_t>(day_count_raw);
         const auto time_of_day_nanos =
-            (static_cast<std::int64_t>(*hour) * 3600 + static_cast<std::int64_t>(*minute) * 60 +
-             static_cast<std::int64_t>(*second)) *
-                kNanosPerSecond +
+            ((static_cast<std::int64_t>(*hour) * 3600 + static_cast<std::int64_t>(*minute) * 60 +
+              static_cast<std::int64_t>(*second)) *
+             kNanosPerSecond) +
             nanos;
 
         auto checked_mul = [](std::int64_t lhs, std::int64_t rhs) -> std::optional<std::int64_t> {

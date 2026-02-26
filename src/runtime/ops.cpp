@@ -154,6 +154,25 @@ auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -
     return delegate(std::move(upd_node), t);
 }
 
+auto as_timeframe(const runtime::Table& t, const std::string& column) -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto atf_node = b.as_timeframe(column);
+    atf_node->add_child(std::move(scan_node));
+    return delegate(std::move(atf_node), t);
+}
+
+auto windowed_update(const runtime::Table& t, ir::Duration duration,
+                     const std::vector<ir::FieldSpec>& fields) -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto upd_node = b.update(fields);
+    upd_node->add_child(std::move(scan_node));
+    auto win_node = b.window(duration);
+    win_node->add_child(std::move(upd_node));
+    return delegate(std::move(win_node), t);
+}
+
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.

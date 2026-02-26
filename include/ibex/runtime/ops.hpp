@@ -52,6 +52,12 @@ namespace ibex::ops {
 [[nodiscard]] auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
     -> runtime::Table;
 
+[[nodiscard]] auto as_timeframe(const runtime::Table& t, const std::string& column)
+    -> runtime::Table;
+
+[[nodiscard]] auto windowed_update(const runtime::Table& t, ir::Duration duration,
+                                   const std::vector<ir::FieldSpec>& fields) -> runtime::Table;
+
 [[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,
                               const std::vector<std::string>& keys) -> runtime::Table;
 

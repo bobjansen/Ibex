@@ -288,8 +288,28 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
-        case ir::NodeKind::Window:
-            throw std::runtime_error("ibex_compile: WindowNode emission is not yet supported");
+        case ir::NodeKind::Window: {
+            const auto& win = static_cast<const ir::WindowNode&>(node);
+            if (win.children().empty() || win.children().front()->kind() != ir::NodeKind::Update) {
+                throw std::runtime_error("ibex_compile: WindowNode must have an UpdateNode child");
+            }
+            const auto& upd = static_cast<const ir::UpdateNode&>(*win.children().front());
+            auto source = emit_node(*upd.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::windowed_update(" << source << ",\n";
+            *out_ << "        ibex::ir::Duration(" << win.duration().count() << "LL),\n";
+            *out_ << "        {";
+            bool first = true;
+            for (const auto& f : upd.fields()) {
+                if (!first)
+                    *out_ << ",\n         ";
+                first = false;
+                *out_ << "ibex::ops::make_field(\"" << escape_string(f.alias) << "\", "
+                      << emit_expr(f.expr) << ")";
+            }
+            *out_ << "});\n";
+            return var;
+        }
 
         case ir::NodeKind::Resample: {
             const auto& rs = static_cast<const ir::ResampleNode&>(node);
@@ -327,8 +347,14 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
-        case ir::NodeKind::AsTimeframe:
-            throw std::runtime_error("ibex_compile: AsTimeframeNode emission is not yet supported");
+        case ir::NodeKind::AsTimeframe: {
+            const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
+            auto child = emit_node(*atf.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::as_timeframe(" << child << ", \""
+                  << escape_string(atf.column()) << "\");\n";
+            return var;
+        }
 
         case ir::NodeKind::ExternCall: {
             // In bench mode ExternCall nodes were pre-emitted; reuse the var.

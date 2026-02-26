@@ -3,6 +3,9 @@
 A statically typed DSL for columnar DataFrame manipulation, with a fast
 interpreter and transpiliable to C++23.
 
+See the [website](https://bobjansen.github.io/Ibex/#get-started) for more
+information.
+
 ```
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 

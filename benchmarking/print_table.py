@@ -31,6 +31,7 @@ QUERY_ORDER = [
     "filter_or",
     "sum_by_user",
     "filter_events",
+    "null_left_join",
 ]
 
 QUERY_LABEL = {
@@ -46,6 +47,7 @@ QUERY_LABEL = {
     "filter_or":           "filter OR",
     "sum_by_user":         "sum by user (100K)",
     "filter_events":       "filter events (str)",
+    "null_left_join":      "left join (50% null)",
 }
 
 

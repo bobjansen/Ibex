@@ -89,6 +89,21 @@ def generate(out_dir: pathlib.Path, n: int = N) -> None:
         print(f"  wrote {tr}  ({n:,} rows, {mb:.0f} MB, {time.perf_counter()-t0:.1f}s)")
 
 
+    # ── lookup.csv ───────────────────────────────────────────────────────────
+    lu = out_dir / "lookup.csv"
+    if lu.exists():
+        print(f"  {lu} already exists, skipping")
+    else:
+        # Half the symbols (first 126 of 252) have sector info; the rest produce null.
+        sectors = np.array(["Tech", "Finance", "Energy", "Health", "Consumer"])
+        half = tickers[:N_SYMBOLS // 2]
+        rng5 = np.random.default_rng(SEED + 4)
+        sector_arr = sectors[rng5.integers(0, len(sectors), size=len(half))]
+        t0 = time.perf_counter()
+        pd.DataFrame({"symbol": half, "sector": sector_arr}).to_csv(lu, index=False)
+        mb = lu.stat().st_size / 1024 / 1024
+        print(f"  wrote {lu}  ({len(half)} rows, {mb:.3f} MB, {time.perf_counter()-t0:.3f}s)")
+
     # ── events.csv ───────────────────────────────────────────────────────────
     ev = out_dir / "events.csv"
     if ev.exists():

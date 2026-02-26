@@ -21,15 +21,22 @@ enum class ScalarKind : std::uint8_t {
     Timestamp,
 };
 
-using ColumnValue =
-    std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
-                 Column<Date>, Column<Timestamp>>;
+using ColumnValue = std::variant<Column<std::int64_t>, Column<double>, Column<std::string>,
+                                 Column<Categorical>, Column<Date>, Column<Timestamp>>;
 using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 
 struct ColumnEntry {
     std::string name;
     std::shared_ptr<ColumnValue> column;
+    // Validity bitmap: true = valid (not null), false = null.
+    // nullopt means every row is valid — the common case, with zero overhead.
+    std::optional<std::vector<bool>> validity;
 };
+
+/// Returns true if row `row` of `entry` is null.
+[[nodiscard]] inline auto is_null(const ColumnEntry& entry, std::size_t row) -> bool {
+    return entry.validity.has_value() && !(*entry.validity)[row];
+}
 
 struct Table {
     std::vector<ColumnEntry> columns;
@@ -38,8 +45,11 @@ struct Table {
     std::optional<std::string> time_index;
 
     void add_column(std::string name, ColumnValue column);
+    /// Add a column with an explicit validity bitmap (true = valid, false = null).
+    void add_column(std::string name, ColumnValue column, std::vector<bool> validity);
     [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;
     [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;
+    [[nodiscard]] auto find_entry(const std::string& name) const -> const ColumnEntry*;
     [[nodiscard]] auto rows() const noexcept -> std::size_t;
 };
 

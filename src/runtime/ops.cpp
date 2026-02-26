@@ -219,9 +219,14 @@ void print(const runtime::Table& t, std::ostream& out) {
         widths[c] = t.columns[c].name.size();
         cells[c].reserve(rows);
         for (std::size_t r = 0; r < rows; ++r) {
-            auto s = format_value(*t.columns[c].column, r);
-            widths[c] = std::max(widths[c], s.size());
-            cells[c].push_back(std::move(s));
+            if (is_null(t.columns[c], r)) {
+                widths[c] = std::max(widths[c], std::size_t{4});  // "null"
+                cells[c].push_back("null");
+            } else {
+                auto s = format_value(*t.columns[c].column, r);
+                widths[c] = std::max(widths[c], s.size());
+                cells[c].push_back(std::move(s));
+            }
         }
     }
 

@@ -342,6 +342,26 @@ let df = my_source("data/file.bin");
 
 All scripts respect `IBEX_ROOT`, `BUILD_DIR`, and `CXX` environment overrides.
 
+## Editor Support
+
+### VS Code
+
+Syntax highlighting for `.ibex` files is included in `editors/vscode/`.
+
+**Install:**
+
+```bash
+# Linux / WSL — copy to the Windows VS Code extensions directory
+cp -r editors/vscode /mnt/c/Users/<username>/.vscode/extensions/ibex-language-0.1.0
+
+# macOS / Linux native VS Code
+cp -r editors/vscode ~/.vscode/extensions/ibex-language-0.1.0
+```
+
+Fully restart VS Code after copying. `.ibex` files will be highlighted automatically.
+
+**Highlights:** keywords (`filter`, `select`, `by`, …), clause operators, type names, built-in functions (`mean`, `rolling_sum`, …), duration literals (`1m`, `5s`), backtick-quoted column names, strings, and comments.
+
 ## Roadmap
 
 - [ ] Time-indexed DataFrame support

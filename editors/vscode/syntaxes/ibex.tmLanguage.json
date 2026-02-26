@@ -1,0 +1,131 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Ibex",
+  "scopeName": "source.ibex",
+  "fileTypes": ["ibex"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#backtick-identifiers" },
+    { "include": "#boolean-literals" },
+    { "include": "#duration-literals" },
+    { "include": "#numeric-literals" },
+    { "include": "#type-keywords" },
+    { "include": "#builtin-functions" },
+    { "include": "#clause-keywords" },
+    { "include": "#join-keywords" },
+    { "include": "#declaration-keywords" },
+    { "include": "#logical-operators" },
+    { "include": "#direction-keywords" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.double-slash.ibex",
+      "match": "//.*$"
+    },
+
+    "strings": {
+      "name": "string.quoted.double.ibex",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.ibex", "match": "\\\\." }
+      ]
+    },
+
+    "backtick-identifiers": {
+      "name": "variable.other.quoted.ibex",
+      "match": "`[^`\\n]+`"
+    },
+
+    "boolean-literals": {
+      "name": "constant.language.boolean.ibex",
+      "match": "\\b(true|false)\\b"
+    },
+
+    "duration-literals": {
+      "comment": "Must be tried before numeric-literals so '1m' matches whole, not just '1'.",
+      "name": "constant.numeric.duration.ibex",
+      "match": "\\b[0-9]+(ms|us|ns|mo|[smhdwy])\\b"
+    },
+
+    "numeric-literals": {
+      "name": "constant.numeric.ibex",
+      "match": "\\b[0-9]+(\\.[0-9]+)?\\b"
+    },
+
+    "type-keywords": {
+      "name": "storage.type.ibex",
+      "match": "\\b(Int|Int32|Int64|Float32|Float64|Bool|String|Date|Timestamp|Column|DataFrame|TimeFrame)\\b"
+    },
+
+    "builtin-functions": {
+      "comment": "Aggregate, rolling, and special built-in functions.",
+      "name": "support.function.builtin.ibex",
+      "match": "\\b(first|last|sum|mean|min|max|count|rolling_sum|rolling_mean|rolling_count|rolling_min|rolling_max|lag|lead|as_timeframe|scalar)\\b(?=\\s*\\()"
+    },
+
+    "clause-keywords": {
+      "name": "keyword.control.clause.ibex",
+      "match": "\\b(filter|select|update|by|order|distinct|window|resample)\\b"
+    },
+
+    "join-keywords": {
+      "name": "keyword.control.join.ibex",
+      "match": "\\b(join|left|asof|on)\\b"
+    },
+
+    "declaration-keywords": {
+      "name": "keyword.other.declaration.ibex",
+      "match": "\\b(let|mut|extern|fn|from)\\b"
+    },
+
+    "logical-operators": {
+      "name": "keyword.operator.logical.ibex",
+      "match": "\\b(and|or|not)\\b"
+    },
+
+    "direction-keywords": {
+      "name": "keyword.other.direction.ibex",
+      "match": "\\b(asc|desc)\\b"
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.ibex",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.comparison.ibex",
+          "match": "==|!=|<=|>="
+        },
+        {
+          "name": "keyword.operator.comparison.ibex",
+          "match": "<(?!-)|(?<!-)>"
+        },
+        {
+          "name": "keyword.operator.assignment.ibex",
+          "match": "(?<![=!<>])=(?!=)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.ibex",
+          "match": "[+\\-*/]"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.section.brackets.ibex",   "match": "[\\[\\]]" },
+        { "name": "punctuation.section.braces.ibex",     "match": "[{}]" },
+        { "name": "punctuation.section.parens.ibex",     "match": "[()]" },
+        { "name": "punctuation.separator.colon.ibex",    "match": ":" },
+        { "name": "punctuation.separator.comma.ibex",    "match": "," },
+        { "name": "punctuation.terminator.statement.ibex", "match": ";" }
+      ]
+    }
+  }
+}

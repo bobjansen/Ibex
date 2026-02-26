@@ -471,6 +471,31 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
     </div>
   </section>
 
+  <!-- Editor support -->
+  <section class="section">
+    <p class="section-label">Editor support</p>
+    <h2>Syntax highlighting for VS Code.</h2>
+    <p class="section-sub">
+      A TextMate grammar covering keywords, types, built-in functions, duration
+      literals, backtick-quoted column names, and comments.
+    </p>
+    <div class="steps" style="margin-top: 1rem;">
+      <div>
+        <p class="step-label">Install &mdash; WSL</p>
+<pre><code>cp -r editors/vscode \
+  /mnt/c/Users/&lt;username&gt;/.vscode/extensions/ibex-language-0.1.0</code></pre>
+      </div>
+      <div>
+        <p class="step-label">Install &mdash; macOS / native Linux</p>
+<pre><code>cp -r editors/vscode \
+  ~/.vscode/extensions/ibex-language-0.1.0</code></pre>
+      </div>
+    </div>
+    <p style="margin-top: 0.8rem; color: var(--muted); font-size: 0.91rem;">
+      Fully restart VS Code after copying. <code>.ibex</code> files are highlighted automatically.
+    </p>
+  </section>
+
   <!-- Get started -->
   <section class="section" id="get-started">
     <p class="section-label">Get started</p>

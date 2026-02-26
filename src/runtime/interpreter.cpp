@@ -1158,16 +1158,6 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
         column);
 }
 
-auto string_view_at(const ColumnValue& column, std::size_t row) -> std::string_view {
-    if (const auto* str_col = std::get_if<Column<std::string>>(&column)) {
-        return (*str_col)[row];
-    }
-    if (const auto* cat_col = std::get_if<Column<Categorical>>(&column)) {
-        return (*cat_col)[row];
-    }
-    return std::string_view{};
-}
-
 auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
     if (input.columns.empty()) {
         Table output = input;
@@ -1206,12 +1196,6 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
     return output;
 }
 
-struct OrderColumn {
-    const ColumnValue* column = nullptr;
-    bool ascending = true;
-    ExprType kind = ExprType::Int;
-};
-
 auto column_kind(const ColumnValue& column) -> ExprType;
 
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
@@ -1231,62 +1215,86 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         return output;
     }
 
-    std::vector<OrderColumn> order_cols;
-    order_cols.reserve(resolved_keys.size());
+    // Pre-extract each sort key into a flat typed array so the hot comparator
+    // loop does plain vector indexing rather than per-comparison variant dispatch.
+    enum class FlatKind : std::uint8_t { I64, F64, Str };
+    struct FlatKey {
+        FlatKind kind;
+        std::vector<std::int64_t> i64;  // Int, Date.days, Timestamp.nanos
+        std::vector<double> f64;
+        std::vector<std::string_view> str;  // views into original column storage
+        bool ascending;
+    };
+
+    std::vector<FlatKey> flat_keys;
+    flat_keys.reserve(resolved_keys.size());
     for (const auto& key : resolved_keys) {
         const auto* column = input.find(key.name);
         if (column == nullptr) {
             return std::unexpected("order column not found: " + key.name +
                                    " (available: " + format_columns(input) + ")");
         }
-        order_cols.push_back(OrderColumn{column, key.ascending, column_kind(*column)});
+        FlatKey fk;
+        fk.ascending = key.ascending;
+        std::visit(
+            [&](const auto& col) {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                    fk.kind = FlatKind::I64;
+                    fk.i64.assign(col.begin(), col.end());
+                } else if constexpr (std::is_same_v<ColT, Column<double>>) {
+                    fk.kind = FlatKind::F64;
+                    fk.f64.assign(col.begin(), col.end());
+                } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
+                    fk.kind = FlatKind::I64;
+                    fk.i64.reserve(rows);
+                    for (const auto& d : col)
+                        fk.i64.push_back(d.days);
+                } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+                    fk.kind = FlatKind::I64;
+                    fk.i64.reserve(rows);
+                    for (const auto& ts : col)
+                        fk.i64.push_back(ts.nanos);
+                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    fk.kind = FlatKind::Str;
+                    fk.str.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i)
+                        fk.str.push_back(col[i]);
+                } else {
+                    // Categorical: sort by dictionary value (string_view into shared dict)
+                    fk.kind = FlatKind::Str;
+                    fk.str.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i)
+                        fk.str.push_back(col[i]);
+                }
+            },
+            *column);
+        flat_keys.push_back(std::move(fk));
     }
 
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), 0);
 
     auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
-        for (const auto& col : order_cols) {
-            switch (col.kind) {
-                case ExprType::Int: {
-                    auto lv = std::get<Column<std::int64_t>>(*col.column)[lhs];
-                    auto rv = std::get<Column<std::int64_t>>(*col.column)[rhs];
-                    if (lv == rv) {
-                        break;
-                    }
-                    return col.ascending ? (lv < rv) : (lv > rv);
+        for (const auto& fk : flat_keys) {
+            switch (fk.kind) {
+                case FlatKind::I64: {
+                    auto l = fk.i64[lhs], r = fk.i64[rhs];
+                    if (l != r)
+                        return fk.ascending ? (l < r) : (l > r);
+                    break;
                 }
-                case ExprType::Double: {
-                    auto lv = std::get<Column<double>>(*col.column)[lhs];
-                    auto rv = std::get<Column<double>>(*col.column)[rhs];
-                    if (lv == rv) {
-                        break;
-                    }
-                    return col.ascending ? (lv < rv) : (lv > rv);
+                case FlatKind::F64: {
+                    auto l = fk.f64[lhs], r = fk.f64[rhs];
+                    if (l != r)
+                        return fk.ascending ? (l < r) : (l > r);
+                    break;
                 }
-                case ExprType::String: {
-                    auto lv = string_view_at(*col.column, lhs);
-                    auto rv = string_view_at(*col.column, rhs);
-                    if (lv == rv) {
-                        break;
-                    }
-                    return col.ascending ? (lv < rv) : (lv > rv);
-                }
-                case ExprType::Date: {
-                    auto lv = std::get<Column<Date>>(*col.column)[lhs].days;
-                    auto rv = std::get<Column<Date>>(*col.column)[rhs].days;
-                    if (lv == rv) {
-                        break;
-                    }
-                    return col.ascending ? (lv < rv) : (lv > rv);
-                }
-                case ExprType::Timestamp: {
-                    auto lv = std::get<Column<Timestamp>>(*col.column)[lhs].nanos;
-                    auto rv = std::get<Column<Timestamp>>(*col.column)[rhs].nanos;
-                    if (lv == rv) {
-                        break;
-                    }
-                    return col.ascending ? (lv < rv) : (lv > rv);
+                case FlatKind::Str: {
+                    auto l = fk.str[lhs], r = fk.str[rhs];
+                    if (l != r)
+                        return fk.ascending ? (l < r) : (l > r);
+                    break;
                 }
             }
         }
@@ -1295,19 +1303,54 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
 
     std::stable_sort(idx.begin(), idx.end(), compare_row);
 
+    // Column-major gather: one std::visit per column (not per element).
     Table output;
     output.columns.reserve(input.columns.size());
     for (const auto& entry : input.columns) {
-        output.add_column(entry.name, make_empty_like(*entry.column));
-    }
-    for (auto& entry : output.columns) {
-        std::visit([&](auto& col) { col.reserve(rows); }, *entry.column);
-    }
-    for (std::size_t pos = 0; pos < rows; ++pos) {
-        std::size_t row = idx[pos];
-        for (std::size_t col = 0; col < input.columns.size(); ++col) {
-            append_value(*output.columns[col].column, *input.columns[col].column, row);
-        }
+        ColumnValue gathered = std::visit(
+            [&](const auto& src) -> ColumnValue {
+                using ColT = std::decay_t<decltype(src)>;
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    // Gather codes only; dictionary and index are shared.
+                    std::vector<Column<Categorical>::code_type> codes(rows);
+                    const auto* sp = src.codes_data();
+                    for (std::size_t pos = 0; pos < rows; ++pos)
+                        codes[pos] = sp[idx[pos]];
+                    return Column<Categorical>(src.dictionary_ptr(), src.index_ptr(),
+                                               std::move(codes));
+                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    // Two-pass flat-buffer gather: compute total bytes, then memcpy slabs.
+                    const auto* src_off = src.offsets_data();
+                    const auto* src_char = src.chars_data();
+                    std::size_t total_chars = 0;
+                    for (std::size_t pos = 0; pos < rows; ++pos) {
+                        std::size_t si = idx[pos];
+                        total_chars += src_off[si + 1] - src_off[si];
+                    }
+                    ColT dst;
+                    dst.resize_for_gather(rows, total_chars);
+                    auto* dst_off = dst.offsets_data();
+                    auto* dst_char = dst.chars_data();
+                    dst_off[0] = 0;
+                    std::uint32_t cur = 0;
+                    for (std::size_t pos = 0; pos < rows; ++pos) {
+                        std::size_t si = idx[pos];
+                        std::uint32_t len = src_off[si + 1] - src_off[si];
+                        std::memcpy(dst_char + cur, src_char + src_off[si], len);
+                        cur += len;
+                        dst_off[pos + 1] = cur;
+                    }
+                    return dst;
+                } else {
+                    ColT dst;
+                    dst.resize(rows);
+                    for (std::size_t pos = 0; pos < rows; ++pos)
+                        dst[pos] = src[idx[pos]];
+                    return dst;
+                }
+            },
+            *entry.column);
+        output.add_column(entry.name, std::move(gathered));
     }
     output.ordering = std::move(resolved_keys);
     output.time_index = input.time_index;

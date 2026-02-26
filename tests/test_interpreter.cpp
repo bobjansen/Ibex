@@ -1208,3 +1208,36 @@ TEST_CASE("null: print displays null for null rows", "[null]") {
     CHECK(out.find("null") != std::string::npos);
     CHECK(out.find("99") != std::string::npos);
 }
+
+TEST_CASE("null: left join fan-out (duplicate right keys)", "[null][join]") {
+    // left: id = {1, 2, 3}
+    // right: id = {1, 1, 3}  — id=1 appears twice, id=2 missing
+    // expected output: 4 rows (id=1 ×2, id=2 ×1 null, id=3 ×1)
+    runtime::Table left, right;
+    left.add_column("id", Column<std::int64_t>{1, 2, 3});
+
+    right.add_column("id", Column<std::int64_t>{1, 1, 3});
+    right.add_column("val", Column<double>{10.0, 11.0, 30.0});
+
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(result.has_value());
+    auto& t = *result;
+    REQUIRE(t.rows() == 4);
+
+    // Rows: (1,10), (1,11), (2,null), (3,30)
+    const auto& id_col = std::get<Column<std::int64_t>>(*t.columns[t.index.at("id")].column);
+    const auto& val_entry = t.columns[t.index.at("val")];
+    const auto& val_col = std::get<Column<double>>(*val_entry.column);
+
+    CHECK(id_col[0] == 1);
+    CHECK_FALSE(runtime::is_null(val_entry, 0));
+    CHECK(val_col[0] == 10.0);
+    CHECK(id_col[1] == 1);
+    CHECK_FALSE(runtime::is_null(val_entry, 1));
+    CHECK(val_col[1] == 11.0);
+    CHECK(id_col[2] == 2);
+    CHECK(runtime::is_null(val_entry, 2));
+    CHECK(id_col[3] == 3);
+    CHECK_FALSE(runtime::is_null(val_entry, 3));
+    CHECK(val_col[3] == 30.0);
+}

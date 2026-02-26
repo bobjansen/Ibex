@@ -1114,6 +1114,15 @@ struct KeyEq {
     auto operator()(const Key& a, const Key& b) const -> bool { return a.values == b.values; }
 };
 
+// Transparent hasher so unordered_map<string, ...> can be looked up via string_view.
+// hash<string_view> == hash<string> for equal content (C++17 guarantee).
+struct StringViewHash {
+    using is_transparent = void;
+    auto operator()(std::string_view sv) const noexcept -> std::size_t {
+        return std::hash<std::string_view>{}(sv);
+    }
+};
+
 enum class ExprType : std::uint8_t {
     Int,
     Double,
@@ -1857,26 +1866,6 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
     return std::nullopt;
 }
 
-auto default_scalar_for_column(const ColumnValue& column) -> ScalarValue {
-    return std::visit(
-        [](const auto& col) -> ScalarValue {
-            using ColType = std::decay_t<decltype(col)>;
-            using ValueType = typename ColType::value_type;
-            if constexpr (std::is_same_v<ValueType, std::int64_t>) {
-                return std::int64_t{0};
-            } else if constexpr (std::is_same_v<ValueType, double>) {
-                return 0.0;
-            } else if constexpr (std::is_same_v<ValueType, Date>) {
-                return Date{};
-            } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
-                return Timestamp{};
-            } else {
-                return std::string{};
-            }
-        },
-        column);
-}
-
 auto column_kind(const ColumnValue& column) -> ExprType {
     if (std::holds_alternative<Column<std::int64_t>>(column)) {
         return ExprType::Int;
@@ -2013,9 +2002,25 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     };
 
     auto append_right_defaults = [&]() {
+        // Push type-default directly without going through ScalarValue to avoid
+        // constructing a temporary std::string for string columns.
         for (const auto& item : right_out) {
-            append_scalar(*output.columns[item.out_index].column,
-                          default_scalar_for_column(*item.column));
+            std::visit(
+                [](auto& col) {
+                    using ColType = std::decay_t<decltype(col)>;
+                    if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
+                        col.push_back(std::int64_t{0});
+                    } else if constexpr (std::is_same_v<ColType, Column<double>>) {
+                        col.push_back(0.0);
+                    } else if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                        col.push_back(std::string_view{});
+                    } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                        col.push_code(0);  // placeholder — row is marked null by bitmap
+                    } else {
+                        col.push_back({});
+                    }
+                },
+                *output.columns[item.out_index].column);
         }
         if (track_right_nulls) {
             right_had_nulls = true;
@@ -2031,6 +2036,96 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
     };
+
+    // Pre-reserve output columns for Left join.  With unique right keys the
+    // output is exactly left.rows(); with duplicate right keys (fan-out) it can
+    // be larger, but left.rows() is still a useful lower bound.
+    if (kind == ir::JoinKind::Left) {
+        const auto n = left.rows();
+        for (auto& ce : output.columns) {
+            std::visit([n](auto& c) { c.reserve(n); }, *ce.column);
+        }
+        for (auto& bm : right_validity)
+            bm.reserve(n);
+    }
+
+    // ─── Fast path: single-key string / categorical join ─────────────────────
+    // Avoids constructing a Key struct + copying a std::string for every one of
+    // the (potentially millions of) left rows.
+    //
+    // • Categorical left key: translate each dict entry once to a right-row
+    //   pointer, then the hot loop becomes a plain integer array lookup — zero
+    //   string hashing or allocation in the 4M-row pass.
+    // • String left key: use std::string_view for transparent lookup, so no
+    //   heap allocation per row (C++20 heterogeneous find).
+    if (kind != ir::JoinKind::Asof && keys.size() == 1 &&
+        (std::holds_alternative<Column<std::string>>(*left_keys[0]) ||
+         std::holds_alternative<Column<Categorical>>(*left_keys[0]))) {
+        // Build right-side index: string_view → matching right-row indices.
+        // Keys are views into the right column's storage (stable during join).
+        std::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
+                           std::equal_to<std::string_view>>
+            right_sv_index;
+        right_sv_index.reserve(right.rows());
+        if (const auto* rs = std::get_if<Column<std::string>>(right_keys[0])) {
+            for (std::size_t r = 0; r < right.rows(); ++r)
+                right_sv_index[(*rs)[r]].push_back(r);
+        } else if (const auto* rc = std::get_if<Column<Categorical>>(right_keys[0])) {
+            for (std::size_t r = 0; r < right.rows(); ++r)
+                right_sv_index[(*rc)[r]].push_back(r);
+        }
+
+        auto run_match = [&](std::string_view sv, std::size_t l) {
+            auto it = right_sv_index.find(sv);
+            if (it == right_sv_index.end()) {
+                if (kind == ir::JoinKind::Left) {
+                    append_left_row(l);
+                    append_right_defaults();
+                }
+                return;
+            }
+            for (auto r : it->second) {
+                append_left_row(l);
+                append_right_row(r);
+            }
+        };
+
+        if (const auto* lc = std::get_if<Column<Categorical>>(left_keys[0])) {
+            // Translate each dictionary entry once → O(dict_size) string hashes.
+            // Hot loop uses integer array indexing, no strings at all.
+            const auto& dict = *lc->dictionary_ptr();
+            std::vector<const std::vector<std::size_t>*> code_to_right(dict.size(), nullptr);
+            for (std::size_t code = 0; code < dict.size(); ++code) {
+                auto it = right_sv_index.find(std::string_view{dict[code]});
+                if (it != right_sv_index.end())
+                    code_to_right[code] = &it->second;
+            }
+            const auto* codes = lc->codes_data();
+            for (std::size_t l = 0; l < left.rows(); ++l) {
+                const auto* matches = code_to_right[static_cast<std::size_t>(codes[l])];
+                if (matches == nullptr) {
+                    if (kind == ir::JoinKind::Left) {
+                        append_left_row(l);
+                        append_right_defaults();
+                    }
+                    continue;
+                }
+                for (auto r : *matches) {
+                    append_left_row(l);
+                    append_right_row(r);
+                }
+            }
+        } else {
+            const auto& ls = std::get<Column<std::string>>(*left_keys[0]);
+            for (std::size_t l = 0; l < left.rows(); ++l) {
+                run_match(ls[l], l);  // string_view lookup — no allocation
+            }
+        }
+
+        finalize_right_validity();
+        return output;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     if (kind == ir::JoinKind::Asof) {
         const std::size_t time_pos = *asof_time_key_pos;

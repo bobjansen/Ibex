@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <emmintrin.h>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -1236,7 +1237,14 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
             total += h[b];
         }
         // Stable scatter: sequential reads, random writes.
+        // Prefetch the destination cache line a few elements ahead.
+        constexpr std::size_t kPrefetchDist = 8;
         for (std::size_t i = 0; i < rows; ++i) {
+            if (i + kPrefetchDist < rows) {
+                std::size_t pb = (src_keys[i + kPrefetchDist] >> shift) & 0xFFu;
+                __builtin_prefetch(&dst_keys[cnt[pb]], 1, 0);
+                __builtin_prefetch(&dst_idx[cnt[pb]], 1, 0);
+            }
             std::size_t bucket = (src_keys[i] >> shift) & 0xFFu;
             dst_keys[cnt[bucket]] = src_keys[i];
             dst_idx[cnt[bucket]] = src_idx[i];

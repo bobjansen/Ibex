@@ -241,8 +241,8 @@ auto verify_group_by_symbol_day(const ibex::runtime::Table& table,
     std::vector<bool> seen;
 
     for (std::size_t row = 0; row < rows; ++row) {
-        Key2 key{std::string(string_view_at(*sym_col, row)),
-                 std::string(string_view_at(*day_col, row))};
+        Key2 key{.a = std::string(string_view_at(*sym_col, row)),
+                 .b = std::string(string_view_at(*day_col, row))};
         auto it = index.find(key);
         std::size_t gid = 0;
         if (it == index.end()) {

@@ -1,0 +1,34 @@
+{
+  "name": "ibex-language",
+  "displayName": "Ibex",
+  "description": "Syntax highlighting for the Ibex DataFrame DSL (.ibex files)",
+  "version": "0.1.0",
+  "publisher": "ibex",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bobjansen/Ibex"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "ibex",
+        "aliases": ["Ibex", "ibex"],
+        "extensions": [".ibex"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ibex",
+        "scopeName": "source.ibex",
+        "path": "./syntaxes/ibex.tmLanguage.json"
+      }
+    ]
+  }
+}

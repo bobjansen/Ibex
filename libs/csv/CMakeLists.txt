@@ -3,6 +3,8 @@ add_library(ibex_csv_plugin SHARED csv.cpp)
 set_target_properties(ibex_csv_plugin PROPERTIES
     OUTPUT_NAME csv
     PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY "${IBEX_PLUGIN_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${IBEX_PLUGIN_OUTPUT_DIR}"
 )
 
 target_include_directories(ibex_csv_plugin

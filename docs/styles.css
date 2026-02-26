@@ -1,0 +1,149 @@
+:root {
+  --bg: #f4efe7;
+  --paper: #fffaf0;
+  --ink: #192022;
+  --muted: #4d595f;
+  --accent: #0a7f79;
+  --accent-2: #ff8e3c;
+  --line: #d8d0c4;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(1200px 480px at 10% -10%, #f8c78a 0%, transparent 55%),
+    radial-gradient(900px 520px at 95% 0%, #9cd5cf 0%, transparent 50%),
+    var(--bg);
+  line-height: 1.5;
+}
+
+.page {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 2.5rem 1.2rem 3rem;
+}
+
+.hero {
+  background: linear-gradient(145deg, rgba(255, 250, 240, 0.96), rgba(251, 243, 232, 0.96));
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 1.8rem;
+  box-shadow: 0 16px 40px rgba(30, 34, 36, 0.1);
+}
+
+.eyebrow {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--accent);
+  margin: 0 0 0.5rem;
+  font-weight: 700;
+}
+
+h1,
+h2 {
+  line-height: 1.2;
+  margin: 0 0 0.8rem;
+}
+
+h1 {
+  font-size: clamp(1.8rem, 4vw, 3rem);
+}
+
+h2 {
+  font-size: clamp(1.1rem, 2.2vw, 1.5rem);
+}
+
+.lead {
+  color: var(--muted);
+  max-width: 60ch;
+  margin-bottom: 1.2rem;
+}
+
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.button {
+  display: inline-block;
+  text-decoration: none;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  padding: 0.62rem 0.95rem;
+  color: var(--ink);
+  background: #fff;
+  font-weight: 600;
+}
+
+.button.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: #fff;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.card {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 1.1rem;
+}
+
+ul {
+  padding-left: 1.1rem;
+  margin: 0.6rem 0 0;
+}
+
+.code-card {
+  margin-top: 1rem;
+}
+
+pre {
+  margin: 0.5rem 0 0.8rem;
+  background: #1d2427;
+  color: #f5f0e8;
+  border-radius: 12px;
+  padding: 0.95rem;
+  overflow-x: auto;
+}
+
+code {
+  font-family: "JetBrains Mono", "Cascadia Code", monospace;
+  font-size: 0.95em;
+}
+
+.footnote {
+  margin: 0;
+  color: var(--muted);
+}
+
+@media (max-width: 760px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hero {
+    padding: 1.2rem;
+  }
+}

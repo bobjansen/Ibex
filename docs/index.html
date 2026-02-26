@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Typed DataFrame DSL</title>
+  <meta
+    name="description"
+    content="Ibex is a statically typed DSL for columnar DataFrame and TimeFrame manipulation that transpiles to C++23."
+  />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <p class="eyebrow">Ibex</p>
+      <h1>A typed DSL for fast table pipelines.</h1>
+      <p class="lead">
+        Ibex is a statically typed language for columnar <code>DataFrame</code> and
+        <code>TimeFrame</code> work. It uses data.table-inspired brackets and transpiles
+        to C++23 for performance.
+      </p>
+      <div class="cta-row">
+        <span class="button primary">GitHub Pages Demo</span>
+        <span class="button">Content can be expanded later</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <h2>What Ibex focuses on</h2>
+        <ul>
+          <li>Named clauses like <code>filter</code>, <code>select</code>, <code>update</code>, <code>by</code>, <code>window</code>.</li>
+          <li>Predictable semantics and static typing.</li>
+          <li>Time-aware operations with <code>TimeFrame</code> and rolling windows.</li>
+          <li>Interop through <code>extern fn</code> hooks to C++.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h2>Current language shape</h2>
+        <p>
+          Ibex keeps SQL keywords out of its surface syntax and avoids macro magic.
+          The core unit is an expression pipeline that lowers cleanly into IR
+          operators like scan, filter, project, aggregate, update, window, and join.
+        </p>
+      </article>
+    </section>
+
+    <section class="card code-card">
+      <h2>Sample Ibex</h2>
+      <pre><code>let tf = as_timeframe(ticks, "ts");
+
+let bars = tf[resample 1m, select {
+  close_1m = last(price)
+}];
+
+tf asof join bars on ts;</code></pre>
+      <p class="footnote">
+        The as-of join keeps each left row and attaches the latest matching right row at or before that timestamp.
+      </p>
+    </section>
+  </main>
+</body>
+</html>

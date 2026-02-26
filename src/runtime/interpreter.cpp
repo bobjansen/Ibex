@@ -1198,20 +1198,13 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
 
 auto column_kind(const ColumnValue& column) -> ExprType;
 
-// LSD radix sort on a flat int64 key array.
-// Returns a permutation such that keys[result[i]] is non-decreasing.
-// Signed integers are handled by XOR-flipping the sign bit, mapping the signed
-// ordering bijectively onto unsigned ordering.  All 8 byte histograms are built
-// in a single pass; passes where every element shares the same byte value are
-// skipped automatically (common for clustered timestamps).
-auto radix_sort_i64_asc(const std::vector<std::int64_t>& keys, std::size_t rows)
-    -> std::vector<std::size_t> {
-    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
-
-    std::vector<std::uint64_t> src_keys(rows);
-    for (std::size_t i = 0; i < rows; ++i)
-        src_keys[i] = static_cast<std::uint64_t>(keys[i]) ^ kSignFlip;
-
+// LSD radix sort over pre-sign-flipped uint64 keys.
+// Idx is the index type: uint32_t for tables ≤ UINT32_MAX rows, uint64_t otherwise.
+// Keys must already be sign-flipped (int64 XOR 1<<63) so unsigned order == signed order.
+// All 8 byte histograms are built in a single pass; passes where every element
+// shares the same byte value are skipped (common for clustered timestamps).
+template <typename Idx>
+auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> std::vector<Idx> {
     // Build all 8 byte-histograms in one sequential scan.
     std::array<std::array<std::size_t, 256>, 8> hists{};
     for (std::size_t i = 0; i < rows; ++i) {
@@ -1221,8 +1214,8 @@ auto radix_sort_i64_asc(const std::vector<std::int64_t>& keys, std::size_t rows)
     }
 
     std::vector<std::uint64_t> dst_keys(rows);
-    std::vector<std::size_t> src_idx(rows), dst_idx(rows);
-    std::iota(src_idx.begin(), src_idx.end(), 0);
+    std::vector<Idx> src_idx(rows), dst_idx(rows);
+    std::iota(src_idx.begin(), src_idx.end(), Idx{0});
 
     std::array<std::size_t, 256> cnt;
     for (std::size_t pass = 0; pass < 8; ++pass) {
@@ -1255,6 +1248,15 @@ auto radix_sort_i64_asc(const std::vector<std::int64_t>& keys, std::size_t rows)
     return src_idx;
 }
 
+// Dispatch to 32-bit indices for tables that fit, 64-bit otherwise.
+// Keys are taken by move — caller's FlatKey::u64 is consumed, no copy needed.
+using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64_t>>;
+auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows) -> SortIdx {
+    if (rows <= std::numeric_limits<std::uint32_t>::max())
+        return radix_sort_impl<std::uint32_t>(std::move(keys), rows);
+    return radix_sort_impl<std::uint64_t>(std::move(keys), rows);
+}
+
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     -> std::expected<Table, std::string> {
     std::size_t rows = input.rows();
@@ -1274,10 +1276,14 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
 
     // Pre-extract each sort key into a flat typed array so the hot comparator
     // loop does plain vector indexing rather than per-comparison variant dispatch.
+    // I64 keys are sign-flipped to uint64 at extraction time so that unsigned
+    // comparison is equivalent to signed comparison — this lets radix_sort_u64_asc
+    // consume the vector directly without an extra copy.
+    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
     enum class FlatKind : std::uint8_t { I64, F64, Str };
     struct FlatKey {
         FlatKind kind;
-        std::vector<std::int64_t> i64;  // Int, Date.days, Timestamp.nanos
+        std::vector<std::uint64_t> u64;  // Int / Date.days / Timestamp.nanos, sign-flipped
         std::vector<double> f64;
         std::vector<std::string_view> str;  // views into original column storage
         bool ascending;
@@ -1298,20 +1304,22 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                 using ColT = std::decay_t<decltype(col)>;
                 if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
                     fk.kind = FlatKind::I64;
-                    fk.i64.assign(col.begin(), col.end());
+                    fk.u64.reserve(rows);
+                    for (auto v : col)
+                        fk.u64.push_back(static_cast<std::uint64_t>(v) ^ kSignFlip);
                 } else if constexpr (std::is_same_v<ColT, Column<double>>) {
                     fk.kind = FlatKind::F64;
                     fk.f64.assign(col.begin(), col.end());
                 } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
                     fk.kind = FlatKind::I64;
-                    fk.i64.reserve(rows);
+                    fk.u64.reserve(rows);
                     for (const auto& d : col)
-                        fk.i64.push_back(d.days);
+                        fk.u64.push_back(static_cast<std::uint64_t>(d.days) ^ kSignFlip);
                 } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
                     fk.kind = FlatKind::I64;
-                    fk.i64.reserve(rows);
+                    fk.u64.reserve(rows);
                     for (const auto& ts : col)
-                        fk.i64.push_back(ts.nanos);
+                        fk.u64.push_back(static_cast<std::uint64_t>(ts.nanos) ^ kSignFlip);
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                     fk.kind = FlatKind::Str;
                     fk.str.reserve(rows);
@@ -1329,95 +1337,104 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         flat_keys.push_back(std::move(fk));
     }
 
-    std::vector<std::size_t> idx;
+    // Column-major gather parameterised on index type (uint32_t or size_t).
+    auto do_gather = [&]<typename Idx>(const std::vector<Idx>& idx) -> Table {
+        Table output;
+        output.columns.reserve(input.columns.size());
+        for (const auto& entry : input.columns) {
+            ColumnValue gathered = std::visit(
+                [&](const auto& src) -> ColumnValue {
+                    using ColT = std::decay_t<decltype(src)>;
+                    if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                        // Gather codes only; dictionary and index are shared.
+                        std::vector<Column<Categorical>::code_type> codes(rows);
+                        const auto* sp = src.codes_data();
+                        for (std::size_t pos = 0; pos < rows; ++pos)
+                            codes[pos] = sp[static_cast<std::size_t>(idx[pos])];
+                        return Column<Categorical>(src.dictionary_ptr(), src.index_ptr(),
+                                                   std::move(codes));
+                    } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                        // Two-pass flat-buffer gather: compute total bytes, then memcpy slabs.
+                        const auto* src_off = src.offsets_data();
+                        const auto* src_char = src.chars_data();
+                        std::size_t total_chars = 0;
+                        for (std::size_t pos = 0; pos < rows; ++pos) {
+                            std::size_t si = static_cast<std::size_t>(idx[pos]);
+                            total_chars += src_off[si + 1] - src_off[si];
+                        }
+                        ColT dst;
+                        dst.resize_for_gather(rows, total_chars);
+                        auto* dst_off = dst.offsets_data();
+                        auto* dst_char = dst.chars_data();
+                        dst_off[0] = 0;
+                        std::uint32_t cur = 0;
+                        for (std::size_t pos = 0; pos < rows; ++pos) {
+                            std::size_t si = static_cast<std::size_t>(idx[pos]);
+                            std::uint32_t len = src_off[si + 1] - src_off[si];
+                            std::memcpy(dst_char + cur, src_char + src_off[si], len);
+                            cur += len;
+                            dst_off[pos + 1] = cur;
+                        }
+                        return dst;
+                    } else {
+                        ColT dst;
+                        dst.resize(rows);
+                        for (std::size_t pos = 0; pos < rows; ++pos)
+                            dst[pos] = src[static_cast<std::size_t>(idx[pos])];
+                        return dst;
+                    }
+                },
+                *entry.column);
+            output.add_column(entry.name, std::move(gathered));
+        }
+        output.ordering = std::move(resolved_keys);
+        output.time_index = input.time_index;
+        normalize_time_index(output);
+        return output;
+    };
 
     // Fast path: single ascending I64 key (covers all TimeFrame as_timeframe sorts).
+    // Moves flat_keys[0].u64 into the sort — no key copy.
     if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 && flat_keys[0].ascending) {
-        idx = radix_sort_i64_asc(flat_keys[0].i64, rows);
-    } else {
-        auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
-            for (const auto& fk : flat_keys) {
-                switch (fk.kind) {
-                    case FlatKind::I64: {
-                        auto l = fk.i64[lhs], r = fk.i64[rhs];
-                        if (l != r)
-                            return fk.ascending ? (l < r) : (l > r);
-                        break;
-                    }
-                    case FlatKind::F64: {
-                        auto l = fk.f64[lhs], r = fk.f64[rhs];
-                        if (l != r)
-                            return fk.ascending ? (l < r) : (l > r);
-                        break;
-                    }
-                    case FlatKind::Str: {
-                        auto l = fk.str[lhs], r = fk.str[rhs];
-                        if (l != r)
-                            return fk.ascending ? (l < r) : (l > r);
-                        break;
-                    }
-                }
-            }
-            return lhs < rhs;
-        };
-        idx.resize(rows);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::stable_sort(idx.begin(), idx.end(), compare_row);
+        auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
+        return std::visit(
+            [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
+                return do_gather(idx);
+            },
+            sort_result);
     }
 
-    // Column-major gather: one std::visit per column (not per element).
-    Table output;
-    output.columns.reserve(input.columns.size());
-    for (const auto& entry : input.columns) {
-        ColumnValue gathered = std::visit(
-            [&](const auto& src) -> ColumnValue {
-                using ColT = std::decay_t<decltype(src)>;
-                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    // Gather codes only; dictionary and index are shared.
-                    std::vector<Column<Categorical>::code_type> codes(rows);
-                    const auto* sp = src.codes_data();
-                    for (std::size_t pos = 0; pos < rows; ++pos)
-                        codes[pos] = sp[idx[pos]];
-                    return Column<Categorical>(src.dictionary_ptr(), src.index_ptr(),
-                                               std::move(codes));
-                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                    // Two-pass flat-buffer gather: compute total bytes, then memcpy slabs.
-                    const auto* src_off = src.offsets_data();
-                    const auto* src_char = src.chars_data();
-                    std::size_t total_chars = 0;
-                    for (std::size_t pos = 0; pos < rows; ++pos) {
-                        std::size_t si = idx[pos];
-                        total_chars += src_off[si + 1] - src_off[si];
-                    }
-                    ColT dst;
-                    dst.resize_for_gather(rows, total_chars);
-                    auto* dst_off = dst.offsets_data();
-                    auto* dst_char = dst.chars_data();
-                    dst_off[0] = 0;
-                    std::uint32_t cur = 0;
-                    for (std::size_t pos = 0; pos < rows; ++pos) {
-                        std::size_t si = idx[pos];
-                        std::uint32_t len = src_off[si + 1] - src_off[si];
-                        std::memcpy(dst_char + cur, src_char + src_off[si], len);
-                        cur += len;
-                        dst_off[pos + 1] = cur;
-                    }
-                    return dst;
-                } else {
-                    ColT dst;
-                    dst.resize(rows);
-                    for (std::size_t pos = 0; pos < rows; ++pos)
-                        dst[pos] = src[idx[pos]];
-                    return dst;
+    // General path: multi-key or non-I64 or descending — comparison-based stable sort.
+    // u64 keys compare correctly with unsigned < because sign-flip preserves order.
+    auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
+        for (const auto& fk : flat_keys) {
+            switch (fk.kind) {
+                case FlatKind::I64: {
+                    auto l = fk.u64[lhs], r = fk.u64[rhs];
+                    if (l != r)
+                        return fk.ascending ? (l < r) : (l > r);
+                    break;
                 }
-            },
-            *entry.column);
-        output.add_column(entry.name, std::move(gathered));
-    }
-    output.ordering = std::move(resolved_keys);
-    output.time_index = input.time_index;
-    normalize_time_index(output);
-    return output;
+                case FlatKind::F64: {
+                    auto l = fk.f64[lhs], r = fk.f64[rhs];
+                    if (l != r)
+                        return fk.ascending ? (l < r) : (l > r);
+                    break;
+                }
+                case FlatKind::Str: {
+                    auto l = fk.str[lhs], r = fk.str[rhs];
+                    if (l != r)
+                        return fk.ascending ? (l < r) : (l > r);
+                    break;
+                }
+            }
+        }
+        return lhs < rhs;
+    };
+    std::vector<std::size_t> idx(rows);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::stable_sort(idx.begin(), idx.end(), compare_row);
+    return do_gather(idx);
 }
 
 auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {

@@ -1198,6 +1198,63 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
 
 auto column_kind(const ColumnValue& column) -> ExprType;
 
+// LSD radix sort on a flat int64 key array.
+// Returns a permutation such that keys[result[i]] is non-decreasing.
+// Signed integers are handled by XOR-flipping the sign bit, mapping the signed
+// ordering bijectively onto unsigned ordering.  All 8 byte histograms are built
+// in a single pass; passes where every element shares the same byte value are
+// skipped automatically (common for clustered timestamps).
+auto radix_sort_i64_asc(const std::vector<std::int64_t>& keys, std::size_t rows)
+    -> std::vector<std::size_t> {
+    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
+
+    std::vector<std::uint64_t> src_keys(rows);
+    for (std::size_t i = 0; i < rows; ++i)
+        src_keys[i] = static_cast<std::uint64_t>(keys[i]) ^ kSignFlip;
+
+    // Build all 8 byte-histograms in one sequential scan.
+    std::array<std::array<std::size_t, 256>, 8> hists{};
+    for (std::size_t i = 0; i < rows; ++i) {
+        auto k = src_keys[i];
+        for (std::size_t p = 0; p < 8; ++p)
+            ++hists[p][(k >> (p * 8u)) & 0xFFu];
+    }
+
+    std::vector<std::uint64_t> dst_keys(rows);
+    std::vector<std::size_t> src_idx(rows), dst_idx(rows);
+    std::iota(src_idx.begin(), src_idx.end(), 0);
+
+    std::array<std::size_t, 256> cnt;
+    for (std::size_t pass = 0; pass < 8; ++pass) {
+        const auto& h = hists[pass];
+        // Skip pass if all elements have the same byte value.
+        std::size_t non_zero = 0;
+        for (auto c : h)
+            if (c)
+                ++non_zero;
+        if (non_zero <= 1)
+            continue;
+
+        auto shift = pass * 8u;
+        // Convert histogram to exclusive prefix-sum write positions.
+        std::size_t total = 0;
+        for (std::size_t b = 0; b < 256; ++b) {
+            cnt[b] = total;
+            total += h[b];
+        }
+        // Stable scatter: sequential reads, random writes.
+        for (std::size_t i = 0; i < rows; ++i) {
+            std::size_t bucket = (src_keys[i] >> shift) & 0xFFu;
+            dst_keys[cnt[bucket]] = src_keys[i];
+            dst_idx[cnt[bucket]] = src_idx[i];
+            ++cnt[bucket];
+        }
+        std::swap(src_keys, dst_keys);
+        std::swap(src_idx, dst_idx);
+    }
+    return src_idx;
+}
+
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     -> std::expected<Table, std::string> {
     std::size_t rows = input.rows();
@@ -1272,36 +1329,41 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         flat_keys.push_back(std::move(fk));
     }
 
-    std::vector<std::size_t> idx(rows);
-    std::iota(idx.begin(), idx.end(), 0);
+    std::vector<std::size_t> idx;
 
-    auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
-        for (const auto& fk : flat_keys) {
-            switch (fk.kind) {
-                case FlatKind::I64: {
-                    auto l = fk.i64[lhs], r = fk.i64[rhs];
-                    if (l != r)
-                        return fk.ascending ? (l < r) : (l > r);
-                    break;
-                }
-                case FlatKind::F64: {
-                    auto l = fk.f64[lhs], r = fk.f64[rhs];
-                    if (l != r)
-                        return fk.ascending ? (l < r) : (l > r);
-                    break;
-                }
-                case FlatKind::Str: {
-                    auto l = fk.str[lhs], r = fk.str[rhs];
-                    if (l != r)
-                        return fk.ascending ? (l < r) : (l > r);
-                    break;
+    // Fast path: single ascending I64 key (covers all TimeFrame as_timeframe sorts).
+    if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 && flat_keys[0].ascending) {
+        idx = radix_sort_i64_asc(flat_keys[0].i64, rows);
+    } else {
+        auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
+            for (const auto& fk : flat_keys) {
+                switch (fk.kind) {
+                    case FlatKind::I64: {
+                        auto l = fk.i64[lhs], r = fk.i64[rhs];
+                        if (l != r)
+                            return fk.ascending ? (l < r) : (l > r);
+                        break;
+                    }
+                    case FlatKind::F64: {
+                        auto l = fk.f64[lhs], r = fk.f64[rhs];
+                        if (l != r)
+                            return fk.ascending ? (l < r) : (l > r);
+                        break;
+                    }
+                    case FlatKind::Str: {
+                        auto l = fk.str[lhs], r = fk.str[rhs];
+                        if (l != r)
+                            return fk.ascending ? (l < r) : (l > r);
+                        break;
+                    }
                 }
             }
-        }
-        return lhs < rhs;
-    };
-
-    std::stable_sort(idx.begin(), idx.end(), compare_row);
+            return lhs < rhs;
+        };
+        idx.resize(rows);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::stable_sort(idx.begin(), idx.end(), compare_row);
+    }
 
     // Column-major gather: one std::visit per column (not per element).
     Table output;

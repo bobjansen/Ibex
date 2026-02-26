@@ -34,8 +34,7 @@ auto format_date(Date date) -> std::string {
     sys_days day = sys_days{days{date.days}};
     year_month_day ymd{day};
     return fmt::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
-                       static_cast<unsigned>(ymd.month()),
-                       static_cast<unsigned>(ymd.day()));
+                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
 }
 
 auto format_timestamp(Timestamp ts) -> std::string {
@@ -45,10 +44,9 @@ auto format_timestamp(Timestamp ts) -> std::string {
     year_month_day ymd{day};
     auto tod = tp - day;
     hh_mm_ss<nanoseconds> hms{tod};
-    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}",
-                       static_cast<int>(ymd.year()), static_cast<unsigned>(ymd.month()),
-                       static_cast<unsigned>(ymd.day()), hms.hours().count(),
-                       hms.minutes().count(), hms.seconds().count(),
+    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
+                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()),
+                       hms.hours().count(), hms.minutes().count(), hms.seconds().count(),
                        hms.subseconds().count());
 }
 
@@ -277,6 +275,17 @@ std::string_view trim(std::string_view text) {
     return rtrim(ltrim(text));
 }
 
+bool starts_with_command(std::string_view text, std::string_view command) {
+    if (!text.starts_with(command)) {
+        return false;
+    }
+    if (text.size() == command.size()) {
+        return true;
+    }
+    auto next = static_cast<unsigned char>(text[command.size()]);
+    return std::isspace(next) != 0;
+}
+
 std::string parse_load_path(std::string_view text) {
     std::string_view view = trim(text);
     if (view.empty()) {
@@ -303,6 +312,20 @@ std::size_t parse_optional_size(std::string_view text, std::size_t default_value
         return default_value;
     }
     return value;
+}
+
+void print_elapsed(std::chrono::steady_clock::duration elapsed) {
+    using namespace std::chrono;
+    auto micros = duration_cast<microseconds>(elapsed).count();
+    if (micros < 1000) {
+        fmt::print("time: {} us\n", micros);
+        return;
+    }
+    if (micros < 1000 * 1000) {
+        fmt::print("time: {:.3f} ms\n", static_cast<double>(micros) / 1000.0);
+        return;
+    }
+    fmt::print("time: {:.3f} s\n", static_cast<double>(micros) / 1'000'000.0);
 }
 
 auto make_temp_table_name() -> std::string {
@@ -1063,6 +1086,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     FunctionRegistry functions;
     ExternDeclRegistry extern_decls;
     std::unordered_set<std::string> loaded_plugins;
+    bool timing_enabled = false;
 
     std::string line;
     while (true) {
@@ -1076,6 +1100,47 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
 
+        std::string_view line_view(line);
+
+        if (starts_with_command(line_view, ":timing")) {
+            auto arg = trim(line_view.substr(std::string_view(":timing").size()));
+            if (arg.empty()) {
+                timing_enabled = !timing_enabled;
+            } else if (arg == "on") {
+                timing_enabled = true;
+            } else if (arg == "off") {
+                timing_enabled = false;
+            } else {
+                fmt::print("usage: :timing [on|off]\n");
+                continue;
+            }
+            fmt::print("timing: {}\n", timing_enabled ? "on" : "off");
+            continue;
+        }
+
+        bool one_shot_timing = false;
+        if (starts_with_command(line_view, ":time")) {
+            auto timed_input = trim(line_view.substr(std::string_view(":time").size()));
+            if (timed_input.empty()) {
+                fmt::print("usage: :time <command>\n");
+                continue;
+            }
+            line = std::string(timed_input);
+            line_view = std::string_view(line);
+            one_shot_timing = true;
+        }
+
+        const bool should_time = timing_enabled || one_shot_timing;
+        std::optional<std::chrono::steady_clock::time_point> timing_start;
+        if (should_time) {
+            timing_start = std::chrono::steady_clock::now();
+        }
+        auto report_timing = [&]() {
+            if (timing_start.has_value()) {
+                print_elapsed(std::chrono::steady_clock::now() - *timing_start);
+            }
+        };
+
         if (line == ":q" || line == ":quit" || line == ":exit") {
             break;
         }
@@ -1087,7 +1152,6 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             print_scalars(scalars);
             continue;
         }
-        std::string_view line_view(line);
         if (line_view.starts_with(":schema")) {
             auto arg = trim(line_view.substr(std::string_view(":schema").size()));
             if (arg.empty()) {
@@ -1150,16 +1214,19 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             auto arg_view = trim(line_view.substr(std::string_view(":load").size()));
             if (arg_view.empty()) {
                 fmt::print("usage: :load <file>\n");
+                report_timing();
                 continue;
             }
             std::string path = parse_load_path(arg_view);
             if (path.empty()) {
                 fmt::print("usage: :load <file>\n");
+                report_timing();
                 continue;
             }
             std::ifstream input{path};
             if (!input) {
                 fmt::print("error: failed to open '{}'\n", path);
+                report_timing();
                 continue;
             }
             std::string source((std::istreambuf_iterator<char>(input)),
@@ -1167,13 +1234,16 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             auto parsed = parser::parse(source);
             if (!parsed) {
                 fmt::print("error: {}\n", parsed.error().format());
+                report_timing();
                 continue;
             }
             if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
                                     extern_decls, registry, config.plugin_search_paths,
                                     loaded_plugins)) {
+                report_timing();
                 continue;
             }
+            report_timing();
             continue;
         }
 
@@ -1181,11 +1251,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         auto parsed = parser::parse(normalized);
         if (!parsed) {
             fmt::print("error: {}\n", parsed.error().format());
+            report_timing();
             continue;
         }
 
         execute_statements(parsed->statements, tables, scalars, columns, functions, extern_decls,
                            registry, config.plugin_search_paths, loaded_plugins);
+        report_timing();
     }
 
     spdlog::info("Ibex REPL exiting");

@@ -1404,6 +1404,24 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     // Fast path: single ascending I64 key (covers all TimeFrame as_timeframe sorts).
     // Moves flat_keys[0].u64 into the sort — no key copy.
     if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 && flat_keys[0].ascending) {
+        // Pre-sorted check: one sequential scan over the already-extracted u64 keys.
+        // For already-sorted input (common in TimeFrame) this avoids both the radix
+        // sort and the gather — O(n) scan + O(n) table copy instead of O(n·passes) sort.
+        const auto& u64 = flat_keys[0].u64;
+        bool already_sorted = true;
+        for (std::size_t i = 1; i < rows; ++i) {
+            if (u64[i] < u64[i - 1]) {
+                already_sorted = false;
+                break;
+            }
+        }
+        if (already_sorted) {
+            Table output = input;
+            output.ordering = std::move(resolved_keys);
+            output.time_index = input.time_index;
+            normalize_time_index(output);
+            return output;
+        }
         auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
@@ -3929,21 +3947,30 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
         [&](const auto& col) -> ColumnValue {
             using ColT = std::decay_t<decltype(col)>;
             ColT result;
-            result.reserve(rows);
-            for (std::size_t i = 0; i < rows; ++i) {
-                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    if (is_lag) {
-                        result.push_back(i >= n ? col[i - n] : std::string_view{});
+            if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
+                          std::is_same_v<ColT, Column<std::string>>) {
+                // Categorical/string: element-wise fallback (no plain memcpy).
+                result.reserve(rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                        result.push_back(is_lag ? (i >= n ? col[i - n] : std::string_view{})
+                                                : (i + n < rows ? col[i + n] : std::string_view{}));
                     } else {
-                        result.push_back(i + n < rows ? col[i + n] : std::string_view{});
+                        using T = typename ColT::value_type;
+                        result.push_back(is_lag ? (i >= n ? col[i - n] : T{})
+                                                : (i + n < rows ? col[i + n] : T{}));
                     }
+                }
+            } else {
+                // POD column: zero-fill then bulk-copy the shifted region.
+                using T = typename ColT::value_type;
+                result.resize(rows);  // zero-initialises
+                if (is_lag) {
+                    if (n < rows)
+                        std::memcpy(result.data() + n, col.data(), (rows - n) * sizeof(T));
                 } else {
-                    using T = typename ColT::value_type;
-                    if (is_lag) {
-                        result.push_back(i >= n ? col[i - n] : T{});
-                    } else {
-                        result.push_back(i + n < rows ? col[i + n] : T{});
-                    }
+                    if (n < rows)
+                        std::memcpy(result.data(), col.data() + n, (rows - n) * sizeof(T));
                 }
             }
             return result;
@@ -4007,8 +4034,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         dur_val = duration.count() / kNsPerDay;
     }
 
-    // Two-pointer helper: returns the first index lo in [0, i] such that
-    // time_vals[lo] >= time_vals[i] - dur_val, advancing prev_lo monotonically.
+    // Two-pointer helper: advances lo to the first row still inside the window.
     // Because the TimeFrame is sorted ascending, lo never decreases across rows.
     auto advance_lo = [&](std::size_t& lo, std::size_t i) {
         std::int64_t threshold = time_vals[i] - dur_val;

@@ -4,68 +4,538 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ibex | Typed DataFrame DSL</title>
-  <meta
-    name="description"
-    content="Ibex is a statically typed DSL for columnar DataFrame and TimeFrame manipulation that transpiles to C++23."
-  />
+  <meta name="description" content="Ibex is a statically typed DSL for columnar DataFrame and TimeFrame manipulation. Fast interpreter, transpiles to C++23." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap"
-    rel="stylesheet"
-  />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <main class="page">
-    <section class="hero">
-      <p class="eyebrow">Ibex</p>
-      <h1>A typed DSL for fast table pipelines.</h1>
-      <p class="lead">
-        Ibex is a statically typed language for columnar <code>DataFrame</code> and
-        <code>TimeFrame</code> work. It uses data.table-inspired brackets and transpiles
-        to C++23 for performance.
-      </p>
-      <div class="cta-row">
-        <span class="button primary">GitHub Pages Demo</span>
-        <span class="button">Content can be expanded later</span>
-      </div>
-    </section>
+<main class="page">
 
-    <section class="grid">
-      <article class="card">
-        <h2>What Ibex focuses on</h2>
-        <ul>
-          <li>Named clauses like <code>filter</code>, <code>select</code>, <code>update</code>, <code>by</code>, <code>window</code>.</li>
-          <li>Predictable semantics and static typing.</li>
-          <li>Time-aware operations with <code>TimeFrame</code> and rolling windows.</li>
-          <li>Interop through <code>extern fn</code> hooks to C++.</li>
-        </ul>
-      </article>
+  <!-- Nav -->
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </nav>
 
+  <!-- Hero -->
+  <section class="hero">
+    <p class="eyebrow">Ibex</p>
+    <h1>Typed table pipelines<br>that compile to C++23.</h1>
+    <p class="lead">
+      Ibex is a statically typed language for columnar <code>DataFrame</code> and
+      <code>TimeFrame</code> manipulation. Write concise bracket-pipeline queries —
+      filter, aggregate, roll, resample, join — and run them in the fast interpreter
+      or compile them to standalone C++ binaries.
+    </p>
+    <div class="stats">
+      <span class="stat"><strong>1.3&times;</strong> faster than Polars on aggregation</span>
+      <span class="stat"><strong>5&times;</strong> faster than Pandas</span>
+      <span class="stat"><strong>10&ndash;20&times;</strong> faster on rolling windows</span>
+    </div>
+    <div class="cta-row">
+      <a class="button primary" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">View on GitHub</a>
+      <a class="button" href="#get-started">Get started &darr;</a>
+    </div>
+  </section>
+
+  <!-- Feature cards -->
+  <section class="section">
+    <div class="grid-3">
       <article class="card">
-        <h2>Current language shape</h2>
+        <h3>Concise bracket syntax</h3>
         <p>
-          Ibex keeps SQL keywords out of its surface syntax and avoids macro magic.
-          The core unit is an expression pipeline that lowers cleanly into IR
-          operators like scan, filter, project, aggregate, update, window, and join.
+          Pipeline operations chain left-to-right inside <code>[ ]</code>, in the
+          order they execute. No SQL keywords, no macro magic, no implicit coercions.
+          Backtick-quoted names handle columns with dots or spaces.
         </p>
       </article>
-    </section>
+      <article class="card">
+        <h3>TimeFrame-aware</h3>
+        <p>
+          <code>as_timeframe</code> promotes a DataFrame to a time-indexed structure
+          with O(n) sort detection. Rolling windows use a two-pointer O(n) scan with
+          a single result-column allocation per call — no copies, no heap churn.
+        </p>
+      </article>
+      <article class="card">
+        <h3>C++23 codegen</h3>
+        <p>
+          <code>ibex_compile</code> transpiles any <code>.ibex</code> script to
+          idiomatic C++ using the <code>ibex::ops::*</code> library. Compiled and
+          interpreted outputs are behaviour-equivalent; both run near peak throughput.
+        </p>
+      </article>
+    </div>
+  </section>
 
-    <section class="card code-card">
-      <h2>Sample Ibex</h2>
-      <pre><code>let tf = as_timeframe(ticks, "ts");
+  <!-- Language tour -->
+  <section class="section">
+    <p class="section-label">Language tour</p>
+    <h2>Everything you need, nothing you don&rsquo;t.</h2>
+    <p class="section-sub">A complete analytical pipeline in a handful of composable clauses.</p>
 
-let bars = tf[resample 1m, select {
-  close_1m = last(price)
+    <div class="tour">
+
+      <!-- 1. Load & filter -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Load &amp; Filter</span>
+          <h3>External functions bring data in.</h3>
+          <p>
+            <code>extern fn</code> declares a C++ data-source function as a
+            first-class Ibex binding. The compiler resolves it at link time;
+            the REPL loads the corresponding plugin <code>.so</code> at runtime.
+          </p>
+          <p>
+            Filter expressions support arithmetic, comparisons, and boolean
+            logic (<code>and</code>, <code>or</code>, <code>not</code>).
+            Multiple clauses chain in reading order.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
+
+<span class="cm">// Keep rows where price exceeds 1.0</span>
+<span class="kw">let</span> active = prices[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>];
+
+<span class="cm">// Chain filter with a column projection</span>
+prices[
+    <span class="kw">filter</span> price &gt; <span class="num">1.0</span>,
+    <span class="kw">select</span> { symbol, price, volume }
+];</code></pre>
+        </div>
+      </div>
+
+      <!-- 2. Aggregate -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Aggregation</span>
+          <h3>One clause for projection and grouped reduction.</h3>
+          <p>
+            <code>select</code> doubles as a projection and an aggregation clause.
+            Add <code>by</code> to group; omit it for a global aggregate.
+          </p>
+          <p>
+            Available aggregate functions: <code>first</code>, <code>last</code>,
+            <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>,
+            <code>count</code>.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Mean sepal length and row count, by species</span>
+iris[<span class="kw">select</span> {
+    mean_sl = <span class="fn-name">mean</span>(`Sepal.Length`),
+    n       = <span class="fn-name">count</span>()
+}, <span class="kw">by</span> Species];
+
+<span class="cm">// OHLC per symbol — all in one pass</span>
+prices[<span class="kw">select</span> {
+    open   = <span class="fn-name">first</span>(price),
+    high   = <span class="fn-name">max</span>(price),
+    low    = <span class="fn-name">min</span>(price),
+    close  = <span class="fn-name">last</span>(price),
+    traded = <span class="fn-name">sum</span>(volume)
+}, <span class="kw">by</span> symbol];</code></pre>
+        </div>
+      </div>
+
+      <!-- 3. Update -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Derived Columns</span>
+          <h3>Add or replace columns without losing any data.</h3>
+          <p>
+            <code>update</code> appends named computed columns to every row.
+            All existing columns pass through untouched, so the result schema is
+            a strict superset of the input.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Enrich every row with return, range, and notional</span>
+ohlcv[<span class="kw">update</span> {
+    ret      = (close <span class="op">-</span> open) <span class="op">/</span> open,
+    range    = (high  <span class="op">-</span> low)  <span class="op">/</span> open,
+    notional = close <span class="op">*</span> volume
 }];
 
-tf asof join bars on ts;</code></pre>
-      <p class="footnote">
-        The as-of join keeps each left row and attaches the latest matching right row at or before that timestamp.
-      </p>
-    </section>
-  </main>
+<span class="cm">// Chain an update with an aggregation</span>
+<span class="kw">let</span> daily = ohlcv[<span class="kw">update</span> { ret = (close <span class="op">-</span> open) <span class="op">/</span> open }];
+daily[<span class="kw">select</span> {
+    avg_ret    = <span class="fn-name">mean</span>(ret),
+    n_sessions = <span class="fn-name">count</span>()
+}, <span class="kw">by</span> sector]
+    [<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }];</code></pre>
+        </div>
+      </div>
+
+      <!-- 4. Order & Distinct -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Order &amp; Distinct</span>
+          <h3>Sort and deduplicate with explicit intent.</h3>
+          <p>
+            <code>order</code> accepts a single column, a multi-key block with
+            <code>asc</code>&thinsp;/&thinsp;<code>desc</code> annotations, or no
+            argument at all to sort by every column in schema order.
+          </p>
+          <p>
+            <code>distinct</code> deduplicates on a single column or a set.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Sort by a single key (ascending by default)</span>
+iris[<span class="kw">order</span> `Sepal.Length`];
+
+<span class="cm">// Multi-key sort with explicit directions</span>
+results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span>, symbol <span class="kw">asc</span> }];
+
+<span class="cm">// Sort by all columns in schema order</span>
+iris[<span class="kw">order</span>];
+
+<span class="cm">// Unique species names</span>
+iris[<span class="kw">distinct</span> Species];
+
+<span class="cm">// Unique (species, length) pairs</span>
+iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
+        </div>
+      </div>
+
+      <!-- 5. Joins -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Joins</span>
+          <h3>Inner, left, and as-of — written as natural prose.</h3>
+          <p>
+            The <strong>as-of join</strong> attaches the latest right row
+            at-or-before each left timestamp. It is the standard pattern for
+            enriching tick data with bar data, without look-ahead bias.
+          </p>
+          <p>
+            Join keys are named with <code>on</code>. Both tables must be
+            <code>TimeFrame</code>s for an asof join.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Inner join — drop non-matching rows</span>
+<span class="kw">let</span> enriched = daily <span class="kw">join</span> fund <span class="kw">on</span> symbol;
+
+<span class="cm">// Left join — preserve all left rows</span>
+<span class="kw">let</span> with_meta = prices <span class="kw">left join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
+<span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);
+<span class="kw">let</span> bars = <span class="fn-name">as_timeframe</span>(bars_1m, <span class="str">"ts"</span>);
+tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code></pre>
+        </div>
+      </div>
+
+      <!-- 6. Rolling windows -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Rolling Windows</span>
+          <h3>Time-based rolling aggregates in one O(n) pass.</h3>
+          <p>
+            <code>as_timeframe</code> validates sort order in O(n) and records the
+            time-index column. <code>window&nbsp;&lt;dur&gt;</code> sets the
+            lookback; rolling functions (<code>rolling_sum</code>,
+            <code>rolling_mean</code>, <code>rolling_count</code>, <code>lag</code>)
+            use a two-pointer scan with no per-row heap allocation.
+          </p>
+          <p>
+            Duration literals: <code>1s</code>, <code>30s</code>, <code>1m</code>,
+            <code>5m</code>, <code>1h</code>, &hellip;
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+
+<span class="cm">// Previous tick's price</span>
+tf[<span class="kw">update</span> { prev_price = <span class="fn-name">lag</span>(price, <span class="num">1</span>) }];
+
+<span class="cm">// Tick count in the last 60 seconds</span>
+tf[<span class="kw">window</span> <span class="num">1m</span>, <span class="kw">update</span> { ticks_1m = <span class="fn-name">rolling_count</span>() }];
+
+<span class="cm">// Multiple rolling aggregates in one pass</span>
+tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">update</span> {
+    sum_5m  = <span class="fn-name">rolling_sum</span>(price),
+    mean_5m = <span class="fn-name">rolling_mean</span>(price)
+}];</code></pre>
+        </div>
+      </div>
+
+      <!-- 7. Resample -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Resample</span>
+          <h3>Aggregate ticks into equal-width time buckets.</h3>
+          <p>
+            <code>resample&nbsp;&lt;dur&gt;</code> floors timestamps into
+            fixed-width intervals and reduces each bucket to one output row.
+            Combine with <code>by</code> for per-symbol bars.
+          </p>
+          <p>
+            The output <code>TimeFrame</code> carries the bucket start time as its
+            time index, ready for downstream joins or further resampling.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+
+<span class="cm">// 1-minute OHLC bars</span>
+<span class="kw">let</span> bars = tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+    open  = <span class="fn-name">first</span>(price),
+    high  = <span class="fn-name">max</span>(price),
+    low   = <span class="fn-name">min</span>(price),
+    close = <span class="fn-name">last</span>(price)
+}];
+
+<span class="cm">// Per-symbol 1-minute bars</span>
+tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+    open  = <span class="fn-name">first</span>(price),
+    close = <span class="fn-name">last</span>(price)
+}, <span class="kw">by</span> symbol];
+
+<span class="cm">// Enrich ticks with the latest bar's close</span>
+tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code></pre>
+        </div>
+      </div>
+
+      <!-- 8. Scalar & compile -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Scalar &amp; Codegen</span>
+          <h3>Extract single values and compile to C++.</h3>
+          <p>
+            <code>scalar</code> pulls one typed value out of a single-cell result
+            table. It is available as a binding in subsequent expressions.
+          </p>
+          <p>
+            <code>ibex_compile</code> transpiles a <code>.ibex</code> file to a
+            self-contained C++ source file. The helper script compiles and links it
+            in one step.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Pull a single value from an aggregate</span>
+<span class="kw">let</span> total = <span class="fn-name">scalar</span>(
+    prices[<span class="kw">select</span> { total = <span class="fn-name">sum</span>(price) }],
+    total
+);
+
+<span class="cm">// Use it in subsequent expressions</span>
+prices[<span class="kw">update</span> { weight = price <span class="op">/</span> total }];</code></pre>
+<pre style="margin-top: 0.6rem;"><code><span class="cm"># Compile and run in one step</span>
+scripts/ibex-run.sh examples/quant.ibex</code></pre>
+        </div>
+      </div>
+
+    </div><!-- .tour -->
+  </section>
+
+  <!-- Performance -->
+  <section class="section">
+    <p class="section-label">Performance</p>
+    <h2>Fast by design, not by accident.</h2>
+    <p class="section-sub">
+      Release build, clang++, WSL2. Polars and data.table run multi-threaded on all
+      cores; Ibex is single-threaded throughout.
+    </p>
+
+    <div class="bench-grid">
+
+      <!-- Aggregation -->
+      <div class="card">
+        <p class="bench-title">Aggregation &mdash; 4 M rows, 252 symbols</p>
+        <div class="bench-wrap">
+          <table class="bench">
+            <thead>
+              <tr>
+                <th>Query</th>
+                <th>Ibex</th>
+                <th>Polars</th>
+                <th>Pandas</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="win">
+                <td>mean by symbol</td>
+                <td class="ibex">28.4 ms</td>
+                <td>40.1 ms</td>
+                <td>181 ms</td>
+              </tr>
+              <tr class="win">
+                <td>OHLC by symbol</td>
+                <td class="ibex">34.9 ms</td>
+                <td>48.0 ms</td>
+                <td>249 ms</td>
+              </tr>
+              <tr class="win">
+                <td>count by sym&times;day</td>
+                <td class="ibex">12.6 ms</td>
+                <td>66.2 ms</td>
+                <td>328 ms</td>
+              </tr>
+              <tr class="win">
+                <td>mean by sym&times;day</td>
+                <td class="ibex">14.0 ms</td>
+                <td>76.8 ms</td>
+                <td>367 ms</td>
+              </tr>
+              <tr class="win">
+                <td>OHLC by sym&times;day</td>
+                <td class="ibex">20.6 ms</td>
+                <td>73.9 ms</td>
+                <td>400 ms</td>
+              </tr>
+              <tr>
+                <td>filter simple</td>
+                <td class="ibex">19.5 ms</td>
+                <td>8.40 ms</td>
+                <td>30.7 ms</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="bench-note">
+          Geometric mean across 10 queries: <strong>1.3&times; faster than Polars</strong>,
+          5&times; faster than Pandas, 2.1&times; faster than data.table, 3.5&times;
+          faster than dplyr. Filter queries favour Polars, which uses parallel SIMD scans.
+        </p>
+      </div>
+
+      <!-- TimeFrame -->
+      <div class="card">
+        <p class="bench-title">TimeFrame &mdash; 1 M rows, 1 s spacing</p>
+        <div class="bench-wrap">
+          <table class="bench">
+            <thead>
+              <tr>
+                <th>Operation</th>
+                <th>Ibex</th>
+                <th>Polars</th>
+                <th>data.table</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="win">
+                <td>as_timeframe (sort)</td>
+                <td class="ibex">0.28 ms</td>
+                <td>4.78 ms</td>
+                <td>6.2 ms</td>
+              </tr>
+              <tr class="win">
+                <td>lag(price, 1)</td>
+                <td class="ibex">0.97 ms</td>
+                <td>4.84 ms</td>
+                <td>11.0 ms</td>
+              </tr>
+              <tr class="win">
+                <td>rolling count 1m</td>
+                <td class="ibex">1.12 ms</td>
+                <td>16.9 ms</td>
+                <td>12.2 ms</td>
+              </tr>
+              <tr class="win">
+                <td>rolling sum 1m</td>
+                <td class="ibex">1.43 ms</td>
+                <td>19.0 ms</td>
+                <td>10.9 ms</td>
+              </tr>
+              <tr class="win">
+                <td>rolling mean 5m</td>
+                <td class="ibex">1.65 ms</td>
+                <td>19.7 ms</td>
+                <td>9.6 ms</td>
+              </tr>
+              <tr>
+                <td>resample 1m OHLC</td>
+                <td class="ibex">24.7 ms</td>
+                <td>14.6 ms</td>
+                <td>20.0 ms</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="bench-note">
+          Rolling operations use a two-pointer O(n) scan with a single result-column
+          allocation. Resample delegates to the aggregation path and is slower than
+          Polars&rsquo; parallel <code>group_by_dynamic</code> on this query.
+        </p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- Get started -->
+  <section class="section" id="get-started">
+    <p class="section-label">Get started</p>
+    <h2>Build, run, explore.</h2>
+    <p class="section-sub">Requirements: Clang 17+, CMake 3.26+, Ninja.</p>
+
+    <div class="steps">
+
+      <div>
+        <p class="step-label">1 &mdash; Clone and build</p>
+<pre><code><span class="cm"># Debug build (ASan + UBSan)</span>
+cmake -B build -G Ninja \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DIBEX_ENABLE_SANITIZERS=ON
+cmake --build build
+
+<span class="cm"># Release build</span>
+cmake -B build-release -G Ninja \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release</code></pre>
+      </div>
+
+      <div>
+        <p class="step-label">2 &mdash; Run the test suite</p>
+<pre><code>ctest --test-dir build --output-on-failure</code></pre>
+      </div>
+
+      <div>
+        <p class="step-label">3 &mdash; Start the REPL</p>
+<pre><code>./build-release/tools/ibex --plugin-path ./build-release/libraries</code></pre>
+        <div class="card" style="margin-top: 0.7rem;">
+          <table class="repl-table">
+            <tbody>
+              <tr><td><code>:load examples/quant.ibex</code></td><td>Load and execute an .ibex script</td></tr>
+              <tr><td><code>:tables</code></td><td>List all bound table names</td></tr>
+              <tr><td><code>:schema &lt;table&gt;</code></td><td>Column names and types</td></tr>
+              <tr><td><code>:head &lt;table&gt; [n]</code></td><td>First n rows (default&nbsp;10)</td></tr>
+              <tr><td><code>:describe &lt;table&gt;</code></td><td>Schema + first n rows</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <p class="step-label">4 &mdash; Compile a script to C++</p>
+<pre><code><span class="cm"># Transpile, compile, and run in one step</span>
+scripts/ibex-run.sh examples/quant.ibex
+
+<span class="cm"># Or transpile only</span>
+scripts/ibex-build.sh examples/quant.ibex -o quant</code></pre>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span>Ibex &mdash; typed DataFrame pipelines</span>
+    <a href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">
+      github.com/bobjansen/Ibex &#8599;
+    </a>
+  </footer>
+
+</main>
 </body>
 </html>

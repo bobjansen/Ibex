@@ -9,8 +9,12 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +24,11 @@
 #include <unordered_set>
 #include <variant>
 
+#ifdef IBEX_HAS_READLINE
+#include <readline/history.h>
+#include <readline/readline.h>
+#endif
+
 namespace ibex::repl {
 
 namespace {
@@ -28,6 +37,61 @@ using FunctionRegistry = std::unordered_map<std::string, parser::FunctionDecl>;
 using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
 using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
+
+#ifdef IBEX_HAS_READLINE
+constexpr std::array<std::string_view, 11> kColonCommands = {
+    ":q",    ":quit",     ":exit", ":tables", ":scalars", ":schema",
+    ":head", ":describe", ":load", ":timing", ":time",
+};
+
+auto colon_command_generator(const char* text, int state) -> char* {
+    static std::size_t index = 0;
+    static std::string prefix;
+    if (state == 0) {
+        index = 0;
+        prefix = text != nullptr ? text : "";
+    }
+    while (index < kColonCommands.size()) {
+        const auto command = kColonCommands[index++];
+        if (command.starts_with(prefix)) {
+            return ::strdup(std::string(command).c_str());
+        }
+    }
+    return nullptr;
+}
+
+auto repl_completion(const char* text, int start, int /*end*/) -> char** {
+    if (start != 0 || text == nullptr || text[0] != ':') {
+        return nullptr;
+    }
+    rl_attempted_completion_over = 1;
+    return rl_completion_matches(text, colon_command_generator);
+}
+
+void configure_line_editing() {
+    rl_attempted_completion_function = repl_completion;
+}
+
+auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
+    char* raw = ::readline(prompt.c_str());
+    if (raw == nullptr) {
+        return false;
+    }
+    out.assign(raw);
+    if (!out.empty()) {
+        ::add_history(raw);
+    }
+    std::free(raw);
+    return true;
+}
+#else
+void configure_line_editing() {}
+
+auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
+    fmt::print("{}", prompt);
+    return static_cast<bool>(std::getline(std::cin, out));
+}
+#endif
 
 auto format_date(Date date) -> std::string {
     using namespace std::chrono;
@@ -1087,11 +1151,11 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     ExternDeclRegistry extern_decls;
     std::unordered_set<std::string> loaded_plugins;
     bool timing_enabled = false;
+    configure_line_editing();
 
     std::string line;
     while (true) {
-        fmt::print("{}", config.prompt);
-        if (!std::getline(std::cin, line)) {
+        if (!read_repl_line(config.prompt, line)) {
             fmt::print("\n");
             break;
         }
@@ -1251,7 +1315,6 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         auto parsed = parser::parse(normalized);
         if (!parsed) {
             fmt::print("error: {}\n", parsed.error().format());
-            report_timing();
             continue;
         }
 

@@ -279,7 +279,12 @@ IBEX_LIBRARY_PATH=./build-release/tools ./build-release/tools/ibex
 :head <table> [n]        Show first n rows (default 10)
 :describe <table> [n]    Schema + first n rows
 :load <file>             Load and execute an .ibex script
+:timing [on|off]         Toggle/force command timing output
+:time <command>          Time exactly one command
 ```
+
+Tab completion for `:` commands is enabled when Ibex is built with `readline`
+available on the system (e.g. `libreadline-dev` on Debian/Ubuntu).
 
 ## Plugins
 

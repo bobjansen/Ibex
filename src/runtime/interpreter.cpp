@@ -4178,6 +4178,73 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         *src);
 }
 
+auto resample_table(const Table& input, ir::Duration bucket_dur,
+                    const std::vector<ir::ColumnRef>& extra_group_by,
+                    const std::vector<ir::AggSpec>& aggregations)
+    -> std::expected<Table, std::string> {
+    if (!input.time_index.has_value())
+        return std::unexpected("resample requires a TimeFrame — use as_timeframe() first");
+
+    const std::string& ts_name = *input.time_index;
+    const auto* ts_cv = input.find(ts_name);
+    if (ts_cv == nullptr)
+        return std::unexpected("resample: time index column '" + ts_name + "' not found");
+    const auto* ts_col = std::get_if<Column<Timestamp>>(ts_cv);
+    if (ts_col == nullptr)
+        return std::unexpected("resample: time index must be a Timestamp column");
+
+    const std::int64_t dur_ns = bucket_dur.count();
+    if (dur_ns <= 0)
+        return std::unexpected("resample: duration must be positive");
+
+    // Build bucket column: floor(ts.nanos / dur_ns) * dur_ns
+    const auto rows = input.rows();
+    Column<std::int64_t> bucket_col;
+    bucket_col.reserve(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::int64_t nanos = (*ts_col)[i].nanos;
+        std::int64_t q = nanos / dur_ns;
+        if (nanos < 0 && nanos % dur_ns != 0)
+            --q;  // floor for negative timestamps
+        bucket_col.push_back(q * dur_ns);
+    }
+
+    // Clone input, add _bucket column
+    Table temp = input;
+    temp.add_column("_bucket", std::move(bucket_col));
+
+    // Prepend _bucket to the group-by list
+    std::vector<ir::ColumnRef> full_group_by;
+    full_group_by.push_back(ir::ColumnRef{.name = "_bucket"});
+    full_group_by.insert(full_group_by.end(), extra_group_by.begin(), extra_group_by.end());
+
+    // Run standard aggregation
+    auto result = aggregate_table(temp, full_group_by, aggregations);
+    if (!result.has_value())
+        return result;
+
+    // Convert _bucket (int64) → Timestamp, rename to ts_name
+    Table& out = result.value();
+    auto it = out.index.find("_bucket");
+    if (it == out.index.end())
+        return std::unexpected("resample: internal error — _bucket missing from output");
+    const std::size_t pos = it->second;
+
+    const auto& i64_col = std::get<Column<std::int64_t>>(*out.columns[pos].column);
+    Column<Timestamp> ts_out;
+    ts_out.reserve(i64_col.size());
+    for (auto v : i64_col)
+        ts_out.push_back(Timestamp{v});
+
+    out.columns[pos].name = ts_name;
+    out.columns[pos].column = std::make_shared<ColumnValue>(std::move(ts_out));
+    out.index.erase(it);
+    out.index[ts_name] = pos;
+    out.time_index = ts_name;
+
+    return out;
+}
+
 constexpr auto is_rolling_func(std::string_view name) -> bool {
     return name == "rolling_sum" || name == "rolling_mean" || name == "rolling_min" ||
            name == "rolling_max" || name == "rolling_count";
@@ -4453,6 +4520,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             return aggregate_table(child.value(), agg.group_by(), agg.aggregations());
+        }
+        case ir::NodeKind::Resample: {
+            const auto& rs = static_cast<const ir::ResampleNode&>(node);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child.has_value())
+                return child;
+            return resample_table(child.value(), rs.duration(), rs.group_by(), rs.aggregations());
         }
         case ir::NodeKind::Window: {
             const auto& win = static_cast<const ir::WindowNode&>(node);

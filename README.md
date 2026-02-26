@@ -158,6 +158,36 @@ polars-st      112      3.006      26.84      0.98x
 pandas          35      3.034      86.70      3.17x
 ```
 
+## TimeFrame Benchmark
+
+Rolling-window operations on 1 M rows (1-second uniform spacing).
+Ibex release build (`-O2 -march=native`), Clang 20, WSL2.
+
+| Benchmark              |    Ibex |  Polars 1.38.1 | data.table 1.17.0 |
+|------------------------|--------:|---------------:|------------------:|
+| as_timeframe (sort)    | 0.28 ms |        4.78 ms |            6.2 ms |
+| tf_lag1                | 0.97 ms |        4.84 ms |           11.0 ms |
+| tf_rolling_count_1m    | 1.12 ms |       16.9 ms  |           12.2 ms |
+| tf_rolling_sum_1m      | 1.43 ms |       19.0 ms  |           10.9 ms |
+| tf_rolling_mean_5m     | 1.65 ms |       19.7 ms  |            9.6 ms |
+| resample 1m OHLC       | 24.7 ms |       14.6 ms  |           20.0 ms |
+
+Notes:
+- Ibex uses variable-width time-based rolling windows (two-pointer O(n)); Polars
+  uses the same semantics (`rolling_sum_by`); data.table uses fixed-width row
+  windows (`frollsum`/`frollmean`, n=60/300 rows — equivalent for uniform 1s data).
+- Polars and data.table run multi-threaded on all cores; Ibex is single-threaded.
+- Sort fast-path: ibex detects already-sorted input in O(n) without extracting keys
+  into a temporary buffer; Polars detects via a pre-set `is_sorted` flag (O(1)).
+- Rolling fast-path: ibex accesses the Timestamp column directly via pointer cast,
+  avoiding an 8 MB copy; result column allocation is the only dynamic allocation
+  per call.
+- Resample: ibex floors timestamps into int64 bucket keys and delegates to the
+  standard single-threaded aggregation path. Polars uses `group_by_dynamic`
+  (parallel); data.table uses integer-key `by=` (parallel). The multi-threaded
+  advantage inverts the result here — ibex is 1.7× behind Polars and 1.2× behind
+  data.table on this query.
+
 ## Architecture
 
 ```

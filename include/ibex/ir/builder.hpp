@@ -47,6 +47,12 @@ class Builder {
         return std::make_unique<WindowNode>(next_id(), duration);
     }
 
+    [[nodiscard]] auto resample(Duration duration, std::vector<ColumnRef> group_by,
+                                std::vector<AggSpec> aggregations) -> NodePtr {
+        return std::make_unique<ResampleNode>(next_id(), duration, std::move(group_by),
+                                              std::move(aggregations));
+    }
+
     [[nodiscard]] auto as_timeframe(std::string column) -> NodePtr {
         return std::make_unique<AsTimeframeNode>(next_id(), std::move(column));
     }

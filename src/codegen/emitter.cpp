@@ -291,6 +291,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         case ir::NodeKind::Window:
             throw std::runtime_error("ibex_compile: WindowNode emission is not yet supported");
 
+        case ir::NodeKind::Resample:
+            throw std::runtime_error("ibex_compile: ResampleNode emission is not yet supported");
+
         case ir::NodeKind::AsTimeframe:
             throw std::runtime_error("ibex_compile: AsTimeframeNode emission is not yet supported");
 

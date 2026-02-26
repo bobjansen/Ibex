@@ -97,3 +97,15 @@ bench("tf_rolling_mean_5m", function() {
   d[, m := frollmean(price, n = 300L, fill = NA_real_, align = "right")]
   d
 }, args$warmup, args$iters)
+
+# tf_resample_1m_ohlc: bucket ticks into 1-minute OHLC bars
+# floor(as.numeric(ts) / 60) gives an integer bucket ID per minute
+bench("tf_resample_1m_ohlc", function() {
+  d <- dt[order(ts)]
+  d[, bucket := floor(as.numeric(ts) / 60)]
+  d[, .(open  = first(price),
+        high  = max(price),
+        low   = min(price),
+        close = last(price)),
+    by = bucket]
+}, args$warmup, args$iters)

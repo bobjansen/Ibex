@@ -1,13 +1,13 @@
 #pragma once
 
+#include <ibex/core/time.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <variant>
 #include <vector>
-
-#include <ibex/core/time.hpp>
 
 namespace ibex::parser {
 
@@ -132,8 +132,12 @@ struct WindowClause {
     DurationLiteral duration;
 };
 
+struct ResampleClause {
+    DurationLiteral duration;
+};
+
 using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, OrderClause,
-                            ByClause, WindowClause>;
+                            ByClause, WindowClause, ResampleClause>;
 
 struct BlockExpr {
     ExprPtr base;

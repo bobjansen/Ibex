@@ -1007,6 +1007,95 @@ TEST_CASE("rolling_min and rolling_max with 1ns window") {
     REQUIRE((*mx)[2] == 20);  // max(10,20)
 }
 
+// ─── resample tests ───────────────────────────────────────────────────────────
+
+TEST_CASE("resample basic OHLC — 3 two-minute buckets") {
+    // 6 ticks: t=0,1,2 in bucket 0; t=3,4,5 in bucket 1; t=6 in bucket 2
+    // (using minute-scale nanos: 1 min = 60e9 ns)
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0 * min_ns), ts_from_nanos(1 * min_ns),
+                                             ts_from_nanos(2 * min_ns), ts_from_nanos(3 * min_ns),
+                                             ts_from_nanos(4 * min_ns), ts_from_nanos(5 * min_ns)});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0, 50.0, 60.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("tf", table);
+
+    auto ir = require_ir(
+        R"(tf[resample 2m, select { open = first(price), high = max(price), low = min(price), close = last(price) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    // 3 buckets: [0..1], [2..3], [4..5]
+    REQUIRE(result->rows() == 3);
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+
+    const auto* open_col = result->find("open");
+    const auto* close_col = result->find("close");
+    const auto* high_col = result->find("high");
+    const auto* low_col = result->find("low");
+    REQUIRE(open_col != nullptr);
+    REQUIRE(close_col != nullptr);
+    REQUIRE(high_col != nullptr);
+    REQUIRE(low_col != nullptr);
+
+    // bucket 0: rows 0,1 → open=10, close=20, low=10, high=20
+    const auto& opens = std::get<Column<double>>(*open_col);
+    const auto& closes = std::get<Column<double>>(*close_col);
+    const auto& highs = std::get<Column<double>>(*high_col);
+    const auto& lows = std::get<Column<double>>(*low_col);
+    REQUIRE(opens[0] == 10.0);
+    REQUIRE(closes[0] == 20.0);
+    REQUIRE(highs[0] == 20.0);
+    REQUIRE(lows[0] == 10.0);
+
+    // bucket 1: rows 2,3 → open=30, close=40
+    REQUIRE(opens[1] == 30.0);
+    REQUIRE(closes[1] == 40.0);
+
+    // bucket 2: rows 4,5 → open=50, close=60
+    REQUIRE(opens[2] == 50.0);
+    REQUIRE(closes[2] == 60.0);
+}
+
+TEST_CASE("resample with by — one bucket per (bucket, symbol)") {
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1 * min_ns),
+                                             ts_from_nanos(0), ts_from_nanos(1 * min_ns)});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0});
+    table.add_column("symbol", Column<std::string>{"A", "A", "B", "B"});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("tf", table);
+
+    auto ir = require_ir(R"(tf[resample 1m, select { close = last(price) }, by symbol];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    // 2 symbols × 2 buckets = 4 rows
+    REQUIRE(result->rows() == 4);
+    REQUIRE(result->find("close") != nullptr);
+    REQUIRE(result->find("symbol") != nullptr);
+}
+
+TEST_CASE("resample error on non-timeframe") {
+    runtime::Table table;
+    table.add_column("ts", Column<std::int64_t>{0, 1, 2});
+    table.add_column("price", Column<double>{1.0, 2.0, 3.0});
+    // No time_index set
+
+    runtime::TableRegistry registry;
+    registry.emplace("plain", table);
+
+    auto ir = require_ir(R"(plain[resample 1m, select { close = last(price) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
+}
+
 TEST_CASE("rolling_sum preserves other columns and time_index") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});

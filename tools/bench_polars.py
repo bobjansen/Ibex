@@ -101,6 +101,21 @@ def main() -> None:
         args.iters,
     )
 
+    # tf_resample_1m_ohlc: bucket ticks into 1-minute OHLC bars
+    bench(
+        "tf_resample_1m_ohlc",
+        lambda: df.sort("ts")
+        .group_by_dynamic("ts", every="1m")
+        .agg(
+            pl.col("price").first().alias("open"),
+            pl.col("price").max().alias("high"),
+            pl.col("price").min().alias("low"),
+            pl.col("price").last().alias("close"),
+        ),
+        args.warmup,
+        args.iters,
+    )
+
 
 if __name__ == "__main__":
     main()

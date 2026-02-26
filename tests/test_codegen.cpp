@@ -206,6 +206,62 @@ TEST_CASE("emitter: resample node — no group-by", "[codegen]") {
     CHECK(contains(out, "\"avg\""));
 }
 
+// ─── AsTimeframe ─────────────────────────────────────────────────────────────
+
+TEST_CASE("emitter: as_timeframe node", "[codegen]") {
+    ir::Builder b;
+    auto atf = b.as_timeframe("ts");
+    atf->add_child(make_source(b, "ticks.csv"));
+
+    auto out = emit_to_string(*atf);
+    CHECK(contains(out, "ibex::ops::as_timeframe("));
+    CHECK(contains(out, "\"ts\""));
+}
+
+// ─── Window ──────────────────────────────────────────────────────────────────
+
+TEST_CASE("emitter: window node — rolling sum", "[codegen]") {
+    ir::Builder b;
+    // tf[window 1m, update { s = rolling_sum(price) }]
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    auto price_arg = std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{.name = "price"}});
+    auto upd = b.update({ir::FieldSpec{
+        .alias = "s",
+        .expr = ir::Expr{ir::CallExpr{.callee = "rolling_sum", .args = {price_arg}}}}});
+    upd->add_child(make_source(b, "ticks.csv"));
+    auto win = b.window(ir::Duration(min_ns));
+    win->add_child(std::move(upd));
+
+    auto out = emit_to_string(*win);
+    CHECK(contains(out, "ibex::ops::windowed_update("));
+    CHECK(contains(out, "ibex::ir::Duration(60000000000LL)"));
+    CHECK(contains(out, "\"s\""));
+    CHECK(contains(out, "rolling_sum"));
+    CHECK(contains(out, "ibex::ops::make_field("));
+}
+
+TEST_CASE("emitter: window node — multiple rolling ops", "[codegen]") {
+    ir::Builder b;
+    constexpr std::int64_t min5_ns = 300LL * 1'000'000'000LL;
+    auto price_arg = std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{.name = "price"}});
+    auto upd = b.update({
+        ir::FieldSpec{.alias = "s",
+                      .expr = ir::Expr{ir::CallExpr{.callee = "rolling_sum", .args = {price_arg}}}},
+        ir::FieldSpec{
+            .alias = "m",
+            .expr = ir::Expr{ir::CallExpr{.callee = "rolling_mean", .args = {price_arg}}}},
+    });
+    upd->add_child(make_source(b, "ticks.csv"));
+    auto win = b.window(ir::Duration(min5_ns));
+    win->add_child(std::move(upd));
+
+    auto out = emit_to_string(*win);
+    CHECK(contains(out, "ibex::ir::Duration(300000000000LL)"));
+    CHECK(contains(out, "\"s\""));
+    CHECK(contains(out, "\"m\""));
+    CHECK(contains(out, "rolling_mean"));
+}
+
 // ─── Update ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: update node — simple expression", "[codegen]") {

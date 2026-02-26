@@ -1,0 +1,40 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex TimeFrame Demo
+//
+//  Run from the REPL:
+//    ./build-release/tools/ibex --plugin-path build-release/tools
+//    :load examples/timeframes.ibex
+//
+//  The gen_tf_data plugin generates N rows of 1-second synthetic tick data:
+//    ts    — Timestamp column, 1-second spacing starting at epoch
+//    price — Float column, sawtooth pattern 100..199
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn gen_tf_data(n: Int) -> DataFrame from "gen_tf_data.hpp";
+
+// Generate 10 minutes of 1-second tick data (600 rows).
+let ticks = gen_tf_data(10000000);
+
+// ── 1. Sort by timestamp and promote to a time-indexed DataFrame ──────────────
+//   as_timeframe checks that the key column is sorted (O(n)), reorders if not,
+//   and records which column is the time index.
+let tf = as_timeframe(ticks, "ts");
+
+// ── 2. Lag: previous tick's price ────────────────────────────────────────────
+//   lag(col, n) shifts a column n rows forward (fills first n rows with null).
+tf[update { prev_price = lag(price, 1) }];
+
+// ── 3. Rolling count over a 1-minute window ───────────────────────────────────
+//   Each row gets the number of ticks in the 60-second window ending at that row.
+//   With 1-second data this is always 60 (once the window fills).
+tf[window 1m, update { ticks_1m = rolling_count() }];
+
+// ── 4. Rolling sum and mean over a 5-minute window ───────────────────────────
+tf[window 5m, update { price_sum_5m = rolling_sum(price) }];
+tf[window 5m, update { price_mean_5m = rolling_mean(price) }];
+
+// ── 5. Combine: multiple rolling ops in one pass ──────────────────────────────
+tf[window 5m, update {
+    price_sum_5m  = rolling_sum(price),
+    price_mean_5m = rolling_mean(price)
+}];

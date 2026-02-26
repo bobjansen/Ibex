@@ -43,6 +43,27 @@ install(TARGETS ibex_bench
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
 
+add_library(ibex_gen_tf_data_plugin SHARED gen_tf_data.cpp)
+
+set_target_properties(ibex_gen_tf_data_plugin PROPERTIES
+    OUTPUT_NAME gen_tf_data
+    PREFIX ""
+)
+
+target_include_directories(ibex_gen_tf_data_plugin
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+)
+
+target_link_libraries(ibex_gen_tf_data_plugin
+    PRIVATE
+        Ibex::runtime
+        Ibex::CompilerOptions
+)
+
+if(TARGET Ibex::Sanitizers)
+    target_link_libraries(ibex_gen_tf_data_plugin PRIVATE Ibex::Sanitizers)
+endif()
+
 add_executable(ibex_compile_bin ibex_compile.cpp)
 
 set_target_properties(ibex_compile_bin PROPERTIES

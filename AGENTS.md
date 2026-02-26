@@ -10,6 +10,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - Release: `cmake -B build-release -S . -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DIBEX_ENABLE_MARCH_NATIVE=ON`
 - `cmake --build build --parallel && ctest --test-dir build --output-on-failure`
 - **Always benchmark against `build-release/`, not `build/` (debug is ~4× slower)**
+- Fix build warnings as they pop up
 - LTO (`-DIBEX_ENABLE_LTO=ON`) gives negligible benefit — hot paths are within single TUs
 - Parquet plugin is built standalone: `scripts/ibex-parquet-build.sh` (after Ibex build).
 - End-to-end checks: `scripts/ibex-e2e.sh` (REPL + transpile + plugins).

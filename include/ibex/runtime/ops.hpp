@@ -45,6 +45,10 @@ namespace ibex::ops {
 [[nodiscard]] auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                              const std::vector<ir::AggSpec>& aggs) -> runtime::Table;
 
+[[nodiscard]] auto resample(const runtime::Table& t, ir::Duration duration,
+                            const std::vector<std::string>& group_by,
+                            const std::vector<ir::AggSpec>& aggs) -> runtime::Table;
+
 [[nodiscard]] auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
     -> runtime::Table;
 

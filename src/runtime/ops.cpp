@@ -136,6 +136,16 @@ auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by
     return delegate(std::move(agg_node), t);
 }
 
+auto resample(const runtime::Table& t, ir::Duration duration,
+              const std::vector<std::string>& group_by, const std::vector<ir::AggSpec>& aggs)
+    -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto resample_node = b.resample(duration, to_col_refs(group_by), aggs);
+    resample_node->add_child(std::move(scan_node));
+    return delegate(std::move(resample_node), t);
+}
+
 auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);

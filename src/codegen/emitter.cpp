@@ -291,8 +291,41 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         case ir::NodeKind::Window:
             throw std::runtime_error("ibex_compile: WindowNode emission is not yet supported");
 
-        case ir::NodeKind::Resample:
-            throw std::runtime_error("ibex_compile: ResampleNode emission is not yet supported");
+        case ir::NodeKind::Resample: {
+            const auto& rs = static_cast<const ir::ResampleNode&>(node);
+            auto child = emit_node(*rs.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::resample(" << child << ",\n";
+
+            // duration (nanoseconds count)
+            *out_ << "        ibex::ir::Duration(" << rs.duration().count() << "LL),\n";
+
+            // group_by
+            *out_ << "        {";
+            bool first = true;
+            for (const auto& g : rs.group_by()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(g.name) << '"';
+            }
+            *out_ << "},\n";
+
+            // aggregations
+            *out_ << "        {";
+            first = true;
+            for (const auto& a : rs.aggregations()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << "ibex::ops::make_agg("
+                      << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
+                      << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
+                      << "\")";
+            }
+            *out_ << "});\n";
+            return var;
+        }
 
         case ir::NodeKind::AsTimeframe:
             throw std::runtime_error("ibex_compile: AsTimeframeNode emission is not yet supported");

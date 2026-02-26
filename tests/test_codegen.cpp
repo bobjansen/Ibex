@@ -166,6 +166,46 @@ TEST_CASE("emitter: aggregate node", "[codegen]") {
     CHECK(contains(out, "ibex::ops::make_agg("));
 }
 
+// ─── Resample ────────────────────────────────────────────────────────────────
+
+TEST_CASE("emitter: resample node — OHLC with group-by", "[codegen]") {
+    ir::Builder b;
+    // 1-minute bucket (60 * 10^9 ns), group by symbol, 4 aggs
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    auto rs = b.resample(ir::Duration(min_ns), {ir::ColumnRef{"symbol"}},
+                         {ir::AggSpec{ir::AggFunc::First, ir::ColumnRef{"price"}, "open"},
+                          ir::AggSpec{ir::AggFunc::Max, ir::ColumnRef{"price"}, "high"},
+                          ir::AggSpec{ir::AggFunc::Min, ir::ColumnRef{"price"}, "low"},
+                          ir::AggSpec{ir::AggFunc::Last, ir::ColumnRef{"price"}, "close"}});
+    rs->add_child(make_source(b, "ticks.csv"));
+
+    auto out = emit_to_string(*rs);
+    CHECK(contains(out, "ibex::ops::resample("));
+    CHECK(contains(out, "ibex::ir::Duration(60000000000LL)"));
+    CHECK(contains(out, "\"symbol\""));
+    CHECK(contains(out, "ibex::ir::AggFunc::First"));
+    CHECK(contains(out, "ibex::ir::AggFunc::Max"));
+    CHECK(contains(out, "ibex::ir::AggFunc::Min"));
+    CHECK(contains(out, "ibex::ir::AggFunc::Last"));
+    CHECK(contains(out, "\"open\""));
+    CHECK(contains(out, "\"close\""));
+    CHECK(contains(out, "ibex::ops::make_agg("));
+}
+
+TEST_CASE("emitter: resample node — no group-by", "[codegen]") {
+    ir::Builder b;
+    constexpr std::int64_t hour_ns = 3600LL * 1'000'000'000LL;
+    auto rs = b.resample(ir::Duration(hour_ns), {},
+                         {ir::AggSpec{ir::AggFunc::Mean, ir::ColumnRef{"price"}, "avg"}});
+    rs->add_child(make_source(b, "ticks.csv"));
+
+    auto out = emit_to_string(*rs);
+    CHECK(contains(out, "ibex::ops::resample("));
+    CHECK(contains(out, "ibex::ir::Duration(3600000000000LL)"));
+    CHECK(contains(out, "ibex::ir::AggFunc::Mean"));
+    CHECK(contains(out, "\"avg\""));
+}
+
 // ─── Update ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: update node — simple expression", "[codegen]") {

@@ -33,7 +33,7 @@ cmake --build build-release --parallel
 ## CSV Plugin (built with core)
 
 ```
-IBEX_LIBRARY_PATH=./build/libraries ./build/tools/ibex
+IBEX_LIBRARY_PATH=./build/tools ./build/tools/ibex
 ```
 
 ## Parquet Plugin (standalone)

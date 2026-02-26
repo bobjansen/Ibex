@@ -264,10 +264,10 @@ cmake --build build-release
 
 ```bash
 # With the bundled CSV plugin
-IBEX_LIBRARY_PATH=./build-release/libraries ./build-release/tools/ibex
+IBEX_LIBRARY_PATH=./build-release/tools ./build-release/tools/ibex
 
 # Or pass the plugin directory explicitly
-./build-release/tools/ibex --plugin-path ./build-release/libraries
+./build-release/tools/ibex --plugin-path ./build-release/tools
 ```
 
 ### REPL Commands

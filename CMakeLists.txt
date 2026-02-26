@@ -22,6 +22,8 @@ option(IBEX_ENABLE_SANITIZERS "Enable ASan + UBSan in Debug" OFF)
 option(IBEX_BUILD_TESTS "Build tests" ON)
 option(IBEX_BUILD_TOOLS "Build REPL and other tools" ON)
 option(IBEX_BUILD_EXAMPLES "Build examples" ON)
+set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
+    "Directory for bundled Ibex plugins (csv/gen_tf_data)")
 
 # Include CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

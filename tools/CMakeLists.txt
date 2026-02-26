@@ -48,6 +48,8 @@ add_library(ibex_gen_tf_data_plugin SHARED gen_tf_data.cpp)
 set_target_properties(ibex_gen_tf_data_plugin PROPERTIES
     OUTPUT_NAME gen_tf_data
     PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY "${IBEX_PLUGIN_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${IBEX_PLUGIN_OUTPUT_DIR}"
 )
 
 target_include_directories(ibex_gen_tf_data_plugin

@@ -109,8 +109,6 @@ struct Token {
 };
 
 /// Tokenize an Ibex source string.
-///
-/// TODO: Implement full lexer per SPEC.md Section 2.
 [[nodiscard]] auto tokenize(std::string_view source) -> std::vector<Token>;
 
 }  // namespace ibex::parser

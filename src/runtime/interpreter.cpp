@@ -1045,6 +1045,17 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
             copy_column(c);
         }
     }
+    // Propagate validity bitmaps using the same selected[] indices.
+    for (std::size_t c = 0; c < input.columns.size(); ++c) {
+        if (input.columns[c].validity.has_value()) {
+            const auto& src_bm = *input.columns[c].validity;
+            std::vector<bool> dst_bm(out_n);
+            for (std::size_t j = 0; j < out_n; ++j)
+                dst_bm[j] = src_bm[selected[j]];
+            output.columns[c].validity = std::move(dst_bm);
+        }
+    }
+
     output.ordering = input.ordering;
     output.time_index = input.time_index;
     normalize_time_index(output);
@@ -1055,12 +1066,15 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     -> std::expected<Table, std::string> {
     Table output;
     for (const auto& col : columns) {
-        const auto* source = input.find(col.name);
-        if (source == nullptr) {
+        const auto* entry = input.find_entry(col.name);
+        if (entry == nullptr) {
             return std::unexpected("select column not found: " + col.name +
                                    " (available: " + format_columns(input) + ")");
         }
-        output.add_column(col.name, *source);
+        output.add_column(col.name, *entry->column);
+        if (entry->validity.has_value()) {
+            output.columns.back().validity = entry->validity;
+        }
     }
     if (input.ordering.has_value() && ordering_keys_present(*input.ordering, output.index)) {
         output.ordering = input.ordering;
@@ -1440,6 +1454,13 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                 },
                 *entry.column);
             output.add_column(entry.name, std::move(gathered));
+            if (entry.validity.has_value()) {
+                const auto& src_bm = *entry.validity;
+                std::vector<bool> dst_bm(rows);
+                for (std::size_t pos = 0; pos < rows; ++pos)
+                    dst_bm[pos] = src_bm[static_cast<std::size_t>(idx[pos])];
+                output.columns.back().validity = std::move(dst_bm);
+            }
         }
         output.ordering = std::move(resolved_keys);
         output.time_index = input.time_index;
@@ -1972,9 +1993,22 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
     };
 
+    // Validity bitmaps for right-side output columns.
+    // Only needed for Left/Asof joins where unmatched rows become null.
+    const bool track_right_nulls = (kind == ir::JoinKind::Left || kind == ir::JoinKind::Asof);
+    bool right_had_nulls = false;
+    std::vector<std::vector<bool>> right_validity;
+    if (track_right_nulls) {
+        right_validity.resize(right_out.size());
+    }
+
     auto append_right_row = [&](std::size_t row) {
         for (const auto& item : right_out) {
             append_value(*output.columns[item.out_index].column, *item.column, row);
+        }
+        if (track_right_nulls) {
+            for (auto& bm : right_validity)
+                bm.push_back(true);
         }
     };
 
@@ -1982,6 +2016,19 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         for (const auto& item : right_out) {
             append_scalar(*output.columns[item.out_index].column,
                           default_scalar_for_column(*item.column));
+        }
+        if (track_right_nulls) {
+            right_had_nulls = true;
+            for (auto& bm : right_validity)
+                bm.push_back(false);
+        }
+    };
+
+    auto finalize_right_validity = [&]() {
+        if (right_had_nulls) {
+            for (std::size_t i = 0; i < right_out.size(); ++i) {
+                output.columns[right_out[i].out_index].validity = std::move(right_validity[i]);
+            }
         }
     };
 
@@ -2090,6 +2137,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         output.time_index = left.time_index;
         normalize_time_index(output);
+        finalize_right_validity();
         return output;
     }
 
@@ -2113,6 +2161,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
     }
 
+    finalize_right_validity();
     return output;
 }
 
@@ -4771,12 +4820,34 @@ void Table::add_column(std::string name, ColumnValue column) {
     if (auto it = index.find(name); it != index.end()) {
         // Reseat the shared_ptr rather than mutating shared data (copy-on-write).
         columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
+        columns[it->second].validity.reset();
         return;
     }
     std::size_t pos = columns.size();
     columns.push_back(ColumnEntry{.name = std::move(name),
-                                  .column = std::make_shared<ColumnValue>(std::move(column))});
+                                  .column = std::make_shared<ColumnValue>(std::move(column)),
+                                  .validity = std::nullopt});
     index[columns.back().name] = pos;
+}
+
+void Table::add_column(std::string name, ColumnValue column, std::vector<bool> validity) {
+    if (auto it = index.find(name); it != index.end()) {
+        columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
+        columns[it->second].validity = std::move(validity);
+        return;
+    }
+    std::size_t pos = columns.size();
+    columns.push_back(ColumnEntry{.name = std::move(name),
+                                  .column = std::make_shared<ColumnValue>(std::move(column)),
+                                  .validity = std::move(validity)});
+    index[columns.back().name] = pos;
+}
+
+auto Table::find_entry(const std::string& name) const -> const ColumnEntry* {
+    if (auto it = index.find(name); it != index.end()) {
+        return &columns[it->second];
+    }
+    return nullptr;
 }
 
 auto Table::find(const std::string& name) -> ColumnValue* {

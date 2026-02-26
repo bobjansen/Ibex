@@ -156,6 +156,46 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     return rows
 
 
+# ── Null benchmarks ───────────────────────────────────────────────────────────
+
+def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
+    """Left join producing ~50% null right-column values."""
+    print("pandas: loading for null bench...", file=sys.stderr, flush=True)
+    df = pd.read_csv(csv_path)
+    lookup = pd.read_csv(csv_lookup_path)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+
+    run("null_left_join",
+        lambda: pd.merge(df, lookup, on="symbol", how="left"))
+
+    return rows
+
+
+def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
+    """Left join producing ~50% null right-column values."""
+    print("polars: loading for null bench...", file=sys.stderr, flush=True)
+    df = pl.read_csv(csv_path)
+    lookup = pl.read_csv(csv_lookup_path)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+
+    run("null_left_join",
+        lambda: df.join(lookup, on="symbol", how="left"))
+
+    return rows
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def bench_pandas_events(csv_events_path, warmup, iters):
@@ -205,6 +245,7 @@ def main():
     ap.add_argument("--csv-multi",   help="Path to prices_multi.csv")
     ap.add_argument("--csv-trades",  help="Path to trades.csv")
     ap.add_argument("--csv-events",  help="Path to events.csv")
+    ap.add_argument("--csv-lookup",  help="Path to lookup.csv (null benchmark)")
     ap.add_argument("--warmup",      type=int, default=1)
     ap.add_argument("--iters",       type=int, default=5)
     ap.add_argument("--out",         default="results/python.tsv")
@@ -216,6 +257,9 @@ def main():
     if args.csv_events:
         all_rows += bench_pandas_events(args.csv_events, args.warmup, args.iters)
         all_rows += bench_polars_events(args.csv_events, args.warmup, args.iters)
+    if args.csv_lookup:
+        all_rows += bench_pandas_null(args.csv, args.csv_lookup, args.warmup, args.iters)
+        all_rows += bench_polars_null(args.csv, args.csv_lookup, args.warmup, args.iters)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

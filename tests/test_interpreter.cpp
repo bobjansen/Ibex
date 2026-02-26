@@ -2,12 +2,14 @@
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/ops.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
 #include <limits>
+#include <sstream>
 
 namespace {
 
@@ -1115,4 +1117,94 @@ TEST_CASE("rolling_sum preserves other columns and time_index") {
     REQUIRE(result->find("val") != nullptr);
     REQUIRE(result->find("label") != nullptr);
     REQUIRE(result->find("s") != nullptr);
+}
+
+// ─── Phase 1 null semantics ───────────────────────────────────────────────────
+
+TEST_CASE("null: left join unmatched rows produce null right columns", "[null][join]") {
+    runtime::Table left, right;
+    Column<std::int64_t> lid;
+    lid.push_back(1);
+    lid.push_back(2);
+    lid.push_back(3);
+    left.add_column("id", std::move(lid));
+
+    Column<std::int64_t> rid;
+    rid.push_back(1);
+    rid.push_back(3);
+    right.add_column("id", std::move(rid));
+    Column<double> scores;
+    scores.push_back(10.0);
+    scores.push_back(30.0);
+    right.add_column("score", std::move(scores));
+
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(result.has_value());
+    auto& t = *result;
+    REQUIRE(t.rows() == 3);
+
+    const auto& score_entry = t.columns[t.index.at("score")];
+    CHECK_FALSE(runtime::is_null(score_entry, 0));  // id=1 matched
+    CHECK(runtime::is_null(score_entry, 1));        // id=2 unmatched → null
+    CHECK_FALSE(runtime::is_null(score_entry, 2));  // id=3 matched
+}
+
+TEST_CASE("null: validity bitmap propagates through filter", "[null]") {
+    runtime::Table t;
+    t.add_column("id", Column<std::int64_t>{1, 2, 3});
+    t.add_column("val", Column<double>{1.0, 2.0, 3.0}, std::vector<bool>{true, false, true});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // Filter: keep id >= 1 (all rows) — bitmap must survive unchanged.
+    auto ir = require_ir("t[filter id >= 1];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto& val_entry = result->columns[result->index.at("val")];
+    CHECK_FALSE(runtime::is_null(val_entry, 0));  // row 0 was valid
+    CHECK(runtime::is_null(val_entry, 1));        // row 1 was null → still null
+    CHECK_FALSE(runtime::is_null(val_entry, 2));  // row 2 was valid
+}
+
+TEST_CASE("null: validity bitmap propagates through project", "[null]") {
+    runtime::Table t;
+    t.add_column("id", Column<std::int64_t>{1, 2});
+    t.add_column("val", Column<double>{1.0, 2.0}, std::vector<bool>{true, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[select { val }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& val_entry = result->columns[result->index.at("val")];
+    CHECK_FALSE(runtime::is_null(val_entry, 0));
+    CHECK(runtime::is_null(val_entry, 1));
+}
+
+TEST_CASE("null: print displays null for null rows", "[null]") {
+    runtime::Table left, right;
+    Column<std::int64_t> lid;
+    lid.push_back(1);
+    lid.push_back(2);
+    left.add_column("id", std::move(lid));
+    Column<std::int64_t> rid;
+    rid.push_back(1);
+    right.add_column("id", std::move(rid));
+    Column<double> vals;
+    vals.push_back(99.0);
+    right.add_column("val", std::move(vals));
+
+    auto joined = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(joined.has_value());
+
+    std::ostringstream oss;
+    ops::print(*joined, oss);
+    const std::string out = oss.str();
+    CHECK(out.find("null") != std::string::npos);
+    CHECK(out.find("99") != std::string::npos);
 }

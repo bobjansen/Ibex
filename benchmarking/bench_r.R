@@ -26,6 +26,7 @@ csv_path        <- parse_arg("--csv")
 csv_multi_path  <- parse_arg("--csv-multi")
 csv_trades_path <- parse_arg("--csv-trades")
 csv_events_path <- parse_arg("--csv-events")
+csv_lookup_path <- parse_arg("--csv-lookup")
 warmup          <- as.integer(parse_arg("--warmup", "1"))
 iters           <- as.integer(parse_arg("--iters",  "5"))
 out_path        <- parse_arg("--out", "results/r.tsv")
@@ -199,6 +200,23 @@ if (!is.null(csv_events_path)) {
 
     bench("dplyr", "filter_events",
         function() tb_ev |> filter(amount > 500.0))
+}
+
+# ── Null benchmarks: left join producing ~50% null right-column values ────────
+if (!is.null(csv_lookup_path)) {
+    message("\ndata.table: loading lookup.csv...")
+    dt_lookup <- fread(csv_lookup_path)
+    tb_lookup <- as_tibble(dt_lookup)
+
+    message("\n=== data.table (null) ===")
+
+    bench("data.table", "null_left_join",
+        function() merge(dt, dt_lookup, by = "symbol", all.x = TRUE))
+
+    message("\n=== dplyr (null) ===")
+
+    bench("dplyr", "null_left_join",
+        function() tb |> left_join(tb_lookup, by = "symbol"))
 }
 
 # ── Write results ─────────────────────────────────────────────────────────────

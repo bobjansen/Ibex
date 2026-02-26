@@ -659,6 +659,7 @@ int main(int argc, char** argv) {
     std::string csv_multi_path;
     std::string csv_trades_path;
     std::string csv_events_path;
+    std::string csv_lookup_path;
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
@@ -676,6 +677,9 @@ int main(int argc, char** argv) {
         ->check(CLI::ExistingFile);
     app.add_option("--csv-events", csv_events_path,
                    "CSV file path for high-cardinality benchmarks (user_id, amount, quantity)")
+        ->check(CLI::ExistingFile);
+    app.add_option("--csv-lookup", csv_lookup_path,
+                   "CSV file path for null benchmarks (symbol, sector) — half of prices symbols")
         ->check(CLI::ExistingFile);
     app.add_option("--warmup", warmup_iters, "Warmup iterations")->check(CLI::NonNegativeNumber);
     app.add_option("--iters", iters, "Measured iterations")->check(CLI::PositiveNumber);
@@ -760,6 +764,43 @@ int main(int argc, char** argv) {
             status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
             if (status != 0) {
                 break;
+            }
+        }
+
+        // Null benchmarks: left join produces ~50% null right-column values.
+        // lookup.csv has half the symbols (first 126 of 252); the other half
+        // get null sector values. This exercises validity-bitmap tracking.
+        if (status == 0 && !csv_lookup_path.empty()) {
+            ibex::runtime::Table lookup_table;
+            try {
+                lookup_table = read_csv(csv_lookup_path);
+            } catch (const std::exception& e) {
+                fmt::print("error: failed to read lookup CSV: {}\n", e.what());
+                return 1;
+            }
+            if (print_types) {
+                print_table_types("lookup", lookup_table);
+            }
+
+            // Combine prices + lookup in one registry for the join query.
+            ibex::runtime::TableRegistry null_reg;
+            null_reg.emplace("prices", tables.at("prices"));  // shared_ptr columns — cheap copy
+            null_reg.emplace("lookup", std::move(lookup_table));
+
+            fmt::print("\n-- Null benchmarks ({} prices rows, {} lookup rows) --\n",
+                       null_reg.at("prices").rows(), null_reg.at("lookup").rows());
+
+            // Left join: ~50% of rows get null sector; measures validity-bitmap
+            // tracking and allocation overhead vs polars/data.table.
+            std::vector<BenchQuery> null_queries = {
+                {"null_left_join", "prices left join lookup on symbol"},
+            };
+
+            for (const auto& q : null_queries) {
+                status = run_benchmark(q, null_reg, warmup_iters, iters, saved_include_parse);
+                if (status != 0) {
+                    break;
+                }
             }
         }
     }

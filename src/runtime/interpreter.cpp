@@ -3966,12 +3966,38 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     const auto& time_col = *table.find(*table.time_index);
     std::size_t rows = table.rows();
 
+    // Flatten the time column to int64 and express duration in the same unit.
+    // Timestamp: nanoseconds.  Date: days.
+    std::vector<std::int64_t> time_vals(rows);
+    std::int64_t dur_val = 0;
+    if (const auto* ts_col = std::get_if<Column<Timestamp>>(&time_col)) {
+        for (std::size_t i = 0; i < rows; ++i)
+            time_vals[i] = (*ts_col)[i].nanos;
+        dur_val = duration.count();
+    } else {
+        const auto& date_col = std::get<Column<Date>>(time_col);
+        for (std::size_t i = 0; i < rows; ++i)
+            time_vals[i] = date_col[i].days;
+        static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
+        dur_val = duration.count() / kNsPerDay;
+    }
+
+    // Two-pointer helper: returns the first index lo in [0, i] such that
+    // time_vals[lo] >= time_vals[i] - dur_val, advancing prev_lo monotonically.
+    // Because the TimeFrame is sorted ascending, lo never decreases across rows.
+    auto advance_lo = [&](std::size_t& lo, std::size_t i) {
+        std::int64_t threshold = time_vals[i] - dur_val;
+        while (lo < i && time_vals[lo] < threshold)
+            ++lo;
+    };
+
     if (call.callee == "rolling_count") {
         Column<std::int64_t> result;
-        result.reserve(rows);
+        result.resize(rows);
+        std::size_t lo = 0;
         for (std::size_t i = 0; i < rows; ++i) {
-            std::size_t lo = window_lo(time_col, i, duration);
-            result.push_back(static_cast<std::int64_t>(i - lo + 1));
+            advance_lo(lo, i);
+            result[i] = static_cast<std::int64_t>(i - lo + 1);
         }
         return result;
     }
@@ -3996,14 +4022,17 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     return std::unexpected("rolling_mean: column must be numeric (Int or Float)");
                 } else {
                     Column<double> result;
-                    result.reserve(rows);
+                    result.resize(rows);
+                    double sum = 0.0;
+                    std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
-                        double sum = 0.0;
-                        for (std::size_t j = lo; j <= i; ++j) {
-                            sum += static_cast<double>(col[j]);
+                        sum += static_cast<double>(col[i]);
+                        std::int64_t threshold = time_vals[i] - dur_val;
+                        while (lo < i && time_vals[lo] < threshold) {
+                            sum -= static_cast<double>(col[lo]);
+                            ++lo;
                         }
-                        result.push_back(sum / static_cast<double>(i - lo + 1));
+                        result[i] = sum / static_cast<double>(i - lo + 1);
                     }
                     return result;
                 }
@@ -4020,14 +4049,17 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     return std::unexpected("rolling_sum: column must be numeric (Int or Float)");
                 } else {
                     ColT result;
-                    result.reserve(rows);
+                    result.resize(rows);
+                    T sum{};
+                    std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
-                        T sum{};
-                        for (std::size_t j = lo; j <= i; ++j) {
-                            sum += col[j];
+                        sum += col[i];
+                        std::int64_t threshold = time_vals[i] - dur_val;
+                        while (lo < i && time_vals[lo] < threshold) {
+                            sum -= col[lo];
+                            ++lo;
                         }
-                        result.push_back(sum);
+                        result[i] = sum;
                     }
                     return result;
                 }
@@ -4035,7 +4067,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
             *src);
     }
 
-    // rolling_min / rolling_max — numeric and ordered scalar types
+    // rolling_min / rolling_max — O(n·w), monotonic deque not yet implemented.
     bool is_min = call.callee == "rolling_min";
     return std::visit(
         [&](const auto& col) -> std::expected<ColumnValue, std::string> {
@@ -4048,12 +4080,11 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 ColT result;
                 result.reserve(rows);
                 for (std::size_t i = 0; i < rows; ++i) {
-                    std::size_t lo = window_lo(time_col, i, duration);
-                    T best = col[lo];
-                    for (std::size_t j = lo + 1; j <= i; ++j) {
-                        if (is_min ? (col[j] < best) : (col[j] > best)) {
+                    std::size_t win_lo = window_lo(time_col, i, duration);
+                    T best = col[win_lo];
+                    for (std::size_t j = win_lo + 1; j <= i; ++j) {
+                        if (is_min ? (col[j] < best) : (col[j] > best))
                             best = col[j];
-                        }
                     }
                     result.push_back(best);
                 }

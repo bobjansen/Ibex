@@ -699,7 +699,7 @@ TEST_CASE("as_timeframe on non-existent column returns error") {
 
 TEST_CASE("as_timeframe on non-timestamp column returns error") {
     runtime::Table table;
-    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0});
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -707,7 +707,26 @@ TEST_CASE("as_timeframe on non-timestamp column returns error") {
     auto ir = require_ir(R"(as_timeframe(data, "price");)");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().find("must be Timestamp or Date") != std::string::npos);
+    REQUIRE(result.error().find("must be Timestamp, Date, or Int") != std::string::npos);
+}
+
+TEST_CASE("as_timeframe on Int column treats values as nanoseconds") {
+    runtime::Table table;
+    // 0 ns, 1s, 2s
+    table.add_column("ts", Column<std::int64_t>{0, 1'000'000'000LL, 2'000'000'000LL});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(R"(as_timeframe(data, "ts");)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index == "ts");
+    REQUIRE(result->rows() == 3);
+    // ts column should now be Timestamp
+    REQUIRE(result->find("ts") != nullptr);
+    REQUIRE(std::holds_alternative<Column<Timestamp>>(*result->find("ts")));
 }
 
 TEST_CASE("Filter on TimeFrame preserves time_index") {

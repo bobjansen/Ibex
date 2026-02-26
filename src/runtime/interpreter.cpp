@@ -1282,6 +1282,52 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         return output;
     }
 
+    // Fast pre-sorted check for single ascending Timestamp/Date/Int key — avoids building
+    // the 8 MB flat_keys[0].u64 vector when the input is already sorted (common TimeFrame case).
+    if (resolved_keys.size() == 1 && resolved_keys[0].ascending) {
+        const auto* column = input.find(resolved_keys[0].name);
+        if (column != nullptr) {
+            bool already_sorted = false;
+            std::visit(
+                [&](const auto& col) {
+                    using ColT = std::decay_t<decltype(col)>;
+                    if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+                        already_sorted = true;
+                        for (std::size_t i = 1; i < rows; ++i) {
+                            if (col[i].nanos < col[i - 1].nanos) {
+                                already_sorted = false;
+                                break;
+                            }
+                        }
+                    } else if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                        already_sorted = true;
+                        for (std::size_t i = 1; i < rows; ++i) {
+                            if (col[i] < col[i - 1]) {
+                                already_sorted = false;
+                                break;
+                            }
+                        }
+                    } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
+                        already_sorted = true;
+                        for (std::size_t i = 1; i < rows; ++i) {
+                            if (col[i].days < col[i - 1].days) {
+                                already_sorted = false;
+                                break;
+                            }
+                        }
+                    }
+                },
+                *column);
+            if (already_sorted) {
+                Table output = input;
+                output.ordering = std::move(resolved_keys);
+                output.time_index = input.time_index;
+                normalize_time_index(output);
+                return output;
+            }
+        }
+    }
+
     // Pre-extract each sort key into a flat typed array so the hot comparator
     // loop does plain vector indexing rather than per-comparison variant dispatch.
     // I64 keys are sign-flipped to uint64 at extraction time so that unsigned
@@ -1401,27 +1447,8 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         return output;
     };
 
-    // Fast path: single ascending I64 key (covers all TimeFrame as_timeframe sorts).
-    // Moves flat_keys[0].u64 into the sort — no key copy.
+    // Fast path: single ascending I64 key — radix sort (pre-sorted case already handled above).
     if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 && flat_keys[0].ascending) {
-        // Pre-sorted check: one sequential scan over the already-extracted u64 keys.
-        // For already-sorted input (common in TimeFrame) this avoids both the radix
-        // sort and the gather — O(n) scan + O(n) table copy instead of O(n·passes) sort.
-        const auto& u64 = flat_keys[0].u64;
-        bool already_sorted = true;
-        for (std::size_t i = 1; i < rows; ++i) {
-            if (u64[i] < u64[i - 1]) {
-                already_sorted = false;
-                break;
-            }
-        }
-        if (already_sorted) {
-            Table output = input;
-            output.ordering = std::move(resolved_keys);
-            output.time_index = input.time_index;
-            normalize_time_index(output);
-            return output;
-        }
         auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
@@ -4018,18 +4045,24 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     const auto& time_col = *table.find(*table.time_index);
     std::size_t rows = table.rows();
 
-    // Flatten the time column to int64 and express duration in the same unit.
-    // Timestamp: nanoseconds.  Date: days.
-    std::vector<std::int64_t> time_vals(rows);
+    // Map the time column to a contiguous int64 array and express duration in the same unit.
+    // Timestamp: nanoseconds (layout-compatible with int64, no copy needed).
+    // Date: days (int32, must be widened into a temporary buffer).
+    const std::int64_t* time_vals = nullptr;
+    std::vector<std::int64_t> time_vals_buf;  // only allocated for the Date path
     std::int64_t dur_val = 0;
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(&time_col)) {
-        for (std::size_t i = 0; i < rows; ++i)
-            time_vals[i] = (*ts_col)[i].nanos;
+        // Timestamp is {int64_t nanos} — pointer-cast avoids an 8 MB copy.
+        static_assert(sizeof(Timestamp) == sizeof(std::int64_t) &&
+                      alignof(Timestamp) == alignof(std::int64_t));
+        time_vals = reinterpret_cast<const std::int64_t*>(ts_col->data());
         dur_val = duration.count();
     } else {
         const auto& date_col = std::get<Column<Date>>(time_col);
+        time_vals_buf.resize(rows);
         for (std::size_t i = 0; i < rows; ++i)
-            time_vals[i] = date_col[i].days;
+            time_vals_buf[i] = date_col[i].days;
+        time_vals = time_vals_buf.data();
         static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
         dur_val = duration.count() / kNsPerDay;
     }
@@ -4455,10 +4488,24 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (col == nullptr) {
                 return std::unexpected("as_timeframe: column '" + atf.column() + "' not found");
             }
+            // Accept Int columns as nanosecond timestamps so CSV-loaded integer
+            // time columns work without a plugin.
+            if (const auto* int_col = std::get_if<Column<std::int64_t>>(col)) {
+                Column<Timestamp> ts_col;
+                ts_col.reserve(int_col->size());
+                for (auto v : *int_col)
+                    ts_col.push_back(Timestamp{v});
+                auto idx_it = t.index.find(atf.column());
+                if (idx_it != t.index.end()) {
+                    t.columns[idx_it->second].column =
+                        std::make_shared<ColumnValue>(std::move(ts_col));
+                    col = t.find(atf.column());
+                }
+            }
             if (!std::holds_alternative<Column<Timestamp>>(*col) &&
                 !std::holds_alternative<Column<Date>>(*col)) {
                 return std::unexpected("as_timeframe: column '" + atf.column() +
-                                       "' must be Timestamp or Date");
+                                       "' must be Timestamp, Date, or Int");
             }
             auto sorted = order_table(t, {{.name = atf.column(), .ascending = true}});
             if (!sorted.has_value()) {

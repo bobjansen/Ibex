@@ -1874,9 +1874,6 @@ auto column_kind(const ColumnValue& column) -> ExprType {
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const std::vector<std::string>& keys) -> std::expected<Table, std::string> {
-    if (kind == ir::JoinKind::Asof) {
-        return std::unexpected("asof join is not supported yet");
-    }
     if (keys.empty()) {
         return std::unexpected("join requires at least one key");
     }
@@ -1901,6 +1898,29 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         left_keys.push_back(left_col);
         right_keys.push_back(right_col);
+    }
+
+    std::optional<std::size_t> asof_time_key_pos;
+    if (kind == ir::JoinKind::Asof) {
+        if (!left.time_index.has_value() || !right.time_index.has_value()) {
+            return std::unexpected("asof join requires both operands to be TimeFrame");
+        }
+        if (*left.time_index != *right.time_index) {
+            return std::unexpected(
+                "asof join requires both TimeFrames to share the same time index "
+                "column");
+        }
+        const std::string& time_key = *left.time_index;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == time_key) {
+                asof_time_key_pos = i;
+                break;
+            }
+        }
+        if (!asof_time_key_pos.has_value()) {
+            return std::unexpected("asof join requires the 'on' keys to include the time index '" +
+                                   time_key + "'");
+        }
     }
 
     std::unordered_set<std::string> key_set(keys.begin(), keys.end());
@@ -1964,6 +1984,114 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                           default_scalar_for_column(*item.column));
         }
     };
+
+    if (kind == ir::JoinKind::Asof) {
+        const std::size_t time_pos = *asof_time_key_pos;
+        const auto* left_time_col = left_keys[time_pos];
+        const auto* right_time_col = right_keys[time_pos];
+
+        auto time_value = [](const ColumnValue& col,
+                             std::size_t row) -> std::optional<std::int64_t> {
+            if (const auto* ts = std::get_if<Column<Timestamp>>(&col)) {
+                return (*ts)[row].nanos;
+            }
+            if (const auto* day = std::get_if<Column<Date>>(&col)) {
+                return static_cast<std::int64_t>((*day)[row].days);
+            }
+            if (const auto* ints = std::get_if<Column<std::int64_t>>(&col)) {
+                return (*ints)[row];
+            }
+            return std::nullopt;
+        };
+
+        std::vector<std::int64_t> left_times;
+        left_times.reserve(left.rows());
+        for (std::size_t l = 0; l < left.rows(); ++l) {
+            auto v = time_value(*left_time_col, l);
+            if (!v.has_value()) {
+                return std::unexpected(
+                    "asof join requires a Timestamp/Date/Int time index column in left operand");
+            }
+            left_times.push_back(*v);
+        }
+
+        std::vector<std::int64_t> right_times;
+        right_times.reserve(right.rows());
+        for (std::size_t r = 0; r < right.rows(); ++r) {
+            auto v = time_value(*right_time_col, r);
+            if (!v.has_value()) {
+                return std::unexpected(
+                    "asof join requires a Timestamp/Date/Int time index column in right operand");
+            }
+            right_times.push_back(*v);
+        }
+
+        if (!std::is_sorted(left_times.begin(), left_times.end()) ||
+            !std::is_sorted(right_times.begin(), right_times.end())) {
+            return std::unexpected(
+                "asof join requires both TimeFrames to be sorted ascending by "
+                "their time index");
+        }
+
+        std::vector<const ColumnValue*> left_eq_keys;
+        std::vector<const ColumnValue*> right_eq_keys;
+        left_eq_keys.reserve(keys.size() - 1);
+        right_eq_keys.reserve(keys.size() - 1);
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (i == time_pos) {
+                continue;
+            }
+            left_eq_keys.push_back(left_keys[i]);
+            right_eq_keys.push_back(right_keys[i]);
+        }
+
+        std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
+        right_groups.reserve(right.rows());
+        for (std::size_t r = 0; r < right.rows(); ++r) {
+            Key group;
+            group.values.reserve(right_eq_keys.size());
+            for (const auto* col : right_eq_keys) {
+                group.values.push_back(scalar_from_column(*col, r));
+            }
+            right_groups[group].push_back(r);
+        }
+
+        std::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
+        right_pos.reserve(right_groups.size());
+
+        for (std::size_t l = 0; l < left.rows(); ++l) {
+            append_left_row(l);
+
+            Key group;
+            group.values.reserve(left_eq_keys.size());
+            for (const auto* col : left_eq_keys) {
+                group.values.push_back(scalar_from_column(*col, l));
+            }
+
+            auto it = right_groups.find(group);
+            if (it == right_groups.end()) {
+                append_right_defaults();
+                continue;
+            }
+
+            auto [pos_it, _] = right_pos.try_emplace(group, 0);
+            std::size_t& pos = pos_it->second;
+            const auto& rows = it->second;
+            while (pos < rows.size() && right_times[rows[pos]] <= left_times[l]) {
+                ++pos;
+            }
+
+            if (pos == 0) {
+                append_right_defaults();
+            } else {
+                append_right_row(rows[pos - 1]);
+            }
+        }
+
+        output.time_index = left.time_index;
+        normalize_time_index(output);
+        return output;
+    }
 
     for (std::size_t l = 0; l < left.rows(); ++l) {
         Key key;

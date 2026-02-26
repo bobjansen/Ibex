@@ -193,6 +193,16 @@ auto left_join(const runtime::Table& left, const runtime::Table& right,
     return std::move(*result);
 }
 
+auto asof_join(const runtime::Table& left, const runtime::Table& right,
+               const std::vector<std::string>& keys) -> runtime::Table {
+    // Joins already have a dedicated runtime path; call it directly.
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Asof, keys);
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
 void print(const runtime::Table& t, std::ostream& out) {
     if (t.columns.empty()) {
         out << "(empty table)\n";

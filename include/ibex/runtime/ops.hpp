@@ -64,6 +64,9 @@ namespace ibex::ops {
 [[nodiscard]] auto left_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<std::string>& keys) -> runtime::Table;
 
+[[nodiscard]] auto asof_join(const runtime::Table& left, const runtime::Table& right,
+                             const std::vector<std::string>& keys) -> runtime::Table;
+
 void print(const runtime::Table& t, std::ostream& out = std::cout);
 
 // ─── Expression builders ──────────────────────────────────────────────────────

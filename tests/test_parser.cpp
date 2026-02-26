@@ -45,6 +45,12 @@ const BlockExpr& require_block(const Expr& expr) {
     return *node;
 }
 
+const JoinExpr& require_join(const Expr& expr) {
+    const auto* node = std::get_if<JoinExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    return *node;
+}
+
 }  // namespace
 
 TEST_CASE("Parse extern declaration with schema types") {
@@ -196,6 +202,23 @@ TEST_CASE("Parse expression statement with call") {
     const auto& add = require_binary(require_expr(call.args[1]), BinaryOp::Add);
     REQUIRE(std::get<std::int64_t>(require_literal(require_expr(add.left)).value) == 2);
     REQUIRE(std::get<std::int64_t>(require_literal(require_expr(add.right)).value) == 3);
+}
+
+TEST_CASE("Parse asof join expression with multiple keys") {
+    const char* source = "lhs asof join rhs on {ts, symbol};";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<ExprStmt>(stmt));
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Asof);
+    REQUIRE(join.keys == std::vector<std::string>{"ts", "symbol"});
+    REQUIRE(require_identifier(require_expr(join.left)).name == "lhs");
+    REQUIRE(require_identifier(require_expr(join.right)).name == "rhs");
 }
 
 TEST_CASE("Parse block expression with filter and select") {

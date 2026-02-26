@@ -391,8 +391,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     fn = "left_join";
                     break;
                 case ir::JoinKind::Asof:
-                    throw std::runtime_error(
-                        "ibex_compile: asof join emission is not yet supported");
+                    fn = "asof_join";
+                    break;
             }
             *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right
                   << ", {";

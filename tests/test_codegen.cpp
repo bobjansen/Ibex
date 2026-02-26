@@ -343,6 +343,20 @@ TEST_CASE("emitter: join node — inner join", "[codegen]") {
     CHECK(contains(out, "\"id\""));
 }
 
+TEST_CASE("emitter: join node — asof join", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Asof, {"ts", "symbol"});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::asof_join("));
+    CHECK(contains(out, "\"ts\""));
+    CHECK(contains(out, "\"symbol\""));
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: extern headers in config", "[codegen]") {

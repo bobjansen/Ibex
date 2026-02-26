@@ -54,3 +54,7 @@ tf[resample 60m, select {
     low   = min(price),
     close = last(price)
 }];
+
+// ── 8. As-of join: enrich ticks with latest 1-minute close ───────────────────
+let bars_1m = tf[resample 1m, select { close_1m = last(price) }];
+tf asof join bars_1m on ts;

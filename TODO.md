@@ -11,24 +11,20 @@ CSV library:
 4. Fix csv_split_line to handle RFC 4180 quoted fields ("foo,bar" and "foo""bar")
 5. Apply categorical string detection to the parquet plugin (mirrors CSV auto-encoding).
 
-Stale TODO cleanup:
-6. Remove stale /// TODO: Implement full lexer from lexer.hpp
-7. Remove stale /// TODO: Implement evaluation pipeline from repl.hpp
-
 Tests:
-8. Expand test_repl.cpp — cover :schema, :load, multi-statement files, error recovery
-9. Add tests for order + distinct combinations and edge cases (empty table, single row)
-10. Expand test_csv.cpp — quoted fields, mixed types, empty fields, large file type inference
+6. Expand test_repl.cpp — cover :schema, :load, multi-statement files, error recovery
+7. Add tests for order + distinct combinations and edge cases (empty table, single row)
+8. Expand test_csv.cpp — quoted fields, mixed types, empty fields, large file type inference
 
 Benchmarking:
-11. Add the compiled benchmark queries (mean_by_symbol, ohlc_by_symbol, update_price_x2) to the interpreter benchmark
+9. Add the compiled benchmark queries (mean_by_symbol, ohlc_by_symbol, update_price_x2) to the interpreter benchmark
 results table in README so both rows appear side by side in a single table
 
 Window / TimeFrame (larger scope):
-12. Either implement window operations or remove them from SPEC.md with a clear "not yet implemented" note — currently the
+10. Either implement window operations or remove them from SPEC.md with a clear "not yet implemented" note — currently the
 gap between spec and reality is silent
 
-13. Make filter fast
+11. Make filter fast
 
 ● Two main reasons:
 

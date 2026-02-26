@@ -20,7 +20,6 @@ struct ReplConfig {
 /// Run the interactive REPL loop.
 ///
 /// Reads lines from stdin, parses and evaluates them.
-/// TODO: Implement evaluation pipeline (parse -> IR -> execute).
 void run(const ReplConfig& config, runtime::ExternRegistry& registry);
 
 /// Execute a script in a fresh REPL context (useful for tests).

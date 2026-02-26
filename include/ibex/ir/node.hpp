@@ -161,6 +161,7 @@ enum class NodeKind : std::uint8_t {
     Aggregate,
     Update,
     Window,
+    Resample,
     AsTimeframe,
     ExternCall,
     Join,
@@ -337,6 +338,32 @@ class JoinNode final : public Node {
    private:
     JoinKind kind_;
     std::vector<std::string> keys_;
+};
+
+/// ResampleNode: time-bucket aggregation on a TimeFrame.
+/// Groups rows into buckets of `duration` width; applies aggregations within
+/// each (bucket, group_by) partition. Output has one row per partition.
+class ResampleNode final : public Node {
+   public:
+    ResampleNode(NodeId id, Duration duration, std::vector<ColumnRef> group_by,
+                 std::vector<AggSpec> aggregations)
+        : Node(NodeKind::Resample, id),
+          duration_(duration),
+          group_by_(std::move(group_by)),
+          aggregations_(std::move(aggregations)) {}
+
+    [[nodiscard]] auto duration() const noexcept -> Duration { return duration_; }
+    [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
+        return group_by_;
+    }
+    [[nodiscard]] auto aggregations() const noexcept -> const std::vector<AggSpec>& {
+        return aggregations_;
+    }
+
+   private:
+    Duration duration_;
+    std::vector<ColumnRef> group_by_;
+    std::vector<AggSpec> aggregations_;
 };
 
 /// Window node: specifies a time-based window for rolling computations.

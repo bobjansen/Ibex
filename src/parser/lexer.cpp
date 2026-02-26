@@ -31,6 +31,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"order", TokenKind::KeywordOrder},
         {"by", TokenKind::KeywordBy},
         {"window", TokenKind::KeywordWindow},
+        {"resample", TokenKind::KeywordResample},
         {"join", TokenKind::KeywordJoin},
         {"left", TokenKind::KeywordLeft},
         {"asof", TokenKind::KeywordAsof},

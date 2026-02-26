@@ -38,3 +38,19 @@ tf[window 5m, update {
     price_sum_5m  = rolling_sum(price),
     price_mean_5m = rolling_mean(price)
 }];
+
+// ── 6. OHLC bars: resample 1-second ticks into 1-minute bars ─────────────────
+tf[resample 1m, select {
+    open  = first(price),
+    high  = max(price),
+    low   = min(price),
+    close = last(price)
+}];
+
+// ── 7. OHLC bars: resample 1-second ticks into 60-minute bars ─────────────────
+tf[resample 60m, select {
+    open  = first(price),
+    high  = max(price),
+    low   = min(price),
+    close = last(price)
+}];

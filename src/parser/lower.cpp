@@ -174,8 +174,18 @@ class Lowerer {
         if (state.distinct && state.by) {
             return std::unexpected(LowerError{.message = "distinct cannot be used with by"});
         }
-        if (state.by && !state.select && !state.update) {
+        if (state.by && !state.select && !state.update && !state.resample) {
             return std::unexpected(LowerError{.message = "by requires select or update"});
+        }
+        if (state.resample && state.window) {
+            return std::unexpected(
+                LowerError{.message = "resample and window are mutually exclusive"});
+        }
+        if (state.resample && !state.select) {
+            return std::unexpected(LowerError{.message = "resample requires a select clause"});
+        }
+        if (state.resample && state.update) {
+            return std::unexpected(LowerError{.message = "resample cannot be used with update"});
         }
 
         auto node = std::move(base.value());
@@ -190,13 +200,13 @@ class Lowerer {
             node = std::move(filter_node);
         }
 
-        if (state.select && (state.by || select_has_aggregate(*state.select))) {
+        if (!state.resample && state.select && (state.by || select_has_aggregate(*state.select))) {
             auto aggregate = lower_aggregate(state.by, *state.select, std::move(node));
             if (!aggregate.has_value()) {
                 return std::unexpected(aggregate.error());
             }
             node = std::move(aggregate.value());
-        } else if (state.select) {
+        } else if (!state.resample && state.select) {
             auto project = lower_select_projection(state.select->fields, std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
@@ -241,6 +251,26 @@ class Lowerer {
             node = std::move(window_node);
         }
 
+        if (state.resample) {
+            auto duration = parse_duration(state.resample->duration.text);
+            if (!duration.has_value())
+                return std::unexpected(duration.error());
+            std::vector<ir::ColumnRef> extra_group_by;
+            if (state.by) {
+                auto keys = lower_group_by(*state.by);
+                if (!keys.has_value())
+                    return std::unexpected(keys.error());
+                extra_group_by = std::move(keys.value());
+            }
+            auto agg_specs = lower_resample_aggs(*state.select);
+            if (!agg_specs.has_value())
+                return std::unexpected(agg_specs.error());
+            auto resample_node = builder_.resample(duration.value(), std::move(extra_group_by),
+                                                   std::move(agg_specs.value()));
+            resample_node->add_child(std::move(node));
+            node = std::move(resample_node);
+        }
+
         return node;
     }
 
@@ -252,6 +282,7 @@ class Lowerer {
         const OrderClause* order = nullptr;
         const ByClause* by = nullptr;
         const WindowClause* window = nullptr;
+        const ResampleClause* resample = nullptr;
         std::string error;
 
         auto record(const Clause& clause) -> bool {
@@ -309,6 +340,14 @@ class Lowerer {
                     return false;
                 }
                 window = &std::get<WindowClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<ResampleClause>(clause)) {
+                if (resample != nullptr) {
+                    error = "duplicate resample clause";
+                    return false;
+                }
+                resample = &std::get<ResampleClause>(clause);
                 return true;
             }
             return true;
@@ -785,6 +824,45 @@ class Lowerer {
         });
     }
 
+    static auto lower_resample_aggs(const SelectClause& select)
+        -> std::expected<std::vector<ir::AggSpec>, LowerError> {
+        std::vector<ir::AggSpec> aggs;
+        for (const auto& field : select.fields) {
+            if (field.expr == nullptr) {
+                return std::unexpected(
+                    LowerError{.message = "resample select: bare column reference not supported — "
+                                          "use an aggregate function"});
+            }
+            const auto* call = std::get_if<CallExpr>(&field.expr->node);
+            if (call == nullptr) {
+                return std::unexpected(LowerError{
+                    .message = "resample select: only aggregate function calls are supported"});
+            }
+            auto func = parse_agg_func(call->callee);
+            if (!func.has_value()) {
+                return std::unexpected(LowerError{
+                    .message = "resample select: unknown aggregate function: " + call->callee});
+            }
+            if (call->callee == "count") {
+                if (!call->args.empty())
+                    return std::unexpected(LowerError{.message = "count() takes no arguments"});
+                aggs.push_back(
+                    ir::AggSpec{.func = func.value(), .column = {.name = ""}, .alias = field.name});
+                continue;
+            }
+            if (call->args.size() != 1)
+                return std::unexpected(
+                    LowerError{.message = "aggregate functions take one argument"});
+            const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+            if (ident == nullptr)
+                return std::unexpected(
+                    LowerError{.message = "aggregate argument must be a column name"});
+            aggs.push_back(ir::AggSpec{
+                .func = func.value(), .column = {.name = ident->name}, .alias = field.name});
+        }
+        return aggs;
+    }
+
     static auto lower_group_by(const ByClause& by)
         -> std::expected<std::vector<ir::ColumnRef>, LowerError> {
         std::vector<ir::ColumnRef> group_by;
@@ -979,6 +1057,10 @@ class Lowerer {
                 const auto& window = static_cast<const ir::WindowNode&>(node);
                 auto clone = builder_.window(window.duration());
                 return clone;
+            }
+            case ir::NodeKind::Resample: {
+                const auto& rs = static_cast<const ir::ResampleNode&>(node);
+                return builder_.resample(rs.duration(), rs.group_by(), rs.aggregations());
             }
             case ir::NodeKind::AsTimeframe: {
                 const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);

@@ -650,6 +650,14 @@ class Parser {
             return WindowClause{.duration =
                                     DurationLiteral{.text = std::string(previous().lexeme)}};
         }
+        if (match(TokenKind::KeywordResample)) {
+            if (!consume(TokenKind::DurationLiteral,
+                         "expected duration literal after 'resample'")) {
+                return std::nullopt;
+            }
+            return ResampleClause{.duration =
+                                      DurationLiteral{.text = std::string(previous().lexeme)}};
+        }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
     }

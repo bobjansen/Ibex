@@ -933,6 +933,8 @@ int main(int argc, char** argv) {
              R"(as_timeframe(tf_data, "ts")[window 1m, update { s = rolling_sum(price) }])"},
             {"tf_rolling_mean_5m",
              R"(as_timeframe(tf_data, "ts")[window 5m, update { m = rolling_mean(price) }])"},
+            {"tf_resample_1m_ohlc",
+             R"(as_timeframe(tf_data, "ts")[resample 1m, select { open = first(price), high = max(price), low = min(price), close = last(price) }])"},
         };
 
         for (const auto& query : tf_queries) {

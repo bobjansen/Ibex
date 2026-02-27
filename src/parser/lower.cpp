@@ -365,6 +365,16 @@ class Lowerer {
                 return std::make_unique<ir::FilterExpr>(
                     ir::FilterExpr{ir::FilterNot{.operand = std::move(*operand)}});
             }
+            if (unary->op == UnaryOp::IsNull || unary->op == UnaryOp::IsNotNull) {
+                auto operand = lower_filter_expr(*unary->expr);
+                if (!operand)
+                    return std::unexpected(operand.error());
+                if (unary->op == UnaryOp::IsNull)
+                    return std::make_unique<ir::FilterExpr>(
+                        ir::FilterExpr{ir::FilterIsNull{.operand = std::move(*operand)}});
+                return std::make_unique<ir::FilterExpr>(
+                    ir::FilterExpr{ir::FilterIsNotNull{.operand = std::move(*operand)}});
+            }
             return std::unexpected(LowerError{.message = "unsupported unary op in filter"});
         }
         // Binary ops: And, Or, comparisons, arithmetic
@@ -461,10 +471,16 @@ class Lowerer {
                 } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
                     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterOr{
                         clone_filter_expr(*node.left), clone_filter_expr(*node.right)}});
-                } else {
-                    static_assert(std::is_same_v<T, ir::FilterNot>);
+                } else if constexpr (std::is_same_v<T, ir::FilterNot>) {
                     return std::make_unique<ir::FilterExpr>(
                         ir::FilterExpr{ir::FilterNot{clone_filter_expr(*node.operand)}});
+                } else if constexpr (std::is_same_v<T, ir::FilterIsNull>) {
+                    return std::make_unique<ir::FilterExpr>(
+                        ir::FilterExpr{ir::FilterIsNull{clone_filter_expr(*node.operand)}});
+                } else {
+                    static_assert(std::is_same_v<T, ir::FilterIsNotNull>);
+                    return std::make_unique<ir::FilterExpr>(
+                        ir::FilterExpr{ir::FilterIsNotNull{clone_filter_expr(*node.operand)}});
                 }
             },
             expr.node);

@@ -39,6 +39,9 @@ enum class TokenKind : std::uint8_t {
     KeywordLeft,
     KeywordAsof,
     KeywordOn,
+    KeywordIs,
+    KeywordNull,
+    KeywordNot,
     KeywordAsc,
     KeywordDesc,
 

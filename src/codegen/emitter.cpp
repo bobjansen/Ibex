@@ -451,9 +451,13 @@ auto Emitter::emit_filter_expr(const ir::FilterExpr& expr) -> std::string {
             } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
                 return "ibex::ops::filter_or(" + emit_filter_expr(*node.left) + ", " +
                        emit_filter_expr(*node.right) + ")";
-            } else {
-                static_assert(std::is_same_v<T, ir::FilterNot>);
+            } else if constexpr (std::is_same_v<T, ir::FilterNot>) {
                 return "ibex::ops::filter_not(" + emit_filter_expr(*node.operand) + ")";
+            } else if constexpr (std::is_same_v<T, ir::FilterIsNull>) {
+                return "ibex::ops::filter_is_null(" + emit_filter_expr(*node.operand) + ")";
+            } else {
+                static_assert(std::is_same_v<T, ir::FilterIsNotNull>);
+                return "ibex::ops::filter_is_not_null(" + emit_filter_expr(*node.operand) + ")";
             }
         },
         expr.node);

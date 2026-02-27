@@ -65,6 +65,8 @@ struct LiteralExpr {
 enum class UnaryOp : std::uint8_t {
     Negate,
     Not,
+    IsNull,     // expr is null
+    IsNotNull,  // expr is not null
 };
 
 enum class BinaryOp : std::uint8_t {

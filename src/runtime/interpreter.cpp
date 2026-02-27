@@ -173,8 +173,35 @@ auto make_empty_like(const ColumnValue& src) -> ColumnValue {
 // held as a scalar — no broadcast allocation, just a hoisted constant in the
 // comparison loop.
 
-// Either a pointer into the table (zero-copy) or an owned computed column.
-using ColResult = std::variant<const ColumnValue*, ColumnValue>;
+// Boolean filter mask with optional validity (for 3VL null propagation).
+// valid == nullopt  → all rows are valid (common non-null path, zero overhead).
+struct Mask {
+    std::vector<uint8_t> value;
+    std::optional<std::vector<uint8_t>> valid;  // nullopt = all rows valid
+
+    void apply_validity(const std::vector<bool>* v, std::size_t n) {
+        if (v == nullptr)
+            return;
+        valid.emplace(n, uint8_t{1});
+        for (std::size_t i = 0; i < n; ++i)
+            (*valid)[i] = static_cast<uint8_t>((*v)[i]);
+    }
+};
+
+// Column result: either a pointer into the table (zero-copy) or an owned computed column,
+// plus optional validity tracking for null propagation.
+struct ColResult {
+    std::variant<const ColumnValue*, ColumnValue> data;
+    const std::vector<bool>* validity = nullptr;      // source column validity (no-copy)
+    std::optional<std::vector<bool>> owned_validity;  // for computed expressions
+
+    explicit ColResult(const ColumnValue* p) : data(p) {}
+    explicit ColResult(ColumnValue v) : data(std::move(v)) {}
+
+    [[nodiscard]] const std::vector<bool>* get_validity() const noexcept {
+        return owned_validity ? &*owned_validity : validity;
+    }
+};
 
 auto deref_col(const ColResult& r) -> const ColumnValue& {
     return std::visit(
@@ -184,7 +211,57 @@ auto deref_col(const ColResult& r) -> const ColumnValue& {
             else
                 return v;
         },
-        r);
+        r.data);
+}
+
+static auto merge_validity(const std::vector<bool>* a, const std::vector<bool>* b, std::size_t n)
+    -> std::optional<std::vector<bool>> {
+    if (!a && !b)
+        return std::nullopt;
+    if (!a)
+        return std::vector<bool>(*b);
+    if (!b)
+        return std::vector<bool>(*a);
+    std::vector<bool> out(n);
+    for (std::size_t i = 0; i < n; ++i)
+        out[i] = (*a)[i] && (*b)[i];
+    return out;
+}
+
+// Collect the merged validity bitmap for all column refs in an ir::Expr.
+// Returns nullopt if no referenced column has a validity bitmap.
+static auto collect_expr_validity(const ir::Expr& expr, const Table& table, std::size_t n)
+    -> std::optional<std::vector<bool>> {
+    std::optional<std::vector<bool>> result;
+    auto merge_in = [&](const std::vector<bool>* v) {
+        if (!v)
+            return;
+        result = merge_validity(result ? &*result : nullptr, v, n);
+    };
+    std::function<void(const ir::Expr&)> walk = [&](const ir::Expr& e) {
+        std::visit(
+            [&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                    auto it = table.index.find(node.name);
+                    if (it != table.index.end()) {
+                        const auto& entry = table.columns[it->second];
+                        if (entry.validity.has_value())
+                            merge_in(&*entry.validity);
+                    }
+                } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
+                    walk(*node.left);
+                    walk(*node.right);
+                } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                    for (const auto& arg : node.args)
+                        walk(*arg);
+                }
+                // ir::Literal — no column refs
+            },
+            e.node);
+    };
+    walk(expr);
+    return result;
 }
 
 // Flip a comparison operator (swap lhs and rhs).
@@ -315,10 +392,12 @@ using LitVal = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 template <typename T>
 constexpr bool is_string_like_v =
     std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>;
-auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit, std::size_t n)
-    -> std::expected<std::vector<uint8_t>, std::string> {
-    std::vector<uint8_t> mask(n);
-    uint8_t* mp = mask.data();
+auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit, std::size_t n,
+                        const std::vector<bool>* validity = nullptr)
+    -> std::expected<Mask, std::string> {
+    Mask result;
+    result.value.resize(n);
+    uint8_t* mp = result.value.data();
     if (const auto* s = std::get_if<std::string>(&lit)) {
         if (const auto* str_col = std::get_if<Column<std::string>>(&col)) {
             switch (op) {
@@ -347,7 +426,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         mp[i] = std::string_view((*str_col)[i]) >= *s;
                     break;
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         if (const auto* cat_col = std::get_if<Column<Categorical>>(&col)) {
             if (auto code = cat_col->find_code(*s)) {
@@ -378,12 +458,14 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                             mp[i] = std::string_view((*cat_col)[i]) >= *s;
                         break;
                 }
-                return mask;
+                result.apply_validity(validity, n);
+                return result;
             }
             if (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne) {
                 uint8_t v = (op == ir::CompareOp::Ne) ? 1 : 0;
                 std::fill(mp, mp + n, v);
-                return mask;
+                result.apply_validity(validity, n);
+                return result;
             }
             for (std::size_t i = 0; i < n; ++i) {
                 std::string_view cv = (*cat_col)[i];
@@ -405,7 +487,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         return std::unexpected("filter: cannot compare string and numeric");
     }
@@ -436,7 +519,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         return std::unexpected("filter: cannot compare date and non-date");
     }
@@ -467,7 +551,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         return std::unexpected("filter: cannot compare timestamp and non-timestamp");
     }
@@ -476,22 +561,26 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
         const std::int64_t* cp = int_col->data();
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
             cmp_col_scalar_into(op, cp, *i, mp, n);
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             cmp_col_scalar_into(op, cp, *d, mp, n);
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
     }
     if (const auto* dbl_col = std::get_if<Column<double>>(&col)) {
         const double* cp = dbl_col->data();
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
             cmp_col_scalar_into(op, cp, *i, mp, n);
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             cmp_col_scalar_into(op, cp, *d, mp, n);
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
     }
     if (const auto* date_col = std::get_if<Column<Date>>(&col)) {
@@ -520,7 +609,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             const double rhs = *d;
@@ -547,7 +637,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
     }
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(&col)) {
@@ -576,7 +667,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             const double rhs = *d;
@@ -603,7 +695,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            return mask;
+            result.apply_validity(validity, n);
+            return result;
         }
     }
 
@@ -644,28 +737,46 @@ auto cmp_into(ir::CompareOp op, const L* __restrict__ lp, const R* __restrict__ 
 }
 
 // Dispatch column-vs-column comparison over all type combinations.
-auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n)
-    -> std::expected<std::vector<uint8_t>, std::string> {
-    std::vector<uint8_t> mask(n);
-    uint8_t* mp = mask.data();
+auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n,
+                 const std::vector<bool>* lv = nullptr, const std::vector<bool>* rv = nullptr)
+    -> std::expected<Mask, std::string> {
+    Mask result;
+    result.value.resize(n);
+    uint8_t* mp = result.value.data();
     if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
             cmp_into(op, l->data(), r->data(), mp, n);
-            return mask;
+            {
+                auto merged_v = merge_validity(lv, rv, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                return result;
+            }
         }
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {
             cmp_into(op, l->data(), r->data(), mp, n);
-            return mask;
+            {
+                auto merged_v = merge_validity(lv, rv, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                return result;
+            }
         }
     }
     if (const auto* l = std::get_if<Column<double>>(&lhs)) {
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {
             cmp_into(op, l->data(), r->data(), mp, n);
-            return mask;
+            {
+                auto merged_v = merge_validity(lv, rv, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                return result;
+            }
         }
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
             cmp_into(op, l->data(), r->data(), mp, n);
-            return mask;
+            {
+                auto merged_v = merge_validity(lv, rv, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                return result;
+            }
         }
     }
     if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
@@ -694,7 +805,11 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
                         break;
                 }
             }
-            return mask;
+            {
+                auto merged_v = merge_validity(lv, rv, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                return result;
+            }
         }
     }
     if (const auto* l = std::get_if<Column<Timestamp>>(&lhs)) {
@@ -723,10 +838,14 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
                         break;
                 }
             }
-            return mask;
+            {
+                auto merged_v = merge_validity(lv, rv, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                return result;
+            }
         }
     }
-    auto cmp_string_views = [&](auto&& lcol, auto&& rcol) -> std::vector<uint8_t> {
+    auto cmp_string_views = [&](auto&& lcol, auto&& rcol) {
         switch (op) {
             case ir::CompareOp::Eq:
                 for (std::size_t i = 0; i < n; ++i)
@@ -753,15 +872,21 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
                     mp[i] = std::string_view(lcol[i]) >= std::string_view(rcol[i]);
                 break;
         }
-        return mask;
+    };
+    auto return_with_validity = [&]() -> Mask {
+        auto merged_v = merge_validity(lv, rv, n);
+        result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+        return std::move(result);
     };
 
     if (const auto* l = std::get_if<Column<std::string>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::string>>(&rhs)) {
-            return cmp_string_views(*l, *r);
+            cmp_string_views(*l, *r);
+            return return_with_validity();
         }
         if (const auto* r = std::get_if<Column<Categorical>>(&rhs)) {
-            return cmp_string_views(*l, *r);
+            cmp_string_views(*l, *r);
+            return return_with_validity();
         }
     }
     if (const auto* l = std::get_if<Column<Categorical>>(&lhs)) {
@@ -795,12 +920,14 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
                             mp[i] = lc[i] >= rc[i];
                         break;
                 }
-                return mask;
+                return return_with_validity();
             }
-            return cmp_string_views(*l, *r);
+            cmp_string_views(*l, *r);
+            return return_with_validity();
         }
         if (const auto* r = std::get_if<Column<std::string>>(&rhs)) {
-            return cmp_string_views(*l, *r);
+            cmp_string_views(*l, *r);
+            return return_with_validity();
         }
     }
     return std::unexpected("filter: incompatible column types in comparison");
@@ -815,8 +942,16 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
         [&](const auto& node) -> std::expected<ColResult, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::FilterColumn>) {
-                if (const auto* col = table.find(node.name))
-                    return ColResult{col};
+                if (const auto* col = table.find(node.name)) {
+                    ColResult r{col};
+                    auto idx_it = table.index.find(node.name);
+                    if (idx_it != table.index.end()) {
+                        const auto& entry = table.columns[idx_it->second];
+                        if (entry.validity.has_value())
+                            r.validity = &*entry.validity;
+                    }
+                    return r;
+                }
                 if (scalars != nullptr) {
                     auto it = scalars->find(node.name);
                     if (it != scalars->end()) {
@@ -854,7 +989,9 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
                 auto result = arith_vec(node.op, deref_col(*lhs), deref_col(*rhs), n);
                 if (!result)
                     return std::unexpected(result.error());
-                return ColResult{std::move(*result)};
+                ColResult res{std::move(*result)};
+                res.owned_validity = merge_validity(lhs->get_validity(), rhs->get_validity(), n);
+                return res;
             } else {
                 return std::unexpected("filter: not a value expression");
             }
@@ -862,13 +999,12 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
         expr.node);
 }
 
-// Compute a uint8_t boolean mask for all n rows.
-// For FilterCmp with a literal on either side, uses the scalar fast-path
-// (compare_col_scalar) which avoids allocating a broadcast column.
+// Compute a boolean Mask for all n rows, with 3-valued logic (3VL) for nulls.
+// valid==nullopt means all rows are valid (common non-null path, zero overhead).
 auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRegistry* scalars,
-                  std::size_t n) -> std::expected<std::vector<uint8_t>, std::string> {
+                  std::size_t n) -> std::expected<Mask, std::string> {
     return std::visit(
-        [&](const auto& node) -> std::expected<std::vector<uint8_t>, std::string> {
+        [&](const auto& node) -> std::expected<Mask, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::FilterCmp>) {
                 // Fast path: column/expr op literal (no broadcast needed).
@@ -876,14 +1012,16 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                     auto lhs = eval_value_vec(*node.left, table, scalars, n);
                     if (!lhs)
                         return std::unexpected(lhs.error());
-                    return compare_col_scalar(node.op, deref_col(*lhs), lit->value, n);
+                    return compare_col_scalar(node.op, deref_col(*lhs), lit->value, n,
+                                              lhs->get_validity());
                 }
                 // Fast path: literal op column/expr (flip the operator).
                 if (const auto* lit = std::get_if<ir::FilterLiteral>(&node.left->node)) {
                     auto rhs = eval_value_vec(*node.right, table, scalars, n);
                     if (!rhs)
                         return std::unexpected(rhs.error());
-                    return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), lit->value, n);
+                    return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), lit->value, n,
+                                              rhs->get_validity());
                 }
                 // General: both sides are column expressions.
                 auto lhs = eval_value_vec(*node.left, table, scalars, n);
@@ -892,39 +1030,116 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                 auto rhs = eval_value_vec(*node.right, table, scalars, n);
                 if (!rhs)
                     return std::unexpected(rhs.error());
-                return compare_vec(node.op, deref_col(*lhs), deref_col(*rhs), n);
+                auto res = compare_vec(node.op, deref_col(*lhs), deref_col(*rhs), n,
+                                       lhs->get_validity(), rhs->get_validity());
+                return res;
             } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
+                // 3VL AND truth table:
+                //   T & T = T (valid), T & F = F (valid), T & null = null
+                //   F & T = F (valid), F & F = F (valid), F & null = F (valid!)
+                //   null & T = null,   null & F = F (valid!), null & null = null
                 auto left = compute_mask(*node.left, table, scalars, n);
                 if (!left)
                     return std::unexpected(left.error());
                 auto right = compute_mask(*node.right, table, scalars, n);
                 if (!right)
                     return std::unexpected(right.error());
-                uint8_t* lp = left->data();
-                const uint8_t* rp = right->data();
+                const uint8_t* lp = left->value.data();
+                const uint8_t* rp = right->value.data();
                 for (std::size_t i = 0; i < n; ++i)
-                    lp[i] &= rp[i];
+                    left->value[i] = lp[i] & rp[i];
+                if (left->valid || right->valid) {
+                    if (!left->valid)
+                        left->valid.emplace(n, uint8_t{1});
+                    if (!right->valid)
+                        right->valid.emplace(n, uint8_t{1});
+                    const uint8_t* lval = left->valid->data();
+                    const uint8_t* rval = right->valid->data();
+                    for (std::size_t i = 0; i < n; ++i) {
+                        // Row is definitively false if either side is a known false
+                        uint8_t a_false = lval[i] & (1u - lp[i]);
+                        uint8_t b_false = rval[i] & (1u - rp[i]);
+                        (*left->valid)[i] = (lval[i] & rval[i]) | a_false | b_false;
+                    }
+                }
                 return std::move(*left);
             } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
+                // 3VL OR truth table:
+                //   T | T = T (valid), T | F = T (valid), T | null = T (valid!)
+                //   F | T = T (valid), F | F = F (valid), F | null = null
+                //   null | T = T (valid!), null | F = null, null | null = null
                 auto left = compute_mask(*node.left, table, scalars, n);
                 if (!left)
                     return std::unexpected(left.error());
                 auto right = compute_mask(*node.right, table, scalars, n);
                 if (!right)
                     return std::unexpected(right.error());
-                uint8_t* lp = left->data();
-                const uint8_t* rp = right->data();
+                const uint8_t* lp = left->value.data();
+                const uint8_t* rp = right->value.data();
                 for (std::size_t i = 0; i < n; ++i)
-                    lp[i] |= rp[i];
+                    left->value[i] = lp[i] | rp[i];
+                if (left->valid || right->valid) {
+                    if (!left->valid)
+                        left->valid.emplace(n, uint8_t{1});
+                    if (!right->valid)
+                        right->valid.emplace(n, uint8_t{1});
+                    const uint8_t* lval = left->valid->data();
+                    const uint8_t* rval = right->valid->data();
+                    for (std::size_t i = 0; i < n; ++i) {
+                        // Row is definitively true if either side is a known true
+                        uint8_t a_true = lval[i] & lp[i];
+                        uint8_t b_true = rval[i] & rp[i];
+                        (*left->valid)[i] = (lval[i] & rval[i]) | a_true | b_true;
+                    }
+                }
                 return std::move(*left);
             } else if constexpr (std::is_same_v<T, ir::FilterNot>) {
+                // NOT null = null; NOT true = false; NOT false = true
                 auto mask = compute_mask(*node.operand, table, scalars, n);
                 if (!mask)
                     return std::unexpected(mask.error());
-                for (auto& v : *mask)
-                    v ^= 1;
+                for (auto& v : mask->value)
+                    v ^= 1u;
+                // valid stays as-is (null propagates)
                 return std::move(*mask);
+            } else if constexpr (std::is_same_v<T, ir::FilterIsNull>) {
+                // IS NULL: true where the column has no valid value
+                Mask m;
+                m.value.resize(n, uint8_t{0});
+                if (const auto* col_node = std::get_if<ir::FilterColumn>(&node.operand->node)) {
+                    auto it = table.index.find(col_node->name);
+                    if (it != table.index.end()) {
+                        const auto& entry = table.columns[it->second];
+                        if (entry.validity.has_value()) {
+                            const auto& bm = *entry.validity;
+                            for (std::size_t i = 0; i < n; ++i)
+                                m.value[i] = static_cast<uint8_t>(!bm[i]);
+                        }
+                        // no validity bitmap → all rows valid → none are null → stays 0
+                    }
+                    return m;
+                }
+                return std::unexpected("filter: 'is null' operand must be a column reference");
+            } else if constexpr (std::is_same_v<T, ir::FilterIsNotNull>) {
+                // IS NOT NULL: true where the column has a valid value
+                Mask m;
+                m.value.resize(n, uint8_t{1});
+                if (const auto* col_node = std::get_if<ir::FilterColumn>(&node.operand->node)) {
+                    auto it = table.index.find(col_node->name);
+                    if (it != table.index.end()) {
+                        const auto& entry = table.columns[it->second];
+                        if (entry.validity.has_value()) {
+                            const auto& bm = *entry.validity;
+                            for (std::size_t i = 0; i < n; ++i)
+                                m.value[i] = static_cast<uint8_t>(bm[i]);
+                        }
+                        // no validity bitmap → all rows valid → all are not null → stays 1
+                    }
+                    return m;
+                }
+                return std::unexpected("filter: 'is not null' operand must be a column reference");
             } else {
+                // FilterColumn, FilterLiteral, FilterArith — not boolean expressions
                 return std::unexpected("filter: not a boolean expression");
             }
         },
@@ -938,19 +1153,22 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
     auto mask_result = compute_mask(predicate, input, scalars, n);
     if (!mask_result)
         return std::unexpected(mask_result.error());
-    const uint8_t* mp = mask_result->data();
+
+    // 3VL: keep row iff value[i]==1 AND (no valid vector OR valid[i]==1)
+    const uint8_t* mp = mask_result->value.data();
+    const uint8_t* vp = mask_result->valid ? mask_result->valid->data() : nullptr;
 
     // Count matching rows for pre-allocation.
     std::size_t out_n = 0;
     for (std::size_t i = 0; i < n; ++i)
-        out_n += mp[i];
+        out_n += vp ? (mp[i] & vp[i]) : mp[i];
 
     std::vector<std::size_t> selected;
     selected.resize(out_n);
     {
         std::size_t j = 0;
         for (std::size_t i = 0; i < n; ++i) {
-            if (mp[i]) {
+            if (vp ? (mp[i] & vp[i]) : mp[i]) {
                 selected[j++] = i;
             }
         }
@@ -4615,7 +4833,11 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         }
         if (auto fast = try_fast_update_binary(field.expr, output, rows, inferred.value(), scalars);
             fast.has_value()) {
-            output.add_column(field.alias, std::move(fast.value()));
+            auto validity = collect_expr_validity(field.expr, output, rows);
+            if (validity.has_value())
+                output.add_column(field.alias, std::move(fast.value()), std::move(*validity));
+            else
+                output.add_column(field.alias, std::move(fast.value()));
             continue;
         }
         ColumnValue new_column;
@@ -4690,7 +4912,11 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 },
                 new_column);
         }
-        output.add_column(field.alias, std::move(new_column));
+        auto validity = collect_expr_validity(field.expr, output, rows);
+        if (validity.has_value())
+            output.add_column(field.alias, std::move(new_column), std::move(*validity));
+        else
+            output.add_column(field.alias, std::move(new_column));
     }
     if (drop_ordering) {
         output.ordering.reset();

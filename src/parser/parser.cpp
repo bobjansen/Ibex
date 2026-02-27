@@ -361,6 +361,17 @@ class Parser {
             }
             break;
         }
+        // Postfix: expr is null / expr is not null
+        if (match(TokenKind::KeywordIs)) {
+            if (match(TokenKind::KeywordNot)) {
+                if (!consume(TokenKind::KeywordNull, "expected 'null' after 'is not'"))
+                    return nullptr;
+                return make_unary(UnaryOp::IsNotNull, std::move(expr));
+            }
+            if (!consume(TokenKind::KeywordNull, "expected 'null' after 'is'"))
+                return nullptr;
+            return make_unary(UnaryOp::IsNull, std::move(expr));
+        }
         return expr;
     }
 
@@ -567,6 +578,18 @@ class Parser {
                 return nullptr;
             }
             if (!consume(TokenKind::RParen, "expected ')' after expression")) {
+                return nullptr;
+            }
+            auto group = std::make_unique<Expr>();
+            group->node = GroupExpr{.expr = std::move(expr)};
+            return group;
+        }
+        if (match(TokenKind::LBrace)) {
+            auto expr = parse_expression();
+            if (!expr) {
+                return nullptr;
+            }
+            if (!consume(TokenKind::RBrace, "expected '}' after expression")) {
                 return nullptr;
             }
             auto group = std::make_unique<Expr>();

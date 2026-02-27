@@ -17,8 +17,12 @@ Distinct groups:
 
 Usage:
   uv run data/gen_data.py [output_dir]
+  uv run data/gen_data.py data/scales/1000000 --rows 1000000
 """
-import pathlib, sys, time
+import argparse
+import pathlib
+import sys
+import time
 import numpy as np
 import pandas as pd
 
@@ -41,16 +45,18 @@ def make_tickers(n: int) -> list[str]:
     return tickers
 
 
-def generate(out_dir: pathlib.Path, n: int = N) -> None:
+def generate(out_dir: pathlib.Path, n: int = N, force: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     tickers = np.array(make_tickers(N_SYMBOLS))
     days    = np.array([f"2024-01-0{d}" for d in range(2, 2 + N_DAYS)])
 
     # ── prices.csv ───────────────────────────────────────────────────────────
     p = out_dir / "prices.csv"
-    if p.exists():
+    if p.exists() and not force:
         print(f"  {p} already exists, skipping")
     else:
+        if p.exists() and force:
+            p.unlink()
         rng = np.random.default_rng(SEED)
         sym   = tickers[rng.integers(0, N_SYMBOLS, size=n)]
         price = np.round(rng.uniform(1.0, 1000.0, size=n), 4)
@@ -61,9 +67,11 @@ def generate(out_dir: pathlib.Path, n: int = N) -> None:
 
     # ── prices_multi.csv ─────────────────────────────────────────────────────
     pm = out_dir / "prices_multi.csv"
-    if pm.exists():
+    if pm.exists() and not force:
         print(f"  {pm} already exists, skipping")
     else:
+        if pm.exists() and force:
+            pm.unlink()
         rng2  = np.random.default_rng(SEED + 1)
         sym2  = tickers[rng2.integers(0, N_SYMBOLS, size=n)]
         day   = days[rng2.integers(0, N_DAYS, size=n)]
@@ -76,9 +84,11 @@ def generate(out_dir: pathlib.Path, n: int = N) -> None:
 
     # ── trades.csv ───────────────────────────────────────────────────────────
     tr = out_dir / "trades.csv"
-    if tr.exists():
+    if tr.exists() and not force:
         print(f"  {tr} already exists, skipping")
     else:
+        if tr.exists() and force:
+            tr.unlink()
         rng3  = np.random.default_rng(SEED + 2)
         sym3  = tickers[rng3.integers(0, N_SYMBOLS, size=n)]
         price3 = np.round(rng3.uniform(1.0, 1000.0, size=n), 4)
@@ -91,9 +101,11 @@ def generate(out_dir: pathlib.Path, n: int = N) -> None:
 
     # ── lookup.csv ───────────────────────────────────────────────────────────
     lu = out_dir / "lookup.csv"
-    if lu.exists():
+    if lu.exists() and not force:
         print(f"  {lu} already exists, skipping")
     else:
+        if lu.exists() and force:
+            lu.unlink()
         # Half the symbols (first 126 of 252) have sector info; the rest produce null.
         sectors = np.array(["Tech", "Finance", "Energy", "Health", "Consumer"])
         half = tickers[:N_SYMBOLS // 2]
@@ -106,9 +118,11 @@ def generate(out_dir: pathlib.Path, n: int = N) -> None:
 
     # ── events.csv ───────────────────────────────────────────────────────────
     ev = out_dir / "events.csv"
-    if ev.exists():
+    if ev.exists() and not force:
         print(f"  {ev} already exists, skipping")
     else:
+        if ev.exists() and force:
+            ev.unlink()
         rng4   = np.random.default_rng(SEED + 3)
         # "user_000001" … "user_100000"  (11 chars, SSO-friendly, NOT categorical)
         pool   = np.array([f"user_{i:06d}" for i in range(1, N_USERS + 1)])
@@ -123,5 +137,14 @@ def generate(out_dir: pathlib.Path, n: int = N) -> None:
 
 
 if __name__ == "__main__":
-    out = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).parent
-    generate(out)
+    ap = argparse.ArgumentParser(description="Generate synthetic benchmark CSV datasets.")
+    ap.add_argument("output_dir", nargs="?", default=str(pathlib.Path(__file__).parent))
+    ap.add_argument("--rows", type=int, default=N, help="Number of rows per generated dataset")
+    ap.add_argument("--force", action="store_true", help="Regenerate files even if they exist")
+    args = ap.parse_args()
+
+    out = pathlib.Path(args.output_dir)
+    if args.rows <= 0:
+        print("error: --rows must be > 0", file=sys.stderr)
+        sys.exit(1)
+    generate(out, n=args.rows, force=args.force)

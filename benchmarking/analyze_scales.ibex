@@ -1,0 +1,80 @@
+// Analyze scale benchmark results produced by:
+//   benchmarking/run_scale_suite.sh
+//
+// Expected input:
+//   benchmarking/results/scales.csv
+//
+// Interpreting speedup:
+//   speedup = competitor_ms / ibex_ms
+//   speedup > 1.0  -> Ibex is faster
+//   speedup < 1.0  -> Ibex is slower
+
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let raw = read_csv("benchmarking/results/scales.csv");
+
+// Keep only execution-time rows (exclude ibex+parse).
+let ibex = raw[filter framework == "ibex"]
+              [select { dataset_rows, query, ibex_ms = avg_ms }];
+let polars = raw[filter framework == "polars"]
+                [select { dataset_rows, query, polars_ms = avg_ms }];
+let data_table = raw[filter framework == "data.table"]
+                    [select { dataset_rows, query, data_table_ms = avg_ms }];
+
+let ibex_vs_polars = ibex join polars on {dataset_rows, query};
+let ibex_vs_data_table = ibex join data_table on {dataset_rows, query};
+
+let polars_cmp = ibex_vs_polars[update { speedup = polars_ms / ibex_ms }];
+let data_table_cmp = ibex_vs_data_table[update { speedup = data_table_ms / ibex_ms }];
+
+// Polars comparison: summary by query.
+polars_cmp[select {
+    avg_speedup = mean(speedup),
+    worst_speedup = min(speedup),
+    best_speedup = max(speedup),
+    n_sizes = count()
+}, by query]
+[order { avg_speedup desc }];
+
+// Polars comparison: summary by dataset size.
+polars_cmp[select {
+    avg_speedup = mean(speedup),
+    worst_speedup = min(speedup),
+    best_speedup = max(speedup),
+    n_queries = count()
+}, by dataset_rows]
+[order { dataset_rows asc }];
+
+// Polars comparison: cases where Ibex is slower/faster.
+polars_cmp[filter speedup < 1.0]
+          [select { dataset_rows, query, ibex_ms, polars_ms, speedup }]
+          [order { speedup asc }];
+polars_cmp[filter speedup > 1.0]
+          [select { dataset_rows, query, ibex_ms, polars_ms, speedup }]
+          [order { speedup desc }];
+
+// data.table comparison: summary by query.
+data_table_cmp[select {
+    avg_speedup = mean(speedup),
+    worst_speedup = min(speedup),
+    best_speedup = max(speedup),
+    n_sizes = count()
+}, by query]
+[order { avg_speedup desc }];
+
+// data.table comparison: summary by dataset size.
+data_table_cmp[select {
+    avg_speedup = mean(speedup),
+    worst_speedup = min(speedup),
+    best_speedup = max(speedup),
+    n_queries = count()
+}, by dataset_rows]
+[order { dataset_rows asc }];
+
+// data.table comparison: cases where Ibex is slower/faster.
+data_table_cmp[filter speedup < 1.0]
+              [select { dataset_rows, query, ibex_ms, data_table_ms, speedup }]
+              [order { speedup asc }];
+data_table_cmp[filter speedup > 1.0]
+              [select { dataset_rows, query, ibex_ms, data_table_ms, speedup }]
+              [order { speedup desc }];

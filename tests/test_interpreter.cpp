@@ -1241,3 +1241,137 @@ TEST_CASE("null: left join fan-out (duplicate right keys)", "[null][join]") {
     CHECK_FALSE(runtime::is_null(val_entry, 3));
     CHECK(val_col[3] == 30.0);
 }
+
+// ─── Phase 2: Nullable Expressions + 3VL Filter tests ────────────────────────
+
+TEST_CASE("null 3vl: arithmetic propagates null", "[null][3vl]") {
+    // price column with a validity bitmap: rows 0,2 valid; row 1 null
+    runtime::Table table;
+    Column<std::int64_t> price_col{10, 0, 30};
+    table.add_column("price", std::move(price_col));
+    table.columns[table.index.at("price")].validity = std::vector<bool>{true, false, true};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // select { p2 = price * 2 }
+    auto ir = require_ir("t[select { p2 = price * 2 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& p2_entry = result->columns[result->index.at("p2")];
+    const auto& p2 = std::get<Column<std::int64_t>>(*p2_entry.column);
+    REQUIRE(p2.size() == 3);
+    CHECK(p2[0] == 20);
+    CHECK(p2[2] == 60);
+    // row 1 should be null
+    REQUIRE(p2_entry.validity.has_value());
+    CHECK((*p2_entry.validity)[0] == true);
+    CHECK((*p2_entry.validity)[1] == false);
+    CHECK((*p2_entry.validity)[2] == true);
+}
+
+TEST_CASE("null 3vl: comparison with null drops row", "[null][3vl]") {
+    // sector column where row 1 is null (left join unmatched)
+    runtime::Table left, right;
+    left.add_column("id", Column<std::int64_t>{1, 2, 3});
+
+    right.add_column("id", Column<std::int64_t>{1, 3});
+    right.add_column("sector", Column<std::string>{"Tech", "Finance"});
+
+    auto joined = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(joined.has_value());
+    REQUIRE(joined->rows() == 3);
+
+    runtime::TableRegistry registry;
+    registry.emplace("j", *joined);
+
+    // filter { sector == "Tech" } — null rows should be dropped
+    auto ir = require_ir("j[filter { sector == \"Tech\" }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    CHECK(result->rows() == 1);
+    const auto& id_col =
+        std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
+    CHECK(id_col[0] == 1);
+}
+
+TEST_CASE("null 3vl: IS NULL predicate keeps null rows", "[null][3vl]") {
+    runtime::Table left, right;
+    left.add_column("id", Column<std::int64_t>{1, 2, 3});
+
+    right.add_column("id", Column<std::int64_t>{1, 3});
+    right.add_column("sector", Column<std::string>{"Tech", "Finance"});
+
+    auto joined = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(joined.has_value());
+
+    runtime::TableRegistry registry;
+    registry.emplace("j", *joined);
+
+    // filter { sector is null } — only id=2 (unmatched) should remain
+    auto ir = require_ir("j[filter { sector is null }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    CHECK(result->rows() == 1);
+    const auto& id_col =
+        std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
+    CHECK(id_col[0] == 2);
+}
+
+TEST_CASE("null 3vl: IS NOT NULL predicate keeps valid rows", "[null][3vl]") {
+    runtime::Table left, right;
+    left.add_column("id", Column<std::int64_t>{1, 2, 3});
+
+    right.add_column("id", Column<std::int64_t>{1, 3});
+    right.add_column("sector", Column<std::string>{"Tech", "Finance"});
+
+    auto joined = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(joined.has_value());
+
+    runtime::TableRegistry registry;
+    registry.emplace("j", *joined);
+
+    // filter { sector is not null } — id=1 and id=3 should remain
+    auto ir = require_ir("j[filter { sector is not null }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    CHECK(result->rows() == 2);
+    const auto& id_col =
+        std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
+    CHECK(id_col[0] == 1);
+    CHECK(id_col[1] == 3);
+}
+
+TEST_CASE("null 3vl: OR short-circuit with null — true OR null = true", "[null][3vl]") {
+    runtime::Table left, right;
+    // id=1: price=10, sector="Tech"  (both known)
+    // id=2: price=50, sector=null    (price>0 is TRUE, sector is null → true OR null = true)
+    // id=3: price=-1, sector=null    (price>0 is FALSE, sector is null → false OR null = null →
+    // drop)
+    left.add_column("id", Column<std::int64_t>{1, 2, 3});
+    left.add_column("price", Column<std::int64_t>{10, 50, -1});
+
+    right.add_column("id", Column<std::int64_t>{1});
+    right.add_column("sector", Column<std::string>{"Tech"});
+
+    auto joined = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(joined.has_value());
+    REQUIRE(joined->rows() == 3);
+
+    runtime::TableRegistry registry;
+    registry.emplace("j", *joined);
+
+    // filter { price > 0 || sector is not null }
+    auto ir = require_ir("j[filter { price > 0 || sector is not null }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    // id=1: price>0=true, is not null=true  → true OR true = true → keep
+    // id=2: price>0=true, is not null=false → true OR null(=false,invalid) = true (valid) → keep
+    // id=3: price>0=false, is not null=false → false OR null = null → drop
+    CHECK(result->rows() == 2);
+    const auto& id_col =
+        std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
+    CHECK(id_col[0] == 1);
+    CHECK(id_col[1] == 2);
+}

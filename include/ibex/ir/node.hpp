@@ -136,10 +136,17 @@ struct FilterOr {
 struct FilterNot {
     FilterExprPtr operand;
 };
+/// Null check — always produces a valid boolean (never null itself).
+struct FilterIsNull {
+    FilterExprPtr operand;
+};
+struct FilterIsNotNull {
+    FilterExprPtr operand;
+};
 
 struct FilterExpr {
     std::variant<FilterColumn, FilterLiteral, FilterArith, FilterCmp, FilterAnd, FilterOr,
-                 FilterNot>
+                 FilterNot, FilterIsNull, FilterIsNotNull>
         node;
 };
 

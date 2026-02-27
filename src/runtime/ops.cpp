@@ -4,6 +4,8 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -60,6 +62,68 @@ auto format_timestamp(ibex::Timestamp ts) -> std::string {
                        hms.subseconds().count());
 }
 
+auto normalize_float_text(std::string text) -> std::string {
+    auto trim_mantissa = [](std::string& mantissa) {
+        auto dot = mantissa.find('.');
+        if (dot != std::string::npos) {
+            while (!mantissa.empty() && mantissa.back() == '0') {
+                mantissa.pop_back();
+            }
+            if (!mantissa.empty() && mantissa.back() == '.') {
+                mantissa.pop_back();
+            }
+        }
+        if (mantissa == "-0") {
+            mantissa = "0";
+        }
+    };
+
+    auto exp_pos = text.find_first_of("eE");
+    if (exp_pos == std::string::npos) {
+        trim_mantissa(text);
+        return text;
+    }
+
+    std::string mantissa = text.substr(0, exp_pos);
+    trim_mantissa(mantissa);
+
+    std::string exponent = text.substr(exp_pos + 1);
+    char sign = '\0';
+    std::size_t idx = 0;
+    if (!exponent.empty() && (exponent[0] == '+' || exponent[0] == '-')) {
+        sign = exponent[0];
+        idx = 1;
+    }
+    while (idx < exponent.size() && exponent[idx] == '0') {
+        ++idx;
+    }
+    std::string digits = idx < exponent.size() ? exponent.substr(idx) : "0";
+
+    std::string out = std::move(mantissa);
+    out.push_back('e');
+    if (sign == '-') {
+        out.push_back('-');
+    }
+    out.append(digits);
+    return out;
+}
+
+auto format_float_mixed(double value) -> std::string {
+    if (std::isnan(value)) {
+        return "nan";
+    }
+    if (std::isinf(value)) {
+        return value > 0 ? "inf" : "-inf";
+    }
+    std::array<char, 128> buffer{};
+    auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
+                                   std::chars_format::general, 7);
+    if (ec == std::errc{}) {
+        return normalize_float_text(std::string(buffer.data(), ptr));
+    }
+    return normalize_float_text(fmt::format("{:.7g}", value));
+}
+
 auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::string {
     // Table printer normalization:
     // - keep temporal types human-readable,
@@ -77,13 +141,7 @@ auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::stri
             } else if constexpr (std::is_same_v<T, ibex::Timestamp>) {
                 return format_timestamp(c[row]);
             } else if constexpr (std::is_same_v<T, double>) {
-                double v = c[row];
-                if (std::isnan(v))
-                    return "nan";
-                if (std::isinf(v))
-                    return v > 0 ? "inf" : "-inf";
-                std::string s = fmt::format("{:g}", v);
-                return s;
+                return format_float_mixed(c[row]);
             } else {
                 return std::to_string(c[row]);
             }

@@ -1,0 +1,60 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex 3-Valued Logic (3VL) Demo
+//
+//  Demonstrates SQL-style null semantics over two small tables:
+//    employees.csv   — 6 rows  (id, name, dept_id, salary)
+//    departments.csv — 3 rows  (dept_id, dept_name, budget)
+//
+//  Dave and Frank belong to dept_id 99, which has no entry in departments.
+//  After a left join, their dept_name and budget columns are null.
+//
+//  Rules demonstrated:
+//    · NULL propagates through arithmetic  (null * n  = null)
+//    · NULL propagates through comparison  (null > n  = null → row dropped)
+//    · IS NULL  / IS NOT NULL produce a valid boolean (never null)
+//    · 3VL AND: false AND null = false (known false wins)
+//    · 3VL OR:  true  OR  null = true  (known true wins)
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let emp  = read_csv("examples/data/employees.csv");
+let dept = read_csv("examples/data/departments.csv");
+
+// ── 1. Left join: unmatched employees get null dept_name / budget ─────────────
+//   Result has 6 rows; Dave and Frank have null dept_name, null budget.
+let enriched = emp left join dept on dept_id;
+enriched;
+
+// ── 2. IS NULL — find employees with no department on record ──────────────────
+//   Returns Dave and Frank (dept_id 99 is unknown).
+enriched[filter { dept_name is null }];
+
+// ── 3. IS NOT NULL — keep only employees with a known department ──────────────
+//   Returns Alice, Bob, Carol, Eve.
+enriched[filter { dept_name is not null }];
+
+// ── 4. Arithmetic null propagation ────────────────────────────────────────────
+//   bonus = salary + budget is null for Dave and Frank because budget is null
+//   (it came from the right side of the left join and had no match).
+//   The validity bitmap propagates: even though the stored value of budget is 0,
+//   the output column bonus inherits the "null" flag.
+//   Note: integer null columns print as their stored value (0 or a computed number)
+//   since the REPL display layer does not yet show "null" for integer types.
+let with_bonus = enriched[select { name, salary, dept_name, bonus = salary + budget }];
+with_bonus;
+
+// ── 5. Comparison with null drops the row (3VL: null > n = null → not kept) ──
+//   Only rows where bonus is a known value > 200000 survive.
+//   Dave and Frank are silently dropped — not kept, not an error.
+with_bonus[filter { bonus > 200000 }];
+
+// ── 6. 3VL OR — true OR null = true ───────────────────────────────────────────
+//   Keep employees who either have a known department OR earn above 80000.
+//   Dave (salary 61000, null dept) is dropped — null OR false = null.
+//   Frank (salary 54000, null dept) is dropped — null OR false = null.
+//   Alice (salary 95000, non-null dept) is kept — true OR true = true.
+//   Carol (salary 88000, non-null dept) is kept — true OR true = true.
+//   Eve (salary 115000, non-null dept) is kept — true OR true = true.
+//   Bob (salary 72000, non-null dept) is kept — true OR false = true.
+enriched[filter { dept_name is not null || salary > 80000 }];

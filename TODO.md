@@ -41,4 +41,4 @@
 8. Rollout plan:
     - Phase 1: validity bitmap + left join/asof unmatched rows become null + REPL display.
     - Phase 2: nullable expressions + 3VL in filter.
-    - Phase 3: aggregate semantics + I/O null parsing controls.
+    - Phase 3: aggregate semantics + I/O null parsing controls. ✅

@@ -99,6 +99,7 @@
     <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
 
 <span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
+<span class="kw">let</span> nullable = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>, <span class="str">"&lt;empty&gt;,NA"</span>);
 
 <span class="cm">// Keep rows where price exceeds 1.0</span>
 <span class="kw">let</span> active = prices[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>];

@@ -1209,6 +1209,83 @@ TEST_CASE("null: print displays null for null rows", "[null]") {
     CHECK(out.find("99") != std::string::npos);
 }
 
+TEST_CASE("null agg: grouped sum/mean/min/max ignore nulls", "[null][agg]") {
+    runtime::Table table;
+    table.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    table.add_column("x", Column<double>{10.0, 0.0, 0.0, 0.0},
+                     std::vector<bool>{true, false, false, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[select { g, sx = sum(x), mx = mean(x), mn = min(x), xx = max(x), n = count() }, by g, "
+        "order g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->columns[result->index.at("g")].column);
+    REQUIRE(g[0] == 1);
+    REQUIRE(g[1] == 2);
+
+    const auto& sx_entry = result->columns[result->index.at("sx")];
+    const auto& mx_entry = result->columns[result->index.at("mx")];
+    const auto& mn_entry = result->columns[result->index.at("mn")];
+    const auto& xx_entry = result->columns[result->index.at("xx")];
+    const auto& n_entry = result->columns[result->index.at("n")];
+
+    const auto& sx = std::get<Column<double>>(*sx_entry.column);
+    const auto& mx = std::get<Column<double>>(*mx_entry.column);
+    const auto& mn = std::get<Column<double>>(*mn_entry.column);
+    const auto& xx = std::get<Column<double>>(*xx_entry.column);
+    const auto& n = std::get<Column<std::int64_t>>(*n_entry.column);
+
+    CHECK(sx[0] == Catch::Approx(10.0));
+    CHECK(mx[0] == Catch::Approx(10.0));
+    CHECK(mn[0] == Catch::Approx(10.0));
+    CHECK(xx[0] == Catch::Approx(10.0));
+    CHECK_FALSE(runtime::is_null(sx_entry, 0));
+    CHECK_FALSE(runtime::is_null(mx_entry, 0));
+    CHECK_FALSE(runtime::is_null(mn_entry, 0));
+    CHECK_FALSE(runtime::is_null(xx_entry, 0));
+
+    CHECK(runtime::is_null(sx_entry, 1));
+    CHECK(runtime::is_null(mx_entry, 1));
+    CHECK(runtime::is_null(mn_entry, 1));
+    CHECK(runtime::is_null(xx_entry, 1));
+
+    CHECK(n[0] == 2);
+    CHECK(n[1] == 2);
+}
+
+TEST_CASE("null agg: global all-null aggregate returns null", "[null][agg]") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{0, 0, 0}, std::vector<bool>{false, false, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[select { sx = sum(x), mx = mean(x), mn = min(x), xx = max(x), n = count() }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto& sx_entry = result->columns[result->index.at("sx")];
+    const auto& mx_entry = result->columns[result->index.at("mx")];
+    const auto& mn_entry = result->columns[result->index.at("mn")];
+    const auto& xx_entry = result->columns[result->index.at("xx")];
+    const auto& n_entry = result->columns[result->index.at("n")];
+    const auto& n = std::get<Column<std::int64_t>>(*n_entry.column);
+
+    CHECK(runtime::is_null(sx_entry, 0));
+    CHECK(runtime::is_null(mx_entry, 0));
+    CHECK(runtime::is_null(mn_entry, 0));
+    CHECK(runtime::is_null(xx_entry, 0));
+    CHECK(n[0] == 3);
+}
+
 TEST_CASE("print: doubles use mixed precision formatting", "[print]") {
     runtime::Table t;
     t.add_column("a", Column<double>{0.1 + 0.2});

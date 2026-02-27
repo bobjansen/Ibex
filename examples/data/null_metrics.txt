@@ -1,0 +1,5 @@
+sector,ret,beta,pe,notl
+Tech,-0.0100,1.31,39,1044199
+Fin,NA,1.05,20,405978
+Retail,0.0076,,28,131701
+Energy,0.0035,1.175,NA,

@@ -2,6 +2,7 @@
 
 #include <ibex/core/time.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -184,10 +185,14 @@ struct LetStmt {
     std::string name;
     std::optional<Type> type;
     ExprPtr value;
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
 };
 
 struct ExprStmt {
     ExprPtr expr;
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
 };
 
 using FnStmt = std::variant<LetStmt, ExprStmt>;
@@ -197,6 +202,8 @@ struct FunctionDecl {
     std::vector<Param> params;
     Type return_type;
     std::vector<FnStmt> body;
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
 };
 
 struct ExternDecl {
@@ -204,6 +211,8 @@ struct ExternDecl {
     std::vector<Param> params;
     Type return_type;
     std::string source_path;
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
 };
 
 using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, ExprStmt>;

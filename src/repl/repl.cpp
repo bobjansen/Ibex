@@ -39,9 +39,9 @@ using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
 #ifdef IBEX_HAS_READLINE
-constexpr std::array<std::string_view, 11> kColonCommands = {
+constexpr std::array<std::string_view, 12> kColonCommands = {
     ":q",    ":quit",     ":exit", ":tables", ":scalars", ":schema",
-    ":head", ":describe", ":load", ":timing", ":time",
+    ":head", ":describe", ":load", ":timing", ":time",    ":comments",
 };
 
 auto colon_command_generator(const char* text, int state) -> char* {
@@ -92,6 +92,150 @@ auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
     return static_cast<bool>(std::getline(std::cin, out));
 }
 #endif
+
+std::string_view trim(std::string_view text);
+
+struct ScriptCommentLine {
+    std::size_t line = 0;
+    std::string text;
+};
+
+void append_comment_line(std::vector<ScriptCommentLine>& comments, std::size_t line,
+                         std::string_view raw_text) {
+    auto text = trim(raw_text);
+    if (!text.empty() && text.front() == '*') {
+        text = trim(text.substr(1));
+    }
+    if (text.empty()) {
+        return;
+    }
+    comments.push_back(ScriptCommentLine{
+        .line = line,
+        .text = std::string(text),
+    });
+}
+
+auto collect_script_comment_lines(std::string_view source) -> std::vector<ScriptCommentLine> {
+    std::vector<ScriptCommentLine> comments;
+    std::size_t i = 0;
+    std::size_t line = 1;
+    while (i < source.size()) {
+        if (source[i] == '\n') {
+            ++line;
+            ++i;
+            continue;
+        }
+        if (source[i] == '"' || source[i] == '\'') {
+            const char quote = source[i];
+            ++i;
+            while (i < source.size()) {
+                if (source[i] == '\\' && (i + 1) < source.size()) {
+                    if (source[i + 1] == '\n') {
+                        ++line;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if (source[i] == '\n') {
+                    ++line;
+                }
+                if (source[i] == quote) {
+                    ++i;
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (source[i] == '/' && (i + 1) < source.size() && source[i + 1] == '/') {
+            const std::size_t start = i + 2;
+            std::size_t end = source.find('\n', start);
+            if (end == std::string_view::npos) {
+                end = source.size();
+            }
+            append_comment_line(comments, line, source.substr(start, end - start));
+            i = end;
+            continue;
+        }
+        if (source[i] == '/' && (i + 1) < source.size() && source[i + 1] == '*') {
+            i += 2;
+            std::size_t comment_line = line;
+            std::size_t segment_start = i;
+            bool closed = false;
+            while (i < source.size()) {
+                if (source[i] == '*' && (i + 1) < source.size() && source[i + 1] == '/') {
+                    append_comment_line(comments, comment_line,
+                                        source.substr(segment_start, i - segment_start));
+                    i += 2;
+                    closed = true;
+                    break;
+                }
+                if (source[i] == '\n') {
+                    append_comment_line(comments, comment_line,
+                                        source.substr(segment_start, i - segment_start));
+                    ++line;
+                    ++i;
+                    comment_line = line;
+                    segment_start = i;
+                    continue;
+                }
+                ++i;
+            }
+            if (!closed) {
+                append_comment_line(comments, comment_line, source.substr(segment_start));
+            }
+            continue;
+        }
+        ++i;
+    }
+    return comments;
+}
+
+auto statement_start_line(const parser::Stmt& stmt) -> std::size_t {
+    return std::visit([](const auto& s) { return s.start_line; }, stmt);
+}
+
+auto statement_end_line(const parser::Stmt& stmt) -> std::size_t {
+    return std::visit([](const auto& s) { return s.end_line; }, stmt);
+}
+
+auto build_statement_comment_groups(const std::vector<parser::Stmt>& statements,
+                                    const std::vector<ScriptCommentLine>& comments)
+    -> std::vector<std::vector<std::string>> {
+    std::vector<std::vector<std::string>> groups(statements.size());
+    std::size_t comment_index = 0;
+    std::size_t prev_end_line = 0;
+    for (std::size_t i = 0; i < statements.size(); ++i) {
+        const std::size_t start_line = statement_start_line(statements[i]);
+        const std::size_t end_line = std::max(statement_end_line(statements[i]), start_line);
+
+        while (comment_index < comments.size() && comments[comment_index].line < start_line) {
+            if (comments[comment_index].line > prev_end_line) {
+                groups[i].push_back(comments[comment_index].text);
+            }
+            ++comment_index;
+        }
+        while (comment_index < comments.size() && comments[comment_index].line <= end_line) {
+            if (comments[comment_index].line >= start_line) {
+                groups[i].push_back(comments[comment_index].text);
+            }
+            ++comment_index;
+        }
+        prev_end_line = end_line;
+    }
+    return groups;
+}
+
+void print_comment_group(const std::vector<std::string>& comments) {
+    if (comments.empty()) {
+        return;
+    }
+    fmt::print("script comments:\n");
+    for (const auto& line : comments) {
+        fmt::print("  {}\n", line);
+    }
+    fmt::print("\n");
+}
 
 auto format_date(Date date) -> std::string {
     using namespace std::chrono;
@@ -1060,8 +1204,14 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         FunctionRegistry& functions, ExternDeclRegistry& extern_decls,
                         runtime::ExternRegistry& externs,
                         const std::vector<std::string>& plugin_search_paths,
-                        std::unordered_set<std::string>& loaded_plugins) -> bool {
-    for (auto& stmt : statements) {
+                        std::unordered_set<std::string>& loaded_plugins,
+                        const std::vector<std::vector<std::string>>* comment_groups = nullptr)
+    -> bool {
+    for (std::size_t stmt_index = 0; stmt_index < statements.size(); ++stmt_index) {
+        auto& stmt = statements[stmt_index];
+        if (comment_groups != nullptr && stmt_index < comment_groups->size()) {
+            print_comment_group((*comment_groups)[stmt_index]);
+        }
         if (std::holds_alternative<parser::ExternDecl>(stmt)) {
             const auto& decl = std::get<parser::ExternDecl>(stmt);
             extern_decls.insert_or_assign(decl.name, decl);
@@ -1210,6 +1360,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     ExternDeclRegistry extern_decls;
     std::unordered_set<std::string> loaded_plugins;
     bool timing_enabled = false;
+    bool load_comments_enabled = false;
     configure_line_editing();
 
     std::string line;
@@ -1238,6 +1389,21 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 continue;
             }
             fmt::print("timing: {}\n", timing_enabled ? "on" : "off");
+            continue;
+        }
+        if (starts_with_command(line_view, ":comments")) {
+            auto arg = trim(line_view.substr(std::string_view(":comments").size()));
+            if (arg.empty()) {
+                load_comments_enabled = !load_comments_enabled;
+            } else if (arg == "on") {
+                load_comments_enabled = true;
+            } else if (arg == "off") {
+                load_comments_enabled = false;
+            } else {
+                fmt::print("usage: :comments [on|off]\n");
+                continue;
+            }
+            fmt::print("load comments: {}\n", load_comments_enabled ? "on" : "off");
             continue;
         }
 
@@ -1360,9 +1526,16 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 report_timing();
                 continue;
             }
+            std::vector<std::vector<std::string>> comment_groups;
+            const std::vector<std::vector<std::string>>* comment_groups_ptr = nullptr;
+            if (load_comments_enabled) {
+                auto comments = collect_script_comment_lines(source);
+                comment_groups = build_statement_comment_groups(parsed->statements, comments);
+                comment_groups_ptr = &comment_groups;
+            }
             if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
                                     extern_decls, registry, config.plugin_search_paths,
-                                    loaded_plugins)) {
+                                    loaded_plugins, comment_groups_ptr)) {
                 report_timing();
                 continue;
             }

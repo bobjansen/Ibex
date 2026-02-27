@@ -149,6 +149,39 @@ TEST_CASE("Parse let binding with precedence") {
     REQUIRE(std::get<std::int64_t>(require_literal(require_expr(mul.right)).value) == 3);
 }
 
+TEST_CASE("Parse statements track source line ranges") {
+    const char* source = R"(// header comment
+let x = 1;
+
+foo();
+fn twice(v: Int) -> Int {
+  let y = v + v;
+  y;
+}
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 4);
+
+    const auto& let_stmt = std::get<LetStmt>(result->statements[0]);
+    REQUIRE(let_stmt.start_line == 2);
+    REQUIRE(let_stmt.end_line == 2);
+
+    const auto& expr_stmt = std::get<ExprStmt>(result->statements[1]);
+    REQUIRE(expr_stmt.start_line == 4);
+    REQUIRE(expr_stmt.end_line == 4);
+
+    const auto& fn = std::get<FunctionDecl>(result->statements[2]);
+    REQUIRE(fn.start_line == 5);
+    REQUIRE(fn.end_line == 8);
+
+    const auto& ext = std::get<ExternDecl>(result->statements[3]);
+    REQUIRE(ext.start_line == 9);
+    REQUIRE(ext.end_line == 9);
+}
+
 TEST_CASE("Parse date and timestamp literals") {
     using namespace std::chrono;
 

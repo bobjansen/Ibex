@@ -6,6 +6,7 @@ Progress goes to stderr; TSV rows go to the output file.
 
 Usage:
   uv run bench_python.py --csv data/prices.csv --csv-multi data/prices_multi.csv
+  uv run bench_python.py --csv data/prices.csv --skip-pandas
 """
 import argparse, csv, pathlib, sys, time
 import pandas as pd
@@ -249,17 +250,28 @@ def main():
     ap.add_argument("--warmup",      type=int, default=1)
     ap.add_argument("--iters",       type=int, default=5)
     ap.add_argument("--out",         default="results/python.tsv")
+    ap.add_argument("--skip-pandas", action="store_true", help="Run polars only")
+    ap.add_argument("--skip-polars", action="store_true", help="Run pandas only")
     args = ap.parse_args()
 
+    if args.skip_pandas and args.skip_polars:
+        raise SystemExit("error: both --skip-pandas and --skip-polars are set")
+
     all_rows = []
-    all_rows += bench_pandas(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
-    all_rows += bench_polars(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
+    if not args.skip_pandas:
+        all_rows += bench_pandas(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
+    if not args.skip_polars:
+        all_rows += bench_polars(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
     if args.csv_events:
-        all_rows += bench_pandas_events(args.csv_events, args.warmup, args.iters)
-        all_rows += bench_polars_events(args.csv_events, args.warmup, args.iters)
+        if not args.skip_pandas:
+            all_rows += bench_pandas_events(args.csv_events, args.warmup, args.iters)
+        if not args.skip_polars:
+            all_rows += bench_polars_events(args.csv_events, args.warmup, args.iters)
     if args.csv_lookup:
-        all_rows += bench_pandas_null(args.csv, args.csv_lookup, args.warmup, args.iters)
-        all_rows += bench_polars_null(args.csv, args.csv_lookup, args.warmup, args.iters)
+        if not args.skip_pandas:
+            all_rows += bench_pandas_null(args.csv, args.csv_lookup, args.warmup, args.iters)
+        if not args.skip_polars:
+            all_rows += bench_polars_null(args.csv, args.csv_lookup, args.warmup, args.iters)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

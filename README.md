@@ -121,6 +121,32 @@ parsing overhead is negligble.
 `ibex+parse` includes text parsing and IR lowering; the overhead is negligible.
 See [`benchmarking/`](benchmarking/) for methodology and reproduction instructions.
 
+For scalability runs across dataset sizes (1M, 2M, 4M, 8M, 16M, 32M, 64M rows):
+
+```bash
+benchmarking/run_scale_suite.sh --warmup 1 --iters 3
+```
+
+Results are written per size under `benchmarking/results/scales/<rows>/` and
+combined into:
+- `benchmarking/results/scales.tsv`
+- `benchmarking/results/scales.csv`
+
+Both include a `dataset_rows` column.
+
+To skip only specific frameworks:
+
+```bash
+benchmarking/run_scale_suite.sh --skip-pandas --skip-dplyr
+```
+
+To analyze where ibex is faster/slower than polars and data.table:
+
+```bash
+./build-release/tools/ibex --plugin-path build-release/tools
+ibex> :load benchmarking/analyze_scales.ibex
+```
+
 ## Quant Example Benchmark (Compute-Only)
 
 `examples/quant.ibex` has equivalent pandas/polars scripts:

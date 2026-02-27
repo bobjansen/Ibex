@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./run_all.sh [--warmup N] [--iters N] [--skip-ibex] [--skip-ibex-compiled]
-#                [--skip-r]
+#                [--skip-r] [--skip-pandas] [--skip-dplyr]
 #
 # Environment overrides:
 #   IBEX_ROOT   — repo root        (default: parent of this script)
@@ -28,6 +28,8 @@ SKIP_IBEX=0
 SKIP_IBEX_COMPILED=0
 SKIP_PYTHON=0
 SKIP_R=0
+SKIP_PANDAS=0
+SKIP_DPLYR=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -37,6 +39,8 @@ while [[ $# -gt 0 ]]; do
         --skip-ibex-compiled) SKIP_IBEX_COMPILED=1; shift ;;
         --skip-python) SKIP_PYTHON=1; shift   ;;
         --skip-r)      SKIP_R=1;      shift   ;;
+        --skip-pandas) SKIP_PANDAS=1; shift   ;;
+        --skip-dplyr)  SKIP_DPLYR=1;  shift   ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -81,22 +85,32 @@ fi
 # ── 3. Python (pandas + polars) ───────────────────────────────────────────────
 if [[ $SKIP_PYTHON -eq 0 ]]; then
     echo "━━━ Python (pandas + polars) ━━━"
+    PY_ARGS=()
+    if [[ $SKIP_PANDAS -eq 1 ]]; then
+        PY_ARGS+=(--skip-pandas)
+    fi
     uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_python.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
         --warmup "$WARMUP" --iters "$ITERS" \
-        --out "$RESULTS/python.tsv"
+        --out "$RESULTS/python.tsv" \
+        "${PY_ARGS[@]}"
     echo ""
 fi
 
 # ── 4. R (data.table + dplyr) ────────────────────────────────────────────────
 if [[ $SKIP_R -eq 0 ]]; then
     echo "━━━ R (data.table + dplyr) ━━━"
+    R_ARGS=()
+    if [[ $SKIP_DPLYR -eq 1 ]]; then
+        R_ARGS+=(--skip-dplyr)
+    fi
     Rscript "$SCRIPT_DIR/bench_r.R" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
         --warmup "$WARMUP" --iters "$ITERS" \
-        --out "$RESULTS/r.tsv"
+        --out "$RESULTS/r.tsv" \
+        "${R_ARGS[@]}"
     echo ""
 fi
 

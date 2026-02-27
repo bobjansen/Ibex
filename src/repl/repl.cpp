@@ -13,6 +13,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -258,6 +259,68 @@ auto format_timestamp(Timestamp ts) -> std::string {
                        hms.subseconds().count());
 }
 
+auto normalize_float_text(std::string text) -> std::string {
+    auto trim_mantissa = [](std::string& mantissa) {
+        auto dot = mantissa.find('.');
+        if (dot != std::string::npos) {
+            while (!mantissa.empty() && mantissa.back() == '0') {
+                mantissa.pop_back();
+            }
+            if (!mantissa.empty() && mantissa.back() == '.') {
+                mantissa.pop_back();
+            }
+        }
+        if (mantissa == "-0") {
+            mantissa = "0";
+        }
+    };
+
+    auto exp_pos = text.find_first_of("eE");
+    if (exp_pos == std::string::npos) {
+        trim_mantissa(text);
+        return text;
+    }
+
+    std::string mantissa = text.substr(0, exp_pos);
+    trim_mantissa(mantissa);
+
+    std::string exponent = text.substr(exp_pos + 1);
+    char sign = '\0';
+    std::size_t idx = 0;
+    if (!exponent.empty() && (exponent[0] == '+' || exponent[0] == '-')) {
+        sign = exponent[0];
+        idx = 1;
+    }
+    while (idx < exponent.size() && exponent[idx] == '0') {
+        ++idx;
+    }
+    std::string digits = idx < exponent.size() ? exponent.substr(idx) : "0";
+
+    std::string out = std::move(mantissa);
+    out.push_back('e');
+    if (sign == '-') {
+        out.push_back('-');
+    }
+    out.append(digits);
+    return out;
+}
+
+auto format_float_mixed(double value) -> std::string {
+    if (std::isnan(value)) {
+        return "nan";
+    }
+    if (std::isinf(value)) {
+        return value > 0 ? "inf" : "-inf";
+    }
+    std::array<char, 128> buffer{};
+    auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
+                                   std::chars_format::general, 7);
+    if (ec == std::errc{}) {
+        return normalize_float_text(std::string(buffer.data(), ptr));
+    }
+    return normalize_float_text(fmt::format("{:.7g}", value));
+}
+
 auto format_scalar(const runtime::ScalarValue& value) -> std::string {
     return std::visit(
         [](const auto& v) -> std::string {
@@ -266,6 +329,8 @@ auto format_scalar(const runtime::ScalarValue& value) -> std::string {
                 return format_date(v);
             } else if constexpr (std::is_same_v<T, Timestamp>) {
                 return format_timestamp(v);
+            } else if constexpr (std::is_same_v<T, double>) {
+                return format_float_mixed(v);
             } else {
                 return fmt::format("{}", v);
             }
@@ -317,6 +382,8 @@ auto format_cell(const runtime::ColumnEntry& entry, std::size_t row) -> std::str
                 return format_timestamp(col[row]);
             } else if constexpr (std::is_same_v<T, std::string_view>) {
                 return quote_and_escape(col[row]);
+            } else if constexpr (std::is_same_v<T, double>) {
+                return format_float_mixed(col[row]);
             } else {
                 return fmt::format("{}", col[row]);
             }

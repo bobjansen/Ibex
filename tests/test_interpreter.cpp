@@ -1209,6 +1209,21 @@ TEST_CASE("null: print displays null for null rows", "[null]") {
     CHECK(out.find("99") != std::string::npos);
 }
 
+TEST_CASE("print: doubles use mixed precision formatting", "[print]") {
+    runtime::Table t;
+    t.add_column("a", Column<double>{0.1 + 0.2});
+    t.add_column("b", Column<double>{1.3100000000000165});
+    t.add_column("c", Column<double>{1.0441991347356203e13});
+
+    std::ostringstream oss;
+    ops::print(t, oss);
+    const std::string out = oss.str();
+
+    CHECK(out.find("0.3") != std::string::npos);
+    CHECK(out.find("1.31") != std::string::npos);
+    CHECK(out.find("1.044199e13") != std::string::npos);
+}
+
 TEST_CASE("null: left join fan-out (duplicate right keys)", "[null][join]") {
     // left: id = {1, 2, 3}
     // right: id = {1, 1, 3}  — id=1 appears twice, id=2 missing

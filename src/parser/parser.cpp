@@ -50,6 +50,7 @@ class Parser {
     }
 
     auto parse_extern_decl() -> std::optional<Stmt> {
+        const std::size_t start_line = previous().line;
         if (!consume(TokenKind::KeywordFn, "expected 'fn' after 'extern'")) {
             return std::nullopt;
         }
@@ -103,10 +104,13 @@ class Parser {
             .params = std::move(params),
             .return_type = std::move(*return_type),
             .source_path = std::move(source_path),
+            .start_line = start_line,
+            .end_line = previous().line,
         };
     }
 
     auto parse_fn_decl() -> std::optional<Stmt> {
+        const std::size_t start_line = previous().line;
         auto name = consume_identifier("expected function name");
         if (!name.has_value()) {
             return std::nullopt;
@@ -177,10 +181,13 @@ class Parser {
             .params = std::move(params),
             .return_type = std::move(*return_type),
             .body = std::move(body),
+            .start_line = start_line,
+            .end_line = previous().line,
         };
     }
 
     auto parse_let_stmt() -> std::optional<Stmt> {
+        const std::size_t start_line = previous().line;
         bool is_mut = match(TokenKind::KeywordMut);
         auto name = consume_identifier("expected identifier after 'let'");
         if (!name.has_value()) {
@@ -209,10 +216,13 @@ class Parser {
             .name = std::move(*name),
             .type = std::move(annotated_type),
             .value = std::move(value),
+            .start_line = start_line,
+            .end_line = previous().line,
         };
     }
 
     auto parse_expr_stmt() -> std::optional<Stmt> {
+        const std::size_t start_line = peek().line;
         auto expr = parse_expression();
         if (!expr) {
             return std::nullopt;
@@ -225,7 +235,11 @@ class Parser {
         if (!consume(TokenKind::Semicolon, "expected ';' after expression")) {
             return std::nullopt;
         }
-        return ExprStmt{.expr = std::move(expr)};
+        return ExprStmt{
+            .expr = std::move(expr),
+            .start_line = start_line,
+            .end_line = previous().line,
+        };
     }
 
     auto parse_expression() -> ExprPtr { return parse_join(); }

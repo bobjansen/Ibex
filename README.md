@@ -279,6 +279,7 @@ IBEX_LIBRARY_PATH=./build-release/tools ./build-release/tools/ibex
 :head <table> [n]        Show first n rows (default 10)
 :describe <table> [n]    Schema + first n rows
 :load <file>             Load and execute an .ibex script
+:comments [on|off]       Toggle/force printing script comments during :load
 :timing [on|off]         Toggle/force command timing output
 :time <command>          Time exactly one command
 ```

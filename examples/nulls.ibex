@@ -38,9 +38,7 @@ enriched[filter { dept_name is not null }];
 //   bonus = salary + budget is null for Dave and Frank because budget is null
 //   (it came from the right side of the left join and had no match).
 //   The validity bitmap propagates: even though the stored value of budget is 0,
-//   the output column bonus inherits the "null" flag.
-//   Note: integer null columns print as their stored value (0 or a computed number)
-//   since the REPL display layer does not yet show "null" for integer types.
+//   the output column bonus inherits the "null" flag and prints as null.
 let with_bonus = enriched[select { name, salary, dept_name, bonus = salary + budget }];
 with_bonus;
 

@@ -129,7 +129,41 @@ auto format_scalar(const runtime::ScalarValue& value) -> std::string {
         value);
 }
 
-auto format_cell(const runtime::ColumnValue& column, std::size_t row) -> std::string {
+auto quote_and_escape(std::string_view text) -> std::string {
+    std::string out;
+    out.reserve(text.size() + 2);
+    out.push_back('"');
+    for (char ch : text) {
+        switch (ch) {
+            case '\\':
+                out.append("\\\\");
+                break;
+            case '"':
+                out.append("\\\"");
+                break;
+            case '\n':
+                out.append("\\n");
+                break;
+            case '\t':
+                out.append("\\t");
+                break;
+            case '\r':
+                out.append("\\r");
+                break;
+            default:
+                out.push_back(ch);
+                break;
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+auto format_cell(const runtime::ColumnEntry& entry, std::size_t row) -> std::string {
+    if (runtime::is_null(entry, row)) {
+        return "null";
+    }
+    const auto& column = *entry.column;
     return std::visit(
         [row](const auto& col) -> std::string {
             using T = typename std::decay_t<decltype(col)>::value_type;
@@ -137,6 +171,8 @@ auto format_cell(const runtime::ColumnValue& column, std::size_t row) -> std::st
                 return format_date(col[row]);
             } else if constexpr (std::is_same_v<T, Timestamp>) {
                 return format_timestamp(col[row]);
+            } else if constexpr (std::is_same_v<T, std::string_view>) {
+                return quote_and_escape(col[row]);
             } else {
                 return fmt::format("{}", col[row]);
             }
@@ -159,26 +195,49 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
         return;
     }
     fmt::print("rows: {}\n", table.rows());
-    fmt::print("columns:");
-    for (const auto& entry : table.columns) {
-        fmt::print(" {}", entry.name);
+
+    const std::size_t col_count = table.columns.size();
+    const std::size_t shown_rows = std::min(table.rows(), max_rows);
+
+    std::vector<std::size_t> widths(col_count);
+    std::vector<std::vector<std::string>> cells(col_count);
+    for (std::size_t c = 0; c < col_count; ++c) {
+        widths[c] = table.columns[c].name.size();
+        cells[c].reserve(shown_rows);
+        for (std::size_t r = 0; r < shown_rows; ++r) {
+            auto cell = format_cell(table.columns[c], r);
+            widths[c] = std::max(widths[c], cell.size());
+            cells[c].push_back(std::move(cell));
+        }
+    }
+
+    auto print_sep = [&]() {
+        fmt::print("+");
+        for (std::size_t c = 0; c < col_count; ++c) {
+            fmt::print("{:-<{}}+", "", widths[c] + 2);
+        }
+        fmt::print("\n");
+    };
+
+    print_sep();
+    fmt::print("|");
+    for (std::size_t c = 0; c < col_count; ++c) {
+        fmt::print(" {:<{}} |", table.columns[c].name, widths[c]);
     }
     fmt::print("\n");
+    print_sep();
 
-    std::size_t rows = std::min(table.rows(), max_rows);
-    for (std::size_t row = 0; row < rows; ++row) {
-        fmt::print("  ");
-        for (std::size_t col = 0; col < table.columns.size(); ++col) {
-            const auto& entry = table.columns[col];
-            fmt::print("{}", format_cell(*entry.column, row));
-            if (col + 1 < table.columns.size()) {
-                fmt::print("\t");
-            }
+    for (std::size_t r = 0; r < shown_rows; ++r) {
+        fmt::print("|");
+        for (std::size_t c = 0; c < col_count; ++c) {
+            fmt::print(" {:<{}} |", cells[c][r], widths[c]);
         }
         fmt::print("\n");
     }
-    if (table.rows() > rows) {
-        fmt::print("  ... ({} more rows)\n", table.rows() - rows);
+    print_sep();
+
+    if (table.rows() > shown_rows) {
+        fmt::print("... ({} more rows)\n", table.rows() - shown_rows);
     }
 }
 

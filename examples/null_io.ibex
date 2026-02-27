@@ -1,0 +1,19 @@
+// Nullable CSV parsing controls:
+// - "<empty>" treats empty fields as null
+// - additional comma-separated tokens are also treated as null
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+
+let metrics = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
+
+// Nulls are represented via validity bitmaps and print as null in REPL.
+metrics;
+
+// Aggregates ignore null values (phase 3 semantics).
+metrics[
+  select {
+    avg_ret = mean(ret),
+    avg_beta = mean(beta),
+    sum_notl = sum(notl),
+    n_rows = count()
+  }
+];

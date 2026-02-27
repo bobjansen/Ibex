@@ -301,6 +301,16 @@ extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 it looks for `csv.so` in the plugin search path and calls its
 `ibex_register(ExternRegistry*)` entry point to register the function.
 
+`csv.so` also supports an optional null-spec argument:
+
+```ibex
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+let df = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
+```
+
+`<empty>` marks empty fields as null; additional comma-separated tokens are
+also treated as null.
+
 ### Writing your own plugin
 
 1. Create a header (`my_source.hpp`) that implements your function returning

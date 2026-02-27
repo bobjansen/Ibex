@@ -2504,17 +2504,33 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
     std::vector<const ColumnValue*> agg_columns;
     agg_columns.reserve(aggregations.size());
+    std::vector<const ColumnEntry*> agg_entries;
+    agg_entries.reserve(aggregations.size());
     for (const auto& agg : aggregations) {
         if (agg.func == ir::AggFunc::Count) {
             agg_columns.push_back(nullptr);
+            agg_entries.push_back(nullptr);
             continue;
         }
-        const auto* column = input.find(agg.column.name);
-        if (column == nullptr) {
+        const auto* entry = input.find_entry(agg.column.name);
+        if (entry == nullptr) {
             return std::unexpected("aggregate column not found: " + agg.column.name +
                                    " (available: " + format_columns(input) + ")");
         }
-        agg_columns.push_back(column);
+        agg_entries.push_back(entry);
+        agg_columns.push_back(entry->column.get());
+    }
+
+    std::vector<const std::vector<bool>*> agg_validity;
+    agg_validity.reserve(aggregations.size());
+    bool has_nullable_agg_inputs = false;
+    for (const auto* entry : agg_entries) {
+        if (entry != nullptr && entry->validity.has_value()) {
+            agg_validity.push_back(&*entry->validity);
+            has_nullable_agg_inputs = true;
+        } else {
+            agg_validity.push_back(nullptr);
+        }
     }
 
     struct AggPlanItem {
@@ -2593,6 +2609,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             AggSlot& slot = slots[i];
             if (agg.func == ir::AggFunc::Count) {
                 slot.count += 1;
+                continue;
+            }
+            if ((agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
+                 agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max) &&
+                agg_validity[i] != nullptr && !(*agg_validity[i])[row]) {
                 continue;
             }
             const ColumnValue& column = *agg_columns[i];
@@ -2880,7 +2901,111 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return std::nullopt;
     };
 
+    auto agg_result_is_valid = [&](std::size_t agg_index, const AggSlot& slot) -> bool {
+        const auto func = aggregations[agg_index].func;
+        switch (func) {
+            case ir::AggFunc::Mean:
+                return slot.count > 0;
+            case ir::AggFunc::Sum:
+            case ir::AggFunc::Min:
+            case ir::AggFunc::Max:
+                return slot.has_value;
+            case ir::AggFunc::Count:
+            case ir::AggFunc::First:
+            case ir::AggFunc::Last:
+                return true;
+        }
+        return true;
+    };
+
     std::size_t rows = input.rows();
+
+    // Null-aware fallback path:
+    // use row-wise state updates so SUM/MEAN/MIN/MAX can ignore null rows and
+    // emit null when every input row is null for a group.
+    if (has_nullable_agg_inputs) {
+        robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> index;
+        index.reserve(rows == 0 ? 1 : rows);
+        std::vector<Key> group_order;
+        group_order.reserve(rows == 0 ? 1 : rows);
+        std::vector<AggState> states;
+        states.reserve(rows == 0 ? 1 : rows);
+
+        for (std::size_t row = 0; row < rows; ++row) {
+            Key key;
+            key.values.reserve(group_columns.size());
+            for (const auto* col : group_columns) {
+                key.values.push_back(scalar_from_column(*col, row));
+            }
+
+            auto [it, inserted] = index.emplace(std::move(key), states.size());
+            if (inserted) {
+                group_order.push_back(it->first);
+                states.push_back(make_state());
+            }
+
+            if (auto err = update_state(states[it->second].slots.data(), row)) {
+                return std::unexpected(*err);
+            }
+        }
+
+        auto output = build_output();
+        if (!output.has_value()) {
+            return std::unexpected(output.error());
+        }
+
+        std::vector<std::vector<bool>> agg_validity_out(aggregations.size());
+        std::vector<bool> track_agg_validity(aggregations.size(), false);
+        for (std::size_t i = 0; i < aggregations.size(); ++i) {
+            const auto func = aggregations[i].func;
+            if (func == ir::AggFunc::Sum || func == ir::AggFunc::Mean || func == ir::AggFunc::Min ||
+                func == ir::AggFunc::Max) {
+                track_agg_validity[i] = true;
+                agg_validity_out[i].reserve(group_order.size());
+            }
+        }
+
+        for (std::size_t g = 0; g < group_order.size(); ++g) {
+            const Key& key = group_order[g];
+            for (std::size_t ci = 0; ci < key.values.size(); ++ci) {
+                auto* column = output->find(group_by[ci].name);
+                if (column == nullptr) {
+                    return std::unexpected("missing group-by column in output");
+                }
+                append_scalar(*column, key.values[ci]);
+            }
+
+            const AggSlot* slots = states[g].slots.data();
+            for (std::size_t i = 0; i < aggregations.size(); ++i) {
+                if (track_agg_validity[i]) {
+                    agg_validity_out[i].push_back(agg_result_is_valid(i, slots[i]));
+                }
+            }
+
+            if (auto err = append_agg_values_flat(*output, slots)) {
+                return std::unexpected(*err);
+            }
+        }
+
+        for (std::size_t i = 0; i < aggregations.size(); ++i) {
+            if (!track_agg_validity[i] || agg_validity_out[i].empty()) {
+                continue;
+            }
+            const bool has_null =
+                std::ranges::any_of(agg_validity_out[i], [](bool valid) { return !valid; });
+            if (!has_null) {
+                continue;
+            }
+            auto out_it = output->index.find(aggregations[i].alias);
+            if (out_it == output->index.end()) {
+                return std::unexpected("missing aggregate column in output");
+            }
+            output->columns[out_it->second].validity = std::move(agg_validity_out[i]);
+        }
+
+        return output;
+    }
+
     if (group_by.size() == 1) {
         const ColumnValue& key_column = *group_columns.front();
         if (group_cats.front() != nullptr) {

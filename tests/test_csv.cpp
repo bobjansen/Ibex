@@ -27,6 +27,12 @@ auto get_string_at(const ibex::runtime::Table& table, const char* name, std::siz
     return {};
 }
 
+auto is_null_at(const ibex::runtime::Table& table, const char* name, std::size_t row) -> bool {
+    const auto* entry = table.find_entry(name);
+    REQUIRE(entry != nullptr);
+    return ibex::runtime::is_null(*entry, row);
+}
+
 }  // namespace
 
 TEST_CASE("Read simple CSV - int and string columns") {
@@ -144,4 +150,40 @@ TEST_CASE("Read CSV - RFC 4180 escaped quotes inside quoted field") {
     REQUIRE(table.rows() == 2);
     REQUIRE(get_string_at(table, "msg", 0) == "say \"hello\"");
     REQUIRE(get_string_at(table, "msg", 1) == "world");
+}
+
+TEST_CASE("Read CSV - nullable parsing via null spec") {
+    auto path = tmp("ibex_test_nullable_parse.csv");
+    write_csv(path, "price,qty,note\n10,1,ok\n,2,NA\n30,NA,\n");
+
+    auto table = read_csv(path.string(), "<empty>,NA");
+    REQUIRE(table.rows() == 3);
+
+    const auto* prices = std::get_if<ibex::Column<std::int64_t>>(table.find("price"));
+    const auto* qtys = std::get_if<ibex::Column<std::int64_t>>(table.find("qty"));
+    const auto* notes = std::get_if<ibex::Column<std::string>>(table.find("note"));
+    REQUIRE(prices != nullptr);
+    REQUIRE(qtys != nullptr);
+    REQUIRE(notes != nullptr);
+
+    REQUIRE((*prices)[0] == 10);
+    REQUIRE((*prices)[1] == 0);  // null payload
+    REQUIRE((*prices)[2] == 30);
+    REQUIRE_FALSE(is_null_at(table, "price", 0));
+    REQUIRE(is_null_at(table, "price", 1));
+    REQUIRE_FALSE(is_null_at(table, "price", 2));
+
+    REQUIRE((*qtys)[0] == 1);
+    REQUIRE((*qtys)[1] == 2);
+    REQUIRE((*qtys)[2] == 0);  // null payload
+    REQUIRE_FALSE(is_null_at(table, "qty", 0));
+    REQUIRE_FALSE(is_null_at(table, "qty", 1));
+    REQUIRE(is_null_at(table, "qty", 2));
+
+    REQUIRE((*notes)[0] == "ok");
+    REQUIRE((*notes)[1] == "");  // null payload
+    REQUIRE((*notes)[2] == "");  // null payload
+    REQUIRE_FALSE(is_null_at(table, "note", 0));
+    REQUIRE(is_null_at(table, "note", 1));
+    REQUIRE(is_null_at(table, "note", 2));
 }

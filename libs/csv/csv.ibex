@@ -1,0 +1,13 @@
+// CSV plugin — standard extern fn declarations.
+//
+// Usage:
+//   import "csv";
+//
+// After importing, the following functions are available without any
+// explicit `extern fn` declaration in the script:
+//   read_csv(path: String) -> DataFrame
+//   read_csv(path: String, nulls: String) -> DataFrame
+//   write_csv(df: DataFrame, path: String) -> Int
+
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";

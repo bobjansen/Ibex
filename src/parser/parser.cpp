@@ -40,6 +40,9 @@ class Parser {
         if (match(TokenKind::KeywordExtern)) {
             return parse_extern_decl();
         }
+        if (match(TokenKind::KeywordImport)) {
+            return parse_import_decl();
+        }
         if (match(TokenKind::KeywordFn)) {
             return parse_fn_decl();
         }
@@ -47,6 +50,39 @@ class Parser {
             return parse_let_stmt();
         }
         return parse_expr_stmt();
+    }
+
+    /// Parse `import "name";` or `import name;`.
+    ///
+    /// The name identifies a library file (<name>.ibex) that the REPL will
+    /// locate on the import search path and process automatically.
+    auto parse_import_decl() -> std::optional<Stmt> {
+        const std::size_t start_line = previous().line;
+        std::string name;
+        if (match(TokenKind::StringLiteral)) {
+            name = unescape_string(previous().lexeme);
+            // Strip any ".ibex" suffix so both `import "csv"` and
+            // `import "csv.ibex"` are equivalent.
+            constexpr std::string_view suffix = ".ibex";
+            if (name.size() > suffix.size() &&
+                name.substr(name.size() - suffix.size()) == suffix) {
+                name.resize(name.size() - suffix.size());
+            }
+        } else {
+            auto ident = consume_identifier("expected module name after 'import'");
+            if (!ident.has_value()) {
+                return std::nullopt;
+            }
+            name = std::move(*ident);
+        }
+        if (!consume(TokenKind::Semicolon, "expected ';' after import declaration")) {
+            return std::nullopt;
+        }
+        return ImportDecl{
+            .name = std::move(name),
+            .start_line = start_line,
+            .end_line = previous().line,
+        };
     }
 
     auto parse_extern_decl() -> std::optional<Stmt> {

@@ -128,3 +128,44 @@ TEST_CASE("Lowering rejects computed group keys") {
     auto result = parser::lower(program);
     REQUIRE_FALSE(result.has_value());
 }
+
+TEST_CASE("map lowers to CallExpr with extern fn name as callee") {
+    auto program = require_parse(
+        "extern fn double_it(x: Float64) -> Float64 from \"mylib.hpp\";\n"
+        "df[update { y = map(double_it, x) }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* update = as_node<ir::UpdateNode>(result->get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->fields().size() == 1);
+    REQUIRE(update->fields()[0].alias == "y");
+
+    const auto* call = std::get_if<ir::CallExpr>(&update->fields()[0].expr.node);
+    REQUIRE(call != nullptr);
+    REQUIRE(call->callee == "double_it");
+    REQUIRE(call->args.size() == 1);
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+    REQUIRE(col_ref != nullptr);
+    REQUIRE(col_ref->name == "x");
+}
+
+TEST_CASE("map rejects undeclared function") {
+    auto program = require_parse("df[update { y = map(unknown_fn, x) }];");
+    auto result = parser::lower(program);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("map rejects non-identifier first argument") {
+    auto program = require_parse("df[update { y = map(42, x) }];");
+    auto result = parser::lower(program);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("map rejects wrong argument count") {
+    auto program = require_parse(
+        "extern fn double_it(x: Float64) -> Float64 from \"mylib.hpp\";\n"
+        "df[update { y = map(double_it) }];");
+    auto result = parser::lower(program);
+    REQUIRE_FALSE(result.has_value());
+}

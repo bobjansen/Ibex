@@ -7,6 +7,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <chrono>
 #include <limits>
 #include <sstream>
@@ -1433,6 +1434,80 @@ TEST_CASE("null 3vl: IS NOT NULL predicate keeps valid rows", "[null][3vl]") {
         std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
     CHECK(id_col[0] == 1);
     CHECK(id_col[1] == 3);
+}
+
+TEST_CASE("map: applies scalar extern fn element-wise over a column") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{3, 4, 5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    runtime::ExternRegistry externs;
+    externs.register_scalar(
+        "square", runtime::ScalarKind::Int,
+        [](const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("square() expects 1 argument");
+            }
+            const auto* value = std::get_if<std::int64_t>(&args[0]);
+            if (value == nullptr) {
+                return std::unexpected("square() expects int argument");
+            }
+            return runtime::ExternValue{(*value) * (*value)};
+        });
+
+    auto ir = require_ir(
+        "extern fn square(x: Int64) -> Int64 from \"dummy.hpp\";\n"
+        "data[update { sq = map(square, val) }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* sq_col = result->find("sq");
+    REQUIRE(sq_col != nullptr);
+    const auto* sq_ints = std::get_if<Column<std::int64_t>>(sq_col);
+    REQUIRE(sq_ints != nullptr);
+    REQUIRE(sq_ints->size() == 3);
+    CHECK((*sq_ints)[0] == 9);
+    CHECK((*sq_ints)[1] == 16);
+    CHECK((*sq_ints)[2] == 25);
+}
+
+TEST_CASE("map: works with double-valued scalar extern fn") {
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.0, 4.0, 9.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    runtime::ExternRegistry externs;
+    externs.register_scalar(
+        "my_sqrt", runtime::ScalarKind::Double,
+        [](const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("my_sqrt() expects 1 argument");
+            }
+            const auto* value = std::get_if<double>(&args[0]);
+            if (value == nullptr) {
+                return std::unexpected("my_sqrt() expects double argument");
+            }
+            return runtime::ExternValue{std::sqrt(*value)};
+        });
+
+    auto ir = require_ir(
+        "extern fn my_sqrt(x: Float64) -> Float64 from \"dummy.hpp\";\n"
+        "data[update { root = map(my_sqrt, x) }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* root_col = result->find("root");
+    REQUIRE(root_col != nullptr);
+    const auto* root_doubles = std::get_if<Column<double>>(root_col);
+    REQUIRE(root_doubles != nullptr);
+    REQUIRE(root_doubles->size() == 3);
+    CHECK((*root_doubles)[0] == Catch::Approx(1.0));
+    CHECK((*root_doubles)[1] == Catch::Approx(2.0));
+    CHECK((*root_doubles)[2] == Catch::Approx(3.0));
 }
 
 TEST_CASE("null 3vl: OR short-circuit with null — true OR null = true", "[null][3vl]") {

@@ -27,6 +27,8 @@ class Lowerer {
                 if (ext->return_type.kind == Type::Kind::DataFrame ||
                     ext->return_type.kind == Type::Kind::TimeFrame) {
                     table_externs_.insert(ext->name);
+                } else if (ext->return_type.kind == Type::Kind::Scalar) {
+                    scalar_externs_.insert(ext->name);
                 }
                 continue;
             }
@@ -588,6 +590,32 @@ class Lowerer {
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
         }
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            if (call->callee == "map") {
+                // map(fn, col) applies a scalar extern fn element-wise over a column.
+                if (call->args.size() != 2) {
+                    return std::unexpected(
+                        LowerError{.message = "map: expects exactly 2 arguments: map(fn, col)"});
+                }
+                const auto* fn_ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                if (fn_ident == nullptr) {
+                    return std::unexpected(LowerError{
+                        .message = "map: first argument must be a scalar extern fn name"});
+                }
+                if (!scalar_externs_.contains(fn_ident->name)) {
+                    return std::unexpected(LowerError{
+                        .message = "map: '" + fn_ident->name +
+                                   "' is not declared as a scalar extern fn"});
+                }
+                auto col_expr = lower_expr_to_ir(*call->args[1]);
+                if (!col_expr.has_value()) {
+                    return std::unexpected(col_expr.error());
+                }
+                ir::CallExpr lowered_call;
+                lowered_call.callee = fn_ident->name;
+                lowered_call.args.push_back(
+                    std::make_shared<ir::Expr>(std::move(col_expr.value())));
+                return ir::Expr{.node = std::move(lowered_call)};
+            }
             ir::CallExpr lowered_call;
             lowered_call.callee = call->callee;
             lowered_call.args.reserve(call->args.size());
@@ -1103,6 +1131,7 @@ class Lowerer {
     ir::Builder builder_;
     std::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
     std::unordered_set<std::string> table_externs_;
+    std::unordered_set<std::string> scalar_externs_;
 };
 
 }  // namespace

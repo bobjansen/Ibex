@@ -24,6 +24,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"extern", TokenKind::KeywordExtern},
         {"fn", TokenKind::KeywordFn},
         {"from", TokenKind::KeywordFrom},
+        {"import", TokenKind::KeywordImport},
         {"filter", TokenKind::KeywordFilter},
         {"select", TokenKind::KeywordSelect},
         {"update", TokenKind::KeywordUpdate},

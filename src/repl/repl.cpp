@@ -1295,12 +1295,33 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
     return {PluginLoadStatus::NotFound, ""};
 }
 
+/// Locate <name>.ibex in the plugin search paths and return its contents.
+/// Returns std::nullopt when the file is not found in any search path.
+auto find_library_source(const std::string& name,
+                         const std::vector<std::string>& search_paths)
+    -> std::optional<std::string> {
+    std::string filename = name + ".ibex";
+    for (const auto& dir : search_paths) {
+        auto full_path = std::filesystem::path(dir) / filename;
+        std::ifstream in{full_path};
+        if (!in) {
+            continue;
+        }
+        std::string source((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+        spdlog::debug("import: found library '{}' at {}", name, full_path.string());
+        return source;
+    }
+    return std::nullopt;
+}
+
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
                         FunctionRegistry& functions, ExternDeclRegistry& extern_decls,
                         runtime::ExternRegistry& externs,
                         const std::vector<std::string>& plugin_search_paths,
                         std::unordered_set<std::string>& loaded_plugins,
+                        const std::vector<std::string>& import_search_paths = {},
                         const std::vector<std::vector<std::string>>* comment_groups = nullptr)
     -> bool {
     for (std::size_t stmt_index = 0; stmt_index < statements.size(); ++stmt_index) {
@@ -1319,6 +1340,37 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 } else if (result.status == PluginLoadStatus::LoadError) {
                     fmt::print("warning: {}\n", result.message);
                 }
+            }
+            continue;
+        }
+        if (std::holds_alternative<parser::ImportDecl>(stmt)) {
+            const auto& imp = std::get<parser::ImportDecl>(stmt);
+            // Prefer explicit import_search_paths; fall back to plugin_search_paths so
+            // that .ibex stubs can live alongside their .so files in the same directory.
+            const auto& primary_paths =
+                import_search_paths.empty() ? plugin_search_paths : import_search_paths;
+            auto source = find_library_source(imp.name, primary_paths);
+            // If not found in primary, also check plugin_search_paths when import_search_paths
+            // were explicitly provided.
+            if (!source.has_value() && !import_search_paths.empty()) {
+                source = find_library_source(imp.name, plugin_search_paths);
+            }
+            if (!source.has_value()) {
+                fmt::print("error: import '{}': could not find '{}.ibex' in search path\n",
+                           imp.name, imp.name);
+                return false;
+            }
+            auto parsed = parser::parse(*source);
+            if (!parsed) {
+                fmt::print("error: import '{}': {}\n", imp.name, parsed.error().format());
+                return false;
+            }
+            // Recursively execute the imported file's statements (which will typically
+            // only contain extern fn and fn declarations).
+            if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
+                                    extern_decls, externs, plugin_search_paths, loaded_plugins,
+                                    import_search_paths)) {
+                return false;
             }
             continue;
         }
@@ -1631,7 +1683,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             }
             if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
                                     extern_decls, registry, config.plugin_search_paths,
-                                    loaded_plugins, comment_groups_ptr)) {
+                                    loaded_plugins, config.import_search_paths,
+                                    comment_groups_ptr)) {
                 report_timing();
                 continue;
             }
@@ -1647,7 +1700,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         }
 
         execute_statements(parsed->statements, tables, scalars, columns, functions, extern_decls,
-                           registry, config.plugin_search_paths, loaded_plugins);
+                           registry, config.plugin_search_paths, loaded_plugins,
+                           config.import_search_paths);
         report_timing();
     }
 

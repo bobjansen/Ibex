@@ -27,6 +27,7 @@ enum class TokenKind : std::uint8_t {
     KeywordExtern,
     KeywordFn,
     KeywordFrom,
+    KeywordImport,
     KeywordFilter,
     KeywordSelect,
     KeywordUpdate,

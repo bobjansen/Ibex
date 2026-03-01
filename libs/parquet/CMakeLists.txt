@@ -120,3 +120,12 @@ if(TARGET arrow_shared AND TARGET parquet_shared)
 else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()
+
+# Copy the library stub to the plugin output directory so that
+# `import "parquet";` works when IBEX_LIBRARY_PATH points to that directory.
+add_custom_command(TARGET ibex_parquet_plugin POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${IBEX_ROOT}/libs/parquet/parquet.ibex"
+        "${IBEX_ROOT}/libraries/parquet.ibex"
+    COMMENT "Installing parquet.ibex stub"
+)

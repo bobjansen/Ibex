@@ -12,10 +12,14 @@ auto main(int argc, char** argv) -> int {
 
     bool verbose = false;
     std::string plugin_path;
+    std::string import_path;
     app.add_flag("-v,--verbose", verbose, "Enable verbose output");
     app.add_option("--plugin-path", plugin_path,
                    "Directory to search for plugin shared libraries (*.so). "
                    "Defaults to IBEX_LIBRARY_PATH environment variable.");
+    app.add_option("--import-path", import_path,
+                   "Directory to search for library stub files (*.ibex) used by "
+                   "`import` declarations.  Defaults to the plugin search path.");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -40,6 +44,9 @@ auto main(int argc, char** argv) -> int {
     config.verbose = verbose;
     if (!plugin_path.empty()) {
         config.plugin_search_paths.push_back(plugin_path);
+    }
+    if (!import_path.empty()) {
+        config.import_search_paths.push_back(import_path);
     }
 
     ibex::repl::run(config, registry);

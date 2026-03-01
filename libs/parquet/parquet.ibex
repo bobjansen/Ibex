@@ -1,0 +1,12 @@
+// Parquet plugin — standard extern fn declarations.
+//
+// Usage:
+//   import "parquet";
+//
+// After importing, the following functions are available without any
+// explicit `extern fn` declaration in the script:
+//   read_parquet(path: String) -> DataFrame
+//   write_parquet(df: DataFrame, path: String) -> Int
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";

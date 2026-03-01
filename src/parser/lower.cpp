@@ -33,6 +33,11 @@ class Lowerer {
             if (std::holds_alternative<FunctionDecl>(stmt)) {
                 continue;
             }
+            if (std::holds_alternative<ImportDecl>(stmt)) {
+                // Import declarations are resolved by the REPL before lowering;
+                // they have no IR representation.
+                continue;
+            }
             if (std::holds_alternative<LetStmt>(stmt)) {
                 const auto& let_stmt = std::get<LetStmt>(stmt);
                 auto value = lower_expr(*let_stmt.value);

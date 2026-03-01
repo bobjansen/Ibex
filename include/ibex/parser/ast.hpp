@@ -215,7 +215,15 @@ struct ExternDecl {
     std::size_t end_line = 0;
 };
 
-using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, ExprStmt>;
+/// `import "name";` — import all extern fn declarations from a library file
+/// (<name>.ibex) found on the import search path.
+struct ImportDecl {
+    std::string name;  // e.g. "csv" or "parquet"
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
+};
+
+using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, ExprStmt, ImportDecl>;
 
 struct Program {
     std::vector<Stmt> statements;

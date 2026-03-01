@@ -909,6 +909,35 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (fn->kind != runtime::ExternReturnKind::Scalar) {
                 return std::unexpected("extern function returns table: " + call->callee);
             }
+            if (fn->first_arg_is_table) {
+                // First argument is a DataFrame; remaining arguments are scalars.
+                if (call->args.empty()) {
+                    return std::unexpected(call->callee + "() requires a DataFrame first argument");
+                }
+                auto table = eval_table_expr(*call->args[0], tables, scalars, columns, functions,
+                                             extern_decls, externs);
+                if (!table) {
+                    return std::unexpected(table.error());
+                }
+                runtime::ExternArgs scalar_args;
+                scalar_args.reserve(call->args.size() - 1);
+                for (std::size_t i = 1; i < call->args.size(); ++i) {
+                    auto value = eval_scalar_expr(*call->args[i], tables, scalars, columns,
+                                                  functions, extern_decls, externs);
+                    if (!value) {
+                        return std::unexpected(value.error());
+                    }
+                    scalar_args.push_back(std::move(value.value()));
+                }
+                auto result = fn->table_consumer_func(table.value(), scalar_args);
+                if (!result) {
+                    return std::unexpected(result.error());
+                }
+                if (auto* scalar = std::get_if<runtime::ScalarValue>(&result.value())) {
+                    return *scalar;
+                }
+                return std::unexpected("extern function returned table: " + call->callee);
+            }
             runtime::ExternArgs args;
             args.reserve(call->args.size());
             for (const auto& arg : call->args) {

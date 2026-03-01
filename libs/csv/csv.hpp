@@ -1,12 +1,16 @@
 #pragma once
-// Ibex CSV library — RFC 4180 compliant CSV reading via rapidcsv.
+// Ibex CSV library — RFC 4180 compliant CSV reading and writing via rapidcsv.
 //
-// Usage in .ibex:
+// Reading:
 //   extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 //   let df = read_csv("data/myfile.csv");
 // Optional null controls:
 //   extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
 //   let df = read_csv("data/myfile.csv", "<empty>,NA");
+//
+// Writing:
+//   extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+//   let rows = write_csv(df, "data/out.csv");
 
 #include <ibex/core/column.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -15,6 +19,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <rapidcsv.h>
 #include <stdexcept>
@@ -22,6 +27,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -238,4 +244,95 @@ inline auto read_csv(std::string_view path) -> ibex::runtime::Table {
 
 inline auto read_csv(std::string_view path, std::string_view null_spec) -> ibex::runtime::Table {
     return read_csv_with_options(path, csv_parse_null_spec(null_spec));
+}
+
+namespace {
+
+/// Write a single CSV field, quoting it when necessary (RFC 4180).
+inline void csv_write_field(std::ostream& out, std::string_view value) {
+    const bool needs_quoting = value.find_first_of(",\"\r\n") != std::string_view::npos;
+    if (!needs_quoting) {
+        out.write(value.data(), static_cast<std::streamsize>(value.size()));
+        return;
+    }
+    out.put('"');
+    for (char c : value) {
+        if (c == '"') {
+            out.put('"');  // double the quote (RFC 4180)
+        }
+        out.put(c);
+    }
+    out.put('"');
+}
+
+/// Write one cell of a column at row `r`, dispatching on the column variant.
+inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& entry,
+                           std::size_t r) {
+    if (ibex::runtime::is_null(entry, r)) {
+        return;  // empty field for nulls
+    }
+    std::visit(
+        [&](const auto& col) {
+            using ColT = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<ColT, ibex::Column<std::int64_t>>) {
+                out << col[r];
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<double>>) {
+                out << col[r];
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<std::string>>) {
+                csv_write_field(out, col[r]);
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Categorical>>) {
+                csv_write_field(out, col[r]);
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Date>>) {
+                out << col[r].days;
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
+                out << col[r].nanos;
+            }
+        },
+        *entry.column);
+}
+
+}  // namespace
+
+/// Write `table` to a CSV file at `path`.
+///
+/// Returns the number of data rows written (excluding the header line).
+/// Null values are written as empty fields.  String fields containing commas,
+/// double-quotes, or newlines are quoted per RFC 4180.
+inline auto write_csv(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
+    std::string path_str{path};
+    std::ofstream ofs{path_str};
+    if (!ofs) {
+        throw std::runtime_error("write_csv: cannot open for writing: " + path_str);
+    }
+
+    const auto& cols = table.columns;
+    const std::size_t n_cols = cols.size();
+    const std::size_t n_rows = table.rows();
+
+    // Header row
+    for (std::size_t c = 0; c < n_cols; ++c) {
+        if (c > 0) {
+            ofs.put(',');
+        }
+        csv_write_field(ofs, cols[c].name);
+    }
+    ofs.put('\n');
+
+    // Data rows
+    for (std::size_t r = 0; r < n_rows; ++r) {
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            if (c > 0) {
+                ofs.put(',');
+            }
+            csv_write_cell(ofs, cols[c], r);
+        }
+        ofs.put('\n');
+    }
+
+    ofs.flush();
+    if (!ofs) {
+        throw std::runtime_error("write_csv: I/O error writing: " + path_str);
+    }
+
+    return static_cast<std::int64_t>(n_rows);
 }

@@ -4,6 +4,7 @@
 #include <csv.hpp>
 #include <filesystem>
 #include <fstream>
+#include <string>
 
 namespace {
 
@@ -186,4 +187,119 @@ TEST_CASE("Read CSV - nullable parsing via null spec") {
     REQUIRE_FALSE(is_null_at(table, "note", 0));
     REQUIRE(is_null_at(table, "note", 1));
     REQUIRE(is_null_at(table, "note", 2));
+}
+
+// ---------------------------------------------------------------------------
+// write_csv tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Write CSV - int and string columns round-trip") {
+    auto path = tmp("ibex_test_write_simple.csv");
+    write_csv(path, "price,symbol\n10,A\n20,B\n30,A\n");
+
+    auto original = read_csv(path.string());
+    auto out_path = tmp("ibex_test_write_simple_out.csv");
+    auto rows_written = write_csv(original, out_path.string());
+    REQUIRE(rows_written == 3);
+
+    auto reread = read_csv(out_path.string());
+    REQUIRE(reread.rows() == 3);
+    const auto* prices = std::get_if<ibex::Column<std::int64_t>>(reread.find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE((*prices)[0] == 10);
+    REQUIRE((*prices)[1] == 20);
+    REQUIRE((*prices)[2] == 30);
+    REQUIRE(get_string_at(reread, "symbol", 0) == "A");
+    REQUIRE(get_string_at(reread, "symbol", 1) == "B");
+    REQUIRE(get_string_at(reread, "symbol", 2) == "A");
+}
+
+TEST_CASE("Write CSV - double column round-trip") {
+    auto path = tmp("ibex_test_write_double.csv");
+    write_csv(path, "x,y\n1.5,2.25\n0.5,3.0\n");
+
+    auto original = read_csv(path.string());
+    auto out_path = tmp("ibex_test_write_double_out.csv");
+    auto rows_written = write_csv(original, out_path.string());
+    REQUIRE(rows_written == 2);
+
+    auto reread = read_csv(out_path.string());
+    const auto* x = std::get_if<ibex::Column<double>>(reread.find("x"));
+    const auto* y = std::get_if<ibex::Column<double>>(reread.find("y"));
+    REQUIRE(x != nullptr);
+    REQUIRE(y != nullptr);
+    REQUIRE((*x)[0] == Catch::Approx(1.5));
+    REQUIRE((*x)[1] == Catch::Approx(0.5));
+    REQUIRE((*y)[0] == Catch::Approx(2.25));
+    REQUIRE((*y)[1] == Catch::Approx(3.0));
+}
+
+TEST_CASE("Write CSV - fields with commas are quoted") {
+    // Build a table that has a string column containing commas.
+    ibex::runtime::Table table;
+    table.add_column("name", ibex::Column<std::string>({"Smith, John", "Doe, Jane"}));
+    table.add_column("score", ibex::Column<std::int64_t>({95, 87}));
+
+    auto out_path = tmp("ibex_test_write_quoted.csv");
+    auto rows_written = write_csv(table, out_path.string());
+    REQUIRE(rows_written == 2);
+
+    // Read back and verify the commas survived the round-trip.
+    auto reread = read_csv(out_path.string());
+    REQUIRE(reread.rows() == 2);
+    REQUIRE(get_string_at(reread, "name", 0) == "Smith, John");
+    REQUIRE(get_string_at(reread, "name", 1) == "Doe, Jane");
+    const auto* scores = std::get_if<ibex::Column<std::int64_t>>(reread.find("score"));
+    REQUIRE(scores != nullptr);
+    REQUIRE((*scores)[0] == 95);
+    REQUIRE((*scores)[1] == 87);
+}
+
+TEST_CASE("Write CSV - fields with double-quotes are escaped") {
+    ibex::runtime::Table table;
+    table.add_column("msg", ibex::Column<std::string>({"say \"hello\"", "world"}));
+
+    auto out_path = tmp("ibex_test_write_escaped.csv");
+    write_csv(table, out_path.string());
+
+    auto reread = read_csv(out_path.string());
+    REQUIRE(get_string_at(reread, "msg", 0) == "say \"hello\"");
+    REQUIRE(get_string_at(reread, "msg", 1) == "world");
+}
+
+TEST_CASE("Write CSV - null values written as empty fields") {
+    auto src_path = tmp("ibex_test_write_nulls_src.csv");
+    write_csv(src_path, "price,note\n10,ok\n,NA\n30,\n");
+
+    auto original = read_csv(src_path.string(), "<empty>,NA");
+    auto out_path = tmp("ibex_test_write_nulls_out.csv");
+    auto rows_written = write_csv(original, out_path.string());
+    REQUIRE(rows_written == 3);
+
+    // Re-read with the same null spec to verify round-trip.
+    auto reread = read_csv(out_path.string(), "<empty>,NA");
+    REQUIRE(reread.rows() == 3);
+    REQUIRE_FALSE(is_null_at(reread, "price", 0));
+    REQUIRE(is_null_at(reread, "price", 1));
+    REQUIRE_FALSE(is_null_at(reread, "price", 2));
+    REQUIRE_FALSE(is_null_at(reread, "note", 0));
+    REQUIRE(is_null_at(reread, "note", 1));
+    REQUIRE(is_null_at(reread, "note", 2));
+}
+
+TEST_CASE("Write CSV - empty table writes only header") {
+    ibex::runtime::Table table;
+    table.add_column("a", ibex::Column<std::int64_t>{});
+    table.add_column("b", ibex::Column<std::string>{});
+
+    auto out_path = tmp("ibex_test_write_empty.csv");
+    auto rows_written = write_csv(table, out_path.string());
+    REQUIRE(rows_written == 0);
+
+    // File should contain only the header line.
+    std::ifstream f(out_path);
+    std::string line;
+    REQUIRE(std::getline(f, line));
+    REQUIRE(line == "a,b");
+    REQUIRE_FALSE(std::getline(f, line));  // no data rows
 }

@@ -166,13 +166,17 @@ class Lowerer {
     }
 
     auto lower_block(const BlockExpr& block) -> LowerResult {
-        auto base = lower_expr(*block.base);
+        return lower_block(*block.base, block.clauses);
+    }
+
+    auto lower_block(const Expr& base_expr, const std::vector<Clause>& clauses) -> LowerResult {
+        auto base = lower_expr(base_expr);
         if (!base.has_value()) {
             return base;
         }
 
         ClauseState state;
-        for (const auto& clause : block.clauses) {
+        for (const auto& clause : clauses) {
             if (!state.record(clause)) {
                 return std::unexpected(LowerError{.message = state.error});
             }
@@ -1178,12 +1182,11 @@ class Lowerer {
         }
 
         // --- transform ---
-        // Synthesise a BlockExpr with "__stream_input__" as the base so that the existing
-        // lower_block path handles clause ordering and validation.
-        auto base_ident = std::make_unique<Expr>();
-        base_ident->node = IdentifierExpr{.name = "__stream_input__"};
-        BlockExpr synthetic_block{.base = std::move(base_ident), .clauses = stream.transform};
-        auto transform_ir = lower_block(synthetic_block);
+        // Synthesise a base identifier expr and pass the transform clauses by const-ref so
+        // that we avoid copying move-only Clause elements (which contain unique_ptr fields).
+        Expr base_ident;
+        base_ident.node = IdentifierExpr{.name = "__stream_input__"};
+        auto transform_ir = lower_block(base_ident, stream.transform);
         if (!transform_ir.has_value()) {
             return transform_ir;
         }

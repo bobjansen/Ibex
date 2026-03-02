@@ -174,9 +174,23 @@ struct JoinExpr {
     std::vector<std::string> keys;
 };
 
+/// `Stream { source = call_expr, transform = [clauses...], sink = call_expr }`
+///
+/// source   — an extern call returning DataFrame; called in a loop (empty = EOF).
+/// transform — anonymous block clauses applied to the accumulated buffer.
+///             The lowerer synthesises ScanNode("__stream_input__") as the implicit base.
+/// sink_callee / sink_args — the table-consumer extern that receives each output batch;
+///             the stream runtime prepends the output Table as the first argument.
+struct StreamExpr {
+    ExprPtr source;                  ///< source call expression (e.g. udp_recv(9001))
+    std::vector<Clause> transform;   ///< anonymous block clauses
+    std::string sink_callee;         ///< name of the sink extern fn
+    std::vector<ExprPtr> sink_args;  ///< extra scalar args for the sink (table prepended at runtime)
+};
+
 struct Expr {
     std::variant<IdentifierExpr, LiteralExpr, CallExpr, UnaryExpr, BinaryExpr, GroupExpr, BlockExpr,
-                 JoinExpr>
+                 JoinExpr, StreamExpr>
         node;
 };
 

@@ -5255,6 +5255,189 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return join_table_impl(left.value(), right.value(), join.kind(), join.keys());
         }
+        case ir::NodeKind::Stream: {
+            const auto& sn = static_cast<const ir::StreamNode&>(node);
+            if (externs == nullptr) {
+                return std::unexpected("stream node requires an extern registry");
+            }
+            if (sn.children().empty()) {
+                return std::unexpected("stream node has no transform child");
+            }
+
+            // Resolve source and sink functions.
+            const auto* source_fn = externs->find(sn.source_callee());
+            if (source_fn == nullptr) {
+                return std::unexpected("unknown stream source: " + sn.source_callee());
+            }
+            if (source_fn->kind != ExternReturnKind::Table) {
+                return std::unexpected("stream source must return a table: " + sn.source_callee());
+            }
+            const auto* sink_fn = externs->find(sn.sink_callee());
+            if (sink_fn == nullptr) {
+                return std::unexpected("unknown stream sink: " + sn.sink_callee());
+            }
+            if (!sink_fn->first_arg_is_table) {
+                return std::unexpected("stream sink must be a table-consumer extern: " +
+                                       sn.sink_callee());
+            }
+
+            // Pre-evaluate scalar args (literals — no row context needed).
+            ExternArgs source_args;
+            for (const auto& arg : sn.source_args()) {
+                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+                if (!val) return std::unexpected(val.error());
+                source_args.push_back(std::move(val.value()));
+            }
+            ExternArgs sink_scalar_args;
+            for (const auto& arg : sn.sink_args()) {
+                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+                if (!val) return std::unexpected(val.error());
+                sink_scalar_args.push_back(std::move(val.value()));
+            }
+
+            const ir::Node& transform_ir = sn.transform_ir();
+
+            // Append every row of `src` into `dst`, initialising dst schema on first call.
+            auto append_table = [&](Table& dst, const Table& src) -> std::expected<void, std::string> {
+                if (src.rows() == 0) return {};
+                if (dst.columns.empty()) {
+                    for (const auto& entry : src.columns) {
+                        dst.columns.push_back(
+                            ColumnEntry{.name = entry.name,
+                                        .column = std::make_shared<ColumnValue>(
+                                            make_empty_like(*entry.column)),
+                                        .validity = std::nullopt});
+                        dst.index[entry.name] = dst.columns.size() - 1;
+                    }
+                    dst.time_index = src.time_index;
+                    dst.ordering = src.ordering;
+                }
+                for (std::size_t row = 0; row < src.rows(); ++row) {
+                    for (std::size_t col = 0; col < src.columns.size(); ++col) {
+                        if (col >= dst.columns.size()) {
+                            return std::unexpected("stream: source schema changed mid-stream");
+                        }
+                        append_value(*dst.columns[col].column, *src.columns[col].column, row);
+                        bool null = is_null(src.columns[col], row);
+                        if (null) {
+                            if (!dst.columns[col].validity.has_value()) {
+                                dst.columns[col].validity = std::vector<bool>(
+                                    column_size(*dst.columns[col].column) - 1, true);
+                            }
+                            dst.columns[col].validity->push_back(false);
+                        } else if (dst.columns[col].validity.has_value()) {
+                            dst.columns[col].validity->push_back(true);
+                        }
+                    }
+                }
+                return {};
+            };
+
+            // Slice a single row out of `src` into a new one-row Table.
+            auto slice_row = [&](const Table& src, std::size_t r) -> Table {
+                Table out;
+                for (const auto& entry : src.columns) {
+                    out.columns.push_back(
+                        ColumnEntry{.name = entry.name,
+                                    .column = std::make_shared<ColumnValue>(
+                                        make_empty_like(*entry.column)),
+                                    .validity = std::nullopt});
+                    out.index[entry.name] = out.columns.size() - 1;
+                    append_value(*out.columns.back().column, *entry.column, r);
+                    if (is_null(entry, r)) {
+                        out.columns.back().validity = std::vector<bool>{false};
+                    }
+                }
+                out.time_index = src.time_index;
+                return out;
+            };
+
+            // Get the nanosecond timestamp of the last row (for bucket detection).
+            auto get_last_ts_ns = [&](const Table& t) -> std::optional<std::int64_t> {
+                if (t.rows() == 0 || !t.time_index.has_value()) return std::nullopt;
+                const auto* col = t.find(*t.time_index);
+                if (col == nullptr) return std::nullopt;
+                std::size_t last = t.rows() - 1;
+                return std::visit(
+                    [last](const auto& c) -> std::optional<std::int64_t> {
+                        using C = std::decay_t<decltype(c)>;
+                        if constexpr (std::is_same_v<C, Column<Timestamp>>) {
+                            return static_cast<std::int64_t>(c[last].nanos);
+                        } else if constexpr (std::is_same_v<C, Column<std::int64_t>>) {
+                            return c[last];
+                        }
+                        return std::nullopt;
+                    },
+                    *col);
+            };
+
+            // Run the transform over `buf` and emit the result to the sink.
+            auto emit_buffer = [&](const Table& buf) -> std::expected<void, std::string> {
+                if (buf.rows() == 0) return {};
+                TableRegistry stream_reg = registry;
+                stream_reg["__stream_input__"] = buf;
+                auto output = interpret_node(transform_ir, stream_reg, scalars, externs);
+                if (!output) return std::unexpected(output.error());
+                if (output->rows() == 0) return {};
+                auto sr = sink_fn->table_consumer_func(*output, sink_scalar_args);
+                if (!sr) return std::unexpected(sr.error());
+                return {};
+            };
+
+            // ── Event loop ──────────────────────────────────────────────────────
+            Table buffer;
+            std::int64_t open_bucket_ns = -1;
+            const std::int64_t bucket_ns =
+                sn.stream_kind() == ir::StreamKind::TimeBucket
+                    ? static_cast<std::int64_t>(sn.bucket_duration().count())
+                    : 0;
+
+            while (true) {
+                auto src_result = source_fn->func(source_args);
+                if (!src_result) return std::unexpected(src_result.error());
+                const auto* batch = std::get_if<Table>(&src_result.value());
+                if (batch == nullptr) {
+                    return std::unexpected("stream source did not return a table");
+                }
+                if (batch->rows() == 0) break;  // source signalled EOF
+
+                if (sn.stream_kind() == ir::StreamKind::TimeBucket && bucket_ns > 0) {
+                    // Process row-by-row so we can detect bucket boundaries.
+                    for (std::size_t r = 0; r < batch->rows(); ++r) {
+                        Table row_tbl = slice_row(*batch, r);
+                        auto ts_opt = get_last_ts_ns(row_tbl);
+                        std::int64_t row_bucket = ts_opt ? ((*ts_opt / bucket_ns) * bucket_ns) : -1;
+
+                        if (open_bucket_ns >= 0 && row_bucket >= 0 &&
+                            row_bucket > open_bucket_ns) {
+                            // Bucket boundary crossed — flush the closed bucket.
+                            auto er = emit_buffer(buffer);
+                            if (!er) return std::unexpected(er.error());
+                            buffer = Table{};
+                        }
+                        if (row_bucket >= 0) {
+                            open_bucket_ns = row_bucket;
+                        }
+                        auto app = append_table(buffer, row_tbl);
+                        if (!app) return std::unexpected(app.error());
+                    }
+                } else {
+                    // PerRow — append batch to rolling buffer, run transform, emit last rows.
+                    auto app = append_table(buffer, *batch);
+                    if (!app) return std::unexpected(app.error());
+                    auto er = emit_buffer(buffer);
+                    if (!er) return std::unexpected(er.error());
+                }
+            }
+
+            // Flush any remaining buffered rows (TimeBucket only).
+            if (sn.stream_kind() == ir::StreamKind::TimeBucket && buffer.rows() > 0) {
+                auto er = emit_buffer(buffer);
+                if (!er) return std::unexpected(er.error());
+            }
+
+            return Table{};  // stream execution produces no result table
+        }
     }
     return std::unexpected("unknown node kind");
 }

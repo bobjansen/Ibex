@@ -172,6 +172,16 @@ enum class NodeKind : std::uint8_t {
     AsTimeframe,
     ExternCall,
     Join,
+    Stream,
+};
+
+/// How a StreamNode triggers output emission.
+/// Inferred from the transform IR — never specified by the user.
+enum class StreamKind : std::uint8_t {
+    /// Emit one output row for every incoming row (rolling window or plain transforms).
+    PerRow,
+    /// Buffer rows and emit when a time-bucket boundary is crossed (resample).
+    TimeBucket,
 };
 
 /// Base IR node for the query plan.
@@ -386,6 +396,57 @@ class WindowNode final : public Node {
 
    private:
     Duration duration_;
+};
+
+/// Stream node: wires a source extern, an anonymous transform, and a sink extern into a
+/// continuous event loop.
+///
+/// Children:
+///   child[0] — transform IR (rooted at ScanNode("__stream_input__")); the event loop
+///              substitutes the current buffer for "__stream_input__" on each iteration.
+///
+/// The source and sink are stored as callee names + pre-evaluated scalar argument lists
+/// rather than as child nodes, because they are called with a fixed calling convention
+/// by the event loop rather than being evaluated as part of the IR tree.
+///
+/// stream_kind is inferred by the lowerer:
+///   ResampleNode anywhere in the transform → TimeBucket
+///   WindowNode anywhere in the transform   → PerRow
+///   Neither                                → PerRow
+class StreamNode final : public Node {
+   public:
+    StreamNode(NodeId id, std::string source_callee, std::vector<Expr> source_args,
+               std::string sink_callee, std::vector<Expr> sink_args, StreamKind kind,
+               Duration bucket_duration)
+        : Node(NodeKind::Stream, id),
+          source_callee_(std::move(source_callee)),
+          source_args_(std::move(source_args)),
+          sink_callee_(std::move(sink_callee)),
+          sink_args_(std::move(sink_args)),
+          stream_kind_(kind),
+          bucket_duration_(bucket_duration) {}
+
+    [[nodiscard]] auto source_callee() const noexcept -> const std::string& {
+        return source_callee_;
+    }
+    [[nodiscard]] auto source_args() const noexcept -> const std::vector<Expr>& {
+        return source_args_;
+    }
+    [[nodiscard]] auto sink_callee() const noexcept -> const std::string& { return sink_callee_; }
+    [[nodiscard]] auto sink_args() const noexcept -> const std::vector<Expr>& { return sink_args_; }
+    [[nodiscard]] auto stream_kind() const noexcept -> StreamKind { return stream_kind_; }
+    /// Bucket duration for TimeBucket streams (zero for PerRow streams).
+    [[nodiscard]] auto bucket_duration() const noexcept -> Duration { return bucket_duration_; }
+    /// The transform IR is stored as child[0].
+    [[nodiscard]] auto transform_ir() const -> const Node& { return *children()[0]; }
+
+   private:
+    std::string source_callee_;
+    std::vector<Expr> source_args_;
+    std::string sink_callee_;
+    std::vector<Expr> sink_args_;
+    StreamKind stream_kind_;
+    Duration bucket_duration_;  ///< set for TimeBucket; zero for PerRow
 };
 
 }  // namespace ibex::ir

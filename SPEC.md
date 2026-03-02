@@ -45,8 +45,9 @@ normalizes all blocks to the canonical evaluation order:
 1. `filter` — row selection (relational σ)
 2. `by` — grouping key computation
 3. `select`, `update`, or `distinct` — column projection / mutation (relational π or ε)
-4. `order` — row ordering (relational τ)
-5. `window` — temporal windowing (relational ω)
+4. `rename` — column renaming (relational ρ)
+5. `order` — row ordering (relational τ)
+6. `window` — temporal windowing (relational ω)
 
 The following two expressions are equivalent:
 
@@ -64,6 +65,7 @@ The canonical order is recommended for readability but not enforced.
 | `filter`            | σ (selection)             | `FilterNode`    |
 | `select`            | π (projection)            | `ProjectNode`   |
 | `distinct`          | δ (duplicate removal)     | `DistinctNode`  |
+| `rename`            | ρ (renaming)              | `RenameNode`    |
 | `order`             | τ (ordering)              | `OrderNode`     |
 | `select` + `by`     | γ (aggregation)           | `AggregateNode` |
 | `update`            | ε (extended projection)   | `UpdateNode`    |
@@ -135,9 +137,11 @@ The following identifiers are reserved and may not be used as binding names,
 column names, or function names:
 
 ```
-let    mut    extern  fn     from
+let    mut    extern  fn      from
 filter select update  distinct order by window
+rename resample
 join   left   asof    on
+import Stream
 asc    desc
 true   false
 Int32  Int64  Float32 Float64
@@ -540,6 +544,8 @@ Within a single block:
 | C8 | At most **one** `window` clause. |
 | C9 | `by` requires either `select` or `update`. |
 | C10 | `window` requires the operand to be a `TimeFrame`. |
+| C11 | At most **one** `rename` clause. |
+| C12 | `rename` is mutually compatible with `filter`, `select`, `update`, `distinct`, `order`, and `by`. |
 
 Violation of any constraint is a **compile-time error**.
 
@@ -598,6 +604,40 @@ trades[update { log_price = log(price) }]
 If `name` matches an existing column, it is replaced. If `name` is new, it is
 appended. The output schema is the input schema with the specified
 modifications.
+
+**`rename { new_name = old_name, ... }`**
+
+Renames one or more columns while keeping all other columns intact. Each
+mapping is of the form `new_name = old_name`, where `old_name` must be an
+existing column and `new_name` is the desired output column name.
+
+Single-rename shorthand (no braces required):
+
+```
+trades[rename p = price]
+```
+
+Multi-rename form (braces required):
+
+```
+trades[rename { p = price, q = volume }]
+```
+
+The output schema is identical to the input schema except that the named
+columns are relabelled. Column order is preserved; renamed columns remain in
+their original positions.
+
+It is a **runtime error** if any `old_name` does not exist in the input
+schema. Renaming a column to a name already in the schema is a compile-time
+error.
+
+`rename` is compatible with all other clauses. When combined with `select`,
+the `rename` is applied first (in canonical evaluation order), so the
+`select` clause sees the renamed names:
+
+```
+trades[filter price > 15, rename p = price, select p]
+```
 
 **`by <keys>`**
 
@@ -666,6 +706,7 @@ operand is a `TimeFrame`. See Section 8.
 | `select` only         | `DataFrame<S'>` | S' = listed fields |
 | `distinct` only       | `DataFrame<S'>` | S' = listed fields |
 | `update` only         | `DataFrame<S'>` | S' = S ∪ new fields |
+| `rename` only         | Same type as input | S' = S with specified columns relabelled |
 | `order` only          | Same as input | Identical schema |
 | `select` + `by`       | `DataFrame<S'>` | S' = listed fields (one row per group) |
 | `update` + `by`       | `DataFrame<S'>` | S' = S ∪ new fields (same row count) |
@@ -1218,7 +1259,146 @@ extern implementations. The recommended path for custom scalar logic is
 
 ---
 
-## 12. Minimal Complete Example
+## 12. Stream Runtime
+
+The Stream runtime connects a **source** extern, an anonymous **transform**
+block, and a **sink** extern into a continuous event loop. It is the primary
+mechanism for processing real-time data in Ibex.
+
+### 12.1 Syntax
+
+```
+let <name> = Stream {
+    source    = <source_call>,
+    transform = [<clause>, ...],
+    sink      = <sink_call>,
+};
+```
+
+All three fields are required. Field order within the braces is
+**semantically insignificant** (mirrors clause ordering in DataFrame blocks).
+
+`Stream` is a **capitalized keyword** and is not a valid user identifier.
+
+### 12.2 Fields
+
+**`source = <extern_call>`**
+
+An extern function call that returns a `DataFrame` or `TimeFrame` on each
+invocation. The source is called repeatedly by the event loop; the loop
+terminates when the source returns an **empty** DataFrame (zero rows).
+
+The source extern must be declared via `extern fn` (Section 10) or loaded
+with `import` before the `Stream` expression is evaluated.
+
+```
+source = udp_recv(9001)
+```
+
+**`transform = [<clause>, ...]`**
+
+An anonymous block (square-bracket clause list) applied to each batch
+produced by the source. The transform is applied to a special binding named
+`__stream_input__`; users do not reference this name directly. The transform
+syntax is identical to a DataFrame block expression — no stream-specific
+syntax is needed inside the transform.
+
+```
+transform = [resample 1m, select {
+    open  = first(price),
+    high  = max(price),
+    low   = min(price),
+    close = last(price)
+}]
+```
+
+**`sink = <extern_call>`**
+
+An extern function call that consumes the output of the transform. The sink
+extern must accept a `DataFrame` or `TimeFrame` as its first argument; the
+stream runtime prepends the transform output automatically. Any remaining
+arguments after the first are supplied in the `sink` field.
+
+```
+sink = udp_send("127.0.0.1", 9002)
+```
+
+### 12.3 Stream Kinds
+
+The compiler infers how and when to emit output from the transform IR.
+
+| Kind         | Trigger condition                          | IR presence              |
+|--------------|---------------------------------------------|--------------------------|
+| `PerRow`     | Emit one output row for every incoming row  | No `ResampleNode` in transform |
+| `TimeBucket` | Buffer rows; emit when time-bucket closes   | `ResampleNode` in transform    |
+
+The stream kind is **never specified by the user**; it is derived
+automatically during lowering. `TimeBucket` is selected when the transform
+contains a `resample` clause; otherwise `PerRow` is used.
+
+### 12.4 Plugin Loading with `import`
+
+Extern functions used as stream sources or sinks are typically provided by
+plugins. The `import` statement loads a named `.ibex` library stub (which
+itself contains `extern fn` declarations) from the import search path:
+
+```
+import "udp";
+```
+
+This locates `udp.ibex` on the import search path, parses its `extern fn`
+declarations, and loads the corresponding shared library (e.g. `udp.so`) via
+the plugin mechanism (Section 10.4). The `import` statement is shorthand for
+manually writing a series of `extern fn` declarations.
+
+`import` accepts either a quoted string or a bare identifier:
+
+```
+import "udp";      // searches for udp.ibex
+import udp;        // equivalent
+```
+
+### 12.5 Execution Model
+
+The REPL **blocks** in the Stream event loop until the source signals
+end-of-stream (returns an empty DataFrame). There is currently no mechanism
+to run multiple streams concurrently within a single session. The event loop:
+
+1. Calls the source extern to obtain a batch.
+2. If the batch is empty, stops and returns.
+3. For `PerRow` streams: applies the transform to the batch and passes each
+   output row to the sink.
+4. For `TimeBucket` streams: appends the batch to an internal buffer; when a
+   time-bucket boundary is crossed, applies the transform to the buffer,
+   passes the result to the sink, and resets the buffer.
+
+### 12.6 Example
+
+The following example reads tick data from UDP port 9001, resamples it into
+1-minute OHLC bars, and forwards the bars to UDP port 9002:
+
+```
+import "udp";
+
+let ohlc_stream = Stream {
+    source    = udp_recv(9001),
+    transform = [resample 1m, select {
+        open  = first(price),
+        high  = max(price),
+        low   = min(price),
+        close = last(price)
+    }],
+    sink = udp_send("127.0.0.1", 9002)
+};
+```
+
+The `resample 1m` in the transform causes the stream kind to be inferred as
+`TimeBucket`. The REPL blocks until `udp_recv` returns an empty DataFrame
+(the sender signals end-of-stream).
+
+---
+
+## 13. Minimal Complete Example
 
 The following program is syntactically and semantically valid under this
 specification. It demonstrates DataFrame loading, grouped aggregation, extern
@@ -1338,6 +1518,7 @@ Highest precedence at top.
 
 ```
 let  mut  extern  fn  from  filter  select  update  distinct  order  by  window  join  left  asof  on
+rename  resample  import  Stream
 asc  desc  true  false
 ```
 
@@ -1367,20 +1548,35 @@ parse_statement:
     "let"    → let_stmt
     "fn"     → fn_decl
     "extern" → extern_decl
+    "import" → import_decl
     IDENT    → peek "=" (not "==") → assign_stmt
              → otherwise → expr_stmt
 
 parse_expr (Pratt):
-    NUD: IDENT, "^" IDENT, literal, schema_lit, "(", unary_op
+    NUD: IDENT, "^" IDENT, literal, schema_lit, "(", unary_op, "Stream" → stream_expr
     LED: binary_op, join_form, "[" (block), "(" (call — only after IDENT NUD)
 
 parse_clause:
-    "filter" → filter_clause
-    "select" → select_clause
-    "update" → update_clause
-    "by"     → peek "{" → braced field list
-             → otherwise → single IDENT
-    "window" → DURATION_LIT
+    "filter"   → filter_clause
+    "select"   → select_clause
+    "update"   → update_clause
+    "rename"   → peek "{" → braced rename list (new_name "=" old_name, ...)
+               → otherwise → single rename (new_name "=" old_name)
+    "resample" → DURATION_LIT
+    "by"       → peek "{" → braced field list
+               → otherwise → single IDENT
+    "window"   → DURATION_LIT
+
+import_decl:
+    "import" (STRING_LIT | IDENT) ";"
+
+stream_expr:
+    "Stream" "{" stream_field ("," stream_field)* [","] "}"
+
+stream_field:
+    "source"    "=" expr
+    "transform" "=" "[" clause ("," clause)* [","] "]"
+    "sink"      "=" expr
 
 join_form:
     expr "join" expr "on" IDENT

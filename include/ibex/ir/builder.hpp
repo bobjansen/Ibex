@@ -66,11 +66,11 @@ class Builder {
     }
 
     [[nodiscard]] auto stream(std::string source_callee, std::vector<Expr> source_args,
-                              std::string sink_callee, std::vector<Expr> sink_args,
-                              StreamKind kind, Duration bucket_duration) -> NodePtr {
+                              std::vector<SinkCase> sinks, StreamKind kind,
+                              Duration bucket_duration) -> NodePtr {
         return std::make_unique<StreamNode>(next_id(), std::move(source_callee),
-                                           std::move(source_args), std::move(sink_callee),
-                                           std::move(sink_args), kind, bucket_duration);
+                                           std::move(source_args), std::move(sinks), kind,
+                                           bucket_duration);
     }
 
    private:

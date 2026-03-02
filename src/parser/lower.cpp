@@ -1162,19 +1162,38 @@ class Lowerer {
             source_args.push_back(std::move(lowered.value()));
         }
 
-        // --- sink ---
-        if (!sink_externs_.contains(stream.sink_callee)) {
-            return std::unexpected(LowerError{.message = "Stream sink '" + stream.sink_callee +
-                                                         "' is not a known table-consumer extern"});
+        // --- sinks ---
+        if (stream.sinks.empty()) {
+            return std::unexpected(LowerError{.message = "Stream requires at least one sink"});
         }
-        std::vector<ir::Expr> sink_args;
-        sink_args.reserve(stream.sink_args.size());
-        for (const auto& arg : stream.sink_args) {
-            auto lowered = lower_expr_to_ir(*arg);
-            if (!lowered.has_value()) {
-                return std::unexpected(lowered.error());
+        std::vector<ir::SinkCase> ir_sinks;
+        ir_sinks.reserve(stream.sinks.size());
+        for (std::size_t i = 0; i < stream.sinks.size(); ++i) {
+            const auto& sc = stream.sinks[i];
+            if (!sink_externs_.contains(sc.callee)) {
+                return std::unexpected(LowerError{.message = "Stream sink '" + sc.callee +
+                                                             "' is not a known table-consumer extern"});
             }
-            sink_args.push_back(std::move(lowered.value()));
+            // Lower filter predicate (absent = catch-all).
+            std::optional<ir::FilterExprPtr> filter;
+            if (sc.filter.has_value()) {
+                auto lowered_filter = lower_filter_expr(**sc.filter);
+                if (!lowered_filter.has_value()) {
+                    return std::unexpected(lowered_filter.error());
+                }
+                filter = std::move(lowered_filter.value());
+            }
+            // Lower scalar args.
+            std::vector<ir::Expr> args;
+            args.reserve(sc.args.size());
+            for (const auto& arg : sc.args) {
+                auto lowered = lower_expr_to_ir(*arg);
+                if (!lowered.has_value()) {
+                    return std::unexpected(lowered.error());
+                }
+                args.push_back(std::move(lowered.value()));
+            }
+            ir_sinks.push_back(ir::SinkCase{std::move(filter), sc.callee, std::move(args)});
         }
 
         // --- transform ---
@@ -1201,8 +1220,7 @@ class Lowerer {
 
         // Build the StreamNode; transform IR is stored as child[0].
         auto node = builder_.stream(src_call->callee, std::move(source_args),
-                                    stream.sink_callee, std::move(sink_args),
-                                    kind, bucket_duration);
+                                    std::move(ir_sinks), kind, bucket_duration);
         node->add_child(std::move(transform_ir.value()));
         return node;
     }

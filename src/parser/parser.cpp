@@ -652,21 +652,90 @@ class Parser {
         return fail_expr(peek(), "expected expression");
     }
 
-    /// Parse `Stream { source = expr, transform = [clauses...], sink = ident(args...) }`.
+    /// Parse `ident(scalar_args...)` — the table will be prepended by the runtime.
+    /// Returns a partially-built SinkCase (filter left for caller to set).
+    auto parse_sink_send() -> std::optional<SinkCase> {
+        auto name = consume_identifier("expected sink function name");
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::LParen, "expected '(' after sink function name")) {
+            return std::nullopt;
+        }
+        std::vector<ExprPtr> args;
+        if (!check(TokenKind::RParen)) {
+            do {
+                auto arg = parse_expression();
+                if (!arg) {
+                    return std::nullopt;
+                }
+                args.push_back(std::move(arg));
+            } while (match(TokenKind::Comma));
+        }
+        if (!consume(TokenKind::RParen, "expected ')' after sink argument list")) {
+            return std::nullopt;
+        }
+        return SinkCase{.filter = std::nullopt, .callee = std::move(*name), .args = std::move(args)};
+    }
+
+    /// Parse one sink case: `{ filter <pred>, send = callee(args...) }` or
+    ///                       `{ send = callee(args...) }` (catch-all).
+    auto parse_sink_case() -> std::optional<SinkCase> {
+        if (!consume(TokenKind::LBrace, "expected '{' for sink case")) {
+            return std::nullopt;
+        }
+        std::optional<ExprPtr> filter;
+        std::optional<SinkCase> sc;
+
+        // Optional `filter <pred>` sub-clause.
+        if (match(TokenKind::KeywordFilter)) {
+            auto pred = parse_expression();
+            if (!pred) {
+                return std::nullopt;
+            }
+            filter = std::move(pred);
+            match(TokenKind::Comma);
+        }
+
+        // Required `send = callee(args...)`.
+        auto send_kw = consume_identifier("expected 'send' in sink case");
+        if (!send_kw.has_value() || *send_kw != "send") {
+            fail_expr(previous(), "expected 'send' keyword in sink case");
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::Eq, "expected '=' after 'send'")) {
+            return std::nullopt;
+        }
+        sc = parse_sink_send();
+        if (!sc.has_value()) {
+            return std::nullopt;
+        }
+        sc->filter = std::move(filter);
+
+        match(TokenKind::Comma);  // optional trailing comma before '}'
+        if (!consume(TokenKind::RBrace, "expected '}' to close sink case")) {
+            return std::nullopt;
+        }
+        return sc;
+    }
+
+    /// Parse `Stream { source = expr, transform = [clauses...], sink = ident(args...) }`
+    ///     or `Stream { source = expr, transform = [clauses...], sinks = [{...}, ...] }`.
+    ///
+    /// The legacy `sink = callee(args...)` form is desugared into a single catch-all SinkCase.
     auto parse_stream_expr() -> ExprPtr {
         if (!consume(TokenKind::LBrace, "expected '{' after 'Stream'")) {
             return nullptr;
         }
         ExprPtr source;
         std::vector<Clause> transform;
-        std::string sink_callee;
-        std::vector<ExprPtr> sink_args;
+        std::vector<SinkCase> sinks;
         bool has_source = false;
         bool has_transform = false;
-        bool has_sink = false;
+        bool has_sinks = false;
 
         while (!check(TokenKind::RBrace) && !is_at_end()) {
-            auto field = consume_identifier("expected field name (source, transform, or sink)");
+            auto field = consume_identifier("expected field name (source, transform, sink, or sinks)");
             if (!field.has_value()) {
                 return nullptr;
             }
@@ -700,35 +769,40 @@ class Parser {
                 transform = std::move(*clauses);
                 has_transform = true;
             } else if (*field == "sink") {
-                if (has_sink) {
-                    return fail_expr(previous(), "duplicate 'sink' field in Stream");
+                // Legacy single-sink form — desugared into a catch-all SinkCase.
+                if (has_sinks) {
+                    return fail_expr(previous(), "cannot mix 'sink' and 'sinks' in Stream");
                 }
-                // Parse `ident(scalar_args...)` — the table will be prepended by the runtime.
-                auto name = consume_identifier("expected sink function name");
-                if (!name.has_value()) {
+                auto sc = parse_sink_send();
+                if (!sc.has_value()) {
                     return nullptr;
                 }
-                sink_callee = std::move(*name);
-                if (!consume(TokenKind::LParen, "expected '(' after sink function name")) {
+                sinks.push_back(std::move(*sc));
+                has_sinks = true;
+            } else if (*field == "sinks") {
+                if (has_sinks) {
+                    return fail_expr(previous(), "duplicate 'sinks' field in Stream");
+                }
+                if (!consume(TokenKind::LBracket, "expected '[' for sinks list")) {
                     return nullptr;
                 }
-                if (!check(TokenKind::RParen)) {
+                if (!check(TokenKind::RBracket)) {
                     do {
-                        auto arg = parse_expression();
-                        if (!arg) {
+                        auto sc = parse_sink_case();
+                        if (!sc.has_value()) {
                             return nullptr;
                         }
-                        sink_args.push_back(std::move(arg));
-                    } while (match(TokenKind::Comma));
+                        sinks.push_back(std::move(*sc));
+                    } while (match(TokenKind::Comma) && !check(TokenKind::RBracket));
                 }
-                if (!consume(TokenKind::RParen, "expected ')' after sink argument list")) {
+                if (!consume(TokenKind::RBracket, "expected ']' after sinks list")) {
                     return nullptr;
                 }
-                has_sink = true;
+                has_sinks = true;
             } else {
                 return fail_expr(previous(),
                                  "unknown Stream field '" + *field +
-                                     "'; expected 'source', 'transform', or 'sink'");
+                                     "'; expected 'source', 'transform', 'sink', or 'sinks'");
             }
 
             // Allow an optional trailing comma between fields.
@@ -741,8 +815,8 @@ class Parser {
         if (!has_transform) {
             return fail_expr(peek(), "Stream requires a 'transform' field");
         }
-        if (!has_sink) {
-            return fail_expr(peek(), "Stream requires a 'sink' field");
+        if (!has_sinks) {
+            return fail_expr(peek(), "Stream requires a 'sink' or 'sinks' field");
         }
         if (!consume(TokenKind::RBrace, "expected '}' to close Stream block")) {
             return nullptr;
@@ -752,8 +826,7 @@ class Parser {
         expr->node = StreamExpr{
             .source = std::move(source),
             .transform = std::move(transform),
-            .sink_callee = std::move(sink_callee),
-            .sink_args = std::move(sink_args),
+            .sinks = std::move(sinks),
         };
         return expr;
     }

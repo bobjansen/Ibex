@@ -174,18 +174,32 @@ struct JoinExpr {
     std::vector<std::string> keys;
 };
 
-/// `Stream { source = call_expr, transform = [clauses...], sink = call_expr }`
+/// One branch in a `sinks` list.
+///
+/// filter — optional predicate; nullopt means "catch-all" (matches every row).
+/// callee / args — the table-consumer extern called when this case matches;
+///                 the stream runtime prepends the output Table as the first argument.
+///
+/// First-match semantics: the event loop routes each row to the first SinkCase
+/// whose filter matches.  Subsequent cases are not evaluated for that row.
+struct SinkCase {
+    std::optional<ExprPtr> filter;   ///< nullopt = catch-all
+    std::string callee;              ///< name of the sink extern fn
+    std::vector<ExprPtr> args;       ///< extra scalar args (table prepended at runtime)
+};
+
+/// `Stream { source = call_expr, transform = [clauses...], sinks = [...] }`
 ///
 /// source   — an extern call returning DataFrame; called in a loop (empty = EOF).
 /// transform — anonymous block clauses applied to the accumulated buffer.
 ///             The lowerer synthesises ScanNode("__stream_input__") as the implicit base.
-/// sink_callee / sink_args — the table-consumer extern that receives each output batch;
-///             the stream runtime prepends the output Table as the first argument.
+/// sinks    — ordered list of SinkCase entries evaluated with first-match semantics.
+///            The legacy `sink = callee(args...)` form is desugared by the parser into a
+///            single catch-all SinkCase.
 struct StreamExpr {
     ExprPtr source;                  ///< source call expression (e.g. udp_recv(9001))
     std::vector<Clause> transform;   ///< anonymous block clauses
-    std::string sink_callee;         ///< name of the sink extern fn
-    std::vector<ExprPtr> sink_args;  ///< extra scalar args for the sink (table prepended at runtime)
+    std::vector<SinkCase> sinks;     ///< ordered sink cases (first match wins)
 };
 
 struct Expr {

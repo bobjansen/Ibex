@@ -5264,7 +5264,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected("stream node has no transform child");
             }
 
-            // Resolve source and sink functions.
+            // Resolve source function.
             const auto* source_fn = externs->find(sn.source_callee());
             if (source_fn == nullptr) {
                 return std::unexpected("unknown stream source: " + sn.source_callee());
@@ -5272,13 +5272,30 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (source_fn->kind != ExternReturnKind::Table) {
                 return std::unexpected("stream source must return a table: " + sn.source_callee());
             }
-            const auto* sink_fn = externs->find(sn.sink_callee());
-            if (sink_fn == nullptr) {
-                return std::unexpected("unknown stream sink: " + sn.sink_callee());
-            }
-            if (!sink_fn->first_arg_is_table) {
-                return std::unexpected("stream sink must be a table-consumer extern: " +
-                                       sn.sink_callee());
+
+            // Resolve sink functions and pre-evaluate their scalar args.
+            struct ResolvedSink {
+                const ExternFunction* fn;
+                ExternArgs args;
+            };
+            std::vector<ResolvedSink> resolved_sinks;
+            resolved_sinks.reserve(sn.sinks().size());
+            for (const auto& sc : sn.sinks()) {
+                const auto* fn = externs->find(sc.callee);
+                if (fn == nullptr) {
+                    return std::unexpected("unknown stream sink: " + sc.callee);
+                }
+                if (!fn->first_arg_is_table) {
+                    return std::unexpected("stream sink must be a table-consumer extern: " +
+                                           sc.callee);
+                }
+                ExternArgs args;
+                for (const auto& arg : sc.args) {
+                    auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+                    if (!val) return std::unexpected(val.error());
+                    args.push_back(std::move(val.value()));
+                }
+                resolved_sinks.push_back(ResolvedSink{fn, std::move(args)});
             }
 
             // Pre-evaluate scalar args (literals — no row context needed).
@@ -5287,12 +5304,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 auto val = eval_expr(arg, Table{}, 0, scalars, externs);
                 if (!val) return std::unexpected(val.error());
                 source_args.push_back(std::move(val.value()));
-            }
-            ExternArgs sink_scalar_args;
-            for (const auto& arg : sn.sink_args()) {
-                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val) return std::unexpected(val.error());
-                sink_scalar_args.push_back(std::move(val.value()));
             }
 
             const ir::Node& transform_ir = sn.transform_ir();
@@ -5371,7 +5382,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     *col);
             };
 
-            // Run the transform over `buf` and emit the result to the sink.
+            // Run the transform over `buf` and route each output row to the first matching sink.
+            // First-match semantics: for each row, iterate sink cases in order; the first case
+            // whose filter passes (or that is a catch-all) claims the row.  Subsequent cases are
+            // not evaluated for that row.  Rows unmatched by all cases are silently dropped.
             auto emit_buffer = [&](const Table& buf) -> std::expected<void, std::string> {
                 if (buf.rows() == 0) return {};
                 TableRegistry stream_reg = registry;
@@ -5379,8 +5393,50 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 auto output = interpret_node(transform_ir, stream_reg, scalars, externs);
                 if (!output) return std::unexpected(output.error());
                 if (output->rows() == 0) return {};
-                auto sr = sink_fn->table_consumer_func(*output, sink_scalar_args);
-                if (!sr) return std::unexpected(sr.error());
+
+                const std::size_t nrows = output->rows();
+                // claimed[r] becomes true once row r is routed to a sink case.
+                std::vector<bool> claimed(nrows, false);
+
+                for (std::size_t i = 0; i < sn.sinks().size(); ++i) {
+                    const auto& sc = sn.sinks()[i];
+                    std::vector<std::size_t> indices;
+
+                    if (!sc.filter.has_value()) {
+                        // Catch-all: claim every unclaimed row.
+                        for (std::size_t r = 0; r < nrows; ++r) {
+                            if (!claimed[r]) indices.push_back(r);
+                        }
+                    } else {
+                        // Evaluate the filter over the full output table, then intersect with
+                        // unclaimed rows (first-match: a row can only go to one sink).
+                        auto mask_result =
+                            compute_mask(*sc.filter.value(), *output, scalars, nrows);
+                        if (!mask_result) return std::unexpected(mask_result.error());
+                        const uint8_t* mp = mask_result->value.data();
+                        const uint8_t* vp =
+                            mask_result->valid ? mask_result->valid->data() : nullptr;
+                        for (std::size_t r = 0; r < nrows; ++r) {
+                            if (!claimed[r] && (vp ? (mp[r] & vp[r]) : mp[r])) {
+                                indices.push_back(r);
+                            }
+                        }
+                    }
+
+                    if (indices.empty()) continue;
+                    for (std::size_t r : indices) claimed[r] = true;
+
+                    // Build a sub-table for the matched rows and call the sink.
+                    Table matched;
+                    for (std::size_t r : indices) {
+                        auto row = slice_row(*output, r);
+                        auto app = append_table(matched, row);
+                        if (!app) return std::unexpected(app.error());
+                    }
+                    auto sr =
+                        resolved_sinks[i].fn->table_consumer_func(matched, resolved_sinks[i].args);
+                    if (!sr) return std::unexpected(sr.error());
+                }
                 return {};
             };
 

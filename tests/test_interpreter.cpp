@@ -1467,3 +1467,88 @@ TEST_CASE("null 3vl: OR short-circuit with null — true OR null = true", "[null
     CHECK(id_col[0] == 1);
     CHECK(id_col[1] == 2);
 }
+
+TEST_CASE("Interpret rename: basic column renaming") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[rename p = price];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 2);
+    CHECK(result->columns[0].name == "p");
+    CHECK(result->columns[1].name == "symbol");
+    const auto& p = std::get<Column<std::int64_t>>(*result->columns[0].column);
+    CHECK(p[0] == 10);
+    CHECK(p[1] == 20);
+    CHECK(p[2] == 30);
+}
+
+TEST_CASE("Interpret rename: keeps non-renamed columns") {
+    runtime::Table table;
+    table.add_column("a", Column<std::int64_t>{1, 2});
+    table.add_column("b", Column<std::int64_t>{3, 4});
+    table.add_column("c", Column<std::int64_t>{5, 6});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[rename x = b];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 3);
+    CHECK(result->columns[0].name == "a");
+    CHECK(result->columns[1].name == "x");
+    CHECK(result->columns[2].name == "c");
+}
+
+TEST_CASE("Interpret rename: multiple renames") {
+    runtime::Table table;
+    table.add_column("foo", Column<std::int64_t>{1, 2});
+    table.add_column("bar", Column<std::int64_t>{3, 4});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[rename { x = foo, y = bar }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 2);
+    CHECK(result->columns[0].name == "x");
+    CHECK(result->columns[1].name == "y");
+}
+
+TEST_CASE("Interpret rename: combined with filter and select") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+    table.add_column("qty", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[filter price > 15, rename p = price, select p];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 1);
+    CHECK(result->columns[0].name == "p");
+    const auto& p = std::get<Column<std::int64_t>>(*result->columns[0].column);
+    CHECK(p[0] == 20);
+    CHECK(p[1] == 30);
+}
+
+TEST_CASE("Interpret rename: error on missing column") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[rename p = nonexistent];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nonexistent") != std::string::npos);
+}

@@ -86,7 +86,7 @@ class Lowerer {
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
             return lower_table_call(*call);
         }
-        if (const auto* stream = std::get_if<StreamExpr>(&expr.node)) {
+        if (auto* stream = std::get_if<StreamExpr>(const_cast<decltype(expr.node)*>(&expr.node))) {
             return lower_stream(*stream);
         }
         return std::unexpected(LowerError{.message = "expected DataFrame expression"});
@@ -214,6 +214,16 @@ class Lowerer {
             node = std::move(filter_node);
         }
 
+        if (state.rename) {
+            auto renames = lower_rename(*state.rename);
+            if (!renames.has_value()) {
+                return std::unexpected(renames.error());
+            }
+            auto rename_node = builder_.rename(std::move(renames.value()));
+            rename_node->add_child(std::move(node));
+            node = std::move(rename_node);
+        }
+
         if (!state.resample && state.select && (state.by || select_has_aggregate(*state.select))) {
             auto aggregate = lower_aggregate(state.by, *state.select, std::move(node));
             if (!aggregate.has_value()) {
@@ -293,6 +303,7 @@ class Lowerer {
         const SelectClause* select = nullptr;
         const DistinctClause* distinct = nullptr;
         const UpdateClause* update = nullptr;
+        const RenameClause* rename = nullptr;
         const OrderClause* order = nullptr;
         const ByClause* by = nullptr;
         const WindowClause* window = nullptr;
@@ -330,6 +341,14 @@ class Lowerer {
                     return false;
                 }
                 update = &std::get<UpdateClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<RenameClause>(clause)) {
+                if (rename != nullptr) {
+                    error = "duplicate rename clause";
+                    return false;
+                }
+                rename = &std::get<RenameClause>(clause);
                 return true;
             }
             if (std::holds_alternative<OrderClause>(clause)) {
@@ -562,6 +581,25 @@ class Lowerer {
             group_by = std::move(keys.value());
         }
         return builder_.update(std::move(fields), std::move(group_by));
+    }
+
+    static auto lower_rename(const RenameClause& clause)
+        -> std::expected<std::vector<ir::RenameSpec>, LowerError> {
+        std::vector<ir::RenameSpec> renames;
+        renames.reserve(clause.fields.size());
+        for (const auto& field : clause.fields) {
+            if (field.expr == nullptr) {
+                return std::unexpected(
+                    LowerError{.message = "rename field requires a right-hand side column name"});
+            }
+            const auto* ident = std::get_if<IdentifierExpr>(&field.expr->node);
+            if (ident == nullptr) {
+                return std::unexpected(LowerError{
+                    .message = "rename: right-hand side must be a plain column name"});
+            }
+            renames.push_back(ir::RenameSpec{.new_name = field.name, .old_name = ident->name});
+        }
+        return renames;
     }
 
     static auto lower_order(const OrderClause& clause)
@@ -1083,6 +1121,10 @@ class Lowerer {
                 auto clone = builder_.update(update.fields(), update.group_by());
                 return clone;
             }
+            case ir::NodeKind::Rename: {
+                const auto& rename = static_cast<const ir::RenameNode&>(node);
+                return builder_.rename(rename.renames());
+            }
             case ir::NodeKind::Window: {
                 const auto& window = static_cast<const ir::WindowNode&>(node);
                 auto clone = builder_.window(window.duration());
@@ -1104,6 +1146,9 @@ class Lowerer {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
                 return builder_.join(join.kind(), join.keys());
             }
+            case ir::NodeKind::Stream:
+                // StreamNode is not cloned during block lowering.
+                return nullptr;
         }
         return nullptr;
     }
@@ -1141,7 +1186,7 @@ class Lowerer {
     /// its implicit base.  The stream kind is inferred from the transform IR:
     ///   - ResampleNode present → TimeBucket (emit when bucket boundary crossed)
     ///   - otherwise            → PerRow     (emit on every incoming row)
-    auto lower_stream(const StreamExpr& stream) -> LowerResult {
+    auto lower_stream(StreamExpr& stream) -> LowerResult {
         // --- source ---
         const auto* src_call = std::get_if<CallExpr>(&stream.source->node);
         if (src_call == nullptr) {
@@ -1182,7 +1227,7 @@ class Lowerer {
         // lower_block path handles clause ordering and validation.
         auto base_ident = std::make_unique<Expr>();
         base_ident->node = IdentifierExpr{.name = "__stream_input__"};
-        BlockExpr synthetic_block{.base = std::move(base_ident), .clauses = stream.transform};
+        BlockExpr synthetic_block{.base = std::move(base_ident), .clauses = std::move(stream.transform)};
         auto transform_ir = lower_block(synthetic_block);
         if (!transform_ir.has_value()) {
             return transform_ir;

@@ -212,6 +212,15 @@ auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -
     return delegate(std::move(upd_node), t);
 }
 
+auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames)
+    -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto rename_node = b.rename(renames);
+    rename_node->add_child(std::move(scan_node));
+    return delegate(std::move(rename_node), t);
+}
+
 auto as_timeframe(const runtime::Table& t, const std::string& column) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);

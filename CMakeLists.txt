@@ -56,6 +56,7 @@ target_link_libraries(ibex_lib
 
 # Plugin libraries
 add_subdirectory(libs/csv)
+add_subdirectory(libs/sqlite)
 
 # Tools
 if(IBEX_BUILD_TOOLS)

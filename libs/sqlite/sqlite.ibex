@@ -1,0 +1,12 @@
+// SQLite plugin — standard extern fn declarations.
+//
+// Usage:
+//   import "sqlite";
+//
+// After importing, the following functions are available without any
+// explicit `extern fn` declaration in the script:
+//   read_sqlite(path: String, table: String) -> DataFrame
+//   write_sqlite(df: DataFrame, path: String, table: String) -> Int
+
+extern fn read_sqlite(path: String, table: String) -> DataFrame from "sqlite.hpp";
+extern fn write_sqlite(df: DataFrame, path: String, table: String) -> Int from "sqlite.hpp";

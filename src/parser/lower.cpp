@@ -166,13 +166,17 @@ class Lowerer {
     }
 
     auto lower_block(const BlockExpr& block) -> LowerResult {
-        auto base = lower_expr(*block.base);
+        return lower_block(*block.base, block.clauses);
+    }
+
+    auto lower_block(const Expr& base_expr, const std::vector<Clause>& clauses) -> LowerResult {
+        auto base = lower_expr(base_expr);
         if (!base.has_value()) {
             return base;
         }
 
         ClauseState state;
-        for (const auto& clause : block.clauses) {
+        for (const auto& clause : clauses) {
             if (!state.record(clause)) {
                 return std::unexpected(LowerError{.message = state.error});
             }

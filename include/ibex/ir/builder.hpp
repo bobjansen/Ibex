@@ -43,6 +43,10 @@ class Builder {
         return std::make_unique<UpdateNode>(next_id(), std::move(fields), std::move(group_by));
     }
 
+    [[nodiscard]] auto rename(std::vector<RenameSpec> renames) -> NodePtr {
+        return std::make_unique<RenameNode>(next_id(), std::move(renames));
+    }
+
     [[nodiscard]] auto window(Duration duration) -> NodePtr {
         return std::make_unique<WindowNode>(next_id(), duration);
     }

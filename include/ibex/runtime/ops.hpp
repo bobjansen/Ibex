@@ -52,6 +52,9 @@ namespace ibex::ops {
 [[nodiscard]] auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
     -> runtime::Table;
 
+[[nodiscard]] auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames)
+    -> runtime::Table;
+
 [[nodiscard]] auto as_timeframe(const runtime::Table& t, const std::string& column)
     -> runtime::Table;
 

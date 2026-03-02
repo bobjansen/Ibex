@@ -55,6 +55,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"Series", TokenKind::KeywordSeries},
         {"DataFrame", TokenKind::KeywordDataFrame},
         {"TimeFrame", TokenKind::KeywordTimeFrame},
+        {"Stream", TokenKind::KeywordStream},
     };
 
     const auto is_ident_start = [](unsigned char ch) -> bool {

@@ -60,6 +60,7 @@ enum class TokenKind : std::uint8_t {
     KeywordSeries,
     KeywordDataFrame,
     KeywordTimeFrame,
+    KeywordStream,
 
     // Comparison operators
     EqEq,    // ==

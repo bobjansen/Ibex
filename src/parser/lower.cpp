@@ -28,6 +28,12 @@ class Lowerer {
                     ext->return_type.kind == Type::Kind::TimeFrame) {
                     table_externs_.insert(ext->name);
                 }
+                // Track externs whose first argument is a DataFrame — these are sink candidates
+                // (e.g. write_csv, udp_send).  lower_stream uses this to validate sink calls.
+                if (!ext->params.empty() &&
+                    ext->params[0].type.kind == Type::Kind::DataFrame) {
+                    sink_externs_.insert(ext->name);
+                }
                 continue;
             }
             if (std::holds_alternative<FunctionDecl>(stmt)) {
@@ -79,6 +85,9 @@ class Lowerer {
         }
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
             return lower_table_call(*call);
+        }
+        if (const auto* stream = std::get_if<StreamExpr>(&expr.node)) {
+            return lower_stream(*stream);
         }
         return std::unexpected(LowerError{.message = "expected DataFrame expression"});
     }
@@ -1100,9 +1109,108 @@ class Lowerer {
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
 
+    /// Recursively walk an IR tree and return true if any node has the given kind.
+    static auto contains_node_kind(const ir::Node& node, ir::NodeKind target) -> bool {
+        if (node.kind() == target) {
+            return true;
+        }
+        for (const auto& child : node.children()) {
+            if (contains_node_kind(*child, target)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Walk an IR tree and return the Duration of the first ResampleNode found.
+    static auto find_resample_duration(const ir::Node& node) -> std::optional<ir::Duration> {
+        if (node.kind() == ir::NodeKind::Resample) {
+            return static_cast<const ir::ResampleNode&>(node).duration();
+        }
+        for (const auto& child : node.children()) {
+            if (auto dur = find_resample_duration(*child)) {
+                return dur;
+            }
+        }
+        return std::nullopt;
+    }
+
+    /// Lower a `StreamExpr` into a `StreamNode`.
+    ///
+    /// The transform is lowered as an anonymous block with `ScanNode("__stream_input__")` as
+    /// its implicit base.  The stream kind is inferred from the transform IR:
+    ///   - ResampleNode present → TimeBucket (emit when bucket boundary crossed)
+    ///   - otherwise            → PerRow     (emit on every incoming row)
+    auto lower_stream(const StreamExpr& stream) -> LowerResult {
+        // --- source ---
+        const auto* src_call = std::get_if<CallExpr>(&stream.source->node);
+        if (src_call == nullptr) {
+            return std::unexpected(
+                LowerError{.message = "Stream 'source' must be a function call expression"});
+        }
+        if (!table_externs_.contains(src_call->callee)) {
+            return std::unexpected(LowerError{.message = "Stream source '" + src_call->callee +
+                                                         "' is not a known table-returning extern"});
+        }
+        std::vector<ir::Expr> source_args;
+        source_args.reserve(src_call->args.size());
+        for (const auto& arg : src_call->args) {
+            auto lowered = lower_expr_to_ir(*arg);
+            if (!lowered.has_value()) {
+                return std::unexpected(lowered.error());
+            }
+            source_args.push_back(std::move(lowered.value()));
+        }
+
+        // --- sink ---
+        if (!sink_externs_.contains(stream.sink_callee)) {
+            return std::unexpected(LowerError{.message = "Stream sink '" + stream.sink_callee +
+                                                         "' is not a known table-consumer extern"});
+        }
+        std::vector<ir::Expr> sink_args;
+        sink_args.reserve(stream.sink_args.size());
+        for (const auto& arg : stream.sink_args) {
+            auto lowered = lower_expr_to_ir(*arg);
+            if (!lowered.has_value()) {
+                return std::unexpected(lowered.error());
+            }
+            sink_args.push_back(std::move(lowered.value()));
+        }
+
+        // --- transform ---
+        // Synthesise a BlockExpr with "__stream_input__" as the base so that the existing
+        // lower_block path handles clause ordering and validation.
+        auto base_ident = std::make_unique<Expr>();
+        base_ident->node = IdentifierExpr{.name = "__stream_input__"};
+        BlockExpr synthetic_block{.base = std::move(base_ident), .clauses = stream.transform};
+        auto transform_ir = lower_block(synthetic_block);
+        if (!transform_ir.has_value()) {
+            return transform_ir;
+        }
+
+        // --- infer stream kind ---
+        ir::StreamKind kind = ir::StreamKind::PerRow;
+        ir::Duration bucket_duration{};
+        if (contains_node_kind(*transform_ir.value(), ir::NodeKind::Resample)) {
+            kind = ir::StreamKind::TimeBucket;
+            auto dur = find_resample_duration(*transform_ir.value());
+            if (dur.has_value()) {
+                bucket_duration = *dur;
+            }
+        }
+
+        // Build the StreamNode; transform IR is stored as child[0].
+        auto node = builder_.stream(src_call->callee, std::move(source_args),
+                                    stream.sink_callee, std::move(sink_args),
+                                    kind, bucket_duration);
+        node->add_child(std::move(transform_ir.value()));
+        return node;
+    }
+
     ir::Builder builder_;
     std::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
     std::unordered_set<std::string> table_externs_;
+    std::unordered_set<std::string> sink_externs_;
 };
 
 }  // namespace

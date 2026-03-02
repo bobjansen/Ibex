@@ -65,6 +65,14 @@ class Builder {
         return std::make_unique<JoinNode>(next_id(), kind, std::move(keys));
     }
 
+    [[nodiscard]] auto stream(std::string source_callee, std::vector<Expr> source_args,
+                              std::string sink_callee, std::vector<Expr> sink_args,
+                              StreamKind kind, Duration bucket_duration) -> NodePtr {
+        return std::make_unique<StreamNode>(next_id(), std::move(source_callee),
+                                           std::move(source_args), std::move(sink_callee),
+                                           std::move(sink_args), kind, bucket_duration);
+    }
+
    private:
     [[nodiscard]] auto next_id() -> NodeId {
         return next_id_.fetch_add(1, std::memory_order_relaxed);

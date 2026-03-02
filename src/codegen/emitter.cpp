@@ -288,6 +288,23 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Rename: {
+            const auto& ren = static_cast<const ir::RenameNode&>(node);
+            auto child = emit_node(*ren.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::rename(" << child << ", {";
+            bool first = true;
+            for (const auto& spec : ren.renames()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << "ibex::ir::RenameSpec{\"" << escape_string(spec.new_name) << "\", \""
+                      << escape_string(spec.old_name) << "\"}";
+            }
+            *out_ << "});\n";
+            return var;
+        }
+
         case ir::NodeKind::Window: {
             const auto& win = static_cast<const ir::WindowNode&>(node);
             if (win.children().empty() || win.children().front()->kind() != ir::NodeKind::Update) {

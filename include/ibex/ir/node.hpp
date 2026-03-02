@@ -157,6 +157,12 @@ struct AggSpec {
     std::string alias;
 };
 
+/// Rename specification: maps an old column name to a new column name.
+struct RenameSpec {
+    std::string new_name;
+    std::string old_name;
+};
+
 /// IR node types.
 /// See SPEC.md Section 1.3 (Mapping to Relational Algebra).
 enum class NodeKind : std::uint8_t {
@@ -167,6 +173,7 @@ enum class NodeKind : std::uint8_t {
     Order,
     Aggregate,
     Update,
+    Rename,
     Window,
     Resample,
     AsTimeframe,
@@ -309,6 +316,20 @@ class UpdateNode final : public Node {
    private:
     std::vector<FieldSpec> fields_;
     std::vector<ColumnRef> group_by_;
+};
+
+/// Rename node: renames specified columns while keeping all others intact.
+class RenameNode final : public Node {
+   public:
+    RenameNode(NodeId id, std::vector<RenameSpec> renames)
+        : Node(NodeKind::Rename, id), renames_(std::move(renames)) {}
+
+    [[nodiscard]] auto renames() const noexcept -> const std::vector<RenameSpec>& {
+        return renames_;
+    }
+
+   private:
+    std::vector<RenameSpec> renames_;
 };
 
 /// AsTimeframe node: promotes a DataFrame to a TimeFrame by designating a timestamp column.

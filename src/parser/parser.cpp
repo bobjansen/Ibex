@@ -808,6 +808,13 @@ class Parser {
             }
             return UpdateClause{.fields = std::move(*fields)};
         }
+        if (match(TokenKind::KeywordRename)) {
+            auto fields = parse_field_list_or_single();
+            if (!fields.has_value()) {
+                return std::nullopt;
+            }
+            return RenameClause{.fields = std::move(*fields)};
+        }
         if (match(TokenKind::KeywordBy)) {
             if (match(TokenKind::LBrace)) {
                 auto fields = parse_field_list_after_open_brace();

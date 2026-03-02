@@ -1,0 +1,18 @@
+// UDP plugin — extern fn declarations.
+//
+// Usage:
+//   import "udp";
+//
+// After importing, the following functions are available:
+//   udp_recv(port: Int) -> DataFrame
+//     Blocks until one JSON tick datagram arrives on `port`, returns a
+//     one-row DataFrame {ts: Timestamp, symbol: String, price: Float64,
+//     volume: Int}.  Returns an empty DataFrame on EOF (sentinel or socket
+//     error).  The stream runtime calls this in a loop.
+//
+//   udp_send(df: DataFrame, host: String, port: Int) -> Int
+//     Serialises each row of `df` as a JSON UDP datagram and sends it to
+//     `host:port`.  Returns the number of rows sent.
+
+extern fn udp_recv(port: Int) -> DataFrame from "udp";
+extern fn udp_send(df: DataFrame, host: String, port: Int) -> Int from "udp";

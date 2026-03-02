@@ -1313,6 +1313,164 @@ existing Ibex IR (see `include/ibex/ir/node.hpp`).
 
 ---
 
+## 13. Stream Pipelines
+
+### 13.1 Overview
+
+A `Stream` expression wires a **source** extern function, an anonymous
+**transform** pipeline, and one or more **sink** cases into a continuous event
+loop. The runtime calls the source repeatedly until it returns an empty table
+(EOF signal), applies the transform to the accumulated buffer, and routes each
+output row to the appropriate sink.
+
+Single-sink form (short-hand):
+
+```
+Stream {
+    source    = source_fn(scalar_args...),
+    transform = [clause, ...],
+    sink      = sink_fn(scalar_args...)
+}
+```
+
+Multi-sink form with first-match routing:
+
+```
+Stream {
+    source    = source_fn(scalar_args...),
+    transform = [clause, ...],
+    sinks     = [
+        { filter <predicate>, send = sink_a(scalar_args...) },
+        { filter <predicate>, send = sink_b(scalar_args...) },
+        { send = sink_c(scalar_args...) }     // catch-all (no filter)
+    ]
+}
+```
+
+`sink` and `sinks` are mutually exclusive — a `Stream` block must contain
+exactly one of them.
+
+---
+
+### 13.2 Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `source` | Yes | Call to a table-returning extern. Returns an empty table to signal EOF. |
+| `transform` | Yes | Ordered list of block clauses applied to the accumulated buffer on each emission. |
+| `sink` | One of `sink`/`sinks` | Single-sink short form. Desugared to a single catch-all `sinks` entry. |
+| `sinks` | One of `sink`/`sinks` | Ordered list of sink cases; rows are routed by first-match (§13.4). |
+
+---
+
+### 13.3 Source
+
+The source must be a call to an extern function whose return type is `DataFrame`
+or `TimeFrame`. The runtime calls it in a loop:
+
+```
+let batch = source_fn(scalar_args...)
+```
+
+- A non-empty result appends the batch to the rolling buffer.
+- An **empty** result (zero rows) signals end-of-stream; the loop exits.
+
+Scalar arguments are evaluated **once** before the loop starts.
+
+---
+
+### 13.4 Sinks and First-Match Routing
+
+#### Single sink (`sink = callee(args...)`)
+
+The named function receives `(output_table, scalar_args...)` on every emission.
+This is equivalent to `sinks = [{ send = callee(args...) }]`.
+
+#### Multi-sink (`sinks = [...]`)
+
+Each entry is a **sink case**:
+
+```
+{ filter <predicate>, send = sink_fn(scalar_args...) }   // conditional
+{ send = sink_fn(scalar_args...) }                       // catch-all
+```
+
+**First-match semantics.** For each row in the transform output:
+
+1. The runtime evaluates sink cases in **list order**.
+2. The row is routed to the **first** case whose predicate is `true`.
+3. Evaluation stops at the first match — later cases are not tested.
+4. A catch-all case (no `filter`) always matches.
+
+Rows not matched by any case are **silently dropped**.
+
+Rules:
+- A catch-all should appear last; any cases after a catch-all are unreachable.
+- Filter predicates may reference any column present in the transform output.
+- The same sink function may appear in more than one case.
+
+---
+
+### 13.5 Emit Timing
+
+The stream kind is inferred from the transform IR:
+
+| Transform content | Kind | Emit trigger |
+|-------------------|------|--------------|
+| `resample <dur>` anywhere | `TimeBucket` | Time-bucket boundary crossed in incoming data |
+| `window <dur>` (no `resample`) | `PerRow` | After every source batch is appended |
+| Neither | `PerRow` | After every source batch is appended |
+
+In `TimeBucket` mode the runtime compares the timestamp of each incoming row
+against the currently open bucket. When a new bucket starts, the previous
+bucket is flushed, transformed, and routed.
+
+---
+
+### 13.6 Sink Function Convention
+
+A sink extern must declare a `DataFrame` (or `TimeFrame`) as its **first**
+parameter. The runtime prepends the output table automatically; scalar
+arguments specified in `send = callee(args...)` follow:
+
+```
+extern fn my_sink(df: DataFrame, host: String, port: Int) -> Int
+    from "my_plugin.hpp";
+
+Stream {
+    source    = my_source(9001),
+    transform = [filter volume > 0],
+    sink      = my_sink("localhost", 9002)  // runtime prepends df
+}
+```
+
+---
+
+### 13.7 Example — Multi-Sink Routing
+
+```
+import "udp"
+
+Stream {
+    source    = udp_recv(9001),
+    transform = [
+        as_timeframe ts,
+        window 30s,
+        update { vwap = rolling_sum(price * volume) / rolling_sum(volume) }
+    ],
+    sinks = [
+        { filter volume > 1_000_000, send = udp_send("heavy", 9010) },
+        { filter vwap > 100.0,       send = udp_send("mid",   9011) },
+        { send =                           udp_send("other", 9012) }
+    ]
+}
+```
+
+Rows where `volume > 1_000_000` go to port 9010. Of the remaining rows, those
+where `vwap > 100.0` go to 9011. Everything else goes to 9012.
+
+---
+
 ## Appendix A: Operator Precedence Table
 
 Highest precedence at top.

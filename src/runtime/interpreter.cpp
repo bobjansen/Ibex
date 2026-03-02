@@ -1309,6 +1309,49 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     return output;
 }
 
+auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames)
+    -> std::expected<Table, std::string> {
+    std::unordered_map<std::string, std::string> rename_map;
+    rename_map.reserve(renames.size());
+    for (const auto& spec : renames) {
+        const auto* entry = input.find_entry(spec.old_name);
+        if (entry == nullptr) {
+            return std::unexpected("rename: column not found: " + spec.old_name +
+                                   " (available: " + format_columns(input) + ")");
+        }
+        rename_map[spec.old_name] = spec.new_name;
+    }
+
+    Table output;
+    for (const auto& entry : input.columns) {
+        auto it = rename_map.find(entry.name);
+        const std::string& out_name = (it != rename_map.end()) ? it->second : entry.name;
+        output.add_column(out_name, *entry.column);
+        if (entry.validity.has_value()) {
+            output.columns.back().validity = entry.validity;
+        }
+    }
+
+    if (input.ordering.has_value()) {
+        std::vector<ir::OrderKey> new_ordering;
+        for (const auto& key : *input.ordering) {
+            auto it = rename_map.find(key.name);
+            new_ordering.push_back(
+                {.name = (it != rename_map.end()) ? it->second : key.name,
+                 .ascending = key.ascending});
+        }
+        output.ordering = std::move(new_ordering);
+    }
+
+    if (input.time_index.has_value()) {
+        auto it = rename_map.find(*input.time_index);
+        output.time_index = (it != rename_map.end()) ? it->second : *input.time_index;
+    }
+
+    normalize_time_index(output);
+    return output;
+}
+
 struct Key {
     std::vector<ScalarValue> values;
 };
@@ -5122,6 +5165,17 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             return update_table(std::move(child.value()), update.fields(), scalars, externs);
+        }
+        case ir::NodeKind::Rename: {
+            const auto& rename = static_cast<const ir::RenameNode&>(node);
+            if (rename.children().empty()) {
+                return std::unexpected("rename node missing child");
+            }
+            auto child = interpret_node(*rename.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return rename_table(child.value(), rename.renames());
         }
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);

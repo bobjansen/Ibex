@@ -121,6 +121,10 @@ struct UpdateClause {
     std::vector<Field> fields;
 };
 
+struct RenameClause {
+    std::vector<Field> fields;
+};
+
 struct OrderClause {
     std::vector<OrderKey> keys;
     bool is_braced = false;
@@ -139,8 +143,8 @@ struct ResampleClause {
     DurationLiteral duration;
 };
 
-using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, OrderClause,
-                            ByClause, WindowClause, ResampleClause>;
+using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
+                            OrderClause, ByClause, WindowClause, ResampleClause>;
 
 struct BlockExpr {
     ExprPtr base;

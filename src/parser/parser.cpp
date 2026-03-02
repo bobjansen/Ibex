@@ -646,7 +646,116 @@ class Parser {
             group->node = GroupExpr{.expr = std::move(expr)};
             return group;
         }
+        if (match(TokenKind::KeywordStream)) {
+            return parse_stream_expr();
+        }
         return fail_expr(peek(), "expected expression");
+    }
+
+    /// Parse `Stream { source = expr, transform = [clauses...], sink = ident(args...) }`.
+    auto parse_stream_expr() -> ExprPtr {
+        if (!consume(TokenKind::LBrace, "expected '{' after 'Stream'")) {
+            return nullptr;
+        }
+        ExprPtr source;
+        std::vector<Clause> transform;
+        std::string sink_callee;
+        std::vector<ExprPtr> sink_args;
+        bool has_source = false;
+        bool has_transform = false;
+        bool has_sink = false;
+
+        while (!check(TokenKind::RBrace) && !is_at_end()) {
+            auto field = consume_identifier("expected field name (source, transform, or sink)");
+            if (!field.has_value()) {
+                return nullptr;
+            }
+            if (!consume(TokenKind::Eq, "expected '=' after field name")) {
+                return nullptr;
+            }
+
+            if (*field == "source") {
+                if (has_source) {
+                    return fail_expr(previous(), "duplicate 'source' field in Stream");
+                }
+                source = parse_expression();
+                if (!source) {
+                    return nullptr;
+                }
+                has_source = true;
+            } else if (*field == "transform") {
+                if (has_transform) {
+                    return fail_expr(previous(), "duplicate 'transform' field in Stream");
+                }
+                if (!consume(TokenKind::LBracket, "expected '[' for transform clause list")) {
+                    return nullptr;
+                }
+                auto clauses = parse_clause_list();
+                if (!clauses.has_value()) {
+                    return nullptr;
+                }
+                if (!consume(TokenKind::RBracket, "expected ']' after transform clause list")) {
+                    return nullptr;
+                }
+                transform = std::move(*clauses);
+                has_transform = true;
+            } else if (*field == "sink") {
+                if (has_sink) {
+                    return fail_expr(previous(), "duplicate 'sink' field in Stream");
+                }
+                // Parse `ident(scalar_args...)` — the table will be prepended by the runtime.
+                auto name = consume_identifier("expected sink function name");
+                if (!name.has_value()) {
+                    return nullptr;
+                }
+                sink_callee = std::move(*name);
+                if (!consume(TokenKind::LParen, "expected '(' after sink function name")) {
+                    return nullptr;
+                }
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        auto arg = parse_expression();
+                        if (!arg) {
+                            return nullptr;
+                        }
+                        sink_args.push_back(std::move(arg));
+                    } while (match(TokenKind::Comma));
+                }
+                if (!consume(TokenKind::RParen, "expected ')' after sink argument list")) {
+                    return nullptr;
+                }
+                has_sink = true;
+            } else {
+                return fail_expr(previous(),
+                                 "unknown Stream field '" + *field +
+                                     "'; expected 'source', 'transform', or 'sink'");
+            }
+
+            // Allow an optional trailing comma between fields.
+            match(TokenKind::Comma);
+        }
+
+        if (!has_source) {
+            return fail_expr(peek(), "Stream requires a 'source' field");
+        }
+        if (!has_transform) {
+            return fail_expr(peek(), "Stream requires a 'transform' field");
+        }
+        if (!has_sink) {
+            return fail_expr(peek(), "Stream requires a 'sink' field");
+        }
+        if (!consume(TokenKind::RBrace, "expected '}' to close Stream block")) {
+            return nullptr;
+        }
+
+        auto expr = std::make_unique<Expr>();
+        expr->node = StreamExpr{
+            .source = std::move(source),
+            .transform = std::move(transform),
+            .sink_callee = std::move(sink_callee),
+            .sink_args = std::move(sink_args),
+        };
+        return expr;
     }
 
     auto parse_clause_list() -> std::optional<std::vector<Clause>> {

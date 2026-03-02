@@ -1,0 +1,51 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex UDP Market Stream Demo
+//
+//  Receives tick data over UDP, resamples it into 1-minute OHLC bars, and
+//  forwards the bars over UDP.  Demonstrates the Stream runtime and the
+//  inferred TimeBucket trigger.
+//
+//  To run:
+//    1. Build the project (cmake --build build-release).
+//    2. Start the REPL:
+//         ./build-release/tools/ibex --plugin-path build-release/tools
+//    3. Load this script:
+//         :load examples/market_stream/market_stream.ibex
+//    4. In a separate terminal, start the bar receiver (prints bars):
+//         python3 examples/market_stream/bar_receiver.py
+//    5. In another terminal, start the tick sender:
+//         python3 examples/market_stream/tick_sender.py
+//
+//  Wire protocol (one JSON object per UDP datagram):
+//    Tick  (port 9001): {"ts":<ns>,"symbol":"AAPL","price":182.5,"volume":1000}
+//    Bar   (port 9002): {"ts":<ns>,"open":182.0,"high":183.0,"low":181.5,"close":182.5}
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "udp";
+
+// Stream { } wires together a source, a transform, and a sink.
+//
+// stream_kind is inferred automatically:
+//   - the transform contains `resample 1m`  → TimeBucket
+//     (buffer rows per minute, emit one OHLC bar when the bucket closes)
+//
+// The REPL blocks in the event loop until the source returns an empty
+// DataFrame (tick_sender.py sends {"eof":true} as the last packet).
+
+let ohlc_stream = Stream {
+    // Source: udp_recv(port) returns one tick per call (blocks until data arrives).
+    source    = udp_recv(9001),
+
+    // Transform: anonymous block applied to the accumulated per-minute buffer.
+    // Identical to batch usage — no stream-specific syntax needed.
+    transform = [resample 1m, select {
+        open  = first(price),
+        high  = max(price),
+        low   = min(price),
+        close = last(price)
+    }],
+
+    // Sink: udp_send(df, host, port) — the output Table is prepended by the
+    // stream runtime; host and port are the extra scalar arguments.
+    sink = udp_send("127.0.0.1", 9002)
+};

@@ -26,8 +26,9 @@
     <p class="lead">
       Ibex is a statically typed language for columnar <code>DataFrame</code> and
       <code>TimeFrame</code> manipulation. Write concise bracket-pipeline queries —
-      filter, aggregate, roll, resample, join — and run them in the fast interpreter
-      or compile them to standalone C++ binaries.
+      filter, aggregate, roll, resample, join, rename — and run them in the fast
+      interpreter or compile them to standalone C++ binaries. Wire sources and sinks
+      into real-time <code>Stream</code> pipelines with no extra syntax.
     </p>
     <div class="stats">
       <span class="stat"><strong>1.3&times;</strong> faster than Polars on aggregation</span>
@@ -174,7 +175,45 @@ daily[<span class="kw">select</span> {
         </div>
       </div>
 
-      <!-- 4. Order & Distinct -->
+      <!-- 4. Rename -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Rename</span>
+          <h3>Relabel columns without touching the data.</h3>
+          <p>
+            <code>rename</code> maps old column names to new ones while keeping
+            every other column intact. Use the single-name shorthand or the
+            braced multi-rename form. Column order is preserved.
+          </p>
+          <p>
+            Because <code>rename</code> runs before <code>select</code> in
+            canonical order, renamed columns are immediately visible to the
+            rest of the pipeline.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Single rename — no braces needed</span>
+trades[<span class="kw">rename</span> p = price];
+
+<span class="cm">// Rename multiple columns at once</span>
+trades[<span class="kw">rename</span> { p = price, q = volume }];
+
+<span class="cm">// Rename then select using the new name</span>
+trades[
+    <span class="kw">filter</span> price &gt; <span class="num">15</span>,
+    <span class="kw">rename</span> p = price,
+    <span class="kw">select</span> { p, volume }
+];
+
+<span class="cm">// Works with update and aggregation too</span>
+trades[
+    <span class="kw">rename</span> { sym = symbol, vol = volume },
+    <span class="kw">select</span> { total_vol = <span class="fn-name">sum</span>(vol) }, <span class="kw">by</span> sym
+];</code></pre>
+        </div>
+      </div>
+
+      <!-- 5. Order & Distinct -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Order &amp; Distinct</span>
@@ -206,7 +245,7 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
         </div>
       </div>
 
-      <!-- 5. Joins -->
+      <!-- 6. Joins -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Joins</span>
@@ -235,7 +274,7 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
         </div>
       </div>
 
-      <!-- 6. Rolling windows -->
+      <!-- 7. Rolling windows -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Rolling Windows</span>
@@ -269,7 +308,7 @@ tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">
         </div>
       </div>
 
-      <!-- 7. Resample -->
+      <!-- 8. Resample -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Resample</span>
@@ -306,7 +345,7 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
         </div>
       </div>
 
-      <!-- 8. Scalar & compile -->
+      <!-- 9. Scalar & compile -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Scalar &amp; Codegen</span>
@@ -332,6 +371,54 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
 prices[<span class="kw">update</span> { weight = price <span class="op">/</span> total }];</code></pre>
 <pre style="margin-top: 0.6rem;"><code><span class="cm"># Compile and run in one step</span>
 scripts/ibex-run.sh examples/quant.ibex</code></pre>
+        </div>
+      </div>
+
+      <!-- 10. Stream -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Stream</span>
+          <h3>Continuous pipelines with no new syntax.</h3>
+          <p>
+            <code>Stream&nbsp;{&nbsp;}</code> wires a source extern, an anonymous
+            transform block, and a sink extern into a continuous event loop.
+            The transform is written in plain Ibex — the same clauses used
+            for batch queries.
+          </p>
+          <p>
+            When the transform contains <code>resample</code>, the runtime
+            automatically switches to <strong>TimeBucket</strong> mode:
+            it buffers rows and emits one output batch per closed time bucket.
+            Otherwise it operates <strong>PerRow</strong>, forwarding each
+            incoming batch immediately.
+          </p>
+          <p>
+            Use <code>import</code> to load a library stub that registers
+            the extern source and sink functions as a plugin.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Load the UDP plugin (registers udp_recv / udp_send)</span>
+<span class="kw">import</span> <span class="str">"udp"</span>;
+
+<span class="cm">// Receive ticks, resample to 1-minute OHLC bars, forward over UDP</span>
+<span class="kw">let</span> ohlc_stream = Stream {
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
+    transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+        open  = <span class="fn-name">first</span>(price),
+        high  = <span class="fn-name">max</span>(price),
+        low   = <span class="fn-name">min</span>(price),
+        close = <span class="fn-name">last</span>(price)
+    }],
+    sink = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
+};
+
+<span class="cm">// PerRow stream: forward filtered rows with no buffering</span>
+<span class="kw">let</span> live_filter = Stream {
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
+    transform = [<span class="kw">filter</span> price &gt; <span class="num">100.0</span>, <span class="kw">rename</span> p = price],
+    sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9003</span>)
+};</code></pre>
         </div>
       </div>
 

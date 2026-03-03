@@ -1552,3 +1552,195 @@ TEST_CASE("Interpret rename: error on missing column") {
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().find("nonexistent") != std::string::npos);
 }
+
+// ── Statistical aggregation functions ────────────────────────────────────────
+
+TEST_CASE("Interpret median aggregation (odd count)") {
+    runtime::Table table;
+    table.add_column("price", Column<double>{10.0, 30.0, 20.0});
+    table.add_column("symbol", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { med = median(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* med_col = result->find("med");
+    REQUIRE(med_col != nullptr);
+    const auto* meds = std::get_if<Column<double>>(med_col);
+    REQUIRE(meds != nullptr);
+    REQUIRE(meds->size() == 1);
+    CHECK((*meds)[0] == Catch::Approx(20.0));
+}
+
+TEST_CASE("Interpret median aggregation (even count)") {
+    runtime::Table table;
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0});
+    table.add_column("symbol", Column<std::string>{"A", "A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { med = median(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* med_col = result->find("med");
+    REQUIRE(med_col != nullptr);
+    const auto* meds = std::get_if<Column<double>>(med_col);
+    REQUIRE(meds != nullptr);
+    REQUIRE(meds->size() == 1);
+    CHECK((*meds)[0] == Catch::Approx(25.0));
+}
+
+TEST_CASE("Interpret median aggregation grouped") {
+    runtime::Table table;
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 5.0, 15.0});
+    table.add_column("symbol", Column<std::string>{"A", "A", "A", "B", "B"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { med = median(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* med_col = result->find("med");
+    REQUIRE(med_col != nullptr);
+    const auto* meds = std::get_if<Column<double>>(med_col);
+    REQUIRE(meds != nullptr);
+    REQUIRE(meds->size() == 2);
+    // Group A: {10, 20, 30} → median = 20
+    CHECK((*meds)[0] == Catch::Approx(20.0));
+    // Group B: {5, 15} → median = 10
+    CHECK((*meds)[1] == Catch::Approx(10.0));
+}
+
+TEST_CASE("Interpret median on integer column") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{1, 3, 2});
+    table.add_column("symbol", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { med = median(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* med_col = result->find("med");
+    REQUIRE(med_col != nullptr);
+    const auto* meds = std::get_if<Column<double>>(med_col);
+    REQUIRE(meds != nullptr);
+    REQUIRE(meds->size() == 1);
+    CHECK((*meds)[0] == Catch::Approx(2.0));
+}
+
+TEST_CASE("Interpret sample stddev aggregation") {
+    runtime::Table table;
+    // {0, 2, 4}: mean=2, M2=8, sample stddev = sqrt(8/2) = 2.0
+    table.add_column("v", Column<double>{0.0, 2.0, 4.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { s = std(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* s_col = result->find("s");
+    REQUIRE(s_col != nullptr);
+    const auto* sv = std::get_if<Column<double>>(s_col);
+    REQUIRE(sv != nullptr);
+    REQUIRE(sv->size() == 1);
+    CHECK((*sv)[0] == Catch::Approx(2.0));
+}
+
+TEST_CASE("Interpret sample stddev grouped") {
+    runtime::Table table;
+    table.add_column("v", Column<double>{2.0, 4.0, 6.0, 1.0, 3.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A", "B", "B"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { s = std(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* s_col = result->find("s");
+    REQUIRE(s_col != nullptr);
+    const auto* sv = std::get_if<Column<double>>(s_col);
+    REQUIRE(sv != nullptr);
+    REQUIRE(sv->size() == 2);
+    // Group A: {2,4,6} → mean=4, M2=8, sample std = sqrt(8/2) = 2
+    CHECK((*sv)[0] == Catch::Approx(2.0));
+    // Group B: {1,3} → mean=2, M2=2, sample std = sqrt(2/1) = sqrt(2) ≈ 1.41421356
+    CHECK((*sv)[1] == Catch::Approx(1.41421356).epsilon(1e-5));
+}
+
+TEST_CASE("Interpret stddev single element is null") {
+    runtime::Table table;
+    table.add_column("v", Column<double>{5.0});
+    table.add_column("grp", Column<std::string>{"A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { s = std(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    // Single element → count < 2 → result should be null
+    const auto* s_entry = result->find_entry("s");
+    REQUIRE(s_entry != nullptr);
+    REQUIRE(s_entry->validity.has_value());
+    CHECK((*s_entry->validity)[0] == false);
+}
+
+TEST_CASE("Interpret EWMA aggregation") {
+    runtime::Table table;
+    // alpha=0.5: ewma starts at 1.0, then 0.5*3+0.5*1=2.0, then 0.5*5+0.5*2=3.5
+    table.add_column("v", Column<double>{1.0, 3.0, 5.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { e = ewma(v, 0.5) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* e_col = result->find("e");
+    REQUIRE(e_col != nullptr);
+    const auto* ev = std::get_if<Column<double>>(e_col);
+    REQUIRE(ev != nullptr);
+    REQUIRE(ev->size() == 1);
+    CHECK((*ev)[0] == Catch::Approx(3.5));
+}
+
+TEST_CASE("Interpret EWMA grouped") {
+    runtime::Table table;
+    // Group A: {1, 3}, alpha=0.5 → 1.0 then 0.5*3+0.5*1 = 2.0
+    // Group B: {2, 4}, alpha=0.5 → 2.0 then 0.5*4+0.5*2 = 3.0
+    table.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0});
+    table.add_column("grp", Column<std::string>{"A", "B", "A", "B"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { e = ewma(v, 0.5) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* e_col = result->find("e");
+    REQUIRE(e_col != nullptr);
+    const auto* ev = std::get_if<Column<double>>(e_col);
+    REQUIRE(ev != nullptr);
+    REQUIRE(ev->size() == 2);
+    CHECK((*ev)[0] == Catch::Approx(2.0));
+    CHECK((*ev)[1] == Catch::Approx(3.0));
+}

@@ -604,6 +604,12 @@ auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {
             return "First";
         case ir::AggFunc::Last:
             return "Last";
+        case ir::AggFunc::Median:
+            return "Median";
+        case ir::AggFunc::Stddev:
+            return "Stddev";
+        case ir::AggFunc::Ewma:
+            return "Ewma";
     }
     return "Sum";
 }

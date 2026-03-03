@@ -746,6 +746,41 @@ class Lowerer {
                     temp_columns[alias] = true;
                     return ir::Expr{.node = ir::ColumnRef{.name = alias}};
                 }
+                if (call->callee == "ewma") {
+                    if (call->args.size() != 2) {
+                        return std::unexpected(LowerError{
+                            .message = "ewma() takes two arguments: ewma(column, alpha)"});
+                    }
+                    const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                    if (ident == nullptr) {
+                        return std::unexpected(LowerError{
+                            .message = "first argument of ewma() must be a column name"});
+                    }
+                    double alpha = 0.0;
+                    if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
+                        if (const auto* dv = std::get_if<double>(&lit->value)) {
+                            alpha = *dv;
+                        } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                            alpha = static_cast<double>(*iv);
+                        } else {
+                            return std::unexpected(LowerError{
+                                .message =
+                                    "second argument of ewma() must be a numeric literal (alpha)"});
+                        }
+                    } else {
+                        return std::unexpected(LowerError{
+                            .message =
+                                "second argument of ewma() must be a numeric literal (alpha)"});
+                    }
+                    aggs.push_back(ir::AggSpec{
+                        .func = func.value(),
+                        .column = ir::ColumnRef{.name = ident->name},
+                        .alias = alias,
+                        .param = alpha,
+                    });
+                    temp_columns[alias] = true;
+                    return ir::Expr{.node = ir::ColumnRef{.name = alias}};
+                }
                 if (call->args.size() != 1) {
                     return std::unexpected(
                         LowerError{.message = "aggregate functions take one argument"});
@@ -813,6 +848,42 @@ class Lowerer {
                             .func = func.value(),
                             .column = ir::ColumnRef{.name = ""},
                             .alias = field.name,
+                        });
+                        final_columns.push_back(field.name);
+                        continue;
+                    }
+                    if (call->callee == "ewma") {
+                        if (call->args.size() != 2) {
+                            return std::unexpected(LowerError{
+                                .message = "ewma() takes two arguments: ewma(column, alpha)"});
+                        }
+                        const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                        if (ident == nullptr) {
+                            return std::unexpected(LowerError{
+                                .message = "first argument of ewma() must be a column name"});
+                        }
+                        double alpha = 0.0;
+                        if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
+                            if (const auto* dv = std::get_if<double>(&lit->value)) {
+                                alpha = *dv;
+                            } else if (const auto* iv =
+                                           std::get_if<std::int64_t>(&lit->value)) {
+                                alpha = static_cast<double>(*iv);
+                            } else {
+                                return std::unexpected(LowerError{
+                                    .message = "second argument of ewma() must be a numeric "
+                                               "literal (alpha)"});
+                            }
+                        } else {
+                            return std::unexpected(
+                                LowerError{.message = "second argument of ewma() must be a "
+                                                      "numeric literal (alpha)"});
+                        }
+                        aggs.push_back(ir::AggSpec{
+                            .func = func.value(),
+                            .column = ir::ColumnRef{.name = ident->name},
+                            .alias = field.name,
+                            .param = alpha,
                         });
                         final_columns.push_back(field.name);
                         continue;
@@ -920,6 +991,36 @@ class Lowerer {
                     return std::unexpected(LowerError{.message = "count() takes no arguments"});
                 aggs.push_back(
                     ir::AggSpec{.func = func.value(), .column = {.name = ""}, .alias = field.name});
+                continue;
+            }
+            if (call->callee == "ewma") {
+                if (call->args.size() != 2)
+                    return std::unexpected(
+                        LowerError{.message = "ewma() takes two arguments: ewma(column, alpha)"});
+                const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                if (ident == nullptr)
+                    return std::unexpected(
+                        LowerError{.message = "first argument of ewma() must be a column name"});
+                double alpha = 0.0;
+                if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
+                    if (const auto* dv = std::get_if<double>(&lit->value)) {
+                        alpha = *dv;
+                    } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                        alpha = static_cast<double>(*iv);
+                    } else {
+                        return std::unexpected(LowerError{
+                            .message =
+                                "second argument of ewma() must be a numeric literal (alpha)"});
+                    }
+                } else {
+                    return std::unexpected(LowerError{
+                        .message =
+                            "second argument of ewma() must be a numeric literal (alpha)"});
+                }
+                aggs.push_back(ir::AggSpec{.func = func.value(),
+                                            .column = {.name = ident->name},
+                                            .alias = field.name,
+                                            .param = alpha});
                 continue;
             }
             if (call->args.size() != 1)
@@ -1086,6 +1187,15 @@ class Lowerer {
         }
         if (name == "last") {
             return ir::AggFunc::Last;
+        }
+        if (name == "median") {
+            return ir::AggFunc::Median;
+        }
+        if (name == "std") {
+            return ir::AggFunc::Stddev;
+        }
+        if (name == "ewma") {
+            return ir::AggFunc::Ewma;
         }
         return std::nullopt;
     }

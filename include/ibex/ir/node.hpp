@@ -92,6 +92,9 @@ enum class AggFunc : std::uint8_t {
     Count,
     First,
     Last,
+    Median,   ///< Middle value (ignores nulls; always returns double).
+    Stddev,   ///< Sample standard deviation, n-1 denominator (ignores nulls; always returns double).
+    Ewma,     ///< Exponentially weighted moving average: ewma(col, alpha) (always returns double).
 };
 
 /// Join type.
@@ -155,6 +158,7 @@ struct AggSpec {
     AggFunc func = AggFunc::Sum;
     ColumnRef column;
     std::string alias;
+    double param = 0.0;  ///< Function-specific parameter (e.g. alpha for Ewma).
 };
 
 /// Rename specification: maps an old column name to a new column name.

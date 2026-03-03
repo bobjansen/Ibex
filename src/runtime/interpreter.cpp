@@ -1402,8 +1402,11 @@ struct AggSlot {
     std::int64_t int_value = 0;
     double double_value = 0.0;
     double sum = 0.0;
+    double m2 = 0.0;            ///< Welford M2 accumulator for sample stddev.
+    double param = 0.0;         ///< Function-specific parameter (e.g. EWMA alpha).
     ScalarValue first_value;
     ScalarValue last_value;
+    std::vector<double> values; ///< Collected values for median.
 };
 
 struct AggState {
@@ -2579,6 +2582,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     struct AggPlanItem {
         ir::AggFunc func = ir::AggFunc::Sum;
         ExprType kind = ExprType::Int;
+        double param = 0.0;  ///< Function-specific parameter (e.g. EWMA alpha).
         const Column<std::int64_t>* int_col = nullptr;
         const Column<double>* dbl_col = nullptr;
         const Column<std::string>* str_col = nullptr;
@@ -2588,10 +2592,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     std::vector<AggPlanItem> plan;
     plan.reserve(aggregations.size());
     bool numeric_only = true;
+    bool has_complex_agg = false;  // true when Median/Stddev/Ewma require the row-wise path
     for (std::size_t i = 0; i < aggregations.size(); ++i) {
         const auto& agg = aggregations[i];
         AggPlanItem item;
         item.func = agg.func;
+        item.param = agg.param;
         if (agg.func == ir::AggFunc::Count) {
             item.kind = ExprType::Int;
         } else {
@@ -2613,11 +2619,17 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
         if (item.kind == ExprType::String &&
             (agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
-             agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max)) {
+             agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
+             agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
+             agg.func == ir::AggFunc::Ewma)) {
             return std::unexpected("string aggregation not supported");
         }
 
-        if (agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) {
+        if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
+            agg.func == ir::AggFunc::Ewma) {
+            has_complex_agg = true;
+            numeric_only = false;
+        } else if (agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) {
             // numeric First/Last are handled in the fast path; only fall back for strings
             if (item.kind == ExprType::String) {
                 numeric_only = false;
@@ -2641,6 +2653,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             AggSlot slot;
             slot.func = plan[i].func;
             slot.kind = plan[i].kind;
+            slot.param = plan[i].param;
             state.slots.push_back(slot);
         }
         return state;
@@ -2655,7 +2668,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 continue;
             }
             if ((agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
-                 agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max) &&
+                 agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
+                 agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
+                 agg.func == ir::AggFunc::Ewma) &&
                 agg_validity[i] != nullptr && !(*agg_validity[i])[row]) {
                 continue;
             }
@@ -2670,6 +2685,45 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (agg.func == ir::AggFunc::Last) {
                 slot.last_value = scalar_from_column(column, row);
                 slot.has_value = true;
+                continue;
+            }
+            if (agg.func == ir::AggFunc::Median) {
+                double x;
+                if (std::holds_alternative<Column<std::int64_t>>(column)) {
+                    x = static_cast<double>(std::get<std::int64_t>(scalar_from_column(column, row)));
+                } else {
+                    x = std::get<double>(scalar_from_column(column, row));
+                }
+                slot.values.push_back(x);
+                continue;
+            }
+            if (agg.func == ir::AggFunc::Stddev) {
+                double x;
+                if (std::holds_alternative<Column<std::int64_t>>(column)) {
+                    x = static_cast<double>(std::get<std::int64_t>(scalar_from_column(column, row)));
+                } else {
+                    x = std::get<double>(scalar_from_column(column, row));
+                }
+                slot.count += 1;
+                double delta = x - slot.double_value;
+                slot.double_value += delta / static_cast<double>(slot.count);
+                double delta2 = x - slot.double_value;
+                slot.m2 += delta * delta2;
+                continue;
+            }
+            if (agg.func == ir::AggFunc::Ewma) {
+                double x;
+                if (std::holds_alternative<Column<std::int64_t>>(column)) {
+                    x = static_cast<double>(std::get<std::int64_t>(scalar_from_column(column, row)));
+                } else {
+                    x = std::get<double>(scalar_from_column(column, row));
+                }
+                if (!slot.has_value) {
+                    slot.double_value = x;
+                    slot.has_value = true;
+                } else {
+                    slot.double_value = slot.param * x + (1.0 - slot.param) * slot.double_value;
+                }
                 continue;
             }
 
@@ -2702,6 +2756,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Count:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::Median:
+                    case ir::AggFunc::Stddev:
+                    case ir::AggFunc::Ewma:
                         break;
                 }
                 slot.has_value = true;
@@ -2734,6 +2791,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Count:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::Median:
+                    case ir::AggFunc::Stddev:
+                    case ir::AggFunc::Ewma:
                         break;
                 }
                 slot.has_value = true;
@@ -2800,6 +2860,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Count:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::Median:
+                    case ir::AggFunc::Stddev:
+                    case ir::AggFunc::Ewma:
                         break;
                 }
                 slot.has_value = true;
@@ -2831,6 +2894,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Count:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
+                    case ir::AggFunc::Median:
+                    case ir::AggFunc::Stddev:
+                    case ir::AggFunc::Ewma:
                         break;
                 }
                 slot.has_value = true;
@@ -2861,6 +2927,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     column = Column<std::int64_t>{};
                     break;
                 case ir::AggFunc::Mean:
+                case ir::AggFunc::Median:
+                case ir::AggFunc::Stddev:
+                case ir::AggFunc::Ewma:
                     column = Column<double>{};
                     break;
                 case ir::AggFunc::Sum:
@@ -2939,6 +3008,31 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         append_scalar(*column, slot.last_value);
                     }
                     break;
+                case ir::AggFunc::Median: {
+                    if (slot.values.empty()) {
+                        append_scalar(*column, 0.0);
+                    } else {
+                        std::vector<double> sorted = slot.values;
+                        std::sort(sorted.begin(), sorted.end());
+                        std::size_t n = sorted.size();
+                        double med = (n % 2 == 1)
+                                         ? sorted[n / 2]
+                                         : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+                        append_scalar(*column, med);
+                    }
+                    break;
+                }
+                case ir::AggFunc::Stddev:
+                    if (slot.count < 2) {
+                        append_scalar(*column, 0.0);
+                    } else {
+                        append_scalar(*column,
+                                      std::sqrt(slot.m2 / static_cast<double>(slot.count - 1)));
+                    }
+                    break;
+                case ir::AggFunc::Ewma:
+                    append_scalar(*column, slot.double_value);
+                    break;
             }
         }
         return std::nullopt;
@@ -2953,6 +3047,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             case ir::AggFunc::Min:
             case ir::AggFunc::Max:
                 return slot.has_value;
+            case ir::AggFunc::Median:
+                return !slot.values.empty();
+            case ir::AggFunc::Stddev:
+                return slot.count >= 2;
+            case ir::AggFunc::Ewma:
+                return slot.has_value;
             case ir::AggFunc::Count:
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
@@ -2963,10 +3063,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
     std::size_t rows = input.rows();
 
-    // Null-aware fallback path:
+    // Null-aware / complex-agg fallback path:
     // use row-wise state updates so SUM/MEAN/MIN/MAX can ignore null rows and
     // emit null when every input row is null for a group.
-    if (has_nullable_agg_inputs) {
+    // Also required for Median/Stddev/Ewma which need per-row sequential processing.
+    if (has_nullable_agg_inputs || has_complex_agg) {
         robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> index;
         index.reserve(rows == 0 ? 1 : rows);
         std::vector<Key> group_order;
@@ -3002,7 +3103,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto func = aggregations[i].func;
             if (func == ir::AggFunc::Sum || func == ir::AggFunc::Mean || func == ir::AggFunc::Min ||
-                func == ir::AggFunc::Max) {
+                func == ir::AggFunc::Max || func == ir::AggFunc::Median ||
+                func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma) {
                 track_agg_validity[i] = true;
                 agg_validity_out[i].reserve(group_order.size());
             }

@@ -1119,6 +1119,162 @@ TEST_CASE("rolling_sum preserves other columns and time_index") {
     REQUIRE(result->find("s") != nullptr);
 }
 
+// ─── rolling_median / rolling_std / rolling_ewma ─────────────────────────────
+// Same 3-row, 1ns-window setup used by the other rolling tests:
+//   ts: 0ns, 1ns, 2ns   val: 10, 20, 30
+//   window 1ns → [t-1, t]
+//     row 0: only row 0      → {10}
+//     row 1: rows 0..1       → {10,20}
+//     row 2: rows 1..2       → {20,30}
+
+TEST_CASE("rolling_median with 1ns window") {
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{10.0, 20.0, 30.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { m = rolling_median(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    // row 0: median({10}) = 10
+    CHECK((*m)[0] == Catch::Approx(10.0));
+    // row 1: median({10,20}) = 15   (even count → average of two middle values)
+    CHECK((*m)[1] == Catch::Approx(15.0));
+    // row 2: median({20,30}) = 25
+    CHECK((*m)[2] == Catch::Approx(25.0));
+}
+
+TEST_CASE("rolling_median odd window size") {
+    // 5 timestamps, window 2ns → row 2 sees {10,20,30} (odd count)
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3), ts_from_nanos(4)});
+    table.add_column("val", Column<double>{10.0, 30.0, 20.0, 40.0, 50.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 2ns, update { m = rolling_median(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    // row 2 (t=2): window [0,2] → {10,30,20} sorted {10,20,30} → median = 20
+    CHECK((*m)[2] == Catch::Approx(20.0));
+    // row 3 (t=3): window [1,3] → {30,20,40} sorted {20,30,40} → median = 30
+    CHECK((*m)[3] == Catch::Approx(30.0));
+}
+
+TEST_CASE("rolling_std with 1ns window") {
+    // row 0: {10}      → n<2, stddev = 0.0
+    // row 1: {10,20}   → mean=15, M2=50, sample std = sqrt(50/1)=sqrt(50)≈7.071
+    // row 2: {20,30}   → mean=25, M2=50, sample std = sqrt(50/1)=sqrt(50)≈7.071
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{10.0, 20.0, 30.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { s = rolling_std(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* s = std::get_if<Column<double>>(result->find("s"));
+    REQUIRE(s != nullptr);
+    // single-element window → 0.0 (undefined sample stddev)
+    CHECK((*s)[0] == Catch::Approx(0.0));
+    // {10,20}: sample std = sqrt(50) ≈ 7.0711
+    CHECK((*s)[1] == Catch::Approx(7.0711).epsilon(1e-3));
+    // {20,30}: sample std = sqrt(50) ≈ 7.0711
+    CHECK((*s)[2] == Catch::Approx(7.0711).epsilon(1e-3));
+}
+
+TEST_CASE("rolling_std larger window") {
+    // {0,2,4}: mean=2, M2=8, sample std = sqrt(8/2) = 2.0
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3), ts_from_nanos(4)});
+    table.add_column("val", Column<double>{0.0, 2.0, 4.0, 6.0, 8.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    // window 2ns: row 2 sees {0,2,4}
+    auto ir = require_ir("data[window 2ns, update { s = rolling_std(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* s = std::get_if<Column<double>>(result->find("s"));
+    REQUIRE(s != nullptr);
+    // row 2: {0,2,4} → sample std = 2.0
+    CHECK((*s)[2] == Catch::Approx(2.0));
+}
+
+TEST_CASE("rolling_ewma with 1ns window") {
+    // alpha = 0.5
+    // row 0: window {10}     → ewma = 10
+    // row 1: window {10,20}  → ewma starts 10, then 0.5*20 + 0.5*10 = 15
+    // row 2: window {20,30}  → ewma starts 20, then 0.5*30 + 0.5*20 = 25
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{10.0, 20.0, 30.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { e = rolling_ewma(val, 0.5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* e = std::get_if<Column<double>>(result->find("e"));
+    REQUIRE(e != nullptr);
+    CHECK((*e)[0] == Catch::Approx(10.0));
+    CHECK((*e)[1] == Catch::Approx(15.0));
+    CHECK((*e)[2] == Catch::Approx(25.0));
+}
+
+TEST_CASE("rolling_ewma larger window") {
+    // window 2ns, alpha = 0.5
+    // row 0 (t=0): {10}            → ewma = 10
+    // row 1 (t=1): {10, 20}        → 10 → 0.5*20+0.5*10 = 15
+    // row 2 (t=2): {10, 20, 30}    → 10 → 15 → 0.5*30+0.5*15 = 22.5
+    // row 3 (t=3): {20, 30, 40}    → 20 → 0.5*30+0.5*20=25 → 0.5*40+0.5*25 = 32.5
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("val", Column<double>{10.0, 20.0, 30.0, 40.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 2ns, update { e = rolling_ewma(val, 0.5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* e = std::get_if<Column<double>>(result->find("e"));
+    REQUIRE(e != nullptr);
+    CHECK((*e)[0] == Catch::Approx(10.0));
+    CHECK((*e)[1] == Catch::Approx(15.0));
+    CHECK((*e)[2] == Catch::Approx(22.5));
+    CHECK((*e)[3] == Catch::Approx(32.5));
+}
+
 // ─── Phase 1 null semantics ───────────────────────────────────────────────────
 
 TEST_CASE("null: left join unmatched rows produce null right columns", "[null][join]") {

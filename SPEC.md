@@ -860,15 +860,18 @@ To reference a computed column, use a separate block or `let` binding.
 The following built-in functions are **aggregate functions**. They consume a
 `Series<T>` (the full column or a per-group slice) and produce a scalar:
 
-| Function   | Input           | Output     |
-|------------|-----------------|------------|
-| `sum(col)` | `Series<Numeric>` | Same numeric type |
-| `mean(col)` | `Series<Numeric>` | `Float64`  |
-| `min(col)` | `Series<T>`     | `T`        |
-| `max(col)` | `Series<T>`     | `T`        |
-| `count()`  | (none)          | `Int64`    |
-| `first(col)` | `Series<T>`   | `T`        |
-| `last(col)` | `Series<T>`    | `T`        |
+| Function              | Input              | Output     | Notes |
+|-----------------------|--------------------|------------|-------|
+| `sum(col)`            | `Series<Numeric>`  | Same numeric type | |
+| `mean(col)`           | `Series<Numeric>`  | `Float64`  | |
+| `min(col)`            | `Series<T>`        | `T`        | |
+| `max(col)`            | `Series<T>`        | `T`        | |
+| `count()`             | (none)             | `Int64`    | |
+| `first(col)`          | `Series<T>`        | `T`        | |
+| `last(col)`           | `Series<T>`        | `T`        | |
+| `median(col)`         | `Series<Numeric>`  | `Float64`  | Middle value; null rows are ignored. Even-length groups return the average of the two middle values. |
+| `std(col)`            | `Series<Numeric>`  | `Float64`  | Sample standard deviation (denominator n − 1). Returns null for groups with fewer than 2 non-null values. |
+| `ewma(col, alpha)`    | `Series<Numeric>`  | `Float64`  | Exponentially weighted moving average. `alpha` ∈ (0, 1] is a numeric literal; rows are processed in storage order within each group. Returns null if the group is empty. |
 
 `Numeric` denotes `Int32 | Int64 | Float32 | Float64`.
 
@@ -1018,13 +1021,16 @@ functions require an active `window` clause; `lag` and `lead` do not.
 
 **Rolling aggregates (require `window`):**
 
-| Function            | Description                    |
-|---------------------|--------------------------------|
-| `rolling_sum(col)`  | Sum within window              |
-| `rolling_mean(col)` | Mean within window             |
-| `rolling_min(col)`  | Minimum within window          |
-| `rolling_max(col)`  | Maximum within window          |
-| `rolling_count()`   | Row count within window        |
+| Function                   | Description                                                         |
+|----------------------------|---------------------------------------------------------------------|
+| `rolling_sum(col)`         | Sum within window                                                   |
+| `rolling_mean(col)`        | Mean within window                                                  |
+| `rolling_min(col)`         | Minimum within window                                               |
+| `rolling_max(col)`         | Maximum within window                                               |
+| `rolling_count()`          | Row count within window                                             |
+| `rolling_median(col)`      | Median within window (`Float64`); O(n log w) via sliding two-heap  |
+| `rolling_std(col)`         | Sample standard deviation within window (`Float64`; 0.0 when fewer than 2 rows) |
+| `rolling_ewma(col, alpha)` | EWMA within window (`Float64`); `alpha` is a numeric literal        |
 
 Rolling functions are **aggregate-like**: they produce one scalar per row
 (evaluated over the window) and are valid in both `select` and `update`.
@@ -1534,7 +1540,7 @@ Column  Series  DataFrame  TimeFrame
 ```
 scalar
 date  timestamp  ts
-sum  mean  min  max  count  first  last
+sum  mean  min  max  count  first  last  median  std  ewma
 ```
 
 ---

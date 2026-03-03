@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <cstdint>
 #include <cstring>
 #include <emmintrin.h>
@@ -4919,18 +4920,62 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_median: column must be numeric (Int or Float)");
                 } else {
+                    // Sliding-window median via two multisets — O(n log w).
+                    //
+                    // lo holds the lower half, hi the upper half.
+                    // Invariants:
+                    //   (1) lo.size() == hi.size()     (even total)
+                    //    OR lo.size() == hi.size() + 1 (odd total)
+                    //   (2) max(lo) <= min(hi)
+                    //
+                    // Median = max(lo) when sizes differ, else avg of both tops.
+                    std::multiset<double> lo;  // lower half  — max is rbegin()
+                    std::multiset<double> hi;  // upper half  — min is begin()
+
+                    // Restore invariant (1) after a single insert or erase.
+                    auto rebalance = [&]() {
+                        if (lo.size() > hi.size() + 1) {
+                            hi.insert(*lo.rbegin());
+                            lo.erase(std::prev(lo.end()));
+                        } else if (hi.size() > lo.size()) {
+                            lo.insert(*hi.begin());
+                            hi.erase(hi.begin());
+                        }
+                    };
+
+                    auto insert_val = [&](double x) {
+                        // Preserves invariant (2): x goes to lo if it belongs
+                        // in the lower half, hi otherwise.
+                        if (lo.empty() || x <= *lo.rbegin())
+                            lo.insert(x);
+                        else
+                            hi.insert(x);
+                        rebalance();
+                    };
+
+                    auto remove_val = [&](double x) {
+                        // Remove one copy from whichever half contains it.
+                        auto it = lo.find(x);
+                        if (it != lo.end())
+                            lo.erase(it);
+                        else
+                            hi.erase(hi.find(x));
+                        rebalance();
+                    };
+
                     Column<double> result;
                     result.resize(rows);
+                    std::size_t lo_ptr = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
-                        std::vector<double> vals;
-                        vals.reserve(i - lo + 1);
-                        for (std::size_t j = lo; j <= i; ++j)
-                            vals.push_back(static_cast<double>(col[j]));
-                        std::sort(vals.begin(), vals.end());
-                        std::size_t n = vals.size();
-                        result[i] = (n % 2 == 1) ? vals[n / 2]
-                                                  : (vals[n / 2 - 1] + vals[n / 2]) / 2.0;
+                        insert_val(static_cast<double>(col[i]));
+                        std::int64_t threshold = time_vals[i] - dur_val;
+                        while (lo_ptr < i && time_vals[lo_ptr] < threshold) {
+                            remove_val(static_cast<double>(col[lo_ptr]));
+                            ++lo_ptr;
+                        }
+                        result[i] = (lo.size() > hi.size())
+                                        ? static_cast<double>(*lo.rbegin())
+                                        : (*lo.rbegin() + *hi.begin()) / 2.0;
                     }
                     return result;
                 }

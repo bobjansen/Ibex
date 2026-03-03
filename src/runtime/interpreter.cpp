@@ -4444,7 +4444,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             return expr_type_for_column(*source);
         }
         // Built-in rolling aggregate functions
-        if (call->callee == "rolling_mean") {
+        if (call->callee == "rolling_mean" || call->callee == "rolling_median" ||
+            call->callee == "rolling_std" || call->callee == "rolling_ewma") {
             return ExprType::Double;
         }
         if (call->callee == "rolling_count") {
@@ -4911,6 +4912,105 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
             *src);
     }
 
+    if (call.callee == "rolling_median") {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected("rolling_median: column must be numeric (Int or Float)");
+                } else {
+                    Column<double> result;
+                    result.resize(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::vector<double> vals;
+                        vals.reserve(i - lo + 1);
+                        for (std::size_t j = lo; j <= i; ++j)
+                            vals.push_back(static_cast<double>(col[j]));
+                        std::sort(vals.begin(), vals.end());
+                        std::size_t n = vals.size();
+                        result[i] = (n % 2 == 1) ? vals[n / 2]
+                                                  : (vals[n / 2 - 1] + vals[n / 2]) / 2.0;
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
+    if (call.callee == "rolling_std") {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected("rolling_std: column must be numeric (Int or Float)");
+                } else {
+                    Column<double> result;
+                    result.resize(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::size_t n = i - lo + 1;
+                        if (n < 2) {
+                            result[i] = 0.0;
+                            continue;
+                        }
+                        // Welford's online algorithm over the window.
+                        double mean = 0.0;
+                        double m2 = 0.0;
+                        std::int64_t cnt = 0;
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            double x = static_cast<double>(col[j]);
+                            ++cnt;
+                            double delta = x - mean;
+                            mean += delta / static_cast<double>(cnt);
+                            m2 += delta * (x - mean);
+                        }
+                        result[i] = std::sqrt(m2 / static_cast<double>(n - 1));
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
+    if (call.callee == "rolling_ewma") {
+        // Parse alpha from the second argument (a numeric literal).
+        double alpha = 0.0;
+        if (call.args.size() < 2) {
+            return std::unexpected("rolling_ewma: expected two arguments: rolling_ewma(col, alpha)");
+        }
+        if (const auto* lit = std::get_if<ir::Literal>(&call.args[1]->node)) {
+            if (const auto* dv = std::get_if<double>(&lit->value)) {
+                alpha = *dv;
+            } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                alpha = static_cast<double>(*iv);
+            } else {
+                return std::unexpected("rolling_ewma: alpha must be a numeric literal");
+            }
+        } else {
+            return std::unexpected("rolling_ewma: alpha must be a numeric literal");
+        }
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected("rolling_ewma: column must be numeric (Int or Float)");
+                } else {
+                    Column<double> result;
+                    result.resize(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        double ewma = static_cast<double>(col[lo]);
+                        for (std::size_t j = lo + 1; j <= i; ++j)
+                            ewma = alpha * static_cast<double>(col[j]) + (1.0 - alpha) * ewma;
+                        result[i] = ewma;
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
     // rolling_min / rolling_max — O(n·w), monotonic deque not yet implemented.
     bool is_min = call.callee == "rolling_min";
     return std::visit(
@@ -5007,7 +5107,8 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
 
 constexpr auto is_rolling_func(std::string_view name) -> bool {
     return name == "rolling_sum" || name == "rolling_mean" || name == "rolling_min" ||
-           name == "rolling_max" || name == "rolling_count";
+           name == "rolling_max" || name == "rolling_count" || name == "rolling_median" ||
+           name == "rolling_std" || name == "rolling_ewma";
 }
 
 // Like update_table but evaluates rolling aggregate expressions using the given window duration.

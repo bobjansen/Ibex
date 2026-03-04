@@ -1318,7 +1318,8 @@ depends entirely on the transport:
   user-space queue and there is no independent producer thread, messages
   produced during the `StreamTimeout` window may be lost. The plugin author
   is responsible for arranging OS-level or thread-level buffering so that
-  data accumulates safely until `recvfrom` is called again.
+  data accumulates safely until the source is called again. For a convenient
+  zero-extra-copy solution see `StreamBuffered` (§12.7).
 
 `StreamTimeout` is meaningful only for `TimeBucket` streams; for `PerRow`
 streams it is silently ignored.
@@ -1496,6 +1497,63 @@ immediately when the first tick belonging to the next minute arrives
 the wall-clock check to fire close to the bucket boundary while the source
 stays live and misses no messages. A `udp_recv` that blocks indefinitely
 delays emission until the next tick arrives.
+
+### 12.7 StreamBuffered: Zero-Copy In-Process Sources
+
+For user-space / in-process transports where double-buffering is undesirable,
+the runtime provides `ibex::runtime::StreamBuffered` — a helper that combines
+an SPSC (single-producer, single-consumer) ring buffer with a compatible
+`ExternFn` so the queue IS the only buffer in the pipeline.
+
+#### How it works
+
+1. The plugin creates a `std::shared_ptr<StreamBuffered>` with a chosen ring
+   capacity.
+2. It calls `buf->make_source_fn()` to obtain an `ExternFn` and registers that
+   function with `ExternRegistry::register_table`.
+3. A **producer thread** pushes batches via `buf->write(table)` and signals
+   completion with `buf->close()`.
+4. The **Ibex event loop** calls the `ExternFn` on each iteration:
+   - Ring non-empty → returns the next `Table` (rows > 0).
+   - Ring empty, not closed → returns `StreamTimeout{}` so the wall-clock
+     bucket flush can fire without blocking the consumer.
+   - Ring empty, closed → returns an empty `Table` (EOF) to stop the loop.
+
+#### API summary
+
+```cpp
+#include <ibex/runtime/stream_buffered.hpp>
+
+// Create with ring capacity (number of Table slots).
+auto buf = std::make_shared<ibex::runtime::StreamBuffered>(/*capacity=*/256);
+
+// Register as the stream source.
+registry.register_table("my_src", buf->make_source_fn());
+
+// Producer thread:
+buf->write(my_table);   // blocks (yields) if ring is full
+buf->close();           // signal end-of-stream
+```
+
+#### Comparison with kernel-backed sockets
+
+| Property | `StreamBuffered` | UDP with SO_RCVTIMEO |
+|---|---|---|
+| Buffer location | User-space SPSC ring | Kernel socket buffer |
+| Extra copy on read | None | None (kernel → user via recvfrom) |
+| Overflow behaviour | Producer blocks (backpressure) | Kernel drops datagrams |
+| Suitable for | In-process queues, shared memory | Network sources |
+
+For kernel-backed transports (UDP/TCP), use the `StreamTimeout{}` pattern
+directly without `StreamBuffered` — the kernel already provides an equivalent
+ring buffer at no extra cost.
+
+#### Concurrency guarantees
+
+`write()` and `close()` must be called from a single producer thread.
+The `ExternFn` returned by `make_source_fn()` is called only from the Ibex
+event loop (single consumer).  The two sides are separated by cache-line-
+aligned atomic indices so no mutex is required on the hot path.
 
 ---
 

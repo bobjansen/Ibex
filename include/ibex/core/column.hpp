@@ -450,4 +450,59 @@ class Column<std::string> {
     [[nodiscard]] auto end() const noexcept -> Iterator { return {this, size()}; }
 };
 
+/// Explicit specialisation for bool.
+///
+/// `std::vector<bool>` is a space-optimised bitset and lacks `data()`, so it
+/// cannot be used as a POD column.  We store booleans as `uint8_t` (0 = false,
+/// non-zero = true) and present a `bool` value interface.
+template <>
+class Column<bool> {
+    std::vector<std::uint8_t> data_;
+
+   public:
+    using value_type = bool;
+    using size_type = std::size_t;
+
+    Column() = default;
+
+    explicit Column(std::vector<bool> bools) {
+        data_.reserve(bools.size());
+        for (bool v : bools)
+            data_.push_back(v ? 1u : 0u);
+    }
+
+    Column(std::initializer_list<bool> init) {
+        data_.reserve(init.size());
+        for (bool v : init)
+            data_.push_back(v ? 1u : 0u);
+    }
+
+    [[nodiscard]] auto size() const noexcept -> size_type { return data_.size(); }
+    [[nodiscard]] auto empty() const noexcept -> bool { return data_.empty(); }
+
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool {
+        return data_[idx] != 0;
+    }
+
+    /// Mutable byte-level access (for gather/sort paths that do `dst[i] = src[j]`).
+    [[nodiscard]] auto byte_at(size_type idx) noexcept -> std::uint8_t& { return data_[idx]; }
+
+    void push_back(bool v) { data_.push_back(v ? 1u : 0u); }
+
+    void reserve(size_type n) { data_.reserve(n); }
+
+    // zero-initialises (false) for resize-based fill in lag/lead paths
+    void resize(size_type n) { data_.resize(n, 0u); }
+
+    // Raw byte pointer: sizeof(bool)==1 ≡ sizeof(uint8_t), so POD memcpy is safe.
+    [[nodiscard]] auto data() const noexcept -> const std::uint8_t* { return data_.data(); }
+    [[nodiscard]] auto data() noexcept -> std::uint8_t* { return data_.data(); }
+
+    // Span access (returns uint8_t span; callers that need bool can cast 0/!0).
+    [[nodiscard]] auto span() const noexcept -> std::span<const std::uint8_t> { return data_; }
+    [[nodiscard]] auto span() noexcept -> std::span<std::uint8_t> { return data_; }
+
+    void assign(size_type count, bool value) { data_.assign(count, value ? 1u : 0u); }
+};
+
 }  // namespace ibex

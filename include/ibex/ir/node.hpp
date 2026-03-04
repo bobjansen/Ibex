@@ -32,7 +32,7 @@ struct Expr;
 using ExprPtr = std::shared_ptr<Expr>;
 
 struct Literal {
-    std::variant<std::int64_t, double, std::string, Date, Timestamp> value;
+    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> value;
 };
 
 enum class ArithmeticOp : std::uint8_t {
@@ -49,9 +49,15 @@ struct BinaryExpr {
     ExprPtr right;
 };
 
+struct NamedArg {
+    std::string name;
+    ExprPtr value;
+};
+
 struct CallExpr {
     std::string callee;
     std::vector<ExprPtr> args;
+    std::vector<NamedArg> named_args;
 };
 
 struct Expr {

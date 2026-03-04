@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -22,9 +23,8 @@ namespace ibex::runtime {
 /// StreamBuffered replaces the plugin's ad-hoc producer queue — not Ibex's
 /// internal buffer.
 ///
-/// ## Usage
+/// ## Usage (manual, capacity chosen in C++)
 ///
-///   // Create on the heap so both producer and ExternFn share ownership.
 ///   auto buf = std::make_shared<StreamBuffered>(/*capacity=*/256);
 ///   registry.register_table("my_src", buf->make_source_fn());
 ///
@@ -34,6 +34,20 @@ namespace ibex::runtime {
 ///       }
 ///       buf->close();
 ///   });
+///
+/// ## Usage (make_buffered_source, capacity set from Ibex)
+///
+/// Prefer make_buffered_source() when the Ibex user should control capacity:
+///
+///   registry.register_table("my_src",
+///       runtime::make_buffered_source([](StreamBuffered& buf) {
+///           for (auto& batch : my_data_source) buf.write(batch);
+///           buf.close();
+///       }));
+///
+///   // In the Ibex query:
+///   extern fn my_src(capacity: Int) -> TimeFrame from "plugin.hpp";
+///   Stream { source = my_src(512), transform = [...], sink = my_sink() };
 ///
 /// ## Thread safety
 ///
@@ -132,5 +146,60 @@ class StreamBuffered : public std::enable_shared_from_this<StreamBuffered> {
         return true;
     }
 };
+
+/// Creates an ExternFn that wraps a StreamBuffered source with lazy
+/// initialisation, allowing the ring capacity to be set from the Ibex query.
+///
+/// The @p producer callable is invoked once in a detached thread the first
+/// time the source is called by the event loop.  It receives a reference to
+/// the StreamBuffered and must call buf.close() when it has no more data.
+///
+/// The ring capacity is taken from the first Int argument passed to the extern
+/// call in the Ibex query.  If no argument is supplied, 256 is used.
+///
+/// ## Example
+///
+///   // C++ plugin — no capacity decision here
+///   registry.register_table("my_src",
+///       runtime::make_buffered_source([](runtime::StreamBuffered& buf) {
+///           for (auto& row : data_source) buf.write(row);
+///           buf.close();
+///       }));
+///
+///   // Ibex query — user tunes capacity alongside other stream parameters
+///   extern fn my_src(capacity: Int) -> TimeFrame from "plugin.hpp";
+///   Stream {
+///       source    = my_src(512),
+///       transform = [resample 1s, select { close = last(price) }],
+///       sink      = my_sink()
+///   };
+template <typename ProducerFn>
+[[nodiscard]] ExternFn make_buffered_source(ProducerFn producer) {
+    struct State {
+        std::optional<ExternFn> source_fn{};
+        ProducerFn producer;
+    };
+    auto state = std::make_shared<State>(State{{}, std::move(producer)});
+
+    return [state](const ExternArgs& args) mutable -> std::expected<ExternValue, std::string> {
+        if (!state->source_fn) {
+            std::size_t cap = 256;
+            if (!args.empty()) {
+                if (const auto* v = std::get_if<std::int64_t>(&args[0])) {
+                    if (*v <= 0) {
+                        return std::unexpected("StreamBuffered capacity must be > 0");
+                    }
+                    cap = static_cast<std::size_t>(*v);
+                }
+            }
+            auto buf = std::make_shared<StreamBuffered>(cap);
+            state->source_fn = buf->make_source_fn();
+            std::thread([buf, p = std::move(state->producer)]() mutable {
+                p(*buf);
+            }).detach();
+        }
+        return (*state->source_fn)(args);
+    };
+}
 
 }  // namespace ibex::runtime

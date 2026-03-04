@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -721,4 +722,88 @@ TEST_CASE("E2E: handles 1000-row table", "[e2e]") {
     int b_idx = 1 - a_idx;
     CHECK(totals[a_idx] == 187250);
     CHECK(totals[b_idx] == 187500);
+}
+
+// ─── Stream wall-clock bucket flush ──────────────────────────────────────────
+
+// Verify that a TimeBucket stream emits a completed bucket at wall-clock bucket
+// end, not only when a message with a later data timestamp arrives.
+//
+// Scenario: both ticks have data timestamps in bucket 0 (by data time), but the
+// second tick arrives after the bucket duration has elapsed on the wall clock.
+// The expected behaviour is two separate sink calls — one for each tick — rather
+// than a single call with both ticks merged into bucket 0.
+TEST_CASE("Stream TimeBucket flushes at wall-clock bucket end", "[e2e][stream]") {
+    std::vector<runtime::Table> emitted;
+    int call_count = 0;
+
+    runtime::ExternRegistry registry;
+
+    // Source: returns tick 1 immediately, then sleeps past the 20 ms bucket
+    // boundary before returning tick 2 (which still carries a data timestamp
+    // inside bucket 0).  After that it signals EOF.
+    registry.register_table(
+        "tick_src",
+        [&](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            ++call_count;
+            if (call_count == 1) {
+                runtime::Table t;
+                t.add_column("ts", Column<Timestamp>{Timestamp{0}});
+                t.add_column("price", Column<double>{100.0});
+                t.time_index = "ts";
+                return runtime::ExternValue{t};
+            }
+            if (call_count == 2) {
+                // Sleep longer than the 20 ms bucket so the wall-clock check fires.
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                runtime::Table t;
+                // Data timestamp 5 ms — still inside bucket 0 by data time.
+                t.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
+                t.add_column("price", Column<double>{110.0});
+                t.time_index = "ts";
+                return runtime::ExternValue{t};
+            }
+            return runtime::ExternValue{runtime::Table{}};  // EOF
+        });
+
+    // Sink: capture each emitted (post-resample) table.
+    registry.register_scalar_table_consumer(
+        "tick_sink", runtime::ScalarKind::Int,
+        [&](const runtime::Table& t,
+            const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            emitted.push_back(t);
+            return runtime::ExternValue{std::int64_t{0}};
+        });
+
+    // Use lower() (not lower_expr) so the extern declarations are registered in
+    // the lowerer's table_externs_ / sink_externs_ sets before the Stream node
+    // is lowered.
+    const char* src = R"(
+extern fn tick_src() -> TimeFrame from "fake.hpp";
+extern fn tick_sink(df: DataFrame) -> Int from "fake.hpp";
+Stream {
+    source    = tick_src(),
+    transform = [resample 20ms, select { close = last(price) }],
+    sink      = tick_sink()
+};
+)";
+
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    auto result = runtime::interpret(*lowered.value(), {}, nullptr, &registry);
+    REQUIRE(result.has_value());
+
+    // Wall-clock flush fires between the two source calls: bucket containing
+    // tick 1 is emitted before tick 2 is processed, giving two sink calls.
+    REQUIRE(emitted.size() == 2);
+
+    auto* close0 = std::get_if<Column<double>>(emitted[0].find("close"));
+    REQUIRE(close0 != nullptr);
+    CHECK((*close0)[0] == Catch::Approx(100.0));
+
+    auto* close1 = std::get_if<Column<double>>(emitted[1].find("close"));
+    REQUIRE(close1 != nullptr);
+    CHECK((*close1)[0] == Catch::Approx(110.0));
 }

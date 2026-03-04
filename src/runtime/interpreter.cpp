@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <set>
 #include <cstdint>
 #include <cstring>
@@ -5689,10 +5690,19 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             // ── Event loop ──────────────────────────────────────────────────────
             Table buffer;
             std::int64_t open_bucket_ns = -1;
+            std::int64_t bucket_open_wall_ns = -1;  // wall-clock ns when current bucket was opened
             const std::int64_t bucket_ns =
                 sn.stream_kind() == ir::StreamKind::TimeBucket
                     ? static_cast<std::int64_t>(sn.bucket_duration().count())
                     : 0;
+
+            // Returns current CLOCK_REALTIME in nanoseconds.
+            auto wall_now_ns = []() -> std::int64_t {
+                struct timespec ts{};
+                clock_gettime(CLOCK_REALTIME, &ts);
+                return static_cast<std::int64_t>(ts.tv_sec) * 1'000'000'000LL +
+                       static_cast<std::int64_t>(ts.tv_nsec);
+            };
 
             while (true) {
                 auto src_result = source_fn->func(source_args);
@@ -5704,7 +5714,20 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 if (batch->rows() == 0) break;  // source signalled EOF
 
                 if (sn.stream_kind() == ir::StreamKind::TimeBucket && bucket_ns > 0) {
-                    // Process row-by-row so we can detect bucket boundaries.
+                    // Wall-clock end-of-bucket flush: emit the open bucket as soon as
+                    // bucket_ns wall-clock time has elapsed since it was opened, rather
+                    // than waiting for a message with a later data timestamp to arrive.
+                    if (open_bucket_ns >= 0 && buffer.rows() > 0 &&
+                        wall_now_ns() - bucket_open_wall_ns >= bucket_ns) {
+                        auto er = emit_buffer(buffer);
+                        if (!er) return std::unexpected(er.error());
+                        buffer = Table{};
+                        open_bucket_ns = -1;
+                        bucket_open_wall_ns = -1;
+                    }
+
+                    // Process row-by-row so we can also detect bucket boundaries from data
+                    // timestamps (handles replayed/historical data where wall-clock does not apply).
                     for (std::size_t r = 0; r < batch->rows(); ++r) {
                         Table row_tbl = slice_row(*batch, r);
                         auto ts_opt = get_last_ts_ns(row_tbl);
@@ -5718,6 +5741,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                             buffer = Table{};
                         }
                         if (row_bucket >= 0) {
+                            if (row_bucket != open_bucket_ns) {
+                                // New bucket — record the wall-clock open time.
+                                bucket_open_wall_ns = wall_now_ns();
+                            }
                             open_bucket_ns = row_bucket;
                         }
                         auto app = append_table(buffer, row_tbl);

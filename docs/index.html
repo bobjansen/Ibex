@@ -455,14 +455,15 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
             so the plugin author doesn't have to implement their own.
           </p>
           <p>
-            A <strong>producer thread</strong> calls <code>buf-&gt;write(table)</code>
-            (blocking on backpressure via CPU yield) and signals completion with
-            <code>buf-&gt;close()</code>. The <code>ExternFn</code> returned by
-            <code>make_source_fn()</code> is registered as the stream source;
-            it drains the ring on each event-loop iteration, returning
-            <code>StreamTimeout{}</code> when empty so wall-clock bucket flushes
-            still fire on schedule. Ibex's own TimeBucket accumulation buffer
-            sits downstream, unchanged.
+            Use <code>make_buffered_source(producer_fn)</code> to let the Ibex
+            query control the capacity: the plugin only supplies the
+            data-production logic; the ring is lazily initialised on the first
+            event-loop call using the <code>capacity</code> argument from the
+            query. A <strong>producer thread</strong> is started at that point,
+            calls <code>buf.write(table)</code> (blocking on backpressure), and
+            signals completion with <code>buf.close()</code>. The event loop
+            drains the ring, returning <code>StreamTimeout{}</code> when empty
+            so wall-clock bucket flushes still fire on schedule.
           </p>
           <p>
             Cache-line-separated <code>std::atomic</code> head and tail indices
@@ -480,25 +481,22 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm">// C++ plugin setup</span>
+<pre><code><span class="cm">// C++ plugin — only the data-production logic</span>
 <span class="kw">#include</span> &lt;ibex/runtime/stream_buffered.hpp&gt;
 
-<span class="kw">auto</span> buf = std::make_shared&lt;ibex::runtime::StreamBuffered&gt;(<span class="num">256</span>);
-registry.register_table(<span class="str">"my_src"</span>, buf-&gt;make_source_fn());
-
-<span class="cm">// Producer thread: push Tables, then signal EOF</span>
-std::thread producer([buf] {
-    <span class="kw">for</span> (<span class="kw">auto</span>&amp; batch : my_data_source) {
-        buf-&gt;write(batch);   <span class="cm">// yields if ring full</span>
-    }
-    buf-&gt;close();            <span class="cm">// signal end-of-stream</span>
-});</code></pre>
-<pre style="margin-top:0.6rem;"><code><span class="cm">// Ibex query — unchanged from any other stream source</span>
-<span class="kw">extern fn</span> my_src() -&gt; TimeFrame <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
+registry.register_table(<span class="str">"my_src"</span>,
+    ibex::runtime::make_buffered_source([](ibex::runtime::StreamBuffered&amp; buf) {
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; batch : my_data_source) {
+            buf.write(batch);  <span class="cm">// yields if ring full</span>
+        }
+        buf.close();
+    }));</code></pre>
+<pre style="margin-top:0.6rem;"><code><span class="cm">// Ibex query — capacity is a first-class tuning parameter</span>
+<span class="kw">extern fn</span> my_src(capacity: Int) -&gt; TimeFrame <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
 <span class="kw">extern fn</span> my_sink(df: DataFrame) -&gt; Int <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
 
 Stream {
-    source    = <span class="fn-name">my_src</span>(),
+    source    = <span class="fn-name">my_src</span>(<span class="num">512</span>),
     transform = [<span class="kw">resample</span> <span class="num">1s</span>, <span class="kw">select</span> { close = <span class="fn-name">last</span>(price) }],
     sink      = <span class="fn-name">my_sink</span>()
 };</code></pre>

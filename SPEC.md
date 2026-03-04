@@ -1511,13 +1511,13 @@ so the plugin author does not need to implement their own thread-safe queue.
 
 #### How it works
 
-1. The plugin creates a `std::shared_ptr<StreamBuffered>` with a chosen ring
-   capacity.
-2. It calls `buf->make_source_fn()` to obtain an `ExternFn` and registers that
-   function with `ExternRegistry::register_table`.
-3. A **producer thread** pushes batches via `buf->write(table)` and signals
-   completion with `buf->close()`.
-4. The **Ibex event loop** calls the `ExternFn` on each iteration:
+1. The plugin registers a source using `make_buffered_source(producer_fn)`.
+2. When the Ibex event loop first calls the source it reads the ring capacity
+   from the first Int argument, initialises `StreamBuffered(capacity)`, and
+   launches the producer callback in a detached thread.
+3. The **producer thread** pushes batches via `buf.write(table)` and signals
+   completion with `buf.close()`.
+4. On every subsequent call the **event loop** drains the ring:
    - Ring non-empty → returns the next `Table` (rows > 0).
    - Ring empty, not closed → returns `StreamTimeout{}` so the wall-clock
      bucket flush can fire without blocking the consumer.
@@ -1525,18 +1525,43 @@ so the plugin author does not need to implement their own thread-safe queue.
 
 #### API summary
 
+There are two usage styles depending on whether capacity should come from
+the Ibex query or from C++.
+
+**Preferred — capacity from the Ibex query (`make_buffered_source`)**
+
 ```cpp
 #include <ibex/runtime/stream_buffered.hpp>
 
-// Create with ring capacity (number of Table slots).
-auto buf = std::make_shared<ibex::runtime::StreamBuffered>(/*capacity=*/256);
+// C++ plugin: only the data-production logic, no capacity decision.
+registry.register_table("my_src",
+    ibex::runtime::make_buffered_source([](ibex::runtime::StreamBuffered& buf) {
+        for (auto& batch : my_data_source) buf.write(batch);
+        buf.close();
+    }));
+```
 
-// Register as the stream source.
+```
+// Ibex query: capacity is a tuning parameter alongside resample, filters, etc.
+extern fn my_src(capacity: Int) -> TimeFrame from "plugin.hpp";
+Stream {
+    source    = my_src(512),
+    transform = [resample 1s, select { close = last(price) }],
+    sink      = my_sink()
+};
+```
+
+**Manual — capacity chosen in C++ (`StreamBuffered` directly)**
+
+```cpp
+// Use when the plugin owns the producer lifecycle explicitly.
+auto buf = std::make_shared<ibex::runtime::StreamBuffered>(/*capacity=*/256);
 registry.register_table("my_src", buf->make_source_fn());
 
-// Producer thread:
-buf->write(my_table);   // blocks (yields) if ring is full
-buf->close();           // signal end-of-stream
+std::thread producer([buf] {
+    buf->write(my_table);   // blocks (yields) if ring is full
+    buf->close();
+});
 ```
 
 #### Comparison with kernel-backed sockets

@@ -393,6 +393,23 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
             incoming batch immediately.
           </p>
           <p>
+            In <strong>TimeBucket</strong> mode the bucket is flushed by
+            whichever trigger fires first: a <em>wall-clock check</em> (the
+            configured duration has elapsed since the bucket opened) or a
+            <em>data-timestamp check</em> (an incoming row carries a later
+            bucket's timestamp). The wall-clock trigger gives prompt delivery
+            for real-time feeds; the data-timestamp trigger handles historical
+            replay correctly.
+          </p>
+          <p class="note">
+            <strong>Caveat:</strong> the wall-clock check runs only when the
+            source call returns. A source that blocks indefinitely — for
+            example a UDP socket with no receive timeout — delays the flush
+            until the next message arrives. For predictable latency, sources
+            should return quickly (e.g. use a socket timeout) rather than
+            blocking past bucket boundaries.
+          </p>
+          <p>
             Use <code>import</code> to load a library stub that registers
             the extern source and sink functions as a plugin.
           </p>

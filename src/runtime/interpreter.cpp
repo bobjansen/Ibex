@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <random>
 #include <set>
 #include <cstdint>
 #include <cstring>
@@ -4369,6 +4370,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     return output;
 }
 
+constexpr auto is_rng_func(std::string_view name) -> bool;
+constexpr auto rng_func_returns_int(std::string_view name) -> bool;
+
 auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                      const ExternRegistry* externs) -> std::expected<ExprType, std::string> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
@@ -4467,6 +4471,10 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 return std::unexpected(call->callee + ": unknown column '" + col_ref->name + "'");
             }
             return expr_type_for_column(*source);
+        }
+        // Vectorized RNG functions
+        if (is_rng_func(call->callee)) {
+            return rng_func_returns_int(call->callee) ? ExprType::Int : ExprType::Double;
         }
         // Extern scalar function lookup
         if (externs == nullptr) {
@@ -5157,6 +5165,213 @@ constexpr auto is_rolling_func(std::string_view name) -> bool {
            name == "rolling_std" || name == "rolling_ewma";
 }
 
+// ─── Vectorized RNG ───────────────────────────────────────────────────────────
+
+constexpr auto is_rng_func(std::string_view name) -> bool {
+    return name == "rand_uniform" || name == "rand_normal" || name == "rand_student_t" ||
+           name == "rand_gamma" || name == "rand_exponential" || name == "rand_bernoulli" ||
+           name == "rand_poisson" || name == "rand_int";
+}
+
+constexpr auto rng_func_returns_int(std::string_view name) -> bool {
+    return name == "rand_bernoulli" || name == "rand_poisson" || name == "rand_int";
+}
+
+// Thread-local Mersenne Twister seeded from std::random_device.
+// Each thread gets its own independent PRNG state.
+auto get_rng() noexcept -> std::mt19937_64& {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    return rng;
+}
+
+// Extract a numeric parameter from a CallExpr argument at `pos`.
+// Returns the value as double; the caller is responsible for range validation.
+auto extract_rng_param(const ir::CallExpr& call, std::size_t pos, std::string_view func_name)
+    -> std::expected<double, std::string> {
+    if (pos >= call.args.size()) {
+        return std::unexpected(std::string(func_name) + ": missing argument at position " +
+                               std::to_string(pos));
+    }
+    const auto* lit = std::get_if<ir::Literal>(&call.args[pos]->node);
+    if (!lit) {
+        return std::unexpected(std::string(func_name) + ": argument " + std::to_string(pos) +
+                               " must be a numeric literal");
+    }
+    return std::visit(
+        [&](const auto& v) -> std::expected<double, std::string> {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, std::int64_t>) {
+                return static_cast<double>(v);
+            } else if constexpr (std::is_same_v<T, double>) {
+                return v;
+            } else {
+                return std::unexpected(std::string(func_name) + ": argument " +
+                                       std::to_string(pos) + " must be numeric");
+            }
+        },
+        lit->value);
+}
+
+// Generate a full column of `rows` independent draws from the named distribution.
+//
+//   rand_uniform(low, high)          – Uniform[low, high)            → Float
+//   rand_normal(mean, stddev)        – Normal(mean, stddev²)          → Float
+//   rand_student_t(df)               – Student-t(df)                  → Float
+//   rand_gamma(shape, scale)         – Gamma(shape, scale)            → Float
+//   rand_exponential(lambda)         – Exponential(1/lambda)          → Float
+//   rand_bernoulli(p)                – Bernoulli(p)  → 0 or 1         → Int
+//   rand_poisson(lambda)             – Poisson(lambda)                → Int
+//   rand_int(lo, hi)                 – Uniform integer [lo, hi]       → Int
+//
+auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
+    -> std::expected<ColumnValue, std::string> {
+    auto& rng = get_rng();
+    const auto& name = call.callee;
+
+    if (name == "rand_uniform") {
+        if (call.args.size() != 2) {
+            return std::unexpected("rand_uniform: expected 2 arguments (low, high)");
+        }
+        auto low = extract_rng_param(call, 0, name);
+        if (!low) return std::unexpected(low.error());
+        auto high = extract_rng_param(call, 1, name);
+        if (!high) return std::unexpected(high.error());
+        if (*low >= *high) {
+            return std::unexpected("rand_uniform: low must be less than high");
+        }
+        std::uniform_real_distribution<double> dist(*low, *high);
+        Column<double> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    if (name == "rand_normal") {
+        if (call.args.size() != 2) {
+            return std::unexpected("rand_normal: expected 2 arguments (mean, stddev)");
+        }
+        auto mean = extract_rng_param(call, 0, name);
+        if (!mean) return std::unexpected(mean.error());
+        auto stddev = extract_rng_param(call, 1, name);
+        if (!stddev) return std::unexpected(stddev.error());
+        if (*stddev <= 0.0) {
+            return std::unexpected("rand_normal: stddev must be positive");
+        }
+        std::normal_distribution<double> dist(*mean, *stddev);
+        Column<double> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    if (name == "rand_student_t") {
+        if (call.args.size() != 1) {
+            return std::unexpected("rand_student_t: expected 1 argument (degrees_of_freedom)");
+        }
+        auto df = extract_rng_param(call, 0, name);
+        if (!df) return std::unexpected(df.error());
+        if (*df <= 0.0) {
+            return std::unexpected("rand_student_t: degrees_of_freedom must be positive");
+        }
+        std::student_t_distribution<double> dist(*df);
+        Column<double> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    if (name == "rand_gamma") {
+        if (call.args.size() != 2) {
+            return std::unexpected("rand_gamma: expected 2 arguments (shape, scale)");
+        }
+        auto shape = extract_rng_param(call, 0, name);
+        if (!shape) return std::unexpected(shape.error());
+        auto scale = extract_rng_param(call, 1, name);
+        if (!scale) return std::unexpected(scale.error());
+        if (*shape <= 0.0) {
+            return std::unexpected("rand_gamma: shape must be positive");
+        }
+        if (*scale <= 0.0) {
+            return std::unexpected("rand_gamma: scale must be positive");
+        }
+        std::gamma_distribution<double> dist(*shape, *scale);
+        Column<double> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    if (name == "rand_exponential") {
+        if (call.args.size() != 1) {
+            return std::unexpected("rand_exponential: expected 1 argument (lambda)");
+        }
+        auto lambda = extract_rng_param(call, 0, name);
+        if (!lambda) return std::unexpected(lambda.error());
+        if (*lambda <= 0.0) {
+            return std::unexpected("rand_exponential: lambda must be positive");
+        }
+        std::exponential_distribution<double> dist(*lambda);
+        Column<double> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    if (name == "rand_bernoulli") {
+        if (call.args.size() != 1) {
+            return std::unexpected("rand_bernoulli: expected 1 argument (p)");
+        }
+        auto p = extract_rng_param(call, 0, name);
+        if (!p) return std::unexpected(p.error());
+        if (*p < 0.0 || *p > 1.0) {
+            return std::unexpected("rand_bernoulli: p must be in [0, 1]");
+        }
+        std::bernoulli_distribution dist(*p);
+        Column<std::int64_t> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng) ? 1 : 0);
+        return col;
+    }
+
+    if (name == "rand_poisson") {
+        if (call.args.size() != 1) {
+            return std::unexpected("rand_poisson: expected 1 argument (lambda)");
+        }
+        auto lambda = extract_rng_param(call, 0, name);
+        if (!lambda) return std::unexpected(lambda.error());
+        if (*lambda <= 0.0) {
+            return std::unexpected("rand_poisson: lambda must be positive");
+        }
+        std::poisson_distribution<std::int64_t> dist(static_cast<double>(*lambda));
+        Column<std::int64_t> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    if (name == "rand_int") {
+        if (call.args.size() != 2) {
+            return std::unexpected("rand_int: expected 2 arguments (lo, hi)");
+        }
+        auto lo_d = extract_rng_param(call, 0, name);
+        if (!lo_d) return std::unexpected(lo_d.error());
+        auto hi_d = extract_rng_param(call, 1, name);
+        if (!hi_d) return std::unexpected(hi_d.error());
+        auto lo = static_cast<std::int64_t>(*lo_d);
+        auto hi = static_cast<std::int64_t>(*hi_d);
+        if (lo > hi) {
+            return std::unexpected("rand_int: lo must be <= hi");
+        }
+        std::uniform_int_distribution<std::int64_t> dist(lo, hi);
+        Column<std::int64_t> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    return std::unexpected("unknown rng function: " + name);
+}
+
 // Like update_table but evaluates rolling aggregate expressions using the given window duration.
 // Non-rolling fields are evaluated via evaluate_field_column (same as regular update_table).
 auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
@@ -5187,6 +5402,12 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 if (!col) {
                     return std::unexpected(col.error());
                 }
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
+            if (is_rng_func(call->callee)) {
+                auto col = apply_rng_func(*call, output.rows());
+                if (!col) return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
@@ -5242,6 +5463,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             if (is_rolling_func(call->callee)) {
                 return std::unexpected(call->callee + ": requires a window clause");
+            }
+            if (is_rng_func(call->callee)) {
+                auto col = apply_rng_func(*call, rows);
+                if (!col) return std::unexpected(col.error());
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
             }
         }
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);

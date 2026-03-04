@@ -1900,3 +1900,318 @@ TEST_CASE("Interpret EWMA grouped") {
     CHECK((*ev)[0] == Catch::Approx(2.0));
     CHECK((*ev)[1] == Catch::Approx(3.0));
 }
+
+// ─── Vectorized RNG ───────────────────────────────────────────────────────────
+
+TEST_CASE("rand_uniform generates correct number of rows in bounds") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { u = rand_uniform(0.0, 1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("u");
+    REQUIRE(col != nullptr);
+    const auto* dv = std::get_if<Column<double>>(col);
+    REQUIRE(dv != nullptr);
+    REQUIRE(dv->size() == 5);
+    for (std::size_t i = 0; i < dv->size(); ++i) {
+        CHECK((*dv)[i] >= 0.0);
+        CHECK((*dv)[i] < 1.0);
+    }
+}
+
+TEST_CASE("rand_uniform with integer literals") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { u = rand_uniform(10.0, 20.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("u");
+    REQUIRE(col != nullptr);
+    const auto* dv = std::get_if<Column<double>>(col);
+    REQUIRE(dv != nullptr);
+    for (std::size_t i = 0; i < dv->size(); ++i) {
+        CHECK((*dv)[i] >= 10.0);
+        CHECK((*dv)[i] < 20.0);
+    }
+}
+
+TEST_CASE("rand_normal generates correct column type and size") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { n = rand_normal(0.0, 1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("n");
+    REQUIRE(col != nullptr);
+    const auto* dv = std::get_if<Column<double>>(col);
+    REQUIRE(dv != nullptr);
+    REQUIRE(dv->size() == 10);
+    // Values from N(0,1) are almost certainly in (-10, 10)
+    for (std::size_t i = 0; i < dv->size(); ++i) {
+        CHECK((*dv)[i] > -10.0);
+        CHECK((*dv)[i] < 10.0);
+    }
+}
+
+TEST_CASE("rand_student_t generates correct column type and size") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { t_val = rand_student_t(5.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("t_val");
+    REQUIRE(col != nullptr);
+    const auto* dv = std::get_if<Column<double>>(col);
+    REQUIRE(dv != nullptr);
+    REQUIRE(dv->size() == 5);
+}
+
+TEST_CASE("rand_gamma generates positive values") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { g = rand_gamma(2.0, 1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("g");
+    REQUIRE(col != nullptr);
+    const auto* dv = std::get_if<Column<double>>(col);
+    REQUIRE(dv != nullptr);
+    REQUIRE(dv->size() == 5);
+    for (std::size_t i = 0; i < dv->size(); ++i) {
+        CHECK((*dv)[i] > 0.0);
+    }
+}
+
+TEST_CASE("rand_exponential generates positive values") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { e = rand_exponential(2.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("e");
+    REQUIRE(col != nullptr);
+    const auto* dv = std::get_if<Column<double>>(col);
+    REQUIRE(dv != nullptr);
+    REQUIRE(dv->size() == 5);
+    for (std::size_t i = 0; i < dv->size(); ++i) {
+        CHECK((*dv)[i] > 0.0);
+    }
+}
+
+TEST_CASE("rand_bernoulli generates 0 or 1 integers") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { b = rand_bernoulli(0.5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("b");
+    REQUIRE(col != nullptr);
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    REQUIRE(iv->size() == 10);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK(((*iv)[i] == 0 || (*iv)[i] == 1));
+    }
+}
+
+TEST_CASE("rand_bernoulli p=0 always yields 0") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { b = rand_bernoulli(0.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("b");
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] == 0);
+    }
+}
+
+TEST_CASE("rand_bernoulli p=1 always yields 1") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { b = rand_bernoulli(1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("b");
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] == 1);
+    }
+}
+
+TEST_CASE("rand_poisson generates non-negative integers") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { p = rand_poisson(3.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("p");
+    REQUIRE(col != nullptr);
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    REQUIRE(iv->size() == 5);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] >= 0);
+    }
+}
+
+TEST_CASE("rand_int generates integers in [lo, hi]") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { r = rand_int(1, 6) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("r");
+    REQUIRE(col != nullptr);
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    REQUIRE(iv->size() == 10);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] >= 1);
+        CHECK((*iv)[i] <= 6);
+    }
+}
+
+TEST_CASE("rand_int lo == hi always yields lo") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { r = rand_int(7, 7) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("r");
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] == 7);
+    }
+}
+
+TEST_CASE("rand functions produce independent columns") {
+    // Two rand_uniform calls in the same query should produce different columns.
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                               11, 12, 13, 14, 15, 16, 17, 18, 19, 20});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { a = rand_uniform(0.0, 1.0), b = rand_uniform(0.0, 1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* a_col = result->find("a");
+    const auto* b_col = result->find("b");
+    REQUIRE(a_col != nullptr);
+    REQUIRE(b_col != nullptr);
+    const auto* av = std::get_if<Column<double>>(a_col);
+    const auto* bv = std::get_if<Column<double>>(b_col);
+    REQUIRE(av != nullptr);
+    REQUIRE(bv != nullptr);
+    // Columns should differ (probability of all 20 values matching is astronomically small)
+    bool any_differ = false;
+    for (std::size_t i = 0; i < av->size(); ++i) {
+        if ((*av)[i] != (*bv)[i]) {
+            any_differ = true;
+            break;
+        }
+    }
+    CHECK(any_differ);
+}
+
+TEST_CASE("rand_uniform invalid arguments") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // low >= high should fail
+    auto ir = require_ir("t[update { u = rand_uniform(1.0, 0.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("rand_normal invalid stddev") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { n = rand_normal(0.0, 0.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("rand_bernoulli invalid p") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { b = rand_bernoulli(1.5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}

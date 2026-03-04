@@ -8,6 +8,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/stream_buffered.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -877,4 +878,76 @@ Stream {
     auto* close0 = std::get_if<Column<double>>(emitted[0].find("close"));
     REQUIRE(close0 != nullptr);
     CHECK((*close0)[0] == Catch::Approx(99.0));
+}
+
+// Verify that StreamBuffered (SPSC queue helper) works as a stream source.
+//
+// Scenario: a producer thread pushes two ticks into a StreamBuffered; the
+// second is delayed by 30 ms so the wall-clock flush fires between them.
+// Expected: two sink calls — one per bucket — without any double-buffering.
+TEST_CASE("StreamBuffered feeds a TimeBucket stream from a producer thread", "[e2e][stream]") {
+    std::vector<runtime::Table> emitted;
+
+    runtime::ExternRegistry registry;
+
+    // Create the SPSC-backed source.  Capacity of 8 is ample for this test.
+    auto buf = std::make_shared<runtime::StreamBuffered>(8);
+    registry.register_table("tick_src", buf->make_source_fn());
+
+    registry.register_scalar_table_consumer(
+        "tick_sink", runtime::ScalarKind::Int,
+        [&](const runtime::Table& t,
+            const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            emitted.push_back(t);
+            return runtime::ExternValue{std::int64_t{0}};
+        });
+
+    // Producer: write tick 1, sleep past the 20 ms bucket, write tick 2, close.
+    std::thread producer([&buf] {
+        runtime::Table t1;
+        t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
+        t1.add_column("price", Column<double>{200.0});
+        t1.time_index = "ts";
+        buf->write(t1);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+        runtime::Table t2;
+        // Data timestamp still inside bucket 0, but wall clock has moved on.
+        t2.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
+        t2.add_column("price", Column<double>{210.0});
+        t2.time_index = "ts";
+        buf->write(t2);
+
+        buf->close();
+    });
+
+    const char* src = R"(
+extern fn tick_src() -> TimeFrame from "fake.hpp";
+extern fn tick_sink(df: DataFrame) -> Int from "fake.hpp";
+Stream {
+    source    = tick_src(),
+    transform = [resample 20ms, select { close = last(price) }],
+    sink      = tick_sink()
+};
+)";
+
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    auto result = runtime::interpret(*lowered.value(), {}, nullptr, &registry);
+    producer.join();
+    REQUIRE(result.has_value());
+
+    // Wall-clock flush fires between the two ticks: two separate emissions.
+    REQUIRE(emitted.size() == 2);
+
+    auto* close0 = std::get_if<Column<double>>(emitted[0].find("close"));
+    REQUIRE(close0 != nullptr);
+    CHECK((*close0)[0] == Catch::Approx(200.0));
+
+    auto* close1 = std::get_if<Column<double>>(emitted[1].find("close"));
+    REQUIRE(close1 != nullptr);
+    CHECK((*close1)[0] == Catch::Approx(210.0));
 }

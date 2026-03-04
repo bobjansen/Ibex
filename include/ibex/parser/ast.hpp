@@ -151,9 +151,15 @@ struct BlockExpr {
     std::vector<Clause> clauses;
 };
 
+struct NamedArg {
+    std::string name;
+    ExprPtr value;
+};
+
 struct CallExpr {
     std::string callee;
     std::vector<ExprPtr> args;
+    std::vector<NamedArg> named_args;
 };
 
 struct UnaryExpr {

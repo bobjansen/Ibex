@@ -1226,6 +1226,13 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                         cur += len;
                         dst_off[j + 1] = cur;
                     }
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    dst->resize(out_n);
+                    const std::uint8_t* sp = src.data();
+                    std::uint8_t* dp = dst->data();
+                    for (std::size_t j = 0; j < out_n; ++j) {
+                        dp[j] = sp[selected[j]];
+                    }
                 } else {
                     using T = typename ColT::value_type;
                     dst->resize(out_n);
@@ -1390,6 +1397,7 @@ struct StringViewHash {
 enum class ExprType : std::uint8_t {
     Int,
     Double,
+    Bool,
     String,
     Date,
     Timestamp,
@@ -1423,6 +1431,9 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     if (std::holds_alternative<Column<double>>(column)) {
         return ExprType::Double;
     }
+    if (std::holds_alternative<Column<bool>>(column)) {
+        return ExprType::Bool;
+    }
     if (std::holds_alternative<Column<Date>>(column)) {
         return ExprType::Date;
     }
@@ -1442,6 +1453,9 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
             } else if constexpr (std::is_same_v<ColType, Column<Date>> ||
                                  std::is_same_v<ColType, Column<Timestamp>>) {
                 return col[row];
+            } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
+                // ScalarValue has no bool: represent as 0/1 int64
+                return static_cast<std::int64_t>(col[row] ? 1 : 0);
             } else {
                 return col[row];
             }
@@ -1664,6 +1678,11 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                     fk.u64.reserve(rows);
                     for (const auto& ts : col)
                         fk.u64.push_back(static_cast<std::uint64_t>(ts.nanos) ^ kSignFlip);
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    fk.kind = FlatKind::I64;
+                    fk.u64.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i)
+                        fk.u64.push_back(static_cast<std::uint64_t>(col[i] ? 1 : 0) ^ kSignFlip);
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                     fk.kind = FlatKind::Str;
                     fk.str.reserve(rows);
@@ -1719,6 +1738,12 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                             cur += len;
                             dst_off[pos + 1] = cur;
                         }
+                        return dst;
+                    } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                        ColT dst;
+                        dst.resize(rows);
+                        for (std::size_t pos = 0; pos < rows; ++pos)
+                            dst.byte_at(pos) = src[static_cast<std::size_t>(idx[pos])] ? 1u : 0u;
                         return dst;
                     } else {
                         ColT dst;
@@ -1866,7 +1891,17 @@ auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {
 }
 
 auto scalar_from_literal(const ir::Literal& literal) -> ScalarValue {
-    return std::visit([](const auto& v) -> ScalarValue { return v; }, literal.value);
+    return std::visit(
+        [](const auto& v) -> ScalarValue {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, bool>) {
+                // ScalarValue has no bool: represent as 0/1 int64
+                return static_cast<std::int64_t>(v ? 1 : 0);
+            } else {
+                return v;
+            }
+        },
+        literal.value);
 }
 
 auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
@@ -2139,6 +2174,9 @@ auto column_kind(const ColumnValue& column) -> ExprType {
     }
     if (std::holds_alternative<Column<double>>(column)) {
         return ExprType::Double;
+    }
+    if (std::holds_alternative<Column<bool>>(column)) {
+        return ExprType::Bool;
     }
     if (std::holds_alternative<Column<Date>>(column)) {
         return ExprType::Date;
@@ -4407,6 +4445,9 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         if (std::holds_alternative<double>(lit->value)) {
             return ExprType::Double;
         }
+        if (std::holds_alternative<bool>(lit->value)) {
+            return ExprType::Bool;
+        }
         return ExprType::String;
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
@@ -4472,6 +4513,22 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             return expr_type_for_column(*source);
         }
+        // rep() — returns the same type as its first positional argument
+        if (call->callee == "rep") {
+            if (call->args.empty()) {
+                return std::unexpected("rep: expected one positional argument (x)");
+            }
+            const auto& x = *call->args[0];
+            if (const auto* lit = std::get_if<ir::Literal>(&x.node)) {
+                if (std::holds_alternative<bool>(lit->value)) return ExprType::Bool;
+                if (std::holds_alternative<std::int64_t>(lit->value)) return ExprType::Int;
+                if (std::holds_alternative<double>(lit->value)) return ExprType::Double;
+                if (std::holds_alternative<Date>(lit->value)) return ExprType::Date;
+                if (std::holds_alternative<Timestamp>(lit->value)) return ExprType::Timestamp;
+                return ExprType::String;
+            }
+            return infer_expr_type(x, input, scalars, externs);
+        }
         // Vectorized RNG functions
         if (is_rng_func(call->callee)) {
             return rng_func_returns_int(call->callee) ? ExprType::Int : ExprType::Double;
@@ -4529,6 +4586,9 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
                               std::is_same_v<ColType, Column<std::string>>) {
                     return std::string(column[row]);
+                } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
+                    // ExprValue has no bool: represent as 0/1 int64
+                    return static_cast<std::int64_t>(column[row] ? 1 : 0);
                 } else {
                     return column[row];
                 }
@@ -4536,7 +4596,17 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             *source);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        return std::visit([](const auto& v) -> ExprValue { return v; }, lit->value);
+        return std::visit(
+            [](const auto& v) -> ExprValue {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, bool>) {
+                    // ExprValue has no bool: represent as 0/1 int64
+                    return static_cast<std::int64_t>(v ? 1 : 0);
+                } else {
+                    return v;
+                }
+            },
+            lit->value);
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
         auto left = eval_expr(*bin->left, input, row, scalars, externs);
@@ -4651,6 +4721,9 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
             break;
         case ExprType::Double:
             new_column = Column<double>{};
+            break;
+        case ExprType::Bool:
+            new_column = Column<bool>{};
             break;
         case ExprType::String:
             new_column = Column<std::string>{};
@@ -5372,6 +5445,151 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
     return std::unexpected("unknown rng function: " + name);
 }
 
+// ─── rep ─────────────────────────────────────────────────────────────────────
+//
+// rep(x, times=1, each=1, length_out=-1)
+//
+//   x          – scalar literal (Int, Float, Bool, String) or column reference.
+//   times      – repeat the whole sequence this many times (default 1).
+//   each       – repeat each element this many times before advancing (default 1).
+//   length_out – desired output length; default is the current table row count.
+//                Shorter sequences are cycled; longer ones are truncated.
+//
+// Mirrors R's rep() semantics within the columnar context.
+
+auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t rows)
+    -> std::expected<ColumnValue, std::string> {
+    if (call.args.size() != 1) {
+        return std::unexpected("rep: expected exactly one positional argument (x)");
+    }
+
+    // ── parse named args ────────────────────────────────────────────────────
+    std::int64_t times = 1;
+    std::int64_t each = 1;
+    std::int64_t length_out = static_cast<std::int64_t>(rows);  // default = table rows
+
+    for (const auto& narg : call.named_args) {
+        const auto* lit = std::get_if<ir::Literal>(&narg.value->node);
+        auto as_int = [&]() -> std::expected<std::int64_t, std::string> {
+            if (lit == nullptr) {
+                return std::unexpected("rep: named argument '" + narg.name +
+                                       "' must be a literal");
+            }
+            if (const auto* i = std::get_if<std::int64_t>(&lit->value)) {
+                return *i;
+            }
+            if (const auto* d = std::get_if<double>(&lit->value)) {
+                return static_cast<std::int64_t>(*d);
+            }
+            return std::unexpected("rep: named argument '" + narg.name +
+                                   "' must be an integer");
+        };
+        if (narg.name == "times") {
+            auto v = as_int();
+            if (!v) return std::unexpected(v.error());
+            times = *v;
+            if (times <= 0) return std::unexpected("rep: times must be positive");
+        } else if (narg.name == "each") {
+            auto v = as_int();
+            if (!v) return std::unexpected(v.error());
+            each = *v;
+            if (each <= 0) return std::unexpected("rep: each must be positive");
+        } else if (narg.name == "length_out") {
+            auto v = as_int();
+            if (!v) return std::unexpected(v.error());
+            length_out = *v;
+            if (length_out < 0)
+                return std::unexpected("rep: length_out must be non-negative");
+        } else {
+            return std::unexpected("rep: unknown named argument '" + narg.name + "'");
+        }
+    }
+
+    const std::size_t out_len = static_cast<std::size_t>(length_out);
+    const std::size_t n_times = static_cast<std::size_t>(times);
+    const std::size_t n_each = static_cast<std::size_t>(each);
+
+    // ── scalar literal x ────────────────────────────────────────────────────
+    if (const auto* lit = std::get_if<ir::Literal>(&call.args[0]->node)) {
+        return std::visit(
+            [&](const auto& v) -> ColumnValue {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, bool>) {
+                    Column<bool> col;
+                    col.reserve(out_len);
+                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    return col;
+                } else if constexpr (std::is_same_v<T, std::int64_t>) {
+                    Column<std::int64_t> col;
+                    col.reserve(out_len);
+                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    return col;
+                } else if constexpr (std::is_same_v<T, double>) {
+                    Column<double> col;
+                    col.reserve(out_len);
+                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    return col;
+                } else if constexpr (std::is_same_v<T, std::string>) {
+                    Column<std::string> col;
+                    col.reserve(out_len);
+                    for (std::size_t i = 0; i < out_len; ++i)
+                        col.push_back(std::string_view{v});
+                    return col;
+                } else if constexpr (std::is_same_v<T, Date>) {
+                    Column<Date> col;
+                    col.reserve(out_len);
+                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    return col;
+                } else {
+                    static_assert(std::is_same_v<T, Timestamp>);
+                    Column<Timestamp> col;
+                    col.reserve(out_len);
+                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    return col;
+                }
+            },
+            lit->value);
+    }
+
+    // ── column reference x ───────────────────────────────────────────────────
+    if (const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node)) {
+        const auto* src_col = input.find(col_ref->name);
+        if (src_col == nullptr) {
+            return std::unexpected("rep: unknown column '" + col_ref->name + "'");
+        }
+        return std::visit(
+            [&](const auto& col) -> ColumnValue {
+                using ColT = std::decay_t<decltype(col)>;
+                std::size_t src_len = col.size();
+                if (src_len == 0) {
+                    return ColT{};
+                }
+                // pattern_len = src_len * each * times (the logical full sequence)
+                std::size_t pattern_len = src_len * n_each * n_times;
+                ColT result;
+                result.reserve(out_len);
+                for (std::size_t i = 0; i < out_len; ++i) {
+                    // Position within the repeating pattern (cycled via %)
+                    std::size_t pos_in_pattern = pattern_len > 0 ? (i % pattern_len) : 0;
+                    // Within one "times" cycle: position in (each-repeated sequence)
+                    std::size_t pos_in_each_seq = pos_in_pattern % (src_len * n_each);
+                    // Index into original column
+                    std::size_t src_idx = pos_in_each_seq / n_each;
+                    if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                        result.push_back(col[src_idx]);
+                    } else {
+                        result.push_back(col[src_idx]);
+                    }
+                }
+                return result;
+            },
+            *src_col);
+    }
+
+    return std::unexpected(
+        "rep: first argument must be a scalar literal or column reference");
+}
+
 // Like update_table but evaluates rolling aggregate expressions using the given window duration.
 // Non-rolling fields are evaluated via evaluate_field_column (same as regular update_table).
 auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
@@ -5407,6 +5625,12 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
             }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, output.rows());
+                if (!col) return std::unexpected(col.error());
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
+            if (call->callee == "rep") {
+                auto col = apply_rep_func(*call, output, output.rows());
                 if (!col) return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
@@ -5470,6 +5694,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+            if (call->callee == "rep") {
+                auto col = apply_rep_func(*call, output, rows);
+                if (!col) return std::unexpected(col.error());
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
         }
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);
         if (!inferred) {
@@ -5491,6 +5721,9 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 break;
             case ExprType::Double:
                 new_column = Column<double>{};
+                break;
+            case ExprType::Bool:
+                new_column = Column<bool>{};
                 break;
             case ExprType::String:
                 new_column = Column<std::string>{};

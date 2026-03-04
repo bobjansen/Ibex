@@ -627,6 +627,9 @@ class Lowerer {
             if (const auto* double_value = std::get_if<double>(&literal->value)) {
                 return ir::Expr{.node = ir::Literal{.value = *double_value}};
             }
+            if (const auto* bool_value = std::get_if<bool>(&literal->value)) {
+                return ir::Expr{.node = ir::Literal{.value = *bool_value}};
+            }
             if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
                 return ir::Expr{.node = ir::Literal{.value = *str_value}};
             }
@@ -649,6 +652,16 @@ class Lowerer {
                 }
                 lowered_call.args.push_back(
                     std::make_shared<ir::Expr>(std::move(lowered_arg.value())));
+            }
+            lowered_call.named_args.reserve(call->named_args.size());
+            for (const auto& narg : call->named_args) {
+                auto lowered_val = lower_expr_to_ir(*narg.value);
+                if (!lowered_val.has_value()) {
+                    return std::unexpected(lowered_val.error());
+                }
+                lowered_call.named_args.push_back(ir::NamedArg{
+                    .name = narg.name,
+                    .value = std::make_shared<ir::Expr>(std::move(lowered_val.value()))});
             }
             return ir::Expr{.node = std::move(lowered_call)};
         }

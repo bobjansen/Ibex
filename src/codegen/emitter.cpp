@@ -494,6 +494,9 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                             return "ibex::ops::int_lit(std::int64_t{" + std::to_string(v) + "})";
                         } else if constexpr (std::is_same_v<V, double>) {
                             return "ibex::ops::dbl_lit(" + format_double(v) + ")";
+                        } else if constexpr (std::is_same_v<V, bool>) {
+                            return "ibex::ops::int_lit(std::int64_t{" +
+                                   std::string(v ? "1" : "0") + "})";
                         } else if constexpr (std::is_same_v<V, std::string>) {
                             return "ibex::ops::str_lit(\"" + escape_string(v) + "\")";
                         } else if constexpr (std::is_same_v<V, Date>) {
@@ -572,6 +575,8 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
                             return std::to_string(v);
                         } else if constexpr (std::is_same_v<V, double>) {
                             return format_double(v);
+                        } else if constexpr (std::is_same_v<V, bool>) {
+                            return v ? "1" : "0";
                         } else if constexpr (std::is_same_v<V, std::string>) {
                             return "\"" + escape_string(v) + "\"";
                         } else if constexpr (std::is_same_v<V, Date>) {

@@ -22,7 +22,8 @@ enum class ScalarKind : std::uint8_t {
 };
 
 using ColumnValue = std::variant<Column<std::int64_t>, Column<double>, Column<std::string>,
-                                 Column<Categorical>, Column<Date>, Column<Timestamp>>;
+                                 Column<Categorical>, Column<Date>, Column<Timestamp>,
+                                 Column<bool>>;
 using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 
 struct ColumnEntry {

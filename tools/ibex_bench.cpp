@@ -428,6 +428,13 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                     }
                     return ibex::Column<ibex::Categorical>(col.dictionary_ptr(), col.index_ptr(),
                                                            std::move(codes));
+                } else if constexpr (std::is_same_v<ColType, ibex::Column<bool>>) {
+                    ibex::Column<bool> data;
+                    data.reserve(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        data.push_back(col[i]);
+                    }
+                    return data;
                 } else {
                     static_assert(std::is_same_v<ColType, void>, "Unhandled column type");
                 }

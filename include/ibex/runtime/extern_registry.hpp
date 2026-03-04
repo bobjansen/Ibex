@@ -11,11 +11,23 @@
 
 namespace ibex::runtime {
 
+/// Sentinel returned by a stream source to signal "receive timeout — no data
+/// arrived but I am not done; keep listening."
+///
+/// Returning StreamTimeout instead of an empty Table lets the stream event
+/// loop fire the wall-clock bucket flush and then call the source again,
+/// so that:
+///   • no messages are missed (the source stays live), and
+///   • the closed bucket is emitted promptly even during idle periods.
+///
+/// An empty Table (rows == 0) still signals end-of-stream (EOF).
+struct StreamTimeout {};
+
 /// Type-erased external function wrapper.
 ///
 /// Stores C++ callables for interop with Ibex queries.
 /// Functions are registered by name and can be looked up at runtime.
-using ExternValue = std::variant<Table, ScalarValue>;
+using ExternValue = std::variant<Table, ScalarValue, StreamTimeout>;
 using ExternArgs = std::vector<ScalarValue>;
 using ExternFn = std::function<std::expected<ExternValue, std::string>(const ExternArgs&)>;
 

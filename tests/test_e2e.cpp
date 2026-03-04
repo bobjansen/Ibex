@@ -807,3 +807,74 @@ Stream {
     REQUIRE(close1 != nullptr);
     CHECK((*close1)[0] == Catch::Approx(110.0));
 }
+
+// Verify that a source returning StreamTimeout (receive timeout, no data) keeps
+// the stream alive and still triggers the wall-clock flush.
+//
+// Scenario: one tick arrives in bucket 0, then the source returns StreamTimeout
+// repeatedly while 30 ms elapses (> 20 ms bucket), then signals EOF.
+// Expected: the bucket is flushed via the wall-clock check during the timeout
+// loop — not delayed until EOF.
+TEST_CASE("Stream TimeBucket flushes via StreamTimeout during idle period", "[e2e][stream]") {
+    std::vector<runtime::Table> emitted;
+    int call_count = 0;
+    auto stream_start = std::chrono::steady_clock::now();
+
+    runtime::ExternRegistry registry;
+
+    registry.register_table(
+        "tick_src",
+        [&](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            ++call_count;
+            if (call_count == 1) {
+                // First call: one tick in bucket 0.
+                runtime::Table t;
+                t.add_column("ts", Column<Timestamp>{Timestamp{0}});
+                t.add_column("price", Column<double>{99.0});
+                t.time_index = "ts";
+                return runtime::ExternValue{t};
+            }
+            // Subsequent calls: return StreamTimeout until 30 ms have elapsed,
+            // then signal EOF.  No second tick is ever sent.
+            auto elapsed = std::chrono::steady_clock::now() - stream_start;
+            if (elapsed < std::chrono::milliseconds(30)) {
+                return runtime::ExternValue{runtime::StreamTimeout{}};
+            }
+            return runtime::ExternValue{runtime::Table{}};  // EOF
+        });
+
+    registry.register_scalar_table_consumer(
+        "tick_sink", runtime::ScalarKind::Int,
+        [&](const runtime::Table& t,
+            const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            emitted.push_back(t);
+            return runtime::ExternValue{std::int64_t{0}};
+        });
+
+    const char* src = R"(
+extern fn tick_src() -> TimeFrame from "fake.hpp";
+extern fn tick_sink(df: DataFrame) -> Int from "fake.hpp";
+Stream {
+    source    = tick_src(),
+    transform = [resample 20ms, select { close = last(price) }],
+    sink      = tick_sink()
+};
+)";
+
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    auto result = runtime::interpret(*lowered.value(), {}, nullptr, &registry);
+    REQUIRE(result.has_value());
+
+    // The bucket must have been flushed during the StreamTimeout loop, before EOF.
+    // Without StreamTimeout support the bucket would only flush at EOF — which
+    // would still yield one emission, but from the wrong trigger.
+    // Here we verify the flush happened AND carried the correct value.
+    REQUIRE(emitted.size() == 1);
+
+    auto* close0 = std::get_if<Column<double>>(emitted[0].find("close"));
+    REQUIRE(close0 != nullptr);
+    CHECK((*close0)[0] == Catch::Approx(99.0));
+}

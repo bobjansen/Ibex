@@ -1290,9 +1290,21 @@ All three fields are required. Field order within the braces is
 
 **`source = <extern_call>`**
 
-An extern function call that returns a `DataFrame` or `TimeFrame` on each
-invocation. The source is called repeatedly by the event loop; the loop
-terminates when the source returns an **empty** DataFrame (zero rows).
+An extern function call that returns one of three values on each invocation:
+
+| Return value | Meaning |
+|---|---|
+| `DataFrame` / `TimeFrame` with rows > 0 | A batch of data to process |
+| `DataFrame` / `TimeFrame` with rows = 0 | **End-of-stream (EOF)** — the event loop stops |
+| `StreamTimeout` | **Receive timeout** — no data arrived; keep listening |
+
+`StreamTimeout` is a C++ sentinel type (`ibex::runtime::StreamTimeout{}`)
+that sources return when an internal timeout fires with no data. The event
+loop runs the wall-clock bucket flush check and then calls the source again.
+Messages are never missed, and the closed bucket is delivered promptly even
+during idle periods when no new tick arrives to trigger the data-timestamp
+check. `StreamTimeout` is meaningful only for `TimeBucket` streams; for
+`PerRow` streams it is silently ignored.
 
 The source extern must be declared via `extern fn` (Section 10) or loaded
 with `import` before the `Stream` expression is evaluated.
@@ -1414,14 +1426,11 @@ Both triggers can fire independently; whichever fires first wins.
 #### Timing caveats
 
 - **Source blocking.** The wall-clock check runs only when the source call
-  *returns*. If the source blocks indefinitely waiting for input (e.g. a UDP
-  socket with no receive timeout), the check cannot fire until the next
-  message arrives. For low-latency end-of-bucket delivery the source should
-  implement an internal timeout and return the available rows (possibly zero)
-  rather than blocking past the bucket boundary. An empty batch returned by a
-  timeout must be distinguished from EOF; the current source contract uses
-  empty = EOF, so sources requiring timeout-without-EOF need to be wrapped
-  (see §12.2).
+  *returns*. A source that blocks indefinitely — e.g. a UDP `recvfrom` with
+  no timeout — prevents the check from firing until the next message arrives.
+  The recommended pattern is for sources to set a short socket timeout and
+  return `StreamTimeout{}` when it fires. This keeps the event loop alive,
+  allows the wall-clock flush to fire on schedule, and misses no messages.
 
 - **Clock vs. data time.** The wall-clock trigger measures elapsed time since
   the bucket was opened on the real-time clock. For historical replay the
@@ -1431,9 +1440,9 @@ Both triggers can fire independently; whichever fires first wins.
 
 - **Emission timing jitter.** The wall-clock check is opportunistic — it
   fires at the next source return after the deadline, not at the deadline
-  itself. Actual emission can lag the nominal bucket boundary by up to one
-  inter-message interval. High-frequency sources (many messages per second)
-  experience negligible jitter; low-frequency sources may see larger delays.
+  itself. For a source using `StreamTimeout`, jitter is bounded by the socket
+  timeout duration (typically a few milliseconds). For a blocking source,
+  jitter can be up to one full inter-message interval.
 
 ### 12.6 Example
 
@@ -1463,10 +1472,11 @@ immediately when the first tick belonging to the next minute arrives
 `udp_recv` returns an empty DataFrame (the sender signals end-of-stream).
 
 **Note on `udp_recv` timeout:** for prompt end-of-bucket delivery, the
-`udp_recv` implementation should use a short socket receive timeout so that
-it returns quickly when no data arrives, allowing the wall-clock check to
-fire close to the bucket boundary. A `udp_recv` that blocks indefinitely will
-delay emission until the next tick arrives.
+`udp_recv` implementation should use a short socket receive timeout (e.g.
+5–10 ms) and return `StreamTimeout{}` when it fires with no data. This allows
+the wall-clock check to fire close to the bucket boundary while the source
+stays live and misses no messages. A `udp_recv` that blocks indefinitely
+delays emission until the next tick arrives.
 
 ---
 

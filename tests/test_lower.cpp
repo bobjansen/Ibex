@@ -128,3 +128,136 @@ TEST_CASE("Lowering rejects computed group keys") {
     auto result = parser::lower(program);
     REQUIRE_FALSE(result.has_value());
 }
+
+TEST_CASE("Lower rename to IR") {
+    auto program = require_parse("df[rename { cost = price }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* rename = as_node<ir::RenameNode>(result->get());
+    REQUIRE(rename != nullptr);
+    REQUIRE(rename->renames().size() == 1);
+    REQUIRE(rename->renames()[0].new_name == "cost");
+    REQUIRE(rename->renames()[0].old_name == "price");
+    REQUIRE(rename->children().size() == 1);
+    const auto* scan = as_node<ir::ScanNode>(rename->children()[0].get());
+    REQUIRE(scan != nullptr);
+    REQUIRE(scan->source_name() == "df");
+}
+
+TEST_CASE("Lower rename with multiple renames") {
+    auto program = require_parse("df[rename { cost = price, amount = qty }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* rename = as_node<ir::RenameNode>(result->get());
+    REQUIRE(rename != nullptr);
+    REQUIRE(rename->renames().size() == 2);
+    REQUIRE(rename->renames()[0].new_name == "cost");
+    REQUIRE(rename->renames()[0].old_name == "price");
+    REQUIRE(rename->renames()[1].new_name == "amount");
+    REQUIRE(rename->renames()[1].old_name == "qty");
+}
+
+TEST_CASE("Lower filter + order pipeline") {
+    auto program = require_parse("df[filter price > 10, order { price asc }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    // Order is on top of filter
+    const auto* order = as_node<ir::OrderNode>(result->get());
+    REQUIRE(order != nullptr);
+    REQUIRE(order->keys().size() == 1);
+    REQUIRE(order->keys()[0].name == "price");
+    REQUIRE(order->keys()[0].ascending);
+
+    REQUIRE(order->children().size() == 1);
+    const auto* filter = as_node<ir::FilterNode>(order->children()[0].get());
+    REQUIRE(filter != nullptr);
+}
+
+TEST_CASE("Lower update without group-by") {
+    auto program = require_parse("df[update { total = price * qty }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* update = as_node<ir::UpdateNode>(result->get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->fields().size() == 1);
+    REQUIRE(update->fields()[0].alias == "total");
+    REQUIRE(update->group_by().empty());
+}
+
+TEST_CASE("Lower join to IR") {
+    auto program = require_parse("a join b on key;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Inner);
+    REQUIRE(join->keys().size() == 1);
+    REQUIRE(join->keys()[0] == "key");
+    REQUIRE(join->children().size() == 2);
+}
+
+TEST_CASE("Lower left join to IR") {
+    auto program = require_parse("a left join b on id;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Left);
+}
+
+TEST_CASE("Lower asof join to IR") {
+    auto program = require_parse("a asof join b on {ts, symbol};");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Asof);
+    REQUIRE(join->keys().size() == 2);
+}
+
+TEST_CASE("Lower select with multiple plain columns") {
+    auto program = require_parse("df[select { price, symbol, qty }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* project = as_node<ir::ProjectNode>(result->get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->columns().size() == 3);
+    REQUIRE(project->columns()[0].name == "price");
+    REQUIRE(project->columns()[1].name == "symbol");
+    REQUIRE(project->columns()[2].name == "qty");
+}
+
+TEST_CASE("Lower order with multiple keys") {
+    auto program = require_parse("df[order { symbol asc, price desc }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* order = as_node<ir::OrderNode>(result->get());
+    REQUIRE(order != nullptr);
+    REQUIRE(order->keys().size() == 2);
+    REQUIRE(order->keys()[0].name == "symbol");
+    REQUIRE(order->keys()[0].ascending);
+    REQUIRE(order->keys()[1].name == "price");
+    REQUIRE_FALSE(order->keys()[1].ascending);
+}
+
+TEST_CASE("Lower distinct with braces") {
+    auto program = require_parse("df[distinct { a, b, c }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* distinct = as_node<ir::DistinctNode>(result->get());
+    REQUIRE(distinct != nullptr);
+    REQUIRE(distinct->children().size() == 1);
+    const auto* project = as_node<ir::ProjectNode>(distinct->children()[0].get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->columns().size() == 3);
+}

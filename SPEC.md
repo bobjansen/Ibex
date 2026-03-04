@@ -1300,11 +1300,28 @@ An extern function call that returns one of three values on each invocation:
 
 `StreamTimeout` is a C++ sentinel type (`ibex::runtime::StreamTimeout{}`)
 that sources return when an internal timeout fires with no data. The event
-loop runs the wall-clock bucket flush check and then calls the source again.
-Messages are never missed, and the closed bucket is delivered promptly even
-during idle periods when no new tick arrives to trigger the data-timestamp
-check. `StreamTimeout` is meaningful only for `TimeBucket` streams; for
-`PerRow` streams it is silently ignored.
+loop runs the wall-clock bucket flush check and then calls the source again,
+so that the closed bucket is delivered promptly even during idle periods.
+
+**Ibex does not buffer data on behalf of the source.** Whether messages
+that arrive during the `StreamTimeout` handling window are lost or preserved
+depends entirely on the transport:
+
+- **OS-kernel-backed sockets (UDP, TCP):** the kernel maintains a socket
+  receive buffer (`SO_RCVBUF`) independently of the application. Datagrams
+  arriving while the event loop is processing `StreamTimeout` queue up in the
+  kernel buffer and are returned on the next `recvfrom`/`recv` call. No
+  application-level buffering is needed. Packets are dropped only if
+  `SO_RCVBUF` overflows — a normal UDP property unrelated to `StreamTimeout`.
+
+- **User-space / in-process transports:** if the source reads from a
+  user-space queue and there is no independent producer thread, messages
+  produced during the `StreamTimeout` window may be lost. The plugin author
+  is responsible for arranging OS-level or thread-level buffering so that
+  data accumulates safely until `recvfrom` is called again.
+
+`StreamTimeout` is meaningful only for `TimeBucket` streams; for `PerRow`
+streams it is silently ignored.
 
 The source extern must be declared via `extern fn` (Section 10) or loaded
 with `import` before the `Stream` expression is evaluated.
@@ -1428,9 +1445,11 @@ Both triggers can fire independently; whichever fires first wins.
 - **Source blocking.** The wall-clock check runs only when the source call
   *returns*. A source that blocks indefinitely — e.g. a UDP `recvfrom` with
   no timeout — prevents the check from firing until the next message arrives.
-  The recommended pattern is for sources to set a short socket timeout and
-  return `StreamTimeout{}` when it fires. This keeps the event loop alive,
-  allows the wall-clock flush to fire on schedule, and misses no messages.
+  The recommended pattern is to set a short socket timeout and return
+  `StreamTimeout{}` when it fires. For kernel-backed sockets this is safe:
+  the OS buffers arriving packets in `SO_RCVBUF` while the event loop is
+  processing `StreamTimeout`, so no data is lost. For user-space transports
+  the plugin author must ensure independent buffering (see §12.2).
 
 - **Clock vs. data time.** The wall-clock trigger measures elapsed time since
   the bucket was opened on the real-time clock. For historical replay the

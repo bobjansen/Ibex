@@ -15,10 +15,28 @@ namespace ibex::runtime {
 /// arrived but I am not done; keep listening."
 ///
 /// Returning StreamTimeout instead of an empty Table lets the stream event
-/// loop fire the wall-clock bucket flush and then call the source again,
-/// so that:
-///   • no messages are missed (the source stays live), and
-///   • the closed bucket is emitted promptly even during idle periods.
+/// loop fire the wall-clock bucket flush and then call the source again.
+///
+/// ## Buffering responsibility
+///
+/// Ibex does NOT buffer data on behalf of the source.  The source plugin is
+/// solely responsible for ensuring that messages arriving while StreamTimeout
+/// is being processed are not lost.  Whether that guarantee holds depends
+/// entirely on the underlying transport:
+///
+///   UDP sockets (SO_RCVTIMEO): the OS kernel buffers incoming datagrams in
+///   the socket receive buffer (SO_RCVBUF) regardless of whether recvfrom()
+///   is being called.  A packet that arrives while the event loop is handling
+///   StreamTimeout will wait in the kernel buffer and be returned on the next
+///   recvfrom() call.  No application-level buffering is needed.  Packets are
+///   dropped only if SO_RCVBUF overflows — a property of UDP in general, not
+///   specific to StreamTimeout.
+///
+///   In-process queues / custom transports: if the source reads from a
+///   user-space queue without an independent producer thread, messages may
+///   be lost while StreamTimeout is being processed.  The plugin author must
+///   ensure the producer continues to run (e.g. via a separate thread or an
+///   OS-level buffer) during the StreamTimeout window.
 ///
 /// An empty Table (rows == 0) still signals end-of-stream (EOF).
 struct StreamTimeout {};

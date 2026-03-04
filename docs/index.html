@@ -405,9 +405,13 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
             <strong>Source timeout contract:</strong> the wall-clock check
             runs only when the source call returns. Sources should use a short
             internal timeout and return <code>StreamTimeout{}</code> when no
-            data arrives — the runtime fires the flush check and calls the
-            source again immediately, so no messages are missed and bucket
-            boundaries are respected even during idle periods.
+            data arrives — the runtime fires the flush check and immediately
+            calls the source again. Ibex does not buffer data on behalf of the
+            source; whether messages arriving during this window are preserved
+            depends on the transport. For OS kernel-backed sockets (UDP, TCP)
+            the kernel's receive buffer holds packets safely — no data is lost.
+            For user-space transports the plugin author must arrange independent
+            buffering.
           </p>
           <p>
             Use <code>import</code> to load a library stub that registers

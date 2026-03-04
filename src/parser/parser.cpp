@@ -572,20 +572,37 @@ class Parser {
             }
             if (match(TokenKind::LParen)) {
                 std::vector<ExprPtr> args;
+                std::vector<NamedArg> named_args;
                 if (!check(TokenKind::RParen)) {
                     do {
-                        auto arg = parse_expression();
-                        if (!arg) {
-                            return nullptr;
+                        // Named arg: identifier = expr (only when not followed by == or !=)
+                        if (peek().kind == TokenKind::Identifier &&
+                            peek_next().kind == TokenKind::Eq) {
+                            std::string arg_name{peek().lexeme};
+                            advance();  // consume identifier
+                            advance();  // consume '='
+                            auto val = parse_expression();
+                            if (!val) {
+                                return nullptr;
+                            }
+                            named_args.push_back(
+                                NamedArg{.name = std::move(arg_name), .value = std::move(val)});
+                        } else {
+                            auto arg = parse_expression();
+                            if (!arg) {
+                                return nullptr;
+                            }
+                            args.push_back(std::move(arg));
                         }
-                        args.push_back(std::move(arg));
                     } while (match(TokenKind::Comma));
                 }
                 if (!consume(TokenKind::RParen, "expected ')' after argument list")) {
                     return nullptr;
                 }
                 auto expr = std::make_unique<Expr>();
-                expr->node = CallExpr{.callee = std::move(name), .args = std::move(args)};
+                expr->node = CallExpr{.callee = std::move(name),
+                                      .args = std::move(args),
+                                      .named_args = std::move(named_args)};
                 return expr;
             }
             auto expr = std::make_unique<Expr>();
@@ -1129,6 +1146,13 @@ class Parser {
     auto is_at_end() const -> bool { return peek().kind == TokenKind::Eof; }
 
     auto peek() const -> const Token& { return tokens_[current_]; }
+
+    auto peek_next() const -> const Token& {
+        if (current_ + 1 < tokens_.size()) {
+            return tokens_[current_ + 1];
+        }
+        return tokens_.back();  // EOF token
+    }
 
     auto previous() const -> const Token& { return tokens_[current_ - 1]; }
 

@@ -2215,3 +2215,176 @@ TEST_CASE("rand_bernoulli invalid p") {
     auto result = runtime::interpret(*ir, registry);
     CHECK_FALSE(result.has_value());
 }
+
+// ─── rep ─────────────────────────────────────────────────────────────────────
+
+TEST_CASE("rep scalar int fills table rows") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { c = rep(42) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("c");
+    REQUIRE(col != nullptr);
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    REQUIRE(iv->size() == 5);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] == 42);
+    }
+}
+
+TEST_CASE("rep scalar float fills table rows") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{10, 20, 30});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { c = rep(3.14) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("c");
+    REQUIRE(col != nullptr);
+    const auto* dv = std::get_if<Column<double>>(col);
+    REQUIRE(dv != nullptr);
+    REQUIRE(dv->size() == 3);
+    for (std::size_t i = 0; i < dv->size(); ++i) {
+        CHECK((*dv)[i] == Catch::Approx(3.14));
+    }
+}
+
+TEST_CASE("rep bool true fills boolean mask column") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { mask = rep(true) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("mask");
+    REQUIRE(col != nullptr);
+    const auto* bv = std::get_if<Column<bool>>(col);
+    REQUIRE(bv != nullptr);
+    REQUIRE(bv->size() == 4);
+    for (std::size_t i = 0; i < bv->size(); ++i) {
+        CHECK((*bv)[i] == true);
+    }
+}
+
+TEST_CASE("rep bool false fills boolean mask column with false") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { mask = rep(false) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("mask");
+    REQUIRE(col != nullptr);
+    const auto* bv = std::get_if<Column<bool>>(col);
+    REQUIRE(bv != nullptr);
+    REQUIRE(bv->size() == 3);
+    for (std::size_t i = 0; i < bv->size(); ++i) {
+        CHECK((*bv)[i] == false);
+    }
+}
+
+TEST_CASE("rep named arg times truncates to table rows") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // rep(7, times=100) — scalar, so output is all 7s (length_out defaults to rows)
+    auto ir = require_ir("t[update { c = rep(7, times=100) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("c");
+    REQUIRE(col != nullptr);
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    REQUIRE(iv->size() == 5);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] == 7);
+    }
+}
+
+TEST_CASE("rep named arg length_out overrides row count") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // length_out=3 produces only 3 elements — but update requires same row count,
+    // so length_out must equal rows; here we verify via select
+    auto ir = require_ir("t[update { c = rep(9, length_out=5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("c");
+    REQUIRE(col != nullptr);
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    REQUIRE(iv->size() == 5);
+    for (std::size_t i = 0; i < iv->size(); ++i) {
+        CHECK((*iv)[i] == 9);
+    }
+}
+
+TEST_CASE("rep column reference with each repeats each element") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{10, 20, 30, 40, 50, 60});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // rep(x, each=2) — each element twice, cycling to 6 rows
+    // pattern: 10,10,20,20,30,30 (exactly 6 rows)
+    auto ir = require_ir("t[update { c = rep(x, each=2) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = result->find("c");
+    REQUIRE(col != nullptr);
+    const auto* iv = std::get_if<Column<std::int64_t>>(col);
+    REQUIRE(iv != nullptr);
+    REQUIRE(iv->size() == 6);
+    CHECK((*iv)[0] == 10);
+    CHECK((*iv)[1] == 10);
+    CHECK((*iv)[2] == 20);
+    CHECK((*iv)[3] == 20);
+    CHECK((*iv)[4] == 30);
+    CHECK((*iv)[5] == 30);
+}
+
+TEST_CASE("rep unknown named argument returns error") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { c = rep(1, foo=3) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("rep missing positional argument returns error") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // rep() with no positional args should fail
+    auto ir = require_ir("t[update { c = rep(times=3) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}

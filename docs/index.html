@@ -402,12 +402,12 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
             replay correctly.
           </p>
           <p class="note">
-            <strong>Caveat:</strong> the wall-clock check runs only when the
-            source call returns. A source that blocks indefinitely — for
-            example a UDP socket with no receive timeout — delays the flush
-            until the next message arrives. For predictable latency, sources
-            should return quickly (e.g. use a socket timeout) rather than
-            blocking past bucket boundaries.
+            <strong>Source timeout contract:</strong> the wall-clock check
+            runs only when the source call returns. Sources should use a short
+            internal timeout and return <code>StreamTimeout{}</code> when no
+            data arrives — the runtime fires the flush check and calls the
+            source again immediately, so no messages are missed and bucket
+            boundaries are respected even during idle periods.
           </p>
           <p>
             Use <code>import</code> to load a library stub that registers

@@ -5,6 +5,14 @@ add_library(Ibex::CompilerOptions ALIAS ibex_compiler_options)
 
 target_compile_features(ibex_compiler_options INTERFACE cxx_std_23)
 
+# Clang paired with libstdc++ reports __cpp_concepts=201907L (the C++20 TS
+# value) instead of 202002L, which is required by libstdc++ 13's <expected>
+# guard. Defining it explicitly unlocks std::expected on this toolchain.
+target_compile_options(ibex_compiler_options
+    INTERFACE
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-D__cpp_concepts=202002L>
+)
+
 target_compile_options(ibex_compiler_options
     INTERFACE
         $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:

@@ -1,5 +1,6 @@
 #include <ibex/parser/parser.hpp>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -464,4 +465,345 @@ TEST_CASE("Lexer error includes invalid numeric literal lexeme") {
     auto result = parse(source);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().message.find("1dfsd1") != std::string::npos);
+}
+
+// ─── Unary expressions ──────────────────────────────────────────────────────
+
+TEST_CASE("Parse unary negation") {
+    const char* source = "let x = -42;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<LetStmt>(stmt));
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    const auto& expr = require_expr(let_stmt.value);
+    const auto* unary = std::get_if<UnaryExpr>(&expr.node);
+    REQUIRE(unary != nullptr);
+    REQUIRE(unary->op == UnaryOp::Negate);
+}
+
+TEST_CASE("Parse logical NOT") {
+    const char* source = "df[filter !active];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+    const auto& filter = std::get<FilterClause>(block.clauses[0]);
+    const auto* unary = std::get_if<UnaryExpr>(&require_expr(filter.predicate).node);
+    REQUIRE(unary != nullptr);
+    REQUIRE(unary->op == UnaryOp::Not);
+}
+
+// ─── Boolean literals ────────────────────────────────────────────────────────
+
+TEST_CASE("Parse boolean true literal") {
+    const char* source = "let x = true;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    const auto& expr = require_expr(let_stmt.value);
+    const auto& lit = require_literal(expr);
+    REQUIRE(std::get<bool>(lit.value) == true);
+}
+
+TEST_CASE("Parse boolean false literal") {
+    const char* source = "let x = false;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    const auto& expr = require_expr(let_stmt.value);
+    const auto& lit = require_literal(expr);
+    REQUIRE(std::get<bool>(lit.value) == false);
+}
+
+// ─── Float literals ──────────────────────────────────────────────────────────
+
+TEST_CASE("Parse float literal in expression") {
+    const char* source = "let x = 3.14;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    const auto& expr = require_expr(let_stmt.value);
+    const auto& lit = require_literal(expr);
+    REQUIRE(std::get<double>(lit.value) == Catch::Approx(3.14));
+}
+
+// ─── String literal ──────────────────────────────────────────────────────────
+
+TEST_CASE("Parse string literal") {
+    const char* source = R"(let x = "hello world";)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    const auto& expr = require_expr(let_stmt.value);
+    const auto& lit = require_literal(expr);
+    REQUIRE(std::get<std::string>(lit.value) == "hello world");
+}
+
+// ─── Rename clause ───────────────────────────────────────────────────────────
+
+TEST_CASE("Parse rename clause with braces") {
+    const char* source = "df[rename { cost = price, amount = qty }];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+    REQUIRE(std::holds_alternative<RenameClause>(block.clauses[0]));
+    const auto& rename = std::get<RenameClause>(block.clauses[0]);
+    REQUIRE(rename.fields.size() == 2);
+    REQUIRE(rename.fields[0].name == "cost");
+    REQUIRE(rename.fields[1].name == "amount");
+}
+
+TEST_CASE("Parse rename clause without braces") {
+    const char* source = "df[rename cost = price];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+    const auto& rename = std::get<RenameClause>(block.clauses[0]);
+    REQUIRE(rename.fields.size() == 1);
+    REQUIRE(rename.fields[0].name == "cost");
+}
+
+// ─── Resample clause ─────────────────────────────────────────────────────────
+
+TEST_CASE("Parse resample clause") {
+    const char* source = "tf[resample 1m, select { symbol, open = first(price) }, by symbol];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 3);
+    REQUIRE(std::holds_alternative<ResampleClause>(block.clauses[0]));
+    const auto& resample = std::get<ResampleClause>(block.clauses[0]);
+    REQUIRE(resample.duration.text == "1m");
+}
+
+// ─── Import declaration ─────────────────────────────────────────────────────
+
+TEST_CASE("Parse import declaration with identifier") {
+    const char* source = "import csv;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+    REQUIRE(std::holds_alternative<ImportDecl>(result->statements.front()));
+    const auto& import = std::get<ImportDecl>(result->statements.front());
+    REQUIRE(import.name == "csv");
+}
+
+TEST_CASE("Parse import declaration with string") {
+    const char* source = R"(import "parquet";)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+    REQUIRE(std::holds_alternative<ImportDecl>(result->statements.front()));
+    const auto& import = std::get<ImportDecl>(result->statements.front());
+    REQUIRE(import.name == "parquet");
+}
+
+// ─── Multiple statements ────────────────────────────────────────────────────
+
+TEST_CASE("Parse multiple statements in sequence") {
+    const char* source = R"(
+let x = 1;
+let y = 2;
+foo(x, y);
+)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 3);
+    REQUIRE(std::holds_alternative<LetStmt>(result->statements[0]));
+    REQUIRE(std::holds_alternative<LetStmt>(result->statements[1]));
+    REQUIRE(std::holds_alternative<ExprStmt>(result->statements[2]));
+}
+
+// ─── Nested call expressions ─────────────────────────────────────────────────
+
+TEST_CASE("Parse nested function calls") {
+    const char* source = "foo(bar(1), baz(2, 3));";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& call = require_call(require_expr(expr_stmt.expr));
+    REQUIRE(call.callee == "foo");
+    REQUIRE(call.args.size() == 2);
+    const auto& inner1 = require_call(require_expr(call.args[0]));
+    REQUIRE(inner1.callee == "bar");
+    const auto& inner2 = require_call(require_expr(call.args[1]));
+    REQUIRE(inner2.callee == "baz");
+    REQUIRE(inner2.args.size() == 2);
+}
+
+// ─── Operator precedence ────────────────────────────────────────────────────
+
+TEST_CASE("Parse comparison has lower precedence than arithmetic") {
+    const char* source = "let x = a + b > c * d;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    const auto& expr = require_expr(let_stmt.value);
+    // Top level should be Gt (comparison)
+    const auto& gt = require_binary(expr, BinaryOp::Gt);
+    // Left should be Add
+    require_binary(require_expr(gt.left), BinaryOp::Add);
+    // Right should be Mul
+    require_binary(require_expr(gt.right), BinaryOp::Mul);
+}
+
+TEST_CASE("Parse AND has lower precedence than comparison") {
+    const char* source = "df[filter a > 1 && b < 2];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& filter = std::get<FilterClause>(block.clauses[0]);
+    // Top level should be And
+    const auto& and_expr = require_binary(require_expr(filter.predicate), BinaryOp::And);
+    // Children should be comparisons
+    require_binary(require_expr(and_expr.left), BinaryOp::Gt);
+    require_binary(require_expr(and_expr.right), BinaryOp::Lt);
+}
+
+TEST_CASE("Parse OR has lower precedence than AND") {
+    const char* source = "df[filter a > 1 || b > 2 && c > 3];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& filter = std::get<FilterClause>(block.clauses[0]);
+    // Top level should be Or
+    const auto& or_expr = require_binary(require_expr(filter.predicate), BinaryOp::Or);
+    // Left is just a > 1
+    require_binary(require_expr(or_expr.left), BinaryOp::Gt);
+    // Right is AND of b > 2 && c > 3
+    require_binary(require_expr(or_expr.right), BinaryOp::And);
+}
+
+// ─── Parenthesized expressions ───────────────────────────────────────────────
+
+TEST_CASE("Parse parenthesized expression overrides precedence") {
+    const char* source = "let x = (1 + 2) * 3;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    const auto& expr = require_expr(let_stmt.value);
+    // Top level should be Mul
+    const auto& mul = require_binary(expr, BinaryOp::Mul);
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(mul.right)).value) == 3);
+}
+
+// ─── Let binding without type annotation ─────────────────────────────────────
+
+TEST_CASE("Parse let binding without type annotation") {
+    const char* source = "let x = 42;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& let_stmt = std::get<LetStmt>(stmt);
+    REQUIRE_FALSE(let_stmt.is_mut);
+    REQUIRE(let_stmt.name == "x");
+    REQUIRE_FALSE(let_stmt.type.has_value());
+}
+
+// ─── More error cases ────────────────────────────────────────────────────────
+
+TEST_CASE("Parse error for unmatched bracket") {
+    auto result = parse("df[filter price > 10;");
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Parse empty block is valid (identity)") {
+    auto result = parse("df[];");
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("Parse error for missing expression in let") {
+    auto result = parse("let x = ;");
+    REQUIRE_FALSE(result.has_value());
+}
+
+// ─── Join expressions ────────────────────────────────────────────────────────
+
+TEST_CASE("Parse inner join") {
+    const char* source = "a join b on id;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Inner);
+    REQUIRE(join.keys.size() == 1);
+    REQUIRE(join.keys[0] == "id");
+}
+
+TEST_CASE("Parse left join") {
+    const char* source = "a left join b on key;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Left);
+    REQUIRE(join.keys.size() == 1);
+    REQUIRE(join.keys[0] == "key");
+}
+
+// ─── All comparison operators parse correctly ────────────────────────────────
+
+TEST_CASE("Parse all comparison operators") {
+    auto check = [](const char* source, BinaryOp expected) {
+        auto result = parse(source);
+        REQUIRE(result.has_value());
+        const auto& stmt = result->statements.front();
+        const auto& let_stmt = std::get<LetStmt>(stmt);
+        const auto& expr = require_expr(let_stmt.value);
+        require_binary(expr, expected);
+    };
+    check("let x = a == b;", BinaryOp::Eq);
+    check("let x = a != b;", BinaryOp::Ne);
+    check("let x = a < b;", BinaryOp::Lt);
+    check("let x = a <= b;", BinaryOp::Le);
+    check("let x = a > b;", BinaryOp::Gt);
+    check("let x = a >= b;", BinaryOp::Ge);
+}
+
+// ─── All arithmetic operators parse correctly ────────────────────────────────
+
+TEST_CASE("Parse all arithmetic operators") {
+    auto check = [](const char* source, BinaryOp expected) {
+        auto result = parse(source);
+        REQUIRE(result.has_value());
+        const auto& stmt = result->statements.front();
+        const auto& let_stmt = std::get<LetStmt>(stmt);
+        const auto& expr = require_expr(let_stmt.value);
+        require_binary(expr, expected);
+    };
+    check("let x = a + b;", BinaryOp::Add);
+    check("let x = a - b;", BinaryOp::Sub);
+    check("let x = a * b;", BinaryOp::Mul);
+    check("let x = a / b;", BinaryOp::Div);
+    check("let x = a % b;", BinaryOp::Mod);
 }

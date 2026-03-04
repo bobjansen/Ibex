@@ -3,7 +3,9 @@ include(Catch2Testing)
 add_executable(ibex_tests
     test_column.cpp
     test_csv.cpp
+    test_e2e.cpp
     test_ir_node.cpp
+    test_lexer.cpp
     test_parser.cpp
     test_repl.cpp
     test_lower.cpp

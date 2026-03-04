@@ -1333,10 +1333,10 @@ sink = udp_send("127.0.0.1", 9002)
 
 The compiler infers how and when to emit output from the transform IR.
 
-| Kind         | Trigger condition                          | IR presence              |
-|--------------|---------------------------------------------|--------------------------|
-| `PerRow`     | Emit one output row for every incoming row  | No `ResampleNode` in transform |
-| `TimeBucket` | Buffer rows; emit when time-bucket closes   | `ResampleNode` in transform    |
+| Kind         | Trigger condition                                        | IR presence                    |
+|--------------|----------------------------------------------------------|--------------------------------|
+| `PerRow`     | Emit one output row for every incoming row               | No `ResampleNode` in transform |
+| `TimeBucket` | Buffer rows; emit when the wall-clock bucket end passes  | `ResampleNode` in transform    |
 
 The stream kind is **never specified by the user**; it is derived
 automatically during lowering. `TimeBucket` is selected when the transform
@@ -1374,9 +1374,66 @@ to run multiple streams concurrently within a single session. The event loop:
 2. If the batch is empty, stops and returns.
 3. For `PerRow` streams: applies the transform to the batch and passes each
    output row to the sink.
-4. For `TimeBucket` streams: appends the batch to an internal buffer; when a
-   time-bucket boundary is crossed, applies the transform to the buffer,
-   passes the result to the sink, and resets the buffer.
+4. For `TimeBucket` streams:
+   a. Checks whether the open bucket's wall-clock duration has elapsed (see
+      §12.5.1). If so, flushes the buffer immediately — before processing
+      the new batch.
+   b. Appends the batch to an internal buffer row-by-row. Whenever a row's
+      data timestamp falls in a later bucket than the currently open one,
+      the buffer is flushed and a new bucket is started.
+   c. On end-of-stream, any remaining buffered rows are flushed.
+
+### 12.5.1 TimeBucket Flush Timing
+
+A `TimeBucket` stream has **two independent flush triggers**:
+
+**Wall-clock trigger (primary for real-time sources)**
+
+When the first row of a new bucket arrives, the runtime records the current
+`CLOCK_REALTIME` instant as `bucket_open_wall`. At the top of each
+subsequent source call, it checks:
+
+```
+wall_now() − bucket_open_wall ≥ bucket_duration
+```
+
+If true, the buffer is flushed immediately — before the new batch is even
+inspected. This delivers the closed bucket at (approximately) the moment the
+frame expires on the real-time clock, not when the next message happens to
+carry a future timestamp.
+
+**Data-timestamp trigger (fallback for historical replay)**
+
+Within each batch, rows are inspected one-by-one. When a row's floored
+timestamp is greater than the open bucket's floor, the buffer is flushed and
+the new bucket is opened. This trigger handles replayed or historical data
+where wall-clock time bears no relation to the timestamps in the data.
+
+Both triggers can fire independently; whichever fires first wins.
+
+#### Timing caveats
+
+- **Source blocking.** The wall-clock check runs only when the source call
+  *returns*. If the source blocks indefinitely waiting for input (e.g. a UDP
+  socket with no receive timeout), the check cannot fire until the next
+  message arrives. For low-latency end-of-bucket delivery the source should
+  implement an internal timeout and return the available rows (possibly zero)
+  rather than blocking past the bucket boundary. An empty batch returned by a
+  timeout must be distinguished from EOF; the current source contract uses
+  empty = EOF, so sources requiring timeout-without-EOF need to be wrapped
+  (see §12.2).
+
+- **Clock vs. data time.** The wall-clock trigger measures elapsed time since
+  the bucket was opened on the real-time clock. For historical replay the
+  bucket is opened, the entire replay completes in milliseconds, and the
+  wall-clock duration never reaches `bucket_duration`; the data-timestamp
+  trigger handles replay correctly without any special configuration.
+
+- **Emission timing jitter.** The wall-clock check is opportunistic — it
+  fires at the next source return after the deadline, not at the deadline
+  itself. Actual emission can lag the nominal bucket boundary by up to one
+  inter-message interval. High-frequency sources (many messages per second)
+  experience negligible jitter; low-frequency sources may see larger delays.
 
 ### 12.6 Example
 
@@ -1399,8 +1456,17 @@ let ohlc_stream = Stream {
 ```
 
 The `resample 1m` in the transform causes the stream kind to be inferred as
-`TimeBucket`. The REPL blocks until `udp_recv` returns an empty DataFrame
-(the sender signals end-of-stream).
+`TimeBucket`. Each 1-minute OHLC bar is emitted approximately one minute
+after the first tick in that bar is received (wall-clock trigger), or
+immediately when the first tick belonging to the next minute arrives
+(data-timestamp trigger) — whichever occurs first. The REPL blocks until
+`udp_recv` returns an empty DataFrame (the sender signals end-of-stream).
+
+**Note on `udp_recv` timeout:** for prompt end-of-bucket delivery, the
+`udp_recv` implementation should use a short socket receive timeout so that
+it returns quickly when no data arrives, allowing the wall-clock check to
+fire close to the bucket boundary. A `udp_recv` that blocks indefinitely will
+delay emission until the next tick arrives.
 
 ---
 

@@ -5707,16 +5707,25 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             while (true) {
                 auto src_result = source_fn->func(source_args);
                 if (!src_result) return std::unexpected(src_result.error());
-                const auto* batch = std::get_if<Table>(&src_result.value());
-                if (batch == nullptr) {
-                    return std::unexpected("stream source did not return a table");
+
+                // StreamTimeout: the source had a receive timeout — no data arrived but
+                // it is not done.  Run the wall-clock flush check and keep listening.
+                const bool is_timeout =
+                    std::holds_alternative<StreamTimeout>(src_result.value());
+
+                if (!is_timeout) {
+                    const auto* batch = std::get_if<Table>(&src_result.value());
+                    if (batch == nullptr) {
+                        return std::unexpected("stream source did not return a table");
+                    }
+                    if (batch->rows() == 0) break;  // source signalled EOF
                 }
-                if (batch->rows() == 0) break;  // source signalled EOF
 
                 if (sn.stream_kind() == ir::StreamKind::TimeBucket && bucket_ns > 0) {
                     // Wall-clock end-of-bucket flush: emit the open bucket as soon as
-                    // bucket_ns wall-clock time has elapsed since it was opened, rather
-                    // than waiting for a message with a later data timestamp to arrive.
+                    // bucket_ns wall-clock time has elapsed since it was opened.  This
+                    // fires on both normal data batches and StreamTimeout returns so
+                    // that idle periods do not delay delivery of the closed bucket.
                     if (open_bucket_ns >= 0 && buffer.rows() > 0 &&
                         wall_now_ns() - bucket_open_wall_ns >= bucket_ns) {
                         auto er = emit_buffer(buffer);
@@ -5726,33 +5735,39 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         bucket_open_wall_ns = -1;
                     }
 
-                    // Process row-by-row so we can also detect bucket boundaries from data
-                    // timestamps (handles replayed/historical data where wall-clock does not apply).
-                    for (std::size_t r = 0; r < batch->rows(); ++r) {
-                        Table row_tbl = slice_row(*batch, r);
-                        auto ts_opt = get_last_ts_ns(row_tbl);
-                        std::int64_t row_bucket = ts_opt ? ((*ts_opt / bucket_ns) * bucket_ns) : -1;
+                    if (!is_timeout) {
+                        const auto& batch = std::get<Table>(src_result.value());
+                        // Process row-by-row so we can also detect bucket boundaries from
+                        // data timestamps (handles replayed/historical data where wall-clock
+                        // does not apply).
+                        for (std::size_t r = 0; r < batch.rows(); ++r) {
+                            Table row_tbl = slice_row(batch, r);
+                            auto ts_opt = get_last_ts_ns(row_tbl);
+                            std::int64_t row_bucket =
+                                ts_opt ? ((*ts_opt / bucket_ns) * bucket_ns) : -1;
 
-                        if (open_bucket_ns >= 0 && row_bucket >= 0 &&
-                            row_bucket > open_bucket_ns) {
-                            // Bucket boundary crossed — flush the closed bucket.
-                            auto er = emit_buffer(buffer);
-                            if (!er) return std::unexpected(er.error());
-                            buffer = Table{};
-                        }
-                        if (row_bucket >= 0) {
-                            if (row_bucket != open_bucket_ns) {
-                                // New bucket — record the wall-clock open time.
-                                bucket_open_wall_ns = wall_now_ns();
+                            if (open_bucket_ns >= 0 && row_bucket >= 0 &&
+                                row_bucket > open_bucket_ns) {
+                                // Bucket boundary crossed — flush the closed bucket.
+                                auto er = emit_buffer(buffer);
+                                if (!er) return std::unexpected(er.error());
+                                buffer = Table{};
                             }
-                            open_bucket_ns = row_bucket;
+                            if (row_bucket >= 0) {
+                                if (row_bucket != open_bucket_ns) {
+                                    // New bucket — record the wall-clock open time.
+                                    bucket_open_wall_ns = wall_now_ns();
+                                }
+                                open_bucket_ns = row_bucket;
+                            }
+                            auto app = append_table(buffer, row_tbl);
+                            if (!app) return std::unexpected(app.error());
                         }
-                        auto app = append_table(buffer, row_tbl);
-                        if (!app) return std::unexpected(app.error());
                     }
-                } else {
+                } else if (!is_timeout) {
                     // PerRow — append batch to rolling buffer, run transform, emit last rows.
-                    auto app = append_table(buffer, *batch);
+                    const auto& batch = std::get<Table>(src_result.value());
+                    auto app = append_table(buffer, batch);
                     if (!app) return std::unexpected(app.error());
                     auto er = emit_buffer(buffer);
                     if (!er) return std::unexpected(er.error());

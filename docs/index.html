@@ -409,13 +409,8 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
             calls the source again. Ibex does not buffer data on behalf of the
             source; whether messages arriving during this window are preserved
             depends on the transport. For OS kernel-backed sockets (UDP, TCP)
-            the kernel's receive buffer holds packets safely — no data is lost.
-            For user-space transports the plugin author must arrange independent
-            buffering. The runtime helper <code>StreamBuffered</code> provides
-            a lockless SPSC ring buffer with a compatible <code>ExternFn</code>:
-            a producer thread calls <code>buf-&gt;write(table)</code> while Ibex
-            drains the ring, returning <code>StreamTimeout{}</code> when it is
-            empty — eliminating double-buffering for in-process transports.
+            the kernel's receive buffer holds packets safely. For user-space
+            transports use <code>StreamBuffered</code> (see below).
           </p>
           <p>
             Use <code>import</code> to load a library stub that registers
@@ -443,6 +438,68 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
     source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
     transform = [<span class="kw">filter</span> price &gt; <span class="num">100.0</span>, <span class="kw">rename</span> p = price],
     sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9003</span>)
+};</code></pre>
+        </div>
+      </div>
+
+      <!-- 11. StreamBuffered -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">StreamBuffered</span>
+          <h3>In-process sources without double-buffering.</h3>
+          <p>
+            For in-process or user-space transports a naive source function
+            needs its own buffer <em>and</em> relies on Ibex's internal
+            pipeline — two copies of every message. <code>StreamBuffered</code>
+            collapses this into a single lockless SPSC ring buffer that IS the
+            pipeline buffer.
+          </p>
+          <p>
+            A <strong>producer thread</strong> calls <code>buf-&gt;write(table)</code>
+            (blocking on backpressure via CPU yield) and signals completion with
+            <code>buf-&gt;close()</code>. The <code>ExternFn</code> returned by
+            <code>make_source_fn()</code> is registered as the stream source;
+            it drains the ring on each event-loop iteration, returning
+            <code>StreamTimeout{}</code> when empty so the wall-clock bucket
+            flush still fires on schedule.
+          </p>
+          <p>
+            Cache-line-separated <code>std::atomic</code> head and tail indices
+            keep the producer and consumer on independent cache lines — no
+            false sharing, no mutex on the hot path.
+          </p>
+          <p class="note">
+            <strong>When to use each approach:</strong> for UDP/TCP sockets the
+            OS kernel already provides an equivalent ring buffer
+            (<code>SO_RCVBUF</code>); wrapping them in <code>StreamBuffered</code>
+            would add a redundant copy. Use <code>StreamTimeout{}</code> directly
+            from <code>recvfrom</code> with a short socket timeout instead.
+            <code>StreamBuffered</code> is for in-process queues, shared-memory
+            channels, or any transport without a kernel-managed receive buffer.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// C++ plugin setup</span>
+<span class="kw">#include</span> &lt;ibex/runtime/stream_buffered.hpp&gt;
+
+<span class="kw">auto</span> buf = std::make_shared&lt;ibex::runtime::StreamBuffered&gt;(<span class="num">256</span>);
+registry.register_table(<span class="str">"my_src"</span>, buf-&gt;make_source_fn());
+
+<span class="cm">// Producer thread: push Tables, then signal EOF</span>
+std::thread producer([buf] {
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; batch : my_data_source) {
+        buf-&gt;write(batch);   <span class="cm">// yields if ring full</span>
+    }
+    buf-&gt;close();            <span class="cm">// signal end-of-stream</span>
+});</code></pre>
+<pre style="margin-top:0.6rem;"><code><span class="cm">// Ibex query — unchanged from any other stream source</span>
+<span class="kw">extern fn</span> my_src() -&gt; TimeFrame <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
+<span class="kw">extern fn</span> my_sink(df: DataFrame) -&gt; Int <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
+
+Stream {
+    source    = <span class="fn-name">my_src</span>(),
+    transform = [<span class="kw">resample</span> <span class="num">1s</span>, <span class="kw">select</span> { close = <span class="fn-name">last</span>(price) }],
+    sink      = <span class="fn-name">my_sink</span>()
 };</code></pre>
         </div>
       </div>

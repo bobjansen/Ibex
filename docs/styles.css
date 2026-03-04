@@ -358,6 +358,15 @@ table.bench {
   line-height: 1.6;
 }
 
+.note {
+  font-size: 0.85rem;
+  color: var(--muted);
+  border-left: 3px solid var(--accent-2);
+  padding: 0.5rem 0.75rem;
+  margin: 0.75rem 0;
+  line-height: 1.6;
+}
+
 /* ── Get started ─────────────────────────────────────────────────────────── */
 
 .steps {

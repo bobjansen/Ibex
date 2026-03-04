@@ -88,6 +88,39 @@ let enriched = prices join ohlc on symbol;
 let with_meta = prices left join metadata on symbol;
 ```
 
+### Vectorized RNG
+
+Generate columns of random draws in a single pass — one independent value per
+row, no row-by-row overhead:
+
+```
+// Gaussian noise column
+df[update { noise = rand_normal(0.0, 1.0) }]
+
+// Uniform weights, biased coin, die roll
+df[update {
+    w    = rand_uniform(0.0, 1.0),
+    flip = rand_bernoulli(0.7),
+    die  = rand_int(1, 6),
+}]
+```
+
+All eight distributions are supported:
+
+| Function | Distribution | Output |
+|---|---|---|
+| `rand_uniform(low, high)` | Uniform[low, high) | Float64 |
+| `rand_normal(mean, stddev)` | Normal | Float64 |
+| `rand_student_t(df)` | Student-t | Float64 |
+| `rand_gamma(shape, scale)` | Gamma | Float64 |
+| `rand_exponential(lambda)` | Exponential | Float64 |
+| `rand_bernoulli(p)` | Bernoulli → 0 or 1 | Int64 |
+| `rand_poisson(lambda)` | Poisson | Int64 |
+| `rand_int(lo, hi)` | Uniform integer [lo, hi] | Int64 |
+
+Each thread uses its own `mt19937_64` seeded from `std::random_device`, so
+parallel queries produce independent streams without locking.
+
 ## Benchmark
 
 Aggregation benchmarks on 4 M rows (`prices.csv`, 252 symbols).

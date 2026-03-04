@@ -1263,6 +1263,55 @@ extern implementations. The recommended path for custom scalar logic is
 | `minute(t)`     | `Timestamp -> Int32`               |
 | `second(t)`     | `Timestamp -> Int32`               |
 
+### 11.7 Vectorized RNG Functions
+
+These built-in functions generate a full column of independent random draws —
+one value per row — in a single vectorized pass.  They are valid in `update`
+expressions (both plain and windowed) and in `select`.  Arguments must be
+numeric literals.
+
+Each call uses a **thread-local `std::mt19937_64`** seeded from
+`std::random_device`, so parallel queries on different threads produce
+independent streams without locking.
+
+**Continuous distributions (return `Float64`):**
+
+| Function | Parameters | Distribution |
+|---|---|---|
+| `rand_uniform(low, high)` | `low < high` | Uniform on [low, high) |
+| `rand_normal(mean, stddev)` | `stddev > 0` | Normal(mean, stddev²) |
+| `rand_student_t(df)` | `df > 0` | Student-t with df degrees of freedom |
+| `rand_gamma(shape, scale)` | `shape > 0`, `scale > 0` | Gamma(shape, scale) |
+| `rand_exponential(lambda)` | `lambda > 0` | Exponential with rate lambda |
+
+**Discrete distributions (return `Int64`):**
+
+| Function | Parameters | Distribution |
+|---|---|---|
+| `rand_bernoulli(p)` | `p ∈ [0, 1]` | Bernoulli(p) — yields 0 or 1 |
+| `rand_poisson(lambda)` | `lambda > 0` | Poisson(lambda) |
+| `rand_int(lo, hi)` | `lo ≤ hi` | Uniform integer on [lo, hi] |
+
+**Examples:**
+
+```
+// Add Gaussian noise to a price column
+df[update { noisy_price = price + rand_normal(0.0, 0.5) }]
+
+// Simulate a biased coin flip per row
+df[update { flip = rand_bernoulli(0.7) }]
+
+// Uniform random weight in [0, 1)
+df[update { w = rand_uniform(0.0, 1.0) }]
+
+// Die rolls
+df[update { die = rand_int(1, 6) }]
+```
+
+**Constraint.** RNG functions are **not** aggregate functions and must not
+appear inside aggregate function calls (Section 7.3). Each call produces
+exactly one value per row of the current table.
+
 ---
 
 ## 12. Stream Runtime

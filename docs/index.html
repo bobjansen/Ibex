@@ -411,7 +411,11 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
             depends on the transport. For OS kernel-backed sockets (UDP, TCP)
             the kernel's receive buffer holds packets safely — no data is lost.
             For user-space transports the plugin author must arrange independent
-            buffering.
+            buffering. The runtime helper <code>StreamBuffered</code> provides
+            a lockless SPSC ring buffer with a compatible <code>ExternFn</code>:
+            a producer thread calls <code>buf-&gt;write(table)</code> while Ibex
+            drains the ring, returning <code>StreamTimeout{}</code> when it is
+            empty — eliminating double-buffering for in-process transports.
           </p>
           <p>
             Use <code>import</code> to load a library stub that registers

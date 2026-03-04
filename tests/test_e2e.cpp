@@ -951,3 +951,81 @@ Stream {
     REQUIRE(close1 != nullptr);
     CHECK((*close1)[0] == Catch::Approx(210.0));
 }
+
+// Stress-test StreamBuffered under high producer rate and a jittery consumer.
+//
+// The producer pushes N single-row Tables as fast as possible into a small
+// ring (capacity 32).  The consumer (the sink callback) sleeps for 2 ms every
+// 50 calls to simulate processing jitter, causing the ring to fill and forcing
+// the producer into its backpressure yield loop.
+//
+// Each row carries a distinct 1 ms-spaced timestamp so the data-timestamp
+// trigger fires a bucket flush for every row — giving exactly N sink calls
+// with 1 row each.  The invariant is:
+//
+//   total rows received by sink == N
+//
+// If StreamBuffered dropped rows under backpressure this CHECK would fail.
+TEST_CASE("StreamBuffered: no packet loss under producer stress with jittery consumer",
+          "[e2e][stream]") {
+    constexpr int N = 2'000;
+
+    std::atomic<int> rows_received{0};
+    std::atomic<int> sink_calls{0};
+
+    // Small ring to force frequent backpressure on the producer thread.
+    auto buf = std::make_shared<runtime::StreamBuffered>(32);
+
+    runtime::ExternRegistry registry;
+    registry.register_table("stress_src", buf->make_source_fn());
+
+    // Jittery sink: every 50th call sleeps 2 ms, simulating an uneven consumer.
+    registry.register_scalar_table_consumer(
+        "stress_sink", runtime::ScalarKind::Int,
+        [&](const runtime::Table& t,
+            const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            rows_received.fetch_add(static_cast<int>(t.rows()), std::memory_order_relaxed);
+            if (sink_calls.fetch_add(1, std::memory_order_relaxed) % 50 == 49) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            return runtime::ExternValue{std::int64_t{0}};
+        });
+
+    // Producer: write N single-row tables as fast as possible.
+    // Each row sits in its own 1 ms bucket so data-timestamp flushes fire
+    // immediately rather than waiting for wall-clock bucket expiry.
+    std::thread producer([&] {
+        for (int i = 0; i < N; ++i) {
+            runtime::Table t;
+            t.add_column("ts",
+                         Column<Timestamp>{Timestamp{static_cast<std::int64_t>(i) * 1'000'000LL}});
+            t.add_column("val", Column<double>{static_cast<double>(i)});
+            t.time_index = "ts";
+            buf->write(t);  // yields on backpressure — never drops
+        }
+        buf->close();
+    });
+
+    // Use resample 1ms so every adjacent pair of rows crosses a bucket boundary,
+    // triggering a data-timestamp flush for each row.
+    const char* src = R"(
+extern fn stress_src() -> TimeFrame from "fake.hpp";
+extern fn stress_sink(df: DataFrame) -> Int from "fake.hpp";
+Stream {
+    source    = stress_src(),
+    transform = [resample 1ms, select { val = last(val) }],
+    sink      = stress_sink()
+};
+)";
+
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    auto result = runtime::interpret(*lowered.value(), {}, nullptr, &registry);
+    producer.join();
+    REQUIRE(result.has_value());
+
+    // N rows in → N rows out.  Any drop under backpressure would show here.
+    CHECK(rows_received.load() == N);
+}

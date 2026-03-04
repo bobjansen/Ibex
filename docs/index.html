@@ -68,6 +68,15 @@
           interpreted outputs are behaviour-equivalent; both run near peak throughput.
         </p>
       </article>
+      <article class="card">
+        <h3>Vectorized RNG</h3>
+        <p>
+          Eight built-in <code>rand_*</code> functions &mdash; covering normal,
+          uniform, gamma, exponential, Bernoulli, Poisson, Student-t, and integer
+          distributions &mdash; generate one draw per row in a single vectorized
+          pass with no locking between threads.
+        </p>
+      </article>
     </div>
   </section>
 
@@ -274,7 +283,48 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
         </div>
       </div>
 
-      <!-- 7. Rolling windows -->
+      <!-- 7. Vectorized RNG -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Vectorized RNG</span>
+          <h3>Generate random columns in a single vectorized pass.</h3>
+          <p>
+            Eight built-in <code>rand_*</code> functions each produce one
+            independent draw <em>per row</em> &mdash; no row-by-row loop, no
+            user-space scalar overhead. Each thread has its own
+            <code>mt19937_64</code> seeded from <code>std::random_device</code>,
+            so parallel queries produce independent streams without locking.
+          </p>
+          <p>
+            Continuous distributions return <code>Float64</code>:
+            <code>rand_uniform</code>, <code>rand_normal</code>,
+            <code>rand_student_t</code>, <code>rand_gamma</code>,
+            <code>rand_exponential</code>.
+            Discrete distributions return <code>Int64</code>:
+            <code>rand_bernoulli</code>, <code>rand_poisson</code>,
+            <code>rand_int</code>.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Gaussian noise column</span>
+df[<span class="kw">update</span> { noise = <span class="fn-name">rand_normal</span>(<span class="num">0.0</span>, <span class="num">1.0</span>) }];
+
+<span class="cm">// Uniform weight, biased coin, die roll — all in one pass</span>
+df[<span class="kw">update</span> {
+    w    = <span class="fn-name">rand_uniform</span>(<span class="num">0.0</span>, <span class="num">1.0</span>),
+    flip = <span class="fn-name">rand_bernoulli</span>(<span class="num">0.7</span>),
+    die  = <span class="fn-name">rand_int</span>(<span class="num">1</span>, <span class="num">6</span>)
+}];
+
+<span class="cm">// Simulate inter-arrival times and Poisson counts</span>
+df[<span class="kw">update</span> {
+    wait   = <span class="fn-name">rand_exponential</span>(<span class="num">2.5</span>),
+    events = <span class="fn-name">rand_poisson</span>(<span class="num">4.0</span>)
+}];</code></pre>
+        </div>
+      </div>
+
+      <!-- 8. Rolling windows -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Rolling Windows</span>

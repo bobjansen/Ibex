@@ -446,13 +446,13 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">StreamBuffered</span>
-          <h3>In-process sources without double-buffering.</h3>
+          <h3>A ready-made producer queue for in-process sources.</h3>
           <p>
-            For in-process or user-space transports a naive source function
-            needs its own buffer <em>and</em> relies on Ibex's internal
-            pipeline — two copies of every message. <code>StreamBuffered</code>
-            collapses this into a single lockless SPSC ring buffer that IS the
-            pipeline buffer.
+            For in-process or user-space transports the plugin needs a
+            thread-safe queue between its producer and the Ibex event loop.
+            <code>StreamBuffered</code> provides one out of the box — a lockless
+            SPSC ring buffer paired with a compatible <code>ExternFn</code> —
+            so the plugin author doesn't have to implement their own.
           </p>
           <p>
             A <strong>producer thread</strong> calls <code>buf-&gt;write(table)</code>
@@ -460,20 +460,21 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
             <code>buf-&gt;close()</code>. The <code>ExternFn</code> returned by
             <code>make_source_fn()</code> is registered as the stream source;
             it drains the ring on each event-loop iteration, returning
-            <code>StreamTimeout{}</code> when empty so the wall-clock bucket
-            flush still fires on schedule.
+            <code>StreamTimeout{}</code> when empty so wall-clock bucket flushes
+            still fire on schedule. Ibex's own TimeBucket accumulation buffer
+            sits downstream, unchanged.
           </p>
           <p>
             Cache-line-separated <code>std::atomic</code> head and tail indices
-            keep the producer and consumer on independent cache lines — no
-            false sharing, no mutex on the hot path.
+            keep producer and consumer on independent cache lines — no false
+            sharing, no mutex on the hot path.
           </p>
           <p class="note">
             <strong>When to use each approach:</strong> for UDP/TCP sockets the
-            OS kernel already provides an equivalent ring buffer
-            (<code>SO_RCVBUF</code>); wrapping them in <code>StreamBuffered</code>
-            would add a redundant copy. Use <code>StreamTimeout{}</code> directly
-            from <code>recvfrom</code> with a short socket timeout instead.
+            OS kernel already manages a receive buffer (<code>SO_RCVBUF</code>)
+            independently of the application — no application-level queue is
+            needed. Return <code>StreamTimeout{}</code> directly from
+            <code>recvfrom</code> with a short socket timeout instead.
             <code>StreamBuffered</code> is for in-process queues, shared-memory
             channels, or any transport without a kernel-managed receive buffer.
           </p>

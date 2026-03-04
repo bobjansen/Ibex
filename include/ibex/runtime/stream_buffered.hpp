@@ -11,11 +11,16 @@ namespace ibex::runtime {
 
 /// SPSC (single-producer, single-consumer) queue-backed stream source helper.
 ///
-/// Eliminates double-buffering for in-process/user-space transports: the queue
-/// IS the buffer.  A producer thread pushes Tables via write(); Ibex's event
-/// loop drains them via the ExternFn returned by make_source_fn(), returning
-/// StreamTimeout{} when the queue is momentarily empty so wall-clock bucket
-/// flushes still fire on schedule.
+/// Provides a ready-made, thread-safe producer queue for in-process and
+/// user-space transports so the plugin author does not need to implement their
+/// own.  A producer thread pushes Tables via write(); Ibex's event loop drains
+/// them via the ExternFn returned by make_source_fn(), returning StreamTimeout{}
+/// when the queue is momentarily empty so wall-clock bucket flushes still fire
+/// on schedule.
+///
+/// Note: Ibex maintains its own TimeBucket accumulation buffer internally.
+/// StreamBuffered replaces the plugin's ad-hoc producer queue — not Ibex's
+/// internal buffer.
 ///
 /// ## Usage
 ///
@@ -44,10 +49,10 @@ namespace ibex::runtime {
 ///
 /// ## Comparison with kernel-backed sockets
 ///
-/// For UDP/TCP sockets the OS kernel already provides an equivalent ring
-/// buffer (SO_RCVBUF).  Wrapping such a source in StreamBuffered would add a
-/// redundant copy; simply have the source call recvfrom() with a short timeout
-/// and return StreamTimeout{} on EAGAIN/ETIMEDOUT instead.
+/// For UDP/TCP sockets the OS kernel already maintains a receive buffer
+/// (SO_RCVBUF) independently of the application — no application-level queue
+/// is needed.  Use StreamTimeout{} directly from recvfrom() with a short socket
+/// timeout instead of wrapping the source in StreamBuffered.
 class StreamBuffered : public std::enable_shared_from_this<StreamBuffered> {
    public:
     /// @param capacity  Maximum number of Tables held in the ring buffer at

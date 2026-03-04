@@ -1498,12 +1498,16 @@ the wall-clock check to fire close to the bucket boundary while the source
 stays live and misses no messages. A `udp_recv` that blocks indefinitely
 delays emission until the next tick arrives.
 
-### 12.7 StreamBuffered: Zero-Copy In-Process Sources
+### 12.7 StreamBuffered: Ready-Made Producer Queue for In-Process Sources
 
-For user-space / in-process transports where double-buffering is undesirable,
-the runtime provides `ibex::runtime::StreamBuffered` — a helper that combines
-an SPSC (single-producer, single-consumer) ring buffer with a compatible
-`ExternFn` so the queue IS the only buffer in the pipeline.
+For user-space / in-process transports the runtime provides
+`ibex::runtime::StreamBuffered` — a helper that combines an SPSC
+(single-producer, single-consumer) ring buffer with a compatible `ExternFn`,
+so the plugin author does not need to implement their own thread-safe queue.
+
+> **Note:** Ibex still maintains its own internal TimeBucket accumulation buffer.
+> `StreamBuffered` provides the producer-side queue that feeds that buffer — it
+> replaces whatever ad-hoc buffering the plugin would otherwise need.
 
 #### How it works
 
@@ -1539,8 +1543,8 @@ buf->close();           // signal end-of-stream
 
 | Property | `StreamBuffered` | UDP with SO_RCVTIMEO |
 |---|---|---|
-| Buffer location | User-space SPSC ring | Kernel socket buffer |
-| Extra copy on read | None | None (kernel → user via recvfrom) |
+| Producer-side buffer | User-space SPSC ring (provided) | Kernel socket buffer (OS-managed) |
+| Plugin author writes own queue | No | No |
 | Overflow behaviour | Producer blocks (backpressure) | Kernel drops datagrams |
 | Suitable for | In-process queues, shared memory | Network sources |
 

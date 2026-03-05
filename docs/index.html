@@ -324,7 +324,39 @@ df[<span class="kw">update</span> {
         </div>
       </div>
 
-      <!-- 8. Rolling windows -->
+      <!-- 8. rep() and boolean masks -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">rep &amp; Boolean Masks</span>
+          <h3>Fill, repeat, and cycle columns with named-argument syntax.</h3>
+          <p>
+            <code>rep(x)</code> mirrors R&rsquo;s <code>rep()</code>: it fills
+            a column by repeating a scalar literal or cycling an existing column.
+            Named arguments &mdash; <code>times</code>, <code>each</code>, and
+            <code>length_out</code> &mdash; control the exact repetition pattern.
+          </p>
+          <p>
+            Passing a <code>Bool</code> literal produces a first-class
+            <code>Column&lt;Bool&gt;</code> (a boolean mask), useful as a
+            computed flag or validity indicator alongside numeric columns.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Constant-fill: all rows set to zero</span>
+df[<span class="kw">update</span> { zero = <span class="fn-name">rep</span>(<span class="num">0</span>) }];
+
+<span class="cm">// All-true boolean mask</span>
+df[<span class="kw">update</span> { active = <span class="fn-name">rep</span>(<span class="kw">true</span>) }];
+
+<span class="cm">// Repeat each element of a column twice</span>
+df[<span class="kw">update</span> { rep2 = <span class="fn-name">rep</span>(price, each=<span class="num">2</span>) }];
+
+<span class="cm">// Named args: times, each, length_out</span>
+df[<span class="kw">update</span> { flag = <span class="fn-name">rep</span>(flag_col, times=<span class="num">50</span>) }];</code></pre>
+        </div>
+      </div>
+
+      <!-- 9. Rolling windows -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Rolling Windows</span>

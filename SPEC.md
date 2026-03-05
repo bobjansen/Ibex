@@ -293,6 +293,11 @@ DataFrame<S>      — a relation with schema S
 TimeFrame<S>      — a time-indexed relation with schema S
 ```
 
+`Column<Bool>` is a first-class column type (boolean mask). It is produced by
+`rep(true)` / `rep(false)` and can appear in `update`/`select` field lists.
+Boolean column values are stored as bytes (0 = false, non-zero = true) and are
+not implicitly convertible to `Int64` in arithmetic expressions.
+
 `TimeFrame<S>` is a `DataFrame<S>` with the additional invariant that exactly
 one column of type `Timestamp` is designated as the time index, and rows are
 sorted by that index in ascending order.
@@ -399,7 +404,10 @@ primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | schema_lit
                 | "(" expr ")" ;
 
-arg_list        = expr { "," expr } [ "," ] ;
+arg_list        = arg { "," arg } [ "," ] ;
+
+arg             = expr
+                | IDENT "=" expr ;    (* named argument *)
 
 schema_lit      = "{" schema_field { "," schema_field } [ "," ] "}" ;
 
@@ -501,6 +509,13 @@ resolve all ambiguities in a recursive-descent or Pratt parser:
    and `^42` are parse errors.
 7. **Join precedence.** Join forms parse after all binary operators and bind
    left: `a join b on k join c on k` parses as `(a join b on k) join c on k`.
+
+8. **Named arguments.** Within a call's argument list, `IDENT "=" expr` is a
+   named argument. The `IDENT` must be immediately followed by a single `=`
+   (not `==`). Named arguments may be mixed with positional arguments; all
+   positional arguments must precede named arguments. Order of named arguments
+   is not semantically significant — built-in functions that accept them
+   interpret them by name.
 
 ---
 
@@ -1311,6 +1326,67 @@ df[update { die = rand_int(1, 6) }]
 **Constraint.** RNG functions are **not** aggregate functions and must not
 appear inside aggregate function calls (Section 7.3). Each call produces
 exactly one value per row of the current table.
+
+### 11.8 `rep` — Repeat and Fill
+
+```
+rep(x, times=1, each=1, length_out=-1)
+```
+
+Produces a column by repeating a scalar literal or an existing column. Mirrors
+R's `rep()` semantics within the columnar context.
+
+**Parameters:**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `x` | *(required)* | Scalar literal (`Int`, `Float`, `Bool`, `String`) or column reference |
+| `times` | `1` | Repeat the whole sequence this many times |
+| `each` | `1` | Repeat each individual element this many times before advancing |
+| `length_out` | *(row count)* | Final output length; shorter sequences are cycled, longer ones truncated |
+
+`times`, `each`, and `length_out` must be positive integer literals and are
+passed as **named arguments**.  When `length_out` is omitted, the output
+length equals the number of rows in the current table (the normal case for
+`update`/`select`).
+
+**Scalar `x` — constant-fill column:**
+
+```
+// Fill every row with the integer 0
+df[update { zero = rep(0) }]
+
+// All-true boolean mask
+df[update { mask = rep(true) }]
+
+// Constant string tag
+df[update { source = rep("live") }]
+```
+
+When `x` is a scalar the value of `times` and `each` are redundant (all
+repetitions of a scalar produce the same value); only `length_out` affects
+the output size.
+
+**Column `x` — element-wise repetition:**
+
+The logical output sequence is built as:
+1. Each element of `x` is repeated `each` times.
+2. The resulting sequence is repeated `times` times.
+3. The sequence is cycled or truncated to `length_out` entries.
+
+```
+// Each element repeated twice: [10,10,20,20,30,30] → same row count
+df[update { rep2 = rep(price, each=2) }]
+
+// Cycle the first two values across all rows
+df[update { flag = rep(flag_col, times=50) }]
+```
+
+**Return type:** identical to the type of `x`.  A `Bool` literal produces a
+`Bool` column (usable as a boolean mask).
+
+**Constraint.** `rep` is not an aggregate function; it must not appear inside
+aggregate function calls (Section 7.3).
 
 ---
 

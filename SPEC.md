@@ -71,6 +71,8 @@ The canonical order is recommended for readability but not enforced.
 | `update`            | ε (extended projection)   | `UpdateNode`    |
 | `update` + `by`     | grouped ε (window-like)   | `UpdateNode`    |
 | `window`            | ω (temporal window)       | `WindowNode`    |
+| `melt`              | unpivot (wide → long)     | `MeltNode`      |
+| `dcast`             | pivot (long → wide)       | `DcastNode`     |
 
 Every valid block expression maps to a composition of these operators. The
 compiler emits the corresponding IR node tree.
@@ -139,7 +141,7 @@ column names, or function names:
 ```
 let    mut    extern  fn      from
 filter select update  distinct order by window
-rename resample
+rename resample melt  dcast
 join   left   asof    on
 import Stream
 asc    desc
@@ -421,7 +423,9 @@ clause          = filter_clause
                 | update_clause
                 | order_clause
                 | by_clause
-                | window_clause ;
+                | window_clause
+                | melt_clause
+                | dcast_clause ;
 
 filter_clause   = "filter" expr ;
 
@@ -443,6 +447,10 @@ by_clause       = "by" IDENT
                 | "by" "{" field_list "}" ;
 
 window_clause   = "window" DURATION_LIT ;
+
+melt_clause     = "melt" field_or_list ;
+
+dcast_clause    = "dcast" IDENT ;
 
 field_or_list   = field
                 | "{" field_list "}" ;
@@ -561,6 +569,12 @@ Within a single block:
 | C10 | `window` requires the operand to be a `TimeFrame`. |
 | C11 | At most **one** `rename` clause. |
 | C12 | `rename` is mutually compatible with `filter`, `select`, `update`, `distinct`, `order`, and `by`. |
+| C13 | At most **one** `melt` clause. |
+| C14 | At most **one** `dcast` clause. |
+| C15 | `melt` and `dcast` are **mutually exclusive**. |
+| C16 | `melt` and `dcast` are mutually exclusive with `distinct`, `update`, `order`, `window`, and `resample`. |
+| C17 | `melt` may combine with `select` (to specify measure columns). |
+| C18 | `dcast` may combine with `select` (to specify the value column) and `by` (to specify row keys). |
 
 Violation of any constraint is a **compile-time error**.
 
@@ -713,6 +727,82 @@ error; ordering by the time index is a no-op.
 Specifies a time-based window for rolling computations. Only valid when the
 operand is a `TimeFrame`. See Section 8.
 
+**`melt { id_cols }`**
+
+Reshapes a wide DataFrame to long format (unpivot). The fields listed in `melt`
+are the **id columns** — they are repeated for each measure column. All columns
+*not* listed as id columns become measure columns by default.
+
+The output has three kinds of columns:
+1. The id columns (preserved from the input).
+2. A `variable` column (`String`) containing the original measure column names.
+3. A `value` column containing the corresponding values.
+
+```
+// Wide format: symbol, open, high, low, close
+ohlc[melt symbol]
+// → symbol | variable | value
+//   AAPL   | open     | 150.0
+//   AAPL   | high     | 155.0
+//   AAPL   | low      | 148.0
+//   AAPL   | close    | 152.0
+//   ...
+```
+
+When combined with `select`, the select clause specifies which **measure
+columns** to include (instead of using all non-id columns):
+
+```
+ohlc[melt symbol, select { open, close }]
+// Only unpivots the open and close columns
+```
+
+Multiple id columns use the braced form:
+
+```
+ohlc[melt { symbol, date }]
+```
+
+Null handling: if a measure value is null in the input (validity bitmap is
+`false`), the corresponding `value` cell in the output is also null.
+
+**`dcast <pivot_column>`**
+
+Reshapes a long DataFrame to wide format (pivot). The named column is the
+**pivot column** — its distinct values become new column names in the output.
+
+The output schema is:
+1. The row key columns (specified via `by`, or inferred as all columns except
+   the pivot and value columns).
+2. One new column for each distinct value in the pivot column, filled with the
+   corresponding value column data.
+
+```
+// Long format: symbol, variable, value
+long[dcast variable, select value, by symbol]
+// → symbol | open  | high  | low   | close
+//   AAPL   | 150.0 | 155.0 | 148.0 | 152.0
+//   ...
+```
+
+When `select` is present, it specifies the **value column** (must be a single
+bare identifier). When `by` is present, it specifies the **row key columns**.
+If `by` is omitted, all columns except the pivot and value columns are used as
+row keys.
+
+Missing cells (combinations of row keys and pivot values not present in the
+input) are filled with null (validity bitmap set to `false`).
+
+`melt` and `dcast` are inverses:
+
+```
+// Roundtrip: wide → long → wide
+let wide  = ohlc;
+let long  = wide[melt symbol];
+let wide2 = long[dcast variable, select value, by symbol];
+// wide2 has the same data as wide (column order may differ)
+```
+
 ### 5.4 Result Type Rules
 
 | Clauses Present       | Output Type | Schema Derivation |
@@ -727,6 +817,8 @@ operand is a `TimeFrame`. See Section 8.
 | `update` + `by`       | `DataFrame<S'>` | S' = S ∪ new fields (same row count) |
 | `window` + `update`   | `TimeFrame<S'>` | S' = S ∪ new fields |
 | `window` + `select`   | `TimeFrame<S'>` | S' = listed fields |
+| `melt`                | `DataFrame<S'>` | S' = id_cols + {variable: String, value: T} |
+| `dcast`               | `DataFrame<S'>` | S' = row_keys + one column per pivot value |
 
 If the input is a `TimeFrame` and no clause removes the time index column,
 the output remains a `TimeFrame`.
@@ -1879,6 +1971,9 @@ parse_clause:
     "by"       → peek "{" → braced field list
                → otherwise → single IDENT
     "window"   → DURATION_LIT
+    "melt"     → peek "{" → braced field list (id columns)
+               → otherwise → single IDENT (single id column)
+    "dcast"    → IDENT (pivot column)
 
 import_decl:
     "import" (STRING_LIT | IDENT) ";"

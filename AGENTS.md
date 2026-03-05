@@ -19,6 +19,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - Workflow: run tests after any parser/lexer/AST changes before marking work done.
 - Workflow: add a usage example for new syntax in an `.ibex` file.
 - Workflow: rebuild plugins after public header/runtime changes (use `scripts/ibex-plugin-build.sh`).
+- Workflow: **when language semantics change** (new built-in functions, syntax, type system additions, or behaviour changes), always update **both** `SPEC.md` (the authoritative language specification) and `docs/index.html` (the public-facing website). These two documents must stay in sync with the implementation.
 
 ## Architecture
 - `include/ibex/` — public headers (all under `ibex` namespace)

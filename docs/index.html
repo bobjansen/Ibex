@@ -26,7 +26,7 @@
     <p class="lead">
       Ibex is a statically typed language for columnar <code>DataFrame</code> and
       <code>TimeFrame</code> manipulation. Write concise bracket-pipeline queries —
-      filter, aggregate, roll, resample, join, rename — and run them in the fast
+      filter, aggregate, roll, resample, reshape, join, rename — and run them in the fast
       interpreter or compile them to standalone C++ binaries. Wire sources and sinks
       into real-time <code>Stream</code> pipelines with no extra syntax.
     </p>
@@ -427,7 +427,46 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
         </div>
       </div>
 
-      <!-- 9. Scalar & compile -->
+      <!-- 9. Reshape (melt & dcast) -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Reshape</span>
+          <h3>Pivot and unpivot with melt &amp; dcast.</h3>
+          <p>
+            <code>melt</code> converts a wide DataFrame to long format: id columns
+            stay fixed while measure columns are unpivoted into
+            <code>variable</code>&thinsp;/&thinsp;<code>value</code> rows.
+            Combine with <code>select</code> to choose specific measure columns.
+          </p>
+          <p>
+            <code>dcast</code> is the inverse &mdash; it pivots a long table back to
+            wide format. Distinct values of the pivot column become new column names.
+            Combine with <code>by</code> for row keys and <code>select</code> for the
+            value column. Missing cells are filled with null.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Wide → long: unpivot all columns except symbol</span>
+ohlc[<span class="kw">melt</span> symbol];
+<span class="cm">// → symbol | variable | value</span>
+<span class="cm">//   AAPL   | open     | 150.0</span>
+<span class="cm">//   AAPL   | high     | 155.0</span>
+<span class="cm">//   ...</span>
+
+<span class="cm">// Only unpivot specific columns</span>
+ohlc[<span class="kw">melt</span> symbol, <span class="kw">select</span> { open, close }];
+
+<span class="cm">// Long → wide: pivot back</span>
+long[<span class="kw">dcast</span> variable, <span class="kw">select</span> value, <span class="kw">by</span> symbol];
+<span class="cm">// → symbol | open  | high  | low   | close</span>
+
+<span class="cm">// Roundtrip: melt then dcast recovers original data</span>
+<span class="kw">let</span> long  = wide[<span class="kw">melt</span> symbol];
+<span class="kw">let</span> wide2 = long[<span class="kw">dcast</span> variable, <span class="kw">select</span> value, <span class="kw">by</span> symbol];</code></pre>
+        </div>
+      </div>
+
+      <!-- 10. Scalar & compile -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Scalar &amp; Codegen</span>

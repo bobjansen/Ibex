@@ -1054,7 +1054,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return std::unexpected(
                 "expected table expression (known scalars: " + format_scalar_names(scalars) + ")");
         }
-        if (columns.contains(ident->name)) {
+        if (columns.contains(ident->name) && !tables.contains(ident->name)) {
             return std::unexpected("expected table expression (name refers to column)");
         }
         if (auto it = tables.find(ident->name); it != tables.end()) {
@@ -1214,6 +1214,14 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             }
             for (std::size_t i = 0; i < tlet.names.size(); ++i) {
                 local_columns.insert_or_assign(tlet.names[i], *table->columns[i].column);
+                runtime::Table single_col;
+                if (table->columns[i].validity) {
+                    single_col.add_column(table->columns[i].name, *table->columns[i].column,
+                                          *table->columns[i].validity);
+                } else {
+                    single_col.add_column(table->columns[i].name, *table->columns[i].column);
+                }
+                local_tables.insert_or_assign(tlet.names[i], std::move(single_col));
             }
             continue;
         }
@@ -1488,6 +1496,14 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             }
             for (std::size_t i = 0; i < tlet.names.size(); ++i) {
                 columns.insert_or_assign(tlet.names[i], *table->columns[i].column);
+                runtime::Table single_col;
+                if (table->columns[i].validity) {
+                    single_col.add_column(table->columns[i].name, *table->columns[i].column,
+                                          *table->columns[i].validity);
+                } else {
+                    single_col.add_column(table->columns[i].name, *table->columns[i].column);
+                }
+                tables.insert_or_assign(tlet.names[i], std::move(single_col));
             }
             continue;
         }

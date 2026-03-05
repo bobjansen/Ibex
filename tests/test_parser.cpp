@@ -859,3 +859,93 @@ TEST_CASE("Parse tuple let binding tracks source lines") {
     REQUIRE(tlet.start_line == 1);
     REQUIRE(tlet.end_line == 1);
 }
+
+// ─── Tuple-LHS in update/select clauses ──────────────────────────────────────
+
+TEST_CASE("Parse tuple-LHS update with two names") {
+    const char* source = "df[update { (colA, colB) = make_xy() }];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.empty());
+    REQUIRE(update.tuple_fields.size() == 1);
+    REQUIRE(update.tuple_fields[0].names.size() == 2);
+    REQUIRE(update.tuple_fields[0].names[0] == "colA");
+    REQUIRE(update.tuple_fields[0].names[1] == "colB");
+    REQUIRE(update.tuple_fields[0].expr != nullptr);
+}
+
+TEST_CASE("Parse tuple-LHS update mixed with regular field") {
+    const char* source = "df[update { x = price + 1, (a, b) = make_ab() }];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.size() == 1);
+    REQUIRE(update.fields[0].name == "x");
+    REQUIRE(update.tuple_fields.size() == 1);
+    REQUIRE(update.tuple_fields[0].names[0] == "a");
+    REQUIRE(update.tuple_fields[0].names[1] == "b");
+}
+
+TEST_CASE("Parse tuple-LHS select with three names") {
+    const char* source = "df[select { (p, q, r) = gen() }];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& select = std::get<SelectClause>(block.clauses[0]);
+    REQUIRE(select.fields.empty());
+    REQUIRE(select.tuple_fields.size() == 1);
+    REQUIRE(select.tuple_fields[0].names.size() == 3);
+    REQUIRE(select.tuple_fields[0].names[0] == "p");
+    REQUIRE(select.tuple_fields[0].names[1] == "q");
+    REQUIRE(select.tuple_fields[0].names[2] == "r");
+}
+
+// ─── String-literal column names ─────────────────────────────────────────────
+
+TEST_CASE("Parse string literal as update column name") {
+    const char* source = R"(df[update { "log price" = log(price) }];)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.size() == 1);
+    REQUIRE(update.fields[0].name == "log price");
+    REQUIRE(update.fields[0].expr != nullptr);
+}
+
+TEST_CASE("Parse string literal as select column name") {
+    const char* source = R"(df[select { "total value" = price * volume }];)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& select = std::get<SelectClause>(block.clauses[0]);
+    REQUIRE(select.fields.size() == 1);
+    REQUIRE(select.fields[0].name == "total value");
+}
+
+TEST_CASE("Parse tuple-LHS with string literal names") {
+    const char* source = R"(df[update { ("col a", "col b") = gen() }];)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.tuple_fields.size() == 1);
+    REQUIRE(update.tuple_fields[0].names[0] == "col a");
+    REQUIRE(update.tuple_fields[0].names[1] == "col b");
+}

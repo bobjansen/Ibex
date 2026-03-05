@@ -6,6 +6,7 @@
 #include <expected>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ibex::parser {
 
@@ -17,6 +18,10 @@ using LowerResult = std::expected<ir::NodePtr, LowerError>;
 
 struct LowerContext {
     std::unordered_map<std::string, ir::NodePtr> bindings;
+    /// Names of extern functions whose return type is DataFrame/TimeFrame.
+    /// Populate before calling lower_expr so that tuple-LHS RHS expressions
+    /// that call table-returning externs are lowered correctly.
+    std::unordered_set<std::string> table_externs;
 };
 
 /// Lower a parsed Program into an IR node tree.

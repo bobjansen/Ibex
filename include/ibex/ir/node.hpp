@@ -72,6 +72,15 @@ struct FieldSpec {
     Expr expr;
 };
 
+/// A tuple-assignment field: multiple aliases bound to columns of a
+/// table-producing sub-plan.  `(colA, colB) = create_x_y()` in an
+/// update/select clause lowers to one TupleFieldSpec whose `source`
+/// is the IR sub-tree for `create_x_y()`.
+struct TupleFieldSpec {
+    std::vector<std::string> aliases;
+    NodePtr source;
+};
+
 struct OrderKey {
     std::string name;
     bool ascending = true;
@@ -317,16 +326,25 @@ class AggregateNode final : public Node {
 /// broadcast back (SPEC.md Section 7.4).
 class UpdateNode final : public Node {
    public:
-    UpdateNode(NodeId id, std::vector<FieldSpec> fields, std::vector<ColumnRef> group_by = {})
-        : Node(NodeKind::Update, id), fields_(std::move(fields)), group_by_(std::move(group_by)) {}
+    UpdateNode(NodeId id, std::vector<FieldSpec> fields,
+               std::vector<TupleFieldSpec> tuple_fields = {},
+               std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Update, id),
+          fields_(std::move(fields)),
+          tuple_fields_(std::move(tuple_fields)),
+          group_by_(std::move(group_by)) {}
 
     [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& { return fields_; }
+    [[nodiscard]] auto tuple_fields() const noexcept -> const std::vector<TupleFieldSpec>& {
+        return tuple_fields_;
+    }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
         return group_by_;
     }
 
    private:
     std::vector<FieldSpec> fields_;
+    std::vector<TupleFieldSpec> tuple_fields_;
     std::vector<ColumnRef> group_by_;
 };
 

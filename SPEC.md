@@ -455,10 +455,17 @@ dcast_clause    = "dcast" IDENT ;
 field_or_list   = field
                 | "{" field_list "}" ;
 
-field_list      = field { "," field } [ "," ] ;
+field_list      = field_item { "," field_item } [ "," ] ;
 
-field           = IDENT "=" expr
-                | IDENT ;
+field_item      = field
+                | tuple_field ;
+
+field           = col_name "=" expr
+                | col_name ;
+
+tuple_field     = "(" col_name { "," col_name } ")" "=" expr ;
+
+col_name        = IDENT | QUOTED_IDENT | STRING_LIT ;
 
 join_keys       = IDENT
                 | "{" IDENT { "," IDENT } [ "," ] "}" ;
@@ -611,7 +618,28 @@ trades[select { price * 2 }]    // ERROR: computed field must be named
 trades[select { doubled = price * 2 }]  // OK
 ```
 
-The output schema contains exactly the fields listed, in the order listed.
+Column names on the left-hand side of `=` may also be written as string
+literals, which allows names that contain spaces or special characters:
+
+```
+trades[select { "notional value" = price * volume }]
+```
+
+**Tuple-LHS assignment in `select`**
+
+When the RHS of an assignment evaluates to a multi-column DataFrame, the
+result can be destructured into multiple named columns using a parenthesised
+tuple on the left-hand side:
+
+```
+trades[select { (x, y) = compute_xy() }]
+```
+
+The RHS must return exactly as many columns as there are names in the tuple.
+Each name is bound to the corresponding column by position.
+
+The output schema contains exactly the fields listed (including all tuple
+names), in the order listed.
 
 **`distinct { field, ... }`**
 
@@ -628,6 +656,30 @@ identifiers are a compile-time error (they would be no-ops).
 
 ```
 trades[update { log_price = log(price) }]
+```
+
+Column names on the left-hand side of `=` may also be written as string
+literals:
+
+```
+trades[update { "log price" = log(price) }]
+```
+
+**Tuple-LHS assignment in `update`**
+
+When an expression returns a multi-column DataFrame, multiple new columns can
+be added in a single assignment using a tuple on the left-hand side:
+
+```
+trades[update { (delta, gamma) = compute_greeks() }]
+```
+
+The RHS must return exactly as many columns as there are names in the tuple.
+Each name is bound to the corresponding column by position. Mixed regular and
+tuple fields are allowed in the same block:
+
+```
+trades[update { log_price = log(price), (delta, gamma) = compute_greeks() }]
 ```
 
 If `name` matches an existing column, it is replaced. If `name` is new, it is

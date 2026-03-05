@@ -1064,6 +1064,12 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                " (available: " + format_table_names(tables) + ")");
     }
     parser::LowerContext context;
+    for (const auto& [name, decl] : extern_decls) {
+        if (decl.return_type.kind == parser::Type::Kind::DataFrame ||
+            decl.return_type.kind == parser::Type::Kind::TimeFrame) {
+            context.table_externs.insert(name);
+        }
+    }
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {
         return std::unexpected(lowered.error().message);

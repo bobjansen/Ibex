@@ -101,7 +101,8 @@ TEST_CASE("UpdateNode stores fields and optional group-by", "[ir][update]") {
                            .alias = "log_price",
                            .expr = ibex::ir::Expr{.node = ibex::ir::ColumnRef{.name = "price"}},
                        }},
-                       {ibex::ir::ColumnRef{.name = "symbol"}});
+                       /*tuple_fields=*/{},
+                       /*group_by=*/{ibex::ir::ColumnRef{.name = "symbol"}});
 
     auto* upd = dynamic_cast<ibex::ir::UpdateNode*>(node.get());
     REQUIRE(upd != nullptr);

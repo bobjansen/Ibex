@@ -6186,17 +6186,29 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 if (!src) {
                     return std::unexpected(src.error());
                 }
-                if (src->columns.size() != tspec.aliases.size()) {
-                    return std::unexpected(
-                        "tuple assignment: expected " + std::to_string(tspec.aliases.size()) +
-                        " column(s), got " + std::to_string(src->columns.size()));
-                }
-                for (std::size_t i = 0; i < tspec.aliases.size(); ++i) {
-                    const auto& entry = src->columns[i];
-                    if (entry.validity) {
-                        result->add_column(tspec.aliases[i], *entry.column, *entry.validity);
-                    } else {
-                        result->add_column(tspec.aliases[i], *entry.column);
+                if (tspec.aliases.empty()) {
+                    // `update = expr`: merge all columns from the source table.
+                    for (const auto& entry : src->columns) {
+                        if (entry.validity) {
+                            result->add_column(entry.name, *entry.column, *entry.validity);
+                        } else {
+                            result->add_column(entry.name, *entry.column);
+                        }
+                    }
+                } else {
+                    if (src->columns.size() != tspec.aliases.size()) {
+                        return std::unexpected(
+                            "tuple assignment: expected " +
+                            std::to_string(tspec.aliases.size()) + " column(s), got " +
+                            std::to_string(src->columns.size()));
+                    }
+                    for (std::size_t i = 0; i < tspec.aliases.size(); ++i) {
+                        const auto& entry = src->columns[i];
+                        if (entry.validity) {
+                            result->add_column(tspec.aliases[i], *entry.column, *entry.validity);
+                        } else {
+                            result->add_column(tspec.aliases[i], *entry.column);
+                        }
                     }
                 }
             }

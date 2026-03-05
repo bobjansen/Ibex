@@ -465,7 +465,10 @@ field           = col_name "=" expr
 
 tuple_field     = "(" col_name { "," col_name } ")" "=" expr ;
 
-col_name        = IDENT | QUOTED_IDENT | STRING_LIT ;
+col_name        = IDENT | QUOTED_IDENT ;
+
+update_clause   = "update" field_or_list
+                | "update" "=" expr ;      (* merge-all form *)
 
 join_keys       = IDENT
                 | "{" IDENT { "," IDENT } [ "," ] "}" ;
@@ -618,13 +621,6 @@ trades[select { price * 2 }]    // ERROR: computed field must be named
 trades[select { doubled = price * 2 }]  // OK
 ```
 
-Column names on the left-hand side of `=` may also be written as string
-literals, which allows names that contain spaces or special characters:
-
-```
-trades[select { "notional value" = price * volume }]
-```
-
 **Tuple-LHS assignment in `select`**
 
 When the RHS of an assignment evaluates to a multi-column DataFrame, the
@@ -658,12 +654,9 @@ identifiers are a compile-time error (they would be no-ops).
 trades[update { log_price = log(price) }]
 ```
 
-Column names on the left-hand side of `=` may also be written as string
-literals:
-
-```
-trades[update { "log price" = log(price) }]
-```
+If `name` matches an existing column, it is replaced. If `name` is new, it is
+appended. The output schema is the input schema with the specified
+modifications.
 
 **Tuple-LHS assignment in `update`**
 
@@ -682,9 +675,19 @@ tuple fields are allowed in the same block:
 trades[update { log_price = log(price), (delta, gamma) = compute_greeks() }]
 ```
 
-If `name` matches an existing column, it is replaced. If `name` is new, it is
-appended. The output schema is the input schema with the specified
-modifications.
+**`update = expr`**
+
+When the RHS is a table-returning expression, the unkeyed form merges **all**
+columns of that result into the base DataFrame:
+
+```
+prices[update = gen_prices(symbols)]
+```
+
+Every column in the result of `gen_prices(symbols)` is added to (or replaces a
+column in) `prices`. No column enumeration is required. This is useful when the
+set of new columns is determined by the called function rather than statically
+known at the call site.
 
 **`rename { new_name = old_name, ... }`**
 

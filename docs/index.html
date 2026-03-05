@@ -162,10 +162,10 @@ prices[<span class="kw">select</span> {
           <h3>Add or replace columns without losing any data.</h3>
           <p>
             <code>update</code> appends named computed columns to every row.
-            All existing columns pass through untouched, so the result schema is
-            a strict superset of the input. Column names may be quoted strings
-            (for names with spaces) and a <strong>tuple left-hand side</strong>
-            unpacks a multi-column result in one assignment.
+            All existing columns pass through untouched. A
+            <strong>tuple left-hand side</strong> unpacks a multi-column result
+            in one assignment. The bare <code>update = expr</code> form merges
+            <em>all</em> columns from a table-returning expression.
           </p>
         </div>
         <div class="tour-code">
@@ -179,8 +179,8 @@ ohlcv[<span class="kw">update</span> {
 <span class="cm">// Unpack a multi-column result with a tuple LHS</span>
 df[<span class="kw">update</span> { (delta, gamma) = compute_greeks() }];
 
-<span class="cm">// Column names may be string literals</span>
-df[<span class="kw">update</span> { <span class="str">"log price"</span> = <span class="fn-name">log</span>(price) }];
+<span class="cm">// Merge all columns from a table-returning function</span>
+prices[<span class="kw">update</span> = gen_prices(symbols)];
 
 <span class="cm">// Chain an update with an aggregation</span>
 <span class="kw">let</span> daily = ohlcv[<span class="kw">update</span> { ret = (close <span class="op">-</span> open) <span class="op">/</span> open }];

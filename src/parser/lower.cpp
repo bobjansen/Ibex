@@ -660,6 +660,17 @@ class Lowerer {
 
     auto lower_update(const ByClause* by, const UpdateClause& clause)
         -> std::expected<ir::NodePtr, LowerError> {
+        // `update = expr`: merge all columns of the result table.
+        if (clause.merge_expr) {
+            auto src = lower_expr(*clause.merge_expr);
+            if (!src.has_value()) {
+                return std::unexpected(src.error());
+            }
+            std::vector<ir::TupleFieldSpec> tuple_specs;
+            tuple_specs.push_back(
+                ir::TupleFieldSpec{.aliases = {}, .source = std::move(src.value())});
+            return builder_.update({}, std::move(tuple_specs));
+        }
         std::vector<ir::FieldSpec> fields;
         for (const auto& field : clause.fields) {
             if (field.expr == nullptr) {

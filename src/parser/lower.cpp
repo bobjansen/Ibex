@@ -55,6 +55,11 @@ class Lowerer {
                 }
                 continue;
             }
+            if (std::holds_alternative<TupleLetStmt>(stmt)) {
+                // Tuple destructuring is resolved at the REPL level; the lowerer
+                // cannot bind individual columns into the IR name registry.
+                continue;
+            }
             if (std::holds_alternative<ExprStmt>(stmt)) {
                 const auto& expr_stmt = std::get<ExprStmt>(stmt);
                 auto value = lower_expr(*expr_stmt.expr);

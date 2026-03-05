@@ -200,7 +200,11 @@ class Parser {
                 if (!stmt.has_value()) {
                     return std::nullopt;
                 }
-                body.push_back(std::get<LetStmt>(std::move(*stmt)));
+                if (std::holds_alternative<TupleLetStmt>(*stmt)) {
+                    body.push_back(std::get<TupleLetStmt>(std::move(*stmt)));
+                } else {
+                    body.push_back(std::get<LetStmt>(std::move(*stmt)));
+                }
             } else {
                 auto stmt = parse_expr_stmt();
                 if (!stmt.has_value()) {
@@ -225,6 +229,39 @@ class Parser {
     auto parse_let_stmt() -> std::optional<Stmt> {
         const std::size_t start_line = previous().line;
         bool is_mut = match(TokenKind::KeywordMut);
+
+        // Tuple destructuring: let (a, b, ...) = expr;
+        if (match(TokenKind::LParen)) {
+            std::vector<std::string> names;
+            do {
+                auto n = consume_identifier("expected identifier in tuple binding");
+                if (!n.has_value()) {
+                    return std::nullopt;
+                }
+                names.push_back(std::move(*n));
+            } while (match(TokenKind::Comma));
+            if (!consume(TokenKind::RParen, "expected ')' after tuple binding names")) {
+                return std::nullopt;
+            }
+            if (!consume(TokenKind::Eq, "expected '=' after tuple binding")) {
+                return std::nullopt;
+            }
+            auto value = parse_expression();
+            if (!value) {
+                return std::nullopt;
+            }
+            if (!consume(TokenKind::Semicolon, "expected ';' after tuple let binding")) {
+                return std::nullopt;
+            }
+            return TupleLetStmt{
+                .is_mut = is_mut,
+                .names = std::move(names),
+                .value = std::move(value),
+                .start_line = start_line,
+                .end_line = previous().line,
+            };
+        }
+
         auto name = consume_identifier("expected identifier after 'let'");
         if (!name.has_value()) {
             return std::nullopt;

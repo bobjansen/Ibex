@@ -222,13 +222,24 @@ struct LetStmt {
     std::size_t end_line = 0;
 };
 
+/// Tuple destructuring assignment: `let (a, b, c) = expr;`
+/// The RHS must evaluate to a DataFrame; each name is bound to the
+/// corresponding column as a Series.
+struct TupleLetStmt {
+    bool is_mut = false;
+    std::vector<std::string> names;
+    ExprPtr value;
+    std::size_t start_line = 0;
+    std::size_t end_line = 0;
+};
+
 struct ExprStmt {
     ExprPtr expr;
     std::size_t start_line = 0;
     std::size_t end_line = 0;
 };
 
-using FnStmt = std::variant<LetStmt, ExprStmt>;
+using FnStmt = std::variant<LetStmt, TupleLetStmt, ExprStmt>;
 
 struct FunctionDecl {
     std::string name;
@@ -256,7 +267,7 @@ struct ImportDecl {
     std::size_t end_line = 0;
 };
 
-using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, ExprStmt, ImportDecl>;
+using Stmt = std::variant<ExternDecl, FunctionDecl, LetStmt, TupleLetStmt, ExprStmt, ImportDecl>;
 
 struct Program {
     std::vector<Stmt> statements;

@@ -864,6 +864,20 @@ class Parser {
             return ResampleClause{.duration =
                                       DurationLiteral{.text = std::string(previous().lexeme)}};
         }
+        if (match(TokenKind::KeywordMelt)) {
+            auto fields = parse_field_list_or_single();
+            if (!fields.has_value()) {
+                return std::nullopt;
+            }
+            return MeltClause{.id_fields = std::move(*fields)};
+        }
+        if (match(TokenKind::KeywordDcast)) {
+            auto name = consume_column_identifier("expected column name after 'dcast'");
+            if (!name.has_value()) {
+                return std::nullopt;
+            }
+            return DcastClause{.pivot_column = std::move(*name)};
+        }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
     }

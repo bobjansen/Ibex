@@ -189,6 +189,8 @@ enum class NodeKind : std::uint8_t {
     AsTimeframe,
     ExternCall,
     Join,
+    Melt,
+    Dcast,
     Stream,
 };
 
@@ -427,6 +429,57 @@ class WindowNode final : public Node {
 
    private:
     Duration duration_;
+};
+
+/// Melt node: unpivots wide-format columns into long-format (variable, value) rows.
+/// id_columns stay as-is; measure_columns are unpivoted.
+/// If measure_columns is empty, all non-id columns are melted.
+class MeltNode final : public Node {
+   public:
+    MeltNode(NodeId id, std::vector<std::string> id_columns,
+             std::vector<std::string> measure_columns)
+        : Node(NodeKind::Melt, id),
+          id_columns_(std::move(id_columns)),
+          measure_columns_(std::move(measure_columns)) {}
+
+    [[nodiscard]] auto id_columns() const noexcept -> const std::vector<std::string>& {
+        return id_columns_;
+    }
+    [[nodiscard]] auto measure_columns() const noexcept -> const std::vector<std::string>& {
+        return measure_columns_;
+    }
+
+   private:
+    std::vector<std::string> id_columns_;
+    std::vector<std::string> measure_columns_;
+};
+
+/// Dcast node: pivots long-format data into wide-format columns.
+/// pivot_column's distinct values become new column names; value_column fills cells.
+/// row_keys are the grouping columns that become row identifiers.
+class DcastNode final : public Node {
+   public:
+    DcastNode(NodeId id, std::string pivot_column, std::string value_column,
+              std::vector<std::string> row_keys)
+        : Node(NodeKind::Dcast, id),
+          pivot_column_(std::move(pivot_column)),
+          value_column_(std::move(value_column)),
+          row_keys_(std::move(row_keys)) {}
+
+    [[nodiscard]] auto pivot_column() const noexcept -> const std::string& {
+        return pivot_column_;
+    }
+    [[nodiscard]] auto value_column() const noexcept -> const std::string& {
+        return value_column_;
+    }
+    [[nodiscard]] auto row_keys() const noexcept -> const std::vector<std::string>& {
+        return row_keys_;
+    }
+
+   private:
+    std::string pivot_column_;
+    std::string value_column_;
+    std::vector<std::string> row_keys_;
 };
 
 /// Stream node: wires a source extern, an anonymous transform, and a sink extern into a

@@ -34,6 +34,8 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"window", TokenKind::KeywordWindow},
         {"resample", TokenKind::KeywordResample},
         {"rename", TokenKind::KeywordRename},
+        {"melt", TokenKind::KeywordMelt},
+        {"dcast", TokenKind::KeywordDcast},
         {"join", TokenKind::KeywordJoin},
         {"left", TokenKind::KeywordLeft},
         {"asof", TokenKind::KeywordAsof},

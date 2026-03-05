@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <sstream>
 
@@ -2212,6 +2213,164 @@ TEST_CASE("rand_bernoulli invalid p") {
     registry.emplace("t", table);
 
     auto ir = require_ir("t[update { b = rand_bernoulli(1.5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}
+
+// ─── rand_corr_normal ─────────────────────────────────────────────────────────
+
+TEST_CASE("rand_corr_normal generates correct column type and size") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[update { z = rand_normal(0.0, 1.0), y = rand_corr_normal(z, 0.8) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* z_col = result->find("z");
+    const auto* y_col = result->find("y");
+    REQUIRE(z_col != nullptr);
+    REQUIRE(y_col != nullptr);
+    REQUIRE(std::get_if<Column<double>>(z_col) != nullptr);
+    REQUIRE(std::get_if<Column<double>>(y_col) != nullptr);
+    REQUIRE(std::get_if<Column<double>>(z_col)->size() == 5);
+    REQUIRE(std::get_if<Column<double>>(y_col)->size() == 5);
+}
+
+TEST_CASE("rand_corr_normal values are reasonable") {
+    // For rho=0.0, y is just an independent N(0,1); check it's in (-10, 10).
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[update { z = rand_normal(0.0, 1.0), y = rand_corr_normal(z, 0.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* y_col = result->find("y");
+    REQUIRE(y_col != nullptr);
+    const auto* yv = std::get_if<Column<double>>(y_col);
+    REQUIRE(yv != nullptr);
+    for (std::size_t i = 0; i < yv->size(); ++i) {
+        CHECK((*yv)[i] > -10.0);
+        CHECK((*yv)[i] < 10.0);
+    }
+}
+
+TEST_CASE("rand_corr_normal approximate correlation is close to rho") {
+    // Generate 10 000 rows and verify sample correlation is near rho=0.7.
+    // Failure probability is negligible (many sigma away).
+    constexpr int N = 10000;
+    runtime::Table table;
+    Column<std::int64_t> idx;
+    idx.reserve(N);
+    for (int i = 0; i < N; ++i) idx.push_back(i);
+    table.add_column("x", idx);
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[update { z = rand_normal(0.0, 1.0), y = rand_corr_normal(z, 0.7) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* zv = std::get_if<Column<double>>(result->find("z"));
+    const auto* yv = std::get_if<Column<double>>(result->find("y"));
+    REQUIRE(zv != nullptr);
+    REQUIRE(yv != nullptr);
+
+    double sum_z = 0.0, sum_y = 0.0, sum_zz = 0.0, sum_yy = 0.0, sum_zy = 0.0;
+    for (int i = 0; i < N; ++i) {
+        sum_z += (*zv)[i];
+        sum_y += (*yv)[i];
+        sum_zz += (*zv)[i] * (*zv)[i];
+        sum_yy += (*yv)[i] * (*yv)[i];
+        sum_zy += (*zv)[i] * (*yv)[i];
+    }
+    double mean_z = sum_z / N;
+    double mean_y = sum_y / N;
+    double var_z = sum_zz / N - mean_z * mean_z;
+    double var_y = sum_yy / N - mean_y * mean_y;
+    double cov_zy = sum_zy / N - mean_z * mean_y;
+    double sample_corr = cov_zy / std::sqrt(var_z * var_y);
+    // Allow ±0.05 tolerance; a 3-sigma bound for N=10 000 is ~0.015.
+    CHECK(sample_corr > 0.65);
+    CHECK(sample_corr < 0.75);
+}
+
+TEST_CASE("rand_corr_normal negative rho produces negative correlation") {
+    constexpr int N = 5000;
+    runtime::Table table;
+    Column<std::int64_t> idx;
+    idx.reserve(N);
+    for (int i = 0; i < N; ++i) idx.push_back(i);
+    table.add_column("x", idx);
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[update { z = rand_normal(0.0, 1.0), y = rand_corr_normal(z, -0.9) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* zv = std::get_if<Column<double>>(result->find("z"));
+    const auto* yv = std::get_if<Column<double>>(result->find("y"));
+    REQUIRE(zv != nullptr);
+    REQUIRE(yv != nullptr);
+
+    double sum_z = 0.0, sum_y = 0.0, sum_zz = 0.0, sum_yy = 0.0, sum_zy = 0.0;
+    for (int i = 0; i < N; ++i) {
+        sum_z += (*zv)[i];
+        sum_y += (*yv)[i];
+        sum_zz += (*zv)[i] * (*zv)[i];
+        sum_yy += (*yv)[i] * (*yv)[i];
+        sum_zy += (*zv)[i] * (*yv)[i];
+    }
+    double mean_z = sum_z / N;
+    double mean_y = sum_y / N;
+    double var_z = sum_zz / N - mean_z * mean_z;
+    double var_y = sum_yy / N - mean_y * mean_y;
+    double cov_zy = sum_zy / N - mean_z * mean_y;
+    double sample_corr = cov_zy / std::sqrt(var_z * var_y);
+    CHECK(sample_corr < -0.85);
+    CHECK(sample_corr > -0.95);
+}
+
+TEST_CASE("rand_corr_normal wrong argument count") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { z = rand_normal(0.0, 1.0), y = rand_corr_normal(z) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("rand_corr_normal rho out of range") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir =
+        require_ir("t[update { z = rand_normal(0.0, 1.0), y = rand_corr_normal(z, 1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("rand_corr_normal non-float source column") {
+    runtime::Table table;
+    table.add_column("i", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { y = rand_corr_normal(i, 0.5) }];");
     auto result = runtime::interpret(*ir, registry);
     CHECK_FALSE(result.has_value());
 }

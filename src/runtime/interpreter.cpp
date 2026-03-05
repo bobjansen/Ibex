@@ -4410,6 +4410,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
 constexpr auto is_rng_func(std::string_view name) -> bool;
 constexpr auto rng_func_returns_int(std::string_view name) -> bool;
+auto apply_rng_func(const ir::CallExpr& call, std::size_t rows, const Table* input)
+    -> std::expected<ColumnValue, std::string>;
 
 auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                      const ExternRegistry* externs) -> std::expected<ExprType, std::string> {
@@ -5243,7 +5245,7 @@ constexpr auto is_rolling_func(std::string_view name) -> bool {
 constexpr auto is_rng_func(std::string_view name) -> bool {
     return name == "rand_uniform" || name == "rand_normal" || name == "rand_student_t" ||
            name == "rand_gamma" || name == "rand_exponential" || name == "rand_bernoulli" ||
-           name == "rand_poisson" || name == "rand_int";
+           name == "rand_poisson" || name == "rand_int" || name == "rand_corr_normal";
 }
 
 constexpr auto rng_func_returns_int(std::string_view name) -> bool {
@@ -5285,7 +5287,7 @@ auto extract_rng_param(const ir::CallExpr& call, std::size_t pos, std::string_vi
         lit->value);
 }
 
-// Generate a full column of `rows` independent draws from the named distribution.
+// Generate a full column of `rows` draws from the named distribution.
 //
 //   rand_uniform(low, high)          – Uniform[low, high)            → Float
 //   rand_normal(mean, stddev)        – Normal(mean, stddev²)          → Float
@@ -5295,8 +5297,11 @@ auto extract_rng_param(const ir::CallExpr& call, std::size_t pos, std::string_vi
 //   rand_bernoulli(p)                – Bernoulli(p)  → 0 or 1         → Int
 //   rand_poisson(lambda)             – Poisson(lambda)                → Int
 //   rand_int(lo, hi)                 – Uniform integer [lo, hi]       → Int
+//   rand_corr_normal(z, rho)         – Correlated normal: rho*z + sqrt(1-rho²)*N(0,1) → Float
 //
-auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
+// `input` is required only by rand_corr_normal (to read the source column `z`).
+//
+auto apply_rng_func(const ir::CallExpr& call, std::size_t rows, const Table* input)
     -> std::expected<ColumnValue, std::string> {
     auto& rng = get_rng();
     const auto& name = call.callee;
@@ -5439,6 +5444,44 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         Column<std::int64_t> col;
         col.reserve(rows);
         for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        return col;
+    }
+
+    if (name == "rand_corr_normal") {
+        if (call.args.size() != 2) {
+            return std::unexpected("rand_corr_normal: expected 2 arguments (z, rho)");
+        }
+        // First argument must be a column reference to an existing Float column.
+        const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+        if (!col_ref) {
+            return std::unexpected(
+                "rand_corr_normal: first argument must be a column reference");
+        }
+        if (input == nullptr) {
+            return std::unexpected("rand_corr_normal: no table context available");
+        }
+        const auto* source = input->find(col_ref->name);
+        if (source == nullptr) {
+            return std::unexpected("rand_corr_normal: column not found: " + col_ref->name);
+        }
+        const auto* z_col = std::get_if<Column<double>>(source);
+        if (!z_col) {
+            return std::unexpected("rand_corr_normal: column '" + col_ref->name +
+                                   "' must be Float (use rand_normal to generate it first)");
+        }
+        auto rho_res = extract_rng_param(call, 1, name);
+        if (!rho_res) return std::unexpected(rho_res.error());
+        double rho = *rho_res;
+        if (rho <= -1.0 || rho >= 1.0) {
+            return std::unexpected("rand_corr_normal: rho must be in the open interval (-1, 1)");
+        }
+        double sqrt_term = std::sqrt(1.0 - rho * rho);
+        std::normal_distribution<double> dist(0.0, 1.0);
+        Column<double> col;
+        col.reserve(rows);
+        for (std::size_t i = 0; i < rows; ++i) {
+            col.push_back(rho * (*z_col)[i] + sqrt_term * dist(rng));
+        }
         return col;
     }
 
@@ -5624,7 +5667,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 continue;
             }
             if (is_rng_func(call->callee)) {
-                auto col = apply_rng_func(*call, output.rows());
+                auto col = apply_rng_func(*call, output.rows(), &output);
                 if (!col) return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
@@ -5689,7 +5732,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 return std::unexpected(call->callee + ": requires a window clause");
             }
             if (is_rng_func(call->callee)) {
-                auto col = apply_rng_func(*call, rows);
+                auto col = apply_rng_func(*call, rows, &output);
                 if (!col) return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;

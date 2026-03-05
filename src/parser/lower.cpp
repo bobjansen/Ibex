@@ -766,6 +766,31 @@ class Lowerer {
         if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
             return lower_expr_to_ir(*group->expr);
         }
+        if (const auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+            if (unary->op == UnaryOp::Negate) {
+                auto operand = lower_expr_to_ir(*unary->expr);
+                if (!operand.has_value()) {
+                    return std::unexpected(operand.error());
+                }
+                // Fold negation of a numeric literal into the literal itself.
+                if (auto* lit = std::get_if<ir::Literal>(&operand->node)) {
+                    if (auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                        return ir::Expr{.node = ir::Literal{.value = -(*iv)}};
+                    }
+                    if (auto* dv = std::get_if<double>(&lit->value)) {
+                        return ir::Expr{.node = ir::Literal{.value = -(*dv)}};
+                    }
+                }
+                // Non-literal: emit as 0 - operand.
+                ir::BinaryExpr bin{
+                    .op = ir::ArithmeticOp::Sub,
+                    .left = std::make_shared<ir::Expr>(
+                        ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}}),
+                    .right = std::make_shared<ir::Expr>(std::move(operand.value())),
+                };
+                return ir::Expr{.node = std::move(bin)};
+            }
+        }
         return std::unexpected(LowerError{.message = "unsupported expression"});
     }
 

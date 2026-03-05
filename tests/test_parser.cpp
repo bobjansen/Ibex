@@ -910,42 +910,33 @@ TEST_CASE("Parse tuple-LHS select with three names") {
     REQUIRE(select.tuple_fields[0].names[2] == "r");
 }
 
-// ─── String-literal column names ─────────────────────────────────────────────
+// ─── update = expr (merge-all) ───────────────────────────────────────────────
 
-TEST_CASE("Parse string literal as update column name") {
-    const char* source = R"(df[update { "log price" = log(price) }];)";
+TEST_CASE("Parse update = expr merge-all form") {
+    const char* source = "df[update = gen_cols()];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.empty());
+    REQUIRE(update.tuple_fields.empty());
+    REQUIRE(update.merge_expr != nullptr);
+}
+
+TEST_CASE("Parse update = expr with argument") {
+    const char* source = "prices[update = gen_prices(symbols)];";
     auto result = parse(source);
     REQUIRE(result.has_value());
     const auto& stmt = result->statements.front();
     const auto& expr_stmt = std::get<ExprStmt>(stmt);
     const auto& block = require_block(require_expr(expr_stmt.expr));
     const auto& update = std::get<UpdateClause>(block.clauses[0]);
-    REQUIRE(update.fields.size() == 1);
-    REQUIRE(update.fields[0].name == "log price");
-    REQUIRE(update.fields[0].expr != nullptr);
-}
-
-TEST_CASE("Parse string literal as select column name") {
-    const char* source = R"(df[select { "total value" = price * volume }];)";
-    auto result = parse(source);
-    REQUIRE(result.has_value());
-    const auto& stmt = result->statements.front();
-    const auto& expr_stmt = std::get<ExprStmt>(stmt);
-    const auto& block = require_block(require_expr(expr_stmt.expr));
-    const auto& select = std::get<SelectClause>(block.clauses[0]);
-    REQUIRE(select.fields.size() == 1);
-    REQUIRE(select.fields[0].name == "total value");
-}
-
-TEST_CASE("Parse tuple-LHS with string literal names") {
-    const char* source = R"(df[update { ("col a", "col b") = gen() }];)";
-    auto result = parse(source);
-    REQUIRE(result.has_value());
-    const auto& stmt = result->statements.front();
-    const auto& expr_stmt = std::get<ExprStmt>(stmt);
-    const auto& block = require_block(require_expr(expr_stmt.expr));
-    const auto& update = std::get<UpdateClause>(block.clauses[0]);
-    REQUIRE(update.tuple_fields.size() == 1);
-    REQUIRE(update.tuple_fields[0].names[0] == "col a");
-    REQUIRE(update.tuple_fields[0].names[1] == "col b");
+    REQUIRE(update.merge_expr != nullptr);
+    // RHS must be a call expression
+    const auto* call = std::get_if<CallExpr>(&update.merge_expr->node);
+    REQUIRE(call != nullptr);
+    REQUIRE(call->callee == "gen_prices");
 }

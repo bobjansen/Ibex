@@ -65,6 +65,18 @@ class Builder {
         return std::make_unique<ExternCallNode>(next_id(), std::move(callee), std::move(args));
     }
 
+    [[nodiscard]] auto melt(std::vector<std::string> id_columns,
+                            std::vector<std::string> measure_columns) -> NodePtr {
+        return std::make_unique<MeltNode>(next_id(), std::move(id_columns),
+                                          std::move(measure_columns));
+    }
+
+    [[nodiscard]] auto dcast(std::string pivot_column, std::string value_column,
+                             std::vector<std::string> row_keys) -> NodePtr {
+        return std::make_unique<DcastNode>(next_id(), std::move(pivot_column),
+                                           std::move(value_column), std::move(row_keys));
+    }
+
     [[nodiscard]] auto join(JoinKind kind, std::vector<std::string> keys) -> NodePtr {
         return std::make_unique<JoinNode>(next_id(), kind, std::move(keys));
     }

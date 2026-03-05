@@ -192,7 +192,7 @@ class Lowerer {
         if (state.distinct && state.by) {
             return std::unexpected(LowerError{.message = "distinct cannot be used with by"});
         }
-        if (state.by && !state.select && !state.update && !state.resample) {
+        if (state.by && !state.select && !state.update && !state.resample && !state.dcast) {
             return std::unexpected(LowerError{.message = "by requires select or update"});
         }
         if (state.resample && state.window) {
@@ -204,6 +204,30 @@ class Lowerer {
         }
         if (state.resample && state.update) {
             return std::unexpected(LowerError{.message = "resample cannot be used with update"});
+        }
+        if (state.melt &&
+            (state.update || state.distinct || state.dcast || state.by || state.window ||
+             state.resample || state.rename)) {
+            return std::unexpected(LowerError{
+                .message =
+                    "melt is mutually exclusive with update, distinct, dcast, by, window, "
+                    "resample, and rename"});
+        }
+        if (state.dcast &&
+            (state.update || state.distinct || state.melt || state.window || state.resample ||
+             state.rename)) {
+            return std::unexpected(LowerError{
+                .message =
+                    "dcast is mutually exclusive with update, distinct, melt, window, "
+                    "resample, and rename"});
+        }
+        if (state.dcast && !state.select) {
+            return std::unexpected(
+                LowerError{.message = "dcast requires a select clause for the value column"});
+        }
+        if (state.dcast && !state.by) {
+            return std::unexpected(
+                LowerError{.message = "dcast requires a by clause for the row keys"});
         }
 
         auto node = std::move(base.value());
@@ -228,13 +252,14 @@ class Lowerer {
             node = std::move(rename_node);
         }
 
-        if (!state.resample && state.select && (state.by || select_has_aggregate(*state.select))) {
+        if (!state.resample && !state.melt && !state.dcast && state.select &&
+            (state.by || select_has_aggregate(*state.select))) {
             auto aggregate = lower_aggregate(state.by, *state.select, std::move(node));
             if (!aggregate.has_value()) {
                 return std::unexpected(aggregate.error());
             }
             node = std::move(aggregate.value());
-        } else if (!state.resample && state.select) {
+        } else if (!state.resample && !state.melt && !state.dcast && state.select) {
             auto project = lower_select_projection(state.select->fields, std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
@@ -299,6 +324,40 @@ class Lowerer {
             node = std::move(resample_node);
         }
 
+        if (state.melt) {
+            std::vector<std::string> id_cols;
+            for (const auto& field : state.melt->id_fields) {
+                id_cols.push_back(field.name);
+            }
+            std::vector<std::string> measure_cols;
+            if (state.select) {
+                for (const auto& field : state.select->fields) {
+                    measure_cols.push_back(field.name);
+                }
+            }
+            auto melt_node = builder_.melt(std::move(id_cols), std::move(measure_cols));
+            melt_node->add_child(std::move(node));
+            node = std::move(melt_node);
+        }
+
+        if (state.dcast) {
+            // Extract the value column name from the select clause.
+            // dcast expects exactly one field in select (the value column).
+            if (state.select->fields.size() != 1) {
+                return std::unexpected(
+                    LowerError{.message = "dcast select must specify exactly one value column"});
+            }
+            std::string value_col = state.select->fields[0].name;
+            std::vector<std::string> row_keys;
+            for (const auto& key : state.by->keys) {
+                row_keys.push_back(key.name);
+            }
+            auto dcast_node = builder_.dcast(state.dcast->pivot_column, std::move(value_col),
+                                             std::move(row_keys));
+            dcast_node->add_child(std::move(node));
+            node = std::move(dcast_node);
+        }
+
         return node;
     }
 
@@ -312,6 +371,8 @@ class Lowerer {
         const ByClause* by = nullptr;
         const WindowClause* window = nullptr;
         const ResampleClause* resample = nullptr;
+        const MeltClause* melt = nullptr;
+        const DcastClause* dcast = nullptr;
         std::string error;
 
         auto record(const Clause& clause) -> bool {
@@ -385,6 +446,22 @@ class Lowerer {
                     return false;
                 }
                 resample = &std::get<ResampleClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<MeltClause>(clause)) {
+                if (melt != nullptr) {
+                    error = "duplicate melt clause";
+                    return false;
+                }
+                melt = &std::get<MeltClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<DcastClause>(clause)) {
+                if (dcast != nullptr) {
+                    error = "duplicate dcast clause";
+                    return false;
+                }
+                dcast = &std::get<DcastClause>(clause);
                 return true;
             }
             return true;
@@ -1272,6 +1349,14 @@ class Lowerer {
             case ir::NodeKind::Join: {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
                 return builder_.join(join.kind(), join.keys());
+            }
+            case ir::NodeKind::Melt: {
+                const auto& mn = static_cast<const ir::MeltNode&>(node);
+                return builder_.melt(mn.id_columns(), mn.measure_columns());
+            }
+            case ir::NodeKind::Dcast: {
+                const auto& dn = static_cast<const ir::DcastNode&>(node);
+                return builder_.dcast(dn.pivot_column(), dn.value_column(), dn.row_keys());
             }
             case ir::NodeKind::Stream:
                 // StreamNode is not cloned during block lowering.

@@ -240,6 +240,24 @@ auto windowed_update(const runtime::Table& t, ir::Duration duration,
     return delegate(std::move(win_node), t);
 }
 
+auto melt(const runtime::Table& t, const std::vector<std::string>& id_cols,
+          const std::vector<std::string>& measure_cols) -> runtime::Table {
+    ir::Builder b;
+    auto scan = b.scan(kSrcKey);
+    auto melt_node = b.melt(id_cols, measure_cols);
+    melt_node->add_child(std::move(scan));
+    return delegate(std::move(melt_node), t);
+}
+
+auto dcast(const runtime::Table& t, const std::string& pivot_col, const std::string& value_col,
+           const std::vector<std::string>& row_keys) -> runtime::Table {
+    ir::Builder b;
+    auto scan = b.scan(kSrcKey);
+    auto dcast_node = b.dcast(pivot_col, value_col, row_keys);
+    dcast_node->add_child(std::move(scan));
+    return delegate(std::move(dcast_node), t);
+}
+
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.

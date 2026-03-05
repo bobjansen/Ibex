@@ -1,7 +1,8 @@
-// tuple_assign.ibex — examples of tuple-LHS and string-literal-name assignment
+// tuple_assign.ibex — examples of tuple-LHS and merge-all update
 
 extern fn get_ohlcv() -> DataFrame from "data_plugin.so";
 extern fn compute_greeks(df: DataFrame) -> DataFrame from "greeks_plugin.so";
+extern fn gen_prices(symbols: String) -> DataFrame from "pricer_plugin.so";
 
 let ohlcv = get_ohlcv();
 
@@ -20,9 +21,9 @@ let full = ohlcv[update {
 // Select only the tuple-unpacked columns (plus symbol for context):
 let greeks_only = ohlcv[select { symbol, (delta, gamma) = compute_greeks(ohlcv) }];
 
-// ── String-literal column names ───────────────────────────────────────────────
-// Useful when the desired output name contains spaces or other special chars.
-let labeled = ohlcv[update {
-    "daily return"  = (close - open) / open,
-    "trade volume"  = volume
-}];
+// ── update = expr (merge-all) ─────────────────────────────────────────────────
+// gen_prices returns however many columns it sees fit; all are merged into prices.
+let data    = get_ohlcv();
+let symbols = scalar(data, "symbol");
+let prices  = data[select { ts }];
+prices[update = gen_prices(symbols)];

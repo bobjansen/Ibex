@@ -807,3 +807,55 @@ TEST_CASE("Parse all arithmetic operators") {
     check("let x = a / b;", BinaryOp::Div);
     check("let x = a % b;", BinaryOp::Mod);
 }
+
+// ─── Tuple let (multi-column) assignment ─────────────────────────────────────
+
+TEST_CASE("Parse tuple let binding with two names") {
+    const char* source = "let (a, b) = some_fn();";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<TupleLetStmt>(stmt));
+    const auto& tlet = std::get<TupleLetStmt>(stmt);
+    REQUIRE_FALSE(tlet.is_mut);
+    REQUIRE(tlet.names.size() == 2);
+    REQUIRE(tlet.names[0] == "a");
+    REQUIRE(tlet.names[1] == "b");
+    REQUIRE(tlet.value != nullptr);
+}
+
+TEST_CASE("Parse mut tuple let binding with three names") {
+    const char* source = "let mut (x, y, z) = gen();";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<TupleLetStmt>(stmt));
+    const auto& tlet = std::get<TupleLetStmt>(stmt);
+    REQUIRE(tlet.is_mut);
+    REQUIRE(tlet.names.size() == 3);
+    REQUIRE(tlet.names[0] == "x");
+    REQUIRE(tlet.names[1] == "y");
+    REQUIRE(tlet.names[2] == "z");
+}
+
+TEST_CASE("Parse tuple let binding with one name") {
+    const char* source = "let (col) = tbl;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    REQUIRE(std::holds_alternative<TupleLetStmt>(stmt));
+    const auto& tlet = std::get<TupleLetStmt>(stmt);
+    REQUIRE(tlet.names.size() == 1);
+    REQUIRE(tlet.names[0] == "col");
+}
+
+TEST_CASE("Parse tuple let binding tracks source lines") {
+    const char* source = "let (a, b) = fn_call();\n";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& tlet = std::get<TupleLetStmt>(stmt);
+    REQUIRE(tlet.start_line == 1);
+    REQUIRE(tlet.end_line == 1);
+}

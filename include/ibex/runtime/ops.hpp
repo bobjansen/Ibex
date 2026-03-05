@@ -61,6 +61,13 @@ namespace ibex::ops {
 [[nodiscard]] auto windowed_update(const runtime::Table& t, ir::Duration duration,
                                    const std::vector<ir::FieldSpec>& fields) -> runtime::Table;
 
+[[nodiscard]] auto melt(const runtime::Table& t, const std::vector<std::string>& id_cols,
+                        const std::vector<std::string>& measure_cols) -> runtime::Table;
+
+[[nodiscard]] auto dcast(const runtime::Table& t, const std::string& pivot_col,
+                         const std::string& value_col, const std::vector<std::string>& row_keys)
+    -> runtime::Table;
+
 [[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,
                               const std::vector<std::string>& keys) -> runtime::Table;
 

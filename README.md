@@ -88,6 +88,150 @@ let enriched = prices join ohlc on symbol;
 let with_meta = prices left join metadata on symbol;
 ```
 
+### Rename
+
+```
+// Rename columns — schema updated, data unchanged
+iris[rename { `Sepal.Length` -> sepal_length, `Sepal.Width` -> sepal_width }]
+```
+
+### Grouped update (window-function equivalent)
+
+`update + by` evaluates each expression per group and **broadcasts the result
+back to every row in the group** — analogous to a SQL window function with
+`PARTITION BY` and no `ORDER BY` frame:
+
+```
+// Attach group mean to every row (no row reduction)
+iris[update { group_mean = mean(`Sepal.Length`) }, by Species]
+```
+
+### Tuple assignment
+
+When an extern function returns multiple columns, destructure them with a
+parenthesised tuple on the left-hand side of an assignment:
+
+```
+extern fn compute_greeks(p: Float64) -> DataFrame from "greeks.hpp";
+
+trades[update { (delta, gamma) = compute_greeks(price) }]
+```
+
+### Null handling
+
+Ibex uses SQL-style **three-valued logic (3VL)**. Each column carries an
+Arrow-style validity bitmap; null propagates through arithmetic and
+comparisons. Use `is null` / `is not null` to test for nulls explicitly:
+
+```
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let emp  = read_csv("employees.csv");
+let dept = read_csv("departments.csv");
+
+// Left join — unmatched rows get null dept_name
+let enriched = emp left join dept on dept_id;
+
+// Filter using IS NULL / IS NOT NULL
+enriched[filter { dept_name is null }]       // employees with no department
+enriched[filter { dept_name is not null }]   // employees with a known department
+
+// Arithmetic null propagation — bonus is null when budget is null
+enriched[select { name, bonus = salary + budget }]
+
+// 3VL OR: true OR null = true; null OR false = null
+enriched[filter { dept_name is not null || salary > 80000 }]
+```
+
+### TimeFrame and rolling windows
+
+A `TimeFrame` is a `DataFrame` with a designated `Timestamp` index, always
+sorted in ascending order. Rolling window operations are **time-based** (not
+row-count based) and use duration literals:
+
+```
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let prices = read_csv("prices.csv");
+let tf = as_timeframe(prices, timestamp);
+
+// 5-minute rolling mean
+tf[window 5m, update { ma5 = rolling_mean(price) }]
+
+// Lag / lead (positional shifts, no window clause needed)
+tf[update { prev_price = lag(price, 1) }]
+
+// Resample to 1-minute OHLC bars
+tf[resample 1m, select {
+    open  = first(price),
+    high  = max(price),
+    low   = min(price),
+    close = last(price),
+}]
+
+// As-of join two TimeFrames on time index
+let tf2 = as_timeframe(read_csv("quotes.csv"), timestamp);
+tf asof join tf2 on timestamp
+```
+
+### Reshape: melt and dcast
+
+`melt` unpivots a wide DataFrame to long format; `dcast` pivots it back:
+
+```
+// Wide → long (unpivot): symbol is the id column; open/high/low/close become rows
+let long = ohlc[melt symbol]
+// Columns: symbol | variable | value
+
+// Restrict which measure columns to unpivot
+ohlc[melt symbol, select { open, close }]
+
+// Multiple id columns
+ohlc[melt { symbol, date }]
+
+// Long → wide (pivot): variable column becomes new column names
+long[dcast variable, select value, by symbol]
+// Columns: symbol | open | high | low | close
+```
+
+### Scalar functions
+
+```
+// Math
+df[update { log_ret = log(price / lag(price, 1)) }]
+df[update { vol = sqrt(variance) }]
+df[update { notional = abs(pnl) }]
+
+// Date / time extraction
+df[update { yr = year(date), mo = month(date), dy = day(date) }]
+df[update { hr = hour(timestamp) }]
+```
+
+### rep()
+
+Create constant columns or repeat values across all rows:
+
+```
+// Boolean mask column
+df[update { is_live = rep(true) }]
+
+// Constant tag
+df[update { source = rep("backtest") }]
+
+// Repeat column values (R-style)
+df[update { rep2 = rep(price, each=2) }]
+```
+
+### Writing output
+
+```
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+
+let rows_written = write_csv(result, "output.csv");
+write_parquet(result, "output.parquet");
+```
+
 ### Vectorized RNG
 
 Generate columns of random draws in a single pass — one independent value per
@@ -434,6 +578,8 @@ Fully restart VS Code after copying. `.ibex` files will be highlighted automatic
 
 ## Roadmap
 
-- [ ] Time-indexed DataFrame support
 - [ ] Query optimizer (predicate pushdown, projection pruning)
+- [ ] Python FFI bindings (pybind11) and C API
+- [ ] R bindings (Rcpp)
+- [ ] Arrow C Data Interface export (zero-copy interop)
 - [ ] REPL tab completion and history

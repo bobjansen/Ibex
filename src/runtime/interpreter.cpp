@@ -6177,7 +6177,30 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return update_table(std::move(child.value()), update.fields(), scalars, externs);
+            auto result = update_table(std::move(child.value()), update.fields(), scalars, externs);
+            if (!result) {
+                return result;
+            }
+            for (const auto& tspec : update.tuple_fields()) {
+                auto src = interpret_node(*tspec.source, registry, scalars, externs);
+                if (!src) {
+                    return std::unexpected(src.error());
+                }
+                if (src->columns.size() != tspec.aliases.size()) {
+                    return std::unexpected(
+                        "tuple assignment: expected " + std::to_string(tspec.aliases.size()) +
+                        " column(s), got " + std::to_string(src->columns.size()));
+                }
+                for (std::size_t i = 0; i < tspec.aliases.size(); ++i) {
+                    const auto& entry = src->columns[i];
+                    if (entry.validity) {
+                        result->add_column(tspec.aliases[i], *entry.column, *entry.validity);
+                    } else {
+                        result->add_column(tspec.aliases[i], *entry.column);
+                    }
+                }
+            }
+            return result;
         }
         case ir::NodeKind::Rename: {
             const auto& rename = static_cast<const ir::RenameNode&>(node);

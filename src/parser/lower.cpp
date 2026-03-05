@@ -15,8 +15,9 @@ namespace {
 
 class Lowerer {
    public:
-    explicit Lowerer(std::unordered_map<std::string, ir::NodePtr>* bindings)
-        : bindings_(bindings) {}
+    explicit Lowerer(std::unordered_map<std::string, ir::NodePtr>* bindings,
+                     std::unordered_set<std::string> initial_table_externs = {})
+        : bindings_(bindings), table_externs_(std::move(initial_table_externs)) {}
 
     auto lower_program(const Program& program) -> LowerResult {
         ir::NodePtr last_expr;
@@ -265,13 +266,14 @@ class Lowerer {
             }
             node = std::move(aggregate.value());
         } else if (!state.resample && !state.melt && !state.dcast && state.select) {
-            auto project = lower_select_projection(state.select->fields, std::move(node));
+            auto project = lower_select_projection(state.select->fields, state.select->tuple_fields,
+                                                     std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
             }
             node = std::move(project.value());
         } else if (state.distinct) {
-            auto project = lower_select_projection(state.distinct->fields, std::move(node));
+            auto project = lower_select_projection(state.distinct->fields, {}, std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
             }
@@ -605,8 +607,9 @@ class Lowerer {
             expr.node);
     }
 
-    auto lower_select_projection(const std::vector<Field>& clause_fields, ir::NodePtr base)
-        -> std::expected<ir::NodePtr, LowerError> {
+    auto lower_select_projection(const std::vector<Field>& clause_fields,
+                                  const std::vector<TupleField>& tuple_fields,
+                                  ir::NodePtr base) -> std::expected<ir::NodePtr, LowerError> {
         std::vector<ir::FieldSpec> fields;
         std::vector<ir::ColumnRef> columns;
         fields.reserve(clause_fields.size());
@@ -628,13 +631,26 @@ class Lowerer {
             columns.push_back(ir::ColumnRef{.name = field.name});
         }
 
-        if (fields.empty()) {
+        std::vector<ir::TupleFieldSpec> tuple_specs;
+        for (const auto& tf : tuple_fields) {
+            auto src = lower_expr(*tf.expr);
+            if (!src.has_value()) {
+                return std::unexpected(src.error());
+            }
+            for (const auto& name : tf.names) {
+                columns.push_back(ir::ColumnRef{.name = name});
+            }
+            tuple_specs.push_back(
+                ir::TupleFieldSpec{.aliases = tf.names, .source = std::move(src.value())});
+        }
+
+        if (fields.empty() && tuple_specs.empty()) {
             auto project = builder_.project(std::move(columns));
             project->add_child(std::move(base));
             return project;
         }
 
-        auto update = builder_.update(std::move(fields));
+        auto update = builder_.update(std::move(fields), std::move(tuple_specs));
         update->add_child(std::move(base));
 
         auto project = builder_.project(std::move(columns));
@@ -658,6 +674,15 @@ class Lowerer {
                 .expr = std::move(expr.value()),
             });
         }
+        std::vector<ir::TupleFieldSpec> tuple_specs;
+        for (const auto& tf : clause.tuple_fields) {
+            auto src = lower_expr(*tf.expr);
+            if (!src.has_value()) {
+                return std::unexpected(src.error());
+            }
+            tuple_specs.push_back(
+                ir::TupleFieldSpec{.aliases = tf.names, .source = std::move(src.value())});
+        }
         std::vector<ir::ColumnRef> group_by;
         if (by != nullptr) {
             auto keys = lower_group_by(*by);
@@ -666,7 +691,7 @@ class Lowerer {
             }
             group_by = std::move(keys.value());
         }
-        return builder_.update(std::move(fields), std::move(group_by));
+        return builder_.update(std::move(fields), std::move(tuple_specs), std::move(group_by));
     }
 
     static auto lower_rename(const RenameClause& clause)
@@ -1327,7 +1352,7 @@ class Lowerer {
             }
             case ir::NodeKind::Update: {
                 const auto& update = static_cast<const ir::UpdateNode&>(node);
-                auto clone = builder_.update(update.fields(), update.group_by());
+                auto clone = builder_.update(update.fields(), {}, update.group_by());
                 return clone;
             }
             case ir::NodeKind::Rename: {
@@ -1484,7 +1509,7 @@ auto lower(const Program& program) -> LowerResult {
 }
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
-    Lowerer lowerer(&context.bindings);
+    Lowerer lowerer(&context.bindings, context.table_externs);
     return lowerer.lower_expression(expr);
 }
 

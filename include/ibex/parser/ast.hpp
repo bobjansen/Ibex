@@ -100,6 +100,14 @@ struct Field {
     ExprPtr expr;
 };
 
+/// Tuple-LHS field assignment: `(colA, colB) = expr` inside select/update.
+/// The RHS must evaluate to a DataFrame; each name is bound to the
+/// corresponding column of the result.
+struct TupleField {
+    std::vector<std::string> names;
+    ExprPtr expr;
+};
+
 struct OrderKey {
     std::string name;
     bool ascending = true;
@@ -111,6 +119,7 @@ struct FilterClause {
 
 struct SelectClause {
     std::vector<Field> fields;
+    std::vector<TupleField> tuple_fields;
 };
 
 struct DistinctClause {
@@ -119,6 +128,7 @@ struct DistinctClause {
 
 struct UpdateClause {
     std::vector<Field> fields;
+    std::vector<TupleField> tuple_fields;
 };
 
 struct RenameClause {

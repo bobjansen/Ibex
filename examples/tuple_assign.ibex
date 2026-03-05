@@ -1,0 +1,28 @@
+// tuple_assign.ibex — examples of tuple-LHS and string-literal-name assignment
+
+extern fn get_ohlcv() -> DataFrame from "data_plugin.so";
+extern fn compute_greeks(df: DataFrame) -> DataFrame from "greeks_plugin.so";
+
+let ohlcv = get_ohlcv();
+
+// ── Tuple-LHS in update ───────────────────────────────────────────────────────
+// compute_greeks() returns a two-column DataFrame: (delta, gamma).
+// Both columns are added to ohlcv in a single assignment.
+let enriched = ohlcv[update { (delta, gamma) = compute_greeks(ohlcv) }];
+
+// Mixed regular and tuple fields in one update block:
+let full = ohlcv[update {
+    ret             = (close - open) / open,
+    (delta, gamma)  = compute_greeks(ohlcv)
+}];
+
+// ── Tuple-LHS in select ───────────────────────────────────────────────────────
+// Select only the tuple-unpacked columns (plus symbol for context):
+let greeks_only = ohlcv[select { symbol, (delta, gamma) = compute_greeks(ohlcv) }];
+
+// ── String-literal column names ───────────────────────────────────────────────
+// Useful when the desired output name contains spaces or other special chars.
+let labeled = ohlcv[update {
+    "daily return"  = (close - open) / open,
+    "trade volume"  = volume
+}];

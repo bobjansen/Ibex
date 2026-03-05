@@ -14,7 +14,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1353,4 +1356,137 @@ let df = get_base();
 df[update = compute_extras()];
 )";
     REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+// ─── Proof: read symbols from a file, generate 250-day correlated returns ────
+//
+// Mirrors the real-world pattern:
+//   let data    = read_csv("symbols.csv");
+//   let symbols = scalar(data, "symbol");   // e.g. "AAPL,MSFT,GOOG"
+//   days[update = gen_correlated_returns(symbols)]
+//
+// The test pre-loads `symbols` into the scalar registry (simulating what
+// scalar(data,"symbol") would produce in the REPL) and registers an extern
+// function that:
+//   1. Parses the comma-separated symbol list from the scalar argument.
+//   2. Applies a Cholesky factor to draw 250-day correlated normal returns.
+//   3. Returns a DataFrame with one column per symbol (250 rows each).
+// `update = expr` then merges all those columns into the 250-day base frame.
+
+TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
+    // ── 1. "symbols.csv" content ─────────────────────────────────────────────
+    // In production: let data = read_csv("symbols.csv");
+    //                let symbols = scalar(data, "symbol");
+    // Here we put the scalar directly into the registry.
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("symbols", std::string("AAPL,MSFT,GOOG"));
+
+    // ── 2. Base frame: 250 trading-day skeleton ───────────────────────────────
+    constexpr int n_days = 250;
+    runtime::Table days_tbl;
+    {
+        Column<std::int64_t> idx;
+        for (int i = 1; i <= n_days; ++i) idx.push_back(i);
+        days_tbl.add_column("day", std::move(idx));
+    }
+    runtime::TableRegistry tables;
+    tables.emplace("days", std::move(days_tbl));
+
+    // ── 3. Extern: gen_correlated_returns(syms: String) -> DataFrame ──────────
+    // Cholesky factor L for 3-asset correlation matrix:
+    //   rho(AAPL,MSFT) = 0.70,  rho(AAPL,GOOG) = 0.50,  rho(MSFT,GOOG) = 0.60
+    //
+    //   C = [[1.00, 0.70, 0.50],    L = [[1.0000,  0,      0     ],
+    //        [0.70, 1.00, 0.60],         [0.7000,  0.7141, 0     ],
+    //        [0.50, 0.60, 1.00]]         [0.5000,  0.3499, 0.7929]]
+    //
+    // Correlated draw: r = L * z  (z ~ N(0,I)),  scaled by daily_vol.
+    runtime::ExternRegistry externs;
+    externs.register_table(
+        "gen_correlated_returns",
+        [](const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            if (args.empty())
+                return std::unexpected("gen_correlated_returns: missing symbol-list argument");
+            const auto* sym_str = std::get_if<std::string>(&args[0]);
+            if (!sym_str)
+                return std::unexpected("gen_correlated_returns: argument must be a String");
+
+            std::vector<std::string> syms;
+            {
+                std::stringstream ss(*sym_str);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) syms.push_back(tok);
+            }
+            if (syms.empty())
+                return std::unexpected("gen_correlated_returns: empty symbol list");
+
+            constexpr int n_days = 250;
+            const int n = (int)syms.size();
+            // Cholesky (hardcoded for 3-asset; clamp at 3 for safety)
+            const double L[3][3] = {{1.0000, 0.0000, 0.0000},
+                                    {0.7000, 0.7141, 0.0000},
+                                    {0.5000, 0.3499, 0.7929}};
+            constexpr double daily_vol = 0.01;
+
+            std::mt19937 rng{42};
+            std::normal_distribution<double> std_norm;
+
+            // n_days × n independent standard normals
+            std::vector<std::vector<double>> z(n_days, std::vector<double>(n));
+            for (auto& row : z)
+                for (auto& v : row)
+                    v = std_norm(rng);
+
+            // Apply Cholesky and scale
+            runtime::Table result;
+            for (int s = 0; s < n && s < 3; ++s) {
+                Column<double> col;
+                col.reserve(n_days);
+                for (int d = 0; d < n_days; ++d) {
+                    double r = 0.0;
+                    for (int k = 0; k <= s; ++k)
+                        r += L[s][k] * z[d][k];
+                    col.push_back(r * daily_vol);
+                }
+                result.add_column(syms[s], std::move(col));
+            }
+            return runtime::ExternValue{std::move(result)};
+        });
+
+    // ── 4. Ibex script ────────────────────────────────────────────────────────
+    // `symbols` is resolved from the scalar registry at runtime.
+    const char* src = R"(
+extern fn gen_correlated_returns(syms: String) -> DataFrame from "quant.so";
+days[update = gen_correlated_returns(symbols)];
+)";
+
+    auto out = run(src, tables, &scalars, &externs);
+
+    // ── 5. Shape checks ───────────────────────────────────────────────────────
+    REQUIRE(out.rows() == n_days);
+    REQUIRE(out.columns.size() == 4);  // day + AAPL + MSFT + GOOG
+    REQUIRE(out.find("day")  != nullptr);
+    REQUIRE(out.find("AAPL") != nullptr);
+    REQUIRE(out.find("MSFT") != nullptr);
+    REQUIRE(out.find("GOOG") != nullptr);
+
+    // ── 6. Correlation checks ─────────────────────────────────────────────────
+    // Verify that the Cholesky structure produced the intended correlations.
+    auto pearson = [&](const std::string& a, const std::string& b) {
+        const auto& ca = std::get<Column<double>>(*out.find(a));
+        const auto& cb = std::get<Column<double>>(*out.find(b));
+        double ma = 0, mb = 0;
+        for (int i = 0; i < n_days; ++i) { ma += ca[i]; mb += cb[i]; }
+        ma /= n_days; mb /= n_days;
+        double cov = 0, va = 0, vb = 0;
+        for (int i = 0; i < n_days; ++i) {
+            double da = ca[i] - ma, db = cb[i] - mb;
+            cov += da * db; va += da * da; vb += db * db;
+        }
+        return cov / std::sqrt(va * vb);
+    };
+
+    CHECK(pearson("AAPL", "MSFT") == Catch::Approx(0.70).epsilon(0.12));
+    CHECK(pearson("AAPL", "GOOG") == Catch::Approx(0.50).epsilon(0.12));
+    CHECK(pearson("MSFT", "GOOG") == Catch::Approx(0.60).epsilon(0.12));
 }

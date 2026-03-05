@@ -341,6 +341,87 @@ inferred from the right-hand side expression. The language remains statically
 typed; inference is local and does not alter function signatures (parameters
 and return types remain required).
 
+### 3.5 Nullable Columns and Three-Valued Logic
+
+Every column carries an **Arrow-style validity bitmap** alongside its value
+buffer. A cell is either *valid* (non-null) or *null* (no value). Ibex uses
+SQL-style **three-valued logic (3VL)**: every predicate can evaluate to `true`,
+`false`, or `null`.
+
+#### Null Propagation
+
+Null propagates through arithmetic and comparison expressions:
+
+```
+null + x     = null
+null * x     = null
+null > x     = null     // not false — the result is unknown
+null = null  = null     // equality with null is never true
+```
+
+A `filter` clause keeps only rows where the predicate evaluates to `true`.
+Rows where the predicate is `null` are **silently dropped** (not an error).
+
+#### IS NULL / IS NOT NULL
+
+The special predicates `is null` and `is not null` test the validity bitmap
+directly and always return a valid `Bool` — never null:
+
+```
+expr is null        // true iff expr's validity bitmap is false
+expr is not null    // true iff expr's validity bitmap is true
+```
+
+These are the only predicates that can reliably detect null values:
+
+```
+enriched[filter { dept_name is null }]      // rows with no matched department
+enriched[filter { dept_name is not null }]  // rows with a known department
+```
+
+#### 3VL Boolean Logic
+
+Boolean operators follow SQL 3VL rules, where null means "unknown":
+
+| Expression            | Result  |
+|-----------------------|---------|
+| `true  OR  null`      | `true`  |
+| `false OR  null`      | `null`  |
+| `true  AND null`      | `null`  |
+| `false AND null`      | `false` |
+| `NOT null`            | `null`  |
+
+Known-true wins in OR; known-false wins in AND.
+
+#### Null Sources
+
+Nulls arise from:
+- **Left join** — unmatched right-side columns for a row with no join partner
+- **`dcast`** — missing pivot combinations are filled with null
+- **`melt`** — a null measure value in the input produces a null `value` cell
+- **Aggregate functions** — some functions return null for empty groups (e.g.
+  `ewma` on an empty group, `std` on a group with fewer than 2 non-null values)
+
+#### Aggregate Functions and Null
+
+Aggregate functions skip null rows by default:
+
+```
+sum(col)    // sums only non-null values; returns 0 for an all-null group
+count()     // counts all rows regardless of null
+mean(col)   // averages only non-null values
+median(col) // ignores null rows
+std(col)    // ignores null rows; returns null if fewer than 2 non-null values
+ewma(col, alpha)  // ignores null rows; returns null for an empty group
+```
+
+#### Column Storage
+
+Null is represented as a validity bit in an Arrow-compatible bitmap, not as a
+sentinel value in the data buffer. The stored value in a null cell is
+unspecified and must not be read directly. This design avoids ambiguity between
+the value zero / empty string and "no value".
+
 ---
 
 ## 4. Formal Grammar

@@ -176,6 +176,66 @@ if (!is.null(csv_multi_path)) {
     }
 }
 
+# ── Reshape benchmarks (melt / dcast) ─────────────────────────────────────────
+if (!is.null(csv_multi_path)) {
+    if (!skip_data_table) {
+        message("\ndata.table: loading multi for reshape...")
+        dtm_reshape <- fread(csv_multi_path)
+
+        # Build the wide OHLC table first
+        wide_dt <- dtm_reshape[, .(open = data.table::first(price),
+                                    high = max(price),
+                                    low  = min(price),
+                                    close = data.table::last(price)),
+                                by = .(symbol, day)]
+        message(sprintf("  data.table: wide table has %d rows", nrow(wide_dt)))
+
+        message("\n=== data.table (reshape) ===")
+
+        bench("data.table", "melt_wide_to_long",
+            function() melt(wide_dt, id.vars = c("symbol", "day"),
+                            measure.vars = c("open", "high", "low", "close")))
+
+        # Build long table for dcast
+        long_dt <- melt(wide_dt, id.vars = c("symbol", "day"),
+                        measure.vars = c("open", "high", "low", "close"))
+
+        bench("data.table", "dcast_long_to_wide",
+            function() dcast(long_dt, symbol + day ~ variable, value.var = "value"))
+    }
+
+    if (!skip_dplyr) {
+        message("\ndplyr: loading multi for reshape...")
+        tbm_reshape <- as_tibble(fread(csv_multi_path))
+        library(tidyr)
+
+        # Build the wide OHLC table first
+        wide_tb <- tbm_reshape |> group_by(symbol, day) |>
+            summarise(open = dplyr::first(price),
+                      high = max(price),
+                      low  = min(price),
+                      close = dplyr::last(price),
+                      .groups = "drop")
+        message(sprintf("  dplyr: wide table has %d rows", nrow(wide_tb)))
+
+        message("\n=== dplyr (reshape) ===")
+
+        bench("dplyr", "melt_wide_to_long",
+            function() wide_tb |> pivot_longer(cols = c(open, high, low, close),
+                                                names_to = "variable",
+                                                values_to = "value"))
+
+        # Build long table for dcast
+        long_tb <- wide_tb |> pivot_longer(cols = c(open, high, low, close),
+                                            names_to = "variable",
+                                            values_to = "value")
+
+        bench("dplyr", "dcast_long_to_wide",
+            function() long_tb |> pivot_wider(names_from = variable,
+                                               values_from = value))
+    }
+}
+
 # ── Filter benchmarks ─────────────────────────────────────────────────────────
 if (!is.null(csv_trades_path)) {
     dt_trades <- NULL

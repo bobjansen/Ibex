@@ -5802,6 +5802,310 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     return output;
 }
 
+// ─── Melt (wide → long) ──────────────────────────────────────────────────────
+
+auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
+                const std::vector<std::string>& measure_columns)
+    -> std::expected<Table, std::string> {
+    // Resolve id column indices.
+    std::vector<std::size_t> id_indices;
+    id_indices.reserve(id_columns.size());
+    for (const auto& name : id_columns) {
+        auto it = input.index.find(name);
+        if (it == input.index.end()) {
+            return std::unexpected("melt: id column not found: " + name +
+                                   " (available: " + format_columns(input) + ")");
+        }
+        id_indices.push_back(it->second);
+    }
+
+    // Resolve measure column indices — if empty, use all non-id columns.
+    std::unordered_set<std::string> id_set(id_columns.begin(), id_columns.end());
+    std::vector<std::size_t> measure_indices;
+    std::vector<std::string> measure_names;
+    if (measure_columns.empty()) {
+        for (std::size_t i = 0; i < input.columns.size(); ++i) {
+            if (!id_set.contains(input.columns[i].name)) {
+                measure_indices.push_back(i);
+                measure_names.push_back(input.columns[i].name);
+            }
+        }
+    } else {
+        measure_indices.reserve(measure_columns.size());
+        measure_names.reserve(measure_columns.size());
+        for (const auto& name : measure_columns) {
+            auto it = input.index.find(name);
+            if (it == input.index.end()) {
+                return std::unexpected("melt: measure column not found: " + name +
+                                       " (available: " + format_columns(input) + ")");
+            }
+            measure_indices.push_back(it->second);
+            measure_names.push_back(name);
+        }
+    }
+
+    if (measure_indices.empty()) {
+        return std::unexpected("melt: no measure columns to melt");
+    }
+
+    // Validate all measure columns have the same type variant index.
+    std::size_t first_type = input.columns[measure_indices[0]].column->index();
+    for (std::size_t i = 1; i < measure_indices.size(); ++i) {
+        if (input.columns[measure_indices[i]].column->index() != first_type) {
+            return std::unexpected("melt: all measure columns must have the same type");
+        }
+    }
+
+    std::size_t rows = input.rows();
+    std::size_t n_measures = measure_indices.size();
+    std::size_t out_rows = rows * n_measures;
+
+    // Build output table.
+    Table output;
+
+    // Id columns: repeat each value n_measures times.
+    for (std::size_t id_idx : id_indices) {
+        const auto& entry = input.columns[id_idx];
+        auto col = make_empty_like(*entry.column);
+        std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
+        std::optional<std::vector<bool>> validity;
+        if (entry.validity.has_value()) {
+            validity.emplace();
+            validity->reserve(out_rows);
+        }
+        for (std::size_t r = 0; r < rows; ++r) {
+            for (std::size_t m = 0; m < n_measures; ++m) {
+                append_value(col, *entry.column, r);
+                if (validity.has_value()) {
+                    validity->push_back((*entry.validity)[r]);
+                }
+            }
+        }
+        output.add_column(entry.name, std::move(col));
+        if (validity.has_value()) {
+            output.columns.back().validity = std::move(validity);
+        }
+    }
+
+    // "variable" column: column names as strings.
+    Column<std::string> var_col;
+    var_col.reserve(out_rows);
+    for (std::size_t r = 0; r < rows; ++r) {
+        for (const auto& mname : measure_names) {
+            var_col.push_back(mname);
+        }
+    }
+    output.add_column("variable", std::move(var_col));
+
+    // "value" column: gather values from each measure column.
+    auto value_col = make_empty_like(*input.columns[measure_indices[0]].column);
+    std::visit([out_rows](auto& c) { c.reserve(out_rows); }, value_col);
+    std::optional<std::vector<bool>> value_validity;
+
+    for (std::size_t r = 0; r < rows; ++r) {
+        for (std::size_t mi = 0; mi < n_measures; ++mi) {
+            const auto& entry = input.columns[measure_indices[mi]];
+            append_value(value_col, *entry.column, r);
+            bool null = is_null(entry, r);
+            if (null && !value_validity.has_value()) {
+                value_validity.emplace(output.columns.back().column
+                                           ? column_size(value_col) - 1
+                                           : r * n_measures + mi,
+                                       true);
+            }
+            if (value_validity.has_value()) {
+                value_validity->push_back(!null);
+            }
+        }
+    }
+    output.add_column("value", std::move(value_col));
+    if (value_validity.has_value()) {
+        output.columns.back().validity = std::move(value_validity);
+    }
+
+    return output;
+}
+
+// ─── Dcast (long → wide) ────────────────────────────────────────────────────
+
+auto dcast_table(const Table& input, const std::string& pivot_column,
+                 const std::string& value_column, const std::vector<std::string>& row_keys)
+    -> std::expected<Table, std::string> {
+    // Validate columns exist.
+    auto pivot_it = input.index.find(pivot_column);
+    if (pivot_it == input.index.end()) {
+        return std::unexpected("dcast: pivot column not found: " + pivot_column +
+                               " (available: " + format_columns(input) + ")");
+    }
+    auto value_it = input.index.find(value_column);
+    if (value_it == input.index.end()) {
+        return std::unexpected("dcast: value column not found: " + value_column +
+                               " (available: " + format_columns(input) + ")");
+    }
+    std::vector<std::size_t> key_indices;
+    key_indices.reserve(row_keys.size());
+    for (const auto& name : row_keys) {
+        auto it = input.index.find(name);
+        if (it == input.index.end()) {
+            return std::unexpected("dcast: row key column not found: " + name +
+                                   " (available: " + format_columns(input) + ")");
+        }
+        key_indices.push_back(it->second);
+    }
+
+    std::size_t pivot_idx = pivot_it->second;
+    std::size_t value_idx = value_it->second;
+    std::size_t rows = input.rows();
+
+    // Collect distinct pivot values in insertion order, converted to strings.
+    std::vector<std::string> pivot_values;
+    std::unordered_map<std::string, std::size_t> pivot_value_index;
+    const auto& pivot_col = *input.columns[pivot_idx].column;
+
+    for (std::size_t r = 0; r < rows; ++r) {
+        if (is_null(input.columns[pivot_idx], r)) continue;
+        std::string pv = std::visit(
+            [r](const auto& col) -> std::string {
+                using ColType = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                    return std::string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                    return std::string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
+                    return std::to_string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<double>>) {
+                    return std::to_string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
+                    return col[r] ? "true" : "false";
+                } else {
+                    // Date/Timestamp — use scalar_from_column fallback
+                    return std::to_string(r);
+                }
+            },
+            pivot_col);
+        if (!pivot_value_index.contains(pv)) {
+            pivot_value_index[pv] = pivot_values.size();
+            pivot_values.push_back(pv);
+        }
+    }
+
+    if (pivot_values.empty()) {
+        // No non-null pivot values; return just the key columns.
+        Table output;
+        for (std::size_t ki : key_indices) {
+            const auto& entry = input.columns[ki];
+            output.add_column(entry.name, *entry.column);
+            if (entry.validity.has_value()) {
+                output.columns.back().validity = entry.validity;
+            }
+        }
+        return output;
+    }
+
+    // Group rows by row_keys. Map from Key → first-seen output row index.
+    // Also collect which (output_row, pivot_col_idx) has a value.
+    struct CellInfo {
+        std::size_t input_row;
+    };
+    // output_row → (pivot_col_idx → input_row)
+    std::unordered_map<Key, std::size_t, KeyHash, KeyEq> key_to_row;
+    std::vector<std::size_t> first_input_row;  // for each output row, the first input row
+    // Map: (output_row_idx * n_pivots + pivot_col_idx) → input_row
+    std::unordered_map<std::size_t, std::size_t> cell_map;
+    std::size_t n_pivots = pivot_values.size();
+
+    for (std::size_t r = 0; r < rows; ++r) {
+        if (is_null(input.columns[pivot_idx], r)) continue;
+
+        Key key;
+        key.values.reserve(row_keys.size());
+        for (std::size_t ki : key_indices) {
+            if (is_null(input.columns[ki], r)) {
+                key.values.push_back(std::string("__null__"));
+            } else {
+                key.values.push_back(scalar_from_column(*input.columns[ki].column, r));
+            }
+        }
+
+        auto [it, inserted] = key_to_row.try_emplace(key, first_input_row.size());
+        if (inserted) {
+            first_input_row.push_back(r);
+        }
+        std::size_t out_row = it->second;
+
+        std::string pv = std::visit(
+            [r](const auto& col) -> std::string {
+                using ColType = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                    return std::string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                    return std::string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
+                    return std::to_string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<double>>) {
+                    return std::to_string(col[r]);
+                } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
+                    return col[r] ? "true" : "false";
+                } else {
+                    return std::to_string(r);
+                }
+            },
+            pivot_col);
+        std::size_t pvi = pivot_value_index[pv];
+        std::size_t cell_key = out_row * n_pivots + pvi;
+        cell_map[cell_key] = r;  // last value wins for duplicates
+    }
+
+    std::size_t out_rows = first_input_row.size();
+
+    // Build output table.
+    Table output;
+
+    // Row key columns — take the first row for each group.
+    for (std::size_t k = 0; k < row_keys.size(); ++k) {
+        std::size_t ki = key_indices[k];
+        const auto& entry = input.columns[ki];
+        auto col = make_empty_like(*entry.column);
+        std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
+        for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
+            append_value(col, *entry.column, first_input_row[or_idx]);
+        }
+        output.add_column(entry.name, std::move(col));
+    }
+
+    // Pivot value columns.
+    const auto& value_entry = input.columns[value_idx];
+    for (std::size_t pi = 0; pi < n_pivots; ++pi) {
+        auto col = make_empty_like(*value_entry.column);
+        std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
+        std::vector<bool> validity(out_rows, false);
+        bool has_nulls = false;
+
+        for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
+            std::size_t cell_key = or_idx * n_pivots + pi;
+            auto cit = cell_map.find(cell_key);
+            if (cit != cell_map.end()) {
+                append_value(col, *value_entry.column, cit->second);
+                bool val_null = is_null(value_entry, cit->second);
+                validity[or_idx] = !val_null;
+                if (val_null) has_nulls = true;
+            } else {
+                // Missing cell — append a default value and mark as null.
+                std::visit([](auto& c) { c.push_back({}); }, col);
+                has_nulls = true;
+            }
+        }
+
+        if (has_nulls) {
+            output.add_column(pivot_values[pi], std::move(col), std::move(validity));
+        } else {
+            output.add_column(pivot_values[pi], std::move(col));
+        }
+    }
+
+    return output;
+}
+
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs)
@@ -6017,6 +6321,28 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(right.error());
             }
             return join_table_impl(left.value(), right.value(), join.kind(), join.keys());
+        }
+        case ir::NodeKind::Melt: {
+            const auto& mn = static_cast<const ir::MeltNode&>(node);
+            if (mn.children().empty()) {
+                return std::unexpected("melt node missing child");
+            }
+            auto child = interpret_node(*mn.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return melt_table(child.value(), mn.id_columns(), mn.measure_columns());
+        }
+        case ir::NodeKind::Dcast: {
+            const auto& dn = static_cast<const ir::DcastNode&>(node);
+            if (dn.children().empty()) {
+                return std::unexpected("dcast node missing child");
+            }
+            auto child = interpret_node(*dn.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return dcast_table(child.value(), dn.pivot_column(), dn.value_column(), dn.row_keys());
         }
         case ir::NodeKind::Stream: {
             const auto& sn = static_cast<const ir::StreamNode&>(node);

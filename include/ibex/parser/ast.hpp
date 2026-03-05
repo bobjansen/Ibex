@@ -143,8 +143,17 @@ struct ResampleClause {
     DurationLiteral duration;
 };
 
+struct MeltClause {
+    std::vector<Field> id_fields;
+};
+
+struct DcastClause {
+    std::string pivot_column;
+};
+
 using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
-                            OrderClause, ByClause, WindowClause, ResampleClause>;
+                            OrderClause, ByClause, WindowClause, ResampleClause, MeltClause,
+                            DcastClause>;
 
 struct BlockExpr {
     ExprPtr base;

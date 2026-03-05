@@ -1095,3 +1095,168 @@ Stream {
     // N rows in → N rows out.  Any drop under backpressure would show here.
     CHECK(rows_received.load() == N);
 }
+
+// ─── Melt ────────────────────────────────────────────────────────────────────
+
+TEST_CASE("E2E: melt basic — all non-id columns melted", "[e2e][melt]") {
+    runtime::Table t;
+    t.add_column("name", Column<std::string>{"Alice", "Bob"});
+    t.add_column("math", Column<std::int64_t>{90, 80});
+    t.add_column("science", Column<std::int64_t>{85, 95});
+    runtime::TableRegistry tables;
+    tables.emplace("scores", std::move(t));
+
+    auto out = run("scores[melt { name }];", tables);
+
+    REQUIRE(out.rows() == 4);
+    auto names = col_str(out, "name");
+    auto vars = col_str(out, "variable");
+    auto vals = col_i64(out, "value");
+
+    // Row order: Alice×math, Alice×science, Bob×math, Bob×science
+    CHECK(names == std::vector<std::string>{"Alice", "Alice", "Bob", "Bob"});
+    CHECK(vars == std::vector<std::string>{"math", "science", "math", "science"});
+    CHECK(vals == std::vector<std::int64_t>{90, 85, 80, 95});
+}
+
+TEST_CASE("E2E: melt with explicit measure columns via select", "[e2e][melt]") {
+    runtime::Table t;
+    t.add_column("name", Column<std::string>{"Alice", "Bob"});
+    t.add_column("math", Column<std::int64_t>{90, 80});
+    t.add_column("science", Column<std::int64_t>{85, 95});
+    t.add_column("english", Column<std::int64_t>{88, 92});
+    runtime::TableRegistry tables;
+    tables.emplace("scores", std::move(t));
+
+    auto out = run("scores[melt { name }, select { math, science }];", tables);
+
+    REQUIRE(out.rows() == 4);
+    auto names = col_str(out, "name");
+    auto vars = col_str(out, "variable");
+    auto vals = col_i64(out, "value");
+
+    CHECK(names == std::vector<std::string>{"Alice", "Alice", "Bob", "Bob"});
+    CHECK(vars == std::vector<std::string>{"math", "science", "math", "science"});
+    CHECK(vals == std::vector<std::int64_t>{90, 85, 80, 95});
+    // english column should not appear
+    CHECK(out.find("english") == nullptr);
+}
+
+TEST_CASE("E2E: melt with multiple id columns", "[e2e][melt]") {
+    runtime::Table t;
+    t.add_column("first", Column<std::string>{"A", "B"});
+    t.add_column("last", Column<std::string>{"X", "Y"});
+    t.add_column("score", Column<std::int64_t>{100, 200});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    auto out = run("t[melt { first, last }];", tables);
+
+    REQUIRE(out.rows() == 2);
+    CHECK(col_str(out, "first") == std::vector<std::string>{"A", "B"});
+    CHECK(col_str(out, "last") == std::vector<std::string>{"X", "Y"});
+    CHECK(col_str(out, "variable") == std::vector<std::string>{"score", "score"});
+    CHECK(col_i64(out, "value") == std::vector<std::int64_t>{100, 200});
+}
+
+TEST_CASE("E2E: melt with double measure columns", "[e2e][melt]") {
+    runtime::Table t;
+    t.add_column("id", Column<std::string>{"a", "b"});
+    t.add_column("x", Column<double>{1.5, 2.5});
+    t.add_column("y", Column<double>{3.5, 4.5});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    auto out = run("t[melt { id }];", tables);
+
+    REQUIRE(out.rows() == 4);
+    CHECK(col_dbl(out, "value") == std::vector<double>{1.5, 3.5, 2.5, 4.5});
+}
+
+// ─── Dcast ───────────────────────────────────────────────────────────────────
+
+TEST_CASE("E2E: dcast basic — long to wide", "[e2e][dcast]") {
+    runtime::Table t;
+    t.add_column("name", Column<std::string>{"Alice", "Alice", "Bob", "Bob"});
+    t.add_column("subject", Column<std::string>{"math", "science", "math", "science"});
+    t.add_column("score", Column<std::int64_t>{90, 85, 80, 95});
+    runtime::TableRegistry tables;
+    tables.emplace("scores", std::move(t));
+
+    auto out = run("scores[dcast subject, select score, by name];", tables);
+
+    REQUIRE(out.rows() == 2);
+    auto names = col_str(out, "name");
+    CHECK(names == std::vector<std::string>{"Alice", "Bob"});
+
+    auto math = col_i64(out, "math");
+    auto science = col_i64(out, "science");
+    CHECK(math == std::vector<std::int64_t>{90, 80});
+    CHECK(science == std::vector<std::int64_t>{85, 95});
+}
+
+TEST_CASE("E2E: dcast with missing cells produces nulls", "[e2e][dcast]") {
+    runtime::Table t;
+    t.add_column("name", Column<std::string>{"Alice", "Bob"});
+    t.add_column("subject", Column<std::string>{"math", "science"});
+    t.add_column("score", Column<std::int64_t>{90, 95});
+    runtime::TableRegistry tables;
+    tables.emplace("scores", std::move(t));
+
+    auto out = run("scores[dcast subject, select score, by name];", tables);
+
+    REQUIRE(out.rows() == 2);
+
+    // Alice has math=90, science=null; Bob has math=null, science=95
+    const auto* math_entry = out.find_entry("math");
+    REQUIRE(math_entry != nullptr);
+    REQUIRE(math_entry->validity.has_value());
+    CHECK((*math_entry->validity)[0] == true);   // Alice has math
+    CHECK((*math_entry->validity)[1] == false);   // Bob missing math
+
+    const auto* sci_entry = out.find_entry("science");
+    REQUIRE(sci_entry != nullptr);
+    REQUIRE(sci_entry->validity.has_value());
+    CHECK((*sci_entry->validity)[0] == false);    // Alice missing science
+    CHECK((*sci_entry->validity)[1] == true);     // Bob has science
+}
+
+TEST_CASE("E2E: dcast with multiple row keys", "[e2e][dcast]") {
+    runtime::Table t;
+    t.add_column("first", Column<std::string>{"A", "A", "B", "B"});
+    t.add_column("last", Column<std::string>{"X", "X", "Y", "Y"});
+    t.add_column("metric", Column<std::string>{"height", "weight", "height", "weight"});
+    t.add_column("value", Column<std::int64_t>{170, 65, 180, 75});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    auto out = run("t[dcast metric, select value, by { first, last }];", tables);
+
+    REQUIRE(out.rows() == 2);
+    CHECK(col_str(out, "first") == std::vector<std::string>{"A", "B"});
+    CHECK(col_str(out, "last") == std::vector<std::string>{"X", "Y"});
+    CHECK(col_i64(out, "height") == std::vector<std::int64_t>{170, 180});
+    CHECK(col_i64(out, "weight") == std::vector<std::int64_t>{65, 75});
+}
+
+TEST_CASE("E2E: melt then dcast roundtrip", "[e2e][melt][dcast]") {
+    runtime::Table t;
+    t.add_column("name", Column<std::string>{"Alice", "Bob"});
+    t.add_column("math", Column<std::int64_t>{90, 80});
+    t.add_column("science", Column<std::int64_t>{85, 95});
+    runtime::TableRegistry tables;
+    tables.emplace("wide", std::move(t));
+
+    // Melt then dcast should recover the original shape.
+    auto melted = run("wide[melt { name }];", tables);
+    runtime::TableRegistry tables2;
+    tables2.emplace("long", std::move(melted));
+
+    auto out = run("long[dcast variable, select value, by name];", tables2);
+
+    REQUIRE(out.rows() == 2);
+    auto names = col_str(out, "name");
+    CHECK(names == std::vector<std::string>{"Alice", "Bob"});
+    CHECK(col_i64(out, "math") == std::vector<std::int64_t>{90, 80});
+    CHECK(col_i64(out, "science") == std::vector<std::int64_t>{85, 95});
+}

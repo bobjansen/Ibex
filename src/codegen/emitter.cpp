@@ -423,6 +423,48 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "});\n";
             return var;
         }
+
+        case ir::NodeKind::Melt: {
+            const auto& mn = static_cast<const ir::MeltNode&>(node);
+            auto child = emit_node(*mn.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::melt(" << child << ", {";
+            bool first = true;
+            for (const auto& col : mn.id_columns()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(col) << '"';
+            }
+            *out_ << "}, {";
+            first = true;
+            for (const auto& col : mn.measure_columns()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(col) << '"';
+            }
+            *out_ << "});\n";
+            return var;
+        }
+
+        case ir::NodeKind::Dcast: {
+            const auto& dn = static_cast<const ir::DcastNode&>(node);
+            auto child = emit_node(*dn.children().front());
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::dcast(" << child << ", \""
+                  << escape_string(dn.pivot_column()) << "\", \""
+                  << escape_string(dn.value_column()) << "\", {";
+            bool first = true;
+            for (const auto& key : dn.row_keys()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(key) << '"';
+            }
+            *out_ << "});\n";
+            return var;
+        }
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     throw std::runtime_error("ibex_compile: unknown IR node kind");

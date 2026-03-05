@@ -129,6 +129,8 @@ struct DistinctClause {
 struct UpdateClause {
     std::vector<Field> fields;
     std::vector<TupleField> tuple_fields;
+    /// Set for the `update = expr` form: all columns of the result are merged in.
+    ExprPtr merge_expr;
 };
 
 struct RenameClause {

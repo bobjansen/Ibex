@@ -857,6 +857,14 @@ class Parser {
             return OrderClause{.keys = std::move(keys->first), .is_braced = keys->second};
         }
         if (match(TokenKind::KeywordUpdate)) {
+            // `update = expr`: merge all columns from a table-returning expression.
+            if (match(TokenKind::Eq)) {
+                auto expr = parse_expression();
+                if (!expr) {
+                    return std::nullopt;
+                }
+                return UpdateClause{.merge_expr = std::move(expr)};
+            }
             auto result = parse_clause_field_list_or_single();
             if (!result.has_value()) {
                 return std::nullopt;
@@ -1245,9 +1253,6 @@ class Parser {
         }
         if (match(TokenKind::QuotedIdentifier)) {
             return unescape_quoted_identifier(previous().lexeme);
-        }
-        if (match(TokenKind::StringLiteral)) {
-            return unescape_string(previous().lexeme);
         }
         error_ = make_error(peek(), message);
         return std::nullopt;

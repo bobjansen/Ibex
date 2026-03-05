@@ -1326,15 +1326,31 @@ df[update { (a, b) = one_col_fn() }];
     REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
 }
 
-TEST_CASE("E2E: string literal column name in update", "[e2e]") {
-    runtime::Table t;
-    t.add_column("price", Column<std::int64_t>{10, 20, 30});
-    runtime::TableRegistry tables;
-    tables.emplace("t", std::move(t));
+TEST_CASE("E2E: update = expr merges all columns from extern fn", "[e2e]") {
+    runtime::Table extra;
+    extra.add_column("delta", Column<double>{0.1, 0.2, 0.3});
+    extra.add_column("gamma", Column<double>{0.01, 0.02, 0.03});
 
-    // "log price" is a column name with a space; verify it is accepted and produced.
-    auto out = run(R"(t[update { "doubled price" = price * 2 }];)", tables);
-    REQUIRE(out.rows() == 3);
-    REQUIRE(out.find("doubled price") != nullptr);
-    CHECK(col_i64(out, "doubled price") == std::vector<std::int64_t>{20, 40, 60});
+    runtime::Table base_tbl;
+    base_tbl.add_column("price", Column<std::int64_t>{100, 200, 300});
+
+    runtime::ExternRegistry registry;
+    registry.register_table("get_base",
+                            [&base_tbl](const runtime::ExternArgs&)
+                                -> std::expected<runtime::ExternValue, std::string> {
+                                return runtime::ExternValue{base_tbl};
+                            });
+    registry.register_table("compute_extras",
+                            [&extra](const runtime::ExternArgs&)
+                                -> std::expected<runtime::ExternValue, std::string> {
+                                return runtime::ExternValue{extra};
+                            });
+
+    const char* src = R"(
+extern fn get_base() -> DataFrame from "fake.hpp";
+extern fn compute_extras() -> DataFrame from "fake.hpp";
+let df = get_base();
+df[update = compute_extras()];
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
 }

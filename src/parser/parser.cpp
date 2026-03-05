@@ -835,11 +835,12 @@ class Parser {
             return FilterClause{.predicate = std::move(predicate)};
         }
         if (match(TokenKind::KeywordSelect)) {
-            auto fields = parse_field_list_or_single();
-            if (!fields.has_value()) {
+            auto result = parse_clause_field_list_or_single();
+            if (!result.has_value()) {
                 return std::nullopt;
             }
-            return SelectClause{.fields = std::move(*fields)};
+            return SelectClause{.fields = std::move(result->fields),
+                                .tuple_fields = std::move(result->tuple_fields)};
         }
         if (match(TokenKind::KeywordDistinct)) {
             auto fields = parse_field_list_or_single();
@@ -856,11 +857,12 @@ class Parser {
             return OrderClause{.keys = std::move(keys->first), .is_braced = keys->second};
         }
         if (match(TokenKind::KeywordUpdate)) {
-            auto fields = parse_field_list_or_single();
-            if (!fields.has_value()) {
+            auto result = parse_clause_field_list_or_single();
+            if (!result.has_value()) {
                 return std::nullopt;
             }
-            return UpdateClause{.fields = std::move(*fields)};
+            return UpdateClause{.fields = std::move(result->fields),
+                                .tuple_fields = std::move(result->tuple_fields)};
         }
         if (match(TokenKind::KeywordRename)) {
             auto fields = parse_field_list_or_single();
@@ -1023,6 +1025,82 @@ class Parser {
         return Field{.name = std::move(*name), .expr = std::move(expr)};
     }
 
+    // ── Clause field lists with tuple-LHS support ─────────────────────────────
+    // Used by select and update clauses; other clauses (by, rename, etc.) keep
+    // using parse_field_list_or_single / parse_field_list_after_open_brace.
+
+    struct ClauseFields {
+        std::vector<Field> fields;
+        std::vector<TupleField> tuple_fields;
+    };
+
+    auto parse_clause_field_list_after_open_brace() -> std::optional<ClauseFields> {
+        std::vector<Field> fields;
+        std::vector<TupleField> tuple_fields;
+        if (!check(TokenKind::RBrace)) {
+            do {
+                if (match(TokenKind::LParen)) {
+                    // Tuple LHS: (colA, colB, ...) = expr
+                    std::vector<std::string> names;
+                    do {
+                        auto n = consume_column_identifier("expected column name in tuple LHS");
+                        if (!n.has_value()) {
+                            return std::nullopt;
+                        }
+                        names.push_back(std::move(*n));
+                    } while (match(TokenKind::Comma));
+                    if (!consume(TokenKind::RParen, "expected ')' after tuple column names")) {
+                        return std::nullopt;
+                    }
+                    if (!consume(TokenKind::Eq, "expected '=' after tuple column names")) {
+                        return std::nullopt;
+                    }
+                    auto value = parse_expression();
+                    if (!value) {
+                        return std::nullopt;
+                    }
+                    tuple_fields.push_back(
+                        TupleField{.names = std::move(names), .expr = std::move(value)});
+                } else {
+                    auto name = consume_column_identifier("expected field name or '('");
+                    if (!name.has_value()) {
+                        return std::nullopt;
+                    }
+                    ExprPtr expr = nullptr;
+                    if (match(TokenKind::Eq)) {
+                        auto value = parse_expression();
+                        if (!value) {
+                            return std::nullopt;
+                        }
+                        expr = std::move(value);
+                    }
+                    fields.push_back(Field{.name = std::move(*name), .expr = std::move(expr)});
+                }
+            } while (match(TokenKind::Comma));
+        }
+        if (!consume(TokenKind::RBrace, "expected '}' after field list")) {
+            return std::nullopt;
+        }
+        return ClauseFields{.fields = std::move(fields), .tuple_fields = std::move(tuple_fields)};
+    }
+
+    auto parse_clause_field_list_or_single() -> std::optional<ClauseFields> {
+        if (check(TokenKind::LBrace)) {
+            if (!consume(TokenKind::LBrace, "expected '{' to start field list")) {
+                return std::nullopt;
+            }
+            return parse_clause_field_list_after_open_brace();
+        }
+        // Unbraced single field — no tuple support in single-field form
+        auto field = parse_single_field();
+        if (!field.has_value()) {
+            return std::nullopt;
+        }
+        std::vector<Field> fields;
+        fields.push_back(std::move(*field));
+        return ClauseFields{.fields = std::move(fields), .tuple_fields = {}};
+    }
+
     auto parse_type() -> std::optional<Type> {
         if (auto scalar = parse_scalar_type()) {
             return Type{.kind = Type::Kind::Scalar, .arg = *scalar};
@@ -1167,6 +1245,9 @@ class Parser {
         }
         if (match(TokenKind::QuotedIdentifier)) {
             return unescape_quoted_identifier(previous().lexeme);
+        }
+        if (match(TokenKind::StringLiteral)) {
+            return unescape_string(previous().lexeme);
         }
         error_ = make_error(peek(), message);
         return std::nullopt;

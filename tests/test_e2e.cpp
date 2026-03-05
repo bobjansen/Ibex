@@ -1260,3 +1260,81 @@ TEST_CASE("E2E: melt then dcast roundtrip", "[e2e][melt][dcast]") {
     CHECK(col_i64(out, "math") == std::vector<std::int64_t>{90, 80});
     CHECK(col_i64(out, "science") == std::vector<std::int64_t>{85, 95});
 }
+
+// ─── Tuple-LHS column assignment ─────────────────────────────────────────────
+
+TEST_CASE("E2E: tuple-LHS update unpacks two columns from extern fn", "[e2e]") {
+    // The extern function returns a two-column DataFrame (delta, gamma).
+    runtime::Table greeks;
+    greeks.add_column("delta", Column<double>{0.1, 0.2, 0.3});
+    greeks.add_column("gamma", Column<double>{0.01, 0.02, 0.03});
+
+    runtime::Table base_tbl;
+    base_tbl.add_column("price", Column<std::int64_t>{100, 200, 300});
+
+    runtime::ExternRegistry registry;
+    registry.register_table("get_base",
+                            [&base_tbl](const runtime::ExternArgs&)
+                                -> std::expected<runtime::ExternValue, std::string> {
+                                return runtime::ExternValue{base_tbl};
+                            });
+    registry.register_table("compute_greeks",
+                            [&greeks](const runtime::ExternArgs&)
+                                -> std::expected<runtime::ExternValue, std::string> {
+                                return runtime::ExternValue{greeks};
+                            });
+
+    const char* src = R"(
+extern fn get_base() -> DataFrame from "fake.hpp";
+extern fn compute_greeks() -> DataFrame from "fake.hpp";
+let df = get_base();
+df[update { (delta, gamma) = compute_greeks() }];
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("E2E: tuple-LHS update via execute_script verifies column count error", "[e2e]") {
+    // The extern function returns ONE column but we expect TWO — should fail.
+    runtime::Table one_col;
+    one_col.add_column("delta", Column<double>{0.1, 0.2});
+
+    runtime::Table base;
+    base.add_column("price", Column<std::int64_t>{100, 200});
+
+    runtime::TableRegistry tables;
+    tables.emplace("base", std::move(base));
+
+    runtime::ExternRegistry registry;
+    registry.register_table("get_base",
+                            [&tables](const runtime::ExternArgs&)
+                                -> std::expected<runtime::ExternValue, std::string> {
+                                return runtime::ExternValue{tables.at("base")};
+                            });
+    registry.register_table("one_col_fn",
+                            [&one_col](const runtime::ExternArgs&)
+                                -> std::expected<runtime::ExternValue, std::string> {
+                                return runtime::ExternValue{one_col};
+                            });
+
+    const char* src = R"(
+extern fn get_base() -> DataFrame from "fake.hpp";
+extern fn one_col_fn() -> DataFrame from "fake.hpp";
+let df = get_base();
+df[update { (a, b) = one_col_fn() }];
+)";
+    // Should return false (error printed, not crashing)
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("E2E: string literal column name in update", "[e2e]") {
+    runtime::Table t;
+    t.add_column("price", Column<std::int64_t>{10, 20, 30});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    // "log price" is a column name with a space; verify it is accepted and produced.
+    auto out = run(R"(t[update { "doubled price" = price * 2 }];)", tables);
+    REQUIRE(out.rows() == 3);
+    REQUIRE(out.find("doubled price") != nullptr);
+    CHECK(col_i64(out, "doubled price") == std::vector<std::int64_t>{20, 40, 60});
+}

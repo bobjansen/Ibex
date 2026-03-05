@@ -934,6 +934,74 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Reshape benchmarks: melt (wide→long) and dcast (long→wide).
+    // Uses prices_multi to build a wide OHLC table via aggregation, then
+    // melts it and dcasts it back. This exercises the reshape interpreter paths
+    // on a realistic (252 symbols × 4 days = 1008 rows, 4 measure columns) table.
+    if (status == 0 && !csv_multi_path.empty()) {
+        ibex::runtime::Table multi_table;
+        try {
+            multi_table = read_csv(csv_multi_path);
+        } catch (const std::exception& e) {
+            fmt::print("error: failed to read multi CSV for reshape: {}\n", e.what());
+            return 1;
+        }
+
+        // First, build the wide OHLC table via aggregation.
+        ibex::runtime::TableRegistry agg_reg;
+        agg_reg.emplace("prices_multi", std::move(multi_table));
+
+        ibex::runtime::ScalarRegistry agg_scalars;
+        auto agg_src = normalize_input(
+            "prices_multi[select {open = first(price), high = max(price), "
+            "low = min(price), close = last(price)}, by {symbol, day}]");
+        auto agg_parsed = ibex::parser::parse(agg_src);
+        auto agg_lowered = ibex::parser::lower(*agg_parsed);
+        auto wide_result = ibex::runtime::interpret(*agg_lowered.value(), agg_reg, &agg_scalars);
+        if (!wide_result) {
+            fmt::print("error: failed to build wide table for reshape: {}\n", wide_result.error());
+            return 1;
+        }
+
+        fmt::print("\n-- Reshape benchmarks ({} wide rows, 4 measure cols) --\n",
+                   wide_result->rows());
+
+        ibex::runtime::TableRegistry reshape_tables;
+        reshape_tables.emplace("wide", std::move(*wide_result));
+
+        // melt: wide→long (id={symbol,day}, measures=open,high,low,close)
+        BenchQuery melt_query{
+            "melt_wide_to_long",
+            "wide[melt {symbol, day}]",
+        };
+        status = run_benchmark(melt_query, reshape_tables, warmup_iters, iters, saved_include_parse);
+
+        // Build the long table for dcast benchmark
+        if (status == 0) {
+            ibex::runtime::ScalarRegistry melt_scalars;
+            auto melt_src = normalize_input("wide[melt {symbol, day}]");
+            auto melt_parsed = ibex::parser::parse(melt_src);
+            auto melt_lowered = ibex::parser::lower(*melt_parsed);
+            auto long_result =
+                ibex::runtime::interpret(*melt_lowered.value(), reshape_tables, &melt_scalars);
+            if (!long_result) {
+                fmt::print("error: failed to build long table for dcast: {}\n", long_result.error());
+                return 1;
+            }
+
+            ibex::runtime::TableRegistry dcast_tables;
+            dcast_tables.emplace("long", std::move(*long_result));
+
+            // dcast: long→wide (pivot=variable, value=value, by={symbol,day})
+            BenchQuery dcast_query{
+                "dcast_long_to_wide",
+                "long[dcast variable, select value, by {symbol, day}]",
+            };
+            status =
+                run_benchmark(dcast_query, dcast_tables, warmup_iters, iters, saved_include_parse);
+        }
+    }
+
     // TimeFrame benchmarks: synthetic in-memory data, no CSV required.
     // Pass --timeframe-rows N (e.g. 1000000) to enable.
     //

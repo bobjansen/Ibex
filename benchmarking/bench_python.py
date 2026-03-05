@@ -199,6 +199,83 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def bench_pandas_reshape(csv_multi_path, warmup, iters):
+    """Melt (wide→long) and dcast (long→wide) on an OHLC table."""
+    print("pandas: loading multi for reshape...", file=sys.stderr, flush=True)
+    dfm = pd.read_csv(csv_multi_path)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+
+    # Build the wide OHLC table first
+    wide = dfm.groupby(["symbol", "day"], sort=False).agg(
+        open=("price", "first"),
+        high=("price", "max"),
+        low=("price", "min"),
+        close=("price", "last"),
+    ).reset_index()
+    print(f"  pandas: wide table has {len(wide)} rows", file=sys.stderr, flush=True)
+
+    # melt: wide → long
+    run("melt_wide_to_long",
+        lambda: wide.melt(id_vars=["symbol", "day"],
+                          value_vars=["open", "high", "low", "close"]))
+
+    # Build long table for dcast
+    long = wide.melt(id_vars=["symbol", "day"],
+                     value_vars=["open", "high", "low", "close"])
+
+    # dcast (pivot): long → wide
+    run("dcast_long_to_wide",
+        lambda: long.pivot_table(index=["symbol", "day"],
+                                 columns="variable", values="value",
+                                 aggfunc="first").reset_index())
+
+    return rows
+
+
+def bench_polars_reshape(csv_multi_path, warmup, iters):
+    """Melt (wide→long) and dcast (long→wide) on an OHLC table."""
+    print("polars: loading multi for reshape...", file=sys.stderr, flush=True)
+    dfm = pl.read_csv(csv_multi_path)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+
+    # Build the wide OHLC table first
+    wide = dfm.group_by(["symbol", "day"]).agg(
+        pl.col("price").first().alias("open"),
+        pl.col("price").max().alias("high"),
+        pl.col("price").min().alias("low"),
+        pl.col("price").last().alias("close"),
+    )
+    print(f"  polars: wide table has {len(wide)} rows", file=sys.stderr, flush=True)
+
+    # melt: wide → long
+    run("melt_wide_to_long",
+        lambda: wide.unpivot(on=["open", "high", "low", "close"],
+                             index=["symbol", "day"]))
+
+    # Build long table for dcast
+    long = wide.unpivot(on=["open", "high", "low", "close"],
+                        index=["symbol", "day"])
+
+    # dcast (pivot): long → wide
+    run("dcast_long_to_wide",
+        lambda: long.pivot(on="variable", index=["symbol", "day"],
+                           values="value"))
+
+    return rows
+
+
 def bench_pandas_events(csv_events_path, warmup, iters):
     print("pandas: loading events...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_events_path)
@@ -262,6 +339,11 @@ def main():
         all_rows += bench_pandas(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
     if not args.skip_polars:
         all_rows += bench_polars(args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters)
+    if args.csv_multi:
+        if not args.skip_pandas:
+            all_rows += bench_pandas_reshape(args.csv_multi, args.warmup, args.iters)
+        if not args.skip_polars:
+            all_rows += bench_polars_reshape(args.csv_multi, args.warmup, args.iters)
     if args.csv_events:
         if not args.skip_pandas:
             all_rows += bench_pandas_events(args.csv_events, args.warmup, args.iters)

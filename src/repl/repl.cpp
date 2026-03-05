@@ -1195,6 +1195,28 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             }
             continue;
         }
+        if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
+            const auto& tlet = std::get<parser::TupleLetStmt>(stmt);
+            auto value = eval_expr_value(*tlet.value, local_tables, local_scalars, local_columns,
+                                         functions, extern_decls, externs);
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+            auto* table = std::get_if<runtime::Table>(&value.value());
+            if (table == nullptr) {
+                return std::unexpected(
+                    "tuple binding requires a DataFrame on the right-hand side");
+            }
+            if (table->columns.size() != tlet.names.size()) {
+                return std::unexpected(
+                    fmt::format("tuple binding expects {} column(s), got {}", tlet.names.size(),
+                                table->columns.size()));
+            }
+            for (std::size_t i = 0; i < tlet.names.size(); ++i) {
+                local_columns.insert_or_assign(tlet.names[i], *table->columns[i].column);
+            }
+            continue;
+        }
         const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
         auto value = eval_expr_value(*expr_stmt.expr, local_tables, local_scalars, local_columns,
                                      functions, extern_decls, externs);
@@ -1443,6 +1465,29 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             } else {
                 tables.insert_or_assign(let_stmt.name,
                                         std::get<runtime::Table>(std::move(value.value())));
+            }
+            continue;
+        }
+        if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
+            const auto& tlet = std::get<parser::TupleLetStmt>(stmt);
+            auto value = eval_expr_value(*tlet.value, tables, scalars, columns, functions,
+                                         extern_decls, externs);
+            if (!value) {
+                fmt::print("error: {}\n", value.error());
+                return false;
+            }
+            auto* table = std::get_if<runtime::Table>(&value.value());
+            if (table == nullptr) {
+                fmt::print("error: tuple binding requires a DataFrame on the right-hand side\n");
+                return false;
+            }
+            if (table->columns.size() != tlet.names.size()) {
+                fmt::print("error: tuple binding expects {} column(s), got {}\n",
+                           tlet.names.size(), table->columns.size());
+                return false;
+            }
+            for (std::size_t i = 0; i < tlet.names.size(); ++i) {
+                columns.insert_or_assign(tlet.names[i], *table->columns[i].column);
             }
             continue;
         }

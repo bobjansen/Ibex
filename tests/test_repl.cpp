@@ -130,3 +130,65 @@ TEST_CASE("REPL executes :load via execute_script with file path") {
     std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
+
+TEST_CASE("REPL executes tuple let binding from DataFrame") {
+    ibex::runtime::ExternRegistry registry;
+
+    // Returns a 2-column DataFrame: (x, y)
+    registry.register_table(
+        "make_xy",
+        [](const ibex::runtime::ExternArgs&) -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("x", ibex::Column<std::int64_t>{1, 2, 3});
+            t.add_column("y", ibex::Column<std::int64_t>{4, 5, 6});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn make_xy() -> DataFrame from "fake.hpp";
+let (x, y) = make_xy();
+x;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL tuple let binding: column count mismatch fails") {
+    ibex::runtime::ExternRegistry registry;
+
+    registry.register_table(
+        "make_two",
+        [](const ibex::runtime::ExternArgs&) -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("a", ibex::Column<std::int64_t>{1, 2});
+            t.add_column("b", ibex::Column<std::int64_t>{3, 4});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn make_two() -> DataFrame from "fake.hpp";
+let (a, b, c) = make_two();
+a;
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL tuple let binding: bound columns usable in expressions") {
+    ibex::runtime::ExternRegistry registry;
+
+    registry.register_table(
+        "make_cols",
+        [](const ibex::runtime::ExternArgs&) -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("p", ibex::Column<std::int64_t>{10, 20, 30});
+            t.add_column("q", ibex::Column<std::int64_t>{1, 2, 3});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    // After tuple binding, each name should be available as a Series in further expressions.
+    const char* src = R"(
+extern fn make_cols() -> DataFrame from "fake.hpp";
+let (p, q) = make_cols();
+p;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}

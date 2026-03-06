@@ -5624,30 +5624,11 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_normal: stddev must be positive");
         }
         // Generate all normals into the column buffer.
-        // AVX2 path: 4-wide xoshiro256++ streams + vectorized libmvec log/cos/sin,
-        // 8 outputs per iteration.  Falls back to scalar Box-Muller otherwise.
+        // fill_normal_x4 dispatches internally: AVX2 + libmvec when available,
+        // portable 4-wide scalar otherwise.  Same seed → same stream on any ISA.
         Column<double> col;
         col.resize(rows);
-#ifdef __AVX2__
         fill_normal_x4(col.data(), rows, *mean, *stddev);
-#else
-        std::size_t i = 0;
-        for (; i + 1 < rows; i += 2) {
-            const double u1 = bits_to_01(rng()) + 1e-300;
-            const double u2 = bits_to_01(rng());
-            double z0, z1;
-            box_muller(u1, u2, z0, z1);
-            col[i]     = *mean + *stddev * z0;
-            col[i + 1] = *mean + *stddev * z1;
-        }
-        if (i < rows) {
-            const double u1 = bits_to_01(rng()) + 1e-300;
-            const double u2 = bits_to_01(rng());
-            double z0, z1;
-            box_muller(u1, u2, z0, z1);
-            col[i] = *mean + *stddev * z0;
-        }
-#endif
         return col;
     }
 

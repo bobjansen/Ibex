@@ -4410,6 +4410,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
 constexpr auto is_rng_func(std::string_view name) -> bool;
 constexpr auto rng_func_returns_int(std::string_view name) -> bool;
+constexpr auto is_cum_func(std::string_view name) -> bool;
 
 auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                      const ExternRegistry* externs) -> std::expected<ExprType, std::string> {
@@ -4475,6 +4476,23 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         return ExprType::Int;
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        // Cumulative functions (cumsum / cumprod)
+        if (is_cum_func(call->callee)) {
+            if (call->args.size() != 1) {
+                return std::unexpected(std::string(call->callee) + ": expected 1 argument");
+            }
+            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+            if (!col_ref) {
+                return std::unexpected(std::string(call->callee) +
+                                       ": argument must be a column name");
+            }
+            const auto* source = input.find(col_ref->name);
+            if (!source) {
+                return std::unexpected(std::string(call->callee) + ": unknown column '" +
+                                       col_ref->name + "'");
+            }
+            return expr_type_for_column(*source);
+        }
         // Built-in temporal shift functions
         if (call->callee == "lag" || call->callee == "lead") {
             if (call->args.size() != 2) {
@@ -4845,6 +4863,48 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                 }
             }
             return result;
+        },
+        *src);
+}
+
+// Compute a cumulative sum or product column.
+// cumsum(col)[i] = col[0] + col[1] + ... + col[i]  (identity: 0 for sum, 1 for product)
+// cumprod(col)[i] = col[0] * col[1] * ... * col[i]
+// Only valid for numeric (Int / Float) columns.
+auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bool is_prod)
+    -> std::expected<ColumnValue, std::string> {
+    const std::string fname = is_prod ? "cumprod" : "cumsum";
+    if (call.args.size() != 1) {
+        return std::unexpected(fname + ": expected 1 argument");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected(fname + ": argument must be a column name");
+    }
+    const auto* src = input.find(col_ref->name);
+    if (!src) {
+        return std::unexpected(fname + ": unknown column '" + col_ref->name + "'");
+    }
+    std::size_t rows = input.rows();
+    return std::visit(
+        [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            using ColT = std::decay_t<decltype(col)>;
+            using T = typename ColT::value_type;
+            if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
+                ColT result;
+                result.reserve(rows);
+                T acc = is_prod ? T{1} : T{0};
+                for (std::size_t i = 0; i < rows; ++i) {
+                    if (is_prod)
+                        acc *= col[i];
+                    else
+                        acc += col[i];
+                    result.push_back(acc);
+                }
+                return result;
+            } else {
+                return std::unexpected(fname + ": column must be numeric (Int or Float)");
+            }
         },
         *src);
 }
@@ -5238,6 +5298,10 @@ constexpr auto is_rolling_func(std::string_view name) -> bool {
            name == "rolling_std" || name == "rolling_ewma";
 }
 
+constexpr auto is_cum_func(std::string_view name) -> bool {
+    return name == "cumsum" || name == "cumprod";
+}
+
 // ─── Vectorized RNG ───────────────────────────────────────────────────────────
 
 constexpr auto is_rng_func(std::string_view name) -> bool {
@@ -5623,6 +5687,12 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+            if (is_cum_func(call->callee)) {
+                auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");
+                if (!col) return std::unexpected(col.error());
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, output.rows());
                 if (!col) return std::unexpected(col.error());
@@ -5687,6 +5757,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             if (is_rolling_func(call->callee)) {
                 return std::unexpected(call->callee + ": requires a window clause");
+            }
+            if (is_cum_func(call->callee)) {
+                auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");
+                if (!col) return std::unexpected(col.error());
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
             }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, rows);

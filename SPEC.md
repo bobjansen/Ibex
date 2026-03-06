@@ -1292,6 +1292,22 @@ range, the result is the type's default value (0 for numerics, empty string for
 `lag` and `lead` respect the TimeFrame's index ordering. They are valid in any
 TimeFrame block, with or without a `window` clause.
 
+**Cumulative functions (no `window` required):**
+
+| Function        | Description                                                        |
+|-----------------|--------------------------------------------------------------------|
+| `cumsum(col)`   | Running sum: result[i] = col[0] + col[1] + ... + col[i]           |
+| `cumprod(col)`  | Running product: result[i] = col[0] * col[1] * ... * col[i]       |
+
+Both functions accept `Int` or `Float` columns and return the same type as the
+input. They are valid in any `update` block (DataFrame or TimeFrame), with or
+without a `window` clause.
+
+```
+df[update { cs = cumsum(price) }]
+tf[update { cp = cumprod(returns) }]
+```
+
 ### 8.5 Sortedness Invariant
 
 A `TimeFrame` guarantees ascending order by its time index at all times. Any

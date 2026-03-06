@@ -38,4 +38,12 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_tests PRIVATE Ibex::Sanitizers)
 endif()
 
+# Match ibex_runtime's AVX2 flags so that rng.hpp's #ifdef __AVX2__ guards
+# agree between the test binary and the runtime library.  Without this,
+# reseed_rng_x4() compiles to a no-op in the test while ibex_runtime still
+# uses the x4 engine, breaking the reproducibility tests.
+if(IBEX_HAS_AVX2)
+    target_compile_options(ibex_tests PRIVATE -mavx2 -mfma)
+endif()
+
 catch_discover_tests(ibex_tests)

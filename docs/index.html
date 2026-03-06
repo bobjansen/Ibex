@@ -103,6 +103,11 @@
             logic (<code>and</code>, <code>or</code>, <code>not</code>).
             Multiple clauses chain in reading order.
           </p>
+          <p>
+            Output plugins mirror the input API: <code>write_csv</code> and
+            <code>write_parquet</code> accept a DataFrame and a path and return
+            the number of rows written.
+          </p>
         </div>
         <div class="tour-code">
 <pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
@@ -118,7 +123,16 @@
 prices[
     <span class="kw">filter</span> price &gt; <span class="num">1.0</span>,
     <span class="kw">select</span> { symbol, price, volume }
-];</code></pre>
+];
+
+<span class="cm">// Write results back to disk</span>
+<span class="kw">extern fn</span> <span class="fn-name">write_csv</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+
+<span class="kw">let</span> n = <span class="fn-name">write_csv</span>(active, <span class="str">"out/active.csv"</span>);
+<span class="fn-name">write_parquet</span>(active, <span class="str">"out/active.parquet"</span>);</code></pre>
         </div>
       </div>
 
@@ -132,9 +146,10 @@ prices[
             Add <code>by</code> to group; omit it for a global aggregate.
           </p>
           <p>
-            Available aggregate functions: <code>first</code>, <code>last</code>,
+            Aggregate functions: <code>first</code>, <code>last</code>,
             <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>,
-            <code>count</code>.
+            <code>count</code>, <code>median</code>, <code>std</code>,
+            <code>ewma</code>. All skip null rows by default.
           </p>
         </div>
         <div class="tour-code">
@@ -152,6 +167,40 @@ prices[<span class="kw">select</span> {
     close  = <span class="fn-name">last</span>(price),
     traded = <span class="fn-name">sum</span>(volume)
 }, <span class="kw">by</span> symbol];</code></pre>
+        </div>
+      </div>
+
+      <!-- 2b. Grouped update -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Grouped Update</span>
+          <h3>Broadcast group aggregates back to every row.</h3>
+          <p>
+            <code>update&nbsp;+&nbsp;by</code> evaluates each expression
+            <em>per group</em> and writes the result back to every row in
+            that group &mdash; no row reduction, no separate join step. This is
+            the equivalent of a SQL window function with
+            <code>PARTITION&nbsp;BY</code> and no frame clause.
+          </p>
+          <p>
+            Use it to attach group statistics (mean, z-score, rank) alongside
+            the original columns without losing any rows.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Attach species mean to every individual row</span>
+iris[<span class="kw">update</span> { group_mean = <span class="fn-name">mean</span>(`Sepal.Length`) }, <span class="kw">by</span> Species];
+
+<span class="cm">// Z-score within each symbol group</span>
+prices[<span class="kw">update</span> {
+    z = (price <span class="op">-</span> <span class="fn-name">mean</span>(price)) <span class="op">/</span> <span class="fn-name">std</span>(price)
+}, <span class="kw">by</span> symbol];
+
+<span class="cm">// Combine grouped update with filter — keeps all original rows</span>
+prices[
+    <span class="kw">update</span> { avg = <span class="fn-name">mean</span>(price) }, <span class="kw">by</span> symbol,
+    <span class="kw">filter</span> price <span class="op">&gt;</span> avg
+];</code></pre>
         </div>
       </div>
 
@@ -288,6 +337,93 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
 <span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);
 <span class="kw">let</span> bars = <span class="fn-name">as_timeframe</span>(bars_1m, <span class="str">"ts"</span>);
 tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code></pre>
+        </div>
+      </div>
+
+      <!-- 6b. Null handling -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Null Handling</span>
+          <h3>SQL-style three-valued logic, Arrow-style storage.</h3>
+          <p>
+            Every column carries an Arrow-compatible validity bitmap alongside
+            its value buffer. Null propagates through arithmetic and
+            comparisons: <code>null&nbsp;*&nbsp;x&nbsp;=&nbsp;null</code>,
+            <code>null&nbsp;&gt;&nbsp;5&nbsp;=&nbsp;null</code>.
+            <code>filter</code> silently drops rows where the predicate is null.
+          </p>
+          <p>
+            Use <code>is null</code> / <code>is not null</code> to inspect the
+            validity bitmap directly &mdash; these predicates always return a
+            valid <code>Bool</code>, never null. Three-valued boolean operators
+            follow SQL rules: <code>true&nbsp;OR&nbsp;null&nbsp;=&nbsp;true</code>,
+            <code>false&nbsp;AND&nbsp;null&nbsp;=&nbsp;false</code>.
+          </p>
+          <p>
+            Nulls arise from left joins (unmatched right columns), dcast
+            (missing pivot combinations), and certain aggregate functions
+            (<code>std</code> on fewer than 2 non-null values,
+            <code>ewma</code> on an empty group).
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Left join introduces nulls for unmatched rows</span>
+<span class="kw">let</span> enriched = employees <span class="kw">left join</span> departments <span class="kw">on</span> dept_id;
+
+<span class="cm">// Test the validity bitmap with IS NULL / IS NOT NULL</span>
+enriched[<span class="kw">filter</span> { dept_name <span class="kw">is null</span> }];
+enriched[<span class="kw">filter</span> { dept_name <span class="kw">is not null</span> }];
+
+<span class="cm">// Null propagates through arithmetic</span>
+<span class="cm">// bonus is null wherever budget is null</span>
+enriched[<span class="kw">select</span> { name, bonus = salary <span class="op">+</span> budget }];
+
+<span class="cm">// 3VL: true OR null = true; keeps the row</span>
+enriched[<span class="kw">filter</span> { dept_name <span class="kw">is not null</span> <span class="op">||</span> salary <span class="op">&gt;</span> <span class="num">80000</span> }];
+
+<span class="cm">// Aggregates skip null rows automatically</span>
+enriched[<span class="kw">select</span> { avg_sal = <span class="fn-name">mean</span>(salary) }, <span class="kw">by</span> dept_name];</code></pre>
+        </div>
+      </div>
+
+      <!-- 6c. Scalar functions -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Scalar Functions</span>
+          <h3>Math and date extraction built in.</h3>
+          <p>
+            Ibex ships a small set of built-in scalar functions that apply
+            element-wise to a column. Math: <code>abs</code>, <code>log</code>,
+            <code>sqrt</code>. Date/time extraction: <code>year</code>,
+            <code>month</code>, <code>day</code>, <code>hour</code>,
+            <code>minute</code>, <code>second</code>.
+          </p>
+          <p>
+            All scalar functions operate on <code>Numeric</code> or
+            <code>Date&nbsp;|&nbsp;Timestamp</code> columns and produce a new
+            column of the return type. Use them inside <code>update</code>,
+            <code>select</code>, or <code>filter</code> expressions.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Math functions</span>
+trades[<span class="kw">update</span> {
+    log_ret  = <span class="fn-name">log</span>(price <span class="op">/</span> <span class="fn-name">lag</span>(price, <span class="num">1</span>)),
+    vol      = <span class="fn-name">sqrt</span>(variance),
+    notional = <span class="fn-name">abs</span>(pnl)
+}];
+
+<span class="cm">// Date / time extraction</span>
+trades[<span class="kw">update</span> {
+    yr = <span class="fn-name">year</span>(date),
+    mo = <span class="fn-name">month</span>(date),
+    dy = <span class="fn-name">day</span>(date)
+}];
+
+trades[<span class="kw">update</span> { hr = <span class="fn-name">hour</span>(timestamp) }];
+
+<span class="cm">// Use in filter</span>
+trades[<span class="kw">filter</span> <span class="fn-name">year</span>(date) <span class="op">=</span> <span class="num">2024</span>];</code></pre>
         </div>
       </div>
 

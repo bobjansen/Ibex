@@ -395,7 +395,18 @@ f(Float64(3));
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
-TEST_CASE("cast: Int64(float_literal) allows passing to Int64 param") {
+TEST_CASE("cast: Int64(whole float literal) allows passing to Int64 param") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Int64) -> Int64 {
+    x;
+}
+f(Int64(4.0));
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("cast: Int64(non-integer float) is a runtime error") {
     ibex::runtime::ExternRegistry registry;
     const char* src = R"(
 fn f(x: Int64) -> Int64 {
@@ -403,7 +414,7 @@ fn f(x: Int64) -> Int64 {
 }
 f(Int64(3.9));
 )";
-    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
 }
 
 TEST_CASE("cast: Float64(int_var) converts scalar variable across function calls") {
@@ -425,9 +436,14 @@ TEST_CASE("cast: let binding with Float64 cast from Int") {
     REQUIRE(ibex::repl::execute_script("let x: Float64 = Float64(3);", registry));
 }
 
-TEST_CASE("cast: let binding with Int64 cast from Float (truncates)") {
+TEST_CASE("cast: let binding with Int64 cast from whole Float") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE(ibex::repl::execute_script("let x: Int64 = Int64(9.9);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = Int64(9.0);", registry));
+}
+
+TEST_CASE("cast: let binding Int64 from fractional Float is a runtime error") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = Int64(9.9);", registry));
 }
 
 TEST_CASE("cast: Float64 applied to Int column converts element types") {
@@ -451,7 +467,28 @@ f;
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
-TEST_CASE("cast: Int64 applied to Float column converts element types") {
+TEST_CASE("cast: Int64 applied to whole-number Float column converts element types") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("v", ibex::Column<double>{1.0, 2.0, 3.0});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df = get_data();
+let (v) = df;
+let i: Series<Int64> = Int64(v);
+i;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("cast: Int64 applied to fractional Float column is a runtime error") {
     ibex::runtime::ExternRegistry registry;
     registry.register_table(
         "get_data",
@@ -469,5 +506,5 @@ let (v) = df;
 let i: Series<Int64> = Int64(v);
 i;
 )";
-    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
 }

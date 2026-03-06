@@ -415,6 +415,63 @@ std(col)    // ignores null rows; returns null if fewer than 2 non-null values
 ewma(col, alpha)  // ignores null rows; returns null for an empty group
 ```
 
+#### Null-Fill Functions
+
+Three built-in functions replace or propagate null values within a column.
+They are valid in both `select` and `update` blocks and require no `window`
+clause.
+
+| Function                 | Description                                                        |
+|--------------------------|--------------------------------------------------------------------|
+| `fill_null(col, value)`  | Replace every null cell with the constant `value`                 |
+| `fill_forward(col)`      | LOCF — carry the last valid value forward; leading nulls stay null |
+| `fill_backward(col)`     | NOCB — carry the next valid value backward; trailing nulls stay null |
+
+All three functions accept any column type and return the same type as `col`.
+
+**`fill_null(col, value)`** — constant fill:
+
+```
+// Replace null prices with 0
+df[update { price = fill_null(price, 0) }]
+
+// Replace null labels with "unknown"
+df[update { label = fill_null(label, "unknown") }]
+```
+
+The `value` literal must be type-compatible with `col`. After filling, the
+result column has no validity bitmap (all rows are valid).
+
+**`fill_forward(col)`** — last observation carried forward (LOCF):
+
+```
+// Carry the previous valid price into any null gaps
+df[update { price = fill_forward(price) }]
+```
+
+Fills each null cell with the most recent preceding valid value. Leading nulls
+(rows before the first valid value) cannot be filled and remain null.
+
+**`fill_backward(col)`** — next observation carried backward (NOCB):
+
+```
+// Fill null prices from the next available price
+df[update { price = fill_backward(price) }]
+```
+
+Fills each null cell with the nearest following valid value. Trailing nulls
+(rows after the last valid value) cannot be filled and remain null.
+
+**Combining fill strategies:**
+
+Chain operations using multiple `update` blocks to combine strategies:
+
+```
+// Fill forward first, then replace any remaining leading nulls with 0
+df[update { price = fill_forward(price) }]
+  [update { price = fill_null(price, 0) }]
+```
+
 #### Column Storage
 
 Null is represented as a validity bit in an Arrow-compatible bitmap, not as a

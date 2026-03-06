@@ -2486,6 +2486,242 @@ TEST_CASE("rep unknown named argument returns error") {
     CHECK_FALSE(result.has_value());
 }
 
+// ─── fill_null / fill_forward / fill_backward tests ──────────────────────────
+
+TEST_CASE("fill_null replaces null cells with constant (Int)", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<std::int64_t>{10, 0, 30, 0, 50});
+    t.columns[t.index.at("val")].validity = std::vector<bool>{true, false, true, false, true};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { v2 = fill_null(val, 0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("v2");
+    REQUIRE(entry != nullptr);
+    // No validity bitmap — all rows are now valid.
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& v2 = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(v2[0] == 10);
+    CHECK(v2[1] == 0);   // was null, filled with 0
+    CHECK(v2[2] == 30);
+    CHECK(v2[3] == 0);   // was null, filled with 0
+    CHECK(v2[4] == 50);
+}
+
+TEST_CASE("fill_null replaces null cells with constant (Float)", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<double>{1.0, 0.0, 3.0});
+    t.columns[t.index.at("val")].validity = std::vector<bool>{true, false, true};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { v2 = fill_null(val, 99.5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("v2");
+    REQUIRE(entry != nullptr);
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& v2 = std::get<Column<double>>(*entry->column);
+    CHECK(v2[0] == Catch::Approx(1.0));
+    CHECK(v2[1] == Catch::Approx(99.5));  // was null, filled with 99.5
+    CHECK(v2[2] == Catch::Approx(3.0));
+}
+
+TEST_CASE("fill_null on column with no nulls is a no-op", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<std::int64_t>{1, 2, 3});
+    // No validity bitmap — no nulls.
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { v2 = fill_null(val, 99) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("v2");
+    REQUIRE(entry != nullptr);
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& v2 = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(v2[0] == 1);
+    CHECK(v2[1] == 2);
+    CHECK(v2[2] == 3);
+}
+
+TEST_CASE("fill_forward carries last valid value forward (LOCF)", "[null][fill]") {
+    runtime::Table t;
+    //                      valid null  valid null  null  valid
+    t.add_column("val", Column<std::int64_t>{10, 0, 20, 0, 0, 30});
+    t.columns[t.index.at("val")].validity =
+        std::vector<bool>{true, false, true, false, false, true};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { fwd = fill_forward(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("fwd");
+    REQUIRE(entry != nullptr);
+    // No leading nulls — all rows should be valid after fill.
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& fwd = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(fwd[0] == 10);
+    CHECK(fwd[1] == 10);  // carried from row 0
+    CHECK(fwd[2] == 20);
+    CHECK(fwd[3] == 20);  // carried from row 2
+    CHECK(fwd[4] == 20);  // carried from row 2
+    CHECK(fwd[5] == 30);
+}
+
+TEST_CASE("fill_forward leaves leading nulls as null", "[null][fill]") {
+    runtime::Table t;
+    //                      null  null  valid null
+    t.add_column("val", Column<std::int64_t>{0, 0, 5, 0});
+    t.columns[t.index.at("val")].validity = std::vector<bool>{false, false, true, false};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { fwd = fill_forward(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("fwd");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK(runtime::is_null(*entry, 0));   // leading null — unfillable
+    CHECK(runtime::is_null(*entry, 1));   // leading null — unfillable
+    CHECK_FALSE(runtime::is_null(*entry, 2));
+    CHECK_FALSE(runtime::is_null(*entry, 3));  // filled from row 2
+    const auto& fwd = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(fwd[2] == 5);
+    CHECK(fwd[3] == 5);
+}
+
+TEST_CASE("fill_forward on column with no nulls is a no-op", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { fwd = fill_forward(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("fwd");
+    REQUIRE(entry != nullptr);
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& fwd = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(fwd[0] == 1);
+    CHECK(fwd[1] == 2);
+    CHECK(fwd[2] == 3);
+}
+
+TEST_CASE("fill_backward carries next valid value backward (NOCB)", "[null][fill]") {
+    runtime::Table t;
+    //                      valid null  null  valid null  valid
+    t.add_column("val", Column<std::int64_t>{10, 0, 0, 20, 0, 30});
+    t.columns[t.index.at("val")].validity =
+        std::vector<bool>{true, false, false, true, false, true};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { bwd = fill_backward(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("bwd");
+    REQUIRE(entry != nullptr);
+    // No trailing nulls — all rows should be valid after fill.
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& bwd = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(bwd[0] == 10);
+    CHECK(bwd[1] == 20);  // carried from row 3
+    CHECK(bwd[2] == 20);  // carried from row 3
+    CHECK(bwd[3] == 20);
+    CHECK(bwd[4] == 30);  // carried from row 5
+    CHECK(bwd[5] == 30);
+}
+
+TEST_CASE("fill_backward leaves trailing nulls as null", "[null][fill]") {
+    runtime::Table t;
+    //                      null  valid null  null
+    t.add_column("val", Column<std::int64_t>{0, 5, 0, 0});
+    t.columns[t.index.at("val")].validity = std::vector<bool>{false, true, false, false};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { bwd = fill_backward(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("bwd");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK_FALSE(runtime::is_null(*entry, 0));  // filled from row 1
+    CHECK_FALSE(runtime::is_null(*entry, 1));
+    CHECK(runtime::is_null(*entry, 2));        // trailing null — unfillable
+    CHECK(runtime::is_null(*entry, 3));        // trailing null — unfillable
+    const auto& bwd = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(bwd[0] == 5);
+    CHECK(bwd[1] == 5);
+}
+
+TEST_CASE("fill_backward on column with no nulls is a no-op", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { bwd = fill_backward(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("bwd");
+    REQUIRE(entry != nullptr);
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& bwd = std::get<Column<std::int64_t>>(*entry->column);
+    CHECK(bwd[0] == 1);
+    CHECK(bwd[1] == 2);
+    CHECK(bwd[2] == 3);
+}
+
+TEST_CASE("fill_null wrong argument count returns error", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { v2 = fill_null(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error().find("fill_null") != std::string::npos);
+}
+
+TEST_CASE("fill_forward wrong argument count returns error", "[null][fill]") {
+    runtime::Table t;
+    t.add_column("val", Column<std::int64_t>{1, 2, 3});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { fwd = fill_forward(val, val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error().find("fill_forward") != std::string::npos);
+}
+
 TEST_CASE("rep missing positional argument returns error") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3});

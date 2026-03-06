@@ -535,7 +535,44 @@ tf[<span class="kw">update</span> { running_vol = <span class="fn-name">cumsum</
         </div>
       </div>
 
-      <!-- 10. Rolling windows -->
+      <!-- 10. Null fill -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Null Fill</span>
+          <h3>Fill missing values with three strategies.</h3>
+          <p>
+            Three built-in functions cover data.table&rsquo;s
+            <code>nafill</code> semantics in a single O(n) pass:
+          </p>
+          <ul>
+            <li><code>fill_null(col, value)</code> &mdash; constant fill</li>
+            <li><code>fill_forward(col)</code> &mdash; LOCF (last observation carried forward)</li>
+            <li><code>fill_backward(col)</code> &mdash; NOCB (next observation carried backward)</li>
+          </ul>
+          <p>
+            All three work on any column type (<code>Int</code>,
+            <code>Float</code>, <code>String</code>, &hellip;) in
+            <code>select</code> or <code>update</code> blocks.
+            Unfillable leading (LOCF) or trailing (NOCB) nulls remain null.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Constant fill: replace null prices with 0</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];
+
+<span class="cm">// LOCF: carry last known price into gaps</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_forward</span>(price) }];
+
+<span class="cm">// NOCB: fill backwards from next available value</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_backward</span>(price) }];
+
+<span class="cm">// Chain: LOCF then fill remaining leading nulls with 0</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_forward</span>(price) }]
+  [<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];</code></pre>
+        </div>
+      </div>
+
+      <!-- 11. Rolling windows -->
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Rolling Windows</span>

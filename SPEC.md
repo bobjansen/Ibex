@@ -142,7 +142,7 @@ column names, or function names:
 let    mut    extern  fn      from
 filter select update  distinct order by window
 rename resample melt  dcast
-join   left   asof    on
+join   left   right   outer   asof   on
 import Stream
 asc    desc
 true   false
@@ -536,6 +536,8 @@ expr            = primary
                 | expr "[" clause_list "]"
                 | expr "join" expr "on" join_keys
                 | expr "left" "join" expr "on" join_keys
+                | expr "right" "join" expr "on" join_keys
+                | expr "outer" "join" expr "on" join_keys
                 | expr "asof" "join" expr "on" join_keys ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
@@ -1024,9 +1026,13 @@ columns. The supported surface forms are:
 ```
 A join B on key
 A left join B on key
+A right join B on key
+A outer join B on key
 A asof join B on time
 A join B on { key1, key2 }
 A left join B on { key1, key2 }
+A right join B on { key1, key2 }
+A outer join B on { key1, key2 }
 A asof join B on { time }
 ```
 
@@ -1034,6 +1040,8 @@ Semantics:
 
 - `A join B on key` is an inner join (rows must match on `key`).
 - `A left join B on key` is a left outer join (all rows from `A` are preserved).
+- `A right join B on key` is a right outer join (all rows from `B` are preserved).
+- `A outer join B on key` is a full outer join (rows from both sides are preserved).
 - `A asof join B on time` is an as-of join on the TimeFrame index column.
 
 The `on` list must be one or more unqualified column names present in both
@@ -1045,9 +1053,13 @@ Join expressions are **syntactic sugar** for the built-in join functions:
 
 - `A join B on key` → `inner_join(A, B, key)`
 - `A left join B on key` → `left_join(A, B, key)`
+- `A right join B on key` → `right_join(A, B, key)`
+- `A outer join B on key` → `outer_join(A, B, key)`
 - `A asof join B on time` → `asof_join(A, B, time, tolerance = 0s)`
 - `A join B on { k1, k2 }` → `inner_join(A, B, k1, k2)`
 - `A left join B on { k1, k2 }` → `left_join(A, B, k1, k2)`
+- `A right join B on { k1, k2 }` → `right_join(A, B, k1, k2)`
+- `A outer join B on { k1, k2 }` → `outer_join(A, B, k1, k2)`
 - `A asof join B on { time }` → `asof_join(A, B, time, tolerance = 0s)`
 - `A asof join B on { time, k1, k2 }` → `asof_join(A, B, time, k1, k2, tolerance = 0s)`
 
@@ -1527,6 +1539,8 @@ It is a runtime error if the DataFrame has any row count other than 1.
 ```
 inner_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFrame<A ∪ B>
 left_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFrame<A ∪ B>
+right_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFrame<A ∪ B>
+outer_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFrame<A ∪ B>
 asof_join(left: TimeFrame<A>, right: TimeFrame<B>, key1, ..., keyN, tolerance: Duration) -> TimeFrame<A ∪ B>
 ```
 

@@ -771,6 +771,30 @@ TEST_CASE("Parse left join") {
     REQUIRE(join.keys[0] == "key");
 }
 
+
+TEST_CASE("Parse right join") {
+    const char* source = "a right join b on key;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Right);
+    REQUIRE(join.keys.size() == 1);
+    REQUIRE(join.keys[0] == "key");
+}
+
+TEST_CASE("Parse outer join") {
+    const char* source = "a outer join b on key;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Outer);
+    REQUIRE(join.keys.size() == 1);
+    REQUIRE(join.keys[0] == "key");
+}
 // ─── All comparison operators parse correctly ────────────────────────────────
 
 TEST_CASE("Parse all comparison operators") {

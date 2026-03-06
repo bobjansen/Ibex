@@ -215,6 +215,8 @@ TEST_CASE("Lexer: all hard keywords", "[lexer]") {
         {"rename", TokenKind::KeywordRename},
         {"join", TokenKind::KeywordJoin},
         {"left", TokenKind::KeywordLeft},
+        {"right", TokenKind::KeywordRight},
+        {"outer", TokenKind::KeywordOuter},
         {"asof", TokenKind::KeywordAsof},
         {"on", TokenKind::KeywordOn},
         {"is", TokenKind::KeywordIs},

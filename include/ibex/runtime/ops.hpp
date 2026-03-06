@@ -74,6 +74,12 @@ namespace ibex::ops {
 [[nodiscard]] auto left_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<std::string>& keys) -> runtime::Table;
 
+[[nodiscard]] auto right_join(const runtime::Table& left, const runtime::Table& right,
+                              const std::vector<std::string>& keys) -> runtime::Table;
+
+[[nodiscard]] auto outer_join(const runtime::Table& left, const runtime::Table& right,
+                              const std::vector<std::string>& keys) -> runtime::Table;
+
 [[nodiscard]] auto asof_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<std::string>& keys) -> runtime::Table;
 

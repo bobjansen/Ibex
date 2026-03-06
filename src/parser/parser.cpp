@@ -331,6 +331,16 @@ class Parser {
                     return nullptr;
                 }
                 kind = JoinKind::Left;
+            } else if (match(TokenKind::KeywordRight)) {
+                if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'right'")) {
+                    return nullptr;
+                }
+                kind = JoinKind::Right;
+            } else if (match(TokenKind::KeywordOuter)) {
+                if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'outer'")) {
+                    return nullptr;
+                }
+                kind = JoinKind::Outer;
             } else if (match(TokenKind::KeywordAsof)) {
                 if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'asof'")) {
                     return nullptr;

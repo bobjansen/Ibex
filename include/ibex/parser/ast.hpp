@@ -89,6 +89,8 @@ enum class BinaryOp : std::uint8_t {
 enum class JoinKind : std::uint8_t {
     Inner,
     Left,
+    Right,
+    Outer,
     Asof,
 };
 

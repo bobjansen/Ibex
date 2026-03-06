@@ -211,6 +211,26 @@ TEST_CASE("Lower left join to IR") {
     REQUIRE(join->kind() == ir::JoinKind::Left);
 }
 
+
+TEST_CASE("Lower right join to IR") {
+    auto program = require_parse("a right join b on id;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Right);
+}
+
+TEST_CASE("Lower outer join to IR") {
+    auto program = require_parse("a outer join b on id;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Outer);
+}
 TEST_CASE("Lower asof join to IR") {
     auto program = require_parse("a asof join b on {ts, symbol};");
     auto result = parser::lower(program);

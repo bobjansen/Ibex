@@ -742,6 +742,56 @@ auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
     return std::unexpected(std::string(callee) + "(): cannot cast column to Float");
 }
 
+/// Validates that an expression is a bare mode identifier and returns its name.
+auto extract_round_mode(const parser::Expr& arg) -> std::expected<std::string_view, std::string> {
+    const auto* ident = std::get_if<parser::IdentifierExpr>(&arg.node);
+    if (!ident) {
+        return std::unexpected(
+            "round(): second argument must be a bare mode identifier (nearest, floor, ceil, trunc)");
+    }
+    if (ident->name != "nearest" && ident->name != "floor" && ident->name != "ceil" &&
+        ident->name != "trunc") {
+        return std::unexpected("round(): unknown mode '" + ident->name +
+                               "' (expected: nearest, floor, ceil, trunc)");
+    }
+    return std::string_view{ident->name};
+}
+
+auto apply_scalar_round(double v, std::string_view mode)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    std::int64_t result{};
+    if (mode == "nearest") {
+        result = static_cast<std::int64_t>(std::llround(v));
+    } else if (mode == "floor") {
+        result = static_cast<std::int64_t>(std::floor(v));
+    } else if (mode == "ceil") {
+        result = static_cast<std::int64_t>(std::ceil(v));
+    } else {  // trunc
+        result = static_cast<std::int64_t>(std::trunc(v));
+    }
+    return runtime::ScalarValue{result};
+}
+
+auto apply_column_round(const Column<double>& src, std::string_view mode)
+    -> Column<std::int64_t> {
+    Column<std::int64_t> dst;
+    dst.reserve(src.size());
+    for (double v : src) {
+        std::int64_t r{};
+        if (mode == "nearest") {
+            r = static_cast<std::int64_t>(std::llround(v));
+        } else if (mode == "floor") {
+            r = static_cast<std::int64_t>(std::floor(v));
+        } else if (mode == "ceil") {
+            r = static_cast<std::int64_t>(std::ceil(v));
+        } else {  // trunc
+            r = static_cast<std::int64_t>(std::trunc(v));
+        }
+        dst.push_back(r);
+    }
+    return dst;
+}
+
 void print_schema(const runtime::Table& table) {
     fmt::print("columns:\n");
     for (const auto& entry : table.columns) {
@@ -908,6 +958,31 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                 return EvalValue{std::move(result.value())};
             }
             return std::unexpected(std::string(call->callee) + "(): cannot cast a table");
+        }
+        if (call->callee == "round" && call->args.size() == 2) {
+            auto mode = extract_round_mode(*call->args[1]);
+            if (!mode) {
+                return std::unexpected(mode.error());
+            }
+            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, functions,
+                                         extern_decls, externs);
+            if (!inner) {
+                return std::unexpected(inner.error());
+            }
+            if (auto* col = std::get_if<runtime::ColumnValue>(&inner.value())) {
+                if (!std::holds_alternative<Column<double>>(*col)) {
+                    return std::unexpected("round(): column must be Float");
+                }
+                return EvalValue{runtime::ColumnValue{
+                    apply_column_round(std::get<Column<double>>(*col), *mode)}};
+            }
+            if (auto* scalar = std::get_if<runtime::ScalarValue>(&inner.value())) {
+                if (!std::holds_alternative<double>(*scalar)) {
+                    return std::unexpected("round(): first argument must be Float");
+                }
+                return EvalValue{apply_scalar_round(std::get<double>(*scalar), *mode).value()};
+            }
+            return std::unexpected("round(): cannot round a table");
         }
         if (call->callee == "seed_rng") {
             if (call->args.size() != 1 || !call->named_args.empty()) {
@@ -1172,6 +1247,24 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::unexpected(value.error());
             }
             return apply_scalar_cast(value.value(), call->callee);
+        }
+        if (call->callee == "round") {
+            if (call->args.size() != 2) {
+                return std::unexpected("round(): expects (value, mode) — mode: nearest, floor, ceil, trunc");
+            }
+            auto mode = extract_round_mode(*call->args[1]);
+            if (!mode) {
+                return std::unexpected(mode.error());
+            }
+            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, functions,
+                                          extern_decls, externs);
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+            if (!std::holds_alternative<double>(*value)) {
+                return std::unexpected("round(): first argument must be Float");
+            }
+            return apply_scalar_round(std::get<double>(*value), *mode);
         }
         return std::unexpected("unknown function: " + call->callee + " (available: " +
                                format_function_names(functions, extern_decls) + ")");

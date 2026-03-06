@@ -202,12 +202,28 @@ inline auto get_rng_x4_portable() noexcept -> Xoshiro256pp_x4_portable& {
 // ─── xoshiro256++ × 4 (AVX2 explicit-SIMD) ───────────────────────────────────
 #ifdef __AVX2__
 
-// libmvec 4-wide double transcendentals (glibc ≥ 2.22).
+// GNU Vector SIMD ABI — 4-wide double transcendentals from glibc's libmvec.
+//
+// These look like C++ mangled names but are not: _ZGVdN4v_<func> is the GNU
+// Vector SIMD ABI naming scheme (glibc ≥ 2.22, stable ABI):
+//   _ZGV  — GNU Vector function prefix
+//   d     — double precision
+//   N4    — 4 elements, no mask
+//   v     — vector (all lanes active)
+//   _log  — the scalar math function being vectorized
+//
+// There is no public glibc header for them: they are intended to be called
+// only by compilers via -fveclib=libmvec.  We call them directly because our
+// loop is already manually vectorized and auto-vec can't apply.  On non-glibc
+// systems (musl, macOS) IBEX_HAVE_LIBMVEC is not defined and fill_normal_x4
+// falls back to scalar transcendentals even when __AVX2__ is set.
+#if defined(IBEX_HAVE_LIBMVEC)
 extern "C" {
     __m256d _ZGVdN4v_log(__m256d x);
     __m256d _ZGVdN4v_cos(__m256d x);
     __m256d _ZGVdN4v_sin(__m256d x);
 }
+#endif
 
 struct Xoshiro256pp_x4 {
     // s[w] holds word w of all four streams packed in one __m256i.
@@ -275,22 +291,32 @@ inline auto get_rng_x4() noexcept -> Xoshiro256pp_x4& {
 //
 // Generate `rows` normally-distributed doubles into `out[0..rows)`.
 //
-// On AVX2: uses Xoshiro256pp_x4 + libmvec 4-wide log/cos/sin.
-// Otherwise: uses Xoshiro256pp_x4_portable + scalar transcendentals.
+// Three dispatch paths, selected at compile time:
 //
-// Both paths consume the same logical random stream for the same seed (same
-// four independent xoshiro256++ instances, same bits_to_01 conversion) and
-// produce the same output up to transcendental rounding (≤ 1 ULP difference
-// between libmvec and the scalar math library).
+//   AVX2 + libmvec  (IBEX_HAVE_LIBMVEC defined)
+//     Xoshiro256pp_x4 (__m256i) + _ZGVdN4v_{log,cos,sin} — fastest path.
 //
-// Output layout per 8-element block (lane = stream index, 0..3):
+//   AVX2, no libmvec  (non-glibc platforms: musl, macOS)
+//     Xoshiro256pp_x4 for generation, scalar std::log/cos/sin — still gets
+//     vectorized xoshiro throughput; transcendentals remain serial.
+//
+//   No AVX2  (portable fallback)
+//     Xoshiro256pp_x4_portable (SoA, auto-vecs when -mavx2 is active) +
+//     scalar transcendentals.
+//
+// All paths consume the same logical xoshiro stream for a given seed (same
+// four derived seeds, same bits_to_01 conversion), so results agree up to
+// ≤ 1 ULP from transcendental library rounding differences.
+//
+// Output layout per 8-element block (lane = stream index 0..3):
 //   out[i + 2*lane + 0] = mean + stddev * cos-branch of Box-Muller for lane
 //   out[i + 2*lane + 1] = mean + stddev * sin-branch of Box-Muller for lane
 inline void fill_normal_x4(double* __restrict__ out, std::size_t rows,
                             double mean, double stddev) noexcept {
     std::size_t i = 0;
 
-#ifdef __AVX2__
+#if defined(__AVX2__) && defined(IBEX_HAVE_LIBMVEC)
+    // ── fastest: vectorized xoshiro + vectorized transcendentals ─────────────
     auto& rng4 = get_rng_x4();
 
     const __m256d two_pi = _mm256_set1_pd(2.0 * std::numbers::pi);
@@ -310,10 +336,27 @@ inline void fill_normal_x4(double* __restrict__ out, std::size_t rows,
             _mm256_mul_pd(vstd, _mm256_mul_pd(r, _ZGVdN4v_sin(th))));
 
         // Interleave: out[i+0]=z0[0], out[i+1]=z1[0], out[i+2]=z0[1], …
-        const __m256d lo = _mm256_unpacklo_pd(z0, z1); // [z0[0],z1[0],z0[2],z1[2]]
-        const __m256d hi = _mm256_unpackhi_pd(z0, z1); // [z0[1],z1[1],z0[3],z1[3]]
+        const __m256d lo = _mm256_unpacklo_pd(z0, z1);
+        const __m256d hi = _mm256_unpackhi_pd(z0, z1);
         _mm256_storeu_pd(out + i,     _mm256_permute2f128_pd(lo, hi, 0x20));
         _mm256_storeu_pd(out + i + 4, _mm256_permute2f128_pd(lo, hi, 0x31));
+    }
+
+#elif defined(__AVX2__)
+    // ── AVX2 without libmvec: vectorized xoshiro, scalar transcendentals ─────
+    auto& rng4 = get_rng_x4();
+
+    for (; i + 7 < rows; i += 8) {
+        alignas(32) double u1v[4], u2v[4];
+        _mm256_store_pd(u1v, _mm256_add_pd(bits_to_01_x4(rng4()),
+                                           _mm256_set1_pd(1e-300)));
+        _mm256_store_pd(u2v, bits_to_01_x4(rng4()));
+        for (int lane = 0; lane < 4; ++lane) {
+            double z0, z1;
+            box_muller(u1v[lane], u2v[lane], z0, z1);
+            out[i + 2*lane]     = mean + stddev * z0;
+            out[i + 2*lane + 1] = mean + stddev * z1;
+        }
     }
 
 #else  // portable path

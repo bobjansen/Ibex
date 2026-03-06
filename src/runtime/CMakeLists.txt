@@ -28,10 +28,14 @@ include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag(-mavx2 IBEX_HAS_AVX2)
 if(IBEX_HAS_AVX2)
     target_compile_options(ibex_runtime PRIVATE -mavx2 -mfma)
-    # libmvec provides _ZGVdN4v_log/cos/sin used by fill_normal_x4.
+    # libmvec (glibc ≥ 2.22) provides 4-wide double transcendentals via the
+    # GNU Vector SIMD ABI (_ZGVdN4v_log/cos/sin).  Define IBEX_HAVE_LIBMVEC so
+    # rng.hpp can gate those declarations — without this guard, non-glibc builds
+    # (musl, macOS) would fail to link even though they have AVX2.
     find_library(IBEX_LIBMVEC mvec)
     if(IBEX_LIBMVEC)
         target_link_libraries(ibex_runtime PRIVATE "${IBEX_LIBMVEC}")
+        target_compile_definitions(ibex_runtime PRIVATE IBEX_HAVE_LIBMVEC=1)
     endif()
 endif()
 

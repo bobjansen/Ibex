@@ -795,6 +795,39 @@ TEST_CASE("Parse outer join") {
     REQUIRE(join.keys.size() == 1);
     REQUIRE(join.keys[0] == "key");
 }
+TEST_CASE("Parse semi join") {
+    const char* source = "a semi join b on key;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Semi);
+    REQUIRE(join.keys == std::vector<std::string>{"key"});
+}
+
+TEST_CASE("Parse anti join") {
+    const char* source = "a anti join b on key;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Anti);
+    REQUIRE(join.keys == std::vector<std::string>{"key"});
+}
+
+TEST_CASE("Parse cross join") {
+    const char* source = "a cross join b;";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& join = require_join(require_expr(expr_stmt.expr));
+    REQUIRE(join.kind == JoinKind::Cross);
+    REQUIRE(join.keys.empty());
+}
+
 // ─── All comparison operators parse correctly ────────────────────────────────
 
 TEST_CASE("Parse all comparison operators") {

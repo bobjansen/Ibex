@@ -14,27 +14,21 @@
 //   · SoA layout (s[word][lane]) lets the compiler auto-vectorize the inner
 //     loops into AVX2 when -mavx2 is present; ILP from OoO execution benefits
 //     even without SIMD
-//   · Seeding is identical to Xoshiro256pp_x4 (same four base seeds), so a
-//     fixed seed produces the same uniform stream on any ISA
-//   · Used by fill_normal_x4 when libmvec is unavailable; profiling shows
-//     log+cos+sin dominate Box-Muller — vectorizing just xoshiro alone gives
-//     no measurable throughput gain, so the simpler portable path is used
+//   · Used by fill_normal_x4's Polar path (portable bulk + libmvec tail)
 //
 // SIMD engine (Xoshiro256pp_x4, __AVX2__ + IBEX_HAVE_LIBMVEC only)
-//   · Same four independent streams as the portable engine, held in four
-//     __m256i registers (one per state word, four lanes per register)
+//   · Four independent streams held in four __m256i registers (one per state
+//     word, four lanes per register)
 //   · Combined with libmvec _ZGVdN4v_log/cos/sin for fully 4-wide Box-Muller
 //   · ~5× throughput vs scalar; entire gain comes from vectorized transcendentals
-//   · bits_to_01_x4 uses the same IEEE-754 mantissa trick as
-//     bits_to_01_portable, so the uniform doubles produced are bit-identical
-//     to those the portable path would produce for the same seed
 //
-// Cross-ISA reproducibility
-//   · A fixed seed produces the same uniform random stream (same Xoshiro
-//     state sequence, same bit_to_01 conversion) on both AVX2 and non-AVX2
-//     builds.  Box-Muller output may differ by ≤ 1 ULP across platforms
-//     because libmvec's transcendentals are not required to be
-//     correctly-rounded — this is acceptable for MC simulation purposes.
+// Algorithm selection in fill_normal_x4
+//   · libmvec available: Box-Muller (x4 xoshiro + vectorized log/cos/sin) for
+//     bulk, Polar for tail
+//   · no libmvec: Marsaglia Polar method throughout (~2× faster than scalar
+//     Box-Muller: eliminating cos+sin saves more than the ~27% rejection overhead)
+//   · The two paths use different algorithms and produce different output
+//     sequences for the same seed; both are statistically correct.
 //
 // Seeding: splitmix64 expands a single 64-bit seed into the four state words.
 
@@ -118,8 +112,15 @@ inline auto bits_to_01_portable(std::uint64_t x) noexcept -> double {
     return std::bit_cast<double>((x & mantissa_mask) | exponent_one) - 1.0;
 }
 
+// Convert a raw 64-bit word to a double in (-1, 1) by treating the top 53
+// bits as a signed integer and scaling.  Used by the Polar method.
+inline auto bits_to_pm1(std::uint64_t x) noexcept -> double {
+    return static_cast<double>(static_cast<std::int64_t>(x) >> 11) * 0x1.0p-52;
+}
+
 // Box-Muller transform: produce two standard-normal variates from two
 // independent uniforms u1 ∈ (0,1) and u2 ∈ [0,1).
+// Used only by the libmvec fast path (the portable path uses Polar instead).
 inline void box_muller(double u1, double u2, double& z0, double& z1) noexcept {
     const double r     = std::sqrt(-2.0 * std::log(u1));
     const double theta = 2.0 * std::numbers::pi * u2;
@@ -296,25 +297,25 @@ inline auto get_rng_x4() noexcept -> Xoshiro256pp_x4& {
 // Two dispatch paths, selected at compile time:
 //
 //   AVX2 + libmvec  (both __AVX2__ and IBEX_HAVE_LIBMVEC defined)
-//     Xoshiro256pp_x4 (__m256i) + _ZGVdN4v_{log,cos,sin} — ~5× faster than
-//     scalar.  The entire speedup comes from 4-wide transcendentals: profiling
-//     shows log+cos+sin dominate Box-Muller; vectorizing just the xoshiro step
-//     (< 5% of work) without also vectorizing the transcendentals yields no
-//     measurable gain over the portable path.
+//     Xoshiro256pp_x4 (__m256i) + _ZGVdN4v_{log,cos,sin} (Box-Muller) for
+//     groups of 8 outputs — ~5× vs scalar.  The remaining tail (< 8 elements)
+//     is handled by the Polar fallback below.
 //
-//   Portable (everything else)
-//     Xoshiro256pp_x4_portable (SoA layout) + scalar transcendentals.
-//     The SoA layout lets the compiler auto-vectorize the xoshiro inner loops
-//     to AVX2 when -mavx2 is active, providing ILP without manual intrinsics.
-//     Since transcendentals dominate, throughput matches a scalar single-stream
-//     baseline — but the 4-wide engine is kept for cross-ISA stream identity:
-//     with the same seed, this path and the libmvec path consume the same
-//     logical xoshiro sequence (same uniform doubles), so only the final ≤1 ULP
-//     transcendental rounding differs between builds.
+//   Portable (everything else, including the libmvec tail)
+//     Marsaglia Polar method with Xoshiro256pp_x4_portable:
+//       · Generate (u1, u2) ∈ (−1,1)²; accept if s = u1²+u2² < 1
+//       · z0 = u1·√(−2·log(s)/s),  z1 = u2·√(−2·log(s)/s)
+//       · Acceptance rate π/4 ≈ 78.5%; only log+sqrt, no trig
+//     Benchmarked ~2× faster than scalar Box-Muller: eliminating cos+sin saves
+//     more than the ~27% extra candidates from rejection.  Polar + libmvec
+//     would be slower than Box-Muller + libmvec (rejection overhead > trig
+//     savings when transcendentals are already vectorized), so Box-Muller is
+//     kept for the libmvec bulk path.
 //
-// Output layout per 8-element block (lane = stream index 0..3):
-//   out[i + 2*lane + 0] = mean + stddev * cos-branch of Box-Muller for lane
-//   out[i + 2*lane + 1] = mean + stddev * sin-branch of Box-Muller for lane
+// Note: the libmvec and portable paths use different algorithms (Box-Muller vs
+// Polar) and therefore produce different output sequences for the same seed.
+// Both are statistically correct and seeding is per-engine (reseed_rng_x4
+// reseeds both engines so determinism is preserved within each path).
 inline void fill_normal_x4(double* __restrict__ out, std::size_t rows,
                             double mean, double stddev) noexcept {
     std::size_t i = 0;
@@ -345,46 +346,24 @@ inline void fill_normal_x4(double* __restrict__ out, std::size_t rows,
         _mm256_storeu_pd(out + i,     _mm256_permute2f128_pd(lo, hi, 0x20));
         _mm256_storeu_pd(out + i + 4, _mm256_permute2f128_pd(lo, hi, 0x31));
     }
-
-#else  // portable path (non-glibc AVX2, no AVX2, or non-x86)
-    // Xoshiro256pp_x4_portable SoA loops auto-vectorize on -mavx2 targets;
-    // transcendentals remain scalar (they dominate, vectorizing xoshiro alone
-    // gives no measurable benefit without also vectorizing the transcendentals).
-    auto& rng4 = get_rng_x4_portable();
-
-    for (; i + 7 < rows; i += 8) {
-        const auto u1_raw = rng4();
-        const auto u2_raw = rng4();
-        for (int lane = 0; lane < 4; ++lane) {
-            const double u1 = bits_to_01_portable(u1_raw[lane]) + 1e-300;
-            const double u2 = bits_to_01_portable(u2_raw[lane]);
-            double z0, z1;
-            box_muller(u1, u2, z0, z1);
-            out[i + 2 * lane]     = mean + stddev * z0;
-            out[i + 2 * lane + 1] = mean + stddev * z1;
-        }
-    }
 #endif
 
-    // Scalar tail (< 8 remaining elements), drawn from the portable engine
-    // so the same x4 seed always produces the same tail regardless of ISA.
-    auto& rng4_tail = get_rng_x4_portable();
-    for (; i + 1 < rows; i += 2) {
-        const auto raw = rng4_tail();
-        const double u1 = bits_to_01_portable(raw[0]) + 1e-300;
-        const double u2 = bits_to_01_portable(raw[1]);
-        double z0, z1;
-        box_muller(u1, u2, z0, z1);
-        out[i]     = mean + stddev * z0;
-        out[i + 1] = mean + stddev * z1;
-    }
-    if (i < rows) {
-        const auto raw = rng4_tail();
-        const double u1 = bits_to_01_portable(raw[0]) + 1e-300;
-        const double u2 = bits_to_01_portable(raw[1]);
-        double z0, z1;
-        box_muller(u1, u2, z0, z1);
-        out[i] = mean + stddev * z0;
+    // ── Polar method: portable bulk path + libmvec tail (i..rows) ────────────
+    // Processes 4 candidate pairs per xoshiro call; accepted pairs are written
+    // sequentially.  Naturally handles any remaining count including odd tails.
+    auto& rng4p = get_rng_x4_portable();
+    while (i < rows) {
+        const auto r1 = rng4p();
+        const auto r2 = rng4p();
+        for (int lane = 0; lane < 4 && i < rows; ++lane) {
+            const double u1 = bits_to_pm1(r1[lane]);
+            const double u2 = bits_to_pm1(r2[lane]);
+            const double s  = u1 * u1 + u2 * u2;
+            if (s >= 1.0 || s == 0.0) [[unlikely]] continue;
+            const double scale = std::sqrt(-2.0 * std::log(s) / s);
+            out[i++] = mean + stddev * u1 * scale;
+            if (i < rows) out[i++] = mean + stddev * u2 * scale;
+        }
     }
 }
 

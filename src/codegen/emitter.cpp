@@ -413,21 +413,33 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 case ir::JoinKind::Outer:
                     fn = "outer_join";
                     break;
+                case ir::JoinKind::Semi:
+                    fn = "semi_join";
+                    break;
+                case ir::JoinKind::Anti:
+                    fn = "anti_join";
+                    break;
+                case ir::JoinKind::Cross:
+                    fn = "cross_join";
+                    break;
                 case ir::JoinKind::Asof:
                     fn = "asof_join";
                     break;
             }
-            *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right
-                  << ", {";
-            bool first = true;
-            for (const auto& key : join.keys()) {
-                if (!first)
-                    *out_ << ", ";
-                first = false;
-                *out_ << '"' << escape_string(key) << '"';
+            *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right;
+            if (join.kind() != ir::JoinKind::Cross) {
+                *out_ << ", {";
+                bool first = true;
+                for (const auto& key : join.keys()) {
+                    if (!first)
+                        *out_ << ", ";
+                    first = false;
+                    *out_ << '"' << escape_string(key) << '"';
+                }
+                *out_ << "}";
             }
-            *out_ << "});\n";
-            return var;
+            *out_ << ");\n";
+                        return var;
         }
 
         case ir::NodeKind::Melt: {

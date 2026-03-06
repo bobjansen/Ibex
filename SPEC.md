@@ -1028,11 +1028,16 @@ A join B on key
 A left join B on key
 A right join B on key
 A outer join B on key
+A semi join B on key
+A anti join B on key
+A cross join B
 A asof join B on time
 A join B on { key1, key2 }
 A left join B on { key1, key2 }
 A right join B on { key1, key2 }
 A outer join B on { key1, key2 }
+A semi join B on { key1, key2 }
+A anti join B on { key1, key2 }
 A asof join B on { time }
 ```
 
@@ -1042,6 +1047,9 @@ Semantics:
 - `A left join B on key` is a left outer join (all rows from `A` are preserved).
 - `A right join B on key` is a right outer join (all rows from `B` are preserved).
 - `A outer join B on key` is a full outer join (rows from both sides are preserved).
+- `A semi join B on key` keeps left rows that have at least one right match.
+- `A anti join B on key` keeps left rows that have no right match.
+- `A cross join B` returns the Cartesian product of rows from `A` and `B`.
 - `A asof join B on time` is an as-of join on the TimeFrame index column.
 
 The `on` list must be one or more unqualified column names present in both
@@ -1055,11 +1063,16 @@ Join expressions are **syntactic sugar** for the built-in join functions:
 - `A left join B on key` → `left_join(A, B, key)`
 - `A right join B on key` → `right_join(A, B, key)`
 - `A outer join B on key` → `outer_join(A, B, key)`
+- `A semi join B on key` → `semi_join(A, B, key)`
+- `A anti join B on key` → `anti_join(A, B, key)`
+- `A cross join B` → `cross_join(A, B)`
 - `A asof join B on time` → `asof_join(A, B, time, tolerance = 0s)`
 - `A join B on { k1, k2 }` → `inner_join(A, B, k1, k2)`
 - `A left join B on { k1, k2 }` → `left_join(A, B, k1, k2)`
 - `A right join B on { k1, k2 }` → `right_join(A, B, k1, k2)`
 - `A outer join B on { k1, k2 }` → `outer_join(A, B, k1, k2)`
+- `A semi join B on { k1, k2 }` → `semi_join(A, B, k1, k2)`
+- `A anti join B on { k1, k2 }` → `anti_join(A, B, k1, k2)`
 - `A asof join B on { time }` → `asof_join(A, B, time, tolerance = 0s)`
 - `A asof join B on { time, k1, k2 }` → `asof_join(A, B, time, k1, k2, tolerance = 0s)`
 
@@ -2137,7 +2150,7 @@ Highest precedence at top.
 | 3     | Equality     | `==` `!=`                         | None   |
 | 2     | Logical AND  | `&&`                              | Left   |
 | 1     | Logical OR   | `\|\|`                            | Left   |
-| 0     | Join         | `join` `left join` `asof join`    | Left   |
+| 0     | Join         | `join` `left join` `right join` `outer join` `semi join` `anti join` `cross join` `asof join` | Left   |
 
 ---
 
@@ -2146,7 +2159,7 @@ Highest precedence at top.
 **Hard keywords** (always reserved, used by grammar):
 
 ```
-let  mut  extern  fn  from  filter  select  update  distinct  order  by  window  join  left  asof  on
+let  mut  extern  fn  from  filter  select  update  distinct  order  by  window  join  left  right  outer  semi  anti  cross  asof  on
 rename  resample  import  Stream
 asc  desc  true  false
 ```

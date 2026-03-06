@@ -2190,7 +2190,7 @@ auto column_kind(const ColumnValue& column) -> ExprType {
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const std::vector<std::string>& keys) -> std::expected<Table, std::string> {
-    if (keys.empty()) {
+    if (kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
     }
 
@@ -2244,6 +2244,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     const bool preserve_left_rows =
         (kind == ir::JoinKind::Left || kind == ir::JoinKind::Outer || kind == ir::JoinKind::Asof);
     const bool preserve_right_rows = (kind == ir::JoinKind::Right || kind == ir::JoinKind::Outer);
+    const bool semi_join = (kind == ir::JoinKind::Semi);
+    const bool anti_join = (kind == ir::JoinKind::Anti);
 
     Table output;
     output.columns.reserve(left.columns.size() + right.columns.size());
@@ -2263,7 +2265,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     std::vector<RightOut> right_out;
     right_out.reserve(right.columns.size());
     for (const auto& entry : right.columns) {
-        if (key_set.contains(entry.name)) {
+        if (semi_join || anti_join || key_set.contains(entry.name)) {
             continue;
         }
         std::string name = entry.name;
@@ -2273,6 +2275,21 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         out_names.insert(name);
         output.add_column(name, make_empty_like(*entry.column));
         right_out.push_back(RightOut{entry.column.get(), output.columns.size() - 1});
+    }
+
+    if (kind == ir::JoinKind::Cross) {
+        for (std::size_t l = 0; l < left.rows(); ++l) {
+            for (std::size_t r = 0; r < right.rows(); ++r) {
+                for (std::size_t i = 0; i < left.columns.size(); ++i) {
+                    append_value(*output.columns[i].column, *left.columns[i].column, l);
+                }
+                for (const auto& item : right_out) {
+                    append_value(*output.columns[item.out_index].column, *item.column, r);
+                }
+            }
+        }
+        normalize_time_index(output);
+        return output;
     }
 
     std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_index;
@@ -2637,7 +2654,20 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             key.values.push_back(scalar_from_column(*col, l));
         }
         auto it = right_index.find(key);
-        if (it == right_index.end()) {
+        const bool has_match = (it != right_index.end());
+        if (semi_join) {
+            if (has_match) {
+                append_left_row(l);
+            }
+            continue;
+        }
+        if (anti_join) {
+            if (!has_match) {
+                append_left_row(l);
+            }
+            continue;
+        }
+        if (!has_match) {
             if (preserve_left_rows) {
                 append_left_row(l);
                 append_right_defaults();

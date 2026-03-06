@@ -166,6 +166,15 @@ class Lowerer {
             case JoinKind::Outer:
                 kind = ir::JoinKind::Outer;
                 break;
+            case JoinKind::Semi:
+                kind = ir::JoinKind::Semi;
+                break;
+            case JoinKind::Anti:
+                kind = ir::JoinKind::Anti;
+                break;
+            case JoinKind::Cross:
+                kind = ir::JoinKind::Cross;
+                break;
             case JoinKind::Asof:
                 kind = ir::JoinKind::Asof;
                 break;

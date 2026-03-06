@@ -207,3 +207,64 @@ TEST_CASE("join: asof join requires time index key in on-list", "[join]") {
     auto error = interpret_error("lhs asof join rhs on symbol;", tables);
     CHECK(error.find("include the time index") != std::string::npos);
 }
+
+
+TEST_CASE("join: semi join keeps matching left rows only", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
+    lhs.add_column("lval", Column<std::int64_t>{10, 20, 30, 40});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{2, 2, 4});
+    rhs.add_column("rval", Column<std::int64_t>{200, 201, 400});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs semi join rhs on id;", tables);
+
+    CHECK(out.rows() == 2);
+    CHECK(out.find("rval") == nullptr);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 4});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 40});
+}
+
+TEST_CASE("join: anti join keeps non-matching left rows only", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
+    lhs.add_column("lval", Column<std::int64_t>{10, 20, 30, 40});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{2, 4});
+    rhs.add_column("rval", Column<std::int64_t>{200, 400});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs anti join rhs on id;", tables);
+
+    CHECK(out.rows() == 2);
+    CHECK(out.find("rval") == nullptr);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 3});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 30});
+}
+
+TEST_CASE("join: cross join returns cartesian product", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2});
+
+    runtime::Table rhs;
+    rhs.add_column("group", Column<std::string>{"A", "B", "C"});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs cross join rhs;", tables);
+
+    CHECK(out.rows() == 6);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 1, 1, 2, 2, 2});
+    CHECK(col_str(out, "group") == std::vector<std::string>{"A", "B", "C", "A", "B", "C"});
+}

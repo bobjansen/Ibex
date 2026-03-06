@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -445,6 +446,16 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
     return out;
 }
 
+
+auto verify_join_row_count(const ibex::runtime::Table& result, std::size_t expected_rows,
+                           std::string_view label) -> std::optional<std::string> {
+    if (result.rows() != expected_rows) {
+        return fmt::format("{} row-count mismatch: expected {}, got {}", label, expected_rows,
+                           result.rows());
+    }
+    return std::nullopt;
+}
+
 auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
                       std::size_t max_rows) -> std::optional<std::string> {
     auto normalized = normalize_input(query.source);
@@ -472,6 +483,21 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
     if (tables.contains("prices_multi")) {
         multi = &tables.at("prices_multi");
         sliced.emplace("prices_multi", slice_table(*multi, max_rows));
+    }
+    const ibex::runtime::Table* lookup = nullptr;
+    if (tables.contains("lookup")) {
+        lookup = &tables.at("lookup");
+        sliced.emplace("lookup", slice_table(*lookup, max_rows));
+    }
+    const ibex::runtime::Table* prices_small = nullptr;
+    if (tables.contains("prices_small")) {
+        prices_small = &tables.at("prices_small");
+        sliced.emplace("prices_small", slice_table(*prices_small, max_rows));
+    }
+    const ibex::runtime::Table* lookup_small = nullptr;
+    if (tables.contains("lookup_small")) {
+        lookup_small = &tables.at("lookup_small");
+        sliced.emplace("lookup_small", slice_table(*lookup_small, max_rows));
     }
 
     auto result = ibex::runtime::interpret(*lowered.value(), sliced, &scalars);
@@ -525,6 +551,67 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         std::size_t rows = sliced.at("prices_multi").rows();
         if (!verify_group_by_symbol_day(sliced.at("prices_multi"), *result, rows, "ohlc")) {
             return "ohlc_by_symbol_day verification failed";
+        }
+    } else if (query.name == "null_left_join") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        if (auto err = verify_join_row_count(*result, sliced.at("prices").rows(), "null_left_join")) {
+            return *err;
+        }
+    } else if (query.name == "null_semi_join") {
+        if (table == nullptr || lookup == nullptr) {
+            return "missing prices/lookup tables";
+        }
+        std::size_t expected = 0;
+        const auto* p_sym = sliced.at("prices").find("symbol");
+        const auto* l_sym = sliced.at("lookup").find("symbol");
+        if (p_sym == nullptr || l_sym == nullptr) {
+            return "missing symbol column for semi join verification";
+        }
+        std::unordered_set<std::string> right_keys;
+        right_keys.reserve(sliced.at("lookup").rows());
+        for (std::size_t r = 0; r < sliced.at("lookup").rows(); ++r) {
+            right_keys.emplace(string_view_at(*l_sym, r));
+        }
+        for (std::size_t l = 0; l < sliced.at("prices").rows(); ++l) {
+            if (right_keys.contains(std::string(string_view_at(*p_sym, l)))) {
+                ++expected;
+            }
+        }
+        if (auto err = verify_join_row_count(*result, expected, "null_semi_join")) {
+            return *err;
+        }
+    } else if (query.name == "null_anti_join") {
+        if (table == nullptr || lookup == nullptr) {
+            return "missing prices/lookup tables";
+        }
+        std::size_t expected = 0;
+        const auto* p_sym = sliced.at("prices").find("symbol");
+        const auto* l_sym = sliced.at("lookup").find("symbol");
+        if (p_sym == nullptr || l_sym == nullptr) {
+            return "missing symbol column for anti join verification";
+        }
+        std::unordered_set<std::string> right_keys;
+        right_keys.reserve(sliced.at("lookup").rows());
+        for (std::size_t r = 0; r < sliced.at("lookup").rows(); ++r) {
+            right_keys.emplace(string_view_at(*l_sym, r));
+        }
+        for (std::size_t l = 0; l < sliced.at("prices").rows(); ++l) {
+            if (!right_keys.contains(std::string(string_view_at(*p_sym, l)))) {
+                ++expected;
+            }
+        }
+        if (auto err = verify_join_row_count(*result, expected, "null_anti_join")) {
+            return *err;
+        }
+    } else if (query.name == "null_cross_join_small") {
+        if (prices_small == nullptr || lookup_small == nullptr) {
+            return "missing prices_small/lookup_small tables";
+        }
+        std::size_t expected = sliced.at("prices_small").rows() * sliced.at("lookup_small").rows();
+        if (auto err = verify_join_row_count(*result, expected, "null_cross_join_small")) {
+            return *err;
         }
     } else if (query.name == "filter_simple") {
         if (trades == nullptr) {
@@ -864,17 +951,47 @@ int main(int argc, char** argv) {
             fmt::print("\n-- Null benchmarks ({} prices rows, {} lookup rows) --\n",
                        null_reg.at("prices").rows(), null_reg.at("lookup").rows());
 
-            // Left join: ~50% of rows get null sector; measures validity-bitmap
-            // tracking and allocation overhead vs polars/data.table.
+            // Join benchmarks on the same lookup workload.
+            // - left: exercises null bitmap tracking on right-side columns.
+            // - semi/anti: membership-style joins returning left schema only.
             std::vector<BenchQuery> null_queries = {
                 {"null_left_join", "prices left join lookup on symbol"},
+                {"null_semi_join", "prices semi join lookup on symbol"},
+                {"null_anti_join", "prices anti join lookup on symbol"},
             };
 
             for (const auto& q : null_queries) {
+                if (verify) {
+                    if (auto err = verify_benchmark(q, null_reg, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", q.name, *err);
+                        return 1;
+                    }
+                }
                 status = run_benchmark(q, null_reg, warmup_iters, iters, saved_include_parse);
                 if (status != 0) {
                     break;
                 }
+            }
+
+            if (status == 0) {
+                // Cross join can explode in cardinality, so benchmark a bounded subset.
+                constexpr std::size_t kCrossLeftRows = 2000;
+                constexpr std::size_t kCrossRightRows = 64;
+                ibex::runtime::TableRegistry cross_reg;
+                cross_reg.emplace("prices_small", slice_table(null_reg.at("prices"), kCrossLeftRows));
+                cross_reg.emplace("lookup_small", slice_table(null_reg.at("lookup"), kCrossRightRows));
+                fmt::print("-- Cross join benchmark subset ({} x {} rows) --\n",
+                           cross_reg.at("prices_small").rows(), cross_reg.at("lookup_small").rows());
+
+                BenchQuery cross_query{"null_cross_join_small", "prices_small cross join lookup_small"};
+                if (verify) {
+                    if (auto err = verify_benchmark(cross_query, cross_reg, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", cross_query.name, *err);
+                        return 1;
+                    }
+                }
+                status =
+                    run_benchmark(cross_query, cross_reg, warmup_iters, iters, saved_include_parse);
             }
         }
     }

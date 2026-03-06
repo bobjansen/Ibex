@@ -1,4 +1,4 @@
-// Join examples (inner + left + right + outer)
+// Join examples (inner + left + right + outer + semi + anti + cross)
 
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 
@@ -16,3 +16,12 @@ iris right join species_meta on Species;
 
 // Full outer join on a single key
 iris outer join species_meta on Species;
+
+// Semi join keeps only matching left rows
+iris semi join species_meta on Species;
+
+// Anti join keeps only non-matching left rows
+iris anti join species_meta on Species;
+
+// Cross join returns the cartesian product
+iris cross join species_meta;

@@ -367,6 +367,42 @@ TEST_CASE("emitter: join node — outer join", "[codegen]") {
     auto out = emit_to_string(*join);
     CHECK(contains(out, "ibex::ops::outer_join("));
 }
+TEST_CASE("emitter: join node — semi join", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Semi, {"id"});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::semi_join("));
+}
+
+TEST_CASE("emitter: join node — anti join", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Anti, {"id"});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::anti_join("));
+}
+
+TEST_CASE("emitter: join node — cross join", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Cross, {});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::cross_join("));
+}
+
 TEST_CASE("emitter: join node — asof join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");

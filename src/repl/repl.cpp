@@ -679,7 +679,12 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
             return val;
         }
         if (std::holds_alternative<double>(val)) {
-            return runtime::ScalarValue{static_cast<std::int64_t>(std::get<double>(val))};
+            double v = std::get<double>(val);
+            if (v != std::trunc(v)) {
+                return std::unexpected(std::string(callee) + "(): cannot cast non-integer Float " +
+                                       std::to_string(v) + " to Int (use floor(), ceil(), or round())");
+            }
+            return runtime::ScalarValue{static_cast<std::int64_t>(v)};
         }
         return std::unexpected(std::string(callee) + "(): cannot cast " +
                                std::string(scalar_value_type_name(val)) + " to Int");
@@ -705,6 +710,13 @@ auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
         }
         if (std::holds_alternative<Column<double>>(col)) {
             const auto& src = std::get<Column<double>>(col);
+            for (double v : src) {
+                if (v != std::trunc(v)) {
+                    return std::unexpected(
+                        std::string(callee) +
+                        "(): cannot cast non-integer Float column to Int (use floor(), ceil(), or round())");
+                }
+            }
             Column<std::int64_t> dst;
             dst.reserve(src.size());
             for (double v : src) {

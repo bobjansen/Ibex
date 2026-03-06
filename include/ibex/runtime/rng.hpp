@@ -98,6 +98,13 @@ inline auto get_rng() noexcept -> Xoshiro256pp& {
     return rng;
 }
 
+// Re-seed the thread-local scalar RNG with an explicit value.
+// After this call, rand_uniform / rand_student_t / etc. all produce a
+// deterministic sequence for the given seed on this thread.
+inline void reseed_rng(std::uint64_t seed) noexcept {
+    get_rng() = Xoshiro256pp{seed};
+}
+
 // ─── xoshiro256++ × 4 (AVX2) ─────────────────────────────────────────────────
 //
 // Four fully independent xoshiro256++ streams packed into four __m256i words.
@@ -269,5 +276,14 @@ inline void fill_normal_x4(double* __restrict__ out, std::size_t rows,
 }
 
 #endif // __AVX2__
+
+// Re-seed the thread-local 4-wide RNG with an explicit value.
+// When AVX2 is unavailable the 4-wide engine does not exist; this becomes a
+// no-op so callers never need #ifdef guards around it.
+inline void reseed_rng_x4([[maybe_unused]] std::uint64_t seed) noexcept {
+#ifdef __AVX2__
+    get_rng_x4() = Xoshiro256pp_x4{seed};
+#endif
+}
 
 } // namespace ibex::runtime

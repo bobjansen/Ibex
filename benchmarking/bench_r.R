@@ -30,6 +30,7 @@ csv_lookup_path <- parse_arg("--csv-lookup")
 warmup          <- as.integer(parse_arg("--warmup", "1"))
 iters           <- as.integer(parse_arg("--iters",  "5"))
 out_path        <- parse_arg("--out", "results/r.tsv")
+fill_rows       <- as.integer(parse_arg("--fill-rows", "4000000"))
 skip_data_table <- parse_flag("--skip-data-table")
 skip_dplyr      <- parse_flag("--skip-dplyr")
 
@@ -107,6 +108,12 @@ if (!skip_data_table) {
             tmp <- copies[[copy_idx]]
             tmp[, price_x2 := price * 2][]
         })
+
+    bench("data.table", "cumsum_price",
+        function() dt[, cs := cumsum(price)][])
+
+    bench("data.table", "cumprod_price",
+        function() dt[, cp := cumprod(price)][])
 }
 
 if (!skip_dplyr) {
@@ -126,6 +133,12 @@ if (!skip_dplyr) {
 
     bench("dplyr", "update_price_x2",
         function() tb |> mutate(price_x2 = price * 2))
+
+    bench("dplyr", "cumsum_price",
+        function() tb |> mutate(cs = cumsum(price)))
+
+    bench("dplyr", "cumprod_price",
+        function() tb |> mutate(cp = cumprod(price)))
 }
 
 # ── Multi-column group-by ─────────────────────────────────────────────────────
@@ -333,6 +346,50 @@ if (!is.null(csv_lookup_path)) {
 
         bench("dplyr", "null_left_join",
             function() tb |> left_join(tb_lookup, by = "symbol"))
+    }
+}
+
+# ── Fill benchmarks: fill_null, fill_forward (LOCF), fill_backward (NOCB) ────
+# Uses an in-memory vector with alternating valid / NA doubles (~50% null).
+# Row count is controlled by --fill-rows (default 4 000 000).
+{
+    message(sprintf("\nBuilding fill data (%d rows, 50%% NA)...", fill_rows))
+    idx   <- seq_len(fill_rows) - 1L          # 0-based index
+    valid <- (idx %% 2L == 0L)
+    vals  <- ifelse(valid, 100.0 + (idx %% 100L), NA_real_)
+    dt_fill <- NULL
+    tb_fill <- NULL
+    if (!skip_data_table) {
+        dt_fill <- data.table(val = vals)
+
+        message("\n=== data.table (fill) ===")
+
+        bench("data.table", "fill_null",
+            function() dt_fill[, v2 := nafill(val, fill = 0.0)][])
+
+        bench("data.table", "fill_forward",
+            function() dt_fill[, v2 := nafill(val, type = "locf")][])
+
+        bench("data.table", "fill_backward",
+            function() dt_fill[, v2 := nafill(val, type = "nocb")][])
+    }
+
+    if (!skip_dplyr) {
+        library(tidyr)
+        tb_fill <- tibble::tibble(val = vals)
+
+        message("\n=== dplyr (fill) ===")
+
+        bench("dplyr", "fill_null",
+            function() tb_fill |> mutate(v2 = tidyr::replace_na(val, 0.0)))
+
+        bench("dplyr", "fill_forward",
+            function() tb_fill |> tidyr::fill(val, .direction = "down") |>
+                rename(v2 = val))
+
+        bench("dplyr", "fill_backward",
+            function() tb_fill |> tidyr::fill(val, .direction = "up") |>
+                rename(v2 = val))
     }
 }
 

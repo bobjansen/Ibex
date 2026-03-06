@@ -21,6 +21,20 @@ target_link_libraries(ibex_runtime
         robin_hood::robin_hood
 )
 
+# ── AVX2 / libmvec ────────────────────────────────────────────────────────────
+# Enable when the compiler supports -mavx2.  The #ifdef __AVX2__ guards in
+# rng.hpp make this a no-op on platforms that lack AVX2.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-mavx2 IBEX_HAS_AVX2)
+if(IBEX_HAS_AVX2)
+    target_compile_options(ibex_runtime PRIVATE -mavx2 -mfma)
+    # libmvec provides _ZGVdN4v_log/cos/sin used by fill_normal_x4.
+    find_library(IBEX_LIBMVEC mvec)
+    if(IBEX_LIBMVEC)
+        target_link_libraries(ibex_runtime PRIVATE "${IBEX_LIBMVEC}")
+    endif()
+endif()
+
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_runtime PRIVATE Ibex::Sanitizers)
 endif()

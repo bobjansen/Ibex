@@ -2794,12 +2794,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             (agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
              agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
              agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
-             agg.func == ir::AggFunc::Ewma)) {
+             agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
+             agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis)) {
             return std::unexpected("string aggregation not supported");
         }
 
         if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
-            agg.func == ir::AggFunc::Ewma) {
+            agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
+            agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) {
             has_complex_agg = true;
             numeric_only = false;
         } else if (agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) {
@@ -2843,7 +2845,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if ((agg.func == ir::AggFunc::Sum || agg.func == ir::AggFunc::Mean ||
                  agg.func == ir::AggFunc::Min || agg.func == ir::AggFunc::Max ||
                  agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
-                 agg.func == ir::AggFunc::Ewma) &&
+                 agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
+                 agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) &&
                 agg_validity[i] != nullptr && !(*agg_validity[i])[row]) {
                 continue;
             }
@@ -2860,7 +2863,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 slot.has_value = true;
                 continue;
             }
-            if (agg.func == ir::AggFunc::Median) {
+            if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Quantile ||
+                agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) {
                 double x;
                 if (std::holds_alternative<Column<std::int64_t>>(column)) {
                     x = static_cast<double>(std::get<std::int64_t>(scalar_from_column(column, row)));
@@ -2932,6 +2936,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
+                    case ir::AggFunc::Quantile:
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
                         break;
                 }
                 slot.has_value = true;
@@ -2967,6 +2974,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
+                    case ir::AggFunc::Quantile:
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
                         break;
                 }
                 slot.has_value = true;
@@ -3036,6 +3046,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
+                    case ir::AggFunc::Quantile:
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
                         break;
                 }
                 slot.has_value = true;
@@ -3070,6 +3083,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     case ir::AggFunc::Median:
                     case ir::AggFunc::Stddev:
                     case ir::AggFunc::Ewma:
+                    case ir::AggFunc::Quantile:
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
                         break;
                 }
                 slot.has_value = true;
@@ -3103,6 +3119,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Median:
                 case ir::AggFunc::Stddev:
                 case ir::AggFunc::Ewma:
+                case ir::AggFunc::Quantile:
+                case ir::AggFunc::Skew:
+                case ir::AggFunc::Kurtosis:
                     column = Column<double>{};
                     break;
                 case ir::AggFunc::Sum:
@@ -3206,6 +3225,75 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Ewma:
                     append_scalar(*column, slot.double_value);
                     break;
+                case ir::AggFunc::Quantile: {
+                    if (slot.values.empty()) {
+                        append_scalar(*column, 0.0);
+                    } else {
+                        std::vector<double> sorted = slot.values;
+                        std::sort(sorted.begin(), sorted.end());
+                        double idx = slot.param * static_cast<double>(sorted.size() - 1);
+                        std::size_t lo = static_cast<std::size_t>(idx);
+                        std::size_t hi = lo + 1 < sorted.size() ? lo + 1 : lo;
+                        double frac = idx - static_cast<double>(lo);
+                        append_scalar(*column, sorted[lo] + frac * (sorted[hi] - sorted[lo]));
+                    }
+                    break;
+                }
+                case ir::AggFunc::Skew: {
+                    std::size_t n = slot.values.size();
+                    if (n < 3) {
+                        append_scalar(*column, 0.0);
+                    } else {
+                        double mean = 0.0;
+                        for (double x : slot.values) mean += x;
+                        mean /= static_cast<double>(n);
+                        double m2 = 0.0, m3 = 0.0;
+                        for (double x : slot.values) {
+                            double d = x - mean;
+                            m2 += d * d;
+                            m3 += d * d * d;
+                        }
+                        if (m2 == 0.0) {
+                            append_scalar(*column, 0.0);
+                        } else {
+                            double dn = static_cast<double>(n);
+                            // Fisher–Pearson sample skewness (same as pandas default)
+                            double skew = (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) *
+                                          (m3 / std::pow(m2, 1.5));
+                            append_scalar(*column, skew);
+                        }
+                    }
+                    break;
+                }
+                case ir::AggFunc::Kurtosis: {
+                    std::size_t n = slot.values.size();
+                    if (n < 4) {
+                        append_scalar(*column, 0.0);
+                    } else {
+                        double mean = 0.0;
+                        for (double x : slot.values) mean += x;
+                        mean /= static_cast<double>(n);
+                        double m2 = 0.0, m4 = 0.0;
+                        for (double x : slot.values) {
+                            double d = x - mean;
+                            double d2 = d * d;
+                            m2 += d2;
+                            m4 += d2 * d2;
+                        }
+                        if (m2 == 0.0) {
+                            append_scalar(*column, 0.0);
+                        } else {
+                            double dn = static_cast<double>(n);
+                            // Fisher excess kurtosis (unbiased, matches scipy/pandas default):
+                            // G2 = (n-1)/((n-2)*(n-3)) * [(n+1)*n*m4/m2^2 - 3*(n-1)]
+                            double kurt =
+                                (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
+                                ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
+                            append_scalar(*column, kurt);
+                        }
+                    }
+                    break;
+                }
             }
         }
         return std::nullopt;
@@ -3221,11 +3309,16 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             case ir::AggFunc::Max:
                 return slot.has_value;
             case ir::AggFunc::Median:
+            case ir::AggFunc::Quantile:
                 return !slot.values.empty();
             case ir::AggFunc::Stddev:
                 return slot.count >= 2;
             case ir::AggFunc::Ewma:
                 return slot.has_value;
+            case ir::AggFunc::Skew:
+                return slot.values.size() >= 3;
+            case ir::AggFunc::Kurtosis:
+                return slot.values.size() >= 4;
             case ir::AggFunc::Count:
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
@@ -3277,7 +3370,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             const auto func = aggregations[i].func;
             if (func == ir::AggFunc::Sum || func == ir::AggFunc::Mean || func == ir::AggFunc::Min ||
                 func == ir::AggFunc::Max || func == ir::AggFunc::Median ||
-                func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma) {
+                func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma ||
+                func == ir::AggFunc::Quantile || func == ir::AggFunc::Skew ||
+                func == ir::AggFunc::Kurtosis) {
                 track_agg_validity[i] = true;
                 agg_validity_out[i].reserve(group_order.size());
             }
@@ -4660,7 +4755,9 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         }
         // Built-in rolling aggregate functions
         if (call->callee == "rolling_mean" || call->callee == "rolling_median" ||
-            call->callee == "rolling_std" || call->callee == "rolling_ewma") {
+            call->callee == "rolling_std" || call->callee == "rolling_ewma" ||
+            call->callee == "rolling_quantile" || call->callee == "rolling_skew" ||
+            call->callee == "rolling_kurtosis") {
             return ExprType::Double;
         }
         if (call->callee == "rolling_count") {
@@ -5561,6 +5658,137 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
             *src);
     }
 
+    if (call.callee == "rolling_quantile") {
+        // Parse p from the second argument (a numeric literal).
+        double p = 0.5;
+        if (call.args.size() < 2) {
+            return std::unexpected(
+                "rolling_quantile: expected two arguments: rolling_quantile(col, p)");
+        }
+        if (const auto* lit = std::get_if<ir::Literal>(&call.args[1]->node)) {
+            if (const auto* dv = std::get_if<double>(&lit->value)) {
+                p = *dv;
+            } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                p = static_cast<double>(*iv);
+            } else {
+                return std::unexpected("rolling_quantile: p must be a numeric literal");
+            }
+        } else {
+            return std::unexpected("rolling_quantile: p must be a numeric literal");
+        }
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected(
+                        "rolling_quantile: column must be numeric (Int or Float)");
+                } else {
+                    Column<double> result;
+                    result.resize(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::size_t n = i - lo + 1;
+                        std::vector<double> window;
+                        window.reserve(n);
+                        for (std::size_t j = lo; j <= i; ++j)
+                            window.push_back(static_cast<double>(col[j]));
+                        std::sort(window.begin(), window.end());
+                        double idx = p * static_cast<double>(n - 1);
+                        std::size_t idx_lo = static_cast<std::size_t>(idx);
+                        std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
+                        double frac = idx - static_cast<double>(idx_lo);
+                        result[i] = window[idx_lo] + frac * (window[idx_hi] - window[idx_lo]);
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
+    if (call.callee == "rolling_skew") {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected("rolling_skew: column must be numeric (Int or Float)");
+                } else {
+                    Column<double> result;
+                    result.resize(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::size_t n = i - lo + 1;
+                        if (n < 3) {
+                            result[i] = 0.0;
+                            continue;
+                        }
+                        double mean = 0.0;
+                        for (std::size_t j = lo; j <= i; ++j)
+                            mean += static_cast<double>(col[j]);
+                        mean /= static_cast<double>(n);
+                        double m2 = 0.0, m3 = 0.0;
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            double d = static_cast<double>(col[j]) - mean;
+                            m2 += d * d;
+                            m3 += d * d * d;
+                        }
+                        if (m2 == 0.0) {
+                            result[i] = 0.0;
+                        } else {
+                            double dn = static_cast<double>(n);
+                            result[i] = (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) *
+                                        (m3 / std::pow(m2, 1.5));
+                        }
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
+    if (call.callee == "rolling_kurtosis") {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using T = typename std::decay_t<decltype(col)>::value_type;
+                if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
+                    return std::unexpected(
+                        "rolling_kurtosis: column must be numeric (Int or Float)");
+                } else {
+                    Column<double> result;
+                    result.resize(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::size_t n = i - lo + 1;
+                        if (n < 4) {
+                            result[i] = 0.0;
+                            continue;
+                        }
+                        double mean = 0.0;
+                        for (std::size_t j = lo; j <= i; ++j)
+                            mean += static_cast<double>(col[j]);
+                        mean /= static_cast<double>(n);
+                        double m2 = 0.0, m4 = 0.0;
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            double d = static_cast<double>(col[j]) - mean;
+                            double d2 = d * d;
+                            m2 += d2;
+                            m4 += d2 * d2;
+                        }
+                        if (m2 == 0.0) {
+                            result[i] = 0.0;
+                        } else {
+                            double dn = static_cast<double>(n);
+                            // Fisher excess kurtosis (unbiased, matches scipy/pandas):
+                            result[i] =
+                                (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
+                                ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
+                        }
+                    }
+                    return result;
+                }
+            },
+            *src);
+    }
+
     // rolling_min / rolling_max — O(n·w), monotonic deque not yet implemented.
     bool is_min = call.callee == "rolling_min";
     return std::visit(
@@ -5658,7 +5886,8 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
 constexpr auto is_rolling_func(std::string_view name) -> bool {
     return name == "rolling_sum" || name == "rolling_mean" || name == "rolling_min" ||
            name == "rolling_max" || name == "rolling_count" || name == "rolling_median" ||
-           name == "rolling_std" || name == "rolling_ewma";
+           name == "rolling_std" || name == "rolling_ewma" || name == "rolling_quantile" ||
+           name == "rolling_skew" || name == "rolling_kurtosis";
 }
 
 constexpr auto is_cum_func(std::string_view name) -> bool {

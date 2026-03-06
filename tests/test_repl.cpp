@@ -508,3 +508,82 @@ i;
 )";
     REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
 }
+
+// --- round() with rounding mode ---
+
+TEST_CASE("round: nearest mode rounds half away from zero") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.5, nearest);", registry));
+}
+
+TEST_CASE("round: floor mode rounds down") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.9, floor);", registry));
+}
+
+TEST_CASE("round: ceil mode rounds up") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.1, ceil);", registry));
+}
+
+TEST_CASE("round: trunc mode rounds toward zero") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.9, trunc);", registry));
+}
+
+TEST_CASE("round: negative value with floor") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(-2.1, floor);", registry));
+}
+
+TEST_CASE("round: unknown mode is an error") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(2.5, bankers);", registry));
+}
+
+TEST_CASE("round: Int argument is an error") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(3, nearest);", registry));
+}
+
+TEST_CASE("round: applied to Float column with nearest mode") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("v", ibex::Column<double>{1.4, 2.5, 3.6});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df = get_data();
+let (v) = df;
+let r: Series<Int64> = round(v, nearest);
+r;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("round: applied to Int column is an error") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("n", ibex::Column<std::int64_t>{1, 2, 3});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df = get_data();
+let (n) = df;
+let r: Series<Int64> = round(n, nearest);
+r;
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}

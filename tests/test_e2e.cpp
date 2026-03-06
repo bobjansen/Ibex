@@ -526,6 +526,44 @@ TEST_CASE("E2E: left join preserves all left rows", "[e2e]") {
     CHECK(col_i64(out, "score") == std::vector<std::int64_t>{0, 85, 0});
 }
 
+
+TEST_CASE("E2E: right join preserves all right rows", "[e2e]") {
+    runtime::Table lhs, rhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2});
+    lhs.add_column("name", Column<std::string>{"alice", "bob"});
+
+    rhs.add_column("id", Column<std::int64_t>{2, 3});
+    rhs.add_column("score", Column<std::int64_t>{85, 78});
+
+    runtime::TableRegistry tables;
+    tables.emplace("people", std::move(lhs));
+    tables.emplace("scores", std::move(rhs));
+
+    auto out = run("people right join scores on id;", tables);
+    REQUIRE(out.rows() == 2);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 3});
+    CHECK(col_str(out, "name") == std::vector<std::string>{"bob", ""});
+    CHECK(col_i64(out, "score") == std::vector<std::int64_t>{85, 78});
+}
+
+TEST_CASE("E2E: outer join preserves rows from both sides", "[e2e]") {
+    runtime::Table lhs, rhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2});
+    lhs.add_column("name", Column<std::string>{"alice", "bob"});
+
+    rhs.add_column("id", Column<std::int64_t>{2, 3});
+    rhs.add_column("score", Column<std::int64_t>{85, 78});
+
+    runtime::TableRegistry tables;
+    tables.emplace("people", std::move(lhs));
+    tables.emplace("scores", std::move(rhs));
+
+    auto out = run("people outer join scores on id;", tables);
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3});
+    CHECK(col_str(out, "name") == std::vector<std::string>{"alice", "bob", ""});
+    CHECK(col_i64(out, "score") == std::vector<std::int64_t>{0, 85, 78});
+}
 // ─── Scalar predicate in filter ──────────────────────────────────────────────
 
 TEST_CASE("E2E: filter with scalar variable", "[e2e]") {

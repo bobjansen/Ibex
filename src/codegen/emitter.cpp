@@ -675,6 +675,12 @@ auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {
             return "Stddev";
         case ir::AggFunc::Ewma:
             return "Ewma";
+        case ir::AggFunc::Quantile:
+            return "Quantile";
+        case ir::AggFunc::Skew:
+            return "Skew";
+        case ir::AggFunc::Kurtosis:
+            return "Kurtosis";
     }
     return "Sum";
 }

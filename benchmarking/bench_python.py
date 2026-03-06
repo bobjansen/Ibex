@@ -9,6 +9,7 @@ Usage:
   uv run bench_python.py --csv data/prices.csv --skip-pandas
 """
 import argparse, csv, pathlib, sys, time
+import numpy as np
 import pandas as pd
 import polars as pl
 
@@ -53,6 +54,16 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     run("update_price_x2",
         lambda: df.assign(price_x2=df["price"] * 2))
+
+    run("cumsum_price",
+        lambda: df.assign(cs=df["price"].cumsum()))
+
+    run("cumprod_price",
+        lambda: df.assign(cp=df["price"].cumprod()))
+
+    rng_gen = np.random.default_rng(42)
+    run("rand_normal",
+        lambda: df.assign(n=rng_gen.standard_normal(len(df))))
 
     if csv_multi_path:
         print("pandas: loading multi...", file=sys.stderr, flush=True)
@@ -118,6 +129,17 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     run("update_price_x2",
         lambda: df.with_columns((pl.col("price") * 2).alias("price_x2")))
+
+    run("cumsum_price",
+        lambda: df.with_columns(pl.col("price").cum_sum().alias("cs")))
+
+    run("cumprod_price",
+        lambda: df.with_columns(pl.col("price").cum_prod().alias("cp")))
+
+    rng_gen = np.random.default_rng(42)
+    run("rand_normal",
+        lambda: df.with_columns(
+            pl.Series("n", rng_gen.standard_normal(len(df)))))
 
     if csv_multi_path:
         print("polars: loading multi...", file=sys.stderr, flush=True)
@@ -276,6 +298,54 @@ def bench_polars_reshape(csv_multi_path, warmup, iters):
     return rows
 
 
+def bench_pandas_fill(n_rows, warmup, iters):
+    """fill_null, fill_forward (LOCF), fill_backward (NOCB) on 50% null numeric data."""
+    print("pandas: building fill data...", file=sys.stderr, flush=True)
+    vals = np.where(np.arange(n_rows) % 2 == 0,
+                    100.0 + (np.arange(n_rows) % 100).astype(float),
+                    np.nan)
+    df_fill = pd.DataFrame({"val": vals})
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+
+    run("fill_null",
+        lambda: df_fill.assign(v2=df_fill["val"].fillna(0.0)))
+    run("fill_forward",
+        lambda: df_fill.assign(v2=df_fill["val"].ffill()))
+    run("fill_backward",
+        lambda: df_fill.assign(v2=df_fill["val"].bfill()))
+    return rows
+
+
+def bench_polars_fill(n_rows, warmup, iters):
+    """fill_null, fill_forward (LOCF), fill_backward (NOCB) on 50% null numeric data."""
+    print("polars: building fill data...", file=sys.stderr, flush=True)
+    vals = np.where(np.arange(n_rows) % 2 == 0,
+                    100.0 + (np.arange(n_rows) % 100).astype(float),
+                    np.nan)
+    df_fill = pl.DataFrame({"val": vals})
+    rows = []
+
+    def run(name, fn):
+        avg_ms, result = timer(fn, warmup, iters)
+        n = len(result)
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+
+    run("fill_null",
+        lambda: df_fill.with_columns(pl.col("val").fill_null(0.0).alias("v2")))
+    run("fill_forward",
+        lambda: df_fill.with_columns(pl.col("val").forward_fill().alias("v2")))
+    run("fill_backward",
+        lambda: df_fill.with_columns(pl.col("val").backward_fill().alias("v2")))
+    return rows
+
+
 def bench_pandas_events(csv_events_path, warmup, iters):
     print("pandas: loading events...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_events_path)
@@ -329,6 +399,8 @@ def main():
     ap.add_argument("--out",         default="results/python.tsv")
     ap.add_argument("--skip-pandas", action="store_true", help="Run polars only")
     ap.add_argument("--skip-polars", action="store_true", help="Run pandas only")
+    ap.add_argument("--fill-rows",   type=int, default=4_000_000,
+                    help="Row count for in-memory fill benchmarks (default: 4000000)")
     args = ap.parse_args()
 
     if args.skip_pandas and args.skip_polars:
@@ -354,6 +426,10 @@ def main():
             all_rows += bench_pandas_null(args.csv, args.csv_lookup, args.warmup, args.iters)
         if not args.skip_polars:
             all_rows += bench_polars_null(args.csv, args.csv_lookup, args.warmup, args.iters)
+    if not args.skip_pandas:
+        all_rows += bench_pandas_fill(args.fill_rows, args.warmup, args.iters)
+    if not args.skip_polars:
+        all_rows += bench_polars_fill(args.fill_rows, args.warmup, args.iters)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

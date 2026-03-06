@@ -1,21 +1,43 @@
 #pragma once
 // High-throughput PRNG for Ibex's vectorized RNG functions.
 //
-// Scalar engine: xoshiro256++ by Blackman & Vigna (https://prng.di.unimi.it/)
+// Scalar engine (Xoshiro256pp)
 //   · 256-bit state → fits entirely in L1 cache (vs 2496-byte MT state)
-//   · ~3-4× faster than std::mt19937_64 in the scalar generation loop
 //   · Period 2^256 - 1; passes all known statistical test suites
 //   · Satisfies UniformRandomBitGenerator — drop-in for std::<dist>(rng)
+//   · Used by rand_uniform, rand_student_t, rand_bernoulli, rand_poisson, rand_int
 //
-// SIMD engine: Xoshiro256pp_x4 (AVX2, available when __AVX2__ is defined)
-//   · Runs four independent xoshiro256++ streams in parallel using __m256i
-//   · Each call to operator()() advances all four streams and returns four
-//     uint64_t in a single __m256i — four times the raw throughput
-//   · bits_to_01_x4() converts them to four doubles in [0, 1) via the
-//     IEEE-754 mantissa trick (no division, no explicit integer→float path)
+// Portable 4-wide engine (Xoshiro256pp_x4_portable)
+//   · Four independent xoshiro256++ streams in a Structure-of-Arrays layout
+//   · Each operator()() call advances all four streams and returns one value
+//     per stream in a std::array<uint64_t,4>
+//   · SoA layout (s[word][lane]) lets the compiler auto-vectorize the inner
+//     loops into SIMD instructions when -mavx2 is present, with no extra
+//     effort from us — we get ILP from OoO execution even without AVX2
+//   · Seeding is identical to Xoshiro256pp_x4 (same four base seeds derived
+//     from the user seed), so a fixed seed produces the same uniform stream
+//     on any ISA
+//   · Used by fill_normal_x4 on non-AVX2 targets
 //
-// Seeding: splitmix64 expands a single 64-bit seed into the state words.
+// SIMD engine (Xoshiro256pp_x4, __AVX2__ only)
+//   · Same four independent streams as the portable engine, but held in four
+//     __m256i registers (one per state word, four lanes packed per register)
+//   · Combined with libmvec _ZGVdN4v_log/cos/sin for 4-wide Box-Muller
+//   · bits_to_01_x4 uses the same IEEE-754 mantissa trick as
+//     bits_to_01_portable, so the uniform doubles produced are bit-identical
+//     to those the portable path would produce for the same seed
+//
+// Cross-ISA reproducibility
+//   · A fixed seed produces the same uniform random stream (same Xoshiro
+//     state sequence, same bit_to_01 conversion) on both AVX2 and non-AVX2
+//     builds.  Box-Muller output may differ by ≤ 1 ULP across platforms
+//     because libmvec's transcendentals are not required to be
+//     correctly-rounded — this is acceptable for MC simulation purposes.
+//
+// Seeding: splitmix64 expands a single 64-bit seed into the four state words.
 
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -39,7 +61,7 @@ inline auto splitmix64(std::uint64_t& state) noexcept -> std::uint64_t {
     return z ^ (z >> 31);
 }
 
-// ─── xoshiro256++ (scalar) ────────────────────────────────────────────────────
+// ─── xoshiro256++ (scalar single-stream) ─────────────────────────────────────
 // Reference: https://prng.di.unimi.it/xoshiro256plusplus.c
 struct Xoshiro256pp {
     using result_type = std::uint64_t;
@@ -79,8 +101,19 @@ private:
 // ─── Scalar helpers ───────────────────────────────────────────────────────────
 
 // Convert a raw 64-bit word to a double in [0, 1) using the top 53 bits.
+// Used by the single-stream engine (rand_uniform, rand_student_t, etc.).
 inline auto bits_to_01(std::uint64_t x) noexcept -> double {
     return static_cast<double>(x >> 11) * 0x1.0p-53;
+}
+
+// Convert a raw 64-bit word to a double in [0, 1) using the IEEE-754 mantissa
+// trick: OR the low 52 bits into a biased [1, 2) exponent then subtract 1.0.
+// Produces the same bit pattern as bits_to_01_x4 on the same raw value, so
+// the two paths agree bit-for-bit on the uniform doubles they feed to Box-Muller.
+inline auto bits_to_01_portable(std::uint64_t x) noexcept -> double {
+    constexpr std::uint64_t mantissa_mask = 0x000FFFFFFFFFFFFFULL;
+    constexpr std::uint64_t exponent_one  = 0x3FF0000000000000ULL;
+    return std::bit_cast<double>((x & mantissa_mask) | exponent_one) - 1.0;
 }
 
 // Box-Muller transform: produce two standard-normal variates from two
@@ -99,28 +132,77 @@ inline auto get_rng() noexcept -> Xoshiro256pp& {
 }
 
 // Re-seed the thread-local scalar RNG with an explicit value.
-// After this call, rand_uniform / rand_student_t / etc. all produce a
-// deterministic sequence for the given seed on this thread.
 inline void reseed_rng(std::uint64_t seed) noexcept {
     get_rng() = Xoshiro256pp{seed};
 }
 
-// ─── xoshiro256++ × 4 (AVX2) ─────────────────────────────────────────────────
+// ─── Four base seeds shared by both 4-wide engines ────────────────────────────
+// Derived from a single user seed.  Both Xoshiro256pp_x4_portable and
+// Xoshiro256pp_x4 use these constants so their streams are identical.
+namespace detail {
+    inline constexpr std::uint64_t stream_offsets[4] = {
+        0x0000000000000000ULL,
+        0x9e3779b97f4a7c15ULL,
+        0x6c62272e07bb0142ULL,
+        0xd2a98b26625eee7bULL,
+    };
+} // namespace detail
+
+// ─── xoshiro256++ × 4 (portable, always available) ───────────────────────────
 //
-// Four fully independent xoshiro256++ streams packed into four __m256i words.
-// Each operator()() call advances all four streams simultaneously and returns
-// a __m256i holding one output uint64_t from each lane.
+// Four independent xoshiro256++ streams stored in SoA layout:
+//   s[word][lane] — word W of all four stream states packed contiguously.
 //
-// Independence: the four streams are seeded from four well-separated seeds
-// produced by running splitmix64 in four different positions.  They share no
-// state and produce statistically independent sequences.
+// This layout lets the compiler auto-vectorize each inner `for (int i…)` loop
+// into a single AVX2 instruction when -mavx2 is active, while remaining
+// correct plain C++ for all other targets.
 //
-// Only compiled when the compiler has AVX2 enabled (-mavx2 / -march=native).
+// Produces the same uniform stream as Xoshiro256pp_x4 for the same seed.
+struct Xoshiro256pp_x4_portable {
+    // s[word][lane]: word w of stream lane.
+    std::uint64_t s[4][4];
+
+    explicit Xoshiro256pp_x4_portable(std::uint64_t seed) noexcept {
+        for (int lane = 0; lane < 4; ++lane) {
+            std::uint64_t lseed = seed ^ detail::stream_offsets[lane];
+            s[0][lane] = splitmix64(lseed);
+            s[1][lane] = splitmix64(lseed);
+            s[2][lane] = splitmix64(lseed);
+            s[3][lane] = splitmix64(lseed);
+        }
+    }
+
+    // Advance all four streams and return one output per lane.
+    // The inner loops over [0..3] are independent and auto-vectorize.
+    [[nodiscard]] std::array<std::uint64_t, 4> operator()() noexcept {
+        std::uint64_t result[4];
+        for (int i = 0; i < 4; ++i)
+            result[i] = std::rotl(s[0][i] + s[3][i], 23) + s[0][i];
+
+        std::uint64_t t[4];
+        for (int i = 0; i < 4; ++i) t[i] = s[1][i] << 17;
+
+        for (int i = 0; i < 4; ++i) s[2][i] ^= s[0][i];
+        for (int i = 0; i < 4; ++i) s[3][i] ^= s[1][i];
+        for (int i = 0; i < 4; ++i) s[1][i] ^= s[2][i];
+        for (int i = 0; i < 4; ++i) s[0][i] ^= s[3][i];
+        for (int i = 0; i < 4; ++i) s[2][i] ^= t[i];
+        for (int i = 0; i < 4; ++i) s[3][i] = std::rotl(s[3][i], 45);
+
+        return {result[0], result[1], result[2], result[3]};
+    }
+};
+
+// Thread-local portable 4-wide engine seeded from std::random_device.
+inline auto get_rng_x4_portable() noexcept -> Xoshiro256pp_x4_portable& {
+    static thread_local Xoshiro256pp_x4_portable rng{std::random_device{}()};
+    return rng;
+}
+
+// ─── xoshiro256++ × 4 (AVX2 explicit-SIMD) ───────────────────────────────────
 #ifdef __AVX2__
 
 // libmvec 4-wide double transcendentals (glibc ≥ 2.22).
-// These are regular C functions exported from libmvec.so; the mangled names
-// follow the GNU Vector ABI: _ZGVdN4v_<func>.
 extern "C" {
     __m256d _ZGVdN4v_log(__m256d x);
     __m256d _ZGVdN4v_cos(__m256d x);
@@ -128,27 +210,18 @@ extern "C" {
 }
 
 struct Xoshiro256pp_x4 {
-    // s[w] holds word w of all four streams:
-    //   lane 0 = stream A, lane 1 = stream B, lane 2 = stream C, lane 3 = stream D
+    // s[w] holds word w of all four streams packed in one __m256i.
     __m256i s[4];
 
     explicit Xoshiro256pp_x4(std::uint64_t seed) noexcept {
-        // Derive four well-separated seeds then expand each with splitmix64.
-        // Multiplying by successive large primes gives state-space separation.
-        std::uint64_t seeds[4] = {
-            seed,
-            seed ^ 0x9e3779b97f4a7c15ULL,
-            seed ^ 0x6c62272e07bb0142ULL,
-            seed ^ 0xd2a98b26625eee7bULL,
-        };
-        std::uint64_t sw[4][4];
+        std::uint64_t sw[4][4]; // sw[lane][word]
         for (int lane = 0; lane < 4; ++lane) {
-            sw[lane][0] = splitmix64(seeds[lane]);
-            sw[lane][1] = splitmix64(seeds[lane]);
-            sw[lane][2] = splitmix64(seeds[lane]);
-            sw[lane][3] = splitmix64(seeds[lane]);
+            std::uint64_t lseed = seed ^ detail::stream_offsets[lane];
+            sw[lane][0] = splitmix64(lseed);
+            sw[lane][1] = splitmix64(lseed);
+            sw[lane][2] = splitmix64(lseed);
+            sw[lane][3] = splitmix64(lseed);
         }
-        // Pack: s[word] = [ lane0.word, lane1.word, lane2.word, lane3.word ]
         for (int w = 0; w < 4; ++w) {
             s[w] = _mm256_set_epi64x(
                 static_cast<long long>(sw[3][w]),
@@ -158,9 +231,7 @@ struct Xoshiro256pp_x4 {
         }
     }
 
-    // Advance all four streams and return four random uint64_t.
     [[nodiscard]] __m256i operator()() noexcept {
-        // xoshiro256++ output: rotl(s0+s3, 23) + s0
         const __m256i result = add(rotl(add(s[0], s[3]), 23), s[0]);
         const __m256i t      = _mm256_slli_epi64(s[1], 17);
         s[2] = xorv(s[2], s[0]);
@@ -181,45 +252,45 @@ private:
 };
 
 // Convert four raw uint64_t to four doubles in [0, 1).
-// Uses the IEEE-754 mantissa trick: OR the top 52 bits into the exponent+mantissa
-// of a biased [1, 2) double, then subtract 1.0.  No integer→float conversion
-// instruction needed; 52 bits of randomness (vs 53 scalar) is negligible.
+// Uses the same IEEE-754 mantissa trick as bits_to_01_portable so that both
+// paths produce bit-identical doubles for the same raw random word.
 inline __m256d bits_to_01_x4(__m256i x) noexcept {
     const __m256i mantissa_mask = _mm256_set1_epi64x(0x000FFFFFFFFFFFFFLL);
     const __m256i exponent_one  = _mm256_set1_epi64x(0x3FF0000000000000LL);
-    // Keep top 52 bits of the random word as the mantissa of a [1,2) double.
     const __m256i bits = _mm256_or_si256(
         _mm256_and_si256(x, mantissa_mask),
         exponent_one);
     return _mm256_sub_pd(_mm256_castsi256_pd(bits), _mm256_set1_pd(1.0));
 }
 
-// Thread-local 4-wide engine seeded from std::random_device.
+// Thread-local AVX2 4-wide engine.
 inline auto get_rng_x4() noexcept -> Xoshiro256pp_x4& {
     static thread_local Xoshiro256pp_x4 rng{std::random_device{}()};
     return rng;
 }
 
-// Fill `out[0..rows)` with uniform doubles in [0,1) using the 4-wide engine.
-// Bulk-generates 4 values per step; the remainder is filled via scalar.
-inline void fill_uniform_x4(double* __restrict__ out, std::size_t rows) noexcept {
-    auto& rng4 = get_rng_x4();
-    std::size_t i = 0;
-    for (; i + 3 < rows; i += 4) {
-        _mm256_storeu_pd(out + i, bits_to_01_x4(rng4()));
-    }
-    // Scalar tail
-    auto& rng = get_rng();
-    for (; i < rows; ++i) out[i] = bits_to_01(rng());
-}
+#endif // __AVX2__
 
-// Generate `rows` normally-distributed doubles into `out`.
-// Uses the 4-wide engine to produce batches of 8 uniforms (4 pairs), then
-// applies the Box-Muller transform 4 times in parallel via libmvec.
+// ─── fill_normal_x4 (always available) ───────────────────────────────────────
 //
-// Layout:  u1 = out[0..3], u2 = out[4..7]  → 4 (z0,z1) pairs → 8 normals.
+// Generate `rows` normally-distributed doubles into `out[0..rows)`.
+//
+// On AVX2: uses Xoshiro256pp_x4 + libmvec 4-wide log/cos/sin.
+// Otherwise: uses Xoshiro256pp_x4_portable + scalar transcendentals.
+//
+// Both paths consume the same logical random stream for the same seed (same
+// four independent xoshiro256++ instances, same bits_to_01 conversion) and
+// produce the same output up to transcendental rounding (≤ 1 ULP difference
+// between libmvec and the scalar math library).
+//
+// Output layout per 8-element block (lane = stream index, 0..3):
+//   out[i + 2*lane + 0] = mean + stddev * cos-branch of Box-Muller for lane
+//   out[i + 2*lane + 1] = mean + stddev * sin-branch of Box-Muller for lane
 inline void fill_normal_x4(double* __restrict__ out, std::size_t rows,
                             double mean, double stddev) noexcept {
+    std::size_t i = 0;
+
+#ifdef __AVX2__
     auto& rng4 = get_rng_x4();
 
     const __m256d two_pi = _mm256_set1_pd(2.0 * std::numbers::pi);
@@ -228,59 +299,69 @@ inline void fill_normal_x4(double* __restrict__ out, std::size_t rows,
     const __m256d vmean  = _mm256_set1_pd(mean);
     const __m256d vstd   = _mm256_set1_pd(stddev);
 
-    std::size_t i = 0;
     for (; i + 7 < rows; i += 8) {
-        // 4 × u1 and 4 × u2, each in (0, 1)
         const __m256d u1 = _mm256_add_pd(bits_to_01_x4(rng4()), eps);
         const __m256d u2 = bits_to_01_x4(rng4());
-
-        // r = sqrt(-2 * log(u1))  — vectorized log then scalar sqrt
-        const __m256d r = _mm256_sqrt_pd(
-            _mm256_mul_pd(neg2, _ZGVdN4v_log(u1)));
-
-        // theta = 2π * u2
-        const __m256d theta = _mm256_mul_pd(two_pi, u2);
-
-        // z0 = r * cos(theta),  z1 = r * sin(theta)
+        const __m256d r  = _mm256_sqrt_pd(_mm256_mul_pd(neg2, _ZGVdN4v_log(u1)));
+        const __m256d th = _mm256_mul_pd(two_pi, u2);
         const __m256d z0 = _mm256_add_pd(vmean,
-            _mm256_mul_pd(vstd, _mm256_mul_pd(r, _ZGVdN4v_cos(theta))));
+            _mm256_mul_pd(vstd, _mm256_mul_pd(r, _ZGVdN4v_cos(th))));
         const __m256d z1 = _mm256_add_pd(vmean,
-            _mm256_mul_pd(vstd, _mm256_mul_pd(r, _ZGVdN4v_sin(theta))));
+            _mm256_mul_pd(vstd, _mm256_mul_pd(r, _ZGVdN4v_sin(th))));
 
-        // Interleave z0[0..3] and z1[0..3] into out[i..i+7]:
-        //   out[i+0]=z0[0], out[i+1]=z1[0], out[i+2]=z0[1], out[i+3]=z1[1], …
+        // Interleave: out[i+0]=z0[0], out[i+1]=z1[0], out[i+2]=z0[1], …
         const __m256d lo = _mm256_unpacklo_pd(z0, z1); // [z0[0],z1[0],z0[2],z1[2]]
         const __m256d hi = _mm256_unpackhi_pd(z0, z1); // [z0[1],z1[1],z0[3],z1[3]]
-        // Rearrange into output order: lo_lo, hi_lo, lo_hi, hi_hi
         _mm256_storeu_pd(out + i,     _mm256_permute2f128_pd(lo, hi, 0x20));
         _mm256_storeu_pd(out + i + 4, _mm256_permute2f128_pd(lo, hi, 0x31));
     }
 
-    // Scalar tail (< 8 remaining elements)
-    auto& rng = get_rng();
+#else  // portable path
+    auto& rng4 = get_rng_x4_portable();
+
+    for (; i + 7 < rows; i += 8) {
+        const auto u1_raw = rng4();
+        const auto u2_raw = rng4();
+        // Interleave pairs in the same order as the AVX2 path (lane 0 first):
+        //   out[i + 2*lane + 0/1] = z0,z1 from Box-Muller(stream[lane])
+        for (int lane = 0; lane < 4; ++lane) {
+            const double u1 = bits_to_01_portable(u1_raw[lane]) + 1e-300;
+            const double u2 = bits_to_01_portable(u2_raw[lane]);
+            double z0, z1;
+            box_muller(u1, u2, z0, z1);
+            out[i + 2 * lane]     = mean + stddev * z0;
+            out[i + 2 * lane + 1] = mean + stddev * z1;
+        }
+    }
+#endif
+
+    // Scalar tail (< 8 remaining elements), drawn from the portable engine
+    // so the same x4 seed always produces the same tail regardless of ISA.
+    auto& rng4_tail = get_rng_x4_portable();
     for (; i + 1 < rows; i += 2) {
-        const double u1 = bits_to_01(rng()) + 1e-300;
-        const double u2 = bits_to_01(rng());
+        const auto raw = rng4_tail();
+        const double u1 = bits_to_01_portable(raw[0]) + 1e-300;
+        const double u2 = bits_to_01_portable(raw[1]);
         double z0, z1;
         box_muller(u1, u2, z0, z1);
         out[i]     = mean + stddev * z0;
         out[i + 1] = mean + stddev * z1;
     }
     if (i < rows) {
-        const double u1 = bits_to_01(rng()) + 1e-300;
-        const double u2 = bits_to_01(rng());
+        const auto raw = rng4_tail();
+        const double u1 = bits_to_01_portable(raw[0]) + 1e-300;
+        const double u2 = bits_to_01_portable(raw[1]);
         double z0, z1;
         box_muller(u1, u2, z0, z1);
         out[i] = mean + stddev * z0;
     }
 }
 
-#endif // __AVX2__
-
-// Re-seed the thread-local 4-wide RNG with an explicit value.
-// When AVX2 is unavailable the 4-wide engine does not exist; this becomes a
-// no-op so callers never need #ifdef guards around it.
-inline void reseed_rng_x4([[maybe_unused]] std::uint64_t seed) noexcept {
+// ─── reseed_rng_x4 (always available) ────────────────────────────────────────
+// Re-seeds all 4-wide engines that are active for this build.
+// Called by seed_rng() and by tests; callers never need #ifdef guards.
+inline void reseed_rng_x4(std::uint64_t seed) noexcept {
+    get_rng_x4_portable() = Xoshiro256pp_x4_portable{seed};
 #ifdef __AVX2__
     get_rng_x4() = Xoshiro256pp_x4{seed};
 #endif

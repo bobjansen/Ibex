@@ -2384,20 +2384,19 @@ TEST_CASE("reseed_rng with different seeds produces different sequences") {
 
 TEST_CASE("reseed_rng_x4 produces identical rand_normal sequence") {
     runtime::Table table;
-    // Use a size that exercises the 8-wide AVX2 loop and the scalar tail.
+    // 33 rows: exercises the 8-wide main loop (4 iterations = 32 rows) and
+    // the 1-element scalar tail.
     table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(33)));
     runtime::TableRegistry registry;
     registry.emplace("t", table);
 
     auto ir = require_ir("t[update { n = rand_normal(0.0, 1.0) }];");
 
-    runtime::reseed_rng(0xCAFEBABE);
     runtime::reseed_rng_x4(0xCAFEBABE);
     auto r1 = runtime::interpret(*ir, registry);
     REQUIRE(r1.has_value());
     const auto& c1 = std::get<Column<double>>(*r1->find("n"));
 
-    runtime::reseed_rng(0xCAFEBABE);
     runtime::reseed_rng_x4(0xCAFEBABE);
     auto r2 = runtime::interpret(*ir, registry);
     REQUIRE(r2.has_value());
@@ -2406,6 +2405,53 @@ TEST_CASE("reseed_rng_x4 produces identical rand_normal sequence") {
     REQUIRE(c1.size() == c2.size());
     for (std::size_t i = 0; i < c1.size(); ++i) {
         CHECK(c1[i] == c2[i]);
+    }
+}
+
+// ─── Cross-ISA stream identity ────────────────────────────────────────────────
+// Verify that Xoshiro256pp_x4_portable and Xoshiro256pp_x4 (when AVX2 is
+// available) produce bit-identical uint64_t outputs for the same seed, and
+// that bits_to_01_portable agrees with bits_to_01_x4 on the same raw word.
+// This is the core invariant that makes rand_normal reproducible across ISAs.
+
+TEST_CASE("Xoshiro256pp_x4_portable produces same stream as Xoshiro256pp_x4") {
+    const std::uint64_t seed = 0x1234567890ABCDEFULL;
+    runtime::Xoshiro256pp_x4_portable portable{seed};
+#ifdef __AVX2__
+    runtime::Xoshiro256pp_x4 simd{seed};
+    for (int iter = 0; iter < 200; ++iter) {
+        const auto port_out = portable();
+        const __m256i simd_out = simd();
+        alignas(32) std::uint64_t lanes[4];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), simd_out);
+        for (int lane = 0; lane < 4; ++lane) {
+            CHECK(port_out[lane] == lanes[lane]);
+        }
+    }
+#else
+    // On non-AVX2 we can at least verify the portable engine is self-consistent.
+    runtime::Xoshiro256pp_x4_portable portable2{seed};
+    for (int iter = 0; iter < 200; ++iter) {
+        CHECK(portable() == portable2());
+    }
+#endif
+}
+
+TEST_CASE("bits_to_01_portable and bits_to_01_x4 agree on the same raw word") {
+    runtime::Xoshiro256pp rng{0xBEEFCAFE};
+    for (int i = 0; i < 1000; ++i) {
+        const std::uint64_t x = rng();
+        const double portable = runtime::bits_to_01_portable(x);
+#ifdef __AVX2__
+        alignas(32) double lanes[4];
+        _mm256_store_pd(lanes, runtime::bits_to_01_x4(_mm256_set1_epi64x(
+            static_cast<long long>(x))));
+        CHECK(portable == lanes[0]);
+#else
+        // Without AVX2: verify the portable conversion is in [0, 1).
+        CHECK(portable >= 0.0);
+        CHECK(portable < 1.0);
+#endif
     }
 }
 

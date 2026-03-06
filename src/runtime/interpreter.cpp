@@ -4411,6 +4411,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 constexpr auto is_rng_func(std::string_view name) -> bool;
 constexpr auto rng_func_returns_int(std::string_view name) -> bool;
 constexpr auto is_cum_func(std::string_view name) -> bool;
+constexpr auto is_fill_func(std::string_view name) -> bool;
 
 auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                      const ExternRegistry* externs) -> std::expected<ExprType, std::string> {
@@ -4476,6 +4477,23 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         return ExprType::Int;
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        // Null-fill functions (fill_null / fill_forward / fill_backward)
+        if (is_fill_func(call->callee)) {
+            if (call->args.empty()) {
+                return std::unexpected(std::string(call->callee) + ": expected at least 1 argument");
+            }
+            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+            if (!col_ref) {
+                return std::unexpected(std::string(call->callee) +
+                                       ": first argument must be a column name");
+            }
+            const auto* source = input.find(col_ref->name);
+            if (!source) {
+                return std::unexpected(std::string(call->callee) + ": unknown column '" +
+                                       col_ref->name + "'");
+            }
+            return expr_type_for_column(*source);
+        }
         // Cumulative functions (cumsum / cumprod)
         if (is_cum_func(call->callee)) {
             if (call->args.size() != 1) {
@@ -4907,6 +4925,219 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
             }
         },
         *src);
+}
+
+// ─── Null-fill functions ──────────────────────────────────────────────────────
+//
+// fill_null(col, value)  — constant fill: replace every null cell with `value`
+// fill_forward(col)      — LOCF: carry the last valid value forward
+// fill_backward(col)     — NOCB: carry the next valid value backward
+//
+// fill_forward/fill_backward leave unfillable leading/trailing nulls as null.
+// fill_null produces a column with no validity bitmap (all rows are valid).
+
+struct FillResult {
+    ColumnValue column;
+    std::optional<std::vector<bool>> validity;  // nullopt = all rows valid
+};
+
+// fill_null(col, value): replace every null cell with the scalar `value`.
+// Accepts any column type; `value` must be a literal matching the column type.
+// Returns a column with no validity bitmap.
+auto eval_fill_null(const ir::CallExpr& call, const Table& input)
+    -> std::expected<FillResult, std::string> {
+    if (call.args.size() != 2) {
+        return std::unexpected("fill_null: expected 2 arguments (col, value)");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected("fill_null: first argument must be a column name");
+    }
+    const auto* entry = input.find_entry(col_ref->name);
+    if (!entry) {
+        return std::unexpected("fill_null: unknown column '" + col_ref->name + "'");
+    }
+    const auto* fill_lit = std::get_if<ir::Literal>(&call.args[1]->node);
+    if (!fill_lit) {
+        return std::unexpected("fill_null: second argument must be a literal value");
+    }
+
+    std::size_t rows = input.rows();
+    const bool has_validity = entry->validity.has_value();
+
+    return std::visit(
+        [&](const auto& col) -> std::expected<FillResult, std::string> {
+            using ColT = std::decay_t<decltype(col)>;
+            using T = typename ColT::value_type;
+
+            // Extract the fill value of type T from the literal using std::get_if.
+            // Each branch is a constexpr-guarded check on a specific alternative.
+            std::optional<T> maybe_fill;
+            if constexpr (std::is_same_v<T, std::int64_t>) {
+                if (const auto* v = std::get_if<std::int64_t>(&fill_lit->value))
+                    maybe_fill = *v;
+                else if (const auto* v = std::get_if<double>(&fill_lit->value))
+                    maybe_fill = static_cast<std::int64_t>(*v);
+            } else if constexpr (std::is_same_v<T, double>) {
+                if (const auto* v = std::get_if<double>(&fill_lit->value))
+                    maybe_fill = *v;
+                else if (const auto* v = std::get_if<std::int64_t>(&fill_lit->value))
+                    maybe_fill = static_cast<double>(*v);
+            } else if constexpr (std::is_same_v<T, bool>) {
+                if (const auto* v = std::get_if<bool>(&fill_lit->value)) maybe_fill = *v;
+            } else if constexpr (std::is_same_v<T, std::string_view>) {
+                // Covers both Column<std::string> and Column<Categorical>.
+                // The literal's std::string lives as long as the IR tree.
+                if (const auto* v = std::get_if<std::string>(&fill_lit->value))
+                    maybe_fill = std::string_view(*v);
+            } else if constexpr (std::is_same_v<T, Date>) {
+                if (const auto* v = std::get_if<Date>(&fill_lit->value)) maybe_fill = *v;
+            } else if constexpr (std::is_same_v<T, Timestamp>) {
+                if (const auto* v = std::get_if<Timestamp>(&fill_lit->value)) maybe_fill = *v;
+            }
+
+            if (!maybe_fill) {
+                return std::unexpected(
+                    "fill_null: fill value type does not match column type for '" +
+                    col_ref->name + "'");
+            }
+            T fill_val = *maybe_fill;
+
+            ColT result;
+            result.reserve(rows);
+            for (std::size_t i = 0; i < rows; ++i) {
+                bool is_null_row = has_validity && !(*entry->validity)[i];
+                result.push_back(is_null_row ? fill_val : col[i]);
+            }
+            // All rows are now valid (nulls replaced).
+            return FillResult{std::move(result), std::nullopt};
+        },
+        *entry->column);
+}
+
+// fill_forward(col): LOCF — carry the last valid (non-null) value forward.
+// Unfillable leading nulls (no prior valid value) remain null.
+auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
+    -> std::expected<FillResult, std::string> {
+    if (call.args.size() != 1) {
+        return std::unexpected("fill_forward: expected 1 argument (col)");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected("fill_forward: argument must be a column name");
+    }
+    const auto* entry = input.find_entry(col_ref->name);
+    if (!entry) {
+        return std::unexpected("fill_forward: unknown column '" + col_ref->name + "'");
+    }
+
+    // If there's no validity bitmap, no nulls exist — return the column unchanged.
+    if (!entry->validity.has_value()) {
+        return FillResult{*entry->column, std::nullopt};
+    }
+
+    std::size_t rows = input.rows();
+    const auto& validity = *entry->validity;
+
+    return std::visit(
+        [&](const auto& col) -> std::expected<FillResult, std::string> {
+            using ColT = std::decay_t<decltype(col)>;
+            using T = typename ColT::value_type;
+            ColT result;
+            result.reserve(rows);
+            std::optional<std::vector<bool>> out_validity;
+
+            // carry: last seen valid value (safe for string_view: points into source col).
+            T carry{};
+            bool have_carry = false;
+
+            for (std::size_t i = 0; i < rows; ++i) {
+                if (validity[i]) {
+                    result.push_back(col[i]);
+                    carry = col[i];
+                    have_carry = true;
+                } else if (have_carry) {
+                    result.push_back(carry);
+                } else {
+                    // Leading null — no value to carry; stays null.
+                    result.push_back(T{});
+                    if (!out_validity) {
+                        out_validity.emplace(rows, true);
+                    }
+                    (*out_validity)[i] = false;
+                }
+            }
+            return FillResult{std::move(result), std::move(out_validity)};
+        },
+        *entry->column);
+}
+
+// fill_backward(col): NOCB — carry the next valid (non-null) value backward.
+// Unfillable trailing nulls (no subsequent valid value) remain null.
+auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
+    -> std::expected<FillResult, std::string> {
+    if (call.args.size() != 1) {
+        return std::unexpected("fill_backward: expected 1 argument (col)");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected("fill_backward: argument must be a column name");
+    }
+    const auto* entry = input.find_entry(col_ref->name);
+    if (!entry) {
+        return std::unexpected("fill_backward: unknown column '" + col_ref->name + "'");
+    }
+
+    // If there's no validity bitmap, no nulls exist — return the column unchanged.
+    if (!entry->validity.has_value()) {
+        return FillResult{*entry->column, std::nullopt};
+    }
+
+    std::size_t rows = input.rows();
+    const auto& validity = *entry->validity;
+
+    return std::visit(
+        [&](const auto& col) -> std::expected<FillResult, std::string> {
+            using ColT = std::decay_t<decltype(col)>;
+            using T = typename ColT::value_type;
+
+            // Scan right-to-left to compute (value, valid) for each row,
+            // storing in plain vectors so we can then push_back into ColT.
+            std::vector<T> vals(rows);
+            std::optional<std::vector<bool>> out_validity;
+
+            bool have_val = false;
+            T next_val{};
+            for (std::size_t ri = 0; ri < rows; ++ri) {
+                std::size_t i = rows - 1 - ri;
+                if (validity[i]) {
+                    vals[i] = col[i];
+                    next_val = col[i];
+                    have_val = true;
+                } else if (have_val) {
+                    vals[i] = next_val;
+                } else {
+                    // Trailing null — no following value; stays null.
+                    vals[i] = T{};
+                        if (!out_validity) {
+                        out_validity.emplace(rows, true);
+                    }
+                    (*out_validity)[i] = false;
+                }
+            }
+            // Build the output column using push_back (safe for all column types).
+            ColT result;
+            result.reserve(rows);
+            for (std::size_t i = 0; i < rows; ++i) {
+                result.push_back(vals[i]);
+            }
+            return FillResult{std::move(result), std::move(out_validity)};
+        },
+        *entry->column);
+}
+
+constexpr auto is_fill_func(std::string_view name) -> bool {
+    return name == "fill_null" || name == "fill_forward" || name == "fill_backward";
 }
 
 // Find the first row index lo in [0, row] where time[lo] >= time[row] - duration.
@@ -5693,6 +5924,21 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+            if (is_fill_func(call->callee)) {
+                std::expected<FillResult, std::string> res =
+                    call->callee == "fill_null"
+                        ? eval_fill_null(*call, output)
+                        : call->callee == "fill_forward"
+                              ? eval_fill_forward(*call, output)
+                              : eval_fill_backward(*call, output);
+                if (!res) return std::unexpected(res.error());
+                if (res->validity)
+                    output.add_column(field.alias, std::move(res->column),
+                                      std::move(*res->validity));
+                else
+                    output.add_column(field.alias, std::move(res->column));
+                continue;
+            }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, output.rows());
                 if (!col) return std::unexpected(col.error());
@@ -5762,6 +6008,21 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");
                 if (!col) return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
+            if (is_fill_func(call->callee)) {
+                std::expected<FillResult, std::string> res =
+                    call->callee == "fill_null"
+                        ? eval_fill_null(*call, output)
+                        : call->callee == "fill_forward"
+                              ? eval_fill_forward(*call, output)
+                              : eval_fill_backward(*call, output);
+                if (!res) return std::unexpected(res.error());
+                if (res->validity)
+                    output.add_column(field.alias, std::move(res->column),
+                                      std::move(*res->validity));
+                else
+                    output.add_column(field.alias, std::move(res->column));
                 continue;
             }
             if (is_rng_func(call->callee)) {

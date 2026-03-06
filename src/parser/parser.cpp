@@ -682,6 +682,29 @@ class Parser {
             expr->node = IdentifierExpr{.name = std::move(name)};
             return expr;
         }
+        // Type-name cast: Int64(expr), Float64(expr), Int32(expr), Float32(expr), Int(expr)
+        if (check(TokenKind::KeywordInt) || check(TokenKind::KeywordInt32) ||
+            check(TokenKind::KeywordInt64) || check(TokenKind::KeywordFloat32) ||
+            check(TokenKind::KeywordFloat64)) {
+            advance();
+            std::string type_name(previous().lexeme);
+            if (match(TokenKind::LParen)) {
+                auto arg = parse_expression();
+                if (!arg) {
+                    return nullptr;
+                }
+                if (!consume(TokenKind::RParen, "expected ')' after cast argument")) {
+                    return nullptr;
+                }
+                std::vector<ExprPtr> cast_args;
+                cast_args.push_back(std::move(arg));
+                auto cast_expr = std::make_unique<Expr>();
+                cast_expr->node =
+                    CallExpr{.callee = std::move(type_name), .args = std::move(cast_args)};
+                return cast_expr;
+            }
+            return fail_expr(previous(), "expected '(' after type name in cast expression");
+        }
         if (match(TokenKind::IntLiteral)) {
             auto value = parse_int(previous().lexeme);
             if (!value.has_value()) {

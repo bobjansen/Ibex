@@ -41,6 +41,8 @@ enum class TokenKind : std::uint8_t {
     KeywordDcast,
     KeywordJoin,
     KeywordLeft,
+    KeywordRight,
+    KeywordOuter,
     KeywordAsof,
     KeywordOn,
     KeywordIs,

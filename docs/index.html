@@ -315,7 +315,7 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Joins</span>
-          <h3>Inner, left, and as-of — written as natural prose.</h3>
+          <h3>Inner, left, right, outer, and as-of — written as natural prose.</h3>
           <p>
             The <strong>as-of join</strong> attaches the latest right row
             at-or-before each left timestamp. It is the standard pattern for
@@ -332,6 +332,12 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
 
 <span class="cm">// Left join — preserve all left rows</span>
 <span class="kw">let</span> with_meta = prices <span class="kw">left join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Right join — preserve all right rows</span>
+<span class="kw">let</span> with_scores = prices <span class="kw">right join</span> scores <span class="kw">on</span> symbol;
+
+<span class="cm">// Outer join — preserve rows from both sides</span>
+<span class="kw">let</span> unioned = prices <span class="kw">outer join</span> metadata <span class="kw">on</span> symbol;
 
 <span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
 <span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);

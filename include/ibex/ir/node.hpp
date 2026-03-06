@@ -116,6 +116,8 @@ enum class AggFunc : std::uint8_t {
 enum class JoinKind : std::uint8_t {
     Inner,
     Left,
+    Right,
+    Outer,
     Asof,
 };
 

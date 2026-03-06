@@ -2241,6 +2241,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
     std::unordered_set<std::string> key_set(keys.begin(), keys.end());
 
+    const bool preserve_left_rows =
+        (kind == ir::JoinKind::Left || kind == ir::JoinKind::Outer || kind == ir::JoinKind::Asof);
+    const bool preserve_right_rows = (kind == ir::JoinKind::Right || kind == ir::JoinKind::Outer);
+
     Table output;
     output.columns.reserve(left.columns.size() + right.columns.size());
 
@@ -2282,15 +2286,28 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         right_index[key].push_back(r);
     }
 
+    // Validity bitmaps for left-side output columns.
+    // Needed for Right/Outer joins where unmatched right rows make left columns null.
+    const bool track_left_nulls = preserve_right_rows;
+    bool left_had_nulls = false;
+    std::vector<std::vector<bool>> left_validity;
+    if (track_left_nulls) {
+        left_validity.resize(left.columns.size());
+    }
+
     auto append_left_row = [&](std::size_t row) {
         for (std::size_t i = 0; i < left.columns.size(); ++i) {
             append_value(*output.columns[i].column, *left.columns[i].column, row);
         }
+        if (track_left_nulls) {
+            for (auto& bm : left_validity)
+                bm.push_back(true);
+        }
     };
 
     // Validity bitmaps for right-side output columns.
-    // Only needed for Left/Asof joins where unmatched rows become null.
-    const bool track_right_nulls = (kind == ir::JoinKind::Left || kind == ir::JoinKind::Asof);
+    // Needed for Left/Asof/Outer joins where unmatched left rows make right columns null.
+    const bool track_right_nulls = preserve_left_rows;
     bool right_had_nulls = false;
     std::vector<std::vector<bool>> right_validity;
     if (track_right_nulls) {
@@ -2335,6 +2352,53 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
     };
 
+    auto append_left_defaults_from_right = [&](std::size_t right_row) {
+        for (std::size_t i = 0; i < left.columns.size(); ++i) {
+            const auto& left_entry = left.columns[i];
+            if (key_set.contains(left_entry.name)) {
+                const auto* right_key_col = right.find(left_entry.name);
+                if (right_key_col == nullptr) {
+                    throw std::runtime_error("join key not found in right during row emission: " +
+                                             left_entry.name);
+                }
+                append_value(*output.columns[i].column, *right_key_col, right_row);
+                if (track_left_nulls)
+                    left_validity[i].push_back(true);
+                continue;
+            }
+
+            std::visit(
+                [](auto& col) {
+                    using ColType = std::decay_t<decltype(col)>;
+                    if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
+                        col.push_back(std::int64_t{0});
+                    } else if constexpr (std::is_same_v<ColType, Column<double>>) {
+                        col.push_back(0.0);
+                    } else if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                        col.push_back(std::string_view{});
+                    } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                        col.push_code(0);
+                    } else {
+                        col.push_back({});
+                    }
+                },
+                *output.columns[i].column);
+            if (track_left_nulls)
+                left_validity[i].push_back(false);
+        }
+        if (track_left_nulls) {
+            left_had_nulls = true;
+        }
+    };
+
+    auto finalize_left_validity = [&]() {
+        if (left_had_nulls) {
+            for (std::size_t i = 0; i < left.columns.size(); ++i) {
+                output.columns[i].validity = std::move(left_validity[i]);
+            }
+        }
+    };
+
     auto finalize_right_validity = [&]() {
         if (right_had_nulls) {
             for (std::size_t i = 0; i < right_out.size(); ++i) {
@@ -2343,11 +2407,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
     };
 
-    // Pre-reserve output columns for Left join.  With unique right keys the
-    // output is exactly left.rows(); with duplicate right keys (fan-out) it can
-    // be larger, but left.rows() is still a useful lower bound.
-    if (kind == ir::JoinKind::Left) {
-        const auto n = left.rows();
+    // Pre-reserve output columns for joins that preserve one side.
+    if (preserve_left_rows || preserve_right_rows) {
+        const auto n = std::max(left.rows(), right.rows());
         for (auto& ce : output.columns) {
             std::visit([n](auto& c) { c.reserve(n); }, *ce.column);
         }
@@ -2381,10 +2443,15 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 right_sv_index[(*rc)[r]].push_back(r);
         }
 
+        std::vector<bool> right_matched;
+        if (preserve_right_rows) {
+            right_matched.assign(right.rows(), false);
+        }
+
         auto run_match = [&](std::string_view sv, std::size_t l) {
             auto it = right_sv_index.find(sv);
             if (it == right_sv_index.end()) {
-                if (kind == ir::JoinKind::Left) {
+                if (preserve_left_rows) {
                     append_left_row(l);
                     append_right_defaults();
                 }
@@ -2393,6 +2460,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             for (auto r : it->second) {
                 append_left_row(l);
                 append_right_row(r);
+                if (preserve_right_rows) {
+                    right_matched[r] = true;
+                }
             }
         };
 
@@ -2410,7 +2480,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             for (std::size_t l = 0; l < left.rows(); ++l) {
                 const auto* matches = code_to_right[static_cast<std::size_t>(codes[l])];
                 if (matches == nullptr) {
-                    if (kind == ir::JoinKind::Left) {
+                    if (preserve_left_rows) {
                         append_left_row(l);
                         append_right_defaults();
                     }
@@ -2419,6 +2489,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 for (auto r : *matches) {
                     append_left_row(l);
                     append_right_row(r);
+                    if (preserve_right_rows) {
+                        right_matched[r] = true;
+                    }
                 }
             }
         } else {
@@ -2428,6 +2501,16 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
 
+        if (preserve_right_rows) {
+            for (std::size_t r = 0; r < right.rows(); ++r) {
+                if (!right_matched[r]) {
+                    append_left_defaults_from_right(r);
+                    append_right_row(r);
+                }
+            }
+        }
+
+        finalize_left_validity();
         finalize_right_validity();
         return output;
     }
@@ -2542,6 +2625,11 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         return output;
     }
 
+    std::vector<bool> right_matched;
+    if (preserve_right_rows) {
+        right_matched.assign(right.rows(), false);
+    }
+
     for (std::size_t l = 0; l < left.rows(); ++l) {
         Key key;
         key.values.reserve(keys.size());
@@ -2550,7 +2638,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         auto it = right_index.find(key);
         if (it == right_index.end()) {
-            if (kind == ir::JoinKind::Left) {
+            if (preserve_left_rows) {
                 append_left_row(l);
                 append_right_defaults();
             }
@@ -2559,9 +2647,22 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         for (auto r : it->second) {
             append_left_row(l);
             append_right_row(r);
+            if (preserve_right_rows) {
+                right_matched[r] = true;
+            }
         }
     }
 
+    if (preserve_right_rows) {
+        for (std::size_t r = 0; r < right.rows(); ++r) {
+            if (!right_matched[r]) {
+                append_left_defaults_from_right(r);
+                append_right_row(r);
+            }
+        }
+    }
+
+    finalize_left_validity();
     finalize_right_validity();
     return output;
 }

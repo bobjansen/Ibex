@@ -38,6 +38,8 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"dcast", TokenKind::KeywordDcast},
         {"join", TokenKind::KeywordJoin},
         {"left", TokenKind::KeywordLeft},
+        {"right", TokenKind::KeywordRight},
+        {"outer", TokenKind::KeywordOuter},
         {"asof", TokenKind::KeywordAsof},
         {"on", TokenKind::KeywordOn},
         {"is", TokenKind::KeywordIs},

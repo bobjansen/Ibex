@@ -1300,10 +1300,11 @@ TimeFrame block, with or without a `window` clause.
 | `cumprod(col)`  | Running product: result[i] = col[0] * col[1] * ... * col[i]       |
 
 Both functions accept `Int` or `Float` columns and return the same type as the
-input. They are valid in any `update` block (DataFrame or TimeFrame), with or
-without a `window` clause.
+input. They are valid in both `select` and `update` blocks (DataFrame or
+TimeFrame), with or without a `window` clause.
 
 ```
+df[select { cs = cumsum(price) }]
 df[update { cs = cumsum(price) }]
 tf[update { cp = cumprod(returns) }]
 ```

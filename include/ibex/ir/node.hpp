@@ -108,8 +108,11 @@ enum class AggFunc : std::uint8_t {
     First,
     Last,
     Median,   ///< Middle value (ignores nulls; always returns double).
-    Stddev,   ///< Sample standard deviation, n-1 denominator (ignores nulls; always returns double).
-    Ewma,     ///< Exponentially weighted moving average: ewma(col, alpha) (always returns double).
+    Stddev,    ///< Sample standard deviation, n-1 denominator (ignores nulls; always returns double).
+    Ewma,      ///< Exponentially weighted moving average: ewma(col, alpha) (always returns double).
+    Quantile,  ///< quantile(col, p): p-th quantile via linear interpolation (always returns double).
+    Skew,      ///< Sample skewness (Fisher–Pearson, n≥3; ignores nulls; always returns double).
+    Kurtosis,  ///< Sample excess kurtosis (n≥4; ignores nulls; always returns double).
 };
 
 /// Join type.

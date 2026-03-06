@@ -209,3 +209,175 @@ p;
 )";
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
+
+// --- Type annotation validation ---
+
+TEST_CASE("type annotation: Int64 let binding accepts int literal") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = 3;", registry));
+}
+
+TEST_CASE("type annotation: Int64 let binding rejects float literal") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = 3.14;", registry));
+}
+
+TEST_CASE("type annotation: Float64 let binding accepts float literal") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Float64 = 3.0;", registry));
+}
+
+TEST_CASE("type annotation: Float64 let binding rejects int literal") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Float64 = 3;", registry));
+}
+
+TEST_CASE("type annotation: untyped let binding accepts either scalar") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x = 3;", registry));
+    REQUIRE(ibex::repl::execute_script("let y = 3.14;", registry));
+}
+
+TEST_CASE("type annotation: function call accepts matching Float64 argument") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Float64) -> Float64 {
+    x;
+}
+f(3.0);
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: function call rejects Int where Float64 expected") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Float64) -> Float64 {
+    x;
+}
+f(3);
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: function call accepts matching Int64 argument") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Int64) -> Int64 {
+    x;
+}
+f(42);
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: function call rejects Float where Int64 expected") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Int64) -> Int64 {
+    x;
+}
+f(1.5);
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: DataFrame schema validates correct column types") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("price", ibex::Column<double>{1.0, 2.0});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df: DataFrame<{price: Float64}> = get_data();
+df;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: DataFrame schema allows extra columns") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("price", ibex::Column<double>{1.0, 2.0});
+            t.add_column("symbol", ibex::Column<std::string>{"A", "B"});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    // Schema only declares 'price'; 'symbol' is an extra column and should be allowed.
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df: DataFrame<{price: Float64}> = get_data();
+df;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: DataFrame schema rejects wrong column type") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            // price is Int64 but schema declares Float64
+            t.add_column("price", ibex::Column<std::int64_t>{1, 2});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df: DataFrame<{price: Float64}> = get_data();
+df;
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: DataFrame schema rejects missing column") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("symbol", ibex::Column<std::string>{"A", "B"});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    // Schema requires 'price' which is absent from the table.
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df: DataFrame<{price: Float64}> = get_data();
+df;
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("type annotation: bare DataFrame schema (no fields) skips validation") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("price", ibex::Column<std::int64_t>{1, 2});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    // Bare DataFrame with no schema should not validate column types.
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df: DataFrame = get_data();
+df;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}

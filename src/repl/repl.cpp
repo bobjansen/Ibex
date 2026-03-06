@@ -578,6 +578,92 @@ std::string column_type_name(const runtime::ColumnValue& column) {
     return "Unknown";
 }
 
+auto scalar_type_name(parser::ScalarType st) -> std::string_view {
+    switch (st) {
+        case parser::ScalarType::Int32:    return "Int32";
+        case parser::ScalarType::Int64:    return "Int64";
+        case parser::ScalarType::Float32:  return "Float32";
+        case parser::ScalarType::Float64:  return "Float64";
+        case parser::ScalarType::Bool:     return "Bool";
+        case parser::ScalarType::String:   return "String";
+        case parser::ScalarType::Date:     return "Date";
+        case parser::ScalarType::Timestamp: return "Timestamp";
+    }
+    return "Unknown";
+}
+
+auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view {
+    if (std::holds_alternative<std::int64_t>(val)) return "Int64";
+    if (std::holds_alternative<double>(val)) return "Float64";
+    if (std::holds_alternative<std::string>(val)) return "String";
+    if (std::holds_alternative<Date>(val)) return "Date";
+    if (std::holds_alternative<Timestamp>(val)) return "Timestamp";
+    return "Unknown";
+}
+
+auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType expected) -> bool {
+    switch (expected) {
+        case parser::ScalarType::Int32:
+        case parser::ScalarType::Int64:
+            return std::holds_alternative<std::int64_t>(val);
+        case parser::ScalarType::Float32:
+        case parser::ScalarType::Float64:
+            return std::holds_alternative<double>(val);
+        case parser::ScalarType::String:
+            return std::holds_alternative<std::string>(val);
+        case parser::ScalarType::Date:
+            return std::holds_alternative<Date>(val);
+        case parser::ScalarType::Timestamp:
+            return std::holds_alternative<Timestamp>(val);
+        case parser::ScalarType::Bool:
+            return false;  // Bool is not a ScalarValue variant
+    }
+    return false;
+}
+
+auto column_type_matches(const runtime::ColumnValue& col, parser::ScalarType expected) -> bool {
+    switch (expected) {
+        case parser::ScalarType::Int32:
+        case parser::ScalarType::Int64:
+            return std::holds_alternative<Column<std::int64_t>>(col);
+        case parser::ScalarType::Float32:
+        case parser::ScalarType::Float64:
+            return std::holds_alternative<Column<double>>(col);
+        case parser::ScalarType::Bool:
+            return std::holds_alternative<Column<bool>>(col);
+        case parser::ScalarType::String:
+            return std::holds_alternative<Column<std::string>>(col);
+        case parser::ScalarType::Date:
+            return std::holds_alternative<Column<Date>>(col);
+        case parser::ScalarType::Timestamp:
+            return std::holds_alternative<Column<Timestamp>>(col);
+    }
+    return false;
+}
+
+/// Validates that `table` satisfies the schema declared in `type`.
+/// All declared fields must be present with the correct type; extra columns are allowed.
+/// Returns nullopt on success, or an error message on failure.
+/// Skips validation if no schema fields are declared (bare DataFrame / DataFrame<{}>).
+auto validate_table_type(const runtime::Table& table, const parser::Type& type)
+    -> std::optional<std::string> {
+    const auto* schema = std::get_if<parser::SchemaType>(&type.arg);
+    if (schema == nullptr || schema->fields.empty()) {
+        return std::nullopt;
+    }
+    for (const auto& field : schema->fields) {
+        const auto* col = table.find(field.name);
+        if (col == nullptr) {
+            return "schema mismatch: missing column '" + field.name + "'";
+        }
+        if (!column_type_matches(*col, field.type)) {
+            return "schema mismatch: column '" + field.name + "' has wrong type (expected " +
+                   std::string(scalar_type_name(field.type)) + ")";
+        }
+    }
+    return std::nullopt;
+}
+
 void print_schema(const runtime::Table& table) {
     fmt::print("columns:\n");
     for (const auto& entry : table.columns) {
@@ -1129,6 +1215,13 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 if (!value) {
                     return std::unexpected(value.error());
                 }
+                const auto* st = std::get_if<parser::ScalarType>(&param.type.arg);
+                if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
+                    return std::unexpected(
+                        "type mismatch for parameter '" + param.name + "': expected " +
+                        std::string(scalar_type_name(*st)) + " but got " +
+                        std::string(scalar_value_type_name(value.value())));
+                }
                 local_scalars.insert_or_assign(param.name, std::move(value.value()));
                 break;
             }
@@ -1138,6 +1231,10 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                                              externs);
                 if (!value) {
                     return std::unexpected(value.error());
+                }
+                if (auto err = validate_table_type(value.value(), param.type)) {
+                    return std::unexpected("type mismatch for parameter '" + param.name +
+                                           "': " + *err);
                 }
                 local_tables.insert_or_assign(param.name, std::move(value.value()));
                 break;
@@ -1178,12 +1275,22 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 if (!value) {
                     return std::unexpected(value.error());
                 }
+                const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
+                if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
+                    return std::unexpected(
+                        "type error: '" + let_stmt.name + "' declared as " +
+                        std::string(scalar_type_name(*st)) + " but value is " +
+                        std::string(scalar_value_type_name(value.value())));
+                }
                 local_scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
             } else if (type_is_table) {
                 auto value = eval_table_expr(*let_stmt.value, local_tables, local_scalars,
                                              local_columns, functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
+                }
+                if (auto err = validate_table_type(value.value(), *let_stmt.type)) {
+                    return std::unexpected("type error: '" + let_stmt.name + "': " + *err);
                 }
                 local_tables.insert_or_assign(let_stmt.name, std::move(value.value()));
             } else if (let_stmt.type.has_value() &&
@@ -1440,6 +1547,13 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         fmt::print("error: {}\n", value.error());
                         return false;
                     }
+                    const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
+                    if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
+                        fmt::print("error: '{}' declared as {} but value is {}\n", let_stmt.name,
+                                   scalar_type_name(*st),
+                                   scalar_value_type_name(value.value()));
+                        return false;
+                    }
                     scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
                     continue;
                 }
@@ -1448,6 +1562,10 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                                  functions, extern_decls, externs);
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
+                        return false;
+                    }
+                    if (auto err = validate_table_type(value.value(), *let_stmt.type)) {
+                        fmt::print("error: '{}': {}\n", let_stmt.name, *err);
                         return false;
                     }
                     tables.insert_or_assign(let_stmt.name, std::move(value.value()));

@@ -1,5 +1,6 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/rng.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -5545,12 +5546,7 @@ constexpr auto rng_func_returns_int(std::string_view name) -> bool {
     return name == "rand_bernoulli" || name == "rand_poisson" || name == "rand_int";
 }
 
-// Thread-local Mersenne Twister seeded from std::random_device.
-// Each thread gets its own independent PRNG state.
-auto get_rng() noexcept -> std::mt19937_64& {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    return rng;
-}
+// get_rng() is defined in rng.hpp (returns thread-local Xoshiro256pp).
 
 // Extract a numeric parameter from a CallExpr argument at `pos`.
 // Returns the value as double; the caller is responsible for range validation.
@@ -5607,10 +5603,12 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*low >= *high) {
             return std::unexpected("rand_uniform: low must be less than high");
         }
-        std::uniform_real_distribution<double> dist(*low, *high);
+        // Direct bit→double conversion: faster than uniform_real_distribution.
+        const double range = *high - *low;
         Column<double> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        for (std::size_t i = 0; i < rows; ++i)
+            col.push_back(*low + bits_to_01(rng()) * range);
         return col;
     }
 
@@ -5625,10 +5623,27 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*stddev <= 0.0) {
             return std::unexpected("rand_normal: stddev must be positive");
         }
-        std::normal_distribution<double> dist(*mean, *stddev);
+        // Box-Muller: generate pairs of normals from pairs of uniforms.
+        // No rejection sampling → deterministic throughput.
         Column<double> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        std::size_t i = 0;
+        for (; i + 1 < rows; i += 2) {
+            // u1 must be strictly positive; add tiny epsilon to rule out log(0)
+            const double u1 = bits_to_01(rng()) + 1e-300;
+            const double u2 = bits_to_01(rng());
+            double z0, z1;
+            box_muller(u1, u2, z0, z1);
+            col.push_back(*mean + *stddev * z0);
+            col.push_back(*mean + *stddev * z1);
+        }
+        if (i < rows) {
+            const double u1 = bits_to_01(rng()) + 1e-300;
+            const double u2 = bits_to_01(rng());
+            double z0, z1;
+            box_muller(u1, u2, z0, z1);
+            col.push_back(*mean + *stddev * z0);
+        }
         return col;
     }
 
@@ -5678,10 +5693,13 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*lambda <= 0.0) {
             return std::unexpected("rand_exponential: lambda must be positive");
         }
-        std::exponential_distribution<double> dist(*lambda);
+        // Direct inverse-CDF: X = -ln(U) / lambda where U ~ Uniform(0,1).
         Column<double> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        for (std::size_t i = 0; i < rows; ++i) {
+            const double u = bits_to_01(rng()) + 1e-300;
+            col.push_back(-std::log(u) / *lambda);
+        }
         return col;
     }
 

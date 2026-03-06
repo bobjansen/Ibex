@@ -774,6 +774,73 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Cumulative function benchmarks: cumsum and cumprod on a 4M-row price
+        // column. No grouping — exercises the simple scan-and-accumulate path.
+        if (status == 0) {
+            fmt::print("\n-- Cumulative function benchmarks ({} prices rows) --\n",
+                       tables.at("prices").rows());
+            std::vector<BenchQuery> cumulative_queries = {
+                {"cumsum_price", "prices[update { cs = cumsum(price) }]"},
+                {"cumprod_price", "prices[update { cp = cumprod(price) }]"},
+            };
+            for (const auto& query : cumulative_queries) {
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse);
+                if (status != 0) {
+                    break;
+                }
+            }
+        }
+
+        // Vectorized RNG benchmarks: rand_uniform and rand_normal appended as a
+        // new column. Measures the column-at-a-time PRNG throughput.
+        if (status == 0) {
+            fmt::print("\n-- RNG benchmarks ({} prices rows) --\n", tables.at("prices").rows());
+            std::vector<BenchQuery> rng_queries = {
+                {"rand_uniform", "prices[update { r = rand_uniform(0.0, 1.0) }]"},
+                {"rand_normal", "prices[update { n = rand_normal(0.0, 1.0) }]"},
+            };
+            for (const auto& query : rng_queries) {
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse);
+                if (status != 0) {
+                    break;
+                }
+            }
+        }
+
+        // Fill benchmarks: fill_null, fill_forward (LOCF), fill_backward (NOCB).
+        // Uses an in-memory table with alternating valid / null doubles (~50% null).
+        // Row count matches the prices table to keep wall-clock times comparable.
+        if (status == 0) {
+            std::size_t fill_rows = tables.at("prices").rows();
+            ibex::runtime::Table fill_table;
+            {
+                ibex::Column<double> val_col;
+                std::vector<bool> validity;
+                val_col.reserve(fill_rows);
+                validity.reserve(fill_rows);
+                for (std::size_t i = 0; i < fill_rows; ++i) {
+                    val_col.push_back(100.0 + static_cast<double>(i % 100));
+                    validity.push_back(i % 2 == 0);  // even rows valid, odd rows null
+                }
+                fill_table.add_column("val", std::move(val_col), std::move(validity));
+            }
+            ibex::runtime::TableRegistry fill_tables;
+            fill_tables.emplace("fill_data", std::move(fill_table));
+
+            fmt::print("\n-- Fill benchmarks ({} rows, 50% nulls) --\n", fill_rows);
+            std::vector<BenchQuery> fill_queries = {
+                {"fill_null", "fill_data[update { v2 = fill_null(val, 0.0) }]"},
+                {"fill_forward", "fill_data[update { v2 = fill_forward(val) }]"},
+                {"fill_backward", "fill_data[update { v2 = fill_backward(val) }]"},
+            };
+            for (const auto& query : fill_queries) {
+                status = run_benchmark(query, fill_tables, warmup_iters, iters, saved_include_parse);
+                if (status != 0) {
+                    break;
+                }
+            }
+        }
+
         // Null benchmarks: left join produces ~50% null right-column values.
         // lookup.csv has half the symbols (first 126 of 252); the other half
         // get null sector values. This exercises validity-bitmap tracking.
@@ -1049,6 +1116,12 @@ int main(int argc, char** argv) {
              R"(as_timeframe(tf_data, "ts")[window 1m, update { s = rolling_sum(price) }])"},
             {"tf_rolling_mean_5m",
              R"(as_timeframe(tf_data, "ts")[window 5m, update { m = rolling_mean(price) }])"},
+            {"tf_rolling_median_1m",
+             R"(as_timeframe(tf_data, "ts")[window 1m, update { med = rolling_median(price) }])"},
+            {"tf_rolling_std_1m",
+             R"(as_timeframe(tf_data, "ts")[window 1m, update { s = rolling_std(price) }])"},
+            {"tf_rolling_ewma_1m",
+             R"(as_timeframe(tf_data, "ts")[window 1m, update { e = rolling_ewma(price, 0.1) }])"},
             {"tf_resample_1m_ohlc",
              R"(as_timeframe(tf_data, "ts")[resample 1m, select { open = first(price), high = max(price), low = min(price), close = last(price) }])"},
         };

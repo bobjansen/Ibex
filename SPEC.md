@@ -280,11 +280,45 @@ binary operators and associate **left**.
 
 Integer literals default to `Int64`. Float literals default to `Float64`.
 Implicit narrowing conversions are prohibited; explicit widening is permitted
-(`Int32` → `Int64`, `Float32` → `Float64`).
+(`Int32` → `Int64`, `Float32` → `Float64`). Implicit `Int`↔`Float` coercion
+is also rejected — use explicit cast constructors instead (Section 3.1.1).
 
 `Date` values are stored as signed days since `1970-01-01` (Unix epoch).
 `Timestamp` values are stored as signed nanoseconds since
 `1970-01-01T00:00:00Z`.
+
+#### 3.1.1 Explicit Cast Constructors
+
+A scalar type name followed by `(expr)` is an explicit cast:
+
+```
+Int64(x)    Float64(x)
+Int32(x)    Float32(x)
+Int(x)      -- alias for Int64(x)
+```
+
+**Float → Int casts** succeed only when the value is already a whole number
+(i.e. `trunc(x) == x`). Passing a value with a fractional part — e.g.
+`Int64(3.9)` — is a runtime error. Use `round(x, mode)` (Section 11.6) to
+convert to the nearest integer before casting.
+
+**Int → Float casts** always succeed (subject to precision loss for very large
+`Int64` values converted to `Float32` or `Float64`).
+
+**Column casts** apply element-wise: `Int64(price_col)` produces a
+`Series<Int64>` from a `Series<Float64>`, checking every element.
+
+```
+// Scalar cast
+let n: Int64 = Int64(3.0);     // ok — 3.0 is a whole number
+let bad = Int64(3.9);           // runtime error: 3.9 is not a whole number
+
+// Column cast
+prices[update { vol_int = Int64(volume_f) }];
+
+// Round first, then cast
+prices[update { vol_int = Int64(round(volume_f, nearest)) }];
+```
 
 ### 3.2 Compound Types
 
@@ -334,12 +368,34 @@ Example:
 Schemas are structural: two schemas with the same fields in the same order are
 the same type. Field order is significant.
 
-### 3.4 Local Type Inference
+### 3.4 Local Type Inference and Annotation Validation
 
 `let` bindings may omit the type annotation. When omitted, the binding type is
 inferred from the right-hand side expression. The language remains statically
 typed; inference is local and does not alter function signatures (parameters
 and return types remain required).
+
+When a type annotation **is** present, it is validated at the point of binding
+or call:
+
+- **Scalar annotations** (`Int64`, `Float64`, etc.) require an exact type
+  match. Passing an `Int64` where `Float64` is expected — or vice versa — is
+  an error.
+- **DataFrame/TimeFrame schema annotations** require that all declared columns
+  are present with the correct types. Extra columns in the value are allowed
+  (structural subtyping); missing or mistyped declared columns are errors.
+- **Bare `DataFrame`** (no schema fields) skips validation and accepts any
+  DataFrame value.
+
+```
+let x: Int64 = 42;                // ok
+let y: Float64 = 42;              // error — Int64 is not Float64
+let y: Float64 = Float64(42);     // ok — explicit cast
+
+fn compute(n: Int64) -> Float64 { ... }
+compute(3.0);                      // error — Float64 argument for Int64 param
+compute(Int64(3.0));               // ok
+```
 
 ### 3.5 Nullable Columns and Three-Valued Logic
 
@@ -1606,6 +1662,32 @@ extern implementations. The recommended path for custom scalar logic is
 | `hour(t)`       | `Timestamp -> Int32`               |
 | `minute(t)`     | `Timestamp -> Int32`               |
 | `second(t)`     | `Timestamp -> Int32`               |
+| `round(x, mode)`| `Float -> Int64`                   |
+
+`round(x, mode)` converts a `Float64` scalar or `Series<Float64>` to `Int64` /
+`Series<Int64>`. The mode is a bare identifier (not a string):
+
+| Mode      | Behaviour                                  | C++ equivalent         |
+|-----------|--------------------------------------------|------------------------|
+| `nearest` | Round to nearest, ties away from zero      | `std::llround`         |
+| `floor`   | Round toward −∞                            | `std::floor` + cast    |
+| `ceil`    | Round toward +∞                            | `std::ceil`  + cast    |
+| `trunc`   | Round toward zero (truncate)               | `std::trunc` + cast    |
+
+Passing an `Int` or `Int` column is a type error. An unknown mode identifier
+is a runtime error.
+
+```
+round(3.7, nearest)   // → 4
+round(3.7, floor)     // → 3
+round(3.7, ceil)      // → 4
+round(3.7, trunc)     // → 3
+round(-3.7, nearest)  // → -4
+round(-3.7, trunc)    // → -3
+
+// Typical use: round a Float column to Int before an explicit cast
+prices[update { vol_int = round(volume_f, nearest) }];
+```
 
 ### 11.7 Vectorized RNG Functions
 

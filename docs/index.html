@@ -69,6 +69,16 @@
         </p>
       </article>
       <article class="card">
+        <h3>Strict type system</h3>
+        <p>
+          No implicit <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
+          coercion. Explicit cast constructors (<code>Int64(x)</code>,
+          <code>Float64(x)</code>) and a four-mode <code>round()</code>
+          built-in cover every numeric conversion. Optional annotations are
+          validated when present.
+        </p>
+      </article>
+      <article class="card">
         <h3>Vectorized RNG</h3>
         <p>
           Eight built-in <code>rand_*</code> functions &mdash; covering normal,
@@ -439,6 +449,54 @@ trades[<span class="kw">update</span> { hr = <span class="fn-name">hour</span>(t
 
 <span class="cm">// Use in filter</span>
 trades[<span class="kw">filter</span> <span class="fn-name">year</span>(date) <span class="op">=</span> <span class="num">2024</span>];</code></pre>
+        </div>
+      </div>
+
+      <!-- 6d. Type system: casts and round() -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Type System</span>
+          <h3>Explicit casts and rounding for numeric conversions.</h3>
+          <p>
+            Ibex never coerces <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
+            implicitly. Use type-name constructors — <code>Int64(x)</code>,
+            <code>Float64(x)</code>, etc. — for explicit numeric casts. They
+            work on scalars and on entire columns.
+          </p>
+          <p>
+            <strong>Float &rarr; Int casts</strong> require the value to be a
+            whole number. Use <code>round(x,&nbsp;mode)</code> first when the
+            value may have a fractional part. Four modes are available:
+            <code>nearest</code>, <code>floor</code>, <code>ceil</code>,
+            <code>trunc</code>.
+          </p>
+          <p>
+            Type annotations on <code>let</code> bindings and function
+            parameters are optional. When present, they are validated:
+            scalar types must match exactly; schema annotations require all
+            declared columns to be present with the correct types.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Explicit scalar casts</span>
+<span class="kw">let</span> n: Int64   = <span class="fn-name">Int64</span>(<span class="num">3.0</span>);   <span class="cm">// ok — 3.0 is a whole number</span>
+<span class="kw">let</span> f: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// ok — Int → Float always succeeds</span>
+<span class="cm">// Int64(3.9)  ← runtime error: fractional part</span>
+
+<span class="cm">// Round a Float column to Int</span>
+prices[<span class="kw">update</span> { vol_int = <span class="fn-name">round</span>(volume_f, nearest) }];
+
+<span class="cm">// All four rounding modes</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, nearest)   <span class="cm">// → 4  (ties away from zero)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, floor)     <span class="cm">// → 3  (toward −∞)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, ceil)      <span class="cm">// → 4  (toward +∞)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, trunc)     <span class="cm">// → 3  (toward zero)</span>
+
+<span class="cm">// Column-level cast after rounding</span>
+prices[<span class="kw">update</span> { vol_int = <span class="fn-name">Int64</span>(<span class="fn-name">round</span>(volume_f, nearest)) }];
+
+<span class="cm">// Annotation validation</span>
+<span class="kw">let</span> y: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// explicit cast satisfies annotation</span></code></pre>
         </div>
       </div>
 

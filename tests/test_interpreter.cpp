@@ -2059,6 +2059,373 @@ TEST_CASE("Interpret EWMA grouped") {
     CHECK((*ev)[1] == Catch::Approx(3.0));
 }
 
+// ─── quantile ─────────────────────────────────────────────────────────────────
+
+TEST_CASE("Interpret quantile aggregation (p=0.5 == median)") {
+    runtime::Table table;
+    // {10, 20, 30} sorted → p=0.5 → idx=1.0 → 20.0
+    table.add_column("v", Column<double>{10.0, 30.0, 20.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { q = quantile(v, 0.5) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* q_col = result->find("q");
+    REQUIRE(q_col != nullptr);
+    const auto* qv = std::get_if<Column<double>>(q_col);
+    REQUIRE(qv != nullptr);
+    REQUIRE(qv->size() == 1);
+    CHECK((*qv)[0] == Catch::Approx(20.0));
+}
+
+TEST_CASE("Interpret quantile aggregation (p=0.25 and p=0.75)") {
+    runtime::Table table;
+    // {1, 2, 3, 4} sorted
+    // p=0.25 → idx=0.75 → 1 + 0.75*(2-1) = 1.75
+    // p=0.75 → idx=2.25 → 3 + 0.25*(4-3) = 3.25
+    table.add_column("v", Column<double>{1.0, 3.0, 2.0, 4.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir_lo = require_ir("t[select { q = quantile(v, 0.25) }, by grp];");
+    auto result_lo = runtime::interpret(*ir_lo, registry);
+    REQUIRE(result_lo.has_value());
+    const auto* qv_lo = std::get_if<Column<double>>(result_lo->find("q"));
+    REQUIRE(qv_lo != nullptr);
+    CHECK((*qv_lo)[0] == Catch::Approx(1.75));
+
+    auto ir_hi = require_ir("t[select { q = quantile(v, 0.75) }, by grp];");
+    auto result_hi = runtime::interpret(*ir_hi, registry);
+    REQUIRE(result_hi.has_value());
+    const auto* qv_hi = std::get_if<Column<double>>(result_hi->find("q"));
+    REQUIRE(qv_hi != nullptr);
+    CHECK((*qv_hi)[0] == Catch::Approx(3.25));
+}
+
+TEST_CASE("Interpret quantile aggregation (p=0 and p=1)") {
+    runtime::Table table;
+    table.add_column("v", Column<double>{5.0, 1.0, 3.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir_min = require_ir("t[select { q = quantile(v, 0.0) }, by grp];");
+    auto result_min = runtime::interpret(*ir_min, registry);
+    REQUIRE(result_min.has_value());
+    const auto* qv_min = std::get_if<Column<double>>(result_min->find("q"));
+    REQUIRE(qv_min != nullptr);
+    CHECK((*qv_min)[0] == Catch::Approx(1.0));
+
+    auto ir_max = require_ir("t[select { q = quantile(v, 1.0) }, by grp];");
+    auto result_max = runtime::interpret(*ir_max, registry);
+    REQUIRE(result_max.has_value());
+    const auto* qv_max = std::get_if<Column<double>>(result_max->find("q"));
+    REQUIRE(qv_max != nullptr);
+    CHECK((*qv_max)[0] == Catch::Approx(5.0));
+}
+
+TEST_CASE("Interpret quantile grouped") {
+    runtime::Table table;
+    // Group A: {1,3,5} → p=0.5 → 3.0
+    // Group B: {2,4}   → p=0.5 → idx=0.5 → 2+0.5*(4-2)=3.0
+    table.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    table.add_column("grp", Column<std::string>{"A", "B", "A", "B", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { q = quantile(v, 0.5) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* qv = std::get_if<Column<double>>(result->find("q"));
+    REQUIRE(qv != nullptr);
+    REQUIRE(qv->size() == 2);
+    CHECK((*qv)[0] == Catch::Approx(3.0));
+    CHECK((*qv)[1] == Catch::Approx(3.0));
+}
+
+// ─── skew ──────────────────────────────────────────────────────────────────────
+
+TEST_CASE("Interpret skew aggregation (symmetric → 0)") {
+    runtime::Table table;
+    // {1, 2, 3} — symmetric around 2, skew = 0
+    table.add_column("v", Column<double>{1.0, 2.0, 3.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { s = skew(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* s_col = result->find("s");
+    REQUIRE(s_col != nullptr);
+    const auto* sv = std::get_if<Column<double>>(s_col);
+    REQUIRE(sv != nullptr);
+    REQUIRE(sv->size() == 1);
+    CHECK((*sv)[0] == Catch::Approx(0.0).margin(1e-10));
+}
+
+TEST_CASE("Interpret skew aggregation (right-skewed)") {
+    runtime::Table table;
+    // {1, 1, 1, 4} — right skew
+    // mean=1.75, deviations: -0.75,-0.75,-0.75,2.25
+    // m2=0.75^2*3+2.25^2 = 1.6875+5.0625=6.75
+    // m3=(-0.75)^3*3+(2.25)^3 = -1.265625+11.390625=10.125
+    // n=4, skew = (4*sqrt(3)/2) * (10.125 / 6.75^1.5)
+    // 6.75^1.5 = sqrt(6.75^3) = sqrt(307.546875) ≈ 17.5371
+    // skew = (4*1.73205/2) * (10.125/17.5371) ≈ 3.4641 * 0.5773 ≈ 2.0
+    table.add_column("v", Column<double>{1.0, 1.0, 1.0, 4.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { s = skew(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* sv = std::get_if<Column<double>>(result->find("s"));
+    REQUIRE(sv != nullptr);
+    REQUIRE(sv->size() == 1);
+    // Expected value matches pandas: pandas.Series([1,1,1,4]).skew() ≈ 2.0
+    CHECK((*sv)[0] == Catch::Approx(2.0).epsilon(1e-5));
+}
+
+TEST_CASE("Interpret skew too few values is null") {
+    runtime::Table table;
+    // n=2 → skew is undefined (n<3) → null
+    table.add_column("v", Column<double>{1.0, 2.0});
+    table.add_column("grp", Column<std::string>{"A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { s = skew(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("s");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0] == false);
+}
+
+// ─── kurtosis ──────────────────────────────────────────────────────────────────
+
+TEST_CASE("Interpret kurtosis aggregation (normal-like → ~0 excess)") {
+    runtime::Table table;
+    // {1,2,3,4,5} — excess kurtosis (pandas): ≈ -1.3
+    table.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { k = kurtosis(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* k_col = result->find("k");
+    REQUIRE(k_col != nullptr);
+    const auto* kv = std::get_if<Column<double>>(k_col);
+    REQUIRE(kv != nullptr);
+    REQUIRE(kv->size() == 1);
+    // pandas.Series([1,2,3,4,5]).kurtosis() == -1.2
+    CHECK((*kv)[0] == Catch::Approx(-1.2).epsilon(1e-5));
+}
+
+TEST_CASE("Interpret kurtosis aggregation (leptokurtic)") {
+    runtime::Table table;
+    // {0,0,0,0,10} — heavy tail, positive excess kurtosis
+    table.add_column("v", Column<double>{0.0, 0.0, 0.0, 0.0, 10.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { k = kurtosis(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* kv = std::get_if<Column<double>>(result->find("k"));
+    REQUIRE(kv != nullptr);
+    // pandas.Series([0,0,0,0,10]).kurtosis() ≈ 5.0
+    CHECK((*kv)[0] == Catch::Approx(5.0).epsilon(1e-4));
+}
+
+TEST_CASE("Interpret kurtosis too few values is null") {
+    runtime::Table table;
+    // n=3 → kurtosis undefined (n<4) → null
+    table.add_column("v", Column<double>{1.0, 2.0, 3.0});
+    table.add_column("grp", Column<std::string>{"A", "A", "A"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { k = kurtosis(v) }, by grp];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("k");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0] == false);
+}
+
+// ─── rolling_quantile / rolling_skew / rolling_kurtosis ───────────────────────
+
+TEST_CASE("rolling_quantile with 1ns window") {
+    runtime::Table table;
+    // {10, 20, 30} — 1ns window = each row sees only itself
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{10.0, 20.0, 30.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    // 1ns window includes boundary: row 1 sees {10,20}, row 2 sees {20,30}
+    // p=0.5: row0→10, row1→15, row2→25
+    auto ir = require_ir("data[window 1ns, update { q = rolling_quantile(val, 0.5) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* q_col = result->find("q");
+    REQUIRE(q_col != nullptr);
+    const auto* qv = std::get_if<Column<double>>(q_col);
+    REQUIRE(qv != nullptr);
+    REQUIRE(qv->size() == 3);
+    CHECK((*qv)[0] == Catch::Approx(10.0));
+    CHECK((*qv)[1] == Catch::Approx(15.0));
+    CHECK((*qv)[2] == Catch::Approx(25.0));
+}
+
+TEST_CASE("rolling_quantile with 2ns window") {
+    runtime::Table table;
+    // {10, 20, 30, 40} with 2ns window (threshold = t - 2, lo advances when ts < threshold)
+    // row 0 (t=0): window {10}        → p=0.25 → 10.0
+    // row 1 (t=1): window {10,20}     → idx=0.25 → 12.5
+    // row 2 (t=2): window {10,20,30}  → idx=0.5  → 15.0
+    // row 3 (t=3): window {20,30,40}  → idx=0.5  → 25.0
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                       ts_from_nanos(3)});
+    table.add_column("val", Column<double>{10.0, 20.0, 30.0, 40.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 2ns, update { q = rolling_quantile(val, 0.25) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* qv = std::get_if<Column<double>>(result->find("q"));
+    REQUIRE(qv != nullptr);
+    REQUIRE(qv->size() == 4);
+    CHECK((*qv)[0] == Catch::Approx(10.0));
+    CHECK((*qv)[1] == Catch::Approx(12.5));
+    CHECK((*qv)[2] == Catch::Approx(15.0));
+    CHECK((*qv)[3] == Catch::Approx(25.0));
+}
+
+TEST_CASE("rolling_skew with 1ns window (single element → 0)") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { s = rolling_skew(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* sv = std::get_if<Column<double>>(result->find("s"));
+    REQUIRE(sv != nullptr);
+    REQUIRE(sv->size() == 3);
+    // n<3 → all zeros
+    CHECK((*sv)[0] == Catch::Approx(0.0).margin(1e-10));
+    CHECK((*sv)[1] == Catch::Approx(0.0).margin(1e-10));
+    CHECK((*sv)[2] == Catch::Approx(0.0).margin(1e-10));
+}
+
+TEST_CASE("rolling_skew with wide window (symmetric → 0)") {
+    runtime::Table table;
+    // {1,2,3} fully in window by row 2 — symmetric → skew=0
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 10ns, update { s = rolling_skew(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* sv = std::get_if<Column<double>>(result->find("s"));
+    REQUIRE(sv != nullptr);
+    REQUIRE(sv->size() == 3);
+    // row 2: {1,2,3} symmetric → skew=0
+    CHECK((*sv)[2] == Catch::Approx(0.0).margin(1e-10));
+}
+
+TEST_CASE("rolling_kurtosis with 1ns window (n<4 → 0)") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, update { k = rolling_kurtosis(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* kv = std::get_if<Column<double>>(result->find("k"));
+    REQUIRE(kv != nullptr);
+    REQUIRE(kv->size() == 3);
+    CHECK((*kv)[0] == Catch::Approx(0.0).margin(1e-10));
+    CHECK((*kv)[1] == Catch::Approx(0.0).margin(1e-10));
+    CHECK((*kv)[2] == Catch::Approx(0.0).margin(1e-10));
+}
+
+TEST_CASE("rolling_kurtosis wide window") {
+    runtime::Table table;
+    // {1,2,3,4,5}: excess kurtosis ≈ -1.3 (pandas)
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                       ts_from_nanos(3), ts_from_nanos(4)});
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 100ns, update { k = rolling_kurtosis(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* kv = std::get_if<Column<double>>(result->find("k"));
+    REQUIRE(kv != nullptr);
+    REQUIRE(kv->size() == 5);
+    // row 4: {1,2,3,4,5} → excess kurtosis = -1.2
+    CHECK((*kv)[4] == Catch::Approx(-1.2).epsilon(1e-5));
+}
+
 // ─── Vectorized RNG ───────────────────────────────────────────────────────────
 
 TEST_CASE("rand_uniform generates correct number of rows in bounds") {

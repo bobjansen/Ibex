@@ -927,6 +927,41 @@ class Lowerer {
                     temp_columns[alias] = true;
                     return ir::Expr{.node = ir::ColumnRef{.name = alias}};
                 }
+                if (call->callee == "quantile") {
+                    if (call->args.size() != 2) {
+                        return std::unexpected(LowerError{
+                            .message = "quantile() takes two arguments: quantile(column, p)"});
+                    }
+                    const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                    if (ident == nullptr) {
+                        return std::unexpected(LowerError{
+                            .message = "first argument of quantile() must be a column name"});
+                    }
+                    double p = 0.0;
+                    if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
+                        if (const auto* dv = std::get_if<double>(&lit->value)) {
+                            p = *dv;
+                        } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                            p = static_cast<double>(*iv);
+                        } else {
+                            return std::unexpected(LowerError{
+                                .message =
+                                    "second argument of quantile() must be a numeric literal (p)"});
+                        }
+                    } else {
+                        return std::unexpected(LowerError{
+                            .message =
+                                "second argument of quantile() must be a numeric literal (p)"});
+                    }
+                    aggs.push_back(ir::AggSpec{
+                        .func = func.value(),
+                        .column = ir::ColumnRef{.name = ident->name},
+                        .alias = alias,
+                        .param = p,
+                    });
+                    temp_columns[alias] = true;
+                    return ir::Expr{.node = ir::ColumnRef{.name = alias}};
+                }
                 if (call->args.size() != 1) {
                     return std::unexpected(
                         LowerError{.message = "aggregate functions take one argument"});
@@ -1030,6 +1065,42 @@ class Lowerer {
                             .column = ir::ColumnRef{.name = ident->name},
                             .alias = field.name,
                             .param = alpha,
+                        });
+                        final_columns.push_back(field.name);
+                        continue;
+                    }
+                    if (call->callee == "quantile") {
+                        if (call->args.size() != 2) {
+                            return std::unexpected(LowerError{
+                                .message = "quantile() takes two arguments: quantile(column, p)"});
+                        }
+                        const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                        if (ident == nullptr) {
+                            return std::unexpected(LowerError{
+                                .message = "first argument of quantile() must be a column name"});
+                        }
+                        double p = 0.0;
+                        if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
+                            if (const auto* dv = std::get_if<double>(&lit->value)) {
+                                p = *dv;
+                            } else if (const auto* iv =
+                                           std::get_if<std::int64_t>(&lit->value)) {
+                                p = static_cast<double>(*iv);
+                            } else {
+                                return std::unexpected(LowerError{
+                                    .message = "second argument of quantile() must be a numeric "
+                                               "literal (p)"});
+                            }
+                        } else {
+                            return std::unexpected(
+                                LowerError{.message = "second argument of quantile() must be a "
+                                                      "numeric literal (p)"});
+                        }
+                        aggs.push_back(ir::AggSpec{
+                            .func = func.value(),
+                            .column = ir::ColumnRef{.name = ident->name},
+                            .alias = field.name,
+                            .param = p,
                         });
                         final_columns.push_back(field.name);
                         continue;
@@ -1167,6 +1238,36 @@ class Lowerer {
                                             .column = {.name = ident->name},
                                             .alias = field.name,
                                             .param = alpha});
+                continue;
+            }
+            if (call->callee == "quantile") {
+                if (call->args.size() != 2)
+                    return std::unexpected(
+                        LowerError{.message = "quantile() takes two arguments: quantile(column, p)"});
+                const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
+                if (ident == nullptr)
+                    return std::unexpected(
+                        LowerError{.message = "first argument of quantile() must be a column name"});
+                double p = 0.0;
+                if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
+                    if (const auto* dv = std::get_if<double>(&lit->value)) {
+                        p = *dv;
+                    } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                        p = static_cast<double>(*iv);
+                    } else {
+                        return std::unexpected(LowerError{
+                            .message =
+                                "second argument of quantile() must be a numeric literal (p)"});
+                    }
+                } else {
+                    return std::unexpected(LowerError{
+                        .message =
+                            "second argument of quantile() must be a numeric literal (p)"});
+                }
+                aggs.push_back(ir::AggSpec{.func = func.value(),
+                                            .column = {.name = ident->name},
+                                            .alias = field.name,
+                                            .param = p});
                 continue;
             }
             if (call->args.size() != 1)
@@ -1342,6 +1443,15 @@ class Lowerer {
         }
         if (name == "ewma") {
             return ir::AggFunc::Ewma;
+        }
+        if (name == "quantile") {
+            return ir::AggFunc::Quantile;
+        }
+        if (name == "skew") {
+            return ir::AggFunc::Skew;
+        }
+        if (name == "kurtosis") {
+            return ir::AggFunc::Kurtosis;
         }
         return std::nullopt;
     }

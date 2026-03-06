@@ -5623,27 +5623,31 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*stddev <= 0.0) {
             return std::unexpected("rand_normal: stddev must be positive");
         }
-        // Box-Muller: generate pairs of normals from pairs of uniforms.
-        // No rejection sampling → deterministic throughput.
+        // Generate all normals into the column buffer.
+        // AVX2 path: 4-wide xoshiro256++ streams + vectorized libmvec log/cos/sin,
+        // 8 outputs per iteration.  Falls back to scalar Box-Muller otherwise.
         Column<double> col;
-        col.reserve(rows);
+        col.resize(rows);
+#ifdef __AVX2__
+        fill_normal_x4(col.data(), rows, *mean, *stddev);
+#else
         std::size_t i = 0;
         for (; i + 1 < rows; i += 2) {
-            // u1 must be strictly positive; add tiny epsilon to rule out log(0)
             const double u1 = bits_to_01(rng()) + 1e-300;
             const double u2 = bits_to_01(rng());
             double z0, z1;
             box_muller(u1, u2, z0, z1);
-            col.push_back(*mean + *stddev * z0);
-            col.push_back(*mean + *stddev * z1);
+            col[i]     = *mean + *stddev * z0;
+            col[i + 1] = *mean + *stddev * z1;
         }
         if (i < rows) {
             const double u1 = bits_to_01(rng()) + 1e-300;
             const double u2 = bits_to_01(rng());
             double z0, z1;
             box_muller(u1, u2, z0, z1);
-            col.push_back(*mean + *stddev * z0);
+            col[i] = *mean + *stddev * z0;
         }
+#endif
         return col;
     }
 

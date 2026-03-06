@@ -1101,12 +1101,20 @@ Semantics:
 
 - `A join B on key` is an inner join (rows must match on `key`).
 - `A left join B on key` is a left outer join (all rows from `A` are preserved).
+  Unmatched left rows receive null values for all right-side non-key columns.
 - `A right join B on key` is a right outer join (all rows from `B` are preserved).
+  Unmatched right rows receive null values for all left-side non-key columns.
 - `A outer join B on key` is a full outer join (rows from both sides are preserved).
+  Unmatched left rows receive null values for all right-side non-key columns.
+  Unmatched right rows receive null values for all left-side non-key columns.
 - `A semi join B on key` keeps left rows that have at least one right match.
 - `A anti join B on key` keeps left rows that have no right match.
 - `A cross join B` returns the Cartesian product of rows from `A` and `B`.
 - `A asof join B on time` is an as-of join on the TimeFrame index column.
+
+**Row ordering.** The output preserves the left-table row order for all left-side
+rows (both matched and unmatched). For `outer join` and `right join`, unmatched
+right-side rows are appended after all left-side rows, in right-table order.
 
 The `on` list must be one or more unqualified column names present in both
 input schemas. `asof join` requires both operands to be `TimeFrame`s and the

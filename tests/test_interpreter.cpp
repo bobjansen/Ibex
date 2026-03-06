@@ -1411,6 +1411,14 @@ TEST_CASE("null: right join unmatched rows produce null left columns", "[null][j
 }
 
 TEST_CASE("null: outer join unmatched rows produce nulls on both sides", "[null][join]") {
+    // left:  id {1, 2},  name  {"alice", "bob"}
+    // right: id {2, 3},  score {20.0, 30.0}
+    //
+    // Full outer join on id emits left rows in left-table order, then any
+    // unmatched right rows:
+    //   row 0 → id=1, name="alice" (left-only)  →  score is NULL
+    //   row 1 → id=2, name="bob"  (matched)     →  score=20.0
+    //   row 2 → id=3              (right-only)  →  name is NULL, score=30.0
     runtime::Table left, right;
     left.add_column("id", Column<std::int64_t>{1, 2});
     left.add_column("name", Column<std::string>{"alice", "bob"});
@@ -1423,16 +1431,19 @@ TEST_CASE("null: outer join unmatched rows produce nulls on both sides", "[null]
     auto& t = *result;
     REQUIRE(t.rows() == 3);
 
-    const auto& name_entry = t.columns[t.index.at("name")];
+    const auto& name_entry  = t.columns[t.index.at("name")];
     const auto& score_entry = t.columns[t.index.at("score")];
 
-    CHECK_FALSE(runtime::is_null(name_entry, 0));
-    CHECK_FALSE(runtime::is_null(score_entry, 0));
+    // row 0: id=1, left-only → name valid, score null
+    CHECK_FALSE(runtime::is_null(name_entry,  0));
+    CHECK(      runtime::is_null(score_entry, 0));
 
-    CHECK_FALSE(runtime::is_null(name_entry, 1));
-    CHECK(runtime::is_null(score_entry, 1));
+    // row 1: id=2, matched  → both valid
+    CHECK_FALSE(runtime::is_null(name_entry,  1));
+    CHECK_FALSE(runtime::is_null(score_entry, 1));
 
-    CHECK(runtime::is_null(name_entry, 2));
+    // row 2: id=3, right-only → name null, score valid
+    CHECK(      runtime::is_null(name_entry,  2));
     CHECK_FALSE(runtime::is_null(score_entry, 2));
 }
 TEST_CASE("null: left join unmatched rows produce null right columns", "[null][join]") {

@@ -385,10 +385,13 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
             <code>false&nbsp;AND&nbsp;null&nbsp;=&nbsp;false</code>.
           </p>
           <p>
-            Nulls arise from left joins (unmatched right columns), dcast
-            (missing pivot combinations), and certain aggregate functions
-            (<code>std</code> on fewer than 2 non-null values,
-            <code>ewma</code> on an empty group).
+            Nulls arise from joins with unmatched rows (left join: unmatched
+            right columns; right join: unmatched left columns; outer join:
+            both sides), dcast (missing pivot combinations), and certain
+            aggregate functions (<code>std</code> on fewer than 2 non-null
+            values, <code>ewma</code> on an empty group,
+            <code>skew</code> on fewer than 3, <code>kurtosis</code> on
+            fewer than 4).
           </p>
         </div>
         <div class="tour-code">

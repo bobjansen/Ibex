@@ -898,6 +898,115 @@ TEST_CASE("lag on non-TimeFrame returns error") {
     REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
 }
 
+// ─── cumsum / cumprod tests ───────────────────────────────────────────────────
+
+TEST_CASE("cumsum on Int column produces running sum") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{1, 2, 3, 4});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { cs = cumsum(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* cs = std::get_if<Column<std::int64_t>>(result->find("cs"));
+    REQUIRE(cs != nullptr);
+    REQUIRE((*cs)[0] == 1);
+    REQUIRE((*cs)[1] == 3);
+    REQUIRE((*cs)[2] == 6);
+    REQUIRE((*cs)[3] == 10);
+}
+
+TEST_CASE("cumsum on Float column produces running sum") {
+    runtime::Table table;
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { cs = cumsum(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* cs = std::get_if<Column<double>>(result->find("cs"));
+    REQUIRE(cs != nullptr);
+    REQUIRE((*cs)[0] == Catch::Approx(1.0));
+    REQUIRE((*cs)[1] == Catch::Approx(3.0));
+    REQUIRE((*cs)[2] == Catch::Approx(6.0));
+}
+
+TEST_CASE("cumprod on Int column produces running product") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{1, 2, 3, 4});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { cp = cumprod(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* cp = std::get_if<Column<std::int64_t>>(result->find("cp"));
+    REQUIRE(cp != nullptr);
+    REQUIRE((*cp)[0] == 1);
+    REQUIRE((*cp)[1] == 2);
+    REQUIRE((*cp)[2] == 6);
+    REQUIRE((*cp)[3] == 24);
+}
+
+TEST_CASE("cumprod on Float column produces running product") {
+    runtime::Table table;
+    table.add_column("val", Column<double>{2.0, 3.0, 4.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { cp = cumprod(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* cp = std::get_if<Column<double>>(result->find("cp"));
+    REQUIRE(cp != nullptr);
+    REQUIRE((*cp)[0] == Catch::Approx(2.0));
+    REQUIRE((*cp)[1] == Catch::Approx(6.0));
+    REQUIRE((*cp)[2] == Catch::Approx(24.0));
+}
+
+TEST_CASE("cumsum on TimeFrame works without window clause") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { cs = cumsum(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* cs = std::get_if<Column<std::int64_t>>(result->find("cs"));
+    REQUIRE(cs != nullptr);
+    REQUIRE((*cs)[0] == 10);
+    REQUIRE((*cs)[1] == 30);
+    REQUIRE((*cs)[2] == 60);
+}
+
+TEST_CASE("cumsum on non-numeric column returns error") {
+    runtime::Table table;
+    table.add_column("val", Column<std::string>{"a", "b", "c"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { cs = cumsum(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("must be numeric") != std::string::npos);
+}
+
 TEST_CASE("rolling_sum outside window clause returns error") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1)});

@@ -315,7 +315,7 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Joins</span>
-          <h3>Inner, left, right, outer, and as-of — written as natural prose.</h3>
+          <h3>Inner, left, right, outer, semi, anti, cross, and as-of — written as natural prose.</h3>
           <p>
             The <strong>as-of join</strong> attaches the latest right row
             at-or-before each left timestamp. It is the standard pattern for
@@ -338,6 +338,15 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
 
 <span class="cm">// Outer join — preserve rows from both sides</span>
 <span class="kw">let</span> unioned = prices <span class="kw">outer join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Semi join — keep left rows that have a match</span>
+<span class="kw">let</span> matched = prices <span class="kw">semi join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Anti join — keep left rows that have no match</span>
+<span class="kw">let</span> missing = prices <span class="kw">anti join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Cross join — cartesian product</span>
+<span class="kw">let</span> cartesian = prices <span class="kw">cross join</span> metadata;
 
 <span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
 <span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);

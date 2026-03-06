@@ -217,6 +217,9 @@ TEST_CASE("Lexer: all hard keywords", "[lexer]") {
         {"left", TokenKind::KeywordLeft},
         {"right", TokenKind::KeywordRight},
         {"outer", TokenKind::KeywordOuter},
+        {"semi", TokenKind::KeywordSemi},
+        {"anti", TokenKind::KeywordAnti},
+        {"cross", TokenKind::KeywordCross},
         {"asof", TokenKind::KeywordAsof},
         {"on", TokenKind::KeywordOn},
         {"is", TokenKind::KeywordIs},
@@ -443,6 +446,14 @@ TEST_CASE("Lexer: join expression", "[lexer]") {
     REQUIRE(tokens[3].kind == TokenKind::Identifier);
     REQUIRE(tokens[3].lexeme == "rhs");
     REQUIRE(tokens[4].kind == TokenKind::KeywordOn);
+}
+
+TEST_CASE("Lexer: cross join expression", "[lexer]") {
+    auto tokens = tokenize("lhs cross join rhs");
+    REQUIRE(tokens[0].kind == TokenKind::Identifier);
+    REQUIRE(tokens[1].kind == TokenKind::KeywordCross);
+    REQUIRE(tokens[2].kind == TokenKind::KeywordJoin);
+    REQUIRE(tokens[3].kind == TokenKind::Identifier);
 }
 
 TEST_CASE("Lexer: multiple tokens on one line preserve column positions", "[lexer]") {

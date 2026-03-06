@@ -298,6 +298,32 @@ auto outer_join(const runtime::Table& left, const runtime::Table& right,
     return std::move(*result);
 }
 
+auto semi_join(const runtime::Table& left, const runtime::Table& right,
+               const std::vector<std::string>& keys) -> runtime::Table {
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Semi, keys);
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
+auto anti_join(const runtime::Table& left, const runtime::Table& right,
+               const std::vector<std::string>& keys) -> runtime::Table {
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Anti, keys);
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
+auto cross_join(const runtime::Table& left, const runtime::Table& right) -> runtime::Table {
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Cross, {});
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
 auto asof_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.

@@ -231,6 +231,37 @@ TEST_CASE("Lower outer join to IR") {
     REQUIRE(join != nullptr);
     REQUIRE(join->kind() == ir::JoinKind::Outer);
 }
+TEST_CASE("Lower semi join to IR") {
+    auto program = require_parse("a semi join b on id;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Semi);
+}
+
+TEST_CASE("Lower anti join to IR") {
+    auto program = require_parse("a anti join b on id;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Anti);
+}
+
+TEST_CASE("Lower cross join to IR") {
+    auto program = require_parse("a cross join b;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Cross);
+    REQUIRE(join->keys().empty());
+}
+
 TEST_CASE("Lower asof join to IR") {
     auto program = require_parse("a asof join b on {ts, symbol};");
     auto result = parser::lower(program);

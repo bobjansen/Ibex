@@ -341,6 +341,21 @@ class Parser {
                     return nullptr;
                 }
                 kind = JoinKind::Outer;
+            } else if (match(TokenKind::KeywordSemi)) {
+                if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'semi'")) {
+                    return nullptr;
+                }
+                kind = JoinKind::Semi;
+            } else if (match(TokenKind::KeywordAnti)) {
+                if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'anti'")) {
+                    return nullptr;
+                }
+                kind = JoinKind::Anti;
+            } else if (match(TokenKind::KeywordCross)) {
+                if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'cross'")) {
+                    return nullptr;
+                }
+                kind = JoinKind::Cross;
             } else if (match(TokenKind::KeywordAsof)) {
                 if (!consume(TokenKind::KeywordJoin, "expected 'join' after 'asof'")) {
                     return nullptr;
@@ -354,19 +369,24 @@ class Parser {
             if (!right) {
                 return nullptr;
             }
-            if (!consume(TokenKind::KeywordOn, "expected 'on' after join expression")) {
-                return nullptr;
-            }
-            auto keys = parse_join_keys();
-            if (!keys.has_value()) {
-                return nullptr;
+
+            std::vector<std::string> keys;
+            if (kind != JoinKind::Cross) {
+                if (!consume(TokenKind::KeywordOn, "expected 'on' after join expression")) {
+                    return nullptr;
+                }
+                auto parsed_keys = parse_join_keys();
+                if (!parsed_keys.has_value()) {
+                    return nullptr;
+                }
+                keys = std::move(*parsed_keys);
             }
             auto join = std::make_unique<Expr>();
             join->node = JoinExpr{
                 .kind = kind,
                 .left = std::move(expr),
                 .right = std::move(right),
-                .keys = std::move(*keys),
+                .keys = std::move(keys),
             };
             expr = std::move(join);
         }

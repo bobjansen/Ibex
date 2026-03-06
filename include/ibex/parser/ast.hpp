@@ -91,6 +91,9 @@ enum class JoinKind : std::uint8_t {
     Left,
     Right,
     Outer,
+    Semi,
+    Anti,
+    Cross,
     Asof,
 };
 

@@ -343,6 +343,30 @@ TEST_CASE("emitter: join node — inner join", "[codegen]") {
     CHECK(contains(out, "\"id\""));
 }
 
+
+TEST_CASE("emitter: join node — right join", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Right, {"id"});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::right_join("));
+}
+
+TEST_CASE("emitter: join node — outer join", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Outer, {"id"});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::outer_join("));
+}
 TEST_CASE("emitter: join node — asof join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");

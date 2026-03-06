@@ -407,6 +407,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 case ir::JoinKind::Left:
                     fn = "left_join";
                     break;
+                case ir::JoinKind::Right:
+                    fn = "right_join";
+                    break;
+                case ir::JoinKind::Outer:
+                    fn = "outer_join";
+                    break;
                 case ir::JoinKind::Asof:
                     fn = "asof_join";
                     break;

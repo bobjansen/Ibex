@@ -1387,6 +1387,54 @@ TEST_CASE("rolling_ewma larger window") {
 
 // ─── Phase 1 null semantics ───────────────────────────────────────────────────
 
+
+TEST_CASE("null: right join unmatched rows produce null left columns", "[null][join]") {
+    runtime::Table left, right;
+    left.add_column("id", Column<std::int64_t>{1, 2});
+    left.add_column("name", Column<std::string>{"alice", "bob"});
+
+    right.add_column("id", Column<std::int64_t>{2, 3});
+    right.add_column("score", Column<double>{20.0, 30.0});
+
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Right, {"id"});
+    REQUIRE(result.has_value());
+    auto& t = *result;
+    REQUIRE(t.rows() == 2);
+
+    const auto& name_entry = t.columns[t.index.at("name")];
+    CHECK_FALSE(runtime::is_null(name_entry, 0));
+    CHECK(runtime::is_null(name_entry, 1));
+
+    const auto& id_col = std::get<Column<std::int64_t>>(*t.columns[t.index.at("id")].column);
+    CHECK(id_col[0] == 2);
+    CHECK(id_col[1] == 3);
+}
+
+TEST_CASE("null: outer join unmatched rows produce nulls on both sides", "[null][join]") {
+    runtime::Table left, right;
+    left.add_column("id", Column<std::int64_t>{1, 2});
+    left.add_column("name", Column<std::string>{"alice", "bob"});
+
+    right.add_column("id", Column<std::int64_t>{2, 3});
+    right.add_column("score", Column<double>{20.0, 30.0});
+
+    auto result = runtime::join_tables(left, right, ir::JoinKind::Outer, {"id"});
+    REQUIRE(result.has_value());
+    auto& t = *result;
+    REQUIRE(t.rows() == 3);
+
+    const auto& name_entry = t.columns[t.index.at("name")];
+    const auto& score_entry = t.columns[t.index.at("score")];
+
+    CHECK_FALSE(runtime::is_null(name_entry, 0));
+    CHECK_FALSE(runtime::is_null(score_entry, 0));
+
+    CHECK_FALSE(runtime::is_null(name_entry, 1));
+    CHECK(runtime::is_null(score_entry, 1));
+
+    CHECK(runtime::is_null(name_entry, 2));
+    CHECK_FALSE(runtime::is_null(score_entry, 2));
+}
 TEST_CASE("null: left join unmatched rows produce null right columns", "[null][join]") {
     runtime::Table left, right;
     Column<std::int64_t> lid;

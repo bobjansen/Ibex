@@ -73,9 +73,9 @@
         <p>
           No implicit <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
           coercion. Explicit cast constructors (<code>Int64(x)</code>,
-          <code>Float64(x)</code>) and a four-mode <code>round()</code>
-          built-in cover every numeric conversion. Optional annotations are
-          validated when present.
+          <code>Float64(x)</code>) and a five-mode <code>round()</code>
+          built-in — including banker&rsquo;s rounding — cover every numeric
+          conversion. Optional annotations are validated when present.
         </p>
       </article>
       <article class="card">
@@ -466,9 +466,10 @@ trades[<span class="kw">filter</span> <span class="fn-name">year</span>(date) <s
           <p>
             <strong>Float &rarr; Int casts</strong> require the value to be a
             whole number. Use <code>round(x,&nbsp;mode)</code> first when the
-            value may have a fractional part. Four modes are available:
-            <code>nearest</code>, <code>floor</code>, <code>ceil</code>,
-            <code>trunc</code>.
+            value may have a fractional part. Five modes are available:
+            <code>nearest</code> (ties away from zero), <code>bankers</code>
+            (ties to even — statistically unbiased), <code>floor</code>,
+            <code>ceil</code>, <code>trunc</code>.
           </p>
           <p>
             Type annotations on <code>let</code> bindings and function
@@ -486,8 +487,11 @@ trades[<span class="kw">filter</span> <span class="fn-name">year</span>(date) <s
 <span class="cm">// Round a Float column to Int</span>
 prices[<span class="kw">update</span> { vol_int = <span class="fn-name">round</span>(volume_f, nearest) }];
 
-<span class="cm">// All four rounding modes</span>
+<span class="cm">// All five rounding modes</span>
 <span class="fn-name">round</span>(<span class="num">3.7</span>, nearest)   <span class="cm">// → 4  (ties away from zero)</span>
+<span class="fn-name">round</span>(<span class="num">2.5</span>, nearest)   <span class="cm">// → 3  (tie → away from zero)</span>
+<span class="fn-name">round</span>(<span class="num">2.5</span>, bankers)   <span class="cm">// → 2  (tie → nearest even)</span>
+<span class="fn-name">round</span>(<span class="num">3.5</span>, bankers)   <span class="cm">// → 4  (tie → nearest even)</span>
 <span class="fn-name">round</span>(<span class="num">3.7</span>, floor)     <span class="cm">// → 3  (toward −∞)</span>
 <span class="fn-name">round</span>(<span class="num">3.7</span>, ceil)      <span class="cm">// → 4  (toward +∞)</span>
 <span class="fn-name">round</span>(<span class="num">3.7</span>, trunc)     <span class="cm">// → 3  (toward zero)</span>

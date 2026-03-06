@@ -14,6 +14,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cfenv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -747,12 +748,12 @@ auto extract_round_mode(const parser::Expr& arg) -> std::expected<std::string_vi
     const auto* ident = std::get_if<parser::IdentifierExpr>(&arg.node);
     if (!ident) {
         return std::unexpected(
-            "round(): second argument must be a bare mode identifier (nearest, floor, ceil, trunc)");
+            "round(): second argument must be a bare mode identifier (nearest, bankers, floor, ceil, trunc)");
     }
-    if (ident->name != "nearest" && ident->name != "floor" && ident->name != "ceil" &&
-        ident->name != "trunc") {
+    if (ident->name != "nearest" && ident->name != "bankers" && ident->name != "floor" &&
+        ident->name != "ceil" && ident->name != "trunc") {
         return std::unexpected("round(): unknown mode '" + ident->name +
-                               "' (expected: nearest, floor, ceil, trunc)");
+                               "' (expected: nearest, bankers, floor, ceil, trunc)");
     }
     return std::string_view{ident->name};
 }
@@ -762,6 +763,8 @@ auto apply_scalar_round(double v, std::string_view mode)
     std::int64_t result{};
     if (mode == "nearest") {
         result = static_cast<std::int64_t>(std::llround(v));
+    } else if (mode == "bankers") {
+        result = static_cast<std::int64_t>(std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
     } else if (mode == "floor") {
         result = static_cast<std::int64_t>(std::floor(v));
     } else if (mode == "ceil") {
@@ -780,6 +783,8 @@ auto apply_column_round(const Column<double>& src, std::string_view mode)
         std::int64_t r{};
         if (mode == "nearest") {
             r = static_cast<std::int64_t>(std::llround(v));
+        } else if (mode == "bankers") {
+            r = static_cast<std::int64_t>(std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
         } else if (mode == "floor") {
             r = static_cast<std::int64_t>(std::floor(v));
         } else if (mode == "ceil") {
@@ -1250,7 +1255,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }
         if (call->callee == "round") {
             if (call->args.size() != 2) {
-                return std::unexpected("round(): expects (value, mode) — mode: nearest, floor, ceil, trunc");
+                return std::unexpected("round(): expects (value, mode) — mode: nearest, bankers, floor, ceil, trunc");
             }
             auto mode = extract_round_mode(*call->args[1]);
             if (!mode) {

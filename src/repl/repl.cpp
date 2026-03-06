@@ -664,6 +664,72 @@ auto validate_table_type(const runtime::Table& table, const parser::Type& type)
     return std::nullopt;
 }
 
+/// Returns true if `callee` is one of the type-name cast functions.
+auto is_cast_callee(std::string_view callee) -> bool {
+    return callee == "Int64" || callee == "Int32" || callee == "Int" || callee == "Float64" ||
+           callee == "Float32";
+}
+
+/// Applies a scalar type cast. `callee` must be a cast name (checked by is_cast_callee).
+auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
+    if (to_int) {
+        if (std::holds_alternative<std::int64_t>(val)) {
+            return val;
+        }
+        if (std::holds_alternative<double>(val)) {
+            return runtime::ScalarValue{static_cast<std::int64_t>(std::get<double>(val))};
+        }
+        return std::unexpected(std::string(callee) + "(): cannot cast " +
+                               std::string(scalar_value_type_name(val)) + " to Int");
+    }
+    // Float64 / Float32
+    if (std::holds_alternative<double>(val)) {
+        return val;
+    }
+    if (std::holds_alternative<std::int64_t>(val)) {
+        return runtime::ScalarValue{static_cast<double>(std::get<std::int64_t>(val))};
+    }
+    return std::unexpected(std::string(callee) + "(): cannot cast " +
+                           std::string(scalar_value_type_name(val)) + " to Float");
+}
+
+/// Applies an element-wise column type cast.
+auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
+    if (to_int) {
+        if (std::holds_alternative<Column<std::int64_t>>(col)) {
+            return col;
+        }
+        if (std::holds_alternative<Column<double>>(col)) {
+            const auto& src = std::get<Column<double>>(col);
+            Column<std::int64_t> dst;
+            dst.reserve(src.size());
+            for (double v : src) {
+                dst.push_back(static_cast<std::int64_t>(v));
+            }
+            return runtime::ColumnValue{std::move(dst)};
+        }
+        return std::unexpected(std::string(callee) + "(): cannot cast column to Int");
+    }
+    // Float64 / Float32
+    if (std::holds_alternative<Column<double>>(col)) {
+        return col;
+    }
+    if (std::holds_alternative<Column<std::int64_t>>(col)) {
+        const auto& src = std::get<Column<std::int64_t>>(col);
+        Column<double> dst;
+        dst.reserve(src.size());
+        for (std::int64_t v : src) {
+            dst.push_back(static_cast<double>(v));
+        }
+        return runtime::ColumnValue{std::move(dst)};
+    }
+    return std::unexpected(std::string(callee) + "(): cannot cast column to Float");
+}
+
 void print_schema(const runtime::Table& table) {
     fmt::print("columns:\n");
     for (const auto& entry : table.columns) {
@@ -809,6 +875,28 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (is_cast_callee(call->callee) && call->args.size() == 1) {
+            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, functions,
+                                         extern_decls, externs);
+            if (!inner) {
+                return std::unexpected(inner.error());
+            }
+            if (auto* col = std::get_if<runtime::ColumnValue>(&inner.value())) {
+                auto result = apply_column_cast(*col, call->callee);
+                if (!result) {
+                    return std::unexpected(result.error());
+                }
+                return EvalValue{std::move(result.value())};
+            }
+            if (auto* scalar = std::get_if<runtime::ScalarValue>(&inner.value())) {
+                auto result = apply_scalar_cast(*scalar, call->callee);
+                if (!result) {
+                    return std::unexpected(result.error());
+                }
+                return EvalValue{std::move(result.value())};
+            }
+            return std::unexpected(std::string(call->callee) + "(): cannot cast a table");
+        }
         if (call->callee == "seed_rng") {
             if (call->args.size() != 1 || !call->named_args.empty()) {
                 return std::unexpected("seed_rng: expected exactly one argument (seed: Int)");
@@ -1061,6 +1149,17 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 return *scalar;
             }
             return std::unexpected("extern function returned table: " + call->callee);
+        }
+        if (is_cast_callee(call->callee)) {
+            if (call->args.size() != 1) {
+                return std::unexpected(call->callee + "(): expects exactly one argument");
+            }
+            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, functions,
+                                          extern_decls, externs);
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+            return apply_scalar_cast(value.value(), call->callee);
         }
         return std::unexpected("unknown function: " + call->callee + " (available: " +
                                format_function_names(functions, extern_decls) + ")");

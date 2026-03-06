@@ -381,3 +381,93 @@ df;
 )";
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
+
+// --- Explicit cast expressions ---
+
+TEST_CASE("cast: Float64(int_literal) allows passing to Float64 param") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Float64) -> Float64 {
+    x;
+}
+f(Float64(3));
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("cast: Int64(float_literal) allows passing to Int64 param") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Int64) -> Int64 {
+    x;
+}
+f(Int64(3.9));
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("cast: Float64(int_var) converts scalar variable across function calls") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn f(x: Float64) -> Float64 {
+    x;
+}
+fn g(n: Int64) -> Float64 {
+    f(Float64(n));
+}
+g(5);
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("cast: let binding with Float64 cast from Int") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Float64 = Float64(3);", registry));
+}
+
+TEST_CASE("cast: let binding with Int64 cast from Float (truncates)") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = Int64(9.9);", registry));
+}
+
+TEST_CASE("cast: Float64 applied to Int column converts element types") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("n", ibex::Column<std::int64_t>{1, 2, 3});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df = get_data();
+let (n) = df;
+let f: Series<Float64> = Float64(n);
+f;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("cast: Int64 applied to Float column converts element types") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "get_data",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ibex::runtime::Table t;
+            t.add_column("v", ibex::Column<double>{1.1, 2.9, 3.5});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+let df = get_data();
+let (v) = df;
+let i: Series<Int64> = Int64(v);
+i;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}

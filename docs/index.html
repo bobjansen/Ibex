@@ -509,8 +509,9 @@ df[<span class="kw">update</span> { flag = <span class="fn-name">rep</span>(flag
             <code>cumsum(col)</code> and <code>cumprod(col)</code> compute
             prefix sums and products over any <code>Int</code> or
             <code>Float</code> column. Both return the same type as their input
-            and are valid in any <code>update</code> block &mdash; DataFrame
-            or TimeFrame &mdash; with or without a <code>window</code> clause.
+            and are valid in <code>select</code> and <code>update</code> blocks
+            &mdash; DataFrame or TimeFrame &mdash; with or without a
+            <code>window</code> clause.
           </p>
           <p>
             Typical use: cumulative P&amp;L, compounded returns, or an
@@ -518,7 +519,10 @@ df[<span class="kw">update</span> { flag = <span class="fn-name">rep</span>(flag
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm">// Cumulative P&amp;L from a column of daily P&amp;L values</span>
+<pre><code><span class="cm">// Valid in select (produces only the cumulative column)</span>
+df[<span class="kw">select</span> { cum_pnl = <span class="fn-name">cumsum</span>(pnl) }];
+
+<span class="cm">// Valid in update (adds column alongside existing ones)</span>
 df[<span class="kw">update</span> { cum_pnl = <span class="fn-name">cumsum</span>(pnl) }];
 
 <span class="cm">// Compounded return: product of (1 + daily_ret)</span>

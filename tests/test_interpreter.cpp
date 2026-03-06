@@ -3,6 +3,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/rng.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -2323,6 +2324,89 @@ TEST_CASE("rand_bernoulli invalid p") {
     auto ir = require_ir("t[update { b = rand_bernoulli(1.5) }];");
     auto result = runtime::interpret(*ir, registry);
     CHECK_FALSE(result.has_value());
+}
+
+// ─── seed_rng / reseed_rng ────────────────────────────────────────────────────
+
+TEST_CASE("reseed_rng produces identical rand_uniform sequence") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(32)));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { u = rand_uniform(0.0, 1.0) }];");
+
+    // First run
+    runtime::reseed_rng(0xDEADBEEF);
+    auto r1 = runtime::interpret(*ir, registry);
+    REQUIRE(r1.has_value());
+    const auto& c1 = std::get<Column<double>>(*r1->find("u"));
+
+    // Second run with the same seed
+    runtime::reseed_rng(0xDEADBEEF);
+    auto r2 = runtime::interpret(*ir, registry);
+    REQUIRE(r2.has_value());
+    const auto& c2 = std::get<Column<double>>(*r2->find("u"));
+
+    REQUIRE(c1.size() == c2.size());
+    for (std::size_t i = 0; i < c1.size(); ++i) {
+        CHECK(c1[i] == c2[i]);
+    }
+}
+
+TEST_CASE("reseed_rng with different seeds produces different sequences") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(32)));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { u = rand_uniform(0.0, 1.0) }];");
+
+    runtime::reseed_rng(1);
+    auto r1 = runtime::interpret(*ir, registry);
+    REQUIRE(r1.has_value());
+    const auto& c1 = std::get<Column<double>>(*r1->find("u"));
+
+    runtime::reseed_rng(2);
+    auto r2 = runtime::interpret(*ir, registry);
+    REQUIRE(r2.has_value());
+    const auto& c2 = std::get<Column<double>>(*r2->find("u"));
+
+    bool any_different = false;
+    for (std::size_t i = 0; i < c1.size(); ++i) {
+        if (c1[i] != c2[i]) {
+            any_different = true;
+            break;
+        }
+    }
+    CHECK(any_different);
+}
+
+TEST_CASE("reseed_rng_x4 produces identical rand_normal sequence") {
+    runtime::Table table;
+    // Use a size that exercises the 8-wide AVX2 loop and the scalar tail.
+    table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(33)));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { n = rand_normal(0.0, 1.0) }];");
+
+    runtime::reseed_rng(0xCAFEBABE);
+    runtime::reseed_rng_x4(0xCAFEBABE);
+    auto r1 = runtime::interpret(*ir, registry);
+    REQUIRE(r1.has_value());
+    const auto& c1 = std::get<Column<double>>(*r1->find("n"));
+
+    runtime::reseed_rng(0xCAFEBABE);
+    runtime::reseed_rng_x4(0xCAFEBABE);
+    auto r2 = runtime::interpret(*ir, registry);
+    REQUIRE(r2.has_value());
+    const auto& c2 = std::get<Column<double>>(*r2->find("n"));
+
+    REQUIRE(c1.size() == c2.size());
+    for (std::size_t i = 0; i < c1.size(); ++i) {
+        CHECK(c1[i] == c2[i]);
+    }
 }
 
 // ─── rep ─────────────────────────────────────────────────────────────────────

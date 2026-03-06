@@ -4,6 +4,7 @@
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/rng.hpp>
 
 #include <fmt/core.h>
 #include <spdlog/spdlog.h>
@@ -722,6 +723,24 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (call->callee == "seed_rng") {
+            if (call->args.size() != 1 || !call->named_args.empty()) {
+                return std::unexpected("seed_rng: expected exactly one argument (seed: Int)");
+            }
+            auto seed_val = eval_scalar_expr(*call->args[0], tables, scalars, columns, functions,
+                                             extern_decls, externs);
+            if (!seed_val) {
+                return std::unexpected(seed_val.error());
+            }
+            if (!std::holds_alternative<std::int64_t>(*seed_val)) {
+                return std::unexpected("seed_rng: argument must be an integer");
+            }
+            const auto seed = static_cast<std::uint64_t>(std::get<std::int64_t>(*seed_val));
+            runtime::reseed_rng(seed);
+            runtime::reseed_rng_x4(seed);
+            // Return the seed so the REPL can confirm what was set.
+            return EvalValue{static_cast<std::int64_t>(seed)};
+        }
         if (call->callee == "scalar") {
             auto scalar =
                 eval_scalar_expr(expr, tables, scalars, columns, functions, extern_decls, externs);

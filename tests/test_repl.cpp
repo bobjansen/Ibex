@@ -172,6 +172,23 @@ a;
     REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("seed_rng is accepted as a statement and returns its argument") {
+    ibex::runtime::ExternRegistry registry;
+    // seed_rng(n) should execute without error and echo the seed as a scalar.
+    REQUIRE(ibex::repl::execute_script("seed_rng(42);", registry));
+}
+
+TEST_CASE("seed_rng rejects wrong argument type") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("seed_rng(1.5);", registry));
+}
+
+TEST_CASE("seed_rng rejects wrong argument count") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("seed_rng(1, 2);", registry));
+    REQUIRE_FALSE(ibex::repl::execute_script("seed_rng();", registry));
+}
+
 TEST_CASE("REPL tuple let binding: bound columns usable in expressions") {
     ibex::runtime::ExternRegistry registry;
 

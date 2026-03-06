@@ -536,9 +536,17 @@ TEST_CASE("round: negative value with floor") {
     REQUIRE(ibex::repl::execute_script("let x: Int64 = round(-2.1, floor);", registry));
 }
 
+TEST_CASE("round: bankers mode rounds half-to-even") {
+    ibex::runtime::ExternRegistry registry;
+    // 2.5 rounds to 2 (nearest even), 3.5 rounds to 4 (nearest even)
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.5, bankers);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(3.5, bankers);", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Int64 = round(2.1, bankers);", registry));
+}
+
 TEST_CASE("round: unknown mode is an error") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(2.5, bankers);", registry));
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = round(2.5, halfway);", registry));
 }
 
 TEST_CASE("round: Int argument is an error") {

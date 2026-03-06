@@ -1670,15 +1670,24 @@ extern implementations. The recommended path for custom scalar logic is
 | Mode      | Behaviour                                  | C++ equivalent         |
 |-----------|--------------------------------------------|------------------------|
 | `nearest` | Round to nearest, ties away from zero      | `std::llround`         |
+| `bankers` | Round to nearest, ties to even (banker's)  | `std::llrint`          |
 | `floor`   | Round toward −∞                            | `std::floor` + cast    |
 | `ceil`    | Round toward +∞                            | `std::ceil`  + cast    |
 | `trunc`   | Round toward zero (truncate)               | `std::trunc` + cast    |
+
+`bankers` uses IEEE 754 default rounding (`FE_TONEAREST`): 0.5 rounds to the
+nearest even integer, so 2.5 → 2 and 3.5 → 4. This is the statistically
+unbiased choice for repeated rounding.
 
 Passing an `Int` or `Int` column is a type error. An unknown mode identifier
 is a runtime error.
 
 ```
 round(3.7, nearest)   // → 4
+round(3.7, bankers)   // → 4
+round(2.5, nearest)   // → 3  (ties away from zero)
+round(2.5, bankers)   // → 2  (ties to even)
+round(3.5, bankers)   // → 4  (ties to even)
 round(3.7, floor)     // → 3
 round(3.7, ceil)      // → 4
 round(3.7, trunc)     // → 3
@@ -1686,7 +1695,7 @@ round(-3.7, nearest)  // → -4
 round(-3.7, trunc)    // → -3
 
 // Typical use: round a Float column to Int before an explicit cast
-prices[update { vol_int = round(volume_f, nearest) }];
+prices[update { vol_int = round(volume_f, bankers) }];
 ```
 
 ### 11.7 Vectorized RNG Functions

@@ -2189,8 +2189,10 @@ auto column_kind(const ColumnValue& column) -> ExprType {
 }
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
-                     const std::vector<std::string>& keys) -> std::expected<Table, std::string> {
-    if (kind != ir::JoinKind::Cross && keys.empty()) {
+                     const std::vector<std::string>& keys,
+                     const ir::FilterExpr* predicate = nullptr,
+                     const ScalarRegistry* scalars = nullptr) -> std::expected<Table, std::string> {
+    if (kind != ir::JoinKind::Cross && keys.empty() && predicate == nullptr) {
         return std::unexpected("join requires at least one key");
     }
 
@@ -2423,6 +2425,111 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
     };
+
+    // ─── Non-equijoin / theta-join path (predicate present) ──────────────────
+    // Uses a nested-loop join: for each left row l, broadcast it N_right times
+    // alongside the full right table, evaluate the predicate mask vectorised,
+    // then emit matching pairs with the appropriate null-padding semantics.
+    if (predicate != nullptr) {
+        const std::size_t N_right = right.rows();
+
+        // Build a right-column → batch-name mapping covering ALL right columns,
+        // not just the output columns in right_out.  Semi/anti joins exclude
+        // right columns from right_out but the predicate still references them.
+        struct NLJRightCol {
+            const ColumnValue* column;
+            std::string batch_name;
+        };
+        std::vector<NLJRightCol> nlj_right;
+        nlj_right.reserve(right.columns.size());
+        {
+            std::unordered_set<std::string> batch_left_names;
+            for (const auto& e : left.columns)
+                batch_left_names.insert(e.name);
+            for (const auto& entry : right.columns) {
+                std::string name = entry.name;
+                while (batch_left_names.contains(name))
+                    name += "_right";
+                batch_left_names.insert(name);
+                nlj_right.push_back({entry.column.get(), std::move(name)});
+            }
+        }
+
+        std::vector<bool> right_matched_pred;
+        if (preserve_right_rows) {
+            right_matched_pred.assign(N_right, false);
+        }
+
+        for (std::size_t l = 0; l < left.rows(); ++l) {
+            // Build batch table: left row l repeated N_right times, right as-is.
+            // Column names follow the same renaming convention as the cross join
+            // (right columns that collide with left receive a "_right" suffix).
+            Table batch;
+            batch.columns.reserve(left.columns.size() + nlj_right.size());
+
+            for (std::size_t ci = 0; ci < left.columns.size(); ++ci) {
+                auto col = make_empty_like(*left.columns[ci].column);
+                for (std::size_t j = 0; j < N_right; ++j) {
+                    append_value(col, *left.columns[ci].column, l);
+                }
+                batch.add_column(output.columns[ci].name, std::move(col));
+            }
+            for (const auto& item : nlj_right) {
+                batch.add_column(item.batch_name, *item.column);
+            }
+
+            // Evaluate the predicate against all N_right rows at once.
+            auto mask_res = compute_mask(*predicate, batch, scalars, N_right);
+            if (!mask_res) {
+                return std::unexpected(mask_res.error());
+            }
+
+            bool l_had_match = false;
+            for (std::size_t j = 0; j < N_right; ++j) {
+                const bool match = mask_res->value[j] != 0 &&
+                                   (!mask_res->valid || (*mask_res->valid)[j] != 0);
+                if (!match)
+                    continue;
+                l_had_match = true;
+                if (semi_join) {
+                    append_left_row(l);
+                    break;  // emit left row at most once
+                }
+                if (anti_join) {
+                    break;  // match found — don't emit; skip remaining right rows
+                }
+                append_left_row(l);
+                append_right_row(j);
+                if (preserve_right_rows) {
+                    right_matched_pred[j] = true;
+                }
+            }
+
+            if (!l_had_match) {
+                if (anti_join) {
+                    append_left_row(l);  // anti-join: keep left rows with no match
+                } else if (preserve_left_rows) {
+                    append_left_row(l);
+                    append_right_defaults();  // left/outer: null-pad right side
+                }
+            }
+        }
+
+        if (preserve_right_rows) {
+            for (std::size_t r = 0; r < N_right; ++r) {
+                if (!right_matched_pred[r]) {
+                    append_left_defaults_from_right(r);
+                    append_right_row(r);
+                }
+            }
+        }
+
+        finalize_left_validity();
+        finalize_right_validity();
+        normalize_time_index(output);
+        return output;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Pre-reserve output columns for joins that preserve one side.
     if (preserve_left_rows || preserve_right_rows) {
@@ -7055,7 +7162,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!right) {
                 return std::unexpected(right.error());
             }
-            return join_table_impl(left.value(), right.value(), join.kind(), join.keys());
+            const ir::FilterExpr* pred =
+                join.predicate().has_value() ? join.predicate()->get() : nullptr;
+            return join_table_impl(left.value(), right.value(), join.kind(), join.keys(), pred,
+                                   scalars);
         }
         case ir::NodeKind::Melt: {
             const auto& mn = static_cast<const ir::MeltNode&>(node);

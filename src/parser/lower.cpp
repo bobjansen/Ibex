@@ -95,7 +95,85 @@ class Lowerer {
         if (auto* stream = std::get_if<StreamExpr>(const_cast<decltype(expr.node)*>(&expr.node))) {
             return lower_stream(*stream);
         }
+        if (const auto* tbl = std::get_if<TableExpr>(&expr.node)) {
+            return lower_table_expr(*tbl);
+        }
         return std::unexpected(LowerError{.message = "expected DataFrame expression"});
+    }
+
+    /// Lower a `Table { col = [...], ... }` expression into a ConstructNode.
+    auto lower_table_expr(const TableExpr& tbl) -> LowerResult {
+        std::vector<ir::ConstructColumn> construct_cols;
+        construct_cols.reserve(tbl.columns.size());
+
+        for (const auto& col_def : tbl.columns) {
+            const auto* arr = std::get_if<ArrayLiteralExpr>(&col_def.expr->node);
+            if (arr == nullptr) {
+                return std::unexpected(LowerError{
+                    .message = "Table constructor: column '" + col_def.name +
+                               "' value must be an array literal [...]"});
+            }
+
+            std::vector<ir::Literal> elements;
+            elements.reserve(arr->elements.size());
+
+            // Determine the type from the first element and validate uniformity.
+            int type_tag = -1;  // 0=int, 1=double, 2=bool, 3=string, 4=Date, 5=Timestamp
+            for (const auto& elem_ptr : arr->elements) {
+                const auto* lit = std::get_if<LiteralExpr>(&elem_ptr->node);
+                if (lit == nullptr) {
+                    return std::unexpected(LowerError{
+                        .message = "Table constructor: column '" + col_def.name +
+                                   "' elements must be literals"});
+                }
+                int elem_tag = static_cast<int>(lit->value.index());
+                // Map LiteralExpr variant index to our type tag:
+                // LiteralExpr::value = variant<int64, double, bool, string, DurationLiteral, Date, Timestamp>
+                // DurationLiteral (index 4) is not a valid column element type.
+                if (elem_tag == 4) {
+                    return std::unexpected(LowerError{
+                        .message = "Table constructor: column '" + col_def.name +
+                                   "' duration literals are not valid column elements"});
+                }
+                // Remap: DurationLiteral is index 4, so Date=5→4, Timestamp=6→5
+                int mapped_tag = elem_tag < 4 ? elem_tag : elem_tag - 1;
+                if (type_tag == -1) {
+                    type_tag = mapped_tag;
+                } else if (type_tag != mapped_tag) {
+                    return std::unexpected(LowerError{
+                        .message = "Table constructor: column '" + col_def.name +
+                                   "' has mixed element types"});
+                }
+
+                // Convert LiteralExpr value to ir::Literal
+                ir::Literal ir_lit;
+                std::visit(
+                    [&](const auto& v) {
+                        using T = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<T, std::int64_t>) {
+                            ir_lit.value = v;
+                        } else if constexpr (std::is_same_v<T, double>) {
+                            ir_lit.value = v;
+                        } else if constexpr (std::is_same_v<T, bool>) {
+                            ir_lit.value = v;
+                        } else if constexpr (std::is_same_v<T, std::string>) {
+                            ir_lit.value = v;
+                        } else if constexpr (std::is_same_v<T, Date>) {
+                            ir_lit.value = v;
+                        } else if constexpr (std::is_same_v<T, Timestamp>) {
+                            ir_lit.value = v;
+                        }
+                        // DurationLiteral already excluded above.
+                    },
+                    lit->value);
+                elements.push_back(std::move(ir_lit));
+            }
+
+            construct_cols.push_back(
+                ir::ConstructColumn{.name = col_def.name, .elements = std::move(elements)});
+        }
+
+        return builder_.construct(std::move(construct_cols));
     }
 
     auto lower_table_call(const CallExpr& call) -> LowerResult {

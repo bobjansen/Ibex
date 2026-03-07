@@ -656,6 +656,10 @@ class Parser {
                 }
                 return make_literal(*value);
             }
+            // Table constructor: `Table { col = [...], ... }`
+            if (name == "Table" && check(TokenKind::LBrace)) {
+                return parse_table_expr();
+            }
             if (match(TokenKind::LParen)) {
                 std::vector<ExprPtr> args;
                 std::vector<NamedArg> named_args;
@@ -775,7 +779,63 @@ class Parser {
         if (match(TokenKind::KeywordStream)) {
             return parse_stream_expr();
         }
+        if (match(TokenKind::LBracket)) {
+            return parse_array_literal();
+        }
         return fail_expr(peek(), "expected expression");
+    }
+
+    /// Parse `[expr, expr, ...]` — an array literal (column vector).
+    auto parse_array_literal() -> ExprPtr {
+        // LBracket has already been consumed by the caller.
+        std::vector<ExprPtr> elements;
+        if (!check(TokenKind::RBracket)) {
+            do {
+                auto elem = parse_expression();
+                if (!elem) {
+                    return nullptr;
+                }
+                elements.push_back(std::move(elem));
+            } while (match(TokenKind::Comma));
+        }
+        if (!consume(TokenKind::RBracket, "expected ']' after array literal")) {
+            return nullptr;
+        }
+        auto expr = std::make_unique<Expr>();
+        expr->node = ArrayLiteralExpr{.elements = std::move(elements)};
+        return expr;
+    }
+
+    /// Parse `Table { col = [...], ... }` — a table constructor expression.
+    /// The "Table" identifier has already been consumed by the caller.
+    auto parse_table_expr() -> ExprPtr {
+        if (!consume(TokenKind::LBrace, "expected '{' after 'Table'")) {
+            return nullptr;
+        }
+        std::vector<TableColumnDef> columns;
+        if (!check(TokenKind::RBrace)) {
+            do {
+                auto col_name = consume_column_identifier("expected column name in Table constructor");
+                if (!col_name.has_value()) {
+                    return nullptr;
+                }
+                if (!consume(TokenKind::Eq, "expected '=' after column name in Table constructor")) {
+                    return nullptr;
+                }
+                auto col_expr = parse_expression();
+                if (!col_expr) {
+                    return nullptr;
+                }
+                columns.push_back(TableColumnDef{.name = std::move(*col_name),
+                                                  .expr = std::move(col_expr)});
+            } while (match(TokenKind::Comma));
+        }
+        if (!consume(TokenKind::RBrace, "expected '}' after Table constructor")) {
+            return nullptr;
+        }
+        auto expr = std::make_unique<Expr>();
+        expr->node = TableExpr{.columns = std::move(columns)};
+        return expr;
     }
 
     /// Parse `Stream { source = expr, transform = [clauses...], sink = ident(args...) }`.

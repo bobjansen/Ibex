@@ -203,6 +203,24 @@ struct GroupExpr {
     ExprPtr expr;
 };
 
+/// Array literal: `[expr, expr, ...]` — represents a typed column vector.
+/// All elements must have the same literal type; validated during lowering.
+struct ArrayLiteralExpr {
+    std::vector<ExprPtr> elements;
+};
+
+/// A named column in a Table constructor: `name = [...]`.
+struct TableColumnDef {
+    std::string name;
+    ExprPtr expr;  ///< Expected to be an ArrayLiteralExpr after parsing.
+};
+
+/// Table constructor expression: `Table { col1 = [...], col2 = [...] }`.
+/// All columns must have the same length; validated during lowering.
+struct TableExpr {
+    std::vector<TableColumnDef> columns;
+};
+
 struct JoinExpr {
     JoinKind kind = JoinKind::Inner;
     ExprPtr left;
@@ -227,7 +245,7 @@ struct StreamExpr {
 
 struct Expr {
     std::variant<IdentifierExpr, LiteralExpr, CallExpr, UnaryExpr, BinaryExpr, GroupExpr, BlockExpr,
-                 JoinExpr, StreamExpr>
+                 JoinExpr, StreamExpr, ArrayLiteralExpr, TableExpr>
         node;
 };
 

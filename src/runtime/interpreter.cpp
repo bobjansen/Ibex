@@ -7413,6 +7413,44 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
             return Table{};  // stream execution produces no result table
         }
+        case ir::NodeKind::Construct: {
+            const auto& cn = static_cast<const ir::ConstructNode&>(node);
+            // Validate that all columns have the same length.
+            std::size_t n_rows = 0;
+            if (!cn.columns().empty()) {
+                n_rows = cn.columns()[0].elements.size();
+                for (const auto& col : cn.columns()) {
+                    if (col.elements.size() != n_rows) {
+                        return std::unexpected(
+                            "Table constructor: all columns must have the same length ('" +
+                            col.name + "' has " + std::to_string(col.elements.size()) +
+                            " elements, expected " + std::to_string(n_rows) + ")");
+                    }
+                }
+            }
+            Table result;
+            for (const auto& col : cn.columns()) {
+                if (col.elements.empty()) {
+                    // Empty column: default to Int64
+                    result.add_column(col.name, Column<std::int64_t>{});
+                    continue;
+                }
+                // Determine the column type from the first element and build it.
+                ColumnValue cv = std::visit(
+                    [&](const auto& first_val) -> ColumnValue {
+                        using T = std::decay_t<decltype(first_val)>;
+                        Column<T> col_data;
+                        col_data.reserve(col.elements.size());
+                        for (const auto& lit : col.elements) {
+                            col_data.push_back(std::get<T>(lit.value));
+                        }
+                        return col_data;
+                    },
+                    col.elements[0].value);
+                result.add_column(col.name, std::move(cv));
+            }
+            return result;
+        }
     }
     return std::unexpected("unknown node kind");
 }

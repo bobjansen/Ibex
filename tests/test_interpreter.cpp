@@ -3242,3 +3242,111 @@ TEST_CASE("rep missing positional argument returns error") {
     auto result = runtime::interpret(*ir, registry);
     CHECK_FALSE(result.has_value());
 }
+
+// ─── Table constructor from column vectors ────────────────────────────────────
+
+TEST_CASE("Table constructor creates table from integer columns") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir("Table { price = [10, 20, 30], qty = [1, 2, 3] };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* price = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(price != nullptr);
+    REQUIRE((*price)[0] == 10);
+    REQUIRE((*price)[1] == 20);
+    REQUIRE((*price)[2] == 30);
+
+    const auto* qty = std::get_if<Column<std::int64_t>>(result->find("qty"));
+    REQUIRE(qty != nullptr);
+    REQUIRE((*qty)[0] == 1);
+    REQUIRE((*qty)[1] == 2);
+    REQUIRE((*qty)[2] == 3);
+}
+
+TEST_CASE("Table constructor creates table from string and float columns") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir(R"(Table { symbol = ["A", "B", "C"], price = [1.5, 2.5, 3.5] };)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* symbol = std::get_if<Column<std::string>>(result->find("symbol"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE((*symbol)[0] == "A");
+    REQUIRE((*symbol)[1] == "B");
+    REQUIRE((*symbol)[2] == "C");
+
+    const auto* price = std::get_if<Column<double>>(result->find("price"));
+    REQUIRE(price != nullptr);
+    REQUIRE((*price)[0] == Catch::Approx(1.5));
+    REQUIRE((*price)[1] == Catch::Approx(2.5));
+    REQUIRE((*price)[2] == Catch::Approx(3.5));
+}
+
+TEST_CASE("Table constructor creates table from bool column") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir("Table { active = [true, false, true] };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* active = std::get_if<Column<bool>>(result->find("active"));
+    REQUIRE(active != nullptr);
+    REQUIRE((*active)[0] == true);
+    REQUIRE((*active)[1] == false);
+    REQUIRE((*active)[2] == true);
+}
+
+TEST_CASE("Table constructor creates empty table") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir("Table { };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.empty());
+    REQUIRE(result->rows() == 0);
+}
+
+TEST_CASE("Table constructor can be filtered") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir("Table { x = [1, 2, 3, 4, 5] }[filter x > 3];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE((*x)[0] == 4);
+    REQUIRE((*x)[1] == 5);
+}
+
+TEST_CASE("Table constructor mismatched column lengths returns error") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir("Table { a = [1, 2, 3], b = [4, 5] };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("TimeFrame from Table constructor via as_timeframe") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir(
+        R"(as_timeframe(Table { ts = [1000, 2000, 3000], price = [10, 20, 30] }, "ts");)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->rows() == 3);
+}
+
+TEST_CASE("Table constructor with single column") {
+    runtime::TableRegistry registry;
+    auto ir = require_ir("Table { vals = [42] };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* vals = std::get_if<Column<std::int64_t>>(result->find("vals"));
+    REQUIRE(vals != nullptr);
+    REQUIRE((*vals)[0] == 42);
+}

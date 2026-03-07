@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ibex::codegen {
 
@@ -278,7 +279,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "ibex::ops::make_agg("
                       << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
                       << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
-                      << "\")";
+                      << "\", " << format_double(a.param) << ")";
             }
             *out_ << "});\n";
             return var;
@@ -288,6 +289,16 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             const auto& upd = static_cast<const ir::UpdateNode&>(node);
             auto child = emit_node(require_single_child(upd, "UpdateNode"));
             auto var = fresh_var();
+
+            std::vector<std::pair<std::vector<std::string>, std::string>> tuple_sources;
+            tuple_sources.reserve(upd.tuple_fields().size());
+            for (const auto& tf : upd.tuple_fields()) {
+                if (!tf.source) {
+                    throw std::runtime_error("ibex_compile: UpdateNode tuple source is null");
+                }
+                tuple_sources.emplace_back(tf.aliases, emit_node(*tf.source));
+            }
+
             *out_ << "    auto " << var << " = ibex::ops::update(" << child << ", {\n";
             bool first = true;
             for (const auto& f : upd.fields()) {
@@ -297,7 +308,33 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "        ibex::ops::make_field(\"" << escape_string(f.alias) << "\", "
                       << emit_expr(f.expr) << ")";
             }
-            *out_ << "\n    });\n";
+            *out_ << "\n    }, {";
+
+            bool first_tuple = true;
+            for (const auto& tf : tuple_sources) {
+                if (!first_tuple)
+                    *out_ << ", ";
+                first_tuple = false;
+                *out_ << "ibex::ops::TupleSource{{";
+                bool first_alias = true;
+                for (const auto& alias : tf.first) {
+                    if (!first_alias)
+                        *out_ << ", ";
+                    first_alias = false;
+                    *out_ << '"' << escape_string(alias) << '"';
+                }
+                *out_ << "}, " << tf.second << "}";
+            }
+
+            *out_ << "}, {";
+            bool first_group = true;
+            for (const auto& key : upd.group_by()) {
+                if (!first_group)
+                    *out_ << ", ";
+                first_group = false;
+                *out_ << '"' << escape_string(key.name) << '"';
+            }
+            *out_ << "});\n";
             return var;
         }
 
@@ -325,6 +362,11 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 throw std::runtime_error("ibex_compile: WindowNode must have an UpdateNode child");
             }
             const auto& upd = static_cast<const ir::UpdateNode&>(window_child);
+            if (!upd.tuple_fields().empty() || !upd.group_by().empty()) {
+                throw std::runtime_error(
+                    "ibex_compile: windowed update with tuple fields or by-clause is not "
+                    "supported in the compiled path");
+            }
             auto source = emit_node(require_single_child(upd, "UpdateNode (window payload)"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::windowed_update(" << source << ",\n";
@@ -372,7 +414,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "ibex::ops::make_agg("
                       << "ibex::ir::AggFunc::" << emit_agg_func(a.func) << ", \""
                       << escape_string(a.column.name) << "\", \"" << escape_string(a.alias)
-                      << "\")";
+                      << "\", " << format_double(a.param) << ")";
             }
             *out_ << "});\n";
             return var;
@@ -413,40 +455,57 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             if (!join.children()[0] || !join.children()[1]) {
                 throw std::runtime_error("ibex_compile: JoinNode children must be non-null");
             }
-            if (join.predicate().has_value()) {
-                throw std::runtime_error(
-                    "ibex_compile: non-equijoin predicates are not supported in the compiled "
-                    "path; use the interpreter instead");
-            }
             auto left = emit_node(*join.children()[0]);
             auto right = emit_node(*join.children()[1]);
             auto var = fresh_var();
             const char* fn = nullptr;
+            const char* kind = nullptr;
             switch (join.kind()) {
                 case ir::JoinKind::Inner:
                     fn = "inner_join";
+                    kind = "Inner";
                     break;
                 case ir::JoinKind::Left:
                     fn = "left_join";
+                    kind = "Left";
                     break;
                 case ir::JoinKind::Right:
                     fn = "right_join";
+                    kind = "Right";
                     break;
                 case ir::JoinKind::Outer:
                     fn = "outer_join";
+                    kind = "Outer";
                     break;
                 case ir::JoinKind::Semi:
                     fn = "semi_join";
+                    kind = "Semi";
                     break;
                 case ir::JoinKind::Anti:
                     fn = "anti_join";
+                    kind = "Anti";
                     break;
                 case ir::JoinKind::Cross:
                     fn = "cross_join";
+                    kind = "Cross";
                     break;
                 case ir::JoinKind::Asof:
                     fn = "asof_join";
+                    kind = "Asof";
                     break;
+            }
+            if (join.predicate().has_value()) {
+                *out_ << "    auto " << var << " = ibex::ops::join_with_predicate(" << left << ", "
+                      << right << ", ibex::ir::JoinKind::" << kind << ", {";
+                bool first = true;
+                for (const auto& key : join.keys()) {
+                    if (!first)
+                        *out_ << ", ";
+                    first = false;
+                    *out_ << '"' << escape_string(key) << '"';
+                }
+                *out_ << "}, " << emit_filter_expr(**join.predicate()) << ");\n";
+                return var;
             }
             *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right;
             if (join.kind() != ir::JoinKind::Cross) {
@@ -700,6 +759,19 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                     s += emit_expr(*arg);
                 }
                 s += "})";
+                if (!node.named_args.empty()) {
+                    s.pop_back();  // remove trailing ')'
+                    s += ", {";
+                    bool first_named = true;
+                    for (const auto& narg : node.named_args) {
+                        if (!first_named)
+                            s += ", ";
+                        first_named = false;
+                        s += "ibex::ops::NamedArgExpr{\"" + escape_string(narg.name) + "\", " +
+                             emit_expr(*narg.value) + "}";
+                    }
+                    s += "})";
+                }
                 return s;
             }
             throw std::runtime_error("ibex_compile: unknown expression type");

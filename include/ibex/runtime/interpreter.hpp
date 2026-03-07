@@ -21,9 +21,9 @@ enum class ScalarKind : std::uint8_t {
     Timestamp,
 };
 
-using ColumnValue = std::variant<Column<std::int64_t>, Column<double>, Column<std::string>,
-                                 Column<Categorical>, Column<Date>, Column<Timestamp>,
-                                 Column<bool>>;
+using ColumnValue =
+    std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
+                 Column<Date>, Column<Timestamp>, Column<bool>>;
 using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 
 struct ColumnEntry {
@@ -66,7 +66,9 @@ class ExternRegistry;
     -> std::expected<Table, std::string>;
 
 [[nodiscard]] auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
-                               const std::vector<std::string>& keys)
+                               const std::vector<std::string>& keys,
+                               const ir::FilterExpr* predicate = nullptr,
+                               const ScalarRegistry* scalars = nullptr)
     -> std::expected<Table, std::string>;
 
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)

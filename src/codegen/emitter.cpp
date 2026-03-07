@@ -396,6 +396,11 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             if (join.children().size() != 2) {
                 throw std::runtime_error("ibex_compile: JoinNode expects two children");
             }
+            if (join.predicate().has_value()) {
+                throw std::runtime_error(
+                    "ibex_compile: non-equijoin predicates are not supported in the compiled "
+                    "path; use the interpreter instead");
+            }
             auto left = emit_node(*join.children()[0]);
             auto right = emit_node(*join.children()[1]);
             auto var = fresh_var();

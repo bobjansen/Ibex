@@ -421,3 +421,178 @@ TEST_CASE("join: cross join returns cartesian product", "[join]") {
     CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 1, 1, 2, 2, 2});
     CHECK(col_str(out, "group") == std::vector<std::string>{"A", "B", "C", "A", "B", "C"});
 }
+
+// ─── Non-equijoin / theta join tests ─────────────────────────────────────────
+
+TEST_CASE("non-equijoin: inner join on inequality predicate", "[join][non-equijoin]") {
+    // left.a < right.b  →  only pairs where a < b
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{1, 3, 5});
+
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{2, 4});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // Pairs: (1,2)✓ (1,4)✓ (3,4)✓ (3,2)✗ (5,2)✗ (5,4)✗  → 3 rows
+    auto out = interpret_expr("lhs join rhs on a < b;", tables);
+
+    CHECK(out.rows() == 3);
+    CHECK(col_i64(out, "a") == std::vector<std::int64_t>{1, 1, 3});
+    CHECK(col_i64(out, "b") == std::vector<std::int64_t>{2, 4, 4});
+}
+
+TEST_CASE("non-equijoin: inner join compound predicate (range)", "[join][non-equijoin]") {
+    // Pairs where lo <= val && val < hi
+    runtime::Table ticks;
+    ticks.add_column("val", Column<std::int64_t>{1, 5, 10, 15});
+
+    runtime::Table windows;
+    windows.add_column("lo", Column<std::int64_t>{0, 8});
+    windows.add_column("hi", Column<std::int64_t>{6, 12});
+
+    runtime::TableRegistry tables;
+    tables.emplace("ticks", std::move(ticks));
+    tables.emplace("windows", std::move(windows));
+
+    // val=1:  [0,6)✓ [8,12)✗  → 1 row
+    // val=5:  [0,6)✓ [8,12)✗  → 1 row
+    // val=10: [0,6)✗ [8,12)✓  → 1 row
+    // val=15: [0,6)✗ [8,12)✗  → 0 rows
+    auto out = interpret_expr("ticks join windows on lo <= val && val < hi;", tables);
+
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "val") == std::vector<std::int64_t>{1, 5, 10});
+    CHECK(col_i64(out, "lo")  == std::vector<std::int64_t>{0, 0,  8});
+    CHECK(col_i64(out, "hi")  == std::vector<std::int64_t>{6, 6, 12});
+}
+
+TEST_CASE("non-equijoin: inner join no matches yields empty table", "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{5, 6});
+
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{1, 2});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on a < b;", tables);
+    CHECK(out.rows() == 0);
+}
+
+TEST_CASE("non-equijoin: left join preserves unmatched left rows", "[join][non-equijoin]") {
+    // left rows with no match get null-padded right columns
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{1, 10});  // 10 won't match anything
+
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{2, 3});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // a=1: b=2✓ b=3✓ → 2 rows; a=10: no match → 1 null-padded row
+    auto out = interpret_expr("lhs left join rhs on a < b;", tables);
+
+    REQUIRE(out.rows() == 3);
+    auto a_vals = col_i64(out, "a");
+    CHECK(a_vals == std::vector<std::int64_t>{1, 1, 10});
+
+    // Row 3 (a=10) should have null in b
+    const auto* b_entry = out.find_entry("b");
+    REQUIRE(b_entry != nullptr);
+    CHECK(b_entry->validity.has_value());
+    CHECK((*b_entry->validity)[0] == true);
+    CHECK((*b_entry->validity)[1] == true);
+    CHECK((*b_entry->validity)[2] == false);  // null — no match for a=10
+}
+
+TEST_CASE("non-equijoin: semi join keeps left rows with at least one match",
+          "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{1, 5, 10});
+
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{3, 6});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // a=1: 1<3✓ → keep (once); a=5: 5<6✓ → keep; a=10: 10<3✗ 10<6✗ → drop
+    auto out = interpret_expr("lhs semi join rhs on a < b;", tables);
+
+    REQUIRE(out.rows() == 2);
+    CHECK(col_i64(out, "a") == std::vector<std::int64_t>{1, 5});
+    // Semi join output contains only left columns
+    CHECK(out.find("b") == nullptr);
+}
+
+TEST_CASE("non-equijoin: anti join keeps left rows with no match", "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{1, 5, 10});
+
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{3, 6});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // a=1: 1<3✓ → drop; a=5: 5<6✓ → drop; a=10: no match → keep
+    auto out = interpret_expr("lhs anti join rhs on a < b;", tables);
+
+    REQUIRE(out.rows() == 1);
+    CHECK(col_i64(out, "a") == std::vector<std::int64_t>{10});
+}
+
+TEST_CASE("non-equijoin: right join preserves unmatched right rows", "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{1, 2});
+
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{5, 0});  // b=0: no left row has a > 0? No: a>0 always
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // Predicate: a < b
+    // a=1,b=5: 1<5✓; a=2,b=5: 2<5✓; a=1,b=0: 1<0✗; a=2,b=0: 2<0✗
+    // Matched right rows: b=5 (matched); b=0 (unmatched → null-padded left)
+    auto out = interpret_expr("lhs right join rhs on a < b;", tables);
+
+    REQUIRE(out.rows() == 3);  // 2 matches for b=5, 1 null-padded row for b=0
+    auto b_vals = col_i64(out, "b");
+    // Row order: matched rows first (left-table order), then unmatched right rows
+    CHECK(b_vals[0] == 5);
+    CHECK(b_vals[1] == 5);
+    CHECK(b_vals[2] == 0);
+
+    // b=0 row has null left column
+    const auto* a_entry = out.find_entry("a");
+    REQUIRE(a_entry != nullptr);
+    CHECK(a_entry->validity.has_value());
+    CHECK((*a_entry->validity)[2] == false);
+}
+
+TEST_CASE("non-equijoin: not-equal predicate", "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("x", Column<std::int64_t>{1, 2});
+
+    runtime::Table rhs;
+    rhs.add_column("y", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // x=1: y=2✓ y=3✓; x=2: y=1✓ y=3✓ → 4 rows
+    auto out = interpret_expr("lhs join rhs on x != y;", tables);
+    CHECK(out.rows() == 4);
+}

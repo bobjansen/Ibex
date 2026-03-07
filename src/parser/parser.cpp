@@ -371,15 +371,33 @@ class Parser {
             }
 
             std::vector<std::string> keys;
+            std::optional<ExprPtr> predicate;
             if (kind != JoinKind::Cross) {
                 if (!consume(TokenKind::KeywordOn, "expected 'on' after join expression")) {
                     return nullptr;
                 }
-                auto parsed_keys = parse_join_keys();
-                if (!parsed_keys.has_value()) {
-                    return nullptr;
+                if (check(TokenKind::LBrace)) {
+                    // Brace-list: always equikeys  {k1, k2, ...}
+                    auto parsed_keys = parse_join_keys();
+                    if (!parsed_keys.has_value()) {
+                        return nullptr;
+                    }
+                    keys = std::move(*parsed_keys);
+                } else {
+                    // Parse the on-expression as a full expression.  A bare
+                    // identifier is an equikey (backward compat); any other
+                    // expression is a non-equijoin predicate.
+                    auto on_expr = parse_or();
+                    if (!on_expr) {
+                        return nullptr;
+                    }
+                    if (const auto* ident =
+                            std::get_if<IdentifierExpr>(&on_expr->node)) {
+                        keys.push_back(ident->name);
+                    } else {
+                        predicate = std::move(on_expr);
+                    }
                 }
-                keys = std::move(*parsed_keys);
             }
             auto join = std::make_unique<Expr>();
             join->node = JoinExpr{
@@ -387,6 +405,7 @@ class Parser {
                 .left = std::move(expr),
                 .right = std::move(right),
                 .keys = std::move(keys),
+                .predicate = std::move(predicate),
             };
             expr = std::move(join);
         }

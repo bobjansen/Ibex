@@ -325,15 +325,18 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Joins</span>
-          <h3>Inner, left, right, outer, semi, anti, cross, and as-of — written as natural prose.</h3>
+          <h3>Inner, left, right, outer, semi, anti, cross, as-of — and non-equijoin predicates.</h3>
           <p>
             The <strong>as-of join</strong> attaches the latest right row
             at-or-before each left timestamp. It is the standard pattern for
             enriching tick data with bar data, without look-ahead bias.
           </p>
           <p>
-            Join keys are named with <code>on</code>. Both tables must be
-            <code>TimeFrame</code>s for an asof join.
+            Join keys are named with <code>on</code>. When the expression after
+            <code>on</code> is a comparison or boolean expression rather than a
+            column name, it becomes a <strong>non-equijoin predicate</strong>
+            (theta join) evaluated for every pair of rows.
+            Both tables must be <code>TimeFrame</code>s for an asof join.
           </p>
         </div>
         <div class="tour-code">
@@ -357,6 +360,9 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
 
 <span class="cm">// Cross join — cartesian product</span>
 <span class="kw">let</span> cartesian = prices <span class="kw">cross join</span> metadata;
+
+<span class="cm">// Non-equijoin — pair rows where a column satisfies an inequality</span>
+<span class="kw">let</span> events = ticks <span class="kw">join</span> windows <span class="kw">on</span> ts &gt;= start &amp;&amp; ts &lt; end;
 
 <span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
 <span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);

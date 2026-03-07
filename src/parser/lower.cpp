@@ -31,8 +31,7 @@ class Lowerer {
                 }
                 // Track externs whose first argument is a DataFrame — these are sink candidates
                 // (e.g. write_csv, udp_send).  lower_stream uses this to validate sink calls.
-                if (!ext->params.empty() &&
-                    ext->params[0].type.kind == Type::Kind::DataFrame) {
+                if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
                     sink_externs_.insert(ext->name);
                 }
                 continue;
@@ -135,27 +134,27 @@ class Lowerer {
             for (const auto& elem_ptr : arr->elements) {
                 const auto* lit = std::get_if<LiteralExpr>(&elem_ptr->node);
                 if (lit == nullptr) {
-                    return std::unexpected(LowerError{
-                        .message = "Table constructor: column '" + col_def.name +
-                                   "' elements must be literals"});
+                    return std::unexpected(LowerError{.message = "Table constructor: column '" +
+                                                                 col_def.name +
+                                                                 "' elements must be literals"});
                 }
                 int elem_tag = static_cast<int>(lit->value.index());
                 // Map LiteralExpr variant index to our type tag:
-                // LiteralExpr::value = variant<int64, double, bool, string, DurationLiteral, Date, Timestamp>
-                // DurationLiteral (index 4) is not a valid column element type.
+                // LiteralExpr::value = variant<int64, double, bool, string, DurationLiteral, Date,
+                // Timestamp> DurationLiteral (index 4) is not a valid column element type.
                 if (elem_tag == 4) {
-                    return std::unexpected(LowerError{
-                        .message = "Table constructor: column '" + col_def.name +
-                                   "' duration literals are not valid column elements"});
+                    return std::unexpected(
+                        LowerError{.message = "Table constructor: column '" + col_def.name +
+                                              "' duration literals are not valid column elements"});
                 }
                 // Remap: DurationLiteral is index 4, so Date=5→4, Timestamp=6→5
                 int mapped_tag = elem_tag < 4 ? elem_tag : elem_tag - 1;
                 if (type_tag == -1) {
                     type_tag = mapped_tag;
                 } else if (type_tag != mapped_tag) {
-                    return std::unexpected(LowerError{
-                        .message = "Table constructor: column '" + col_def.name +
-                                   "' has mixed element types"});
+                    return std::unexpected(LowerError{.message = "Table constructor: column '" +
+                                                                 col_def.name +
+                                                                 "' has mixed element types"});
                 }
 
                 // Convert LiteralExpr value to ir::Literal
@@ -338,21 +337,17 @@ class Lowerer {
         if (state.resample && state.update) {
             return std::unexpected(LowerError{.message = "resample cannot be used with update"});
         }
-        if (state.melt &&
-            (state.update || state.distinct || state.dcast || state.by || state.window ||
-             state.resample || state.rename)) {
+        if (state.melt && (state.update || state.distinct || state.dcast || state.by ||
+                           state.window || state.resample || state.rename)) {
             return std::unexpected(LowerError{
-                .message =
-                    "melt is mutually exclusive with update, distinct, dcast, by, window, "
-                    "resample, and rename"});
+                .message = "melt is mutually exclusive with update, distinct, dcast, by, window, "
+                           "resample, and rename"});
         }
-        if (state.dcast &&
-            (state.update || state.distinct || state.melt || state.window || state.resample ||
-             state.rename)) {
+        if (state.dcast && (state.update || state.distinct || state.melt || state.window ||
+                            state.resample || state.rename)) {
             return std::unexpected(LowerError{
-                .message =
-                    "dcast is mutually exclusive with update, distinct, melt, window, "
-                    "resample, and rename"});
+                .message = "dcast is mutually exclusive with update, distinct, melt, window, "
+                           "resample, and rename"});
         }
         if (state.dcast && !state.select) {
             return std::unexpected(
@@ -394,7 +389,7 @@ class Lowerer {
             node = std::move(aggregate.value());
         } else if (!state.resample && !state.melt && !state.dcast && state.select) {
             auto project = lower_select_projection(state.select->fields, state.select->tuple_fields,
-                                                     std::move(node));
+                                                   std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
             }
@@ -735,8 +730,8 @@ class Lowerer {
     }
 
     auto lower_select_projection(const std::vector<Field>& clause_fields,
-                                  const std::vector<TupleField>& tuple_fields,
-                                  ir::NodePtr base) -> std::expected<ir::NodePtr, LowerError> {
+                                 const std::vector<TupleField>& tuple_fields, ir::NodePtr base)
+        -> std::expected<ir::NodePtr, LowerError> {
         std::vector<ir::FieldSpec> fields;
         std::vector<ir::ColumnRef> columns;
         fields.reserve(clause_fields.size());
@@ -843,8 +838,8 @@ class Lowerer {
             }
             const auto* ident = std::get_if<IdentifierExpr>(&field.expr->node);
             if (ident == nullptr) {
-                return std::unexpected(LowerError{
-                    .message = "rename: right-hand side must be a plain column name"});
+                return std::unexpected(
+                    LowerError{.message = "rename: right-hand side must be a plain column name"});
             }
             renames.push_back(ir::RenameSpec{.new_name = field.name, .old_name = ident->name});
         }
@@ -1159,8 +1154,7 @@ class Lowerer {
                         if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
                             if (const auto* dv = std::get_if<double>(&lit->value)) {
                                 alpha = *dv;
-                            } else if (const auto* iv =
-                                           std::get_if<std::int64_t>(&lit->value)) {
+                            } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
                                 alpha = static_cast<double>(*iv);
                             } else {
                                 return std::unexpected(LowerError{
@@ -1195,8 +1189,7 @@ class Lowerer {
                         if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
                             if (const auto* dv = std::get_if<double>(&lit->value)) {
                                 p = *dv;
-                            } else if (const auto* iv =
-                                           std::get_if<std::int64_t>(&lit->value)) {
+                            } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
                                 p = static_cast<double>(*iv);
                             } else {
                                 return std::unexpected(LowerError{
@@ -1343,23 +1336,22 @@ class Lowerer {
                     }
                 } else {
                     return std::unexpected(LowerError{
-                        .message =
-                            "second argument of ewma() must be a numeric literal (alpha)"});
+                        .message = "second argument of ewma() must be a numeric literal (alpha)"});
                 }
                 aggs.push_back(ir::AggSpec{.func = func.value(),
-                                            .column = {.name = ident->name},
-                                            .alias = field.name,
-                                            .param = alpha});
+                                           .column = {.name = ident->name},
+                                           .alias = field.name,
+                                           .param = alpha});
                 continue;
             }
             if (call->callee == "quantile") {
                 if (call->args.size() != 2)
-                    return std::unexpected(
-                        LowerError{.message = "quantile() takes two arguments: quantile(column, p)"});
+                    return std::unexpected(LowerError{
+                        .message = "quantile() takes two arguments: quantile(column, p)"});
                 const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
                 if (ident == nullptr)
-                    return std::unexpected(
-                        LowerError{.message = "first argument of quantile() must be a column name"});
+                    return std::unexpected(LowerError{
+                        .message = "first argument of quantile() must be a column name"});
                 double p = 0.0;
                 if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
                     if (const auto* dv = std::get_if<double>(&lit->value)) {
@@ -1373,13 +1365,12 @@ class Lowerer {
                     }
                 } else {
                     return std::unexpected(LowerError{
-                        .message =
-                            "second argument of quantile() must be a numeric literal (p)"});
+                        .message = "second argument of quantile() must be a numeric literal (p)"});
                 }
                 aggs.push_back(ir::AggSpec{.func = func.value(),
-                                            .column = {.name = ident->name},
-                                            .alias = field.name,
-                                            .param = p});
+                                           .column = {.name = ident->name},
+                                           .alias = field.name,
+                                           .param = p});
                 continue;
             }
             if (call->args.size() != 1)
@@ -1570,59 +1561,93 @@ class Lowerer {
 
     // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
     auto clone_node(const ir::Node& node) -> ir::NodePtr {
+        auto clone_tuple_fields = [&](const std::vector<ir::TupleFieldSpec>& tuple_fields) {
+            std::vector<ir::TupleFieldSpec> cloned;
+            cloned.reserve(tuple_fields.size());
+            for (const auto& tf : tuple_fields) {
+                cloned.push_back(ir::TupleFieldSpec{
+                    .aliases = tf.aliases,
+                    .source = tf.source ? clone_node(*tf.source) : nullptr,
+                });
+            }
+            return cloned;
+        };
+        auto clone_construct_columns = [&](const std::vector<ir::ConstructColumn>& columns) {
+            std::vector<ir::ConstructColumn> cloned;
+            cloned.reserve(columns.size());
+            for (const auto& col : columns) {
+                ir::ConstructColumn cc;
+                cc.name = col.name;
+                cc.elements = col.elements;
+                if (col.expr_node) {
+                    cc.expr_node = clone_node(*col.expr_node);
+                }
+                cloned.push_back(std::move(cc));
+            }
+            return cloned;
+        };
+
+        ir::NodePtr clone;
         switch (node.kind()) {
             case ir::NodeKind::Scan: {
                 const auto& scan = static_cast<const ir::ScanNode&>(node);
-                auto clone = builder_.scan(scan.source_name());
-                return clone;
+                clone = builder_.scan(scan.source_name());
+                break;
             }
             case ir::NodeKind::Filter: {
                 const auto& filter = static_cast<const ir::FilterNode&>(node);
-                auto clone = builder_.filter(clone_filter_expr(filter.predicate()));
-                return clone;
+                clone = builder_.filter(clone_filter_expr(filter.predicate()));
+                break;
             }
             case ir::NodeKind::Project: {
                 const auto& project = static_cast<const ir::ProjectNode&>(node);
-                auto clone = builder_.project(project.columns());
-                return clone;
+                clone = builder_.project(project.columns());
+                break;
             }
             case ir::NodeKind::Distinct: {
-                return builder_.distinct();
+                clone = builder_.distinct();
+                break;
             }
             case ir::NodeKind::Order: {
                 const auto& order = static_cast<const ir::OrderNode&>(node);
-                return builder_.order(order.keys());
+                clone = builder_.order(order.keys());
+                break;
             }
             case ir::NodeKind::Aggregate: {
                 const auto& agg = static_cast<const ir::AggregateNode&>(node);
-                auto clone = builder_.aggregate(agg.group_by(), agg.aggregations());
-                return clone;
+                clone = builder_.aggregate(agg.group_by(), agg.aggregations());
+                break;
             }
             case ir::NodeKind::Update: {
                 const auto& update = static_cast<const ir::UpdateNode&>(node);
-                auto clone = builder_.update(update.fields(), {}, update.group_by());
-                return clone;
+                clone = builder_.update(update.fields(), clone_tuple_fields(update.tuple_fields()),
+                                        update.group_by());
+                break;
             }
             case ir::NodeKind::Rename: {
                 const auto& rename = static_cast<const ir::RenameNode&>(node);
-                return builder_.rename(rename.renames());
+                clone = builder_.rename(rename.renames());
+                break;
             }
             case ir::NodeKind::Window: {
                 const auto& window = static_cast<const ir::WindowNode&>(node);
-                auto clone = builder_.window(window.duration());
-                return clone;
+                clone = builder_.window(window.duration());
+                break;
             }
             case ir::NodeKind::Resample: {
                 const auto& rs = static_cast<const ir::ResampleNode&>(node);
-                return builder_.resample(rs.duration(), rs.group_by(), rs.aggregations());
+                clone = builder_.resample(rs.duration(), rs.group_by(), rs.aggregations());
+                break;
             }
             case ir::NodeKind::AsTimeframe: {
                 const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
-                return builder_.as_timeframe(atf.column());
+                clone = builder_.as_timeframe(atf.column());
+                break;
             }
             case ir::NodeKind::ExternCall: {
                 const auto& ec = static_cast<const ir::ExternCallNode&>(node);
-                return builder_.extern_call(ec.callee(), ec.args());
+                clone = builder_.extern_call(ec.callee(), ec.args());
+                break;
             }
             case ir::NodeKind::Join: {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
@@ -1630,21 +1655,44 @@ class Lowerer {
                 if (join.predicate().has_value()) {
                     pred_clone = clone_filter_expr(**join.predicate());
                 }
-                return builder_.join(join.kind(), join.keys(), std::move(pred_clone));
+                clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone));
+                break;
             }
             case ir::NodeKind::Melt: {
                 const auto& mn = static_cast<const ir::MeltNode&>(node);
-                return builder_.melt(mn.id_columns(), mn.measure_columns());
+                clone = builder_.melt(mn.id_columns(), mn.measure_columns());
+                break;
             }
             case ir::NodeKind::Dcast: {
                 const auto& dn = static_cast<const ir::DcastNode&>(node);
-                return builder_.dcast(dn.pivot_column(), dn.value_column(), dn.row_keys());
+                clone = builder_.dcast(dn.pivot_column(), dn.value_column(), dn.row_keys());
+                break;
             }
-            case ir::NodeKind::Stream:
-                // StreamNode is not cloned during block lowering.
-                return nullptr;
+            case ir::NodeKind::Construct: {
+                const auto& cn = static_cast<const ir::ConstructNode&>(node);
+                clone = builder_.construct(clone_construct_columns(cn.columns()));
+                break;
+            }
+            case ir::NodeKind::Stream: {
+                const auto& stream = static_cast<const ir::StreamNode&>(node);
+                clone = builder_.stream(stream.source_callee(), stream.source_args(),
+                                        stream.sink_callee(), stream.sink_args(),
+                                        stream.stream_kind(), stream.bucket_duration());
+                break;
+            }
         }
-        return nullptr;
+
+        if (!clone) {
+            return nullptr;
+        }
+        for (const auto& child : node.children()) {
+            if (!child) {
+                clone->add_child(nullptr);
+                continue;
+            }
+            clone->add_child(clone_node(*child));
+        }
+        return clone;
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
 
@@ -1688,8 +1736,9 @@ class Lowerer {
                 LowerError{.message = "Stream 'source' must be a function call expression"});
         }
         if (!table_externs_.contains(src_call->callee)) {
-            return std::unexpected(LowerError{.message = "Stream source '" + src_call->callee +
-                                                         "' is not a known table-returning extern"});
+            return std::unexpected(
+                LowerError{.message = "Stream source '" + src_call->callee +
+                                      "' is not a known table-returning extern"});
         }
         std::vector<ir::Expr> source_args;
         source_args.reserve(src_call->args.size());
@@ -1721,7 +1770,8 @@ class Lowerer {
         // lower_block path handles clause ordering and validation.
         auto base_ident = std::make_unique<Expr>();
         base_ident->node = IdentifierExpr{.name = "__stream_input__"};
-        BlockExpr synthetic_block{.base = std::move(base_ident), .clauses = std::move(stream.transform)};
+        BlockExpr synthetic_block{.base = std::move(base_ident),
+                                  .clauses = std::move(stream.transform)};
         auto transform_ir = lower_block(synthetic_block);
         if (!transform_ir.has_value()) {
             return transform_ir;
@@ -1739,9 +1789,8 @@ class Lowerer {
         }
 
         // Build the StreamNode; transform IR is stored as child[0].
-        auto node = builder_.stream(src_call->callee, std::move(source_args),
-                                    stream.sink_callee, std::move(sink_args),
-                                    kind, bucket_duration);
+        auto node = builder_.stream(src_call->callee, std::move(source_args), stream.sink_callee,
+                                    std::move(sink_args), kind, bucket_duration);
         node->add_child(std::move(transform_ir.value()));
         return node;
     }

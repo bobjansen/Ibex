@@ -1,0 +1,4 @@
+let lhs = Table { a = [1, 3, 5] };
+let rhs = Table { b = [2, 4] };
+let j = lhs join rhs on a < b;
+j[select { a, b }][order { a asc, b asc }];

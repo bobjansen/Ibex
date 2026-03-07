@@ -52,3 +52,13 @@ if(IBEX_HAS_AVX2)
 endif()
 
 catch_discover_tests(ibex_tests)
+
+if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin)
+    add_test(
+        NAME ibex_parity_interpreter_vs_transpiled
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "BUILD_DIR=${PROJECT_BINARY_DIR}"
+            "CXX=${CMAKE_CXX_COMPILER}"
+            "${PROJECT_SOURCE_DIR}/tests/parity/run_parity.sh"
+    )
+endif()

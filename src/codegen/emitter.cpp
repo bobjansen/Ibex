@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ibex::codegen {
 
@@ -171,6 +172,9 @@ void Emitter::collect_extern_calls(const ir::Node& node) {
         return;
     }
     for (const auto& child : node.children()) {
+        if (!child) {
+            throw std::runtime_error("ibex_compile: IR contains a null child node");
+        }
         collect_extern_calls(*child);
     }
 }
@@ -182,6 +186,15 @@ auto Emitter::fresh_var() -> std::string {
 }
 
 auto Emitter::emit_node(const ir::Node& node) -> std::string {
+    const auto require_single_child = [](const ir::Node& parent,
+                                         std::string_view node_name) -> const ir::Node& {
+        if (parent.children().size() != 1 || !parent.children().front()) {
+            throw std::runtime_error("ibex_compile: " + std::string(node_name) +
+                                     " expects exactly one non-null child");
+        }
+        return *parent.children().front();
+    };
+
     // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
     switch (node.kind()) {
         case ir::NodeKind::Scan:
@@ -191,7 +204,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Filter: {
             const auto& filter = static_cast<const ir::FilterNode&>(node);
-            auto child = emit_node(*filter.children().front());
+            auto child = emit_node(require_single_child(filter, "FilterNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::filter(" << child << ", "
                   << emit_filter_expr(filter.predicate()) << ");\n";
@@ -200,7 +213,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Project: {
             const auto& proj = static_cast<const ir::ProjectNode&>(node);
-            auto child = emit_node(*proj.children().front());
+            auto child = emit_node(require_single_child(proj, "ProjectNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::project(" << child << ", {";
             bool first = true;
@@ -215,7 +228,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         }
 
         case ir::NodeKind::Distinct: {
-            auto child = emit_node(*node.children().front());
+            auto child = emit_node(require_single_child(node, "DistinctNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::distinct(" << child << ");\n";
             return var;
@@ -223,7 +236,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Order: {
             const auto& order = static_cast<const ir::OrderNode&>(node);
-            auto child = emit_node(*order.children().front());
+            auto child = emit_node(require_single_child(order, "OrderNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::order(" << child << ", {";
             bool first = true;
@@ -240,7 +253,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);
-            auto child = emit_node(*agg.children().front());
+            auto child = emit_node(require_single_child(agg, "AggregateNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::aggregate(" << child << ",\n";
 
@@ -273,7 +286,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Update: {
             const auto& upd = static_cast<const ir::UpdateNode&>(node);
-            auto child = emit_node(*upd.children().front());
+            auto child = emit_node(require_single_child(upd, "UpdateNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::update(" << child << ", {\n";
             bool first = true;
@@ -290,7 +303,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Rename: {
             const auto& ren = static_cast<const ir::RenameNode&>(node);
-            auto child = emit_node(*ren.children().front());
+            auto child = emit_node(require_single_child(ren, "RenameNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::rename(" << child << ", {";
             bool first = true;
@@ -307,11 +320,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Window: {
             const auto& win = static_cast<const ir::WindowNode&>(node);
-            if (win.children().empty() || win.children().front()->kind() != ir::NodeKind::Update) {
+            const auto& window_child = require_single_child(win, "WindowNode");
+            if (window_child.kind() != ir::NodeKind::Update) {
                 throw std::runtime_error("ibex_compile: WindowNode must have an UpdateNode child");
             }
-            const auto& upd = static_cast<const ir::UpdateNode&>(*win.children().front());
-            auto source = emit_node(*upd.children().front());
+            const auto& upd = static_cast<const ir::UpdateNode&>(window_child);
+            auto source = emit_node(require_single_child(upd, "UpdateNode (window payload)"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::windowed_update(" << source << ",\n";
             *out_ << "        ibex::ir::Duration(" << win.duration().count() << "LL),\n";
@@ -330,7 +344,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Resample: {
             const auto& rs = static_cast<const ir::ResampleNode&>(node);
-            auto child = emit_node(*rs.children().front());
+            auto child = emit_node(require_single_child(rs, "ResampleNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::resample(" << child << ",\n";
 
@@ -366,7 +380,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::AsTimeframe: {
             const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
-            auto child = emit_node(*atf.children().front());
+            auto child = emit_node(require_single_child(atf, "AsTimeframeNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::as_timeframe(" << child << ", \""
                   << escape_string(atf.column()) << "\");\n";
@@ -395,6 +409,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             const auto& join = static_cast<const ir::JoinNode&>(node);
             if (join.children().size() != 2) {
                 throw std::runtime_error("ibex_compile: JoinNode expects two children");
+            }
+            if (!join.children()[0] || !join.children()[1]) {
+                throw std::runtime_error("ibex_compile: JoinNode children must be non-null");
             }
             if (join.predicate().has_value()) {
                 throw std::runtime_error(
@@ -444,12 +461,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 *out_ << "}";
             }
             *out_ << ");\n";
-                        return var;
+            return var;
         }
 
         case ir::NodeKind::Melt: {
             const auto& mn = static_cast<const ir::MeltNode&>(node);
-            auto child = emit_node(*mn.children().front());
+            auto child = emit_node(require_single_child(mn, "MeltNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::melt(" << child << ", {";
             bool first = true;
@@ -473,7 +490,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
         case ir::NodeKind::Dcast: {
             const auto& dn = static_cast<const ir::DcastNode&>(node);
-            auto child = emit_node(*dn.children().front());
+            auto child = emit_node(require_single_child(dn, "DcastNode"));
             auto var = fresh_var();
             *out_ << "    auto " << var << " = ibex::ops::dcast(" << child << ", \""
                   << escape_string(dn.pivot_column()) << "\", \""
@@ -503,18 +520,19 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     *out_ << "        if (__sub.columns.size() == 1) {\n";
                     *out_ << "            auto __entry = __sub.columns[0];\n";
                     *out_ << "            __entry.name = \"" << cname << "\";\n";
-                    *out_ << "            " << var << ".index[\"" << cname
-                          << "\"] = " << var << ".columns.size();\n";
+                    *out_ << "            " << var << ".index[\"" << cname << "\"] = " << var
+                          << ".columns.size();\n";
                     *out_ << "            " << var << ".columns.push_back(std::move(__entry));\n";
                     *out_ << "        } else {\n";
                     *out_ << "            auto __it = __sub.index.find(\"" << cname << "\");\n";
                     *out_ << "            if (__it == __sub.index.end())\n";
-                    *out_ << "                throw std::runtime_error(\"Table constructor: column '"
-                          << cname << "' not found in expression result\");\n";
+                    *out_
+                        << "                throw std::runtime_error(\"Table constructor: column '"
+                        << cname << "' not found in expression result\");\n";
                     *out_ << "            auto __entry = __sub.columns[__it->second];\n";
                     *out_ << "            __entry.name = \"" << cname << "\";\n";
-                    *out_ << "            " << var << ".index[\"" << cname
-                          << "\"] = " << var << ".columns.size();\n";
+                    *out_ << "            " << var << ".index[\"" << cname << "\"] = " << var
+                          << ".columns.size();\n";
                     *out_ << "            " << var << ".columns.push_back(std::move(__entry));\n";
                     *out_ << "        }\n";
                     *out_ << "    }\n";
@@ -548,7 +566,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                               << "\", ibex::Column<" << type_str << ">{";
                         bool first = true;
                         for (const auto& lit : col.elements) {
-                            if (!first) *out_ << ", ";
+                            if (!first)
+                                *out_ << ", ";
                             first = false;
                             std::visit(
                                 [&](const auto& v) {
@@ -562,10 +581,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                                     } else if constexpr (std::is_same_v<V, std::string>) {
                                         *out_ << '"' << escape_string(v) << '"';
                                     } else if constexpr (std::is_same_v<V, Date>) {
-                                        *out_ << "ibex::Date{std::int32_t{" << std::to_string(v.days) << "}}";
+                                        *out_ << "ibex::Date{std::int32_t{"
+                                              << std::to_string(v.days) << "}}";
                                     } else {
                                         static_assert(std::is_same_v<V, Timestamp>);
-                                        *out_ << "ibex::Timestamp{std::int64_t{" << std::to_string(v.nanos) << "}}";
+                                        *out_ << "ibex::Timestamp{std::int64_t{"
+                                              << std::to_string(v.nanos) << "}}";
                                     }
                                 },
                                 lit.value);
@@ -576,6 +597,10 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             }
             return var;
         }
+
+        case ir::NodeKind::Stream:
+            throw std::runtime_error(
+                "ibex_compile: stream pipelines are not supported in the compiled path");
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     throw std::runtime_error("ibex_compile: unknown IR node kind");
@@ -648,8 +673,8 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                         } else if constexpr (std::is_same_v<V, double>) {
                             return "ibex::ops::dbl_lit(" + format_double(v) + ")";
                         } else if constexpr (std::is_same_v<V, bool>) {
-                            return "ibex::ops::int_lit(std::int64_t{" +
-                                   std::string(v ? "1" : "0") + "})";
+                            return "ibex::ops::int_lit(std::int64_t{" + std::string(v ? "1" : "0") +
+                                   "})";
                         } else if constexpr (std::is_same_v<V, std::string>) {
                             return "ibex::ops::str_lit(\"" + escape_string(v) + "\")";
                         } else if constexpr (std::is_same_v<V, Date>) {

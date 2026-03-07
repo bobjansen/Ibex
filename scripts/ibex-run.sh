@@ -50,6 +50,13 @@ IBEX_INCS=(
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
 
+# Bundled extern headers live under libs/<name> (e.g. libs/csv/csv.hpp).
+if [[ -d "$IBEX_ROOT/libs" ]]; then
+    while IFS= read -r -d '' lib_dir; do
+        IBEX_INCS+=("-I$lib_dir")
+    done < <(find "$IBEX_ROOT/libs" -mindepth 1 -maxdepth 1 -type d -print0)
+fi
+
 # Support both debug (libfmtd.a) and release (libfmt.a) build trees.
 _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
 [[ -f "$_fmt_lib" ]] || _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"

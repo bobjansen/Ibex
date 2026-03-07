@@ -210,6 +210,7 @@ enum class NodeKind : std::uint8_t {
     Melt,
     Dcast,
     Stream,
+    Construct,  ///< Build a Table from inline literal column vectors.
 };
 
 /// How a StreamNode triggers output emission.
@@ -516,6 +517,30 @@ class DcastNode final : public Node {
     std::string pivot_column_;
     std::string value_column_;
     std::vector<std::string> row_keys_;
+};
+
+/// A single named column in a Construct node.
+/// All elements must share the same Literal variant type (validated at lower time).
+struct ConstructColumn {
+    std::string name;
+    std::vector<Literal> elements;
+};
+
+/// Construct node: builds a Table from inline literal column vectors.
+///
+/// Produced by lowering `Table { col1 = [v, ...], col2 = [v, ...] }` expressions.
+/// All columns must have equal length (validated at interpret time).
+class ConstructNode final : public Node {
+   public:
+    ConstructNode(NodeId id, std::vector<ConstructColumn> columns)
+        : Node(NodeKind::Construct, id), columns_(std::move(columns)) {}
+
+    [[nodiscard]] auto columns() const noexcept -> const std::vector<ConstructColumn>& {
+        return columns_;
+    }
+
+   private:
+    std::vector<ConstructColumn> columns_;
 };
 
 /// Stream node: wires a source extern, an anonymous transform, and a sink extern into a

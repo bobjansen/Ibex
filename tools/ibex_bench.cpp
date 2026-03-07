@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <csv.hpp>
 #include <limits>
 #include <string>
@@ -446,7 +447,6 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
     return out;
 }
 
-
 auto verify_join_row_count(const ibex::runtime::Table& result, std::size_t expected_rows,
                            std::string_view label) -> std::optional<std::string> {
     if (result.rows() != expected_rows) {
@@ -556,7 +556,8 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         if (table == nullptr) {
             return "missing prices table";
         }
-        if (auto err = verify_join_row_count(*result, sliced.at("prices").rows(), "null_left_join")) {
+        if (auto err =
+                verify_join_row_count(*result, sliced.at("prices").rows(), "null_left_join")) {
             return *err;
         }
     } else if (query.name == "null_semi_join") {
@@ -649,6 +650,45 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
     return std::nullopt;
 }
 
+struct BenchStats {
+    double total_ms;
+    double avg_ms;
+    double min_ms;
+    double max_ms;
+    double stddev_ms;
+    double p95_ms;
+    double p99_ms;
+};
+
+auto compute_stats(std::vector<double> times) -> BenchStats {
+    double total = 0.0;
+    for (double t : times)
+        total += t;
+    double avg = total / static_cast<double>(times.size());
+    double mn = times[0];
+    double mx = times[0];
+    double sq_sum = 0.0;
+    for (double t : times) {
+        if (t < mn)
+            mn = t;
+        if (t > mx)
+            mx = t;
+        sq_sum += (t - avg) * (t - avg);
+    }
+    double stddev = times.size() > 1 ? std::sqrt(sq_sum / static_cast<double>(times.size())) : 0.0;
+    std::sort(times.begin(), times.end());
+    auto percentile = [&](double p) -> double {
+        double idx = p * static_cast<double>(times.size() - 1);
+        auto lo = static_cast<std::size_t>(idx);
+        double frac = idx - static_cast<double>(lo);
+        if (lo + 1 < times.size()) {
+            return (times[lo] * (1.0 - frac)) + (times[lo + 1] * frac);
+        }
+        return times[lo];
+    };
+    return {total, avg, mn, mx, stddev, percentile(0.95), percentile(0.99)};
+}
+
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
                    std::size_t warmup_iters, std::size_t iters, bool include_parse) -> int {
     auto normalized = normalize_input(query.source);
@@ -676,24 +716,26 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         }
 
         std::size_t last_rows = 0;
-        auto start = std::chrono::steady_clock::now();
+        std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
+            auto t0 = std::chrono::steady_clock::now();
             auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+            auto t1 = std::chrono::steady_clock::now();
             if (!result) {
                 fmt::print("error: interpret failed for {}: {}\n", query.name, result.error());
                 return 1;
             }
             last_rows = result->rows();
+            times[i] =
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0)
+                    .count();
         }
-        auto end = std::chrono::steady_clock::now();
-
-        auto total_ms =
-            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end - start)
-                .count();
-        auto avg_ms = total_ms / static_cast<double>(iters);
-
-        fmt::print("bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, rows={}\n", query.name,
-                   iters, total_ms, avg_ms, last_rows);
+        auto s = compute_stats(std::move(times));
+        fmt::print(
+            "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
+            "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
+            query.name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
+            s.p99_ms, last_rows);
 
         return 0;
     }
@@ -726,20 +768,22 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
     }
 
     std::size_t last_rows = 0;
-    auto start = std::chrono::steady_clock::now();
+    std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
+        auto t0 = std::chrono::steady_clock::now();
         if (run_once(last_rows) != 0) {
             return 1;
         }
+        auto t1 = std::chrono::steady_clock::now();
+        times[i] =
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
     }
-    auto end = std::chrono::steady_clock::now();
-
-    auto total_ms =
-        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end - start).count();
-    auto avg_ms = total_ms / static_cast<double>(iters);
-
-    fmt::print("bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, rows={}\n", query.name, iters,
-               total_ms, avg_ms, last_rows);
+    auto s = compute_stats(std::move(times));
+    fmt::print(
+        "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
+        "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
+        query.name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
+        s.p99_ms, last_rows);
 
     return 0;
 }
@@ -921,7 +965,8 @@ int main(int argc, char** argv) {
                 {"fill_backward", "fill_data[update { v2 = fill_backward(val) }]"},
             };
             for (const auto& query : fill_queries) {
-                status = run_benchmark(query, fill_tables, warmup_iters, iters, saved_include_parse);
+                status =
+                    run_benchmark(query, fill_tables, warmup_iters, iters, saved_include_parse);
                 if (status != 0) {
                     break;
                 }
@@ -978,12 +1023,16 @@ int main(int argc, char** argv) {
                 constexpr std::size_t kCrossLeftRows = 2000;
                 constexpr std::size_t kCrossRightRows = 64;
                 ibex::runtime::TableRegistry cross_reg;
-                cross_reg.emplace("prices_small", slice_table(null_reg.at("prices"), kCrossLeftRows));
-                cross_reg.emplace("lookup_small", slice_table(null_reg.at("lookup"), kCrossRightRows));
+                cross_reg.emplace("prices_small",
+                                  slice_table(null_reg.at("prices"), kCrossLeftRows));
+                cross_reg.emplace("lookup_small",
+                                  slice_table(null_reg.at("lookup"), kCrossRightRows));
                 fmt::print("-- Cross join benchmark subset ({} x {} rows) --\n",
-                           cross_reg.at("prices_small").rows(), cross_reg.at("lookup_small").rows());
+                           cross_reg.at("prices_small").rows(),
+                           cross_reg.at("lookup_small").rows());
 
-                BenchQuery cross_query{"null_cross_join_small", "prices_small cross join lookup_small"};
+                BenchQuery cross_query{"null_cross_join_small",
+                                       "prices_small cross join lookup_small"};
                 if (verify) {
                     if (auto err = verify_benchmark(cross_query, cross_reg, verify_rows)) {
                         fmt::print("error: verify failed for {}: {}\n", cross_query.name, *err);
@@ -1158,7 +1207,8 @@ int main(int argc, char** argv) {
             "melt_wide_to_long",
             "wide[melt {symbol, day}]",
         };
-        status = run_benchmark(melt_query, reshape_tables, warmup_iters, iters, saved_include_parse);
+        status =
+            run_benchmark(melt_query, reshape_tables, warmup_iters, iters, saved_include_parse);
 
         // Build the long table for dcast benchmark
         if (status == 0) {
@@ -1169,7 +1219,8 @@ int main(int argc, char** argv) {
             auto long_result =
                 ibex::runtime::interpret(*melt_lowered.value(), reshape_tables, &melt_scalars);
             if (!long_result) {
-                fmt::print("error: failed to build long table for dcast: {}\n", long_result.error());
+                fmt::print("error: failed to build long table for dcast: {}\n",
+                           long_result.error());
                 return 1;
             }
 

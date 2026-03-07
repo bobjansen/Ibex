@@ -99,8 +99,8 @@ GEN_DATA="$SCRIPT_DIR/data/gen_data.py"
 
 mkdir -p "$DATA_ROOT" "$RESULT_ROOT" "$(dirname "$COMBINED_TSV")"
 
-printf "dataset_rows\tframework\tquery\tavg_ms\trows\n" > "$COMBINED_TSV"
-printf "dataset_rows,framework,query,avg_ms,rows\n" > "$COMBINED_CSV"
+printf "dataset_rows\tframework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\n" > "$COMBINED_TSV"
+printf "dataset_rows,framework,query,avg_ms,min_ms,max_ms,stddev_ms,p95_ms,p99_ms,rows\n" > "$COMBINED_CSV"
 
 append_tagged_results() {
     local dataset_rows="$1"
@@ -119,7 +119,7 @@ append_tagged_results() {
         BEGIN { FS="\t"; OFS="," }
         {
             sub(/\r$/, "", $0)
-            print n, $1, $2, $3, $4
+            print n, $1, $2, $3, $4, $5, $6, $7, $8, $9
         }
     ' >> "$COMBINED_CSV"
 }

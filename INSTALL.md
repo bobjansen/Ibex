@@ -30,10 +30,19 @@ cmake --build build-release --parallel
 ./build/tools/ibex
 ```
 
-## CSV Plugin (built with core)
+## CSV and JSON Plugins (built with core)
+
+Both CSV and JSON plugins are built automatically with the core:
 
 ```
 IBEX_LIBRARY_PATH=./build/tools ./build/tools/ibex
+```
+
+```ibex
+import "csv";
+import "json";
+let df = read_csv("data.csv");
+write_json(df, "data.json");
 ```
 
 ## Parquet Plugin (standalone)

@@ -1781,8 +1781,16 @@ additional functions, but the recommended path for custom functionality is
 
 ### 12.1 I/O Functions
 
-I/O is provided exclusively via `extern fn` plugins rather than built-ins. A
-common example using the bundled CSV plugin:
+I/O is provided exclusively via `extern fn` plugins rather than built-ins.
+The bundled I/O plugins are:
+
+| Plugin | Reader | Writer | Format |
+|--------|--------|--------|--------|
+| `csv`  | `read_csv(path)` | `write_csv(df, path)` | RFC 4180 CSV |
+| `json` | `read_json(path)` | `write_json(df, path)` | JSON array-of-objects / JSON-Lines |
+| `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet |
+
+A common example using the bundled CSV plugin:
 
 ```
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
@@ -1791,6 +1799,27 @@ let iris = read_csv("iris.csv");
 
 `read_csv` infers column types from the input file (Int64, Float64, or String
 per column). The resulting schema is implementation-defined.
+
+The JSON plugin supports three input formats:
+
+```
+extern fn read_json(path: String) -> DataFrame from "json.hpp";
+let df = read_json("data.json");
+```
+
+`read_json` accepts: (1) a JSON array of objects
+(`[{"a":1},{"a":2}]`), (2) JSON-Lines (one object per line), or (3) a single
+JSON object (produces a one-row DataFrame). Type inference follows:
+Int64 → Float64 → Bool → String. Mixed integer/float columns widen to Float64.
+JSON `null` values and missing keys produce null bitmaps.
+
+All plugins can also be loaded via `import` (Section 13.4):
+
+```
+import "json";
+let df = read_json("data.json");
+write_json(df, "output.json");
+```
 
 The transpiler emits the `from` path as a `#include` in the generated C++.
 The REPL loads `<stem>.so` from the plugin search path at the point the
@@ -2127,18 +2156,21 @@ itself contains `extern fn` declarations) from the import search path:
 
 ```
 import "udp";
+import "json";
 ```
 
-This locates `udp.ibex` on the import search path, parses its `extern fn`
-declarations, and loads the corresponding shared library (e.g. `udp.so`) via
-the plugin mechanism (Section 10.4). The `import` statement is shorthand for
-manually writing a series of `extern fn` declarations.
+This locates `<name>.ibex` on the import search path, parses its `extern fn`
+declarations, and loads the corresponding shared library (e.g. `udp.so`,
+`json.so`) via the plugin mechanism (Section 10.4). The `import` statement is
+shorthand for manually writing a series of `extern fn` declarations.
 
 `import` accepts either a quoted string or a bare identifier:
 
 ```
 import "udp";      // searches for udp.ibex
 import udp;        // equivalent
+import "json";     // searches for json.ibex
+import json;       // equivalent
 ```
 
 ### 13.5 Execution Model

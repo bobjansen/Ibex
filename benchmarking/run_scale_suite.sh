@@ -169,6 +169,7 @@ for rows in "${SIZES[@]}"; do
         uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/python.tsv" \
             "${py_args[@]}"
@@ -184,6 +185,7 @@ for rows in "${SIZES[@]}"; do
         Rscript "$SCRIPT_DIR/bench_r.R" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/r.tsv" \
             "${r_args[@]}"

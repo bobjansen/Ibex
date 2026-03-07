@@ -21,6 +21,8 @@ struct TupleSource {
     runtime::Table table;
 };
 
+void set_scalars(const runtime::ScalarRegistry* scalars);
+
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.
 

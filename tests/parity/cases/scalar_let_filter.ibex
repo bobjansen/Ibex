@@ -1,0 +1,3 @@
+let k = 15;
+let t = Table { x = [10, 20, 30] };
+t[filter { x > k }][select { x }][order { x asc }];

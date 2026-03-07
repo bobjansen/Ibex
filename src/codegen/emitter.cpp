@@ -488,6 +488,68 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "});\n";
             return var;
         }
+
+        case ir::NodeKind::Construct: {
+            const auto& cn = static_cast<const ir::ConstructNode&>(node);
+            auto var = fresh_var();
+            *out_ << "    ibex::runtime::Table " << var << ";\n";
+            for (const auto& col : cn.columns()) {
+                if (col.elements.empty()) {
+                    *out_ << "    " << var << ".add_column(\"" << escape_string(col.name)
+                          << "\", ibex::Column<std::int64_t>{});\n";
+                    continue;
+                }
+                // Determine column type from first element and emit the add_column call.
+                std::visit(
+                    [&](const auto& first_val) {
+                        using T = std::decay_t<decltype(first_val)>;
+                        std::string type_str;
+                        if constexpr (std::is_same_v<T, std::int64_t>) {
+                            type_str = "std::int64_t";
+                        } else if constexpr (std::is_same_v<T, double>) {
+                            type_str = "double";
+                        } else if constexpr (std::is_same_v<T, bool>) {
+                            type_str = "bool";
+                        } else if constexpr (std::is_same_v<T, std::string>) {
+                            type_str = "std::string";
+                        } else if constexpr (std::is_same_v<T, Date>) {
+                            type_str = "ibex::Date";
+                        } else {
+                            static_assert(std::is_same_v<T, Timestamp>);
+                            type_str = "ibex::Timestamp";
+                        }
+                        *out_ << "    " << var << ".add_column(\"" << escape_string(col.name)
+                              << "\", ibex::Column<" << type_str << ">{";
+                        bool first = true;
+                        for (const auto& lit : col.elements) {
+                            if (!first) *out_ << ", ";
+                            first = false;
+                            std::visit(
+                                [&](const auto& v) {
+                                    using V = std::decay_t<decltype(v)>;
+                                    if constexpr (std::is_same_v<V, std::int64_t>) {
+                                        *out_ << "std::int64_t{" << std::to_string(v) << "}";
+                                    } else if constexpr (std::is_same_v<V, double>) {
+                                        *out_ << format_double(v);
+                                    } else if constexpr (std::is_same_v<V, bool>) {
+                                        *out_ << (v ? "true" : "false");
+                                    } else if constexpr (std::is_same_v<V, std::string>) {
+                                        *out_ << '"' << escape_string(v) << '"';
+                                    } else if constexpr (std::is_same_v<V, Date>) {
+                                        *out_ << "ibex::Date{std::int32_t{" << std::to_string(v.days) << "}}";
+                                    } else {
+                                        static_assert(std::is_same_v<V, Timestamp>);
+                                        *out_ << "ibex::Timestamp{std::int64_t{" << std::to_string(v.nanos) << "}}";
+                                    }
+                                },
+                                lit.value);
+                        }
+                        *out_ << "});\n";
+                    },
+                    col.elements[0].value);
+            }
+            return var;
+        }
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     throw std::runtime_error("ibex_compile: unknown IR node kind");

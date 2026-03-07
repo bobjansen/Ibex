@@ -1,0 +1,24 @@
+// WebSocket plugin — extern fn declarations.
+//
+// Usage:
+//   import "websocket";
+//
+// After importing, the following functions are available:
+//
+//   ws_recv(port: Int) -> DataFrame
+//     Starts a WebSocket server on `port` (if not already running) and blocks
+//     up to 200 ms for an incoming JSON tick message from any connected client.
+//     Returns a one-row DataFrame {ts: Timestamp, symbol: String, price:
+//     Float64, volume: Int} on success.  Returns an empty DataFrame to signal
+//     end-of-stream ({"eof":true} message or WebSocket close frame).  Returns
+//     StreamTimeout when no message arrives — the stream runtime calls the
+//     source again after handling any pending time-bucket flushes.
+//
+//   ws_send(df: DataFrame, port: Int) -> Int
+//     Broadcasts each row of `df` as a JSON WebSocket text frame to all
+//     clients currently connected on `port`.  Creates the server listener on
+//     `port` on first call, so ws_send can be used as a standalone sink
+//     (without ws_recv).  Returns the number of rows sent.
+
+extern fn ws_recv(port: Int) -> DataFrame from "websocket";
+extern fn ws_send(df: DataFrame, port: Int) -> Int from "websocket";

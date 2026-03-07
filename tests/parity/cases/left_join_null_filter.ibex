@@ -1,0 +1,4 @@
+let l = Table { id = [1, 2, 3], v = [10, 20, 30] };
+let r = Table { id = [2, 4], w = [200, 400] };
+let j = l left join r on id;
+j[filter { w is null || v > 15 }][select { id, v, w }][order { id asc }];

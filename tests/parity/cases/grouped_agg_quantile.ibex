@@ -1,0 +1,2 @@
+let t = Table { g = ["a", "a", "b", "b"], x = [1, 3, 2, 4] };
+t[select { q50 = quantile(x, 0.5), n = count() }, by g][order { g asc }];

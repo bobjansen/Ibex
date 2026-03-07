@@ -494,6 +494,32 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             auto var = fresh_var();
             *out_ << "    ibex::runtime::Table " << var << ";\n";
             for (const auto& col : cn.columns()) {
+                if (col.expr_node) {
+                    // Expression column: emit the sub-node then extract the column.
+                    auto sub_var = emit_node(*col.expr_node);
+                    auto cname = escape_string(col.name);
+                    *out_ << "    {\n";
+                    *out_ << "        auto& __sub = " << sub_var << ";\n";
+                    *out_ << "        if (__sub.columns.size() == 1) {\n";
+                    *out_ << "            auto __entry = __sub.columns[0];\n";
+                    *out_ << "            __entry.name = \"" << cname << "\";\n";
+                    *out_ << "            " << var << ".index[\"" << cname
+                          << "\"] = " << var << ".columns.size();\n";
+                    *out_ << "            " << var << ".columns.push_back(std::move(__entry));\n";
+                    *out_ << "        } else {\n";
+                    *out_ << "            auto __it = __sub.index.find(\"" << cname << "\");\n";
+                    *out_ << "            if (__it == __sub.index.end())\n";
+                    *out_ << "                throw std::runtime_error(\"Table constructor: column '"
+                          << cname << "' not found in expression result\");\n";
+                    *out_ << "            auto __entry = __sub.columns[__it->second];\n";
+                    *out_ << "            __entry.name = \"" << cname << "\";\n";
+                    *out_ << "            " << var << ".index[\"" << cname
+                          << "\"] = " << var << ".columns.size();\n";
+                    *out_ << "            " << var << ".columns.push_back(std::move(__entry));\n";
+                    *out_ << "        }\n";
+                    *out_ << "    }\n";
+                    continue;
+                }
                 if (col.elements.empty()) {
                     *out_ << "    " << var << ".add_column(\"" << escape_string(col.name)
                           << "\", ibex::Column<std::int64_t>{});\n";

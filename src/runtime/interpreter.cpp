@@ -7415,27 +7415,39 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
         }
         case ir::NodeKind::Construct: {
             const auto& cn = static_cast<const ir::ConstructNode&>(node);
-            // Validate that all columns have the same length.
-            std::size_t n_rows = 0;
-            if (!cn.columns().empty()) {
-                n_rows = cn.columns()[0].elements.size();
-                for (const auto& col : cn.columns()) {
-                    if (col.elements.size() != n_rows) {
-                        return std::unexpected(
-                            "Table constructor: all columns must have the same length ('" +
-                            col.name + "' has " + std::to_string(col.elements.size()) +
-                            " elements, expected " + std::to_string(n_rows) + ")");
-                    }
-                }
-            }
             Table result;
             for (const auto& col : cn.columns()) {
+                if (col.expr_node) {
+                    // Expression column: evaluate the sub-node to produce a Table,
+                    // then extract the target column from it.
+                    auto sub = interpret_node(*col.expr_node, registry, scalars, externs);
+                    if (!sub.has_value()) return std::unexpected(sub.error());
+                    if (sub->columns.size() == 1) {
+                        // Single-column result: use it regardless of its name.
+                        ColumnEntry entry = sub->columns[0];
+                        entry.name = col.name;
+                        result.index[col.name] = result.columns.size();
+                        result.columns.push_back(std::move(entry));
+                    } else if (auto it = sub->index.find(col.name); it != sub->index.end()) {
+                        // Multi-column result: extract the column matching col.name.
+                        ColumnEntry entry = sub->columns[it->second];
+                        entry.name = col.name;
+                        result.index[col.name] = result.columns.size();
+                        result.columns.push_back(std::move(entry));
+                    } else {
+                        return std::unexpected(
+                            "Table constructor: expression for column '" + col.name +
+                            "' must produce a single-column result or a table containing"
+                            " a column named '" + col.name + "'");
+                    }
+                    continue;
+                }
                 if (col.elements.empty()) {
-                    // Empty column: default to Int64
+                    // Empty array literal: default to Int64
                     result.add_column(col.name, Column<std::int64_t>{});
                     continue;
                 }
-                // Determine the column type from the first element and build it.
+                // Literal column: build from inline values.
                 ColumnValue cv = std::visit(
                     [&](const auto& first_val) -> ColumnValue {
                         using T = std::decay_t<decltype(first_val)>;
@@ -7448,6 +7460,21 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     },
                     col.elements[0].value);
                 result.add_column(col.name, std::move(cv));
+            }
+            // Validate that all columns have the same length.
+            if (!result.columns.empty()) {
+                std::size_t n_rows =
+                    std::visit([](const auto& c) { return c.size(); }, *result.columns[0].column);
+                for (std::size_t i = 1; i < result.columns.size(); ++i) {
+                    std::size_t len = std::visit([](const auto& c) { return c.size(); },
+                                                 *result.columns[i].column);
+                    if (len != n_rows) {
+                        return std::unexpected(
+                            "Table constructor: all columns must have the same length ('" +
+                            result.columns[i].name + "' has " + std::to_string(len) +
+                            " elements, expected " + std::to_string(n_rows) + ")");
+                    }
+                }
             }
             return result;
         }

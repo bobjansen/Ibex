@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -402,18 +403,27 @@ class ExternCallNode final : public Node {
     std::vector<Expr> args_;
 };
 
-/// Join node: combines two tables using key equality (or as-of).
+/// Join node: combines two tables using key equality (or as-of), or a
+/// general non-equijoin predicate (theta join).
 class JoinNode final : public Node {
    public:
-    JoinNode(NodeId id, JoinKind kind, std::vector<std::string> keys)
-        : Node(NodeKind::Join, id), kind_(kind), keys_(std::move(keys)) {}
+    JoinNode(NodeId id, JoinKind kind, std::vector<std::string> keys,
+             std::optional<FilterExprPtr> predicate = std::nullopt)
+        : Node(NodeKind::Join, id),
+          kind_(kind),
+          keys_(std::move(keys)),
+          predicate_(std::move(predicate)) {}
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
     [[nodiscard]] auto keys() const noexcept -> const std::vector<std::string>& { return keys_; }
+    [[nodiscard]] auto predicate() const noexcept -> const std::optional<FilterExprPtr>& {
+        return predicate_;
+    }
 
    private:
     JoinKind kind_;
     std::vector<std::string> keys_;
+    std::optional<FilterExprPtr> predicate_;
 };
 
 /// ResampleNode: time-bucket aggregation on a TimeFrame.

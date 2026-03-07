@@ -79,8 +79,9 @@ class Builder {
                                            std::move(value_column), std::move(row_keys));
     }
 
-    [[nodiscard]] auto join(JoinKind kind, std::vector<std::string> keys) -> NodePtr {
-        return std::make_unique<JoinNode>(next_id(), kind, std::move(keys));
+    [[nodiscard]] auto join(JoinKind kind, std::vector<std::string> keys,
+                            std::optional<FilterExprPtr> predicate = std::nullopt) -> NodePtr {
+        return std::make_unique<JoinNode>(next_id(), kind, std::move(keys), std::move(predicate));
     }
 
     [[nodiscard]] auto stream(std::string source_callee, std::vector<Expr> source_args,

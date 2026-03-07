@@ -594,7 +594,13 @@ expr            = primary
                 | expr "left" "join" expr "on" join_keys
                 | expr "right" "join" expr "on" join_keys
                 | expr "outer" "join" expr "on" join_keys
-                | expr "asof" "join" expr "on" join_keys ;
+                | expr "asof" "join" expr "on" join_keys
+                | expr "join" expr "on" expr
+                | expr "left" "join" expr "on" expr
+                | expr "right" "join" expr "on" expr
+                | expr "outer" "join" expr "on" expr
+                | expr "semi" "join" expr "on" expr
+                | expr "anti" "join" expr "on" expr ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "^" IDENT                      (* scope escape *)
@@ -668,6 +674,11 @@ update_clause   = "update" field_or_list
 
 join_keys       = IDENT
                 | "{" IDENT { "," IDENT } [ "," ] "}" ;
+
+(* When `on` is followed by a brace-list, the identifiers are equijoin keys.
+   When `on` is followed by a bare identifier, that identifier is an equijoin key.
+   When `on` is followed by any other expression (comparison, logical, arithmetic),
+   the expression is a non-equijoin predicate (theta join). *)
 
 (* --- Parameters --- *)
 
@@ -1077,7 +1088,8 @@ the output remains a `TimeFrame`.
 ### 5.5 Join Expressions
 
 Join expressions combine two DataFrames or TimeFrames using one or more key
-columns. The supported surface forms are:
+columns (equijoin) or an arbitrary boolean predicate (non-equijoin / theta join).
+The supported surface forms are:
 
 ```
 A join B on key
@@ -1095,6 +1107,12 @@ A outer join B on { key1, key2 }
 A semi join B on { key1, key2 }
 A anti join B on { key1, key2 }
 A asof join B on { time }
+
+(* Non-equijoin / theta join — any comparison or boolean expression *)
+A join B on a < b
+A left join B on lo <= val && val < hi
+A semi join B on a != b
+A anti join B on score > threshold
 ```
 
 Semantics:
@@ -1111,6 +1129,24 @@ Semantics:
 - `A anti join B on key` keeps left rows that have no right match.
 - `A cross join B` returns the Cartesian product of rows from `A` and `B`.
 - `A asof join B on time` is an as-of join on the TimeFrame index column.
+
+**Non-equijoin / theta join.** When the expression after `on` is a comparison or
+boolean expression (not a bare column name or brace-list), it is treated as a
+join predicate rather than an equality key. A pair of rows `(a, b)` is included
+in the output when the predicate evaluates to true for that pair. All join
+semantics (left outer, semi, anti, etc.) apply — unmatched left rows are
+null-padded in the same way as equijoins.
+
+**Column name resolution in predicates.** Inside a non-equijoin predicate,
+column names are resolved against the combined output schema — the same schema
+that a `cross join` of the two inputs would produce. Right-side column names
+that collide with left-side column names receive a `_right` suffix (e.g. if
+both sides have column `id`, the predicate would reference `id` for the
+left-side value and `id_right` for the right-side value).
+
+Non-equijoin joins use a nested-loop algorithm (O(N×M)) and are therefore
+suited for smaller tables or selective predicates. Equijoin hash-join paths
+are not used when the `on` clause is a predicate expression.
 
 **Row ordering.** The output preserves the left-table row order for all left-side
 rows (both matched and unmatched). For `outer join` and `right join`, unmatched

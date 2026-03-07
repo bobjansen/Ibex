@@ -208,6 +208,7 @@ struct JoinExpr {
     ExprPtr left;
     ExprPtr right;
     std::vector<std::string> keys;
+    std::optional<ExprPtr> predicate;  ///< non-equijoin predicate (mutually exclusive with keys)
 };
 
 /// `Stream { source = call_expr, transform = [clauses...], sink = call_expr }`

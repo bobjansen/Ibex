@@ -3,6 +3,7 @@ include(Catch2Testing)
 add_executable(ibex_tests
     test_column.cpp
     test_csv.cpp
+    test_json.cpp
     test_e2e.cpp
     test_ir_node.cpp
     test_lexer.cpp
@@ -14,7 +15,10 @@ add_executable(ibex_tests
     test_join.cpp
 )
 
-target_include_directories(ibex_tests PRIVATE "${PROJECT_SOURCE_DIR}/libs/csv")
+target_include_directories(ibex_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/libs/csv"
+    "${PROJECT_SOURCE_DIR}/libs/json"
+)
 
 target_link_libraries(ibex_tests
     PRIVATE
@@ -27,6 +31,7 @@ target_link_libraries(ibex_tests
         Ibex::CompilerOptions
         Catch2::Catch2WithMain
         rapidcsv
+        nlohmann_json::nlohmann_json
 )
 
 target_compile_definitions(ibex_tests

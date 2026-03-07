@@ -114,9 +114,9 @@
             Multiple clauses chain in reading order.
           </p>
           <p>
-            Output plugins mirror the input API: <code>write_csv</code> and
-            <code>write_parquet</code> accept a DataFrame and a path and return
-            the number of rows written.
+            Output plugins mirror the input API: <code>write_csv</code>,
+            <code>write_json</code>, and <code>write_parquet</code> accept a
+            DataFrame and a path and return the number of rows written.
           </p>
         </div>
         <div class="tour-code">
@@ -138,10 +138,13 @@ prices[
 <span class="cm">// Write results back to disk</span>
 <span class="kw">extern fn</span> <span class="fn-name">write_csv</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
     <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<span class="kw">extern fn</span> <span class="fn-name">write_json</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"json.hpp"</span>;
 <span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
     <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
 
 <span class="kw">let</span> n = <span class="fn-name">write_csv</span>(active, <span class="str">"out/active.csv"</span>);
+<span class="fn-name">write_json</span>(active, <span class="str">"out/active.json"</span>);
 <span class="fn-name">write_parquet</span>(active, <span class="str">"out/active.parquet"</span>);</code></pre>
         </div>
       </div>

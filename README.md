@@ -264,9 +264,11 @@ df[update { rep2 = rep(price, each=2) }]
 
 ```
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+extern fn write_json(df: DataFrame, path: String) -> Int from "json.hpp";
 extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
 
 let rows_written = write_csv(result, "output.csv");
+write_json(result, "output.json");
 write_parquet(result, "output.parquet");
 ```
 
@@ -530,8 +532,9 @@ available on the system (e.g. `libreadline-dev` on Debian/Ubuntu).
 
 ## Plugins
 
-Ibex data-source functions (e.g. `read_csv`, `read_parquet`) are **plugins** —
-shared libraries loaded at runtime when a script declares an `extern fn`.
+Ibex data-source functions (e.g. `read_csv`, `read_json`, `read_parquet`) are
+**plugins** — shared libraries loaded at runtime when a script declares an
+`extern fn`.
 
 When the REPL encounters:
 
@@ -542,6 +545,23 @@ extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 it looks for `csv.so` in the plugin search path and calls its
 `ibex_register(ExternRegistry*)` entry point to register the function.
 
+**Bundled plugins:**
+
+| Plugin | Functions | Format |
+|--------|-----------|--------|
+| `csv`  | `read_csv`, `write_csv` | RFC 4180 CSV with type inference |
+| `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |
+| `parquet` | `read_parquet`, `write_parquet` | Apache Parquet via Arrow |
+| `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
+
+Use `import` to load a plugin without explicit `extern fn` declarations:
+
+```ibex
+import "json";
+let df = read_json("data.json");
+write_json(df, "output.json");
+```
+
 `csv.so` also supports an optional null-spec argument:
 
 ```ibex
@@ -551,6 +571,11 @@ let df = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
 
 `<empty>` marks empty fields as null; additional comma-separated tokens are
 also treated as null.
+
+`json.so` reads JSON arrays of objects, JSON-Lines (one object per line), or a
+single JSON object. Type inference follows the same priority as CSV: Int64,
+Float64, Bool, String. Missing keys and JSON `null` values produce null
+bitmaps.
 
 ### Writing your own plugin
 

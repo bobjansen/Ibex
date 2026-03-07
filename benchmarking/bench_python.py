@@ -328,7 +328,9 @@ def bench_polars_fill(n_rows, warmup, iters):
     vals = np.where(np.arange(n_rows) % 2 == 0,
                     100.0 + (np.arange(n_rows) % 100).astype(float),
                     np.nan)
-    df_fill = pl.DataFrame({"val": vals})
+    # Polars treats NaN and null distinctly; convert NaN -> null once so fill_*
+    # benchmarks measure null-handling work (same semantics as Ibex/R).
+    df_fill = pl.DataFrame({"val": vals}).with_columns(pl.col("val").fill_nan(None))
     rows = []
 
     def run(name, fn):

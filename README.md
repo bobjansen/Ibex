@@ -27,6 +27,32 @@ let enriched = prices join ohlc on symbol;
 
 ## Language at a glance
 
+### Inline table construction
+
+Build a `DataFrame` or `TimeFrame` directly from column vectors — no file or
+extern function needed:
+
+```
+// DataFrame from literal column vectors
+let t = Table {
+    symbol = ["AAPL", "GOOG", "MSFT"],
+    price  = [150.0, 140.0, 300.0],
+    volume = [1000, 2000, 1500],
+};
+
+// Chain operations directly on the inline table
+t[filter price > 145.0, select { symbol, price }];
+
+// Promote to TimeFrame via as_timeframe
+let tf = as_timeframe(
+    Table { ts = [1000, 2000, 3000], price = [10, 20, 30] },
+    "ts"
+);
+```
+
+All columns must have the same length. Supported element types: `Int64`,
+`Float64`, `Bool`, `String`, `Date`, and `Timestamp`.
+
 ### Load and filter
 
 ```

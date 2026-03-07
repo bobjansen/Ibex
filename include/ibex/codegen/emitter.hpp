@@ -3,9 +3,11 @@
 #include <ibex/ir/node.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace ibex::codegen {
@@ -17,10 +19,15 @@ namespace ibex::codegen {
 class Emitter {
    public:
     struct Config {
+        using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
+
         /// Header files to #include (from extern fn declarations).
         std::vector<std::string> extern_headers;
         /// Source file name shown in the generated comment.
         std::string source_name;
+        /// Scalar bindings captured from `let` statements and initialized
+        /// before the emitted query executes.
+        std::vector<std::pair<std::string, ScalarValue>> scalar_bindings;
         /// Whether to emit ibex::ops::print() for the final result.
         bool print_result = true;
         /// Emit a self-contained benchmark harness: data is loaded once

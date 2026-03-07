@@ -105,6 +105,32 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     out << "\n";
     out << "int main() {\n";
 
+    if (!config.scalar_bindings.empty()) {
+        out << "    ibex::runtime::ScalarRegistry _ibex_scalars;\n";
+        for (const auto& [name, value] : config.scalar_bindings) {
+            out << "    _ibex_scalars[\"" << escape_string(name) << "\"] = ";
+            std::visit(
+                [&](const auto& v) {
+                    using V = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<V, std::int64_t>) {
+                        out << "std::int64_t{" << v << "}";
+                    } else if constexpr (std::is_same_v<V, double>) {
+                        out << format_double(v);
+                    } else if constexpr (std::is_same_v<V, std::string>) {
+                        out << "\"" << escape_string(v) << "\"";
+                    } else if constexpr (std::is_same_v<V, Date>) {
+                        out << "ibex::Date{std::int32_t{" << v.days << "}}";
+                    } else {
+                        static_assert(std::is_same_v<V, Timestamp>);
+                        out << "ibex::Timestamp{std::int64_t{" << v.nanos << "}}";
+                    }
+                },
+                value);
+            out << ";\n";
+        }
+        out << "    ibex::ops::set_scalars(&_ibex_scalars);\n\n";
+    }
+
     if (config.bench_mode) {
         // Phase 1: emit ExternCall (data loading) nodes into main buffer (setup).
         collect_extern_calls(root);

@@ -1,0 +1,8 @@
+let needle = "B";
+let t = Table {
+    sym = ["A", "B", "C"],
+    val = [1, 2, 3]
+};
+t[filter sym == needle]
+ [select { sym, val }]
+ [order { val asc }];

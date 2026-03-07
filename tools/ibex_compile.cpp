@@ -4,10 +4,168 @@
 
 #include <CLI/CLI.hpp>
 
+#include <cstdint>
+#include <expected>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <unordered_map>
+#include <variant>
+
+namespace {
+
+using ScalarValue = ibex::codegen::Emitter::Config::ScalarValue;
+
+auto eval_scalar_expr(const ibex::parser::Expr& expr,
+                      const std::unordered_map<std::string, ScalarValue>& env)
+    -> std::expected<ScalarValue, std::string> {
+    using namespace ibex::parser;
+
+    if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+        if (auto it = env.find(ident->name); it != env.end()) {
+            return it->second;
+        }
+        return std::unexpected("unknown scalar binding: " + ident->name);
+    }
+
+    if (const auto* lit = std::get_if<LiteralExpr>(&expr.node)) {
+        if (const auto* v = std::get_if<std::int64_t>(&lit->value))
+            return ScalarValue{*v};
+        if (const auto* v = std::get_if<double>(&lit->value))
+            return ScalarValue{*v};
+        if (const auto* v = std::get_if<std::string>(&lit->value))
+            return ScalarValue{*v};
+        if (const auto* v = std::get_if<ibex::Date>(&lit->value))
+            return ScalarValue{*v};
+        if (const auto* v = std::get_if<ibex::Timestamp>(&lit->value))
+            return ScalarValue{*v};
+        return std::unexpected("unsupported scalar literal");
+    }
+
+    if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+        return eval_scalar_expr(*group->expr, env);
+    }
+
+    if (const auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+        if (unary->op != UnaryOp::Negate) {
+            return std::unexpected("unsupported unary scalar operator");
+        }
+        auto value = eval_scalar_expr(*unary->expr, env);
+        if (!value) {
+            return std::unexpected(value.error());
+        }
+        if (const auto* v = std::get_if<std::int64_t>(&*value))
+            return ScalarValue{-(*v)};
+        if (const auto* v = std::get_if<double>(&*value))
+            return ScalarValue{-(*v)};
+        return std::unexpected("unary negate requires numeric scalar");
+    }
+
+    if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+        auto left = eval_scalar_expr(*binary->left, env);
+        if (!left) {
+            return std::unexpected(left.error());
+        }
+        auto right = eval_scalar_expr(*binary->right, env);
+        if (!right) {
+            return std::unexpected(right.error());
+        }
+
+        const bool left_double = std::holds_alternative<double>(*left);
+        const bool right_double = std::holds_alternative<double>(*right);
+        if (left_double || right_double) {
+            double lhs = left_double ? std::get<double>(*left)
+                                     : static_cast<double>(std::get<std::int64_t>(*left));
+            double rhs = right_double ? std::get<double>(*right)
+                                      : static_cast<double>(std::get<std::int64_t>(*right));
+            switch (binary->op) {
+                case BinaryOp::Add:
+                    return ScalarValue{lhs + rhs};
+                case BinaryOp::Sub:
+                    return ScalarValue{lhs - rhs};
+                case BinaryOp::Mul:
+                    return ScalarValue{lhs * rhs};
+                case BinaryOp::Div:
+                    return ScalarValue{lhs / rhs};
+                case BinaryOp::Mod:
+                    return std::unexpected("mod not supported for float scalars");
+                default:
+                    return std::unexpected("unsupported scalar operator");
+            }
+        }
+
+        if (!std::holds_alternative<std::int64_t>(*left) ||
+            !std::holds_alternative<std::int64_t>(*right)) {
+            return std::unexpected("binary scalar op requires numeric operands");
+        }
+        const auto lhs = std::get<std::int64_t>(*left);
+        const auto rhs = std::get<std::int64_t>(*right);
+        switch (binary->op) {
+            case BinaryOp::Add:
+                return ScalarValue{lhs + rhs};
+            case BinaryOp::Sub:
+                return ScalarValue{lhs - rhs};
+            case BinaryOp::Mul:
+                return ScalarValue{lhs * rhs};
+            case BinaryOp::Div:
+                if (rhs == 0) {
+                    return std::unexpected("division by zero in scalar let");
+                }
+                return ScalarValue{lhs / rhs};
+            case BinaryOp::Mod:
+                if (rhs == 0) {
+                    return std::unexpected("modulo by zero in scalar let");
+                }
+                return ScalarValue{lhs % rhs};
+            default:
+                return std::unexpected("unsupported scalar operator");
+        }
+    }
+
+    return std::unexpected("unsupported scalar expression");
+}
+
+auto collect_scalar_bindings(const ibex::parser::Program& program)
+    -> std::expected<std::vector<std::pair<std::string, ScalarValue>>, std::string> {
+    std::vector<std::pair<std::string, ScalarValue>> ordered;
+    std::unordered_map<std::string, ScalarValue> env;
+
+    ibex::parser::LowerContext lower_ctx;
+
+    for (const auto& stmt : program.statements) {
+        if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+            if (ext->return_type.kind == ibex::parser::Type::Kind::DataFrame ||
+                ext->return_type.kind == ibex::parser::Type::Kind::TimeFrame) {
+                lower_ctx.table_externs.insert(ext->name);
+            }
+            continue;
+        }
+
+        const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt);
+        if (let_stmt == nullptr) {
+            continue;
+        }
+
+        auto table_result = ibex::parser::lower_expr(*let_stmt->value, lower_ctx);
+        if (table_result) {
+            lower_ctx.bindings[let_stmt->name] = std::move(table_result.value());
+            continue;
+        }
+
+        auto scalar_result = eval_scalar_expr(*let_stmt->value, env);
+        if (!scalar_result) {
+            return std::unexpected("unsupported scalar let '" + let_stmt->name +
+                                   "': " + scalar_result.error());
+        }
+        env[let_stmt->name] = scalar_result.value();
+        ordered.emplace_back(let_stmt->name, scalar_result.value());
+    }
+
+    return ordered;
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) {
     CLI::App app{"ibex compiler — transpile .ibex source to C++23"};
@@ -48,6 +206,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    auto scalar_bindings = collect_scalar_bindings(*program);
+    if (!scalar_bindings) {
+        std::cerr << "ibex_compile: " << scalar_bindings.error() << "\n";
+        return 1;
+    }
+
     // Lower to IR
     auto ir = ibex::parser::lower(*program);
     if (!ir) {
@@ -62,6 +226,7 @@ int main(int argc, char* argv[]) {
     config.bench_mode = bench;
     config.bench_warmup = bench_warmup;
     config.bench_iters = bench_iters;
+    config.scalar_bindings = std::move(*scalar_bindings);
     for (const auto& stmt : program->statements) {
         if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
             if (!ext->source_path.empty()) {

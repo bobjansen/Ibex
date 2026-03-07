@@ -3350,3 +3350,119 @@ TEST_CASE("Table constructor with single column") {
     REQUIRE(vals != nullptr);
     REQUIRE((*vals)[0] == 42);
 }
+
+TEST_CASE("Table constructor with column from existing table (single-column select)") {
+    // `prices[select { price }]` produces a single-column Table; Table { p = ... } picks it up.
+    runtime::TableRegistry registry;
+    runtime::Table src;
+    Column<std::int64_t> price_col;
+    price_col.push_back(10);
+    price_col.push_back(20);
+    price_col.push_back(30);
+    src.add_column("price", price_col);
+    registry["prices"] = std::move(src);
+
+    auto ir = require_ir("Table { p = prices[select { price }] };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* p = std::get_if<Column<std::int64_t>>(result->find("p"));
+    REQUIRE(p != nullptr);
+    REQUIRE((*p)[0] == 10);
+    REQUIRE((*p)[1] == 20);
+    REQUIRE((*p)[2] == 30);
+}
+
+TEST_CASE("Table constructor with named column from multi-column expression") {
+    // The expression returns a multi-column Table; we extract the column matching the def name.
+    runtime::TableRegistry registry;
+    runtime::Table src;
+    Column<std::int64_t> price_col;
+    price_col.push_back(1);
+    price_col.push_back(2);
+    Column<std::int64_t> qty_col;
+    qty_col.push_back(10);
+    qty_col.push_back(20);
+    src.add_column("price", price_col);
+    src.add_column("qty", qty_col);
+    registry["trades"] = std::move(src);
+
+    auto ir = require_ir("Table { price = trades, qty = trades };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* price = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(price != nullptr);
+    REQUIRE((*price)[0] == 1);
+    REQUIRE((*price)[1] == 2);
+
+    const auto* qty = std::get_if<Column<std::int64_t>>(result->find("qty"));
+    REQUIRE(qty != nullptr);
+    REQUIRE((*qty)[0] == 10);
+    REQUIRE((*qty)[1] == 20);
+}
+
+TEST_CASE("Table constructor mixing literal and expression columns") {
+    runtime::TableRegistry registry;
+    runtime::Table src;
+    Column<double> price_col;
+    price_col.push_back(1.5);
+    price_col.push_back(2.5);
+    price_col.push_back(3.5);
+    src.add_column("price", price_col);
+    registry["data"] = std::move(src);
+
+    auto ir = require_ir(R"(Table { label = ["a", "b", "c"], price = data[select { price }] };)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* label = std::get_if<Column<std::string>>(result->find("label"));
+    REQUIRE(label != nullptr);
+    REQUIRE((*label)[0] == "a");
+
+    const auto* price = std::get_if<Column<double>>(result->find("price"));
+    REQUIRE(price != nullptr);
+    REQUIRE((*price)[2] == Catch::Approx(3.5));
+}
+
+TEST_CASE("Table constructor expression column length mismatch returns error") {
+    runtime::TableRegistry registry;
+    runtime::Table src;
+    Column<std::int64_t> col;
+    col.push_back(1);
+    col.push_back(2);
+    src.add_column("x", col);
+    registry["data"] = std::move(src);
+
+    // Literal has 3 elements; expression column produces 2 rows → length mismatch.
+    auto ir = require_ir("Table { a = [1, 2, 3], b = data[select { x }] };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("Table constructor expression column not found in multi-column result returns error") {
+    runtime::TableRegistry registry;
+    runtime::Table src;
+    Column<std::int64_t> col;
+    col.push_back(1);
+    src.add_column("x", col);
+    registry["data"] = std::move(src);
+
+    // "missing" does not exist in data (which has only "x"); multi-column, no name match.
+    // data has one column "x" but the def name is "missing" — single-col path renames it,
+    // so we test with two columns to exercise the error path.
+    runtime::Table two_col;
+    Column<std::int64_t> a_col, b_col;
+    a_col.push_back(1);
+    b_col.push_back(2);
+    two_col.add_column("a", a_col);
+    two_col.add_column("b", b_col);
+    registry["two"] = std::move(two_col);
+
+    auto ir = require_ir("Table { missing = two };");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+}

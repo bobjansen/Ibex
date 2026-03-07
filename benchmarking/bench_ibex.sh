@@ -74,25 +74,28 @@ raw="$("$IBEX_BENCH" "${BENCH_ARGS[@]}")"
 echo "$raw" >&2
 
 # ── Parse to TSV ──────────────────────────────────────────────────────────────
-# Input:  bench mean_by_symbol: iters=5, total_ms=12.345, avg_ms=2.469, rows=252
-# Output: ibex<TAB>mean_by_symbol<TAB>2.469<TAB>252
+# Input:  bench mean_by_symbol: iters=5, total_ms=12.345, avg_ms=2.469,
+#           min_ms=2.1, max_ms=3.0, stddev_ms=0.2, p95_ms=2.9, p99_ms=3.0, rows=252
+# Output: ibex<TAB>mean_by_symbol<TAB>2.469<TAB>2.1<TAB>3.0<TAB>0.2<TAB>2.9<TAB>3.0<TAB>252
 {
-    printf "framework\tquery\tavg_ms\trows\n"
+    printf "framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\n"
     echo "$raw" | awk '
     /^bench / {
         name = $2; sub(/:$/, "", name)
-        avg_ms = ""; rows = ""
+        avg_ms = ""; min_ms = ""; max_ms = ""; stddev_ms = ""; p95_ms = ""; p99_ms = ""; rows = ""
         for (i = 3; i <= NF; i++) {
-            if ($i ~ /^avg_ms=/) {
-                split($i, a, "="); avg_ms = a[2]; sub(/,$/, "", avg_ms)
-            }
-            if ($i ~ /^rows=/) {
-                split($i, a, "="); rows = a[2]; sub(/,$/, "", rows)
-            }
+            v = $i; sub(/,$/, "", v)
+            if (v ~ /^avg_ms=/)    { split(v, a, "="); avg_ms    = a[2] }
+            if (v ~ /^min_ms=/)    { split(v, a, "="); min_ms    = a[2] }
+            if (v ~ /^max_ms=/)    { split(v, a, "="); max_ms    = a[2] }
+            if (v ~ /^stddev_ms=/) { split(v, a, "="); stddev_ms = a[2] }
+            if (v ~ /^p95_ms=/)    { split(v, a, "="); p95_ms    = a[2] }
+            if (v ~ /^p99_ms=/)    { split(v, a, "="); p99_ms    = a[2] }
+            if (v ~ /^rows=/)      { split(v, a, "="); rows      = a[2] }
         }
         fw = (name ~ /^parse_/) ? "ibex+parse" : "ibex"
         q  = name; sub(/^parse_/, "", q)
-        print fw "\t" q "\t" avg_ms "\t" rows
+        print fw "\t" q "\t" avg_ms "\t" min_ms "\t" max_ms "\t" stddev_ms "\t" p95_ms "\t" p99_ms "\t" rows
     }'
 } > "$OUT"
 

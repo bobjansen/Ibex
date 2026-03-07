@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ibex — Live OHLC Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      padding: 24px;
+    }
+
+    h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 4px; }
+    .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 24px; }
+
+    #status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      margin-bottom: 20px;
+    }
+    #status.connecting { background: #1e3a5f; color: #93c5fd; }
+    #status.connected  { background: #14532d; color: #86efac; }
+    #status.error      { background: #450a0a; color: #fca5a5; }
+
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    #status.connected .dot { animation: pulse 1.5s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    thead th {
+      text-align: right;
+      padding: 8px 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #64748b;
+      border-bottom: 1px solid #1e293b;
+    }
+    thead th:first-child { text-align: left; }
+    tbody tr {
+      border-bottom: 1px solid #1e293b;
+      transition: background 0.15s;
+    }
+    tbody tr:hover { background: #1e293b; }
+    tbody tr.new-row { animation: highlight 1s ease-out; }
+    @keyframes highlight {
+      from { background: #1e3a5f; }
+      to   { background: transparent; }
+    }
+    td {
+      padding: 10px 12px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    td:first-child { text-align: left; color: #94a3b8; }
+    .up   { color: #4ade80; }
+    .down { color: #f87171; }
+    .flat { color: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <h1>Ibex — Live OHLC Dashboard</h1>
+  <p class="subtitle">Real-time 1-minute bars via WebSocket</p>
+
+  <div id="status" class="connecting">
+    <span class="dot"></span>
+    <span id="status-text">Connecting…</span>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Time (UTC)</th>
+        <th>Open</th>
+        <th>High</th>
+        <th>Low</th>
+        <th>Close</th>
+        <th>Change</th>
+      </tr>
+    </thead>
+    <tbody id="bars"></tbody>
+  </table>
+
+  <script>
+    const HOST = "127.0.0.1";
+    const PORT = 8080;
+    const MAX_ROWS = 50;
+
+    const statusEl = document.getElementById("status");
+    const statusTextEl = document.getElementById("status-text");
+    const tbodyEl = document.getElementById("bars");
+
+    function setStatus(cls, text) {
+      statusEl.className = cls;
+      statusTextEl.textContent = text;
+    }
+
+    function formatNs(ns) {
+      const d = new Date(ns / 1e6);
+      return d.toISOString().replace("T", " ").slice(0, 19);
+    }
+
+    function fmt(v) {
+      return typeof v === "number" ? v.toFixed(2) : "?";
+    }
+
+    function addBar(bar) {
+      const change = (bar.close - bar.open);
+      const pct    = bar.open !== 0 ? (change / bar.open) * 100 : 0;
+      const dir    = change > 0 ? "up" : change < 0 ? "down" : "flat";
+      const sign   = change > 0 ? "+" : "";
+
+      const tr = document.createElement("tr");
+      tr.className = "new-row";
+      tr.innerHTML = `
+        <td>${formatNs(bar.ts)}</td>
+        <td>${fmt(bar.open)}</td>
+        <td>${fmt(bar.high)}</td>
+        <td>${fmt(bar.low)}</td>
+        <td class="${dir}">${fmt(bar.close)}</td>
+        <td class="${dir}">${sign}${fmt(change)} (${sign}${pct.toFixed(2)}%)</td>
+      `;
+
+      tbodyEl.prepend(tr);
+
+      // Keep the table bounded
+      while (tbodyEl.rows.length > MAX_ROWS) {
+        tbodyEl.deleteRow(tbodyEl.rows.length - 1);
+      }
+    }
+
+    function connect() {
+      setStatus("connecting", "Connecting…");
+
+      const ws = new WebSocket(`ws://${HOST}:${PORT}`);
+
+      ws.addEventListener("open", () => {
+        setStatus("connected", `Connected to ws://${HOST}:${PORT}`);
+      });
+
+      ws.addEventListener("message", (event) => {
+        try {
+          const bar = JSON.parse(event.data);
+          addBar(bar);
+        } catch (e) {
+          console.warn("Bad message:", event.data, e);
+        }
+      });
+
+      ws.addEventListener("close", () => {
+        setStatus("error", "Disconnected — reconnecting in 3 s…");
+        setTimeout(connect, 3000);
+      });
+
+      ws.addEventListener("error", () => {
+        setStatus("error", "Connection error — reconnecting in 3 s…");
+      });
+    }
+
+    connect();
+  </script>
+</body>
+</html>

@@ -211,7 +211,6 @@ TEST_CASE("Lower left join to IR") {
     REQUIRE(join->kind() == ir::JoinKind::Left);
 }
 
-
 TEST_CASE("Lower right join to IR") {
     auto program = require_parse("a right join b on id;");
     auto result = parser::lower(program);
@@ -311,4 +310,30 @@ TEST_CASE("Lower distinct with braces") {
     const auto* project = as_node<ir::ProjectNode>(distinct->children()[0].get());
     REQUIRE(project != nullptr);
     REQUIRE(project->columns().size() == 3);
+}
+
+TEST_CASE("Lower let-bound table reuse preserves full child pipeline") {
+    auto program = require_parse(R"(
+let enriched = trades[update { x = price * 2 }];
+enriched[filter x > 10, select { x }];
+)");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* project = as_node<ir::ProjectNode>(result->get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->children().size() == 1);
+
+    const auto* filter = as_node<ir::FilterNode>(project->children()[0].get());
+    REQUIRE(filter != nullptr);
+    REQUIRE(filter->children().size() == 1);
+
+    const auto* update = as_node<ir::UpdateNode>(filter->children()[0].get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->children().size() == 1);
+    REQUIRE(update->children()[0] != nullptr);
+
+    const auto* scan = as_node<ir::ScanNode>(update->children()[0].get());
+    REQUIRE(scan != nullptr);
+    REQUIRE(scan->source_name() == "trades");
 }

@@ -308,6 +308,16 @@ TEST_CASE("emitter: update node — literal types", "[codegen]") {
     CHECK(contains(out, "ibex::ops::timestamp_lit(ibex::Timestamp{std::int64_t{1000}})"));
 }
 
+TEST_CASE("emitter: malformed update node does not crash", "[codegen]") {
+    ir::Builder b;
+    auto upd = b.update({ir::FieldSpec{
+        .alias = "x",
+        .expr = ir::Expr{ir::ColumnRef{.name = "price"}},
+    }});
+
+    REQUIRE_THROWS(emit_to_string(*upd));
+}
+
 // ─── Chained pipeline ────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
@@ -342,7 +352,6 @@ TEST_CASE("emitter: join node — inner join", "[codegen]") {
     CHECK(contains(out, "ibex::ops::inner_join("));
     CHECK(contains(out, "\"id\""));
 }
-
 
 TEST_CASE("emitter: join node — right join", "[codegen]") {
     ir::Builder b;

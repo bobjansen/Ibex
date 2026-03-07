@@ -180,7 +180,28 @@ class Lowerer {
                 break;
         }
 
-        auto node = builder_.join(kind, join.keys);
+        // Resolve the `on` clause: equikeys from the braced list path are
+        // already in join.keys; an expression stored in join.predicate is
+        // either a bare identifier (equikey) or a general predicate.
+        std::vector<std::string> keys = join.keys;
+        std::optional<ir::FilterExprPtr> predicate;
+
+        if (join.predicate.has_value()) {
+            const Expr& on_expr = **join.predicate;
+            if (const auto* ident = std::get_if<IdentifierExpr>(&on_expr.node)) {
+                // Bare identifier → equikey (backward compat: `A join B on key`)
+                keys.push_back(ident->name);
+            } else {
+                // General expression → non-equijoin predicate
+                auto pred = lower_filter_expr(on_expr);
+                if (!pred) {
+                    return std::unexpected(pred.error());
+                }
+                predicate = std::move(*pred);
+            }
+        }
+
+        auto node = builder_.join(kind, std::move(keys), std::move(predicate));
         node->add_child(std::move(left.value()));
         node->add_child(std::move(right.value()));
         return node;
@@ -1514,7 +1535,11 @@ class Lowerer {
             }
             case ir::NodeKind::Join: {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
-                return builder_.join(join.kind(), join.keys());
+                std::optional<ir::FilterExprPtr> pred_clone;
+                if (join.predicate().has_value()) {
+                    pred_clone = clone_filter_expr(**join.predicate());
+                }
+                return builder_.join(join.kind(), join.keys(), std::move(pred_clone));
             }
             case ir::NodeKind::Melt: {
                 const auto& mn = static_cast<const ir::MeltNode&>(node);

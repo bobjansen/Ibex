@@ -1392,24 +1392,26 @@ df[select { symbol, total = sum(price) }]  // ERROR: 'symbol' is bare
 
 ## 8. Inline Table Construction
 
-The `Table { ... }` expression constructs a `DataFrame` from literal column
-vectors without requiring an extern data source. It is the primary way to
-define small, self-contained tables directly in Ibex source.
+The `Table { ... }` expression constructs a `DataFrame` from column definitions
+without requiring an extern data source. Column values may be inline array
+literals **or** arbitrary Ibex expressions that evaluate to a column vector.
 
 ### 8.1 Syntax
 
 ```
-Table { col_name = [ elem, ... ], col_name = [ elem, ... ] }
+Table { col_name = expr, col_name = expr, ... }
 ```
+
+where each `expr` is either an **array literal** `[v, v, ...]` or any expression
+that produces a table from which the column value is extracted.
 
 `Table` is a **contextual keyword**: it is only recognised as a constructor
 when immediately followed by `{`. It is not reserved and can be used as a
 regular binding or function name in other positions.
 
-### 8.2 Column Vectors
+### 8.2 Array-Literal Columns
 
-Each column is specified as an **array literal** — a comma-separated list of
-literal values enclosed in `[ ]`:
+The simplest form uses inline element lists:
 
 ```
 let t = Table {
@@ -1431,20 +1433,70 @@ Supported element types and their inferred column types:
 | `date "…"`      | `Date`                |
 | `ts "…"`        | `Timestamp`           |
 
-### 8.3 Constraints
+All elements within one array must have the same literal kind; mixing types
+is a lowering error. Duration literals (`1m`, `30s`) are not valid array
+elements.
 
-1. **Uniform element type.** All elements within one array must have the same
-   literal kind. Mixing integers and floats, or strings and integers, is a
-   lowering error.
+### 8.3 Expression Columns
 
-2. **Equal column lengths.** Every column in the constructor must have the
-   same number of elements. A mismatch is detected at interpret time and
-   returns an error.
+Any expression that produces a **Table** may be used as a column value. The
+column is extracted from the result table using the following rule:
 
-3. **No duration literals.** Duration values (e.g. `1m`, `30s`) are not valid
-   column elements.
+1. If the result table has **exactly one column**, that column is used
+   (regardless of its name in the source table).
+2. If the result table has **multiple columns**, the column whose name matches
+   the definition name is used.
+3. If neither applies, an error is returned.
 
-### 8.4 Usage
+This allows pulling columns directly from block operations on existing tables:
+
+```
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let prices = read_csv("prices.csv");
+
+// Each column comes from a different pipeline expression
+let t = Table {
+    symbol = prices[select { symbol }],          // single-column result
+    high   = prices[select { high   = max(price) }, by symbol],
+    low    = prices[select { low    = min(price) }, by symbol],
+};
+```
+
+Columns may also reference a multi-column binding directly by name, so long
+as the binding contains a column matching the definition name:
+
+```
+// prices has columns: symbol, price, volume
+Table {
+    symbol = prices,   // extracts 'symbol' from prices
+    price  = prices,   // extracts 'price' from prices
+}
+```
+
+Literal and expression columns may be freely mixed within the same constructor:
+
+```
+let ref = Table {
+    label = ["open", "close"],           // array literal
+    value = ohlc[select { open }],       // expression
+};
+```
+
+### 8.4 Constraints
+
+1. **Equal column lengths.** Every column in the constructor must have the
+   same number of rows, whether the value is a literal array or an expression.
+   A mismatch is detected at interpret time and returns an error.
+
+2. **No duration literals in arrays.** Duration values (e.g. `1m`, `30s`) are
+   not valid elements inside `[...]`.
+
+3. **Expression must resolve to a column.** If an expression produces a
+   multi-column table with no column matching the definition name, an error is
+   returned.
+
+### 8.5 Usage
 
 The result is an ordinary `DataFrame` and can be used anywhere a `DataFrame`
 is expected — including as the input to `as_timeframe`, joins, and block
@@ -1460,21 +1512,32 @@ let tf = as_timeframe(
     "ts"
 );
 
+// Assemble columns from separate pipelines
+let report = Table {
+    symbol  = prices[select { symbol }],
+    avg_px  = prices[select { avg_px = mean(price) }, by symbol],
+};
+
 // Join an inline reference table with a loaded DataFrame
 let ref = Table { symbol = ["AAPL", "GOOG"], tier = [1, 2] };
 prices join ref on symbol;
 ```
 
 An empty constructor `Table { }` produces a zero-row, zero-column DataFrame.
-An array with no elements `col = []` produces a zero-row `Int64` column by
-default.
+An empty array `col = []` produces a zero-row `Int64` column by default.
 
-### 8.5 IR Representation
+### 8.6 IR Representation
 
 The lowerer converts `Table { ... }` into a `ConstructNode` containing a list
-of `ConstructColumn` entries. Each entry holds the column name and a
-`std::vector<ir::Literal>`. The interpreter materialises the node into a
-`runtime::Table` directly, with no external registry lookup.
+of `ConstructColumn` entries. Each entry holds the column name and **either**:
+
+- `std::vector<ir::Literal>` — for array-literal columns (non-null, `expr_node` is null), or
+- `std::unique_ptr<ir::Node> expr_node` — for expression columns (non-null, `elements` is empty).
+
+Expression columns are evaluated recursively by the interpreter; the resulting
+`runtime::Table` is immediately scanned for the target column. The interpreter
+materialises the whole `ConstructNode` into a `runtime::Table` with no external
+registry lookup required for literal columns.
 
 ---
 

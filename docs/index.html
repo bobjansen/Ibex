@@ -150,43 +150,51 @@ prices[
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Inline Tables</span>
-          <h3>Define DataFrames from literal column vectors.</h3>
+          <h3>Build DataFrames from literals or existing column vectors.</h3>
           <p>
             The <code>Table&nbsp;{&nbsp;&hellip;&nbsp;}</code> constructor builds
-            a <code>DataFrame</code> from comma-separated array literals &mdash;
-            no file, no plugin, no extern declaration needed.
+            a <code>DataFrame</code> column-by-column. Each column value is either
+            an inline array literal <code>[v,&nbsp;v,&nbsp;&hellip;]</code>
+            or any Ibex expression that produces a table &mdash; no file or
+            plugin declaration required.
           </p>
           <p>
-            All columns must have the same length. Supported element types are
-            <code>Int64</code>, <code>Float64</code>, <code>Bool</code>,
-            <code>String</code>, <code>Date</code>, and <code>Timestamp</code>.
+            For expression columns, the runtime extracts the column from the
+            result table: a <strong>single-column</strong> result is used
+            directly; a <strong>multi-column</strong> result is matched by
+            column name. Literal and expression columns may be freely mixed.
           </p>
           <p>
-            The result is a first-class <code>DataFrame</code>: chain any
-            block operation on it, pass it to <code>as_timeframe</code>, or
-            join it with another table.
+            All columns must have equal row counts. The result is a first-class
+            <code>DataFrame</code>: chain operations, promote to
+            <code>as_timeframe</code>, or join with another table.
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm">// Build a DataFrame from column vectors</span>
+<pre><code><span class="cm">// Array-literal columns</span>
 <span class="kw">let</span> t = Table {
     symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>, <span class="str">"MSFT"</span>],
     price  = [<span class="num">150.0</span>, <span class="num">140.0</span>, <span class="num">300.0</span>],
-    volume = [<span class="num">1000</span>, <span class="num">2000</span>, <span class="num">1500</span>],
 };
 
-<span class="cm">// Chain operations directly</span>
-t[<span class="kw">filter</span> price <span class="op">&gt;</span> <span class="num">145.0</span>, <span class="kw">select</span> { symbol, price }];
+<span class="cm">// Columns from existing table expressions</span>
+<span class="kw">let</span> summary = Table {
+    symbol = prices[<span class="kw">select</span> { symbol }],
+    high   = prices[<span class="kw">select</span> { high = <span class="fn-name">max</span>(price) }, <span class="kw">by</span> symbol],
+    low    = prices[<span class="kw">select</span> { low  = <span class="fn-name">min</span>(price) }, <span class="kw">by</span> symbol],
+};
+
+<span class="cm">// Mix literals and expressions</span>
+<span class="kw">let</span> ref = Table {
+    label  = [<span class="str">"open"</span>, <span class="str">"close"</span>],
+    value  = ohlc[<span class="kw">select</span> { value = <span class="fn-name">mean</span>(price) }],
+};
 
 <span class="cm">// Promote to TimeFrame</span>
 <span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(
     Table { ts = [<span class="num">1000</span>, <span class="num">2000</span>, <span class="num">3000</span>], price = [<span class="num">10</span>, <span class="num">20</span>, <span class="num">30</span>] },
     <span class="str">"ts"</span>
-);
-
-<span class="cm">// Join an inline reference table with loaded data</span>
-<span class="kw">let</span> ref = Table { symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>], tier = [<span class="num">1</span>, <span class="num">2</span>] };
-prices <span class="kw">join</span> ref <span class="kw">on</span> symbol;</code></pre>
+);</code></pre>
         </div>
       </div>
 

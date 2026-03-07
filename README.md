@@ -29,19 +29,29 @@ let enriched = prices join ohlc on symbol;
 
 ### Inline table construction
 
-Build a `DataFrame` or `TimeFrame` directly from column vectors — no file or
-extern function needed:
+Build a `DataFrame` directly from column vectors. Each column may be an inline
+array literal **or** any expression that produces a table:
 
 ```
-// DataFrame from literal column vectors
+// Columns from array literals
 let t = Table {
     symbol = ["AAPL", "GOOG", "MSFT"],
     price  = [150.0, 140.0, 300.0],
     volume = [1000, 2000, 1500],
 };
 
-// Chain operations directly on the inline table
-t[filter price > 145.0, select { symbol, price }];
+// Columns from existing table expressions
+let summary = Table {
+    symbol = prices[select { symbol }],
+    high   = prices[select { high = max(price) }, by symbol],
+    low    = prices[select { low  = min(price) }, by symbol],
+};
+
+// Mix literals and expressions freely
+let ref = Table {
+    label = ["a", "b", "c"],
+    value = some_df[select { value }],
+};
 
 // Promote to TimeFrame via as_timeframe
 let tf = as_timeframe(
@@ -50,8 +60,10 @@ let tf = as_timeframe(
 );
 ```
 
-All columns must have the same length. Supported element types: `Int64`,
-`Float64`, `Bool`, `String`, `Date`, and `Timestamp`.
+All columns must have the same row count. For array literals, all elements must
+share the same type (`Int64`, `Float64`, `Bool`, `String`, `Date`, `Timestamp`).
+For expression columns, the expression must produce a single-column table or a
+table containing a column named after the definition.
 
 ### Load and filter
 

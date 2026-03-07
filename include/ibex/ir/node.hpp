@@ -520,15 +520,24 @@ class DcastNode final : public Node {
 };
 
 /// A single named column in a Construct node.
-/// All elements must share the same Literal variant type (validated at lower time).
+///
+/// Two mutually exclusive modes:
+///   - Literal: `elements` is non-empty, `expr_node` is null.  Used for inline
+///     array literals `[v, v, ...]`; all elements share the same variant type.
+///   - Expression: `expr_node` is non-null, `elements` is empty.  The node is
+///     evaluated at interpret/codegen time to produce a Table; the column is
+///     extracted from that Table (single-column result, or column named `name`).
 struct ConstructColumn {
     std::string name;
-    std::vector<Literal> elements;
+    std::vector<Literal> elements;     ///< non-empty iff expr_node is null
+    std::unique_ptr<Node> expr_node;   ///< non-null iff elements is empty
 };
 
-/// Construct node: builds a Table from inline literal column vectors.
+/// Construct node: builds a Table from column definitions.
 ///
-/// Produced by lowering `Table { col1 = [v, ...], col2 = [v, ...] }` expressions.
+/// Produced by lowering `Table { col1 = expr, ... }` expressions.
+/// Each column is either an inline literal vector or an arbitrary expression
+/// that evaluates to a single-column Table (or a Table with a matching column name).
 /// All columns must have equal length (validated at interpret time).
 class ConstructNode final : public Node {
    public:

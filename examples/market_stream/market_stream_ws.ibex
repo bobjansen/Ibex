@@ -1,0 +1,55 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex UDP → WebSocket Market Stream Demo
+//
+//  Receives tick data over UDP (port 9001), resamples it into 1-minute OHLC
+//  bars, and pushes the bars over WebSocket (port 8080) so that a browser
+//  dashboard or any WebSocket client can display them in real time.
+//
+//  To run:
+//    1. Build the project (cmake --build build-release).
+//    2. Start the REPL:
+//         ./build-release/tools/ibex --plugin-path build-release/tools
+//    3. Load this script:
+//         :load examples/market_stream/market_stream_ws.ibex
+//    4. Open the dashboard in a browser:
+//         examples/market_stream/ws_dashboard.html
+//       or connect with the Python client in a separate terminal:
+//         python3 examples/market_stream/ws_client.py
+//    5. In another terminal, start the UDP tick sender:
+//         python3 examples/market_stream/tick_sender.py
+//
+//  Wire protocol:
+//    UDP ticks in  (port 9001): {"ts":<ns>,"symbol":"AAPL","price":182.5,"volume":1000}
+//    WS bars  out  (port 8080): {"ts":<ns>,"open":182.0,"high":183.0,"low":181.5,"close":182.5}
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "udp";
+import "websocket";
+
+// Stream { } wires together a source, a transform, and a sink.
+//
+// stream_kind is inferred automatically:
+//   - the transform contains `resample 1m`  → TimeBucket
+//     (buffer rows per minute, emit one OHLC bar when the bucket closes)
+//
+// The REPL blocks in the event loop until the source returns an empty
+// DataFrame (tick_sender.py sends {"eof":true} as the last packet).
+
+let ohlc_stream = Stream {
+    // Source: receive one UDP tick per call.  Blocks until data arrives.
+    source    = udp_recv(9001),
+
+    // Transform: compute OHLC bars for each 1-minute time bucket.
+    // Identical to batch usage — no stream-specific syntax needed.
+    transform = [resample 1m, select {
+        open  = first(price),
+        high  = max(price),
+        low   = min(price),
+        close = last(price)
+    }],
+
+    // Sink: broadcast completed bars to all WebSocket clients on port 8080.
+    // The Ibex runtime prepends the output DataFrame; port is the only scalar
+    // argument passed after the DataFrame.
+    sink = ws_send(8080)
+};

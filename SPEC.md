@@ -73,6 +73,7 @@ The canonical order is recommended for readability but not enforced.
 | `window`            | ω (temporal window)       | `WindowNode`    |
 | `melt`              | unpivot (wide → long)     | `MeltNode`      |
 | `dcast`             | pivot (long → wide)       | `DcastNode`     |
+| `Table { … }`       | literal construction      | `ConstructNode` |
 
 Every valid block expression maps to a composition of these operators. The
 compiler emits the corresponding IR node tree.
@@ -603,10 +604,16 @@ expr            = primary
                 | expr "anti" "join" expr "on" expr ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
+                | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
                 | "^" IDENT                      (* scope escape *)
                 | literal
+                | array_lit
                 | schema_lit
                 | "(" expr ")" ;
+
+table_col_def   = IDENT "=" array_lit ;
+
+array_lit       = "[" [ expr { "," expr } [ "," ] ] "]" ;
 
 arg_list        = arg { "," arg } [ "," ] ;
 
@@ -1383,9 +1390,97 @@ df[select { symbol, total = sum(price) }]  // ERROR: 'symbol' is bare
 
 ---
 
-## 8. TimeFrame Extensions
+## 8. Inline Table Construction
 
-### 8.1 TimeFrame Construction
+The `Table { ... }` expression constructs a `DataFrame` from literal column
+vectors without requiring an extern data source. It is the primary way to
+define small, self-contained tables directly in Ibex source.
+
+### 8.1 Syntax
+
+```
+Table { col_name = [ elem, ... ], col_name = [ elem, ... ] }
+```
+
+`Table` is a **contextual keyword**: it is only recognised as a constructor
+when immediately followed by `{`. It is not reserved and can be used as a
+regular binding or function name in other positions.
+
+### 8.2 Column Vectors
+
+Each column is specified as an **array literal** — a comma-separated list of
+literal values enclosed in `[ ]`:
+
+```
+let t = Table {
+    symbol = ["AAPL", "GOOG", "MSFT"],
+    price  = [150.0, 140.0, 300.0],
+    volume = [1000, 2000, 1500],
+    active = [true, false, true],
+};
+```
+
+Supported element types and their inferred column types:
+
+| Literal kind    | Inferred column type  |
+|-----------------|-----------------------|
+| Integer (`42`)  | `Int64`               |
+| Float (`3.14`)  | `Float64`             |
+| Boolean         | `Bool`                |
+| String          | `String`              |
+| `date "…"`      | `Date`                |
+| `ts "…"`        | `Timestamp`           |
+
+### 8.3 Constraints
+
+1. **Uniform element type.** All elements within one array must have the same
+   literal kind. Mixing integers and floats, or strings and integers, is a
+   lowering error.
+
+2. **Equal column lengths.** Every column in the constructor must have the
+   same number of elements. A mismatch is detected at interpret time and
+   returns an error.
+
+3. **No duration literals.** Duration values (e.g. `1m`, `30s`) are not valid
+   column elements.
+
+### 8.4 Usage
+
+The result is an ordinary `DataFrame` and can be used anywhere a `DataFrame`
+is expected — including as the input to `as_timeframe`, joins, and block
+operations:
+
+```
+// Filter and aggregate inline data
+Table { x = [1, 2, 3, 4, 5] }[filter x > 3, select { x }];
+
+// Promote to TimeFrame
+let tf = as_timeframe(
+    Table { ts = [1000, 2000, 3000], price = [10, 20, 30] },
+    "ts"
+);
+
+// Join an inline reference table with a loaded DataFrame
+let ref = Table { symbol = ["AAPL", "GOOG"], tier = [1, 2] };
+prices join ref on symbol;
+```
+
+An empty constructor `Table { }` produces a zero-row, zero-column DataFrame.
+An array with no elements `col = []` produces a zero-row `Int64` column by
+default.
+
+### 8.5 IR Representation
+
+The lowerer converts `Table { ... }` into a `ConstructNode` containing a list
+of `ConstructColumn` entries. Each entry holds the column name and a
+`std::vector<ir::Literal>`. The interpreter materialises the node into a
+`runtime::Table` directly, with no external registry lookup.
+
+---
+
+## 9. TimeFrame Extensions
+
+### 9.1 TimeFrame Construction
 
 A `TimeFrame` is created from a `DataFrame` by designating a `Timestamp`
 column as the time index:
@@ -1399,7 +1494,7 @@ column in the first argument's schema. The resulting `TimeFrame` maintains the
 sortedness invariant: rows are ordered by the index column in ascending order.
 If the input is not sorted, `as_timeframe` sorts it.
 
-### 8.2 Duration Literals
+### 9.2 Duration Literals
 
 Duration literals specify time spans for windowing and tolerance parameters:
 
@@ -1424,7 +1519,7 @@ arithmetic.
 Duration literals are compile-time constants. Arithmetic on durations is not
 supported in v0.1.
 
-### 8.3 Window Clause
+### 9.3 Window Clause
 
 The `window` clause specifies a lookback duration for rolling computations:
 
@@ -1439,7 +1534,7 @@ subset of rows within this range.
 **Constraint.** `window` is valid only when the operand is a `TimeFrame`
 (constraint C8). Using `window` on a `DataFrame` is a compile-time error.
 
-### 8.4 Temporal Functions
+### 9.4 Temporal Functions
 
 The following functions are available inside `window`-scoped blocks. Rolling
 functions require an active `window` clause; `lag` and `lead` do not.
@@ -1491,7 +1586,7 @@ df[update { cs = cumsum(price) }]
 tf[update { cp = cumprod(returns) }]
 ```
 
-### 8.5 Sortedness Invariant
+### 9.5 Sortedness Invariant
 
 A `TimeFrame` guarantees ascending order by its time index at all times. Any
 operation that would violate this invariant (e.g., updating the index column)
@@ -1506,7 +1601,7 @@ column in ascending order, preserved across all TimeFrame operations.
 
 ---
 
-## 9. User-Defined Functions
+## 10. User-Defined Functions
 
 User-defined functions group multiple statements under a single name.
 
@@ -1532,9 +1627,9 @@ statement level in the REPL/runtime.
 
 ---
 
-## 10. Extern Function Interop
+## 11. Extern Function Interop
 
-### 10.1 Declaration Syntax
+### 11.1 Declaration Syntax
 
 External C++ functions are declared with `extern fn`:
 
@@ -1554,7 +1649,7 @@ The `from` clause specifies the C++ header that provides the function. The
 compiler generates the appropriate `#include` directive in the transpiled
 output.
 
-### 10.2 Parameter Types
+### 11.2 Parameter Types
 
 Extern function parameters may be any scalar type (`Int`, `Int64`, `Float64`,
 `Bool`, `String`, `Date`, `Timestamp`). Series/column parameters are not
@@ -1563,7 +1658,7 @@ supported in the current runtime.
 Return types may be scalar or table types (`DataFrame`, `TimeFrame`). Extern
 functions cannot return `Series`.
 
-### 10.3 Calling Convention
+### 11.3 Calling Convention
 
 Extern functions are called with the same syntax as built-in functions:
 
@@ -1578,7 +1673,7 @@ Extern functions currently accept only scalar arguments and are evaluated as
 **scalar functions** (applied element-wise). Column/series arguments are
 reserved for a future extension.
 
-### 10.4 REPL Plugin Loading
+### 11.4 REPL Plugin Loading
 
 When the REPL processes an `extern fn` declaration whose `from` path is
 non-empty, it automatically loads the corresponding shared library plugin:
@@ -1600,7 +1695,7 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry);
 Use `scripts/ibex-plugin-build.sh` to compile a plugin `.cpp` with the correct
 flags and include paths for the current build tree.
 
-### 10.4 Restrictions
+### 11.4 Restrictions
 
 | Restriction                           | Rationale                         |
 |---------------------------------------|-----------------------------------|
@@ -1615,13 +1710,13 @@ with a unique name and declare that wrapper as the extern.
 
 ---
 
-## 11. Built-in Functions and Forms
+## 12. Built-in Functions and Forms
 
 Ibex keeps built-ins intentionally minimal. Implementations may provide
 additional functions, but the recommended path for custom functionality is
 `extern fn` interop with C++.
 
-### 11.1 I/O Functions
+### 12.1 I/O Functions
 
 I/O is provided exclusively via `extern fn` plugins rather than built-ins. A
 common example using the bundled CSV plugin:
@@ -1638,7 +1733,7 @@ The transpiler emits the `from` path as a `#include` in the generated C++.
 The REPL loads `<stem>.so` from the plugin search path at the point the
 `extern fn` declaration is evaluated (Section 10.4).
 
-### 11.2 Scalar Extraction
+### 12.2 Scalar Extraction
 
 ```
 scalar(df: DataFrame<S>, col: Ident) -> T
@@ -1647,7 +1742,7 @@ scalar(df: DataFrame<S>, col: Ident) -> T
 Extracts a single scalar from a one-row DataFrame. `col` names a column in `S`.
 It is a runtime error if the DataFrame has any row count other than 1.
 
-### 11.3 Join Functions
+### 12.3 Join Functions
 
 ```
 inner_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFrame<A ∪ B>
@@ -1667,7 +1762,7 @@ TimeFrames must share the same time index column. Additional key arguments
 apply equality matching in addition to the time-based match. Join expressions
 (Section 5.5) always pass a tolerance of `0s`.
 
-### 11.4 Ordering
+### 12.4 Ordering
 
 The surface syntax uses the `order` clause (Section 5.3). Implementations may
 also provide an equivalent built-in:
@@ -1680,7 +1775,7 @@ Returns a new DataFrame sorted by the named keys in ascending order unless
 explicit directions are provided in the `order` clause. Sorting a `TimeFrame`
 by its index column is a no-op (already sorted).
 
-### 11.5 Display
+### 12.5 Display
 
 ```
 print(value: Any) -> ()
@@ -1689,7 +1784,7 @@ print(value: Any) -> ()
 Outputs a human-readable representation of the value. In REPL mode, expression
 statements are implicitly printed without requiring `print`.
 
-### 11.6 Scalar Functions
+### 12.6 Scalar Functions
 
 These scalar functions are optional and may be provided by the runtime or by
 extern implementations. The recommended path for custom scalar logic is
@@ -1742,7 +1837,7 @@ round(-3.7, trunc)    // → -3
 prices[update { vol_int = round(volume_f, bankers) }];
 ```
 
-### 11.7 Vectorized RNG Functions
+### 12.7 Vectorized RNG Functions
 
 These built-in functions generate a full column of independent random draws —
 one value per row — in a single vectorized pass.  They are valid in `update`
@@ -1791,7 +1886,7 @@ df[update { die = rand_int(1, 6) }]
 appear inside aggregate function calls (Section 7.3). Each call produces
 exactly one value per row of the current table.
 
-### 11.8 `rep` — Repeat and Fill
+### 12.8 `rep` — Repeat and Fill
 
 ```
 rep(x, times=1, each=1, length_out=-1)
@@ -1854,13 +1949,13 @@ aggregate function calls (Section 7.3).
 
 ---
 
-## 12. Stream Runtime
+## 13. Stream Runtime
 
 The Stream runtime connects a **source** extern, an anonymous **transform**
 block, and a **sink** extern into a continuous event loop. It is the primary
 mechanism for processing real-time data in Ibex.
 
-### 12.1 Syntax
+### 13.1 Syntax
 
 ```
 let <name> = Stream {
@@ -1875,7 +1970,7 @@ All three fields are required. Field order within the braces is
 
 `Stream` is a **capitalized keyword** and is not a valid user identifier.
 
-### 12.2 Fields
+### 13.2 Fields
 
 **`source = <extern_call>`**
 
@@ -1948,7 +2043,7 @@ arguments after the first are supplied in the `sink` field.
 sink = udp_send("127.0.0.1", 9002)
 ```
 
-### 12.3 Stream Kinds
+### 13.3 Stream Kinds
 
 The compiler infers how and when to emit output from the transform IR.
 
@@ -1961,7 +2056,7 @@ The stream kind is **never specified by the user**; it is derived
 automatically during lowering. `TimeBucket` is selected when the transform
 contains a `resample` clause; otherwise `PerRow` is used.
 
-### 12.4 Plugin Loading with `import`
+### 13.4 Plugin Loading with `import`
 
 Extern functions used as stream sources or sinks are typically provided by
 plugins. The `import` statement loads a named `.ibex` library stub (which
@@ -1983,7 +2078,7 @@ import "udp";      // searches for udp.ibex
 import udp;        // equivalent
 ```
 
-### 12.5 Execution Model
+### 13.5 Execution Model
 
 The REPL **blocks** in the Stream event loop until the source signals
 end-of-stream (returns an empty DataFrame). There is currently no mechanism
@@ -2002,7 +2097,7 @@ to run multiple streams concurrently within a single session. The event loop:
       the buffer is flushed and a new bucket is started.
    c. On end-of-stream, any remaining buffered rows are flushed.
 
-### 12.5.1 TimeBucket Flush Timing
+### 13.5.1 TimeBucket Flush Timing
 
 A `TimeBucket` stream has **two independent flush triggers**:
 
@@ -2053,7 +2148,7 @@ Both triggers can fire independently; whichever fires first wins.
   timeout duration (typically a few milliseconds). For a blocking source,
   jitter can be up to one full inter-message interval.
 
-### 12.6 Example
+### 13.6 Example
 
 The following example reads tick data from UDP port 9001, resamples it into
 1-minute OHLC bars, and forwards the bars to UDP port 9002:
@@ -2087,7 +2182,7 @@ the wall-clock check to fire close to the bucket boundary while the source
 stays live and misses no messages. A `udp_recv` that blocks indefinitely
 delays emission until the next tick arrives.
 
-### 12.7 StreamBuffered: Ready-Made Producer Queue for In-Process Sources
+### 13.7 StreamBuffered: Ready-Made Producer Queue for In-Process Sources
 
 For user-space / in-process transports the runtime provides
 `ibex::runtime::StreamBuffered` — a helper that combines an SPSC
@@ -2175,7 +2270,7 @@ aligned atomic indices so no mutex is required on the hot path.
 
 ---
 
-## 13. Minimal Complete Example
+## 14. Minimal Complete Example
 
 The following program is syntactically and semantically valid under this
 specification. It demonstrates DataFrame loading, grouped aggregation, extern

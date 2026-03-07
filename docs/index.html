@@ -146,6 +146,50 @@ prices[
         </div>
       </div>
 
+      <!-- 1b. Inline Table Construction -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Inline Tables</span>
+          <h3>Define DataFrames from literal column vectors.</h3>
+          <p>
+            The <code>Table&nbsp;{&nbsp;&hellip;&nbsp;}</code> constructor builds
+            a <code>DataFrame</code> from comma-separated array literals &mdash;
+            no file, no plugin, no extern declaration needed.
+          </p>
+          <p>
+            All columns must have the same length. Supported element types are
+            <code>Int64</code>, <code>Float64</code>, <code>Bool</code>,
+            <code>String</code>, <code>Date</code>, and <code>Timestamp</code>.
+          </p>
+          <p>
+            The result is a first-class <code>DataFrame</code>: chain any
+            block operation on it, pass it to <code>as_timeframe</code>, or
+            join it with another table.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Build a DataFrame from column vectors</span>
+<span class="kw">let</span> t = Table {
+    symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>, <span class="str">"MSFT"</span>],
+    price  = [<span class="num">150.0</span>, <span class="num">140.0</span>, <span class="num">300.0</span>],
+    volume = [<span class="num">1000</span>, <span class="num">2000</span>, <span class="num">1500</span>],
+};
+
+<span class="cm">// Chain operations directly</span>
+t[<span class="kw">filter</span> price <span class="op">&gt;</span> <span class="num">145.0</span>, <span class="kw">select</span> { symbol, price }];
+
+<span class="cm">// Promote to TimeFrame</span>
+<span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(
+    Table { ts = [<span class="num">1000</span>, <span class="num">2000</span>, <span class="num">3000</span>], price = [<span class="num">10</span>, <span class="num">20</span>, <span class="num">30</span>] },
+    <span class="str">"ts"</span>
+);
+
+<span class="cm">// Join an inline reference table with loaded data</span>
+<span class="kw">let</span> ref = Table { symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>], tier = [<span class="num">1</span>, <span class="num">2</span>] };
+prices <span class="kw">join</span> ref <span class="kw">on</span> symbol;</code></pre>
+        </div>
+      </div>
+
       <!-- 2. Aggregate -->
       <div class="tour-item">
         <div class="tour-text">

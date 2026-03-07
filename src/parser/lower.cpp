@@ -48,7 +48,14 @@ class Lowerer {
                 const auto& let_stmt = std::get<LetStmt>(stmt);
                 auto value = lower_expr(*let_stmt.value);
                 if (!value.has_value()) {
-                    return std::unexpected(value.error());
+                    // Scalar let bindings are handled by the REPL/tooling layer;
+                    // the IR lowerer only needs to accept them so later table
+                    // expressions can still be lowered.
+                    auto scalar = lower_expr_to_ir(*let_stmt.value);
+                    if (!scalar.has_value()) {
+                        return std::unexpected(value.error());
+                    }
+                    continue;
                 }
                 if (bindings_ != nullptr) {
                     (*bindings_)[let_stmt.name] = std::move(value.value());

@@ -1,0 +1,8 @@
+let base = 10;
+let threshold = (base * 2) + 5;
+let t = Table {
+    x = [24, 25, 26, 40]
+};
+t[filter x >= threshold]
+ [select { x }]
+ [order { x asc }];

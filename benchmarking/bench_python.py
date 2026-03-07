@@ -17,14 +17,24 @@ import polars as pl
 # ── Timing helper ─────────────────────────────────────────────────────────────
 
 def timer(fn, warmup: int, iters: int):
-    """Warmup then time fn(). Returns (avg_ms, last_result)."""
+    """Warmup then time fn(). Returns (avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, last_result)."""
     for _ in range(warmup):
         result = fn()
-    t0 = time.perf_counter()
+    times = []
     for _ in range(iters):
+        t0 = time.perf_counter()
         result = fn()
-    avg_ms = (time.perf_counter() - t0) * 1000 / iters
-    return avg_ms, result
+        times.append((time.perf_counter() - t0) * 1000)
+    t = np.array(times)
+    return (
+        float(np.mean(t)),
+        float(np.min(t)),
+        float(np.max(t)),
+        float(np.std(t, ddof=0)),
+        float(np.percentile(t, 95)),
+        float(np.percentile(t, 99)),
+        result,
+    )
 
 
 # ── Benchmark suites ──────────────────────────────────────────────────────────
@@ -35,10 +45,10 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("mean_by_symbol",
         lambda: df.groupby("symbol", sort=False).agg(
@@ -62,6 +72,8 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         lambda: df.assign(cp=df["price"].cumprod()))
 
     rng_gen = np.random.default_rng(42)
+    run("rand_uniform",
+        lambda: df.assign(r=rng_gen.uniform(0.0, 1.0, len(df))))
     run("rand_normal",
         lambda: df.assign(n=rng_gen.standard_normal(len(df))))
 
@@ -110,10 +122,10 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("mean_by_symbol",
         lambda: df.group_by("symbol").agg(
@@ -137,6 +149,9 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         lambda: df.with_columns(pl.col("price").cum_prod().alias("cp")))
 
     rng_gen = np.random.default_rng(42)
+    run("rand_uniform",
+        lambda: df.with_columns(
+            pl.Series("r", rng_gen.uniform(0.0, 1.0, len(df)))))
     run("rand_normal",
         lambda: df.with_columns(
             pl.Series("n", rng_gen.standard_normal(len(df)))))
@@ -189,10 +204,10 @@ def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("null_left_join",
         lambda: pd.merge(df, lookup, on="symbol", how="left"))
@@ -208,10 +223,10 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("null_left_join",
         lambda: df.join(lookup, on="symbol", how="left"))
@@ -228,10 +243,10 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     # Build the wide OHLC table first
     wide = dfm.groupby(["symbol", "day"], sort=False).agg(
@@ -267,10 +282,10 @@ def bench_polars_reshape(csv_multi_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     # Build the wide OHLC table first
     wide = dfm.group_by(["symbol", "day"]).agg(
@@ -308,10 +323,10 @@ def bench_pandas_fill(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("fill_null",
         lambda: df_fill.assign(v2=df_fill["val"].fillna(0.0)))
@@ -334,10 +349,10 @@ def bench_polars_fill(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("fill_null",
         lambda: df_fill.with_columns(pl.col("val").fill_null(0.0).alias("v2")))
@@ -354,10 +369,10 @@ def bench_pandas_events(csv_events_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("pandas", name, f"{avg_ms:.3f}", n))
+        print(f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("sum_by_user",
         lambda: df.groupby("user_id", sort=False).agg(
@@ -375,10 +390,10 @@ def bench_polars_events(csv_events_path, warmup, iters):
     rows = []
 
     def run(name, fn):
-        avg_ms, result = timer(fn, warmup, iters)
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(fn, warmup, iters)
         n = len(result)
-        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
-        rows.append(("polars", name, f"{avg_ms:.3f}", n))
+        print(f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}", file=sys.stderr, flush=True)
+        rows.append(("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}", f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
 
     run("sum_by_user",
         lambda: df.group_by("user_id").agg(pl.col("amount").sum().alias("total")))
@@ -437,7 +452,7 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(["framework", "query", "avg_ms", "rows"])
+        w.writerow(["framework", "query", "avg_ms", "min_ms", "max_ms", "stddev_ms", "p95_ms", "p99_ms", "rows"])
         w.writerows(all_rows)
     print(f"results written to {out}", file=sys.stderr)
 

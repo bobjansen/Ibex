@@ -52,23 +52,39 @@ suppressPackageStartupMessages({
 # ── Timing helper ─────────────────────────────────────────────────────────────
 timer <- function(fn) {
     for (i in seq_len(warmup)) fn()
-    t0 <- proc.time()[["elapsed"]]
-    r  <- NULL
-    for (i in seq_len(iters)) r <- fn()
-    avg_ms <- (proc.time()[["elapsed"]] - t0) * 1000 / iters
-    list(avg_ms = avg_ms, nrow = nrow(r))
+    times <- numeric(iters)
+    r <- NULL
+    for (i in seq_len(iters)) {
+        t0    <- proc.time()[["elapsed"]]
+        r     <- fn()
+        times[i] <- (proc.time()[["elapsed"]] - t0) * 1000
+    }
+    list(
+        avg_ms    = mean(times),
+        min_ms    = min(times),
+        max_ms    = max(times),
+        stddev_ms = if (iters > 1) sd(times) else 0.0,
+        p95_ms    = as.numeric(quantile(times, 0.95)),
+        p99_ms    = as.numeric(quantile(times, 0.99)),
+        nrow      = nrow(r)
+    )
 }
 
 results <- list()
 
 bench <- function(framework, name, fn) {
     r <- timer(fn)
-    message(sprintf("  %s/%s: avg_ms=%.3f, rows=%d",
-                    framework, name, r$avg_ms, r$nrow))
+    message(sprintf("  %s/%s: avg_ms=%.3f, stddev_ms=%.3f, p99_ms=%.3f, rows=%d",
+                    framework, name, r$avg_ms, r$stddev_ms, r$p99_ms, r$nrow))
     results[[length(results) + 1]] <<- data.frame(
         framework = framework,
         query     = name,
         avg_ms    = sprintf("%.3f", r$avg_ms),
+        min_ms    = sprintf("%.3f", r$min_ms),
+        max_ms    = sprintf("%.3f", r$max_ms),
+        stddev_ms = sprintf("%.3f", r$stddev_ms),
+        p95_ms    = sprintf("%.3f", r$p95_ms),
+        p99_ms    = sprintf("%.3f", r$p99_ms),
         rows      = r$nrow,
         stringsAsFactors = FALSE
     )
@@ -114,6 +130,12 @@ if (!skip_data_table) {
 
     bench("data.table", "cumprod_price",
         function() dt[, cp := cumprod(price)][])
+
+    bench("data.table", "rand_uniform",
+        function() dt[, r := runif(.N, 0.0, 1.0)][])
+
+    bench("data.table", "rand_normal",
+        function() dt[, n := rnorm(.N, 0.0, 1.0)][])
 }
 
 if (!skip_dplyr) {
@@ -139,6 +161,12 @@ if (!skip_dplyr) {
 
     bench("dplyr", "cumprod_price",
         function() tb |> mutate(cp = cumprod(price)))
+
+    bench("dplyr", "rand_uniform",
+        function() tb |> mutate(r = runif(n(), 0.0, 1.0)))
+
+    bench("dplyr", "rand_normal",
+        function() tb |> mutate(n = rnorm(n(), 0.0, 1.0)))
 }
 
 # ── Multi-column group-by ─────────────────────────────────────────────────────
@@ -398,9 +426,14 @@ dir.create(dirname(out_path), showWarnings = FALSE, recursive = TRUE)
 if (length(results) == 0) {
     out_df <- data.frame(
         framework = character(),
-        query = character(),
-        avg_ms = character(),
-        rows = integer(),
+        query     = character(),
+        avg_ms    = character(),
+        min_ms    = character(),
+        max_ms    = character(),
+        stddev_ms = character(),
+        p95_ms    = character(),
+        p99_ms    = character(),
+        rows      = integer(),
         stringsAsFactors = FALSE
     )
 } else {

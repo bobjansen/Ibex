@@ -11,6 +11,16 @@
 
 namespace ibex::ops {
 
+struct NamedArgExpr {
+    std::string name;
+    ir::Expr value;
+};
+
+struct TupleSource {
+    std::vector<std::string> aliases;
+    runtime::Table table;
+};
+
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.
 
@@ -33,6 +43,8 @@ namespace ibex::ops {
 [[nodiscard]] auto filter_and(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_or(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_not(ir::FilterExprPtr operand) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_is_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_is_not_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr;
 
 [[nodiscard]] auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
     -> runtime::Table;
@@ -51,6 +63,10 @@ namespace ibex::ops {
 
 [[nodiscard]] auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
     -> runtime::Table;
+
+[[nodiscard]] auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
+                          const std::vector<TupleSource>& tuple_sources,
+                          const std::vector<std::string>& group_by) -> runtime::Table;
 
 [[nodiscard]] auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames)
     -> runtime::Table;
@@ -92,6 +108,10 @@ namespace ibex::ops {
 [[nodiscard]] auto asof_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<std::string>& keys) -> runtime::Table;
 
+[[nodiscard]] auto join_with_predicate(const runtime::Table& left, const runtime::Table& right,
+                                       ir::JoinKind kind, const std::vector<std::string>& keys,
+                                       ir::FilterExprPtr predicate) -> runtime::Table;
+
 void print(const runtime::Table& t, std::ostream& out = std::cout);
 
 // ─── Expression builders ──────────────────────────────────────────────────────
@@ -104,12 +124,13 @@ void print(const runtime::Table& t, std::ostream& out = std::cout);
 [[nodiscard]] auto date_lit(Date v) -> ir::Expr;
 [[nodiscard]] auto timestamp_lit(Timestamp v) -> ir::Expr;
 [[nodiscard]] auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr;
-[[nodiscard]] auto fn_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr;
+[[nodiscard]] auto fn_call(std::string callee, std::vector<ir::Expr> args,
+                           std::vector<NamedArgExpr> named_args = {}) -> ir::Expr;
 
 // ─── Compound builders ────────────────────────────────────────────────────────
 
 [[nodiscard]] auto make_field(std::string alias, ir::Expr expr) -> ir::FieldSpec;
-[[nodiscard]] auto make_agg(ir::AggFunc func, std::string col_name, std::string alias)
-    -> ir::AggSpec;
+[[nodiscard]] auto make_agg(ir::AggFunc func, std::string col_name, std::string alias,
+                            double param = 0.0) -> ir::AggSpec;
 
 }  // namespace ibex::ops

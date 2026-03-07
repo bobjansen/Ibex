@@ -114,6 +114,26 @@ TEST_CASE("emitter: filter node — arithmetic in predicate", "[codegen]") {
     CHECK(contains(out, "ibex::ir::CompareOp::Gt"));
 }
 
+TEST_CASE("emitter: filter node — is null predicate", "[codegen]") {
+    ir::Builder b;
+    auto filter = b.filter(ops::filter_is_null(ops::filter_col("dept_name")));
+    filter->add_child(make_source(b, "data.csv"));
+
+    auto out = emit_to_string(*filter);
+    CHECK(contains(out, "ibex::ops::filter_is_null("));
+    CHECK(contains(out, "ibex::ops::filter_col(\"dept_name\")"));
+}
+
+TEST_CASE("emitter: filter node — is not null predicate", "[codegen]") {
+    ir::Builder b;
+    auto filter = b.filter(ops::filter_is_not_null(ops::filter_col("dept_name")));
+    filter->add_child(make_source(b, "data.csv"));
+
+    auto out = emit_to_string(*filter);
+    CHECK(contains(out, "ibex::ops::filter_is_not_null("));
+    CHECK(contains(out, "ibex::ops::filter_col(\"dept_name\")"));
+}
+
 // ─── Project ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: project node", "[codegen]") {
@@ -164,6 +184,19 @@ TEST_CASE("emitter: aggregate node", "[codegen]") {
     CHECK(contains(out, "\"total\""));
     CHECK(contains(out, "\"n\""));
     CHECK(contains(out, "ibex::ops::make_agg("));
+}
+
+TEST_CASE("emitter: aggregate node with parameterized function", "[codegen]") {
+    ir::Builder b;
+    auto agg = b.aggregate({}, {ir::AggSpec{.func = ir::AggFunc::Ewma,
+                                            .column = ir::ColumnRef{.name = "price"},
+                                            .alias = "ewm",
+                                            .param = 0.5}});
+    agg->add_child(make_source(b, "trades.csv"));
+
+    auto out = emit_to_string(*agg);
+    CHECK(contains(out, "ibex::ops::make_agg(ibex::ir::AggFunc::Ewma"));
+    CHECK(contains(out, ", 0.5)"));
 }
 
 // ─── Resample ────────────────────────────────────────────────────────────────
@@ -318,6 +351,40 @@ TEST_CASE("emitter: malformed update node does not crash", "[codegen]") {
     REQUIRE_THROWS(emit_to_string(*upd));
 }
 
+TEST_CASE("emitter: update node — tuple sources and by keys", "[codegen]") {
+    ir::Builder b;
+    std::vector<ir::TupleFieldSpec> tuple_fields;
+    tuple_fields.push_back(ir::TupleFieldSpec{
+        .aliases = {"x", "y"},
+        .source = make_source(b, "extra.csv"),
+    });
+    auto upd = b.update({}, std::move(tuple_fields), {ir::ColumnRef{.name = "symbol"}});
+    upd->add_child(make_source(b, "base.csv"));
+
+    auto out = emit_to_string(*upd);
+    CHECK(contains(out, "ibex::ops::TupleSource{{\"x\", \"y\"},"));
+    CHECK(contains(out, "{\"symbol\"}"));
+}
+
+TEST_CASE("emitter: call expression preserves named args", "[codegen]") {
+    ir::Builder b;
+    ir::CallExpr rep_call{
+        .callee = "rep",
+        .args = {std::make_shared<ir::Expr>(ir::Expr{ir::Literal{std::int64_t{7}}})},
+        .named_args = {ir::NamedArg{
+            .name = "times",
+            .value = std::make_shared<ir::Expr>(ir::Expr{ir::Literal{std::int64_t{3}}}),
+        }},
+    };
+    auto upd =
+        b.update({ir::FieldSpec{.alias = "v", .expr = ir::Expr{.node = std::move(rep_call)}}});
+    upd->add_child(make_source(b, "base.csv"));
+
+    auto out = emit_to_string(*upd);
+    CHECK(contains(out, "ibex::ops::fn_call(\"rep\""));
+    CHECK(contains(out, "ibex::ops::NamedArgExpr{\"times\""));
+}
+
 // ─── Chained pipeline ────────────────────────────────────────────────────────
 
 TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
@@ -424,6 +491,20 @@ TEST_CASE("emitter: join node — asof join", "[codegen]") {
     CHECK(contains(out, "ibex::ops::asof_join("));
     CHECK(contains(out, "\"ts\""));
     CHECK(contains(out, "\"symbol\""));
+}
+
+TEST_CASE("emitter: join node — non-equijoin predicate", "[codegen]") {
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Inner, {},
+                       filter_cmp(ir::CompareOp::Gt, filter_col("price"), filter_col("limit")));
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::join_with_predicate("));
+    CHECK(contains(out, "ibex::ir::JoinKind::Inner"));
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────

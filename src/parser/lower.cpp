@@ -101,7 +101,13 @@ class Lowerer {
         return std::unexpected(LowerError{.message = "expected DataFrame expression"});
     }
 
-    /// Lower a `Table { col = [...], ... }` expression into a ConstructNode.
+    /// Lower a `Table { col = expr, ... }` expression into a ConstructNode.
+    ///
+    /// Each column value may be:
+    ///   - An array literal `[v, ...]` — lowered inline to a vector of ir::Literal.
+    ///   - Any other expression — lowered recursively to a child IR node that is
+    ///     expected to produce a single-column Table (or a Table containing a column
+    ///     named after the column being defined) at interpret/codegen time.
     auto lower_table_expr(const TableExpr& tbl) -> LowerResult {
         std::vector<ir::ConstructColumn> construct_cols;
         construct_cols.reserve(tbl.columns.size());
@@ -109,9 +115,16 @@ class Lowerer {
         for (const auto& col_def : tbl.columns) {
             const auto* arr = std::get_if<ArrayLiteralExpr>(&col_def.expr->node);
             if (arr == nullptr) {
-                return std::unexpected(LowerError{
-                    .message = "Table constructor: column '" + col_def.name +
-                               "' value must be an array literal [...]"});
+                // Non-literal expression: lower it as a child IR sub-tree.
+                auto sub = lower_expr(*col_def.expr);
+                if (!sub.has_value()) {
+                    return std::unexpected(sub.error());
+                }
+                ir::ConstructColumn cc;
+                cc.name = col_def.name;
+                cc.expr_node = std::move(*sub);
+                construct_cols.push_back(std::move(cc));
+                continue;
             }
 
             std::vector<ir::Literal> elements;

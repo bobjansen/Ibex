@@ -32,6 +32,14 @@ auto delegate(ir::NodePtr node, const runtime::Table& src) -> runtime::Table {
     return std::move(*result);
 }
 
+auto delegate_with_registry(ir::NodePtr node, const runtime::TableRegistry& reg) -> runtime::Table {
+    auto result = runtime::interpret(*node, reg, nullptr, nullptr);
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
 auto to_col_refs(const std::vector<std::string>& names) -> std::vector<ir::ColumnRef> {
     std::vector<ir::ColumnRef> refs;
     refs.reserve(names.size());
@@ -212,8 +220,37 @@ auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -
     return delegate(std::move(upd_node), t);
 }
 
-auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames)
+auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
+            const std::vector<TupleSource>& tuple_sources, const std::vector<std::string>& group_by)
     -> runtime::Table {
+    if (tuple_sources.empty() && group_by.empty()) {
+        return update(t, fields);
+    }
+
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+
+    runtime::TableRegistry reg;
+    reg.emplace(kSrcKey, t);
+
+    std::vector<ir::TupleFieldSpec> tuple_specs;
+    tuple_specs.reserve(tuple_sources.size());
+
+    for (std::size_t i = 0; i < tuple_sources.size(); ++i) {
+        const auto source_name = "__ibex_tuple_" + std::to_string(i);
+        reg.emplace(source_name, tuple_sources[i].table);
+        tuple_specs.push_back(ir::TupleFieldSpec{
+            .aliases = tuple_sources[i].aliases,
+            .source = b.scan(source_name),
+        });
+    }
+
+    auto upd_node = b.update(fields, std::move(tuple_specs), to_col_refs(group_by));
+    upd_node->add_child(std::move(scan_node));
+    return delegate_with_registry(std::move(upd_node), reg);
+}
+
+auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);
     auto rename_node = b.rename(renames);
@@ -334,6 +371,16 @@ auto asof_join(const runtime::Table& left, const runtime::Table& right,
     return std::move(*result);
 }
 
+auto join_with_predicate(const runtime::Table& left, const runtime::Table& right, ir::JoinKind kind,
+                         const std::vector<std::string>& keys, ir::FilterExprPtr predicate)
+    -> runtime::Table {
+    auto result = runtime::join_tables(left, right, kind, keys, predicate.get());
+    if (!result) {
+        throw std::runtime_error(result.error());
+    }
+    return std::move(*result);
+}
+
 void print(const runtime::Table& t, std::ostream& out) {
     if (t.columns.empty()) {
         out << "(empty table)\n";
@@ -422,12 +469,19 @@ auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr {
     }};
 }
 
-auto fn_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr {
+auto fn_call(std::string callee, std::vector<ir::Expr> args, std::vector<NamedArgExpr> named_args)
+    -> ir::Expr {
     ir::CallExpr call;
     call.callee = std::move(callee);
     call.args.reserve(args.size());
     for (auto& arg : args) {
         call.args.push_back(std::make_shared<ir::Expr>(std::move(arg)));
+    }
+    call.named_args.reserve(named_args.size());
+    for (auto& narg : named_args) {
+        call.named_args.push_back(
+            ir::NamedArg{.name = std::move(narg.name),
+                         .value = std::make_shared<ir::Expr>(std::move(narg.value))});
     }
     return ir::Expr{std::move(call)};
 }
@@ -488,16 +542,27 @@ auto filter_not(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterNot{std::move(operand)}});
 }
 
+auto filter_is_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterIsNull{std::move(operand)}});
+}
+
+auto filter_is_not_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
+    return std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{ir::FilterIsNotNull{std::move(operand)}});
+}
+
 // ─── Compound builders ────────────────────────────────────────────────────────
 
 auto make_field(std::string alias, ir::Expr expr) -> ir::FieldSpec {
     return ir::FieldSpec{.alias = std::move(alias), .expr = std::move(expr)};
 }
 
-auto make_agg(ir::AggFunc func, std::string col_name, std::string alias) -> ir::AggSpec {
+auto make_agg(ir::AggFunc func, std::string col_name, std::string alias, double param)
+    -> ir::AggSpec {
     return ir::AggSpec{.func = func,
                        .column = ir::ColumnRef{.name = std::move(col_name)},
-                       .alias = std::move(alias)};
+                       .alias = std::move(alias),
+                       .param = param};
 }
 
 }  // namespace ibex::ops

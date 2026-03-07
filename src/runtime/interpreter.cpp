@@ -7602,8 +7602,9 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
 }
 
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
-                 const std::vector<std::string>& keys) -> std::expected<Table, std::string> {
-    return join_table_impl(left, right, kind, keys);
+                 const std::vector<std::string>& keys, const ir::FilterExpr* predicate,
+                 const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+    return join_table_impl(left, right, kind, keys, predicate, scalars);
 }
 
 auto extract_scalar(const Table& table, const std::string& column)

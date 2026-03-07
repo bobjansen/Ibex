@@ -49,6 +49,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(rapidcsv)
 
+# nlohmann/json — header-only JSON library (MIT)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nlohmann_json)
+
 # Catch2 — testing framework (only when tests enabled)
 if(IBEX_BUILD_TESTS)
     FetchContent_Declare(

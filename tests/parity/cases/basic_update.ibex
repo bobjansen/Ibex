@@ -1,0 +1,2 @@
+let t = Table { x = [1, 2, 3], y = [10, 20, 30] };
+t[update { z = x + y }][select { x, z }][order { x desc }];

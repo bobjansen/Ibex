@@ -87,3 +87,24 @@ endif()
 install(TARGETS ibex_compile_bin
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
+
+add_executable(ibex_eval_bin ibex_eval.cpp)
+
+set_target_properties(ibex_eval_bin PROPERTIES
+    OUTPUT_NAME ibex_eval
+)
+
+target_link_libraries(ibex_eval_bin
+    PRIVATE
+        Ibex::parser
+        Ibex::runtime
+        Ibex::CompilerOptions
+)
+
+if(TARGET Ibex::Sanitizers)
+    target_link_libraries(ibex_eval_bin PRIVATE Ibex::Sanitizers)
+endif()
+
+install(TARGETS ibex_eval_bin
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)

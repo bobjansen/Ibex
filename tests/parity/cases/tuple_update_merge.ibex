@@ -1,0 +1,2 @@
+let base = Table { id = [1, 2], a = [10, 20] };
+base[update { (u, v) = Table { u = [100, 200], v = [1000, 2000] } }][select { id, u, v }];

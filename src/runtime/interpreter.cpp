@@ -4,16 +4,16 @@
 
 #include <algorithm>
 #include <cmath>
-#include <ctime>
-#include <random>
-#include <set>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <emmintrin.h>
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <robin_hood.h>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -1347,9 +1347,8 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
         std::vector<ir::OrderKey> new_ordering;
         for (const auto& key : *input.ordering) {
             auto it = rename_map.find(key.name);
-            new_ordering.push_back(
-                {.name = (it != rename_map.end()) ? it->second : key.name,
-                 .ascending = key.ascending});
+            new_ordering.push_back({.name = (it != rename_map.end()) ? it->second : key.name,
+                                    .ascending = key.ascending});
         }
         output.ordering = std::move(new_ordering);
     }
@@ -1414,11 +1413,11 @@ struct AggSlot {
     std::int64_t int_value = 0;
     double double_value = 0.0;
     double sum = 0.0;
-    double m2 = 0.0;            ///< Welford M2 accumulator for sample stddev.
-    double param = 0.0;         ///< Function-specific parameter (e.g. EWMA alpha).
+    double m2 = 0.0;     ///< Welford M2 accumulator for sample stddev.
+    double param = 0.0;  ///< Function-specific parameter (e.g. EWMA alpha).
     ScalarValue first_value;
     ScalarValue last_value;
-    std::vector<double> values; ///< Collected values for median.
+    std::vector<double> values;  ///< Collected values for median.
 };
 
 struct AggState {
@@ -2486,8 +2485,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
             bool l_had_match = false;
             for (std::size_t j = 0; j < N_right; ++j) {
-                const bool match = mask_res->value[j] != 0 &&
-                                   (!mask_res->valid || (*mask_res->valid)[j] != 0);
+                const bool match =
+                    mask_res->value[j] != 0 && (!mask_res->valid || (*mask_res->valid)[j] != 0);
                 if (!match)
                     continue;
                 l_had_match = true;
@@ -2974,7 +2973,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) {
                 double x;
                 if (std::holds_alternative<Column<std::int64_t>>(column)) {
-                    x = static_cast<double>(std::get<std::int64_t>(scalar_from_column(column, row)));
+                    x = static_cast<double>(
+                        std::get<std::int64_t>(scalar_from_column(column, row)));
                 } else {
                     x = std::get<double>(scalar_from_column(column, row));
                 }
@@ -2984,7 +2984,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (agg.func == ir::AggFunc::Stddev) {
                 double x;
                 if (std::holds_alternative<Column<std::int64_t>>(column)) {
-                    x = static_cast<double>(std::get<std::int64_t>(scalar_from_column(column, row)));
+                    x = static_cast<double>(
+                        std::get<std::int64_t>(scalar_from_column(column, row)));
                 } else {
                     x = std::get<double>(scalar_from_column(column, row));
                 }
@@ -2998,7 +2999,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (agg.func == ir::AggFunc::Ewma) {
                 double x;
                 if (std::holds_alternative<Column<std::int64_t>>(column)) {
-                    x = static_cast<double>(std::get<std::int64_t>(scalar_from_column(column, row)));
+                    x = static_cast<double>(
+                        std::get<std::int64_t>(scalar_from_column(column, row)));
                 } else {
                     x = std::get<double>(scalar_from_column(column, row));
                 }
@@ -3314,9 +3316,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<double> sorted = slot.values;
                         std::sort(sorted.begin(), sorted.end());
                         std::size_t n = sorted.size();
-                        double med = (n % 2 == 1)
-                                         ? sorted[n / 2]
-                                         : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+                        double med = (n % 2 == 1) ? sorted[n / 2]
+                                                  : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
                         append_scalar(*column, med);
                     }
                     break;
@@ -3352,7 +3353,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         append_scalar(*column, 0.0);
                     } else {
                         double mean = 0.0;
-                        for (double x : slot.values) mean += x;
+                        for (double x : slot.values)
+                            mean += x;
                         mean /= static_cast<double>(n);
                         double m2 = 0.0, m3 = 0.0;
                         for (double x : slot.values) {
@@ -3365,8 +3367,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         } else {
                             double dn = static_cast<double>(n);
                             // Fisher–Pearson sample skewness (same as pandas default)
-                            double skew = (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) *
-                                          (m3 / std::pow(m2, 1.5));
+                            double skew =
+                                (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
                             append_scalar(*column, skew);
                         }
                     }
@@ -3378,7 +3380,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         append_scalar(*column, 0.0);
                     } else {
                         double mean = 0.0;
-                        for (double x : slot.values) mean += x;
+                        for (double x : slot.values)
+                            mean += x;
                         mean /= static_cast<double>(n);
                         double m2 = 0.0, m4 = 0.0;
                         for (double x : slot.values) {
@@ -3393,9 +3396,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             double dn = static_cast<double>(n);
                             // Fisher excess kurtosis (unbiased, matches scipy/pandas default):
                             // G2 = (n-1)/((n-2)*(n-3)) * [(n+1)*n*m4/m2^2 - 3*(n-1)]
-                            double kurt =
-                                (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
-                                ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
+                            double kurt = (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
+                                          ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
                             append_scalar(*column, kurt);
                         }
                     }
@@ -4814,7 +4816,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         // Null-fill functions (fill_null / fill_forward / fill_backward)
         if (is_fill_func(call->callee)) {
             if (call->args.empty()) {
-                return std::unexpected(std::string(call->callee) + ": expected at least 1 argument");
+                return std::unexpected(std::string(call->callee) +
+                                       ": expected at least 1 argument");
             }
             const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
             if (!col_ref) {
@@ -4892,11 +4895,16 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             const auto& x = *call->args[0];
             if (const auto* lit = std::get_if<ir::Literal>(&x.node)) {
-                if (std::holds_alternative<bool>(lit->value)) return ExprType::Bool;
-                if (std::holds_alternative<std::int64_t>(lit->value)) return ExprType::Int;
-                if (std::holds_alternative<double>(lit->value)) return ExprType::Double;
-                if (std::holds_alternative<Date>(lit->value)) return ExprType::Date;
-                if (std::holds_alternative<Timestamp>(lit->value)) return ExprType::Timestamp;
+                if (std::holds_alternative<bool>(lit->value))
+                    return ExprType::Bool;
+                if (std::holds_alternative<std::int64_t>(lit->value))
+                    return ExprType::Int;
+                if (std::holds_alternative<double>(lit->value))
+                    return ExprType::Double;
+                if (std::holds_alternative<Date>(lit->value))
+                    return ExprType::Date;
+                if (std::holds_alternative<Timestamp>(lit->value))
+                    return ExprType::Timestamp;
                 return ExprType::String;
             }
             return infer_expr_type(x, input, scalars, externs);
@@ -5320,22 +5328,25 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
                 else if (const auto* v = std::get_if<std::int64_t>(&fill_lit->value))
                     maybe_fill = static_cast<double>(*v);
             } else if constexpr (std::is_same_v<T, bool>) {
-                if (const auto* v = std::get_if<bool>(&fill_lit->value)) maybe_fill = *v;
+                if (const auto* v = std::get_if<bool>(&fill_lit->value))
+                    maybe_fill = *v;
             } else if constexpr (std::is_same_v<T, std::string_view>) {
                 // Covers both Column<std::string> and Column<Categorical>.
                 // The literal's std::string lives as long as the IR tree.
                 if (const auto* v = std::get_if<std::string>(&fill_lit->value))
                     maybe_fill = std::string_view(*v);
             } else if constexpr (std::is_same_v<T, Date>) {
-                if (const auto* v = std::get_if<Date>(&fill_lit->value)) maybe_fill = *v;
+                if (const auto* v = std::get_if<Date>(&fill_lit->value))
+                    maybe_fill = *v;
             } else if constexpr (std::is_same_v<T, Timestamp>) {
-                if (const auto* v = std::get_if<Timestamp>(&fill_lit->value)) maybe_fill = *v;
+                if (const auto* v = std::get_if<Timestamp>(&fill_lit->value))
+                    maybe_fill = *v;
             }
 
             if (!maybe_fill) {
                 return std::unexpected(
-                    "fill_null: fill value type does not match column type for '" +
-                    col_ref->name + "'");
+                    "fill_null: fill value type does not match column type for '" + col_ref->name +
+                    "'");
             }
             T fill_val = *maybe_fill;
 
@@ -5455,7 +5466,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
                 } else {
                     // Trailing null — no following value; stays null.
                     vals[i] = T{};
-                        if (!out_validity) {
+                    if (!out_validity) {
                         out_validity.emplace(rows, true);
                     }
                     (*out_validity)[i] = false;
@@ -5682,9 +5693,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                             remove_val(static_cast<double>(col[lo_ptr]));
                             ++lo_ptr;
                         }
-                        result[i] = (lo.size() > hi.size())
-                                        ? static_cast<double>(*lo.rbegin())
-                                        : (*lo.rbegin() + *hi.begin()) / 2.0;
+                        result[i] = (lo.size() > hi.size()) ? static_cast<double>(*lo.rbegin())
+                                                            : (*lo.rbegin() + *hi.begin()) / 2.0;
                     }
                     return result;
                 }
@@ -5731,7 +5741,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         // Parse alpha from the second argument (a numeric literal).
         double alpha = 0.0;
         if (call.args.size() < 2) {
-            return std::unexpected("rolling_ewma: expected two arguments: rolling_ewma(col, alpha)");
+            return std::unexpected(
+                "rolling_ewma: expected two arguments: rolling_ewma(col, alpha)");
         }
         if (const auto* lit = std::get_if<ir::Literal>(&call.args[1]->node)) {
             if (const auto* dv = std::get_if<double>(&lit->value)) {
@@ -5842,8 +5853,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                             result[i] = 0.0;
                         } else {
                             double dn = static_cast<double>(n);
-                            result[i] = (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) *
-                                        (m3 / std::pow(m2, 1.5));
+                            result[i] =
+                                (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
                         }
                     }
                     return result;
@@ -5885,9 +5896,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         } else {
                             double dn = static_cast<double>(n);
                             // Fisher excess kurtosis (unbiased, matches scipy/pandas):
-                            result[i] =
-                                (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
-                                ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
+                            result[i] = (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
+                                        ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
                         }
                     }
                     return result;
@@ -6064,9 +6074,11 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_uniform: expected 2 arguments (low, high)");
         }
         auto low = extract_rng_param(call, 0, name);
-        if (!low) return std::unexpected(low.error());
+        if (!low)
+            return std::unexpected(low.error());
         auto high = extract_rng_param(call, 1, name);
-        if (!high) return std::unexpected(high.error());
+        if (!high)
+            return std::unexpected(high.error());
         if (*low >= *high) {
             return std::unexpected("rand_uniform: low must be less than high");
         }
@@ -6084,9 +6096,11 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_normal: expected 2 arguments (mean, stddev)");
         }
         auto mean = extract_rng_param(call, 0, name);
-        if (!mean) return std::unexpected(mean.error());
+        if (!mean)
+            return std::unexpected(mean.error());
         auto stddev = extract_rng_param(call, 1, name);
-        if (!stddev) return std::unexpected(stddev.error());
+        if (!stddev)
+            return std::unexpected(stddev.error());
         if (*stddev <= 0.0) {
             return std::unexpected("rand_normal: stddev must be positive");
         }
@@ -6104,14 +6118,16 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_student_t: expected 1 argument (degrees_of_freedom)");
         }
         auto df = extract_rng_param(call, 0, name);
-        if (!df) return std::unexpected(df.error());
+        if (!df)
+            return std::unexpected(df.error());
         if (*df <= 0.0) {
             return std::unexpected("rand_student_t: degrees_of_freedom must be positive");
         }
         std::student_t_distribution<double> dist(*df);
         Column<double> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        for (std::size_t i = 0; i < rows; ++i)
+            col.push_back(dist(rng));
         return col;
     }
 
@@ -6120,9 +6136,11 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_gamma: expected 2 arguments (shape, scale)");
         }
         auto shape = extract_rng_param(call, 0, name);
-        if (!shape) return std::unexpected(shape.error());
+        if (!shape)
+            return std::unexpected(shape.error());
         auto scale = extract_rng_param(call, 1, name);
-        if (!scale) return std::unexpected(scale.error());
+        if (!scale)
+            return std::unexpected(scale.error());
         if (*shape <= 0.0) {
             return std::unexpected("rand_gamma: shape must be positive");
         }
@@ -6132,7 +6150,8 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         std::gamma_distribution<double> dist(*shape, *scale);
         Column<double> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        for (std::size_t i = 0; i < rows; ++i)
+            col.push_back(dist(rng));
         return col;
     }
 
@@ -6141,7 +6160,8 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_exponential: expected 1 argument (lambda)");
         }
         auto lambda = extract_rng_param(call, 0, name);
-        if (!lambda) return std::unexpected(lambda.error());
+        if (!lambda)
+            return std::unexpected(lambda.error());
         if (*lambda <= 0.0) {
             return std::unexpected("rand_exponential: lambda must be positive");
         }
@@ -6160,14 +6180,16 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_bernoulli: expected 1 argument (p)");
         }
         auto p = extract_rng_param(call, 0, name);
-        if (!p) return std::unexpected(p.error());
+        if (!p)
+            return std::unexpected(p.error());
         if (*p < 0.0 || *p > 1.0) {
             return std::unexpected("rand_bernoulli: p must be in [0, 1]");
         }
         std::bernoulli_distribution dist(*p);
         Column<std::int64_t> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng) ? 1 : 0);
+        for (std::size_t i = 0; i < rows; ++i)
+            col.push_back(dist(rng) ? 1 : 0);
         return col;
     }
 
@@ -6176,14 +6198,16 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_poisson: expected 1 argument (lambda)");
         }
         auto lambda = extract_rng_param(call, 0, name);
-        if (!lambda) return std::unexpected(lambda.error());
+        if (!lambda)
+            return std::unexpected(lambda.error());
         if (*lambda <= 0.0) {
             return std::unexpected("rand_poisson: lambda must be positive");
         }
         std::poisson_distribution<std::int64_t> dist(static_cast<double>(*lambda));
         Column<std::int64_t> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        for (std::size_t i = 0; i < rows; ++i)
+            col.push_back(dist(rng));
         return col;
     }
 
@@ -6192,9 +6216,11 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
             return std::unexpected("rand_int: expected 2 arguments (lo, hi)");
         }
         auto lo_d = extract_rng_param(call, 0, name);
-        if (!lo_d) return std::unexpected(lo_d.error());
+        if (!lo_d)
+            return std::unexpected(lo_d.error());
         auto hi_d = extract_rng_param(call, 1, name);
-        if (!hi_d) return std::unexpected(hi_d.error());
+        if (!hi_d)
+            return std::unexpected(hi_d.error());
         auto lo = static_cast<std::int64_t>(*lo_d);
         auto hi = static_cast<std::int64_t>(*hi_d);
         if (lo > hi) {
@@ -6203,7 +6229,8 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         std::uniform_int_distribution<std::int64_t> dist(lo, hi);
         Column<std::int64_t> col;
         col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) col.push_back(dist(rng));
+        for (std::size_t i = 0; i < rows; ++i)
+            col.push_back(dist(rng));
         return col;
     }
 
@@ -6237,8 +6264,7 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
         const auto* lit = std::get_if<ir::Literal>(&narg.value->node);
         auto as_int = [&]() -> std::expected<std::int64_t, std::string> {
             if (lit == nullptr) {
-                return std::unexpected("rep: named argument '" + narg.name +
-                                       "' must be a literal");
+                return std::unexpected("rep: named argument '" + narg.name + "' must be a literal");
             }
             if (const auto* i = std::get_if<std::int64_t>(&lit->value)) {
                 return *i;
@@ -6246,22 +6272,26 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
             if (const auto* d = std::get_if<double>(&lit->value)) {
                 return static_cast<std::int64_t>(*d);
             }
-            return std::unexpected("rep: named argument '" + narg.name +
-                                   "' must be an integer");
+            return std::unexpected("rep: named argument '" + narg.name + "' must be an integer");
         };
         if (narg.name == "times") {
             auto v = as_int();
-            if (!v) return std::unexpected(v.error());
+            if (!v)
+                return std::unexpected(v.error());
             times = *v;
-            if (times <= 0) return std::unexpected("rep: times must be positive");
+            if (times <= 0)
+                return std::unexpected("rep: times must be positive");
         } else if (narg.name == "each") {
             auto v = as_int();
-            if (!v) return std::unexpected(v.error());
+            if (!v)
+                return std::unexpected(v.error());
             each = *v;
-            if (each <= 0) return std::unexpected("rep: each must be positive");
+            if (each <= 0)
+                return std::unexpected("rep: each must be positive");
         } else if (narg.name == "length_out") {
             auto v = as_int();
-            if (!v) return std::unexpected(v.error());
+            if (!v)
+                return std::unexpected(v.error());
             length_out = *v;
             if (length_out < 0)
                 return std::unexpected("rep: length_out must be non-negative");
@@ -6282,17 +6312,20 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
                 if constexpr (std::is_same_v<T, bool>) {
                     Column<bool> col;
                     col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    for (std::size_t i = 0; i < out_len; ++i)
+                        col.push_back(v);
                     return col;
                 } else if constexpr (std::is_same_v<T, std::int64_t>) {
                     Column<std::int64_t> col;
                     col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    for (std::size_t i = 0; i < out_len; ++i)
+                        col.push_back(v);
                     return col;
                 } else if constexpr (std::is_same_v<T, double>) {
                     Column<double> col;
                     col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    for (std::size_t i = 0; i < out_len; ++i)
+                        col.push_back(v);
                     return col;
                 } else if constexpr (std::is_same_v<T, std::string>) {
                     Column<std::string> col;
@@ -6303,13 +6336,15 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
                 } else if constexpr (std::is_same_v<T, Date>) {
                     Column<Date> col;
                     col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    for (std::size_t i = 0; i < out_len; ++i)
+                        col.push_back(v);
                     return col;
                 } else {
                     static_assert(std::is_same_v<T, Timestamp>);
                     Column<Timestamp> col;
                     col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i) col.push_back(v);
+                    for (std::size_t i = 0; i < out_len; ++i)
+                        col.push_back(v);
                     return col;
                 }
             },
@@ -6351,8 +6386,7 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
             *src_col);
     }
 
-    return std::unexpected(
-        "rep: first argument must be a scalar literal or column reference");
+    return std::unexpected("rep: first argument must be a scalar literal or column reference");
 }
 
 // Like update_table but evaluates rolling aggregate expressions using the given window duration.
@@ -6390,18 +6424,18 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
             }
             if (is_cum_func(call->callee)) {
                 auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");
-                if (!col) return std::unexpected(col.error());
+                if (!col)
+                    return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
             if (is_fill_func(call->callee)) {
                 std::expected<FillResult, std::string> res =
-                    call->callee == "fill_null"
-                        ? eval_fill_null(*call, output)
-                        : call->callee == "fill_forward"
-                              ? eval_fill_forward(*call, output)
-                              : eval_fill_backward(*call, output);
-                if (!res) return std::unexpected(res.error());
+                    call->callee == "fill_null"      ? eval_fill_null(*call, output)
+                    : call->callee == "fill_forward" ? eval_fill_forward(*call, output)
+                                                     : eval_fill_backward(*call, output);
+                if (!res)
+                    return std::unexpected(res.error());
                 if (res->validity)
                     output.add_column(field.alias, std::move(res->column),
                                       std::move(*res->validity));
@@ -6411,13 +6445,15 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
             }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, output.rows());
-                if (!col) return std::unexpected(col.error());
+                if (!col)
+                    return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
             if (call->callee == "rep") {
                 auto col = apply_rep_func(*call, output, output.rows());
-                if (!col) return std::unexpected(col.error());
+                if (!col)
+                    return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
@@ -6476,18 +6512,18 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             if (is_cum_func(call->callee)) {
                 auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");
-                if (!col) return std::unexpected(col.error());
+                if (!col)
+                    return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
             if (is_fill_func(call->callee)) {
                 std::expected<FillResult, std::string> res =
-                    call->callee == "fill_null"
-                        ? eval_fill_null(*call, output)
-                        : call->callee == "fill_forward"
-                              ? eval_fill_forward(*call, output)
-                              : eval_fill_backward(*call, output);
-                if (!res) return std::unexpected(res.error());
+                    call->callee == "fill_null"      ? eval_fill_null(*call, output)
+                    : call->callee == "fill_forward" ? eval_fill_forward(*call, output)
+                                                     : eval_fill_backward(*call, output);
+                if (!res)
+                    return std::unexpected(res.error());
                 if (res->validity)
                     output.add_column(field.alias, std::move(res->column),
                                       std::move(*res->validity));
@@ -6497,13 +6533,15 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, rows);
-                if (!col) return std::unexpected(col.error());
+                if (!col)
+                    return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
             if (call->callee == "rep") {
                 auto col = apply_rep_func(*call, output, rows);
-                if (!col) return std::unexpected(col.error());
+                if (!col)
+                    return std::unexpected(col.error());
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
@@ -6715,10 +6753,9 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
             append_value(value_col, *entry.column, r);
             bool null = is_null(entry, r);
             if (null && !value_validity.has_value()) {
-                value_validity.emplace(output.columns.back().column
-                                           ? column_size(value_col) - 1
-                                           : r * n_measures + mi,
-                                       true);
+                value_validity.emplace(
+                    output.columns.back().column ? column_size(value_col) - 1 : r * n_measures + mi,
+                    true);
             }
             if (value_validity.has_value()) {
                 value_validity->push_back(!null);
@@ -6770,7 +6807,8 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     const auto& pivot_col = *input.columns[pivot_idx].column;
 
     for (std::size_t r = 0; r < rows; ++r) {
-        if (is_null(input.columns[pivot_idx], r)) continue;
+        if (is_null(input.columns[pivot_idx], r))
+            continue;
         std::string pv = std::visit(
             [r](const auto& col) -> std::string {
                 using ColType = std::decay_t<decltype(col)>;
@@ -6822,7 +6860,8 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     std::size_t n_pivots = pivot_values.size();
 
     for (std::size_t r = 0; r < rows; ++r) {
-        if (is_null(input.columns[pivot_idx], r)) continue;
+        if (is_null(input.columns[pivot_idx], r))
+            continue;
 
         Key key;
         key.values.reserve(row_keys.size());
@@ -6895,7 +6934,8 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 append_value(col, *value_entry.column, cit->second);
                 bool val_null = is_null(value_entry, cit->second);
                 validity[or_idx] = !val_null;
-                if (val_null) has_nulls = true;
+                if (val_null)
+                    has_nulls = true;
             } else {
                 // Missing cell — append a default value and mark as null.
                 std::visit([](auto& c) { c.push_back({}); }, col);
@@ -7005,9 +7045,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 } else {
                     if (src->columns.size() != tspec.aliases.size()) {
                         return std::unexpected(
-                            "tuple assignment: expected " +
-                            std::to_string(tspec.aliases.size()) + " column(s), got " +
-                            std::to_string(src->columns.size()));
+                            "tuple assignment: expected " + std::to_string(tspec.aliases.size()) +
+                            " column(s), got " + std::to_string(src->columns.size()));
                     }
                     for (std::size_t i = 0; i < tspec.aliases.size(); ++i) {
                         const auto& entry = src->columns[i];
@@ -7219,28 +7258,31 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             ExternArgs source_args;
             for (const auto& arg : sn.source_args()) {
                 auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val) return std::unexpected(val.error());
+                if (!val)
+                    return std::unexpected(val.error());
                 source_args.push_back(std::move(val.value()));
             }
             ExternArgs sink_scalar_args;
             for (const auto& arg : sn.sink_args()) {
                 auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val) return std::unexpected(val.error());
+                if (!val)
+                    return std::unexpected(val.error());
                 sink_scalar_args.push_back(std::move(val.value()));
             }
 
             const ir::Node& transform_ir = sn.transform_ir();
 
             // Append every row of `src` into `dst`, initialising dst schema on first call.
-            auto append_table = [&](Table& dst, const Table& src) -> std::expected<void, std::string> {
-                if (src.rows() == 0) return {};
+            auto append_table = [&](Table& dst,
+                                    const Table& src) -> std::expected<void, std::string> {
+                if (src.rows() == 0)
+                    return {};
                 if (dst.columns.empty()) {
                     for (const auto& entry : src.columns) {
-                        dst.columns.push_back(
-                            ColumnEntry{.name = entry.name,
-                                        .column = std::make_shared<ColumnValue>(
-                                            make_empty_like(*entry.column)),
-                                        .validity = std::nullopt});
+                        dst.columns.push_back(ColumnEntry{
+                            .name = entry.name,
+                            .column = std::make_shared<ColumnValue>(make_empty_like(*entry.column)),
+                            .validity = std::nullopt});
                         dst.index[entry.name] = dst.columns.size() - 1;
                     }
                     dst.time_index = src.time_index;
@@ -7271,11 +7313,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             auto slice_row = [&](const Table& src, std::size_t r) -> Table {
                 Table out;
                 for (const auto& entry : src.columns) {
-                    out.columns.push_back(
-                        ColumnEntry{.name = entry.name,
-                                    .column = std::make_shared<ColumnValue>(
-                                        make_empty_like(*entry.column)),
-                                    .validity = std::nullopt});
+                    out.columns.push_back(ColumnEntry{
+                        .name = entry.name,
+                        .column = std::make_shared<ColumnValue>(make_empty_like(*entry.column)),
+                        .validity = std::nullopt});
                     out.index[entry.name] = out.columns.size() - 1;
                     append_value(*out.columns.back().column, *entry.column, r);
                     if (is_null(entry, r)) {
@@ -7288,9 +7329,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
             // Get the nanosecond timestamp of the last row (for bucket detection).
             auto get_last_ts_ns = [&](const Table& t) -> std::optional<std::int64_t> {
-                if (t.rows() == 0 || !t.time_index.has_value()) return std::nullopt;
+                if (t.rows() == 0 || !t.time_index.has_value())
+                    return std::nullopt;
                 const auto* col = t.find(*t.time_index);
-                if (col == nullptr) return std::nullopt;
+                if (col == nullptr)
+                    return std::nullopt;
                 std::size_t last = t.rows() - 1;
                 return std::visit(
                     [last](const auto& c) -> std::optional<std::int64_t> {
@@ -7307,14 +7350,18 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
             // Run the transform over `buf` and emit the result to the sink.
             auto emit_buffer = [&](const Table& buf) -> std::expected<void, std::string> {
-                if (buf.rows() == 0) return {};
+                if (buf.rows() == 0)
+                    return {};
                 TableRegistry stream_reg = registry;
                 stream_reg["__stream_input__"] = buf;
                 auto output = interpret_node(transform_ir, stream_reg, scalars, externs);
-                if (!output) return std::unexpected(output.error());
-                if (output->rows() == 0) return {};
+                if (!output)
+                    return std::unexpected(output.error());
+                if (output->rows() == 0)
+                    return {};
                 auto sr = sink_fn->table_consumer_func(*output, sink_scalar_args);
-                if (!sr) return std::unexpected(sr.error());
+                if (!sr)
+                    return std::unexpected(sr.error());
                 return {};
             };
 
@@ -7337,19 +7384,20 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
             while (true) {
                 auto src_result = source_fn->func(source_args);
-                if (!src_result) return std::unexpected(src_result.error());
+                if (!src_result)
+                    return std::unexpected(src_result.error());
 
                 // StreamTimeout: the source had a receive timeout — no data arrived but
                 // it is not done.  Run the wall-clock flush check and keep listening.
-                const bool is_timeout =
-                    std::holds_alternative<StreamTimeout>(src_result.value());
+                const bool is_timeout = std::holds_alternative<StreamTimeout>(src_result.value());
 
                 if (!is_timeout) {
                     const auto* batch = std::get_if<Table>(&src_result.value());
                     if (batch == nullptr) {
                         return std::unexpected("stream source did not return a table");
                     }
-                    if (batch->rows() == 0) break;  // source signalled EOF
+                    if (batch->rows() == 0)
+                        break;  // source signalled EOF
                 }
 
                 if (sn.stream_kind() == ir::StreamKind::TimeBucket && bucket_ns > 0) {
@@ -7360,7 +7408,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     if (open_bucket_ns >= 0 && buffer.rows() > 0 &&
                         wall_now_ns() - bucket_open_wall_ns >= bucket_ns) {
                         auto er = emit_buffer(buffer);
-                        if (!er) return std::unexpected(er.error());
+                        if (!er)
+                            return std::unexpected(er.error());
                         buffer = Table{};
                         open_bucket_ns = -1;
                         bucket_open_wall_ns = -1;
@@ -7381,7 +7430,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                                 row_bucket > open_bucket_ns) {
                                 // Bucket boundary crossed — flush the closed bucket.
                                 auto er = emit_buffer(buffer);
-                                if (!er) return std::unexpected(er.error());
+                                if (!er)
+                                    return std::unexpected(er.error());
                                 buffer = Table{};
                             }
                             if (row_bucket >= 0) {
@@ -7392,23 +7442,27 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                                 open_bucket_ns = row_bucket;
                             }
                             auto app = append_table(buffer, row_tbl);
-                            if (!app) return std::unexpected(app.error());
+                            if (!app)
+                                return std::unexpected(app.error());
                         }
                     }
                 } else if (!is_timeout) {
                     // PerRow — append batch to rolling buffer, run transform, emit last rows.
                     const auto& batch = std::get<Table>(src_result.value());
                     auto app = append_table(buffer, batch);
-                    if (!app) return std::unexpected(app.error());
+                    if (!app)
+                        return std::unexpected(app.error());
                     auto er = emit_buffer(buffer);
-                    if (!er) return std::unexpected(er.error());
+                    if (!er)
+                        return std::unexpected(er.error());
                 }
             }
 
             // Flush any remaining buffered rows (TimeBucket only).
             if (sn.stream_kind() == ir::StreamKind::TimeBucket && buffer.rows() > 0) {
                 auto er = emit_buffer(buffer);
-                if (!er) return std::unexpected(er.error());
+                if (!er)
+                    return std::unexpected(er.error());
             }
 
             return Table{};  // stream execution produces no result table
@@ -7421,7 +7475,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     // Expression column: evaluate the sub-node to produce a Table,
                     // then extract the target column from it.
                     auto sub = interpret_node(*col.expr_node, registry, scalars, externs);
-                    if (!sub.has_value()) return std::unexpected(sub.error());
+                    if (!sub.has_value())
+                        return std::unexpected(sub.error());
                     if (sub->columns.size() == 1) {
                         // Single-column result: use it regardless of its name.
                         ColumnEntry entry = sub->columns[0];
@@ -7438,7 +7493,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         return std::unexpected(
                             "Table constructor: expression for column '" + col.name +
                             "' must produce a single-column result or a table containing"
-                            " a column named '" + col.name + "'");
+                            " a column named '" +
+                            col.name + "'");
                     }
                     continue;
                 }

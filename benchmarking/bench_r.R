@@ -359,21 +359,48 @@ if (!is.null(csv_lookup_path)) {
     if (!skip_data_table) {
         message("\ndata.table: loading lookup.csv...")
         dt_lookup <- fread(csv_lookup_path)
+        lookup_symbols <- unique(dt_lookup$symbol)
+        left_small <- copy(dt[seq_len(min(nrow(dt), 2000L))])
+        right_small <- copy(dt_lookup[seq_len(min(nrow(dt_lookup), 64L))])
+        left_small[, join_key := 1L]
+        right_small[, join_key := 1L]
 
         message("\n=== data.table (null) ===")
 
         bench("data.table", "null_left_join",
             function() merge(dt, dt_lookup, by = "symbol", all.x = TRUE))
+
+        bench("data.table", "null_semi_join",
+            function() dt[symbol %chin% lookup_symbols])
+
+        bench("data.table", "null_anti_join",
+            function() dt[!symbol %chin% lookup_symbols])
+
+        bench("data.table", "null_cross_join_small",
+            function() merge(left_small, right_small, by = "join_key", allow.cartesian = TRUE)
+                [, join_key := NULL][])
     }
 
     if (!skip_dplyr) {
         if (is.null(tb_lookup)) {
             tb_lookup <- as_tibble(fread(csv_lookup_path))
         }
+        tb_lookup_symbols <- tb_lookup |> distinct(symbol)
+        tb_left_small <- tb |> slice_head(n = min(nrow(tb), 2000L))
+        tb_right_small <- tb_lookup |> slice_head(n = min(nrow(tb_lookup), 64L))
         message("\n=== dplyr (null) ===")
 
         bench("dplyr", "null_left_join",
             function() tb |> left_join(tb_lookup, by = "symbol"))
+
+        bench("dplyr", "null_semi_join",
+            function() tb |> semi_join(tb_lookup_symbols, by = "symbol"))
+
+        bench("dplyr", "null_anti_join",
+            function() tb |> anti_join(tb_lookup_symbols, by = "symbol"))
+
+        bench("dplyr", "null_cross_join_small",
+            function() tibble::as_tibble(merge(tb_left_small, tb_right_small, by = NULL)))
     }
 }
 

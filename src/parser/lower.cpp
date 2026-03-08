@@ -16,11 +16,15 @@ namespace {
 class Lowerer {
    public:
     explicit Lowerer(std::unordered_map<std::string, ir::NodePtr>* bindings,
-                     std::unordered_set<std::string> initial_table_externs = {})
-        : bindings_(bindings), table_externs_(std::move(initial_table_externs)) {}
+                     std::unordered_set<std::string> initial_table_externs = {},
+                     std::unordered_set<std::string> initial_sink_externs = {})
+        : bindings_(bindings),
+          table_externs_(std::move(initial_table_externs)),
+          sink_externs_(std::move(initial_sink_externs)) {}
 
     auto lower_program(const Program& program) -> LowerResult {
         ir::NodePtr last_expr;
+        std::vector<ir::NodePtr> preamble_calls;
         for (const auto& stmt : program.statements) {
             if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
                 // Track externs that return a table so lower_table_call can
@@ -71,6 +75,26 @@ class Lowerer {
                 const auto& expr_stmt = std::get<ExprStmt>(stmt);
                 auto value = lower_expr(*expr_stmt.expr);
                 if (!value.has_value()) {
+                    // Not a table expression — check whether it's a scalar call
+                    // (e.g. ws_listen(8765)) used purely for its side effect.
+                    if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node)) {
+                        std::vector<ir::Expr> args;
+                        args.reserve(call->args.size());
+                        bool args_ok = true;
+                        for (const auto& arg : call->args) {
+                            auto a = lower_expr_to_ir(*arg);
+                            if (!a.has_value()) {
+                                args_ok = false;
+                                break;
+                            }
+                            args.push_back(std::move(*a));
+                        }
+                        if (args_ok) {
+                            preamble_calls.push_back(
+                                builder_.extern_call(call->callee, std::move(args)));
+                            continue;
+                        }
+                    }
                     return std::unexpected(value.error());
                 }
                 last_expr = std::move(value.value());
@@ -78,6 +102,9 @@ class Lowerer {
         }
         if (!last_expr) {
             return std::unexpected(LowerError{.message = "no expression to lower"});
+        }
+        if (!preamble_calls.empty()) {
+            return builder_.program(std::move(preamble_calls), std::move(last_expr));
         }
         return last_expr;
     }
@@ -1817,7 +1844,7 @@ auto lower(const Program& program) -> LowerResult {
 }
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
-    Lowerer lowerer(&context.bindings, context.table_externs);
+    Lowerer lowerer(&context.bindings, context.table_externs, context.sink_externs);
     return lowerer.lower_expression(expr);
 }
 

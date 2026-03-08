@@ -4,13 +4,16 @@
 
 #include <CLI/CLI.hpp>
 
+#include "import_resolver.hpp"
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace {
@@ -139,11 +142,20 @@ auto collect_scalar_bindings(const ibex::parser::Program& program)
                 ext->return_type.kind == ibex::parser::Type::Kind::TimeFrame) {
                 lower_ctx.table_externs.insert(ext->name);
             }
+            if (!ext->params.empty() &&
+                ext->params[0].type.kind == ibex::parser::Type::Kind::DataFrame) {
+                lower_ctx.sink_externs.insert(ext->name);
+            }
             continue;
         }
 
         const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt);
         if (let_stmt == nullptr) {
+            continue;
+        }
+
+        // Stream lets are never scalar; let the full lowering phase validate them.
+        if (std::holds_alternative<ibex::parser::StreamExpr>(let_stmt->value->node)) {
             continue;
         }
 
@@ -177,6 +189,7 @@ int main(int argc, char* argv[]) {
     bool bench = false;
     int bench_warmup = 3;
     int bench_iters = 10;
+    std::vector<std::string> import_paths;
 
     app.add_option("input", input_path, "Input .ibex source file")->required();
     app.add_option("-o,--output", output_path, "Output .cpp file (default: stdout)");
@@ -187,6 +200,9 @@ int main(int argc, char* argv[]) {
         ->needs("--bench");
     app.add_option("--bench-iters", bench_iters, "Timed iterations (default: 10)")
         ->needs("--bench");
+    app.add_option("--import-path", import_paths,
+                   "Directory to search for library stub files (*.ibex) used by imports. "
+                   "Can be passed multiple times.");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -198,17 +214,36 @@ int main(int argc, char* argv[]) {
     }
     std::string source(std::istreambuf_iterator<char>{in_file}, {});
 
-    // Parse
-    auto program = ibex::parser::parse(source);
-    if (!program) {
-        std::cerr << "ibex_compile: parse error at " << input_path << ":" << program.error().line
-                  << ":" << program.error().column << ": " << program.error().message << "\n";
+    const auto parse_and_expand =
+        [&](const std::string& src) -> std::expected<ibex::parser::Program, std::string> {
+        auto parsed = ibex::parser::parse(src);
+        if (!parsed) {
+            return std::unexpected(
+                "parse error at " + input_path + ":" + std::to_string(parsed.error().line) + ":" +
+                std::to_string(parsed.error().column) + ": " + parsed.error().message);
+        }
+        auto expanded = ibex::tools::expand_imports(std::move(*parsed), input_path, import_paths);
+        if (!expanded) {
+            return std::unexpected(expanded.error());
+        }
+        return expanded;
+    };
+
+    auto scalar_program = parse_and_expand(source);
+    if (!scalar_program) {
+        std::cerr << "ibex_compile: " << scalar_program.error() << "\n";
         return 1;
     }
 
-    auto scalar_bindings = collect_scalar_bindings(*program);
+    auto scalar_bindings = collect_scalar_bindings(*scalar_program);
     if (!scalar_bindings) {
         std::cerr << "ibex_compile: " << scalar_bindings.error() << "\n";
+        return 1;
+    }
+
+    auto program = parse_and_expand(source);
+    if (!program) {
+        std::cerr << "ibex_compile: " << program.error() << "\n";
         return 1;
     }
 
@@ -219,7 +254,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Collect extern headers from the program
+    // Collect extern headers from the program (deduplicated)
     ibex::codegen::Emitter::Config config;
     config.source_name = input_path;
     config.print_result = !no_print && !bench;
@@ -227,10 +262,19 @@ int main(int argc, char* argv[]) {
     config.bench_warmup = bench_warmup;
     config.bench_iters = bench_iters;
     config.scalar_bindings = std::move(*scalar_bindings);
-    for (const auto& stmt : program->statements) {
-        if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
-            if (!ext->source_path.empty()) {
-                config.extern_headers.push_back(ext->source_path);
+    {
+        std::unordered_set<std::string> seen_headers;
+        for (const auto& stmt : program->statements) {
+            if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+                if (!ext->source_path.empty()) {
+                    std::string header = ext->source_path;
+                    if (!std::filesystem::path(header).has_extension()) {
+                        header += ".hpp";
+                    }
+                    if (seen_headers.insert(header).second) {
+                        config.extern_headers.push_back(std::move(header));
+                    }
+                }
             }
         }
     }

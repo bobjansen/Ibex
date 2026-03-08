@@ -12,9 +12,9 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cfenv>
 #include <charconv>
 #include <chrono>
-#include <cfenv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -581,24 +581,37 @@ std::string column_type_name(const runtime::ColumnValue& column) {
 
 auto scalar_type_name(parser::ScalarType st) -> std::string_view {
     switch (st) {
-        case parser::ScalarType::Int32:    return "Int32";
-        case parser::ScalarType::Int64:    return "Int64";
-        case parser::ScalarType::Float32:  return "Float32";
-        case parser::ScalarType::Float64:  return "Float64";
-        case parser::ScalarType::Bool:     return "Bool";
-        case parser::ScalarType::String:   return "String";
-        case parser::ScalarType::Date:     return "Date";
-        case parser::ScalarType::Timestamp: return "Timestamp";
+        case parser::ScalarType::Int32:
+            return "Int32";
+        case parser::ScalarType::Int64:
+            return "Int64";
+        case parser::ScalarType::Float32:
+            return "Float32";
+        case parser::ScalarType::Float64:
+            return "Float64";
+        case parser::ScalarType::Bool:
+            return "Bool";
+        case parser::ScalarType::String:
+            return "String";
+        case parser::ScalarType::Date:
+            return "Date";
+        case parser::ScalarType::Timestamp:
+            return "Timestamp";
     }
     return "Unknown";
 }
 
 auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view {
-    if (std::holds_alternative<std::int64_t>(val)) return "Int64";
-    if (std::holds_alternative<double>(val)) return "Float64";
-    if (std::holds_alternative<std::string>(val)) return "String";
-    if (std::holds_alternative<Date>(val)) return "Date";
-    if (std::holds_alternative<Timestamp>(val)) return "Timestamp";
+    if (std::holds_alternative<std::int64_t>(val))
+        return "Int64";
+    if (std::holds_alternative<double>(val))
+        return "Float64";
+    if (std::holds_alternative<std::string>(val))
+        return "String";
+    if (std::holds_alternative<Date>(val))
+        return "Date";
+    if (std::holds_alternative<Timestamp>(val))
+        return "Timestamp";
     return "Unknown";
 }
 
@@ -683,7 +696,8 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
             double v = std::get<double>(val);
             if (v != std::trunc(v)) {
                 return std::unexpected(std::string(callee) + "(): cannot cast non-integer Float " +
-                                       std::to_string(v) + " to Int (use floor(), ceil(), or round())");
+                                       std::to_string(v) +
+                                       " to Int (use floor(), ceil(), or round())");
             }
             return runtime::ScalarValue{static_cast<std::int64_t>(v)};
         }
@@ -713,9 +727,9 @@ auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
             const auto& src = std::get<Column<double>>(col);
             for (double v : src) {
                 if (v != std::trunc(v)) {
-                    return std::unexpected(
-                        std::string(callee) +
-                        "(): cannot cast non-integer Float column to Int (use floor(), ceil(), or round())");
+                    return std::unexpected(std::string(callee) +
+                                           "(): cannot cast non-integer Float column to Int (use "
+                                           "floor(), ceil(), or round())");
                 }
             }
             Column<std::int64_t> dst;
@@ -748,7 +762,8 @@ auto extract_round_mode(const parser::Expr& arg) -> std::expected<std::string_vi
     const auto* ident = std::get_if<parser::IdentifierExpr>(&arg.node);
     if (!ident) {
         return std::unexpected(
-            "round(): second argument must be a bare mode identifier (nearest, bankers, floor, ceil, trunc)");
+            "round(): second argument must be a bare mode identifier (nearest, bankers, floor, "
+            "ceil, trunc)");
     }
     if (ident->name != "nearest" && ident->name != "bankers" && ident->name != "floor" &&
         ident->name != "ceil" && ident->name != "trunc") {
@@ -764,7 +779,8 @@ auto apply_scalar_round(double v, std::string_view mode)
     if (mode == "nearest") {
         result = static_cast<std::int64_t>(std::llround(v));
     } else if (mode == "bankers") {
-        result = static_cast<std::int64_t>(std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
+        result =
+            static_cast<std::int64_t>(std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
     } else if (mode == "floor") {
         result = static_cast<std::int64_t>(std::floor(v));
     } else if (mode == "ceil") {
@@ -775,8 +791,7 @@ auto apply_scalar_round(double v, std::string_view mode)
     return runtime::ScalarValue{result};
 }
 
-auto apply_column_round(const Column<double>& src, std::string_view mode)
-    -> Column<std::int64_t> {
+auto apply_column_round(const Column<double>& src, std::string_view mode) -> Column<std::int64_t> {
     Column<std::int64_t> dst;
     dst.reserve(src.size());
     for (double v : src) {
@@ -784,7 +799,8 @@ auto apply_column_round(const Column<double>& src, std::string_view mode)
         if (mode == "nearest") {
             r = static_cast<std::int64_t>(std::llround(v));
         } else if (mode == "bankers") {
-            r = static_cast<std::int64_t>(std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
+            r = static_cast<std::int64_t>(
+                std::llrint(v));  // uses FE_TONEAREST (round-half-to-even)
         } else if (mode == "floor") {
             r = static_cast<std::int64_t>(std::floor(v));
         } else if (mode == "ceil") {
@@ -1255,7 +1271,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }
         if (call->callee == "round") {
             if (call->args.size() != 2) {
-                return std::unexpected("round(): expects (value, mode) — mode: nearest, bankers, floor, ceil, trunc");
+                return std::unexpected(
+                    "round(): expects (value, mode) — mode: nearest, bankers, floor, ceil, trunc");
             }
             auto mode = extract_round_mode(*call->args[1]);
             if (!mode) {
@@ -1383,6 +1400,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             decl.return_type.kind == parser::Type::Kind::TimeFrame) {
             context.table_externs.insert(name);
         }
+        if (!decl.params.empty() && decl.params[0].type.kind == parser::Type::Kind::DataFrame) {
+            context.sink_externs.insert(name);
+        }
     }
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {
@@ -1426,10 +1446,10 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&param.type.arg);
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
-                    return std::unexpected(
-                        "type mismatch for parameter '" + param.name + "': expected " +
-                        std::string(scalar_type_name(*st)) + " but got " +
-                        std::string(scalar_value_type_name(value.value())));
+                    return std::unexpected("type mismatch for parameter '" + param.name +
+                                           "': expected " + std::string(scalar_type_name(*st)) +
+                                           " but got " +
+                                           std::string(scalar_value_type_name(value.value())));
                 }
                 local_scalars.insert_or_assign(param.name, std::move(value.value()));
                 break;
@@ -1486,10 +1506,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
-                    return std::unexpected(
-                        "type error: '" + let_stmt.name + "' declared as " +
-                        std::string(scalar_type_name(*st)) + " but value is " +
-                        std::string(scalar_value_type_name(value.value())));
+                    return std::unexpected("type error: '" + let_stmt.name + "' declared as " +
+                                           std::string(scalar_type_name(*st)) + " but value is " +
+                                           std::string(scalar_value_type_name(value.value())));
                 }
                 local_scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
             } else if (type_is_table) {
@@ -1545,13 +1564,11 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             }
             auto* table = std::get_if<runtime::Table>(&value.value());
             if (table == nullptr) {
-                return std::unexpected(
-                    "tuple binding requires a DataFrame on the right-hand side");
+                return std::unexpected("tuple binding requires a DataFrame on the right-hand side");
             }
             if (table->columns.size() != tlet.names.size()) {
-                return std::unexpected(
-                    fmt::format("tuple binding expects {} column(s), got {}", tlet.names.size(),
-                                table->columns.size()));
+                return std::unexpected(fmt::format("tuple binding expects {} column(s), got {}",
+                                                   tlet.names.size(), table->columns.size()));
             }
             for (std::size_t i = 0; i < tlet.names.size(); ++i) {
                 local_columns.insert_or_assign(tlet.names[i], *table->columns[i].column);
@@ -1660,8 +1677,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
 
 /// Locate <name>.ibex in the plugin search paths and return its contents.
 /// Returns std::nullopt when the file is not found in any search path.
-auto find_library_source(const std::string& name,
-                         const std::vector<std::string>& search_paths)
+auto find_library_source(const std::string& name, const std::vector<std::string>& search_paths)
     -> std::optional<std::string> {
     std::string filename = name + ".ibex";
     for (const auto& dir : search_paths) {
@@ -1670,8 +1686,7 @@ auto find_library_source(const std::string& name,
         if (!in) {
             continue;
         }
-        std::string source((std::istreambuf_iterator<char>(in)),
-                           std::istreambuf_iterator<char>());
+        std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         spdlog::debug("import: found library '{}' at {}", name, full_path.string());
         return source;
     }
@@ -1759,8 +1774,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
                     if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
                         fmt::print("error: '{}' declared as {} but value is {}\n", let_stmt.name,
-                                   scalar_type_name(*st),
-                                   scalar_value_type_name(value.value()));
+                                   scalar_type_name(*st), scalar_value_type_name(value.value()));
                         return false;
                     }
                     scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
@@ -1834,8 +1848,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 return false;
             }
             if (table->columns.size() != tlet.names.size()) {
-                fmt::print("error: tuple binding expects {} column(s), got {}\n",
-                           tlet.names.size(), table->columns.size());
+                fmt::print("error: tuple binding expects {} column(s), got {}\n", tlet.names.size(),
+                           table->columns.size());
                 return false;
             }
             for (std::size_t i = 0; i < tlet.names.size(); ++i) {

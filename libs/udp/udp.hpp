@@ -28,18 +28,17 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <cerrno>
 #include <charconv>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
+#include <netinet/in.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <unordered_map>
 
 namespace ibex_udp {
@@ -52,15 +51,22 @@ namespace ibex_udp {
 
 inline auto json_get_str(std::string_view json, std::string_view key)
     -> std::optional<std::string> {
-    // Search for `"key":"`
+    // Search for `"key":` then skip optional whitespace before the opening quote.
     std::string needle = "\"";
     needle += key;
-    needle += "\":\"";
+    needle += "\":";
     auto pos = json.find(needle);
-    if (pos == std::string_view::npos) return std::nullopt;
+    if (pos == std::string_view::npos)
+        return std::nullopt;
     pos += needle.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+        ++pos;
+    if (pos >= json.size() || json[pos] != '"')
+        return std::nullopt;
+    ++pos;  // skip opening quote
     auto end = json.find('"', pos);
-    if (end == std::string_view::npos) return std::nullopt;
+    if (end == std::string_view::npos)
+        return std::nullopt;
     return std::string(json.substr(pos, end - pos));
 }
 
@@ -70,29 +76,34 @@ inline auto json_get_int64(std::string_view json, std::string_view key)
     needle += key;
     needle += "\":";
     auto pos = json.find(needle);
-    if (pos == std::string_view::npos) return std::nullopt;
+    if (pos == std::string_view::npos)
+        return std::nullopt;
     pos += needle.size();
     // Skip whitespace
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+        ++pos;
     std::int64_t value = 0;
     auto [ptr, ec] = std::from_chars(json.data() + pos, json.data() + json.size(), value);
-    if (ec != std::errc{}) return std::nullopt;
+    if (ec != std::errc{})
+        return std::nullopt;
     return value;
 }
 
-inline auto json_get_double(std::string_view json, std::string_view key)
-    -> std::optional<double> {
+inline auto json_get_double(std::string_view json, std::string_view key) -> std::optional<double> {
     std::string needle = "\"";
     needle += key;
     needle += "\":";
     auto pos = json.find(needle);
-    if (pos == std::string_view::npos) return std::nullopt;
+    if (pos == std::string_view::npos)
+        return std::nullopt;
     pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+        ++pos;
     // strtod for floating-point (from_chars for float not universally available pre-C++17)
     char* end = nullptr;
     double value = std::strtod(json.data() + pos, &end);
-    if (end == json.data() + pos) return std::nullopt;
+    if (end == json.data() + pos)
+        return std::nullopt;
     return value;
 }
 
@@ -219,8 +230,8 @@ inline auto udp_recv(std::int64_t port) -> ibex::runtime::Table {
 // Serialises each row of `table` as a JSON object and sends it as a UDP
 // datagram to `host:port`.  Returns the number of rows sent.
 
-inline auto udp_send(const ibex::runtime::Table& table, std::string_view host,
-                     std::int64_t port) -> std::int64_t {
+inline auto udp_send(const ibex::runtime::Table& table, std::string_view host, std::int64_t port)
+    -> std::int64_t {
     using namespace ibex::runtime;
     using namespace ibex;
 
@@ -244,7 +255,8 @@ inline auto udp_send(const ibex::runtime::Table& table, std::string_view host,
         std::string json = "{";
         bool first_field = true;
         for (const auto& entry : table.columns) {
-            if (!first_field) json += ',';
+            if (!first_field)
+                json += ',';
             first_field = false;
             json += '"';
             json += entry.name;
@@ -282,8 +294,8 @@ inline auto udp_send(const ibex::runtime::Table& table, std::string_view host,
         json += '}';
         json += '\n';
 
-        ::sendto(fd, json.data(), json.size(), 0,
-                 reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+        ::sendto(fd, json.data(), json.size(), 0, reinterpret_cast<const sockaddr*>(&addr),
+                 sizeof(addr));
         ++sent;
     }
 
@@ -292,3 +304,9 @@ inline auto udp_send(const ibex::runtime::Table& table, std::string_view host,
 }
 
 }  // namespace ibex_udp
+
+// ─── Global aliases ───────────────────────────────────────────────────────────
+// Expose plugin functions without namespace qualification so that ibex_compile-
+// generated code can call them by their extern fn name directly.
+using ibex_udp::udp_recv;
+using ibex_udp::udp_send;

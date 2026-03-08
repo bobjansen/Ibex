@@ -7534,6 +7534,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return result;
         }
+        case ir::NodeKind::Program:
+            return std::unexpected("ProgramNode cannot be interpreted at runtime");
     }
     return std::unexpected("unknown node kind");
 }

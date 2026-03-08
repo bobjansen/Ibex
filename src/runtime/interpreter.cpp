@@ -235,12 +235,20 @@ auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_
     if (a == b)
         return ValidityBitmap(*a);
     ValidityBitmap out(*a);
-    // `out` is a fresh copy of `a`; `b` is a distinct bitmap in this path.
-    // Tell the compiler these byte ranges do not alias to aid vectorization.
-    auto* __restrict out_data = out.data();
-    const auto* __restrict b_data = b->data();
-    for (std::size_t i = 0; i < n; ++i)
-        out_data[i] &= b_data[i];
+    constexpr std::size_t kBitsPerWord = sizeof(ValidityBitmap::word_type) * 8;
+    const auto full_words = n / kBitsPerWord;
+    const auto tail_bits = n % kBitsPerWord;
+    auto* __restrict out_words = out.words_data();
+    const auto* __restrict b_words = b->words_data();
+
+    for (std::size_t w = 0; w < full_words; ++w) {
+        out_words[w] &= b_words[w];
+    }
+    if (tail_bits != 0) {
+        const auto mask = (ValidityBitmap::word_type{1} << tail_bits) - 1;
+        out_words[full_words] = (out_words[full_words] & ~mask) |
+                                ((out_words[full_words] & b_words[full_words]) & mask);
+    }
     return out;
 }
 
@@ -1290,9 +1298,9 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
     for (std::size_t c = 0; c < input.columns.size(); ++c) {
         if (input.columns[c].validity.has_value()) {
             const auto& src_bm = *input.columns[c].validity;
-            std::vector<bool> dst_bm(out_n);
+            ValidityBitmap dst_bm(out_n, false);
             for (std::size_t j = 0; j < out_n; ++j)
-                dst_bm[j] = src_bm[selected[j]];
+                dst_bm.set(j, src_bm[selected[j]]);
             output.columns[c].validity = std::move(dst_bm);
         }
     }
@@ -1770,9 +1778,9 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
             output.add_column(entry.name, std::move(gathered));
             if (entry.validity.has_value()) {
                 const auto& src_bm = *entry.validity;
-                std::vector<bool> dst_bm(rows);
+                ValidityBitmap dst_bm(rows, false);
                 for (std::size_t pos = 0; pos < rows; ++pos)
-                    dst_bm[pos] = src_bm[static_cast<std::size_t>(idx[pos])];
+                    dst_bm.set(pos, src_bm[static_cast<std::size_t>(idx[pos])]);
                 output.columns.back().validity = std::move(dst_bm);
             }
         }
@@ -2321,7 +2329,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // Needed for Right/Outer joins where unmatched right rows make left columns null.
     const bool track_left_nulls = preserve_right_rows;
     bool left_had_nulls = false;
-    std::vector<std::vector<bool>> left_validity;
+    std::vector<ValidityBitmap> left_validity;
     if (track_left_nulls) {
         left_validity.resize(left.columns.size());
     }
@@ -2340,7 +2348,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // Needed for Left/Asof/Outer joins where unmatched left rows make right columns null.
     const bool track_right_nulls = preserve_left_rows;
     bool right_had_nulls = false;
-    std::vector<std::vector<bool>> right_validity;
+    std::vector<ValidityBitmap> right_validity;
     if (track_right_nulls) {
         right_validity.resize(right_out.size());
     }
@@ -2467,9 +2475,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
 
-        std::vector<bool> right_matched_pred;
+        std::vector<std::uint8_t> right_matched_pred;
         if (preserve_right_rows) {
-            right_matched_pred.assign(N_right, false);
+            right_matched_pred.assign(N_right, 0U);
         }
 
         for (std::size_t l = 0; l < left.rows(); ++l) {
@@ -2513,7 +2521,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 append_left_row(l);
                 append_right_row(j);
                 if (preserve_right_rows) {
-                    right_matched_pred[j] = true;
+                    right_matched_pred[j] = 1U;
                 }
             }
 
@@ -2529,7 +2537,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < N_right; ++r) {
-                if (!right_matched_pred[r]) {
+                if (right_matched_pred[r] == 0U) {
                     append_left_defaults_from_right(r);
                     append_right_row(r);
                 }
@@ -2579,9 +2587,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 right_sv_index[(*rc)[r]].push_back(r);
         }
 
-        std::vector<bool> right_matched;
+        std::vector<std::uint8_t> right_matched;
         if (preserve_right_rows) {
-            right_matched.assign(right.rows(), false);
+            right_matched.assign(right.rows(), 0U);
         }
 
         auto run_match = [&](std::string_view sv, std::size_t l) {
@@ -2597,7 +2605,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 append_left_row(l);
                 append_right_row(r);
                 if (preserve_right_rows) {
-                    right_matched[r] = true;
+                    right_matched[r] = 1U;
                 }
             }
         };
@@ -2626,7 +2634,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     append_left_row(l);
                     append_right_row(r);
                     if (preserve_right_rows) {
-                        right_matched[r] = true;
+                        right_matched[r] = 1U;
                     }
                 }
             }
@@ -2639,7 +2647,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < right.rows(); ++r) {
-                if (!right_matched[r]) {
+                if (right_matched[r] == 0U) {
                     append_left_defaults_from_right(r);
                     append_right_row(r);
                 }
@@ -2761,9 +2769,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         return output;
     }
 
-    std::vector<bool> right_matched;
+    std::vector<std::uint8_t> right_matched;
     if (preserve_right_rows) {
-        right_matched.assign(right.rows(), false);
+        right_matched.assign(right.rows(), 0U);
     }
 
     for (std::size_t l = 0; l < left.rows(); ++l) {
@@ -2797,14 +2805,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             append_left_row(l);
             append_right_row(r);
             if (preserve_right_rows) {
-                right_matched[r] = true;
+                right_matched[r] = 1U;
             }
         }
     }
 
     if (preserve_right_rows) {
         for (std::size_t r = 0; r < right.rows(); ++r) {
-            if (!right_matched[r]) {
+            if (right_matched[r] == 0U) {
                 append_left_defaults_from_right(r);
                 append_right_row(r);
             }
@@ -3486,8 +3494,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             return std::unexpected(output.error());
         }
 
-        std::vector<std::vector<bool>> agg_validity_out(aggregations.size());
-        std::vector<bool> track_agg_validity(aggregations.size(), false);
+        std::vector<ValidityBitmap> agg_validity_out(aggregations.size());
+        std::vector<std::uint8_t> track_agg_validity(aggregations.size(), 0U);
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto func = aggregations[i].func;
             if (func == ir::AggFunc::Sum || func == ir::AggFunc::Mean || func == ir::AggFunc::Min ||
@@ -3495,7 +3503,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 func == ir::AggFunc::Stddev || func == ir::AggFunc::Ewma ||
                 func == ir::AggFunc::Quantile || func == ir::AggFunc::Skew ||
                 func == ir::AggFunc::Kurtosis) {
-                track_agg_validity[i] = true;
+                track_agg_validity[i] = 1U;
                 agg_validity_out[i].reserve(group_order.size());
             }
         }
@@ -3512,7 +3520,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
             const AggSlot* slots = states[g].slots.data();
             for (std::size_t i = 0; i < aggregations.size(); ++i) {
-                if (track_agg_validity[i]) {
+                if (track_agg_validity[i] != 0U) {
                     agg_validity_out[i].push_back(agg_result_is_valid(i, slots[i]));
                 }
             }
@@ -3523,11 +3531,16 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
 
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
-            if (!track_agg_validity[i] || agg_validity_out[i].empty()) {
+            if (track_agg_validity[i] == 0U || agg_validity_out[i].empty()) {
                 continue;
             }
-            const bool has_null =
-                std::ranges::any_of(agg_validity_out[i], [](bool valid) { return !valid; });
+            bool has_null = false;
+            for (std::size_t row = 0; row < agg_validity_out[i].size(); ++row) {
+                if (!agg_validity_out[i][row]) {
+                    has_null = true;
+                    break;
+                }
+            }
             if (!has_null) {
                 continue;
             }
@@ -3608,14 +3621,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 }
 
                 if (item.func == ir::AggFunc::First) {
-                    std::vector<bool> found(n_groups, false);
+                    std::vector<std::uint8_t> found(n_groups, 0U);
                     if (item.int_col != nullptr) {
                         std::vector<std::int64_t> acc(n_groups, 0);
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = (*item.int_col)[row];
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -3627,9 +3640,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         const double* data = item.dbl_col->data();
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = data[row];
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -3640,9 +3653,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<std::string> acc(n_groups);
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = (*item.str_col)[row];
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -3654,9 +3667,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<std::string> acc(n_groups);
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = std::string((*item.cat_col)[row]);
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -4065,14 +4078,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 }
 
                 if (item.func == ir::AggFunc::First) {
-                    std::vector<bool> found(n_groups, false);
+                    std::vector<std::uint8_t> found(n_groups, 0U);
                     if (item.int_col != nullptr) {
                         std::vector<std::int64_t> acc(n_groups, 0);
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = (*item.int_col)[row];
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -4084,9 +4097,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         const double* data = item.dbl_col->data();
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = data[row];
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -4097,9 +4110,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<std::string> acc(n_groups);
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = (*item.str_col)[row];
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -4111,9 +4124,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::vector<std::string> acc(n_groups);
                         for (std::size_t row = 0; row < rows; ++row) {
                             std::uint32_t g = gids[row];
-                            if (!found[g]) {
+                            if (found[g] == 0U) {
                                 acc[g] = std::string((*item.cat_col)[row]);
-                                found[g] = true;
+                                found[g] = 1U;
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
@@ -4496,14 +4509,14 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
 
         if (item.func == ir::AggFunc::First) {
-            std::vector<bool> found(n_groups_m, false);
+            std::vector<std::uint8_t> found(n_groups_m, 0U);
             if (item.int_col != nullptr) {
                 std::vector<std::int64_t> acc(n_groups_m, 0);
                 for (std::size_t row = 0; row < rows; ++row) {
                     std::uint32_t g = gids[row];
-                    if (!found[g]) {
+                    if (found[g] == 0U) {
                         acc[g] = (*item.int_col)[row];
-                        found[g] = true;
+                        found[g] = 1U;
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
@@ -4515,9 +4528,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 const double* data = item.dbl_col->data();
                 for (std::size_t row = 0; row < rows; ++row) {
                     std::uint32_t g = gids[row];
-                    if (!found[g]) {
+                    if (found[g] == 0U) {
                         acc[g] = data[row];
-                        found[g] = true;
+                        found[g] = 1U;
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
@@ -4528,9 +4541,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::vector<std::string> acc(n_groups_m);
                 for (std::size_t row = 0; row < rows; ++row) {
                     std::uint32_t g = gids[row];
-                    if (!found[g]) {
+                    if (found[g] == 0U) {
                         acc[g] = (*item.str_col)[row];
-                        found[g] = true;
+                        found[g] = 1U;
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
@@ -4542,9 +4555,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::vector<std::string> acc(n_groups_m);
                 for (std::size_t row = 0; row < rows; ++row) {
                     std::uint32_t g = gids[row];
-                    if (!found[g]) {
+                    if (found[g] == 0U) {
                         acc[g] = std::string((*item.cat_col)[row]);
-                        found[g] = true;
+                        found[g] = 1U;
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
@@ -5409,7 +5422,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
                     if (!out_validity) {
                         out_validity.emplace(rows, true);
                     }
-                    (*out_validity)[i] = false;
+                    out_validity->set(i, false);
                 }
             }
             return FillResult{std::move(result), std::move(out_validity)};
@@ -5467,7 +5480,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
                     if (!out_validity) {
                         out_validity.emplace(rows, true);
                     }
-                    (*out_validity)[i] = false;
+                    out_validity->set(i, false);
                 }
             }
             // Build the output column using push_back (safe for all column types).
@@ -6922,7 +6935,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     for (std::size_t pi = 0; pi < n_pivots; ++pi) {
         auto col = make_empty_like(*value_entry.column);
         std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
-        std::vector<bool> validity(out_rows, false);
+        ValidityBitmap validity(out_rows, false);
         bool has_nulls = false;
 
         for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
@@ -6931,7 +6944,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             if (cit != cell_map.end()) {
                 append_value(col, *value_entry.column, cit->second);
                 bool val_null = is_null(value_entry, cit->second);
-                validity[or_idx] = !val_null;
+                validity.set(or_idx, !val_null);
                 if (val_null)
                     has_nulls = true;
             } else {
@@ -7318,7 +7331,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     out.index[entry.name] = out.columns.size() - 1;
                     append_value(*out.columns.back().column, *entry.column, r);
                     if (is_null(entry, r)) {
-                        out.columns.back().validity = ValidityBitmap(std::vector<bool>{false});
+                        out.columns.back().validity = ValidityBitmap{false};
                     }
                 }
                 out.time_index = src.time_index;
@@ -7571,10 +7584,6 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
                                   .column = std::make_shared<ColumnValue>(std::move(column)),
                                   .validity = std::move(validity)});
     index[columns.back().name] = pos;
-}
-
-void Table::add_column(std::string name, ColumnValue column, std::vector<bool> validity) {
-    add_column(std::move(name), std::move(column), ValidityBitmap(validity));
 }
 
 auto Table::find_entry(const std::string& name) const -> const ColumnEntry* {

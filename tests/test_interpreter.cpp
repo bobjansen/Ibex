@@ -1239,8 +1239,7 @@ TEST_CASE("rolling_sum preserves other columns and time_index") {
 
 TEST_CASE("rolling_median with 1ns window") {
     runtime::Table table;
-    table.add_column("ts",
-                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
     table.time_index = "ts";
 
@@ -1289,8 +1288,7 @@ TEST_CASE("rolling_std with 1ns window") {
     // row 1: {10,20}   → mean=15, M2=50, sample std = sqrt(50/1)=sqrt(50)≈7.071
     // row 2: {20,30}   → mean=25, M2=50, sample std = sqrt(50/1)=sqrt(50)≈7.071
     runtime::Table table;
-    table.add_column("ts",
-                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
     table.time_index = "ts";
 
@@ -1339,8 +1337,7 @@ TEST_CASE("rolling_ewma with 1ns window") {
     // row 1: window {10,20}  → ewma starts 10, then 0.5*20 + 0.5*10 = 15
     // row 2: window {20,30}  → ewma starts 20, then 0.5*30 + 0.5*20 = 25
     runtime::Table table;
-    table.add_column("ts",
-                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
     table.time_index = "ts";
 
@@ -1387,7 +1384,6 @@ TEST_CASE("rolling_ewma larger window") {
 
 // ─── Phase 1 null semantics ───────────────────────────────────────────────────
 
-
 TEST_CASE("null: right join unmatched rows produce null left columns", "[null][join]") {
     runtime::Table left, right;
     left.add_column("id", Column<std::int64_t>{1, 2});
@@ -1431,19 +1427,19 @@ TEST_CASE("null: outer join unmatched rows produce nulls on both sides", "[null]
     auto& t = *result;
     REQUIRE(t.rows() == 3);
 
-    const auto& name_entry  = t.columns[t.index.at("name")];
+    const auto& name_entry = t.columns[t.index.at("name")];
     const auto& score_entry = t.columns[t.index.at("score")];
 
     // row 0: id=1, left-only → name valid, score null
-    CHECK_FALSE(runtime::is_null(name_entry,  0));
-    CHECK(      runtime::is_null(score_entry, 0));
+    CHECK_FALSE(runtime::is_null(name_entry, 0));
+    CHECK(runtime::is_null(score_entry, 0));
 
     // row 1: id=2, matched  → both valid
-    CHECK_FALSE(runtime::is_null(name_entry,  1));
+    CHECK_FALSE(runtime::is_null(name_entry, 1));
     CHECK_FALSE(runtime::is_null(score_entry, 1));
 
     // row 2: id=3, right-only → name null, score valid
-    CHECK(      runtime::is_null(name_entry,  2));
+    CHECK(runtime::is_null(name_entry, 2));
     CHECK_FALSE(runtime::is_null(score_entry, 2));
 }
 TEST_CASE("null: left join unmatched rows produce null right columns", "[null][join]") {
@@ -2328,9 +2324,8 @@ TEST_CASE("rolling_quantile with 2ns window") {
     // row 1 (t=1): window {10,20}     → idx=0.25 → 12.5
     // row 2 (t=2): window {10,20,30}  → idx=0.5  → 15.0
     // row 3 (t=3): window {20,30,40}  → idx=0.5  → 25.0
-    table.add_column("ts",
-                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
-                                       ts_from_nanos(3)});
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0, 40.0});
     table.time_index = "ts";
 
@@ -2417,9 +2412,8 @@ TEST_CASE("rolling_kurtosis with 1ns window (n<4 → 0)") {
 TEST_CASE("rolling_kurtosis wide window") {
     runtime::Table table;
     // {1,2,3,4,5}: excess kurtosis ≈ -1.3 (pandas)
-    table.add_column("ts",
-                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
-                                       ts_from_nanos(3), ts_from_nanos(4)});
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3), ts_from_nanos(4)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
     table.time_index = "ts";
 
@@ -2689,7 +2683,7 @@ TEST_CASE("rand_int lo == hi always yields lo") {
 TEST_CASE("rand functions produce independent columns") {
     // Two rand_uniform calls in the same query should produce different columns.
     runtime::Table table;
-    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    table.add_column("x", Column<std::int64_t>{1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
                                                11, 12, 13, 14, 15, 16, 17, 18, 19, 20});
 
     runtime::TableRegistry registry;
@@ -3015,9 +3009,9 @@ TEST_CASE("fill_null replaces null cells with constant (Int)", "[null][fill]") {
     CHECK_FALSE(entry->validity.has_value());
     const auto& v2 = std::get<Column<std::int64_t>>(*entry->column);
     CHECK(v2[0] == 10);
-    CHECK(v2[1] == 0);   // was null, filled with 0
+    CHECK(v2[1] == 0);  // was null, filled with 0
     CHECK(v2[2] == 30);
-    CHECK(v2[3] == 0);   // was null, filled with 0
+    CHECK(v2[3] == 0);  // was null, filled with 0
     CHECK(v2[4] == 50);
 }
 
@@ -3106,8 +3100,8 @@ TEST_CASE("fill_forward leaves leading nulls as null", "[null][fill]") {
     const auto* entry = result->find_entry("fwd");
     REQUIRE(entry != nullptr);
     REQUIRE(entry->validity.has_value());
-    CHECK(runtime::is_null(*entry, 0));   // leading null — unfillable
-    CHECK(runtime::is_null(*entry, 1));   // leading null — unfillable
+    CHECK(runtime::is_null(*entry, 0));  // leading null — unfillable
+    CHECK(runtime::is_null(*entry, 1));  // leading null — unfillable
     CHECK_FALSE(runtime::is_null(*entry, 2));
     CHECK_FALSE(runtime::is_null(*entry, 3));  // filled from row 2
     const auto& fwd = std::get<Column<std::int64_t>>(*entry->column);
@@ -3180,8 +3174,8 @@ TEST_CASE("fill_backward leaves trailing nulls as null", "[null][fill]") {
     REQUIRE(entry->validity.has_value());
     CHECK_FALSE(runtime::is_null(*entry, 0));  // filled from row 1
     CHECK_FALSE(runtime::is_null(*entry, 1));
-    CHECK(runtime::is_null(*entry, 2));        // trailing null — unfillable
-    CHECK(runtime::is_null(*entry, 3));        // trailing null — unfillable
+    CHECK(runtime::is_null(*entry, 2));  // trailing null — unfillable
+    CHECK(runtime::is_null(*entry, 3));  // trailing null — unfillable
     const auto& bwd = std::get<Column<std::int64_t>>(*entry->column);
     CHECK(bwd[0] == 5);
     CHECK(bwd[1] == 5);
@@ -3465,4 +3459,446 @@ TEST_CASE("Table constructor expression column not found in multi-column result 
     auto ir = require_ir("Table { missing = two };");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
+}
+
+// ─── Melt (wide → long) ───────────────────────────────────────────────────────
+
+TEST_CASE("melt: basic wide-to-long unpivot", "[melt]") {
+    // wide: symbol | open | close
+    //       AAPL     100    110
+    //       GOOG     200    210
+    // long: symbol | variable | value
+    runtime::TableRegistry registry;
+    runtime::Table wide;
+    wide.add_column("symbol", Column<std::string>{"AAPL", "GOOG"});
+    wide.add_column("open", Column<std::int64_t>{100, 200});
+    wide.add_column("close", Column<std::int64_t>{110, 210});
+    registry["wide"] = std::move(wide);
+
+    auto ir = require_ir("wide[melt symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    // 2 rows × 2 measures = 4 output rows
+    REQUIRE(result->rows() == 4);
+
+    const auto* sym = result->find("symbol");
+    REQUIRE(sym != nullptr);
+    const auto* var = result->find("variable");
+    REQUIRE(var != nullptr);
+    const auto* val = result->find("value");
+    REQUIRE(val != nullptr);
+
+    const auto& sym_col = std::get<Column<std::string>>(*sym);
+    const auto& var_col = std::get<Column<std::string>>(*var);
+    const auto& val_col = std::get<Column<std::int64_t>>(*val);
+
+    // Row order: for each input row, iterate measures in column order.
+    REQUIRE(sym_col[0] == "AAPL");
+    REQUIRE(var_col[0] == "open");
+    REQUIRE(val_col[0] == 100);
+
+    REQUIRE(sym_col[1] == "AAPL");
+    REQUIRE(var_col[1] == "close");
+    REQUIRE(val_col[1] == 110);
+
+    REQUIRE(sym_col[2] == "GOOG");
+    REQUIRE(var_col[2] == "open");
+    REQUIRE(val_col[2] == 200);
+
+    REQUIRE(sym_col[3] == "GOOG");
+    REQUIRE(var_col[3] == "close");
+    REQUIRE(val_col[3] == 210);
+}
+
+TEST_CASE("melt: select restricts measure columns", "[melt]") {
+    runtime::TableRegistry registry;
+    runtime::Table wide;
+    wide.add_column("symbol", Column<std::string>{"AAPL", "GOOG"});
+    wide.add_column("open", Column<std::int64_t>{100, 200});
+    wide.add_column("close", Column<std::int64_t>{110, 210});
+    wide.add_column("volume", Column<std::int64_t>{1000, 2000});
+    registry["wide"] = std::move(wide);
+
+    // Only melt open and close, leave volume out.
+    auto ir = require_ir("wide[melt symbol, select { open, close }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);  // 2 rows × 2 measures
+
+    const auto* var = result->find("variable");
+    REQUIRE(var != nullptr);
+    const auto& var_col = std::get<Column<std::string>>(*var);
+    REQUIRE(var_col[0] == "open");
+    REQUIRE(var_col[1] == "close");
+}
+
+TEST_CASE("melt: multiple id columns", "[melt]") {
+    runtime::TableRegistry registry;
+    runtime::Table wide;
+    wide.add_column("symbol", Column<std::string>{"AAPL", "GOOG"});
+    wide.add_column("date", Column<std::int64_t>{1, 2});
+    wide.add_column("open", Column<double>{100.0, 200.0});
+    wide.add_column("close", Column<double>{110.0, 210.0});
+    registry["wide"] = std::move(wide);
+
+    auto ir = require_ir("wide[melt { symbol, date }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    REQUIRE(result->find("symbol") != nullptr);
+    REQUIRE(result->find("date") != nullptr);
+    REQUIRE(result->find("variable") != nullptr);
+    REQUIRE(result->find("value") != nullptr);
+}
+
+TEST_CASE("melt: id column not found returns error", "[melt]") {
+    runtime::TableRegistry registry;
+    runtime::Table wide;
+    wide.add_column("open", Column<std::int64_t>{100});
+    registry["wide"] = std::move(wide);
+
+    auto ir = require_ir("wide[melt no_such_col];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("id column not found") != std::string::npos);
+}
+
+TEST_CASE("melt: measure type mismatch returns error", "[melt]") {
+    runtime::TableRegistry registry;
+    runtime::Table wide;
+    wide.add_column("id", Column<std::string>{"A"});
+    wide.add_column("int_col", Column<std::int64_t>{1});
+    wide.add_column("float_col", Column<double>{1.0});
+    registry["wide"] = std::move(wide);
+
+    // Mixing int and float measure columns is not allowed.
+    auto ir = require_ir("wide[melt id, select { int_col, float_col }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("same type") != std::string::npos);
+}
+
+// ─── Dcast (long → wide) ─────────────────────────────────────────────────────
+
+TEST_CASE("dcast: basic long-to-wide pivot", "[dcast]") {
+    // long: variable | value
+    //       open       100
+    //       close      110
+    // wide: open | close
+    //       100    110
+    runtime::TableRegistry registry;
+    runtime::Table lng;
+    lng.add_column("variable", Column<std::string>{"open", "close"});
+    lng.add_column("value", Column<std::int64_t>{100, 110});
+    registry["lng"] = std::move(lng);
+
+    // by {} means no row keys (all rows form one group)
+    auto ir = require_ir("lng[dcast variable, select value, by {}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* open_col = result->find("open");
+    REQUIRE(open_col != nullptr);
+    const auto* close_col = result->find("close");
+    REQUIRE(close_col != nullptr);
+
+    REQUIRE(std::get<Column<std::int64_t>>(*open_col)[0] == 100);
+    REQUIRE(std::get<Column<std::int64_t>>(*close_col)[0] == 110);
+}
+
+TEST_CASE("dcast: round-trips melt", "[dcast][melt]") {
+    // wide → melt → dcast should reproduce the original wide table structure.
+    runtime::TableRegistry registry;
+    runtime::Table wide;
+    wide.add_column("symbol", Column<std::string>{"AAPL", "GOOG"});
+    wide.add_column("open", Column<std::int64_t>{100, 200});
+    wide.add_column("close", Column<std::int64_t>{110, 210});
+    registry["wide"] = std::move(wide);
+
+    // Melt first.
+    auto melted_ir = require_ir("wide[melt symbol];");
+    auto melted = runtime::interpret(*melted_ir, registry);
+    REQUIRE(melted.has_value());
+    registry["long"] = std::move(*melted);
+
+    // Then dcast with symbol as row key.
+    auto ir = require_ir("long[dcast variable, select value, by { symbol }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    REQUIRE(result->find("open") != nullptr);
+    REQUIRE(result->find("close") != nullptr);
+
+    const auto& open_col = std::get<Column<std::int64_t>>(*result->find("open"));
+    REQUIRE(open_col[0] == 100);
+    REQUIRE(open_col[1] == 200);
+}
+
+TEST_CASE("dcast: missing cell filled with null", "[dcast]") {
+    // Two symbols; AAPL has both open/close, GOOG only has open.
+    runtime::TableRegistry registry;
+    runtime::Table lng;
+    lng.add_column("symbol", Column<std::string>{"AAPL", "AAPL", "GOOG"});
+    lng.add_column("variable", Column<std::string>{"open", "close", "open"});
+    lng.add_column("value", Column<std::int64_t>{100, 110, 200});
+    registry["lng"] = std::move(lng);
+
+    auto ir = require_ir("lng[dcast variable, select value, by { symbol }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    // close column should have a null for GOOG.
+    const auto* close_entry = result->find_entry("close");
+    REQUIRE(close_entry != nullptr);
+    REQUIRE(close_entry->validity.has_value());
+
+    // Find which row is GOOG.
+    const auto& sym_col = std::get<Column<std::string>>(*result->find("symbol"));
+    std::size_t goog_row = (sym_col[0] == "GOOG") ? 0 : 1;
+    REQUIRE_FALSE((*close_entry->validity)[goog_row]);
+}
+
+TEST_CASE("dcast: pivot column not found returns error", "[dcast]") {
+    runtime::TableRegistry registry;
+    runtime::Table lng;
+    lng.add_column("variable", Column<std::string>{"open"});
+    lng.add_column("value", Column<std::int64_t>{100});
+    registry["lng"] = std::move(lng);
+
+    auto ir = require_ir("lng[dcast no_such_col, select value, by {}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("pivot column not found") != std::string::npos);
+}
+
+TEST_CASE("dcast: value column not found returns error", "[dcast]") {
+    runtime::TableRegistry registry;
+    runtime::Table lng;
+    lng.add_column("variable", Column<std::string>{"open"});
+    lng.add_column("value", Column<std::int64_t>{100});
+    registry["lng"] = std::move(lng);
+
+    auto ir = require_ir("lng[dcast variable, select no_such_val, by {}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("value column not found") != std::string::npos);
+}
+
+// ─── ExternCall node ─────────────────────────────────────────────────────────
+
+// Helper: extern fn declaration so the lowerer recognises the function.
+static constexpr const char* kMakePricesDecl =
+    R"(extern fn make_prices(n: Int) -> DataFrame from "prices.hpp"; make_prices(0);)";
+
+TEST_CASE("ExternCall: table-returning extern is resolved and called", "[extern]") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    // Register a simple table-returning extern that ignores its argument.
+    externs.register_table("make_prices", [](const runtime::ExternArgs&) {
+        runtime::Table t;
+        t.add_column("price", Column<std::int64_t>{42, 99});
+        return std::expected<runtime::ExternValue, std::string>{t};
+    });
+
+    auto ir = require_ir(kMakePricesDecl);
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* price = result->find("price");
+    REQUIRE(price != nullptr);
+    const auto& prices = std::get<Column<std::int64_t>>(*price);
+    REQUIRE(prices[0] == 42);
+    REQUIRE(prices[1] == 99);
+}
+
+TEST_CASE("ExternCall: no extern registry returns error", "[extern]") {
+    runtime::TableRegistry registry;
+
+    // nullptr externs — should get "extern call with no registry" error.
+    auto ir = require_ir(kMakePricesDecl);
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("no registry") != std::string::npos);
+}
+
+TEST_CASE("ExternCall: unknown extern function returns error", "[extern]") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;  // empty — make_prices not registered
+
+    auto ir = require_ir(kMakePricesDecl);
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("unknown extern function") != std::string::npos);
+}
+
+// ─── Grouped update error ────────────────────────────────────────────────────
+
+TEST_CASE("grouped update returns unsupported error", "[update]") {
+    runtime::TableRegistry registry;
+    runtime::Table trades;
+    trades.add_column("symbol", Column<std::string>{"AAPL", "AAPL", "GOOG"});
+    trades.add_column("price", Column<std::int64_t>{100, 110, 200});
+    registry["trades"] = std::move(trades);
+
+    auto ir = require_ir("trades[update { mean_price = mean(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("grouped update not supported") != std::string::npos);
+}
+
+// ─── Filter type coverage: double / string columns ───────────────────────────
+// These exercise template specialisations that the all-int64 tests miss.
+
+TEST_CASE("filter on double column vs float literal", "[filter][types]") {
+    // Exercises eval_value_vec<FilterColumn><double> and compare_col_scalar<double, double>.
+    runtime::Table table;
+    table.add_column("price", Column<double>{1.0, 2.5, 3.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[filter price > 1.5];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& col = std::get<Column<double>>(*result->find("price"));
+    REQUIRE(col[0] == Catch::Approx(2.5));
+    REQUIRE(col[1] == Catch::Approx(3.0));
+}
+
+TEST_CASE("filter int column vs float literal", "[filter][types]") {
+    // Exercises cmp_col_scalar_into<int64, double>: int column compared to a float literal.
+    runtime::Table table;
+    table.add_column("qty", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[filter qty > 1.5];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    const auto& col = std::get<Column<std::int64_t>>(*result->find("qty"));
+    REQUIRE(col[0] == 2);
+    REQUIRE(col[1] == 3);
+}
+
+TEST_CASE("filter double column vs int literal", "[filter][types]") {
+    // Exercises cmp_col_scalar_into<double, int64>: double column compared to an int literal.
+    runtime::Table table;
+    table.add_column("price", Column<double>{1.5, 2.5, 0.5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[filter price > 1];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    const auto& col = std::get<Column<double>>(*result->find("price"));
+    REQUIRE(col[0] == Catch::Approx(1.5));
+    REQUIRE(col[1] == Catch::Approx(2.5));
+}
+
+TEST_CASE("filter on string column", "[filter][types]") {
+    // Exercises eval_value_vec<FilterColumn><string>.
+    runtime::Table table;
+    table.add_column("name", Column<std::string>{"Alice", "Bob", "Charlie"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[filter name > \"B\"];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& col = std::get<Column<std::string>>(*result->find("name"));
+    REQUIRE(col[0] == "Bob");
+    REQUIRE(col[1] == "Charlie");
+}
+
+TEST_CASE("filter by bare column reference returns not-a-boolean-expression error",
+          "[filter][types]") {
+    // Exercises compute_mask<FilterColumn> (the else branch — bare column reference
+    // is not a boolean predicate; interpreter returns an error).
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.add_column("is_active", Column<bool>{true, false, true});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[filter is_active];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("not a boolean expression") != std::string::npos);
+}
+
+// ─── Mixed-type column arithmetic ─────────────────────────────────────────────
+// These exercise arith_into<int64,double>, arith_into<double,int64>,
+// and arith_into<double,double> template specialisations.
+
+TEST_CASE("update: int column + double column = double", "[update][types]") {
+    runtime::Table table;
+    table.add_column("a", Column<std::int64_t>{1, 2, 3});
+    table.add_column("b", Column<double>{0.5, 1.5, 2.5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { c = a + b }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* c = result->find("c");
+    REQUIRE(c != nullptr);
+    const auto& col = std::get<Column<double>>(*c);
+    REQUIRE(col[0] == Catch::Approx(1.5));
+    REQUIRE(col[1] == Catch::Approx(3.5));
+    REQUIRE(col[2] == Catch::Approx(5.5));
+}
+
+TEST_CASE("update: double column + int column = double", "[update][types]") {
+    runtime::Table table;
+    table.add_column("a", Column<double>{0.5, 1.5, 2.5});
+    table.add_column("b", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { c = a + b }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& col = std::get<Column<double>>(*result->find("c"));
+    REQUIRE(col[0] == Catch::Approx(1.5));
+    REQUIRE(col[1] == Catch::Approx(3.5));
+    REQUIRE(col[2] == Catch::Approx(5.5));
+}
+
+TEST_CASE("update: double column * double column = double", "[update][types]") {
+    runtime::Table table;
+    table.add_column("a", Column<double>{1.0, 2.0, 3.0});
+    table.add_column("b", Column<double>{2.0, 3.0, 4.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { c = a * b }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& col = std::get<Column<double>>(*result->find("c"));
+    REQUIRE(col[0] == Catch::Approx(2.0));
+    REQUIRE(col[1] == Catch::Approx(6.0));
+    REQUIRE(col[2] == Catch::Approx(12.0));
 }

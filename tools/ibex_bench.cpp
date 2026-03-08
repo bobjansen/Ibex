@@ -9,6 +9,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <csv.hpp>
 #include <limits>
 #include <string>
@@ -700,6 +701,50 @@ auto compute_stats(std::vector<double> times) -> BenchStats {
     return {total, avg, mn, mx, stddev, percentile(0.95), percentile(0.99)};
 }
 
+volatile std::uint64_t g_bench_sink = 0;
+
+template <typename Fn>
+auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
+                                 std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
+    -> int {
+    auto run_and_touch = [&]() -> int {
+        auto merged = run_once();
+        if (!merged.has_value()) {
+            fmt::print("error: {} returned nullopt unexpectedly\n", bench_name);
+            return 1;
+        }
+        const auto sample_index = static_cast<std::size_t>(g_bench_sink) % rows;
+        g_bench_sink ^= static_cast<std::uint64_t>(merged->size());
+        g_bench_sink ^= static_cast<std::uint64_t>((*merged)[sample_index]);
+        return 0;
+    };
+
+    for (std::size_t i = 0; i < warmup_iters; ++i) {
+        if (run_and_touch() != 0) {
+            return 1;
+        }
+    }
+
+    std::vector<double> times(iters);
+    for (std::size_t i = 0; i < iters; ++i) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (run_and_touch() != 0) {
+            return 1;
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        times[i] =
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
+    }
+
+    auto s = compute_stats(std::move(times));
+    fmt::print(
+        "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
+        "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
+        bench_name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
+        s.p99_ms, rows);
+    return 0;
+}
+
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
                    std::size_t warmup_iters, std::size_t iters, bool include_parse) -> int {
     auto normalized = normalize_input(query.source);
@@ -1296,30 +1341,25 @@ int main(int argc, char** argv) {
             ibex::Column<double> b_col;
             ibex::Column<double> c_col;
             ibex::Column<double> d_col;
-            std::vector<bool> a_valid;
-            std::vector<bool> b_valid;
-            std::vector<bool> c_valid;
-            std::vector<bool> d_valid;
+            ibex::runtime::ValidityBitmap a_valid(merge_validity_rows, true);
+            ibex::runtime::ValidityBitmap b_valid(merge_validity_rows, true);
+            ibex::runtime::ValidityBitmap c_valid(merge_validity_rows, true);
+            ibex::runtime::ValidityBitmap d_valid(merge_validity_rows, true);
 
             a_col.reserve(merge_validity_rows);
             b_col.reserve(merge_validity_rows);
             c_col.reserve(merge_validity_rows);
             d_col.reserve(merge_validity_rows);
-            a_valid.reserve(merge_validity_rows);
-            b_valid.reserve(merge_validity_rows);
-            c_valid.reserve(merge_validity_rows);
-            d_valid.reserve(merge_validity_rows);
-
             for (std::size_t i = 0; i < merge_validity_rows; ++i) {
                 a_col.push_back(static_cast<double>(i % 251));
                 b_col.push_back(static_cast<double>((i * 3) % 997));
                 c_col.push_back(static_cast<double>((i * 7) % 1009));
                 d_col.push_back(static_cast<double>((i * 11) % 4099));
 
-                a_valid.push_back((i % 2) == 0);
-                b_valid.push_back((i % 3) != 0);
-                c_valid.push_back((i % 5) != 0);
-                d_valid.push_back((i % 7) != 0);
+                a_valid[i] = (i % 2) == 0;
+                b_valid[i] = (i % 3) != 0;
+                c_valid[i] = (i % 5) != 0;
+                d_valid[i] = (i % 7) != 0;
             }
 
             merge_table.add_column("a", std::move(a_col), std::move(a_valid));
@@ -1334,7 +1374,64 @@ int main(int argc, char** argv) {
             print_table_types("merge_data", merge_tables.find("merge_data")->second);
         }
 
-        fmt::print("\n-- merge_validity micro benchmarks ({} rows) --\n", merge_validity_rows);
+        const auto* merge_data = &merge_tables.find("merge_data")->second;
+        const auto* a_entry = merge_data->find_entry("a");
+        const auto* b_entry = merge_data->find_entry("b");
+        const auto* c_entry = merge_data->find_entry("c");
+        const auto* d_entry = merge_data->find_entry("d");
+        if (a_entry == nullptr || b_entry == nullptr || c_entry == nullptr || d_entry == nullptr ||
+            !a_entry->validity.has_value() || !b_entry->validity.has_value() ||
+            !c_entry->validity.has_value() || !d_entry->validity.has_value()) {
+            fmt::print("error: merge_validity suite requires nullable columns a,b,c,d\n");
+            return 1;
+        }
+        const auto* a_valid = &*a_entry->validity;
+        const auto* b_valid = &*b_entry->validity;
+        const auto* c_valid = &*c_entry->validity;
+        const auto* d_valid = &*d_entry->validity;
+
+        fmt::print("\n-- merge_validity function micro benchmarks ({} rows) --\n",
+                   merge_validity_rows);
+        status = run_bitmap_kernel_benchmark(
+            "merge_validity_fn_pair", merge_validity_rows, warmup_iters, iters, [&]() {
+                return ibex::runtime::merge_validity_bitmaps(a_valid, b_valid, merge_validity_rows);
+            });
+        if (status == 0) {
+            status = run_bitmap_kernel_benchmark(
+                "merge_validity_fn_chain8", merge_validity_rows, warmup_iters, iters, [&]() {
+                    auto ab = ibex::runtime::merge_validity_bitmaps(a_valid, b_valid,
+                                                                    merge_validity_rows);
+                    if (!ab.has_value())
+                        return std::optional<ibex::runtime::ValidityBitmap>{};
+                    auto cd = ibex::runtime::merge_validity_bitmaps(c_valid, d_valid,
+                                                                    merge_validity_rows);
+                    if (!cd.has_value())
+                        return std::optional<ibex::runtime::ValidityBitmap>{};
+                    auto ac = ibex::runtime::merge_validity_bitmaps(a_valid, c_valid,
+                                                                    merge_validity_rows);
+                    if (!ac.has_value())
+                        return std::optional<ibex::runtime::ValidityBitmap>{};
+                    auto bd = ibex::runtime::merge_validity_bitmaps(b_valid, d_valid,
+                                                                    merge_validity_rows);
+                    if (!bd.has_value())
+                        return std::optional<ibex::runtime::ValidityBitmap>{};
+                    auto lhs =
+                        ibex::runtime::merge_validity_bitmaps(&*ab, &*cd, merge_validity_rows);
+                    if (!lhs.has_value())
+                        return std::optional<ibex::runtime::ValidityBitmap>{};
+                    auto rhs =
+                        ibex::runtime::merge_validity_bitmaps(&*ac, &*bd, merge_validity_rows);
+                    if (!rhs.has_value())
+                        return std::optional<ibex::runtime::ValidityBitmap>{};
+                    return ibex::runtime::merge_validity_bitmaps(&*lhs, &*rhs, merge_validity_rows);
+                });
+        }
+        if (status != 0) {
+            return status;
+        }
+
+        fmt::print("\n-- merge_validity expression micro benchmarks ({} rows) --\n",
+                   merge_validity_rows);
         std::vector<BenchQuery> merge_queries = {
             {"merge_validity_pair", "merge_data[update { out = a + b }]"},
             {"merge_validity_chain8",

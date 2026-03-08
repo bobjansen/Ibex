@@ -462,12 +462,33 @@ class Column<bool> {
     std::vector<std::uint8_t> data_;
 
    public:
+    class Reference {
+        std::uint8_t* byte_ = nullptr;
+
+       public:
+        explicit Reference(std::uint8_t* byte) : byte_(byte) {}
+
+        auto operator=(bool v) -> Reference& {
+            *byte_ = v ? 1U : 0U;
+            return *this;
+        }
+
+        auto operator=(const Reference& other) -> Reference& {
+            *byte_ = static_cast<bool>(other) ? 1U : 0U;
+            return *this;
+        }
+
+        [[nodiscard]] operator bool() const { return *byte_ != 0; }
+    };
+
     using value_type = bool;
     using size_type = std::size_t;
 
     Column() = default;
 
-    explicit Column(const std::vector<bool>& bools) {
+    explicit Column(size_type count, bool value = false) : data_(count, value ? 1U : 0U) {}
+
+    Column(const std::vector<bool>& bools) {
         data_.reserve(bools.size());
         for (bool v : bools)
             data_.push_back(v ? 1U : 0U);
@@ -483,6 +504,17 @@ class Column<bool> {
     [[nodiscard]] auto empty() const noexcept -> bool { return data_.empty(); }
 
     [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool { return data_[idx] != 0; }
+    [[nodiscard]] auto operator[](size_type idx) noexcept -> Reference {
+        return Reference(&data_[idx]);
+    }
+
+    auto operator=(const std::vector<bool>& bools) -> Column& {
+        data_.clear();
+        data_.reserve(bools.size());
+        for (bool v : bools)
+            data_.push_back(v ? 1U : 0U);
+        return *this;
+    }
 
     /// Mutable byte-level access (for gather/sort paths that do `dst[i] = src[j]`).
     [[nodiscard]] auto byte_at(size_type idx) noexcept -> std::uint8_t& { return data_[idx]; }
@@ -493,6 +525,7 @@ class Column<bool> {
 
     // zero-initialises (false) for resize-based fill in lag/lead paths
     void resize(size_type n) { data_.resize(n, 0U); }
+    void resize(size_type n, bool value) { data_.resize(n, value ? 1U : 0U); }
 
     // Raw byte pointer: sizeof(bool)==1 ≡ sizeof(uint8_t), so POD memcpy is safe.
     [[nodiscard]] auto data() const noexcept -> const std::uint8_t* { return data_.data(); }

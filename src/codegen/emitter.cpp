@@ -89,14 +89,18 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     }
 
     out << "#include <cstdint>\n";
+    out << "#include <ctime>\n";
     if (config.bench_mode)
         out << "#include <chrono>\n#include <cstdio>\n";
     else
         out << "#include <iostream>\n";
     out << "#include <limits>\n";
+    out << "#include <optional>\n";
     out << "#include <string>\n";
+    out << "#include <variant>\n";
     out << "#include <vector>\n";
     out << "#include <ibex/runtime/ops.hpp>\n";
+    out << "#include <ibex/runtime/extern_registry.hpp>\n";
 
     for (const auto& hdr : config.extern_headers) {
         out << "#include \"" << escape_string(hdr) << "\"\n";
@@ -224,10 +228,16 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 
     // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
     switch (node.kind()) {
-        case ir::NodeKind::Scan:
+        case ir::NodeKind::Scan: {
+            // NOLINTNEXTLINE cppcoreguidelines-pro-type-static-cast-downcast
+            const auto& scan = static_cast<const ir::ScanNode&>(node);
+            if (scan.source_name() == "__stream_input__" && !stream_scan_var_.empty()) {
+                return stream_scan_var_;
+            }
             throw std::runtime_error(
                 "ibex_compile: ScanNode cannot be emitted — use 'extern fn' to declare data "
                 "sources");
+        }
 
         case ir::NodeKind::Filter: {
             const auto& filter = static_cast<const ir::FilterNode&>(node);
@@ -683,9 +693,164 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
-        case ir::NodeKind::Stream:
-            throw std::runtime_error(
-                "ibex_compile: stream pipelines are not supported in the compiled path");
+        case ir::NodeKind::Stream: {
+            // NOLINTNEXTLINE cppcoreguidelines-pro-type-static-cast-downcast
+            const auto& sn = static_cast<const ir::StreamNode&>(node);
+            auto var = fresh_var();
+
+            // ── Emit the transform into a temporary buffer ────────────────────
+            // The transform IR starts with ScanNode("__stream_input__").
+            // We substitute it with the lambda parameter "_ibex_sbuf".
+            const std::string sbuf = "_ibex_sbuf";
+            std::ostringstream transform_buf;
+            auto* saved_out = out_;
+            out_ = &transform_buf;
+            stream_scan_var_ = sbuf;
+            auto transform_var = emit_node(sn.transform_ir());
+            stream_scan_var_.clear();
+            out_ = saved_out;
+
+            // ── Emit the "flush" lambda: transform buffer → sink ──────────────
+            const std::string emit_fn = "_emit_fn_" + var;
+            *out_ << "    auto " << emit_fn << " = [&](const ibex::runtime::Table& " << sbuf
+                  << ") {\n";
+            *out_ << "        if (" << sbuf << ".rows() == 0) return;\n";
+            *out_ << indent_code(transform_buf.str(), 4);
+            *out_ << "        " << sn.sink_callee() << "(" << transform_var;
+            for (const auto& arg : sn.sink_args()) {
+                *out_ << ", " << emit_raw_expr(arg);
+            }
+            *out_ << ");\n";
+            *out_ << "    };\n\n";
+
+            // ── Emit the source-normalisation lambda ──────────────────────────
+            // Source may return Table (e.g. udp_recv) or ExternValue (e.g. ws_recv).
+            // We normalise both to ExternValue so the event loop is uniform.
+            const std::string call_src = "_call_src_" + var;
+            *out_ << "    auto " << call_src << " = [&]() -> ibex::runtime::ExternValue {\n";
+            *out_ << "        auto _r = " << sn.source_callee() << "(";
+            {
+                bool first = true;
+                for (const auto& arg : sn.source_args()) {
+                    if (!first)
+                        *out_ << ", ";
+                    first = false;
+                    *out_ << emit_raw_expr(arg);
+                }
+            }
+            *out_ << ");\n";
+            *out_ << "        if constexpr (std::is_same_v<decltype(_r), "
+                     "ibex::runtime::ExternValue>) {\n";
+            *out_ << "            return _r;\n";
+            *out_ << "        } else {\n";
+            *out_ << "            return ibex::runtime::ExternValue{std::move(_r)};\n";
+            *out_ << "        }\n";
+            *out_ << "    };\n\n";
+
+            const std::string buf = "_buf_" + var;
+            *out_ << "    ibex::runtime::Table " << buf << ";\n";
+
+            if (sn.stream_kind() == ir::StreamKind::TimeBucket) {
+                const auto bucket_ns = static_cast<std::int64_t>(sn.bucket_duration().count());
+                *out_ << "    std::int64_t _bopen_" << var << " = -1;\n";
+                *out_ << "    std::int64_t _bwall_" << var << " = -1;\n";
+                *out_ << "    const std::int64_t _bns_" << var << " = std::int64_t{" << bucket_ns
+                      << "LL};\n\n";
+
+                *out_ << "    while (true) {\n";
+                *out_ << "        auto _src_" << var << " = " << call_src << "();\n";
+                *out_ << "        const bool _tout_" << var
+                      << " = std::holds_alternative<ibex::runtime::StreamTimeout>(_src_" << var
+                      << ");\n";
+                *out_ << "        if (!_tout_" << var << ") {\n";
+                *out_ << "            if (std::get<ibex::runtime::Table>(_src_" << var
+                      << ").rows() == 0) break;\n";
+                *out_ << "        }\n";
+
+                // Wall-clock flush
+                *out_ << "        {\n";
+                *out_ << "            struct timespec _tp_" << var << "{};\n";
+                *out_ << "            clock_gettime(CLOCK_REALTIME, &_tp_" << var << ");\n";
+                *out_ << "            std::int64_t _wall_" << var << " = std::int64_t(_tp_" << var
+                      << ".tv_sec) * 1'000'000'000LL\n";
+                *out_ << "                       + std::int64_t(_tp_" << var << ".tv_nsec);\n";
+                *out_ << "            if (_bopen_" << var << " >= 0 && " << buf
+                      << ".rows() > 0 &&\n";
+                *out_ << "                _wall_" << var << " - _bwall_" << var << " >= _bns_"
+                      << var << ") {\n";
+                *out_ << "                " << emit_fn << "(" << buf << ");\n";
+                *out_ << "                " << buf << " = ibex::runtime::Table{};\n";
+                *out_ << "                _bopen_" << var << " = -1; _bwall_" << var << " = -1;\n";
+                *out_ << "            }\n";
+
+                // Row-by-row bucket detection
+                *out_ << "            if (!_tout_" << var << ") {\n";
+                *out_ << "                const auto& _batch_" << var
+                      << " = std::get<ibex::runtime::Table>(_src_" << var << ");\n";
+                *out_ << "                for (std::size_t _ri_" << var << " = 0; _ri_" << var
+                      << " < _batch_" << var << ".rows(); ++_ri_" << var << ") {\n";
+                *out_ << "                    auto _rts_" << var
+                      << " = ibex::ops::stream_get_ts_ns(_batch_" << var << ", _ri_" << var
+                      << ");\n";
+                *out_ << "                    const std::int64_t _rbk_" << var << " = _rts_" << var
+                      << " ? ((*_rts_" << var << " / _bns_" << var << ") * _bns_" << var
+                      << ") : -1;\n";
+                *out_ << "                    if (_bopen_" << var << " >= 0 && _rbk_" << var
+                      << " >= 0 && _rbk_" << var << " > _bopen_" << var << ") {\n";
+                *out_ << "                        " << emit_fn << "(" << buf << ");\n";
+                *out_ << "                        " << buf << " = ibex::runtime::Table{};\n";
+                *out_ << "                    }\n";
+                *out_ << "                    if (_rbk_" << var << " >= 0) {\n";
+                *out_ << "                        if (_rbk_" << var << " != _bopen_" << var
+                      << ") _bwall_" << var << " = _wall_" << var << ";\n";
+                *out_ << "                        _bopen_" << var << " = _rbk_" << var << ";\n";
+                *out_ << "                    }\n";
+                *out_ << "                    ibex::ops::stream_append_row(" << buf << ", _batch_"
+                      << var << ", _ri_" << var << ");\n";
+                *out_ << "                }\n";
+                *out_ << "            }\n";
+                *out_ << "        }\n";
+                *out_ << "    }\n";
+                *out_ << "    if (" << buf << ".rows() > 0) " << emit_fn << "(" << buf << ");\n";
+            } else {
+                // PerRow: append entire batch then run transform on accumulated buffer.
+                *out_ << "    while (true) {\n";
+                *out_ << "        auto _src_" << var << " = " << call_src << "();\n";
+                *out_ << "        if (std::holds_alternative<ibex::runtime::StreamTimeout>(_src_"
+                      << var << ")) continue;\n";
+                *out_ << "        const auto& _batch_" << var
+                      << " = std::get<ibex::runtime::Table>(_src_" << var << ");\n";
+                *out_ << "        if (_batch_" << var << ".rows() == 0) break;\n";
+                *out_ << "        for (std::size_t _ri_" << var << " = 0; _ri_" << var
+                      << " < _batch_" << var << ".rows(); ++_ri_" << var << ") {\n";
+                *out_ << "            ibex::ops::stream_append_row(" << buf << ", _batch_" << var
+                      << ", _ri_" << var << ");\n";
+                *out_ << "        }\n";
+                *out_ << "        " << emit_fn << "(" << buf << ");\n";
+                *out_ << "    }\n";
+            }
+
+            *out_ << "    ibex::runtime::Table " << var << ";\n";
+            return var;
+        }
+        case ir::NodeKind::Program: {
+            // NOLINTNEXTLINE cppcoreguidelines-pro-type-static-cast-downcast
+            const auto& prog = static_cast<const ir::ProgramNode&>(node);
+            for (const auto& pnode : prog.preamble()) {
+                // NOLINTNEXTLINE cppcoreguidelines-pro-type-static-cast-downcast
+                const auto& ec = static_cast<const ir::ExternCallNode&>(*pnode);
+                *out_ << "    (void)" << ec.callee() << "(";
+                bool first = true;
+                for (const auto& arg : ec.args()) {
+                    if (!first)
+                        *out_ << ", ";
+                    first = false;
+                    *out_ << emit_raw_expr(arg);
+                }
+                *out_ << ");\n";
+            }
+            return emit_node(prog.main_node());
+        }
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     throw std::runtime_error("ibex_compile: unknown IR node kind");

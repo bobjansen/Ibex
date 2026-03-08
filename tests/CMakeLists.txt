@@ -13,11 +13,13 @@ add_executable(ibex_tests
     test_interpreter.cpp
     test_codegen.cpp
     test_join.cpp
+    test_websocket.cpp
 )
 
 target_include_directories(ibex_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/libs/csv"
     "${PROJECT_SOURCE_DIR}/libs/json"
+    "${PROJECT_SOURCE_DIR}/libs/websocket"
 )
 
 target_link_libraries(ibex_tests

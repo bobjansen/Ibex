@@ -51,6 +51,9 @@ class Emitter {
     /// Cache of nodes already emitted (used in bench mode to avoid re-emitting
     /// ExternCall nodes inside the timing loop).
     std::unordered_map<const ir::Node*, std::string> cached_vars_;
+    /// When emitting a stream transform, holds the C++ variable name that
+    /// substitutes for `ScanNode("__stream_input__")` in the transform IR.
+    std::string stream_scan_var_;
 
     auto fresh_var() -> std::string;
 

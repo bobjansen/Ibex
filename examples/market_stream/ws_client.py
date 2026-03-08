@@ -11,7 +11,7 @@ Usage:
 
 Defaults:
     --host  127.0.0.1
-    --port  8080
+    --port  8765
 """
 
 import argparse
@@ -46,36 +46,42 @@ def _make_handshake(host: str, port: int) -> tuple[bytes, str]:
     return request.encode(), accept
 
 
-def _recv_exactly(sock: socket.socket, n: int) -> bytes:
-    buf = b""
+def _recv_exactly(sock: socket.socket, buf: bytearray, n: int) -> bytes:
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
+        chunk = sock.recv(4096)
         if not chunk:
             raise ConnectionError("Connection closed")
-        buf += chunk
-    return buf
+        buf.extend(chunk)
+    result = bytes(buf[:n])
+    del buf[:n]
+    return result
 
 
-def _recv_ws_frame(sock: socket.socket) -> tuple[int, bytes]:
+def _recv_ws_frame(sock: socket.socket, buf: bytearray) -> tuple[int, bytes]:
     """Receive one WebSocket frame; return (opcode, payload)."""
-    header = _recv_exactly(sock, 2)
+    header = _recv_exactly(sock, buf, 2)
     opcode = header[0] & 0x0F
     payload_len = header[1] & 0x7F
     if payload_len == 126:
-        payload_len = struct.unpack(">H", _recv_exactly(sock, 2))[0]
+        payload_len = struct.unpack(">H", _recv_exactly(sock, buf, 2))[0]
     elif payload_len == 127:
-        payload_len = struct.unpack(">Q", _recv_exactly(sock, 8))[0]
-    payload = _recv_exactly(sock, payload_len)
+        payload_len = struct.unpack(">Q", _recv_exactly(sock, buf, 8))[0]
+    payload = _recv_exactly(sock, buf, payload_len)
     return opcode, payload
 
 
-def ws_connect(host: str, port: int) -> socket.socket:
-    """Open a WebSocket connection; return the connected socket."""
+def ws_connect(host: str, port: int) -> tuple[socket.socket, bytearray]:
+    """Open a WebSocket connection; return (socket, leftover_buffer).
+
+    Any bytes that arrive after the HTTP 101 headers (e.g. the first
+    WebSocket frame bundled in the same TCP segment) are returned in the
+    bytearray so callers can pass it to _recv_ws_frame without data loss.
+    """
     sock = socket.create_connection((host, port))
     request, expected_accept = _make_handshake(host, port)
     sock.sendall(request)
 
-    # Read HTTP response headers
+    # Read until end of HTTP headers; preserve any trailing WS frame bytes.
     response = b""
     while b"\r\n\r\n" not in response:
         chunk = sock.recv(4096)
@@ -83,13 +89,16 @@ def ws_connect(host: str, port: int) -> socket.socket:
             raise ConnectionError("Server closed connection during handshake")
         response += chunk
 
-    response_str = response.decode(errors="replace")
-    if "101 Switching Protocols" not in response_str:
-        raise ConnectionError(f"WebSocket upgrade failed:\n{response_str}")
-    if expected_accept not in response_str:
+    sep = response.index(b"\r\n\r\n")
+    headers = response[:sep].decode(errors="replace")
+    leftover = bytearray(response[sep + 4:])
+
+    if "101 Switching Protocols" not in headers:
+        raise ConnectionError(f"WebSocket upgrade failed:\n{headers}")
+    if expected_accept not in headers:
         raise ConnectionError("Sec-WebSocket-Accept mismatch")
 
-    return sock
+    return sock, leftover
 
 
 # ─── Pretty-print helpers ──────────────────────────────────────────────────────
@@ -103,18 +112,18 @@ def ns_to_dt(ns: int) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ibex WebSocket bar receiver")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
     print(f"Connecting to ws://{args.host}:{args.port} ...")
-    sock = ws_connect(args.host, args.port)
+    sock, buf = ws_connect(args.host, args.port)
     print("Connected.  Waiting for OHLC bars ...\n")
     print(f"{'Time':>25}  {'Open':>8}  {'High':>8}  {'Low':>8}  {'Close':>8}")
     print("-" * 65)
 
     try:
         while True:
-            opcode, payload = _recv_ws_frame(sock)
+            opcode, payload = _recv_ws_frame(sock, buf)
             if opcode == 0x8:   # Close
                 print("\nServer closed connection.")
                 break

@@ -108,10 +108,11 @@ enum class AggFunc : std::uint8_t {
     Count,
     First,
     Last,
-    Median,   ///< Middle value (ignores nulls; always returns double).
-    Stddev,    ///< Sample standard deviation, n-1 denominator (ignores nulls; always returns double).
-    Ewma,      ///< Exponentially weighted moving average: ewma(col, alpha) (always returns double).
-    Quantile,  ///< quantile(col, p): p-th quantile via linear interpolation (always returns double).
+    Median,  ///< Middle value (ignores nulls; always returns double).
+    Stddev,  ///< Sample standard deviation, n-1 denominator (ignores nulls; always returns double).
+    Ewma,    ///< Exponentially weighted moving average: ewma(col, alpha) (always returns double).
+    Quantile,  ///< quantile(col, p): p-th quantile via linear interpolation (always returns
+               ///< double).
     Skew,      ///< Sample skewness (Fisher–Pearson, n≥3; ignores nulls; always returns double).
     Kurtosis,  ///< Sample excess kurtosis (n≥4; ignores nulls; always returns double).
 };
@@ -211,6 +212,7 @@ enum class NodeKind : std::uint8_t {
     Dcast,
     Stream,
     Construct,  ///< Build a Table from inline literal column vectors.
+    Program,    ///< Top-level program: zero or more preamble side-effect calls + one main node.
 };
 
 /// How a StreamNode triggers output emission.
@@ -337,8 +339,7 @@ class AggregateNode final : public Node {
 class UpdateNode final : public Node {
    public:
     UpdateNode(NodeId id, std::vector<FieldSpec> fields,
-               std::vector<TupleFieldSpec> tuple_fields = {},
-               std::vector<ColumnRef> group_by = {})
+               std::vector<TupleFieldSpec> tuple_fields = {}, std::vector<ColumnRef> group_by = {})
         : Node(NodeKind::Update, id),
           fields_(std::move(fields)),
           tuple_fields_(std::move(tuple_fields)),
@@ -503,12 +504,8 @@ class DcastNode final : public Node {
           value_column_(std::move(value_column)),
           row_keys_(std::move(row_keys)) {}
 
-    [[nodiscard]] auto pivot_column() const noexcept -> const std::string& {
-        return pivot_column_;
-    }
-    [[nodiscard]] auto value_column() const noexcept -> const std::string& {
-        return value_column_;
-    }
+    [[nodiscard]] auto pivot_column() const noexcept -> const std::string& { return pivot_column_; }
+    [[nodiscard]] auto value_column() const noexcept -> const std::string& { return value_column_; }
     [[nodiscard]] auto row_keys() const noexcept -> const std::vector<std::string>& {
         return row_keys_;
     }
@@ -529,8 +526,8 @@ class DcastNode final : public Node {
 ///     extracted from that Table (single-column result, or column named `name`).
 struct ConstructColumn {
     std::string name;
-    std::vector<Literal> elements;     ///< non-empty iff expr_node is null
-    std::unique_ptr<Node> expr_node;   ///< non-null iff elements is empty
+    std::vector<Literal> elements;    ///< non-empty iff expr_node is null
+    std::unique_ptr<Node> expr_node;  ///< non-null iff elements is empty
 };
 
 /// Construct node: builds a Table from column definitions.
@@ -601,6 +598,28 @@ class StreamNode final : public Node {
     std::vector<Expr> sink_args_;
     StreamKind stream_kind_;
     Duration bucket_duration_;  ///< set for TimeBucket; zero for PerRow
+};
+
+/// Top-level program node.
+///
+/// Holds zero or more preamble side-effect calls (e.g. `ws_listen(8765)`) as
+/// `ExternCallNode` children emitted before the main expression, plus a single
+/// main child node (the last expression in the program).
+class ProgramNode final : public Node {
+   public:
+    ProgramNode(NodeId id, std::vector<NodePtr> preamble, NodePtr main_node)
+        : Node(NodeKind::Program, id),
+          preamble_(std::move(preamble)),
+          main_node_(std::move(main_node)) {}
+
+    [[nodiscard]] auto preamble() const noexcept -> const std::vector<NodePtr>& {
+        return preamble_;
+    }
+    [[nodiscard]] auto main_node() const noexcept -> const Node& { return *main_node_; }
+
+   private:
+    std::vector<NodePtr> preamble_;
+    NodePtr main_node_;
 };
 
 }  // namespace ibex::ir

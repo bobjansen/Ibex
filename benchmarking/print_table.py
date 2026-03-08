@@ -42,6 +42,7 @@ QUERY_ORDER = [
     "null_left_join",
     "null_semi_join",
     "null_anti_join",
+    "null_cross_join_small",
     # reshape
     "melt_wide_to_long",
     "dcast_long_to_wide",
@@ -58,35 +59,36 @@ QUERY_ORDER = [
 ]
 
 QUERY_LABEL = {
-    "mean_by_symbol":       "mean by symbol",
-    "ohlc_by_symbol":       "OHLC by symbol",
-    "update_price_x2":      "update price×2",
-    "cumsum_price":         "cumsum price",
-    "cumprod_price":        "cumprod price",
-    "rand_uniform":         "rand uniform",
-    "rand_normal":          "rand normal",
-    "count_by_symbol_day":  "count by symbol×day",
-    "mean_by_symbol_day":   "mean by symbol×day",
-    "ohlc_by_symbol_day":   "OHLC by symbol×day",
-    "filter_simple":        "filter simple",
-    "filter_and":           "filter AND",
-    "filter_arith":         "filter arith",
-    "filter_or":            "filter OR",
-    "sum_by_user":          "sum by user (100K str)",
-    "filter_events":        "filter events (str)",
-    "null_left_join":       "left join (50% null)",
-    "null_semi_join":       "semi join",
-    "null_anti_join":       "anti join",
-    "melt_wide_to_long":    "melt wide→long",
-    "dcast_long_to_wide":   "dcast long→wide",
-    "fill_null":            "fill null (const)",
-    "fill_forward":         "fill forward (LOCF)",
-    "fill_backward":        "fill backward (NOCB)",
-    "tf_lag1":              "tf lag-1",
-    "tf_rolling_count_1m":  "tf rolling count 1m",
-    "tf_rolling_mean_5m":   "tf rolling mean 5m",
-    "tf_rolling_sum_1m":    "tf rolling sum 1m",
-    "tf_resample_1m_ohlc":  "tf resample 1m OHLC",
+    "mean_by_symbol": "mean by symbol",
+    "ohlc_by_symbol": "OHLC by symbol",
+    "update_price_x2": "update price×2",
+    "cumsum_price": "cumsum price",
+    "cumprod_price": "cumprod price",
+    "rand_uniform": "rand uniform",
+    "rand_normal": "rand normal",
+    "count_by_symbol_day": "count by symbol×day",
+    "mean_by_symbol_day": "mean by symbol×day",
+    "ohlc_by_symbol_day": "OHLC by symbol×day",
+    "filter_simple": "filter simple",
+    "filter_and": "filter AND",
+    "filter_arith": "filter arith",
+    "filter_or": "filter OR",
+    "sum_by_user": "sum by user (100K str)",
+    "filter_events": "filter events (str)",
+    "null_left_join": "left join (50% null)",
+    "null_semi_join": "semi join",
+    "null_anti_join": "anti join",
+    "null_cross_join_small": "cross join (2k×64)",
+    "melt_wide_to_long": "melt wide→long",
+    "dcast_long_to_wide": "dcast long→wide",
+    "fill_null": "fill null (const)",
+    "fill_forward": "fill forward (LOCF)",
+    "fill_backward": "fill backward (NOCB)",
+    "tf_lag1": "tf lag-1",
+    "tf_rolling_count_1m": "tf rolling count 1m",
+    "tf_rolling_mean_5m": "tf rolling mean 5m",
+    "tf_rolling_sum_1m": "tf rolling sum 1m",
+    "tf_resample_1m_ohlc": "tf resample 1m OHLC",
 }
 
 
@@ -98,7 +100,7 @@ def load(paths):
     for p in paths:
         with open(p, newline="") as f:
             for row in csv.DictReader(f, delimiter="\t"):
-                fw    = row["framework"]
+                fw = row["framework"]
                 query = row["query"]
                 try:
                     avg_ms = float(row["avg_ms"])
@@ -139,18 +141,24 @@ def print_table(avg_data, stat_data):
     import math
 
     # Which queries have any data?
-    present_queries = [q for q in QUERY_ORDER if any(
-        fw in avg_data.get(q, {}) for fw in FRAMEWORK_ORDER)]
+    present_queries = [
+        q
+        for q in QUERY_ORDER
+        if any(fw in avg_data.get(q, {}) for fw in FRAMEWORK_ORDER)
+    ]
     if not present_queries:
         print("No results found.", file=sys.stderr)
         return
 
     # Which frameworks are present?
-    present = [fw for fw in FRAMEWORK_ORDER
-               if any(fw in avg_data.get(q, {}) for q in present_queries)]
+    present = [
+        fw
+        for fw in FRAMEWORK_ORDER
+        if any(fw in avg_data.get(q, {}) for q in present_queries)
+    ]
 
     col_w = max(len(QUERY_LABEL.get(q, q)) for q in present_queries)
-    fw_w  = {fw: max(len(fw), 8) for fw in present}
+    fw_w = {fw: max(len(fw), 8) for fw in present}
 
     def print_divider():
         print("-" * col_w + "-+-" + "-+-".join("-" * fw_w[fw] for fw in present))
@@ -165,7 +173,10 @@ def print_table(avg_data, stat_data):
         row = avg_data.get(q, {})
         cells = {fw: fmt(row.get(fw)) for fw in present}
         label = QUERY_LABEL.get(q, q)
-        print(f"{label:<{col_w}} | " + " | ".join(f"{cells[fw]:>{fw_w[fw]}}" for fw in present))
+        print(
+            f"{label:<{col_w}} | "
+            + " | ".join(f"{cells[fw]:>{fw_w[fw]}}" for fw in present)
+        )
 
     print()
 
@@ -173,11 +184,14 @@ def print_table(avg_data, stat_data):
     # Only print if we have p99 data for at least one cell
     has_p99 = any(
         stat_data.get(q, {}).get(fw, {}).get("p99_ms") is not None
-        for q in present_queries for fw in present
+        for q in present_queries
+        for fw in present
     )
     if has_p99:
         print("## Tail latency — p99 per query  (ms, lower is better)\n")
-        print(f"{'query':<{col_w}} | " + " | ".join(f"{fw:>{fw_w[fw]}}" for fw in present))
+        print(
+            f"{'query':<{col_w}} | " + " | ".join(f"{fw:>{fw_w[fw]}}" for fw in present)
+        )
         print_divider()
         for q in present_queries:
             cells = {}
@@ -185,17 +199,23 @@ def print_table(avg_data, stat_data):
                 p99 = stat_data.get(q, {}).get(fw, {}).get("p99_ms")
                 cells[fw] = fmt(p99)
             label = QUERY_LABEL.get(q, q)
-            print(f"{label:<{col_w}} | " + " | ".join(f"{cells[fw]:>{fw_w[fw]}}" for fw in present))
+            print(
+                f"{label:<{col_w}} | "
+                + " | ".join(f"{cells[fw]:>{fw_w[fw]}}" for fw in present)
+            )
         print()
 
     # ── Noise table (stddev) ─────────────────────────────────────────────────
     has_stddev = any(
         stat_data.get(q, {}).get(fw, {}).get("stddev_ms") is not None
-        for q in present_queries for fw in present
+        for q in present_queries
+        for fw in present
     )
     if has_stddev:
         print("## Run-to-run noise — stddev per query  (ms, lower is better)\n")
-        print(f"{'query':<{col_w}} | " + " | ".join(f"{fw:>{fw_w[fw]}}" for fw in present))
+        print(
+            f"{'query':<{col_w}} | " + " | ".join(f"{fw:>{fw_w[fw]}}" for fw in present)
+        )
         print_divider()
         for q in present_queries:
             cells = {}
@@ -203,7 +223,10 @@ def print_table(avg_data, stat_data):
                 sd = stat_data.get(q, {}).get(fw, {}).get("stddev_ms")
                 cells[fw] = fmt(sd)
             label = QUERY_LABEL.get(q, q)
-            print(f"{label:<{col_w}} | " + " | ".join(f"{cells[fw]:>{fw_w[fw]}}" for fw in present))
+            print(
+                f"{label:<{col_w}} | "
+                + " | ".join(f"{cells[fw]:>{fw_w[fw]}}" for fw in present)
+            )
         print()
 
     # ── Speedup summary ───────────────────────────────────────────────────────
@@ -214,15 +237,19 @@ def print_table(avg_data, stat_data):
         ratios = []
         for q in present_queries:
             ibex_v = avg_data.get(q, {}).get("ibex")
-            fw_v   = avg_data.get(q, {}).get(fw)
+            fw_v = avg_data.get(q, {}).get(fw)
             if ibex_v and fw_v and fw_v > 0:
                 ratios.append(ibex_v / fw_v)
         if ratios:
             gm = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
             if gm > 1:
-                print(f"  {fw:<14}  {fw} is {gm:.1f}× faster than ibex  (over {len(ratios)} queries)")
+                print(
+                    f"  {fw:<14}  {fw} is {gm:.1f}× faster than ibex  (over {len(ratios)} queries)"
+                )
             else:
-                print(f"  {fw:<14}  ibex is {1/gm:.1f}× faster than {fw}  (over {len(ratios)} queries)")
+                print(
+                    f"  {fw:<14}  ibex is {1/gm:.1f}× faster than {fw}  (over {len(ratios)} queries)"
+                )
     print()
 
 

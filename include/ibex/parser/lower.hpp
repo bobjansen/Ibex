@@ -22,6 +22,9 @@ struct LowerContext {
     /// Populate before calling lower_expr so that tuple-LHS RHS expressions
     /// that call table-returning externs are lowered correctly.
     std::unordered_set<std::string> table_externs;
+    /// Names of extern functions whose first argument is a DataFrame.
+    /// Populate before calling lower_expr so Stream sink calls can be validated.
+    std::unordered_set<std::string> sink_externs;
 };
 
 /// Lower a parsed Program into an IR node tree.

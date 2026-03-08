@@ -20,11 +20,15 @@
 //
 //  Wire protocol:
 //    UDP ticks in  (port 9001): {"ts":<ns>,"symbol":"AAPL","price":182.5,"volume":1000}
-//    WS bars  out  (port 8080): {"ts":<ns>,"open":182.0,"high":183.0,"low":181.5,"close":182.5}
+//    WS bars  out  (port 8765): {"ts":<ns>,"open":182.0,"high":183.0,"low":181.5,"close":182.5}
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "udp";
 import "websocket";
+
+// Eagerly bind the WebSocket listen socket so browser clients can connect
+// immediately, before the first OHLC bar is emitted by the Stream block.
+ws_listen(8765);
 
 // Stream { } wires together a source, a transform, and a sink.
 //
@@ -48,8 +52,11 @@ let ohlc_stream = Stream {
         close = last(price)
     }],
 
-    // Sink: broadcast completed bars to all WebSocket clients on port 8080.
+    // Sink: broadcast completed bars to all WebSocket clients on port 8765.
     // The Ibex runtime prepends the output DataFrame; port is the only scalar
     // argument passed after the DataFrame.
-    sink = ws_send(8080)
+    sink = ws_send(8765)
 };
+
+// Keep an explicit final expression so transpile mode can lower and execute it.
+ohlc_stream;

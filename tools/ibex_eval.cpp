@@ -3,6 +3,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
 
+#include "import_resolver.hpp"
 #include <cstdint>
 #include <expected>
 #include <fstream>
@@ -142,11 +143,20 @@ auto collect_scalar_bindings(const ibex::parser::Program& program)
                 ext->return_type.kind == ibex::parser::Type::Kind::TimeFrame) {
                 lower_ctx.table_externs.insert(ext->name);
             }
+            if (!ext->params.empty() &&
+                ext->params[0].type.kind == ibex::parser::Type::Kind::DataFrame) {
+                lower_ctx.sink_externs.insert(ext->name);
+            }
             continue;
         }
 
         const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt);
         if (let_stmt == nullptr) {
+            continue;
+        }
+
+        // Stream lets are never scalar; let the full lowering phase validate them.
+        if (std::holds_alternative<ibex::parser::StreamExpr>(let_stmt->value->node)) {
             continue;
         }
 
@@ -178,19 +188,41 @@ auto main(int argc, char** argv) -> int {
 
     try {
         const std::string source = read_file(argv[1]);
-        auto parsed = ibex::parser::parse(source);
-        if (!parsed) {
-            std::cerr << "parse error: " << parsed.error().message << '\n';
+
+        const auto parse_and_expand =
+            [&](const std::string& src) -> std::expected<ibex::parser::Program, std::string> {
+            auto parsed = ibex::parser::parse(src);
+            if (!parsed) {
+                return std::unexpected("parse error at " + std::to_string(parsed.error().line) +
+                                       ":" + std::to_string(parsed.error().column) + ": " +
+                                       parsed.error().message);
+            }
+            auto expanded = ibex::tools::expand_imports(std::move(*parsed), argv[1]);
+            if (!expanded) {
+                return std::unexpected(expanded.error());
+            }
+            return expanded;
+        };
+
+        auto scalar_program = parse_and_expand(source);
+        if (!scalar_program) {
+            std::cerr << scalar_program.error() << '\n';
             return 1;
         }
 
-        auto scalars = collect_scalar_bindings(*parsed);
+        auto scalars = collect_scalar_bindings(*scalar_program);
         if (!scalars) {
             std::cerr << "scalar error: " << scalars.error() << '\n';
             return 1;
         }
 
-        auto lowered = ibex::parser::lower(*parsed);
+        auto lower_program = parse_and_expand(source);
+        if (!lower_program) {
+            std::cerr << lower_program.error() << '\n';
+            return 1;
+        }
+
+        auto lowered = ibex::parser::lower(*lower_program);
         if (!lowered) {
             std::cerr << "lower error: " << lowered.error().message << '\n';
             return 1;

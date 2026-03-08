@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -568,6 +569,70 @@ auto make_agg(ir::AggFunc func, std::string col_name, std::string alias, double 
                        .column = ir::ColumnRef{.name = std::move(col_name)},
                        .alias = std::move(alias),
                        .param = param};
+}
+
+// ─── Stream helpers ───────────────────────────────────────────────────────────
+
+void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size_t row) {
+    if (row >= src.rows())
+        return;
+
+    // Lazily initialise dst schema on first append.
+    if (dst.columns.empty()) {
+        for (const auto& entry : src.columns) {
+            runtime::ColumnValue empty = std::visit(
+                [](const auto& c) -> runtime::ColumnValue { return std::decay_t<decltype(c)>{}; },
+                *entry.column);
+            dst.add_column(entry.name, std::move(empty));
+        }
+        dst.time_index = src.time_index;
+        dst.ordering = src.ordering;
+    }
+
+    for (std::size_t ci = 0; ci < src.columns.size() && ci < dst.columns.size(); ++ci) {
+        const std::size_t prev_size =
+            std::visit([](const auto& c) { return c.size(); }, *dst.columns[ci].column);
+
+        std::visit(
+            [&](auto& dc) {
+                using D = std::decay_t<decltype(dc)>;
+                const auto* sc = std::get_if<D>(&*src.columns[ci].column);
+                if (sc)
+                    dc.push_back((*sc)[row]);
+            },
+            *dst.columns[ci].column);
+
+        const bool null = runtime::is_null(src.columns[ci], row);
+        if (null) {
+            if (!dst.columns[ci].validity.has_value()) {
+                dst.columns[ci].validity = std::vector<bool>(prev_size, true);
+            }
+            dst.columns[ci].validity->push_back(false);
+        } else if (dst.columns[ci].validity.has_value()) {
+            dst.columns[ci].validity->push_back(true);
+        }
+    }
+}
+
+auto stream_get_ts_ns(const runtime::Table& t, std::size_t row) -> std::optional<std::int64_t> {
+    if (!t.time_index.has_value())
+        return std::nullopt;
+    const auto* col = t.find(*t.time_index);
+    if (col == nullptr)
+        return std::nullopt;
+    return std::visit(
+        [row](const auto& c) -> std::optional<std::int64_t> {
+            using C = std::decay_t<decltype(c)>;
+            if constexpr (std::is_same_v<C, Column<Timestamp>>) {
+                if (row < c.size())
+                    return static_cast<std::int64_t>(c[row].nanos);
+            } else if constexpr (std::is_same_v<C, Column<std::int64_t>>) {
+                if (row < c.size())
+                    return c[row];
+            }
+            return std::nullopt;
+        },
+        *col);
 }
 
 }  // namespace ibex::ops

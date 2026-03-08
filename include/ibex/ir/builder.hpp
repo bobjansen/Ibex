@@ -42,7 +42,7 @@ class Builder {
                               std::vector<TupleFieldSpec> tuple_fields = {},
                               std::vector<ColumnRef> group_by = {}) -> NodePtr {
         return std::make_unique<UpdateNode>(next_id(), std::move(fields), std::move(tuple_fields),
-                                           std::move(group_by));
+                                            std::move(group_by));
     }
 
     [[nodiscard]] auto rename(std::vector<RenameSpec> renames) -> NodePtr {
@@ -88,12 +88,16 @@ class Builder {
         return std::make_unique<ConstructNode>(next_id(), std::move(columns));
     }
 
+    [[nodiscard]] auto program(std::vector<NodePtr> preamble, NodePtr main_node) -> NodePtr {
+        return std::make_unique<ProgramNode>(next_id(), std::move(preamble), std::move(main_node));
+    }
+
     [[nodiscard]] auto stream(std::string source_callee, std::vector<Expr> source_args,
-                              std::string sink_callee, std::vector<Expr> sink_args,
-                              StreamKind kind, Duration bucket_duration) -> NodePtr {
+                              std::string sink_callee, std::vector<Expr> sink_args, StreamKind kind,
+                              Duration bucket_duration) -> NodePtr {
         return std::make_unique<StreamNode>(next_id(), std::move(source_callee),
-                                           std::move(source_args), std::move(sink_callee),
-                                           std::move(sink_args), kind, bucket_duration);
+                                            std::move(source_args), std::move(sink_callee),
+                                            std::move(sink_args), kind, bucket_duration);
     }
 
    private:

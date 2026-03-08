@@ -33,24 +33,23 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
+#include <arpa/inet.h>
 #include <array>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
+#include <netinet/in.h>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -65,12 +64,19 @@ inline auto json_get_str(std::string_view json, std::string_view key)
     -> std::optional<std::string> {
     std::string needle = "\"";
     needle += key;
-    needle += "\":\"";
+    needle += "\":";
     auto pos = json.find(needle);
-    if (pos == std::string_view::npos) return std::nullopt;
+    if (pos == std::string_view::npos)
+        return std::nullopt;
     pos += needle.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+        ++pos;
+    if (pos >= json.size() || json[pos] != '"')
+        return std::nullopt;
+    ++pos;  // skip opening quote
     auto end = json.find('"', pos);
-    if (end == std::string_view::npos) return std::nullopt;
+    if (end == std::string_view::npos)
+        return std::nullopt;
     return std::string(json.substr(pos, end - pos));
 }
 
@@ -80,27 +86,32 @@ inline auto json_get_int64(std::string_view json, std::string_view key)
     needle += key;
     needle += "\":";
     auto pos = json.find(needle);
-    if (pos == std::string_view::npos) return std::nullopt;
+    if (pos == std::string_view::npos)
+        return std::nullopt;
     pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+        ++pos;
     std::int64_t value = 0;
     auto [ptr, ec] = std::from_chars(json.data() + pos, json.data() + json.size(), value);
-    if (ec != std::errc{}) return std::nullopt;
+    if (ec != std::errc{})
+        return std::nullopt;
     return value;
 }
 
-inline auto json_get_double(std::string_view json, std::string_view key)
-    -> std::optional<double> {
+inline auto json_get_double(std::string_view json, std::string_view key) -> std::optional<double> {
     std::string needle = "\"";
     needle += key;
     needle += "\":";
     auto pos = json.find(needle);
-    if (pos == std::string_view::npos) return std::nullopt;
+    if (pos == std::string_view::npos)
+        return std::nullopt;
     pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+        ++pos;
     char* end_ptr = nullptr;
     double value = std::strtod(json.data() + pos, &end_ptr);
-    if (end_ptr == json.data() + pos) return std::nullopt;
+    if (end_ptr == json.data() + pos)
+        return std::nullopt;
     return value;
 }
 
@@ -126,7 +137,8 @@ inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
     // Pre-processing: append 0x80, pad to 56 mod 64 bytes, append big-endian bit length.
     std::vector<std::uint8_t> msg(data, data + len);
     msg.push_back(0x80u);
-    while (msg.size() % 64 != 56) msg.push_back(0x00u);
+    while (msg.size() % 64 != 56)
+        msg.push_back(0x00u);
     const std::uint64_t bit_len = static_cast<std::uint64_t>(len) * 8u;
     for (int i = 7; i >= 0; --i)
         msg.push_back(static_cast<std::uint8_t>((bit_len >> (i * 8)) & 0xFFu));
@@ -136,13 +148,13 @@ inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
         std::array<std::uint32_t, 80> w{};
         for (int i = 0; i < 16; ++i) {
             const std::uint8_t* p = &msg[chunk + static_cast<std::size_t>(i) * 4];
-            w[static_cast<std::size_t>(i)] =
-                (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) |
-                (std::uint32_t{p[2]} <<  8) |  std::uint32_t{p[3]};
+            w[static_cast<std::size_t>(i)] = (std::uint32_t{p[0]} << 24) |
+                                             (std::uint32_t{p[1]} << 16) |
+                                             (std::uint32_t{p[2]} << 8) | std::uint32_t{p[3]};
         }
         for (int i = 16; i < 80; ++i) {
             auto idx = static_cast<std::size_t>(i);
-            w[idx] = rol32(w[idx-3] ^ w[idx-8] ^ w[idx-14] ^ w[idx-16], 1);
+            w[idx] = rol32(w[idx - 3] ^ w[idx - 8] ^ w[idx - 14] ^ w[idx - 16], 1);
         }
 
         std::uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
@@ -163,19 +175,31 @@ inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
                 k = 0xCA62C1D6u;
             }
             const std::uint32_t temp = rol32(a, 5) + f + e + k + w[static_cast<std::size_t>(i)];
-            e = d; d = c; c = rol32(b, 30); b = a; a = temp;
+            e = d;
+            d = c;
+            c = rol32(b, 30);
+            b = a;
+            a = temp;
         }
-        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+        h0 += a;
+        h1 += b;
+        h2 += c;
+        h3 += d;
+        h4 += e;
     }
 
     Sha1Digest digest;
     auto store = [&](std::size_t i, std::uint32_t h) {
-        digest.bytes[i*4+0] = static_cast<std::uint8_t>((h >> 24) & 0xFFu);
-        digest.bytes[i*4+1] = static_cast<std::uint8_t>((h >> 16) & 0xFFu);
-        digest.bytes[i*4+2] = static_cast<std::uint8_t>((h >>  8) & 0xFFu);
-        digest.bytes[i*4+3] = static_cast<std::uint8_t>( h        & 0xFFu);
+        digest.bytes[i * 4 + 0] = static_cast<std::uint8_t>((h >> 24) & 0xFFu);
+        digest.bytes[i * 4 + 1] = static_cast<std::uint8_t>((h >> 16) & 0xFFu);
+        digest.bytes[i * 4 + 2] = static_cast<std::uint8_t>((h >> 8) & 0xFFu);
+        digest.bytes[i * 4 + 3] = static_cast<std::uint8_t>(h & 0xFFu);
     };
-    store(0, h0); store(1, h1); store(2, h2); store(3, h3); store(4, h4);
+    store(0, h0);
+    store(1, h1);
+    store(2, h2);
+    store(3, h3);
+    store(4, h4);
     return digest;
 }
 
@@ -194,27 +218,30 @@ inline auto base64_encode(const std::uint8_t* data, std::size_t len) -> std::str
         out += kChars[(triple >> 18) & 0x3Fu];
         out += kChars[(triple >> 12) & 0x3Fu];
         out += (i + 1 < len) ? kChars[(triple >> 6) & 0x3Fu] : '=';
-        out += (i + 2 < len) ? kChars[ triple       & 0x3Fu] : '=';
+        out += (i + 2 < len) ? kChars[triple & 0x3Fu] : '=';
     }
     return out;
 }
 
 // ─── WebSocket handshake helpers ──────────────────────────────────────────────
 
-static constexpr std::string_view kWsMagicGuid =
-    "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+static constexpr std::string_view kWsMagicGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // Extract the base64 value of the Sec-WebSocket-Key header from an HTTP request.
 inline auto extract_ws_key(std::string_view http) -> std::optional<std::string> {
     // Header name is case-insensitive; check both common forms.
     for (auto hdr : {"Sec-WebSocket-Key:", "sec-websocket-key:"}) {
         auto pos = http.find(hdr);
-        if (pos == std::string_view::npos) continue;
+        if (pos == std::string_view::npos)
+            continue;
         pos += std::string_view(hdr).size();
-        while (pos < http.size() && http[pos] == ' ') ++pos;
+        while (pos < http.size() && http[pos] == ' ')
+            ++pos;
         auto end = http.find('\r', pos);
-        if (end == std::string_view::npos) end = http.find('\n', pos);
-        if (end == std::string_view::npos) return std::nullopt;
+        if (end == std::string_view::npos)
+            end = http.find('\n', pos);
+        if (end == std::string_view::npos)
+            return std::nullopt;
         return std::string(http.substr(pos, end - pos));
     }
     return std::nullopt;
@@ -239,7 +266,7 @@ inline auto ws_encode_text_frame(std::string_view payload) -> std::string {
     } else if (len <= 65535) {
         frame += '\x7E';
         frame += static_cast<char>((len >> 8) & 0xFF);
-        frame += static_cast<char>( len       & 0xFF);
+        frame += static_cast<char>(len & 0xFF);
     } else {
         frame += '\x7F';
         for (int i = 7; i >= 0; --i)
@@ -253,39 +280,44 @@ inline auto ws_encode_text_frame(std::string_view payload) -> std::string {
 
 struct WsFrame {
     std::uint8_t opcode{};
-    std::string  payload;
-    bool         fin{true};
+    std::string payload;
+    bool fin{true};
 };
 
 // Attempts to decode one frame from `buf`, consuming its bytes on success.
 // Returns nullopt when buf contains fewer bytes than the complete frame.
 inline auto ws_decode_frame(std::string& buf) -> std::optional<WsFrame> {
-    if (buf.size() < 2) return std::nullopt;
+    if (buf.size() < 2)
+        return std::nullopt;
 
     const auto* raw = reinterpret_cast<const std::uint8_t*>(buf.data());
-    const bool fin    = (raw[0] & 0x80u) != 0;
+    const bool fin = (raw[0] & 0x80u) != 0;
     const std::uint8_t opcode = raw[0] & 0x0Fu;
     const bool masked = (raw[1] & 0x80u) != 0;
     std::uint64_t payload_len = raw[1] & 0x7Fu;
-    std::size_t   header_size = 2;
+    std::size_t header_size = 2;
 
     if (payload_len == 126) {
-        if (buf.size() < 4) return std::nullopt;
+        if (buf.size() < 4)
+            return std::nullopt;
         payload_len = (std::uint64_t{raw[2]} << 8) | raw[3];
         header_size = 4;
     } else if (payload_len == 127) {
-        if (buf.size() < 10) return std::nullopt;
+        if (buf.size() < 10)
+            return std::nullopt;
         payload_len = 0;
         for (int i = 0; i < 8; ++i)
             payload_len = (payload_len << 8) | raw[2 + static_cast<std::size_t>(i)];
         header_size = 10;
     }
 
-    if (masked) header_size += 4;
-    if (buf.size() < header_size + static_cast<std::size_t>(payload_len)) return std::nullopt;
+    if (masked)
+        header_size += 4;
+    if (buf.size() < header_size + static_cast<std::size_t>(payload_len))
+        return std::nullopt;
 
     WsFrame frame;
-    frame.fin    = fin;
+    frame.fin = fin;
     frame.opcode = opcode;
     frame.payload.resize(static_cast<std::size_t>(payload_len));
 
@@ -304,13 +336,13 @@ inline auto ws_decode_frame(std::string& buf) -> std::optional<WsFrame> {
 // ─── Server state ─────────────────────────────────────────────────────────────
 
 struct WsClient {
-    int         fd{-1};
-    bool        handshaked{false};
+    int fd{-1};
+    bool handshaked{false};
     std::string buf;  // partial receive buffer
 };
 
 struct WsServer {
-    int                   listen_fd{-1};
+    int listen_fd{-1};
     std::vector<WsClient> clients;
 
     WsServer() = default;
@@ -319,8 +351,10 @@ struct WsServer {
 
     ~WsServer() {
         for (auto& c : clients)
-            if (c.fd >= 0) ::close(c.fd);
-        if (listen_fd >= 0) ::close(listen_fd);
+            if (c.fd >= 0)
+                ::close(c.fd);
+        if (listen_fd >= 0)
+            ::close(listen_fd);
     }
 };
 
@@ -328,7 +362,8 @@ struct WsServer {
 inline auto get_server(int port) -> WsServer& {
     static std::unordered_map<int, std::unique_ptr<WsServer>> g_servers;
     auto it = g_servers.find(port);
-    if (it != g_servers.end()) return *it->second;
+    if (it != g_servers.end())
+        return *it->second;
 
     auto srv = std::make_unique<WsServer>();
 
@@ -340,13 +375,13 @@ inline auto get_server(int port) -> WsServer& {
     ::setsockopt(srv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(static_cast<std::uint16_t>(port));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<std::uint16_t>(port));
     addr.sin_addr.s_addr = INADDR_ANY;
     if (::bind(srv->listen_fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::close(srv->listen_fd);
-        throw std::runtime_error(std::string("ws: bind port ") + std::to_string(port) +
-                                 ": " + std::strerror(errno));
+        throw std::runtime_error(std::string("ws: bind port ") + std::to_string(port) + ": " +
+                                 std::strerror(errno));
     }
     if (::listen(srv->listen_fd, 16) < 0) {
         ::close(srv->listen_fd);
@@ -366,8 +401,10 @@ inline auto get_server(int port) -> WsServer& {
 // Returns true when the handshake is complete (or already was).
 // Returns false and closes c.fd when the upgrade request is invalid.
 inline auto try_handshake(WsClient& c) -> bool {
-    if (c.handshaked) return true;
-    if (c.buf.find("\r\n\r\n") == std::string::npos) return false;  // incomplete request
+    if (c.handshaked)
+        return true;
+    if (c.buf.find("\r\n\r\n") == std::string::npos)
+        return false;  // incomplete request
 
     auto key = extract_ws_key(c.buf);
     if (!key) {
@@ -381,7 +418,8 @@ inline auto try_handshake(WsClient& c) -> bool {
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: " + compute_accept_key(*key) + "\r\n\r\n";
+        "Sec-WebSocket-Accept: " +
+        compute_accept_key(*key) + "\r\n\r\n";
     ::send(c.fd, response.data(), response.size(), MSG_NOSIGNAL);
     c.handshaked = true;
     c.buf.clear();
@@ -390,10 +428,9 @@ inline auto try_handshake(WsClient& c) -> bool {
 
 // Remove clients whose fd has been set to -1 (disconnected / errored).
 inline void prune_clients(WsServer& srv) {
-    srv.clients.erase(
-        std::remove_if(srv.clients.begin(), srv.clients.end(),
-                       [](const WsClient& c) { return c.fd < 0; }),
-        srv.clients.end());
+    srv.clients.erase(std::remove_if(srv.clients.begin(), srv.clients.end(),
+                                     [](const WsClient& c) { return c.fd < 0; }),
+                      srv.clients.end());
 }
 
 // Serialise one row of `table` as a compact JSON object string.
@@ -404,7 +441,8 @@ inline auto row_to_json(const ibex::runtime::Table& table, std::size_t row) -> s
     std::string json = "{";
     bool first_field = true;
     for (const auto& entry : table.columns) {
-        if (!first_field) json += ',';
+        if (!first_field)
+            json += ',';
         first_field = false;
         json += '"';
         json += entry.name;
@@ -469,23 +507,27 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
     for (const auto& c : srv.clients) {
         if (c.fd >= 0) {
             FD_SET(c.fd, &rfds);
-            if (c.fd > maxfd) maxfd = c.fd;
+            if (c.fd > maxfd)
+                maxfd = c.fd;
         }
     }
 
     struct timeval tv{0, 200'000};  // 200 ms
     const int nready = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
-    if (nready <= 0) return StreamTimeout{};
+    if (nready <= 0)
+        return StreamTimeout{};
 
     // ── Accept new connections ────────────────────────────────────────────────
     if (FD_ISSET(srv.listen_fd, &rfds)) {
         const int cfd = ::accept(srv.listen_fd, nullptr, nullptr);
-        if (cfd >= 0) srv.clients.push_back(WsClient{cfd, false, {}});
+        if (cfd >= 0)
+            srv.clients.push_back(WsClient{cfd, false, {}});
     }
 
     // ── Service each client ───────────────────────────────────────────────────
     for (auto& c : srv.clients) {
-        if (c.fd < 0 || !FD_ISSET(c.fd, &rfds)) continue;
+        if (c.fd < 0 || !FD_ISSET(c.fd, &rfds))
+            continue;
 
         char tmp[4096];
         const ssize_t n = ::recv(c.fd, tmp, sizeof(tmp), 0);
@@ -504,7 +546,8 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
         // Decode WebSocket frames; return on the first useful text message.
         while (true) {
             auto frame_opt = ws_decode_frame(c.buf);
-            if (!frame_opt) break;
+            if (!frame_opt)
+                break;
 
             const auto& frame = *frame_opt;
 
@@ -534,15 +577,15 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
 
                 // EOF sentinel from client.
                 if (json.find("\"eof\"") != std::string_view::npos &&
-                    json.find("true")   != std::string_view::npos) {
+                    json.find("true") != std::string_view::npos) {
                     prune_clients(srv);
                     return ExternValue{Table{}};
                 }
 
                 // Parse tick fields.
-                auto ts_opt     = json_get_int64(json, "ts");
+                auto ts_opt = json_get_int64(json, "ts");
                 auto symbol_opt = json_get_str(json, "symbol");
-                auto price_opt  = json_get_double(json, "price");
+                auto price_opt = json_get_double(json, "price");
                 auto volume_opt = json_get_int64(json, "volume");
 
                 if (!ts_opt || !symbol_opt || !price_opt || !volume_opt) {
@@ -597,13 +640,15 @@ inline auto ws_send(const ibex::runtime::Table& table, std::int64_t port) -> std
     // ── Accept all pending TCP connections (non-blocking) ─────────────────────
     while (true) {
         const int cfd = ::accept(srv.listen_fd, nullptr, nullptr);
-        if (cfd < 0) break;  // EAGAIN / EWOULDBLOCK — no more pending connections
+        if (cfd < 0)
+            break;  // EAGAIN / EWOULDBLOCK — no more pending connections
         srv.clients.push_back(WsClient{cfd, false, {}});
     }
 
     // ── Promote pending handshakes ────────────────────────────────────────────
     for (auto& c : srv.clients) {
-        if (c.fd < 0 || c.handshaked) continue;
+        if (c.fd < 0 || c.handshaked)
+            continue;
         char tmp[4096];
         const ssize_t n = ::recv(c.fd, tmp, sizeof(tmp), MSG_DONTWAIT);
         if (n > 0) {
@@ -623,11 +668,12 @@ inline auto ws_send(const ibex::runtime::Table& table, std::int64_t port) -> std
     std::int64_t sent = 0;
 
     for (std::size_t row = 0; row < rows; ++row) {
-        const std::string json  = row_to_json(table, row);
+        const std::string json = row_to_json(table, row);
         const std::string frame = ws_encode_text_frame(json);
 
         for (auto& c : srv.clients) {
-            if (!c.handshaked) continue;
+            if (!c.handshaked)
+                continue;
             const ssize_t n = ::send(c.fd, frame.data(), frame.size(), MSG_NOSIGNAL);
             if (n < 0) {
                 ::close(c.fd);
@@ -641,4 +687,19 @@ inline auto ws_send(const ibex::runtime::Table& table, std::int64_t port) -> std
     return sent;
 }
 
+/// ws_listen(port) — eagerly binds the listen socket on `port`.
+/// Calling this before the stream loop lets clients connect before the first
+/// bar is emitted.  Returns 0 on success; throws on bind failure.
+inline auto ws_listen(std::int64_t port) -> std::int64_t {
+    get_server(static_cast<int>(port));
+    return 0;
+}
+
 }  // namespace ibex_ws
+
+// ─── Global aliases ───────────────────────────────────────────────────────────
+// Expose plugin functions without namespace qualification so that ibex_compile-
+// generated code can call them by their extern fn name directly.
+using ibex_ws::ws_listen;
+using ibex_ws::ws_recv;
+using ibex_ws::ws_send;

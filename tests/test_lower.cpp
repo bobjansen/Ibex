@@ -337,3 +337,27 @@ enriched[filter x > 10, select { x }];
     REQUIRE(scan != nullptr);
     REQUIRE(scan->source_name() == "trades");
 }
+
+TEST_CASE("Lower stream expression with context-provided source and sink externs") {
+    auto program = require_parse(R"(
+Stream {
+    source = udp_recv(9001),
+    transform = [resample 1m, select { open = first(price) }],
+    sink = ws_send(8080)
+};
+)");
+    REQUIRE(program.statements.size() == 1);
+    const auto* expr_stmt = std::get_if<parser::ExprStmt>(&program.statements[0]);
+    REQUIRE(expr_stmt != nullptr);
+
+    parser::LowerContext ctx;
+    ctx.table_externs.insert("udp_recv");
+    ctx.sink_externs.insert("ws_send");
+
+    auto result = parser::lower_expr(*expr_stmt->expr, ctx);
+    REQUIRE(result.has_value());
+    const auto* stream = as_node<ir::StreamNode>(result->get());
+    REQUIRE(stream != nullptr);
+    REQUIRE(stream->source_callee() == "udp_recv");
+    REQUIRE(stream->sink_callee() == "ws_send");
+}

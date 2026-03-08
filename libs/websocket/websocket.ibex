@@ -14,11 +14,18 @@
 //     StreamTimeout when no message arrives — the stream runtime calls the
 //     source again after handling any pending time-bucket flushes.
 //
+//   ws_listen(port: Int) -> Int
+//     Eagerly opens the WebSocket listen socket on `port` so that browser
+//     clients can connect before the first bar is emitted by a Stream {} sink.
+//     Call this once before the Stream block.  Returns 0 on success; throws
+//     on bind failure (e.g. port already in use).
+//
 //   ws_send(df: DataFrame, port: Int) -> Int
 //     Broadcasts each row of `df` as a JSON WebSocket text frame to all
 //     clients currently connected on `port`.  Creates the server listener on
 //     `port` on first call, so ws_send can be used as a standalone sink
 //     (without ws_recv).  Returns the number of rows sent.
 
+extern fn ws_listen(port: Int) -> Int from "websocket";
 extern fn ws_recv(port: Int) -> DataFrame from "websocket";
 extern fn ws_send(df: DataFrame, port: Int) -> Int from "websocket";

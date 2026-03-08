@@ -104,11 +104,15 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    // UDP socket
+    // UDP socket with a large send buffer to absorb bursts.
     const int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         std::perror("socket");
         return 1;
+    }
+    {
+        int sndbuf = 16 * 1024 * 1024;  // 16 MB
+        ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     }
 
     sockaddr_in dest{};
@@ -124,11 +128,31 @@ int main(int argc, char* argv[]) {
     std::normal_distribution<double> gauss{0.0, 1.0};
     std::uniform_int_distribution<int> vol{1, 14};  // × 100 = 100..1400
 
-    const auto tick_interval = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::duration<double>(1.0 / cfg.rate));
+    // At rates above this threshold one tick interval < OS scheduler
+    // resolution (~100 µs), so sleep_until is meaningless.  Above the
+    // threshold we send in batches as fast as the socket allows.
+    static constexpr double kSleepThresholdHz = 50'000.0;
 
-    std::printf("tick_gen  |  %.0f ticks/s → udp://%s:%d  |  σ=%.4f\n", cfg.rate, cfg.host,
-                cfg.port, cfg.sigma);
+    // sendmmsg batch size.  Each slot holds one pre-built datagram.
+    // 128 × 192 B = 24 KB on the stack — negligible.
+    static constexpr int kBatch = 128;
+    struct mmsghdr batch_msgs[kBatch]{};
+    struct iovec batch_iovecs[kBatch]{};
+    char batch_bufs[kBatch][192];
+
+    for (int i = 0; i < kBatch; ++i) {
+        batch_msgs[i].msg_hdr.msg_name = &dest;
+        batch_msgs[i].msg_hdr.msg_namelen = sizeof(dest);
+        batch_msgs[i].msg_hdr.msg_iov = &batch_iovecs[i];
+        batch_msgs[i].msg_hdr.msg_iovlen = 1;
+        batch_iovecs[i].iov_base = batch_bufs[i];
+    }
+
+    const auto tick_interval = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(static_cast<double>(kBatch) / cfg.rate));
+
+    std::printf("tick_gen  |  %.0f ticks/s → udp://%s:%d  |  σ=%.4f  |  batch=%d\n", cfg.rate,
+                cfg.host, cfg.port, cfg.sigma, kBatch);
     for (const auto& s : g_symbols)
         std::printf("  %-6s  %.2f\n", s.name, s.price);
     std::printf("Ctrl+C to stop.\n\n");
@@ -136,29 +160,31 @@ int main(int argc, char* argv[]) {
 
     long long n = 0;
     auto report_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    auto next_tick = std::chrono::steady_clock::now();
+    auto next_batch = std::chrono::steady_clock::now();
 
     while (g_running.load(std::memory_order_relaxed)) {
-        auto& sym = g_symbols[static_cast<std::size_t>(n) % g_symbols.size()];
+        // Build one batch of kBatch datagrams.
+        for (int b = 0; b < kBatch; ++b) {
+            auto& sym = g_symbols[static_cast<std::size_t>(n) % g_symbols.size()];
 
-        // GBM step: S(t+1) = S(t) × exp(σ × Z)
-        sym.price *= std::exp(cfg.sigma * gauss(rng));
-        const int volume = vol(rng) * 100;
+            // GBM step: S(t+1) = S(t) × exp(σ × Z)
+            sym.price *= std::exp(cfg.sigma * gauss(rng));
+            const int volume = vol(rng) * 100;
 
-        // Nanosecond wall-clock timestamp
-        const auto ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
+            const auto ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
 
-        // Serialise as JSON without heap allocation
-        char buf[192];
-        const int len = std::snprintf(
-            buf, sizeof(buf), "{\"ts\":%lld,\"symbol\":\"%s\",\"price\":%.2f,\"volume\":%d}",
-            static_cast<long long>(ts_ns), sym.name, sym.price, volume);
+            const int len =
+                std::snprintf(batch_bufs[b], sizeof(batch_bufs[b]),
+                              "{\"ts\":%lld,\"symbol\":\"%s\",\"price\":%.2f,\"volume\":%d}",
+                              static_cast<long long>(ts_ns), sym.name, sym.price, volume);
+            batch_iovecs[b].iov_len = static_cast<std::size_t>(len);
+            ++n;
+        }
 
-        ::sendto(sock, buf, static_cast<std::size_t>(len), 0,
-                 reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
-        ++n;
+        // Ship the whole batch in one syscall.
+        ::sendmmsg(sock, batch_msgs, kBatch, MSG_NOSIGNAL);
 
         // Status report every 10 s
         const auto now = std::chrono::steady_clock::now();
@@ -171,9 +197,12 @@ int main(int argc, char* argv[]) {
             report_at += std::chrono::seconds(10);
         }
 
-        // Precise-interval sleep
-        next_tick += tick_interval;
-        std::this_thread::sleep_until(next_tick);
+        // Only sleep when the batch interval is long enough for the OS to
+        // honour it.  At high rates we let the socket back-pressure us.
+        if (cfg.rate <= kSleepThresholdHz) {
+            next_batch += tick_interval;
+            std::this_thread::sleep_until(next_batch);
+        }
     }
 
     std::printf("Stopped after %lld ticks.\n", n);

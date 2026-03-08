@@ -4,6 +4,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <variant>
 
 namespace {
@@ -199,6 +202,19 @@ TEST_CASE("Parse allows parameter names that match modifier words") {
     REQUIRE(fn.params[1].effect == Param::Effect::Const);
     REQUIRE(fn.params[2].name == "const");
     REQUIRE(fn.params[2].effect == Param::Effect::Const);
+}
+
+TEST_CASE("Parse optimization showcase example script") {
+    const auto script_path =
+        std::filesystem::path(IBEX_SOURCE_DIR) / "examples" / "optimization_showcase.ibex";
+    std::ifstream input(script_path);
+    REQUIRE(input.is_open());
+
+    std::stringstream source;
+    source << input.rdbuf();
+
+    auto result = parse(source.str());
+    REQUIRE(result.has_value());
 }
 
 TEST_CASE("Effect checking: user fn annotation must include inferred extern effects") {

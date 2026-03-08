@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BINARY="@IBEX_TEST_BINARY@"
+PROFRAW="@IBEX_COVERAGE_PROFRAW@"
+PROFDATA="@IBEX_COVERAGE_PROFDATA@"
+REPORT_DIR="@IBEX_COVERAGE_REPORT_DIR@"
+LLVM_PROFDATA="@LLVM_PROFDATA@"
+LLVM_COV="@LLVM_COV@"
+SOURCE_DIR="@CMAKE_SOURCE_DIR@"
+
+echo "=== Running tests ==="
+LLVM_PROFILE_FILE="$PROFRAW" "$BINARY"
+
+echo ""
+echo "=== Merging profile data ==="
+"$LLVM_PROFDATA" merge --sparse "$PROFRAW" -o "$PROFDATA"
+
+mkdir -p "$REPORT_DIR"
+
+echo ""
+echo "=== Generating HTML report -> $REPORT_DIR/index.html ==="
+"$LLVM_COV" show "$BINARY" \
+    "--instr-profile=$PROFDATA" \
+    "--ignore-filename-regex=(_deps|/tests/|/tools/)" \
+    --format=html \
+    "--output-dir=$REPORT_DIR" \
+    "$SOURCE_DIR/src" "$SOURCE_DIR/include" "$SOURCE_DIR/libs"
+
+echo ""
+echo "=== Coverage summary ==="
+"$LLVM_COV" report "$BINARY" \
+    "--instr-profile=$PROFDATA" \
+    "--ignore-filename-regex=(_deps|/tests/|/tools/)" \
+    "$SOURCE_DIR/src" "$SOURCE_DIR/include" "$SOURCE_DIR/libs" \
+    | tee "$REPORT_DIR/summary.txt"

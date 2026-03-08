@@ -126,8 +126,8 @@ auto format_float_mixed(double value) -> std::string {
         return value > 0 ? "inf" : "-inf";
     }
     std::array<char, 128> buffer{};
-    auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
-                                   std::chars_format::general, 7);
+    auto [ptr, ec] =
+        std::to_chars(buffer.begin(), buffer.end(), value, std::chars_format::general, 7);
     if (ec == std::errc{}) {
         return normalize_float_text(std::string(buffer.data(), ptr));
     }

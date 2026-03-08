@@ -213,12 +213,18 @@ auto deref_col(const ColResult& r) -> const ColumnValue& {
             if constexpr (std::is_same_v<std::decay_t<decltype(v)>, const ColumnValue*>)
                 return *v;
             else
+                // Safe: `deref_col` only accepts lvalue `ColResult`; rvalue overloads
+                // are deleted, so this reference cannot bind to a temporary.
+                // NOLINTNEXTLINE(bugprone-return-const-ref-from-parameter)
                 return v;
         },
         r.data);
 }
 
-static auto merge_validity(const std::vector<bool>* a, const std::vector<bool>* b, std::size_t n)
+auto deref_col(ColResult&&) -> const ColumnValue& = delete;
+auto deref_col(const ColResult&&) -> const ColumnValue& = delete;
+
+auto merge_validity(const std::vector<bool>* a, const std::vector<bool>* b, std::size_t n)
     -> std::optional<std::vector<bool>> {
     if (!a && !b)
         return std::nullopt;
@@ -234,7 +240,7 @@ static auto merge_validity(const std::vector<bool>* a, const std::vector<bool>* 
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
 // Returns nullopt if no referenced column has a validity bitmap.
-static auto collect_expr_validity(const ir::Expr& expr, const Table& table, std::size_t n)
+auto collect_expr_validity(const ir::Expr& expr, const Table& table, std::size_t n)
     -> std::optional<std::vector<bool>> {
     std::optional<std::vector<bool>> result;
     auto merge_in = [&](const std::vector<bool>* v) {
@@ -1061,8 +1067,8 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                     const uint8_t* rval = right->valid->data();
                     for (std::size_t i = 0; i < n; ++i) {
                         // Row is definitively false if either side is a known false
-                        uint8_t a_false = lval[i] & (1u - lp[i]);
-                        uint8_t b_false = rval[i] & (1u - rp[i]);
+                        uint8_t a_false = lval[i] & (1U - lp[i]);
+                        uint8_t b_false = rval[i] & (1U - rp[i]);
                         (*left->valid)[i] = (lval[i] & rval[i]) | a_false | b_false;
                     }
                 }
@@ -1103,7 +1109,7 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                 if (!mask)
                     return std::unexpected(mask.error());
                 for (auto& v : mask->value)
-                    v ^= 1u;
+                    v ^= 1U;
                 // valid stays as-is (null propagates)
                 return std::move(*mask);
             } else if constexpr (std::is_same_v<T, ir::FilterIsNull>) {
@@ -1515,11 +1521,12 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
     for (std::size_t i = 0; i < rows; ++i) {
         auto k = src_keys[i];
         for (std::size_t p = 0; p < 8; ++p)
-            ++hists[p][(k >> (p * 8u)) & 0xFFu];
+            ++hists[p][(k >> (p * 8U)) & 0xFFU];
     }
 
     std::vector<std::uint64_t> dst_keys(rows);
-    std::vector<Idx> src_idx(rows), dst_idx(rows);
+    std::vector<Idx> src_idx(rows);
+    std::vector<Idx> dst_idx(rows);
     std::iota(src_idx.begin(), src_idx.end(), Idx{0});
 
     std::array<std::size_t, 256> cnt;
@@ -1533,7 +1540,7 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
         if (non_zero <= 1)
             continue;
 
-        auto shift = pass * 8u;
+        auto shift = pass * 8U;
         // Convert histogram to exclusive prefix-sum write positions.
         std::size_t total = 0;
         for (std::size_t b = 0; b < 256; ++b) {
@@ -1545,11 +1552,11 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
         constexpr std::size_t kPrefetchDist = 8;
         for (std::size_t i = 0; i < rows; ++i) {
             if (i + kPrefetchDist < rows) {
-                std::size_t pb = (src_keys[i + kPrefetchDist] >> shift) & 0xFFu;
+                std::size_t pb = (src_keys[i + kPrefetchDist] >> shift) & 0xFFU;
                 __builtin_prefetch(&dst_keys[cnt[pb]], 1, 1);
                 __builtin_prefetch(&dst_idx[cnt[pb]], 1, 1);
             }
-            std::size_t bucket = (src_keys[i] >> shift) & 0xFFu;
+            std::size_t bucket = (src_keys[i] >> shift) & 0xFFU;
             dst_keys[cnt[bucket]] = src_keys[i];
             dst_idx[cnt[bucket]] = src_idx[i];
             ++cnt[bucket];
@@ -1743,7 +1750,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                         ColT dst;
                         dst.resize(rows);
                         for (std::size_t pos = 0; pos < rows; ++pos)
-                            dst.byte_at(pos) = src[static_cast<std::size_t>(idx[pos])] ? 1u : 0u;
+                            dst.byte_at(pos) = src[static_cast<std::size_t>(idx[pos])] ? 1U : 0U;
                         return dst;
                     } else {
                         ColT dst;
@@ -3733,9 +3740,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                     std::numeric_limits<double>::infinity());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] < acc[g]) {
-                                    acc[g] = data[row];
-                                }
+                                acc[g] = std::min(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
                                 fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
@@ -3749,9 +3754,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                     -std::numeric_limits<double>::infinity());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] > acc[g]) {
-                                    acc[g] = data[row];
-                                }
+                                acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
                                 fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
@@ -3796,9 +3799,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                           std::numeric_limits<std::int64_t>::max());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] < acc[g]) {
-                                    acc[g] = data[row];
-                                }
+                                acc[g] = std::min(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
                                 fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
@@ -3811,9 +3812,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                           std::numeric_limits<std::int64_t>::min());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] > acc[g]) {
-                                    acc[g] = data[row];
-                                }
+                                acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
                                 fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
@@ -4193,8 +4192,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                     std::numeric_limits<double>::infinity());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] < acc[g])
-                                    acc[g] = data[row];
+                                acc[g] = std::min(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
                                 fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
@@ -4208,8 +4206,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                     -std::numeric_limits<double>::infinity());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] > acc[g])
-                                    acc[g] = data[row];
+                                acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
                                 fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
@@ -4253,12 +4250,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                           std::numeric_limits<std::int64_t>::max());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] < acc[g])
-                                    acc[g] = data[row];
+                                acc[g] = std::min(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                fs[(static_cast<std::size_t>(g) * n_aggs) + agg_i].int_value =
+                                    acc[g];
+                                fs[(static_cast<std::size_t>(g) * n_aggs) + agg_i].has_value = true;
                             }
                             break;
                         }
@@ -4267,8 +4264,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                           std::numeric_limits<std::int64_t>::min());
                             for (std::size_t row = 0; row < rows; ++row) {
                                 std::uint32_t g = gids[row];
-                                if (data[row] > acc[g])
-                                    acc[g] = data[row];
+                                acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
                                 fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
@@ -4623,8 +4619,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     std::vector<double> acc(n_groups_m, std::numeric_limits<double>::infinity());
                     for (std::size_t row = 0; row < rows; ++row) {
                         std::uint32_t g = gids[row];
-                        if (data[row] < acc[g])
-                            acc[g] = data[row];
+                        acc[g] = std::min(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
                         fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
@@ -4636,8 +4631,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     std::vector<double> acc(n_groups_m, -std::numeric_limits<double>::infinity());
                     for (std::size_t row = 0; row < rows; ++row) {
                         std::uint32_t g = gids[row];
-                        if (data[row] > acc[g])
-                            acc[g] = data[row];
+                        acc[g] = std::max(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
                         fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
@@ -4680,8 +4674,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                   std::numeric_limits<std::int64_t>::max());
                     for (std::size_t row = 0; row < rows; ++row) {
                         std::uint32_t g = gids[row];
-                        if (data[row] < acc[g])
-                            acc[g] = data[row];
+                        acc[g] = std::min(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
                         fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
@@ -4694,8 +4687,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                   std::numeric_limits<std::int64_t>::min());
                     for (std::size_t row = 0; row < rows; ++row) {
                         std::uint32_t g = gids[row];
-                        if (data[row] > acc[g])
-                            acc[g] = data[row];
+                        acc[g] = std::max(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
                         fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];

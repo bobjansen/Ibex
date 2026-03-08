@@ -369,11 +369,28 @@ awk -F'\t' '
 ' "$BASE_TSV" "$TARGET_TSV" | sort -t$'\t' -k1,1 -k2,2 > "$REPORT_TSV"
 
 awk -F'\t' '
+    function insert_sorted(kind, scope, value,    i) {
+        i = ++cnt[kind, scope]
+        while (i > 1 && vals[kind, scope, i - 1] > value) {
+            vals[kind, scope, i] = vals[kind, scope, i - 1]
+            --i
+        }
+        vals[kind, scope, i] = value
+    }
+
+    function median_of(kind, scope,    m) {
+        m = cnt[kind, scope]
+        if (m == 0) return 0.0
+        if (m % 2 == 1) return vals[kind, scope, (m + 1) / 2]
+        return (vals[kind, scope, m / 2] + vals[kind, scope, (m / 2) + 1]) / 2.0
+    }
+
     FNR == 1 { next }
     {
         fw = $1
         b = $3 + 0.0
         t = $4 + 0.0
+        d = t - b
 
         base_sum[fw] += b
         tgt_sum[fw] += t
@@ -381,17 +398,32 @@ awk -F'\t' '
         base_sum["ALL"] += b
         tgt_sum["ALL"] += t
         n["ALL"] += 1
+        insert_sorted("base", fw, b)
+        insert_sorted("tgt", fw, t)
+        insert_sorted("delta", fw, d)
+        insert_sorted("base", "ALL", b)
+        insert_sorted("tgt", "ALL", t)
+        insert_sorted("delta", "ALL", d)
+
+        if (b > 0.0) {
+            pct = 100.0 * d / b
+            insert_sorted("pct", fw, pct)
+            insert_sorted("pct", "ALL", pct)
+        }
 
         if (b > 0.0 && t > 0.0) {
-            log_sum[fw] += log(b / t)
+            spd = b / t
+            log_sum[fw] += log(spd)
             log_n[fw] += 1
-            log_sum["ALL"] += log(b / t)
+            log_sum["ALL"] += log(spd)
             log_n["ALL"] += 1
+            insert_sorted("spd", fw, spd)
+            insert_sorted("spd", "ALL", spd)
         }
     }
     END {
         OFS = "\t"
-        print "scope", "queries", "total_base_ms", "total_target_ms", "total_delta_ms", "total_delta_pct", "geom_speedup_x", "geom_samples"
+        print "scope", "queries", "total_base_ms", "total_target_ms", "total_delta_ms", "total_delta_pct", "median_base_ms", "median_target_ms", "median_delta_ms", "median_delta_pct", "median_speedup_x", "geom_speedup_x", "geom_samples"
         order[1] = "ALL"
         idx = 2
         for (k in n) {
@@ -409,7 +441,12 @@ awk -F'\t' '
             } else {
                 g = 0.0
             }
-            print k, n[k], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.3f", g), log_n[k]
+            mb = median_of("base", k)
+            mt = median_of("tgt", k)
+            md = median_of("delta", k)
+            mp = (cnt["pct", k] > 0) ? median_of("pct", k) : 0.0
+            ms = (cnt["spd", k] > 0) ? median_of("spd", k) : 0.0
+            print k, n[k], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.4f", mb), sprintf("%.4f", mt), sprintf("%+.4f", md), sprintf("%+.2f%%", mp), sprintf("%.3f", ms), sprintf("%.3f", g), log_n[k]
         }
     }
 ' "$REPORT_TSV" > "$SUMMARY_TSV"
@@ -422,7 +459,7 @@ else
 fi
 
 echo
-echo "Summary (totals + geometric mean speedup):"
+echo "Summary (totals + medians + geometric mean speedup):"
 if command -v column >/dev/null 2>&1; then
     column -t -s $'\t' "$SUMMARY_TSV"
 else

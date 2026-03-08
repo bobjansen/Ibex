@@ -258,9 +258,10 @@ TEST_CASE("emitter: window node — rolling sum", "[codegen]") {
     // tf[window 1m, update { s = rolling_sum(price) }]
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
     auto price_arg = std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{.name = "price"}});
-    auto upd = b.update({ir::FieldSpec{
-        .alias = "s",
-        .expr = ir::Expr{ir::CallExpr{.callee = "rolling_sum", .args = {price_arg}}}}});
+    auto upd = b.update(
+        {ir::FieldSpec{.alias = "s",
+                       .expr = ir::Expr{ir::CallExpr{
+                           .callee = "rolling_sum", .args = {price_arg}, .named_args = {}}}}});
     upd->add_child(make_source(b, "ticks.csv"));
     auto win = b.window(ir::Duration(min_ns));
     win->add_child(std::move(upd));
@@ -279,10 +280,11 @@ TEST_CASE("emitter: window node — multiple rolling ops", "[codegen]") {
     auto price_arg = std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{.name = "price"}});
     auto upd = b.update({
         ir::FieldSpec{.alias = "s",
-                      .expr = ir::Expr{ir::CallExpr{.callee = "rolling_sum", .args = {price_arg}}}},
-        ir::FieldSpec{
-            .alias = "m",
-            .expr = ir::Expr{ir::CallExpr{.callee = "rolling_mean", .args = {price_arg}}}},
+                      .expr = ir::Expr{ir::CallExpr{
+                          .callee = "rolling_sum", .args = {price_arg}, .named_args = {}}}},
+        ir::FieldSpec{.alias = "m",
+                      .expr = ir::Expr{ir::CallExpr{
+                          .callee = "rolling_mean", .args = {price_arg}, .named_args = {}}}},
     });
     upd->add_child(make_source(b, "ticks.csv"));
     auto win = b.window(ir::Duration(min5_ns));

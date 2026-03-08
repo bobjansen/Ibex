@@ -74,6 +74,13 @@ body {
   box-shadow: 0 16px 40px rgba(30, 34, 36, 0.1);
 }
 
+.hero-logo {
+  display: block;
+  width: clamp(72px, 14vw, 108px);
+  height: auto;
+  margin: 0 0 0.6rem;
+}
+
 .eyebrow {
   font-size: 0.82rem;
   text-transform: uppercase;

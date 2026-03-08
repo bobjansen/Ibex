@@ -235,8 +235,10 @@ auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_
     if (a == b)
         return ValidityBitmap(*a);
     ValidityBitmap out(*a);
-    auto* out_data = out.data();
-    const auto* b_data = b->data();
+    // `out` is a fresh copy of `a`; `b` is a distinct bitmap in this path.
+    // Tell the compiler these byte ranges do not alias to aid vectorization.
+    auto* __restrict out_data = out.data();
+    const auto* __restrict b_data = b->data();
     for (std::size_t i = 0; i < n; ++i)
         out_data[i] &= b_data[i];
     return out;

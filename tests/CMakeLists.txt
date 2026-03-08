@@ -55,6 +55,10 @@ endif()
 
 catch_discover_tests(ibex_tests)
 
+if(IBEX_COVERAGE)
+    ibex_add_coverage_target(ibex_tests)
+endif()
+
 if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin)
     add_test(
         NAME ibex_parity_interpreter_vs_transpiled

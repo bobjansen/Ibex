@@ -49,6 +49,26 @@ struct Type {
 struct Param {
     std::string name;
     Type type;
+    enum class Effect : std::uint8_t {
+        Const,
+        Mutable,
+        Consume,
+    };
+    Effect effect = Effect::Const;
+};
+
+enum class EffectKind : std::uint8_t {
+    IoRead,
+    IoWrite,
+    Nondet,
+    State,
+    Blocking,
+    MayFail,
+};
+
+struct EffectSpec {
+    EffectKind kind = EffectKind::MayFail;
+    std::optional<std::string> resource;
 };
 
 struct DurationLiteral {
@@ -168,9 +188,9 @@ struct DcastClause {
     std::string pivot_column;
 };
 
-using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
-                            OrderClause, ByClause, WindowClause, ResampleClause, MeltClause,
-                            DcastClause>;
+using Clause =
+    std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
+                 OrderClause, ByClause, WindowClause, ResampleClause, MeltClause, DcastClause>;
 
 struct BlockExpr {
     ExprPtr base;
@@ -237,10 +257,11 @@ struct JoinExpr {
 /// sink_callee / sink_args — the table-consumer extern that receives each output batch;
 ///             the stream runtime prepends the output Table as the first argument.
 struct StreamExpr {
-    ExprPtr source;                  ///< source call expression (e.g. udp_recv(9001))
-    std::vector<Clause> transform;   ///< anonymous block clauses
-    std::string sink_callee;         ///< name of the sink extern fn
-    std::vector<ExprPtr> sink_args;  ///< extra scalar args for the sink (table prepended at runtime)
+    ExprPtr source;                 ///< source call expression (e.g. udp_recv(9001))
+    std::vector<Clause> transform;  ///< anonymous block clauses
+    std::string sink_callee;        ///< name of the sink extern fn
+    std::vector<ExprPtr>
+        sink_args;  ///< extra scalar args for the sink (table prepended at runtime)
 };
 
 struct Expr {
@@ -281,6 +302,7 @@ struct FunctionDecl {
     std::string name;
     std::vector<Param> params;
     Type return_type;
+    std::optional<std::vector<EffectSpec>> effects;
     std::vector<FnStmt> body;
     std::size_t start_line = 0;
     std::size_t end_line = 0;
@@ -290,6 +312,7 @@ struct ExternDecl {
     std::string name;
     std::vector<Param> params;
     Type return_type;
+    std::optional<std::vector<EffectSpec>> effects;
     std::string source_path;
     std::size_t start_line = 0;
     std::size_t end_line = 0;

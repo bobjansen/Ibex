@@ -232,9 +232,13 @@ auto merge_validity(const std::vector<bool>* a, const std::vector<bool>* b, std:
         return std::vector<bool>(*b);
     if (!b)
         return std::vector<bool>(*a);
-    std::vector<bool> out(n);
-    for (std::size_t i = 0; i < n; ++i)
-        out[i] = (*a)[i] && (*b)[i];
+    if (a == b)
+        return std::vector<bool>(*a);
+    std::vector<bool> out(*a);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!(*b)[i])
+            out[i] = false;
+    }
     return out;
 }
 

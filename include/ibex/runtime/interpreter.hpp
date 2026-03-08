@@ -5,11 +5,13 @@
 #include <ibex/ir/node.hpp>
 
 #include <expected>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 namespace ibex::runtime {
 
@@ -25,7 +27,133 @@ using ColumnValue =
     std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
                  Column<Date>, Column<Timestamp>, Column<bool>>;
 using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
-using ValidityBitmap = Column<bool>;
+
+/// Packed validity bitmap (1 bit per row): true = valid, false = null.
+/// Designed for row-validity propagation where bulk bitwise ops dominate.
+class ValidityBitmap {
+   public:
+    using word_type = std::uint64_t;
+    using size_type = std::size_t;
+
+   private:
+    static constexpr size_type kBitsPerWord = sizeof(word_type) * 8;
+
+    std::vector<word_type> words_;
+    size_type size_bits_ = 0;
+
+    static constexpr auto word_index(size_type bit) noexcept -> size_type {
+        return bit / kBitsPerWord;
+    }
+    static constexpr auto bit_offset(size_type bit) noexcept -> size_type {
+        return bit % kBitsPerWord;
+    }
+    static constexpr auto bit_mask(size_type bit) noexcept -> word_type {
+        return word_type{1} << bit_offset(bit);
+    }
+    static constexpr auto words_for_bits(size_type bits) noexcept -> size_type {
+        return (bits + kBitsPerWord - 1) / kBitsPerWord;
+    }
+    static constexpr auto low_bits_mask(size_type bits) noexcept -> word_type {
+        if (bits == 0) {
+            return word_type{0};
+        }
+        if (bits >= kBitsPerWord) {
+            return ~word_type{0};
+        }
+        return (word_type{1} << bits) - 1;
+    }
+
+    auto clear_unused_tail_bits() noexcept -> void {
+        if (words_.empty()) {
+            return;
+        }
+        const size_type rem = bit_offset(size_bits_);
+        if (rem == 0) {
+            return;
+        }
+        words_.back() &= low_bits_mask(rem);
+    }
+
+   public:
+    ValidityBitmap() = default;
+
+    explicit ValidityBitmap(size_type count, bool value = false) { assign(count, value); }
+
+    ValidityBitmap(const std::vector<bool>& values) {
+        reserve(values.size());
+        for (bool v : values) {
+            push_back(v);
+        }
+    }
+
+    ValidityBitmap(std::initializer_list<bool> init) {
+        reserve(init.size());
+        for (bool v : init) {
+            push_back(v);
+        }
+    }
+
+    [[nodiscard]] auto size() const noexcept -> size_type { return size_bits_; }
+    [[nodiscard]] auto empty() const noexcept -> bool { return size_bits_ == 0; }
+    [[nodiscard]] auto word_count() const noexcept -> size_type { return words_.size(); }
+
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool {
+        return (words_[word_index(idx)] & bit_mask(idx)) != 0;
+    }
+
+    auto set(size_type idx, bool value) noexcept -> void {
+        auto& w = words_[word_index(idx)];
+        const word_type m = bit_mask(idx);
+        if (value) {
+            w |= m;
+        } else {
+            w &= ~m;
+        }
+    }
+
+    auto push_back(bool value) -> void {
+        const size_type idx = size_bits_;
+        if (bit_offset(idx) == 0) {
+            words_.push_back(0);
+        }
+        if (value) {
+            words_.back() |= bit_mask(idx);
+        }
+        ++size_bits_;
+    }
+
+    auto reserve(size_type count_bits) -> void { words_.reserve(words_for_bits(count_bits)); }
+
+    auto resize(size_type count_bits) -> void { resize(count_bits, false); }
+
+    auto resize(size_type count_bits, bool value) -> void {
+        if (count_bits <= size_bits_) {
+            size_bits_ = count_bits;
+            words_.resize(words_for_bits(count_bits));
+            clear_unused_tail_bits();
+            return;
+        }
+
+        const size_type old_size = size_bits_;
+        const size_type new_words = words_for_bits(count_bits);
+        words_.resize(new_words, 0);
+        size_bits_ = count_bits;
+        if (value) {
+            for (size_type i = old_size; i < count_bits; ++i) {
+                set(i, true);
+            }
+        }
+    }
+
+    auto assign(size_type count_bits, bool value) -> void {
+        size_bits_ = count_bits;
+        words_.assign(words_for_bits(count_bits), value ? ~word_type{0} : word_type{0});
+        clear_unused_tail_bits();
+    }
+
+    [[nodiscard]] auto words_data() noexcept -> word_type* { return words_.data(); }
+    [[nodiscard]] auto words_data() const noexcept -> const word_type* { return words_.data(); }
+};
 
 struct ColumnEntry {
     std::string name;
@@ -49,8 +177,6 @@ struct Table {
     void add_column(std::string name, ColumnValue column);
     /// Add a column with an explicit validity bitmap (true = valid, false = null).
     void add_column(std::string name, ColumnValue column, ValidityBitmap validity);
-    /// Convenience overload for callers that still materialize std::vector<bool>.
-    void add_column(std::string name, ColumnValue column, std::vector<bool> validity);
     [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;
     [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;
     [[nodiscard]] auto find_entry(const std::string& name) const -> const ColumnEntry*;

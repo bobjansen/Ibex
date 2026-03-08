@@ -45,6 +45,13 @@ body {
   margin-bottom: 1.4rem;
 }
 
+.nav-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+}
+
 .nav-logo {
   font-size: 0.85rem;
   font-weight: 700;
@@ -58,6 +65,10 @@ body {
   font-weight: 600;
   color: var(--muted);
   text-decoration: none;
+}
+
+.nav-link.active {
+  color: var(--ink);
 }
 
 .nav-link:hover {
@@ -446,6 +457,12 @@ table.bench {
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 
 @media (max-width: 760px) {
+  .nav {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.45rem;
+  }
+
   .grid-2,
   .grid-3 {
     grid-template-columns: 1fr;

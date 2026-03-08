@@ -1356,10 +1356,10 @@ int main(int argc, char** argv) {
                 c_col.push_back(static_cast<double>((i * 7) % 1009));
                 d_col.push_back(static_cast<double>((i * 11) % 4099));
 
-                a_valid[i] = (i % 2) == 0;
-                b_valid[i] = (i % 3) != 0;
-                c_valid[i] = (i % 5) != 0;
-                d_valid[i] = (i % 7) != 0;
+                a_valid.set(i, (i % 2) == 0);
+                b_valid.set(i, (i % 3) != 0);
+                c_valid.set(i, (i % 5) != 0);
+                d_valid.set(i, (i % 7) != 0);
             }
 
             merge_table.add_column("a", std::move(a_col), std::move(a_valid));

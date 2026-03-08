@@ -79,6 +79,7 @@ body {
   width: clamp(72px, 14vw, 108px);
   height: auto;
   margin: 0 0 0.6rem;
+  float: right;
 }
 
 .eyebrow {

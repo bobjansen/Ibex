@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ibex | Function Reference</title>
-  <meta name="description" content="Ibex function reference for built-ins and bundled plugin extern functions." />
+  <meta name="description" content="Ibex function reference with plain Ibex syntax and quick explanations." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -17,6 +17,7 @@
     <span class="nav-logo">Ibex</span>
     <div class="nav-links">
       <a class="nav-link" href="./index.html">Docs</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
       <a class="nav-link active" href="./functions.html">Function reference</a>
       <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
     </div>
@@ -27,9 +28,38 @@
     <p class="eyebrow">Reference</p>
     <h1>Ibex function reference</h1>
     <p class="lead">
-      This page lists language built-ins and bundled plugin externs. User-defined
-      <code>fn</code> and custom <code>extern fn</code> are project-specific and are not listed here.
+      This page lists built-in Ibex functions and standard I/O library functions.
+      For most operations, prefer the Ibex syntax shown below (for example
+      <code>df1 join df2 on key</code>) over direct helper function calls.
     </p>
+  </section>
+
+  <section class="section">
+    <article class="card">
+      <p><strong>Quick terms:</strong> <code>DataFrame</code> means table, and <code>TimeFrame</code> means a table with a designated time column.</p>
+    </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Ibex syntax</p>
+    <h2>How you usually write these</h2>
+    <article class="card">
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>a join b on key</code></td><td>Inner join (equivalent to <code>inner_join(a, b, key)</code>).</td></tr>
+          <tr><td><code>a left join b on key</code></td><td>Left join (equivalent to <code>left_join(a, b, key)</code>).</td></tr>
+          <tr><td><code>a right join b on key</code></td><td>Right join (equivalent to <code>right_join(a, b, key)</code>).</td></tr>
+          <tr><td><code>a outer join b on key</code></td><td>Outer join (equivalent to <code>outer_join(a, b, key)</code>).</td></tr>
+          <tr><td><code>a semi join b on key</code></td><td>Semi join (equivalent to <code>semi_join(a, b, key)</code>).</td></tr>
+          <tr><td><code>a anti join b on key</code></td><td>Anti join (equivalent to <code>anti_join(a, b, key)</code>).</td></tr>
+          <tr><td><code>df[select { x = sum(col) }, by key]</code></td><td>Standard aggregate usage.</td></tr>
+          <tr><td><code>tf[window 5m, update { x = rolling_mean(price) }]</code></td><td>Typical rolling-window usage.</td></tr>
+          <tr><td><code>df[update { x = fill_forward(x) }]</code></td><td>Typical null-fill usage.</td></tr>
+          <tr><td><code>df[order key]</code></td><td>Standard ordering syntax (instead of <code>order(df, key)</code>).</td></tr>
+          <tr><td><code>import "csv"; read_csv("file.csv")</code></td><td>Typical file I/O usage.</td></tr>
+        </tbody>
+      </table>
+    </article>
   </section>
 
   <section class="section">
@@ -40,9 +70,9 @@
         <h3>Core table functions</h3>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>as_timeframe(df, "time_col")</code></td><td>Promote a DataFrame to a TimeFrame with the given time index column.</td></tr>
-            <tr><td><code>scalar(df, col)</code></td><td>Extract one scalar from a one-row DataFrame.</td></tr>
-            <tr><td><code>order(df, key1, ...)</code></td><td>Return a table ordered by one or more keys.</td></tr>
+            <tr><td><code>as_timeframe(df, "time_col")</code></td><td>Convert a table to a time-indexed table using <code>time_col</code>.</td></tr>
+            <tr><td><code>scalar(df, col)</code></td><td>Extract one value from a one-row table.</td></tr>
+            <tr><td><code>order(df, key1, ...)</code></td><td>Return a table ordered by keys. Usually written as <code>df[order key1, ...]</code>.</td></tr>
             <tr><td><code>print(value)</code></td><td>Print a human-readable value in scripts and REPL sessions.</td></tr>
           </tbody>
         </table>
@@ -51,14 +81,14 @@
         <h3>Join functions</h3>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>inner_join(left, right, key1, ...)</code></td><td>Keep rows with matching keys on both sides.</td></tr>
-            <tr><td><code>left_join(left, right, key1, ...)</code></td><td>Keep all left rows, attach right matches when present.</td></tr>
-            <tr><td><code>right_join(left, right, key1, ...)</code></td><td>Keep all right rows, attach left matches when present.</td></tr>
-            <tr><td><code>outer_join(left, right, key1, ...)</code></td><td>Keep all rows from both sides, null-fill missing matches.</td></tr>
-            <tr><td><code>semi_join(left, right, key1, ...)</code></td><td>Keep left rows that have at least one right-side match.</td></tr>
-            <tr><td><code>anti_join(left, right, key1, ...)</code></td><td>Keep left rows that have no right-side match.</td></tr>
-            <tr><td><code>cross_join(left, right)</code></td><td>Cartesian product of left and right rows.</td></tr>
-            <tr><td><code>asof_join(left, right, key1, ...)</code></td><td>Time-aware join for TimeFrames (nearest prior timestamp with key constraints).</td></tr>
+            <tr><td><code>inner_join(left, right, key1, ...)</code></td><td>Keep rows with matching keys. Ibex syntax: <code>df1 join df2 on key1</code>.</td></tr>
+            <tr><td><code>left_join(left, right, key1, ...)</code></td><td>Keep all left rows, attach right matches when present. Ibex syntax: <code>df1 left join df2 on key1</code>.</td></tr>
+            <tr><td><code>right_join(left, right, key1, ...)</code></td><td>Keep all right rows, attach left matches when present. Ibex syntax: <code>df1 right join df2 on key1</code>.</td></tr>
+            <tr><td><code>outer_join(left, right, key1, ...)</code></td><td>Keep all rows from both sides. Ibex syntax: <code>df1 outer join df2 on key1</code>.</td></tr>
+            <tr><td><code>semi_join(left, right, key1, ...)</code></td><td>Keep left rows with a right-side match. Ibex syntax: <code>df1 semi join df2 on key1</code>.</td></tr>
+            <tr><td><code>anti_join(left, right, key1, ...)</code></td><td>Keep left rows with no right-side match. Ibex syntax: <code>df1 anti join df2 on key1</code>.</td></tr>
+            <tr><td><code>cross_join(left, right)</code></td><td>Cartesian product. Ibex syntax: <code>df1 cross join df2</code>.</td></tr>
+            <tr><td><code>asof_join(left, right, key1, ...)</code></td><td>Nearest-in-time join for time-indexed tables. Ibex syntax: <code>tf1 asof join tf2 on key1</code>.</td></tr>
           </tbody>
         </table>
       </article>
@@ -71,6 +101,7 @@
     <div class="grid-2">
       <article class="card">
         <h3>Aggregate functions</h3>
+        <p>Use these inside <code>select { ... }</code> (often with <code>by</code>), e.g. <code>df[select { x = sum(col) }, by key]</code>.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>sum(col)</code></td><td>Sum of non-null values.</td></tr>
@@ -91,6 +122,7 @@
       </article>
       <article class="card">
         <h3>Window and cumulative functions</h3>
+        <p>Rolling functions are usually used with <code>window</code> on a time-indexed table; cumulative functions also work in plain <code>update</code>/<code>select</code>.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>rolling_count()</code></td><td>Row count in the active window.</td></tr>
@@ -120,17 +152,19 @@
     <div class="grid-2">
       <article class="card">
         <h3>Null and sequence functions</h3>
+        <p>Most often used in <code>update { ... }</code>, e.g. <code>df[update { x = fill_forward(x) }]</code>.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>fill_null(col, value)</code></td><td>Replace nulls in <code>col</code> with a constant <code>value</code>.</td></tr>
-            <tr><td><code>fill_forward(col)</code></td><td>Carry the last valid value forward (LOCF).</td></tr>
-            <tr><td><code>fill_backward(col)</code></td><td>Carry the next valid value backward (NOCB).</td></tr>
-            <tr><td><code>rep(x, times=1, each=1, length_out=-1)</code></td><td>Repeat/cycle a scalar or column to produce a full output column.</td></tr>
+            <tr><td><code>fill_forward(col)</code></td><td>Fill missing values using the last earlier non-missing value.</td></tr>
+            <tr><td><code>fill_backward(col)</code></td><td>Fill missing values using the next later non-missing value.</td></tr>
+            <tr><td><code>rep(x, times=1, each=1, length_out=-1)</code></td><td>Repeat or cycle a value/column to build a full output column.</td></tr>
           </tbody>
         </table>
       </article>
       <article class="card">
         <h3>Vectorized RNG functions</h3>
+        <p>Used in expressions like <code>df[update { noise = rand_normal(0.0, 1.0) }]</code>.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>rand_uniform(low, high)</code></td><td>Uniform float draws in [low, high).</td></tr>
@@ -153,6 +187,7 @@
     <div class="grid-2">
       <article class="card">
         <h3>Scalar/date functions</h3>
+        <p>Use in expressions, filters, and updates, e.g. <code>df[filter year(ts) = 2025]</code>.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>abs(x)</code></td><td>Absolute value.</td></tr>
@@ -170,6 +205,7 @@
       </article>
       <article class="card">
         <h3>Cast constructors</h3>
+        <p>These are regular call syntax in Ibex, used in expressions and updates.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>Int64(x)</code></td><td>Explicit cast to 64-bit integer.</td></tr>
@@ -184,11 +220,12 @@
   </section>
 
   <section class="section">
-    <p class="section-label">Bundled externs</p>
-    <h2>Plugin functions shipped with Ibex</h2>
+    <p class="section-label">I/O Libraries</p>
+    <h2>File and stream functions shipped with Ibex</h2>
     <div class="grid-2">
       <article class="card">
         <h3>CSV and JSON</h3>
+        <p>Typical workflow: <code>import "csv"</code> or <code>import "json"</code>, then call these directly.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>read_csv(path)</code></td><td>Load a CSV file into a DataFrame.</td></tr>
@@ -200,6 +237,7 @@
       </article>
       <article class="card">
         <h3>Parquet and stream I/O</h3>
+        <p>Use parquet for batch files; UDP/WebSocket functions are commonly used in <code>Stream { ... }</code> pipelines.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>read_parquet(path)</code></td><td>Load Apache Parquet into a DataFrame.</td></tr>

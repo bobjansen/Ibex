@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Cheat Sheet</title>
+  <meta name="description" content="Quick Ibex syntax overview and cheat sheet." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Docs</a>
+      <a class="nav-link active" href="./cheatsheet.html">Cheat sheet</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">Quick overview</p>
+    <h1>Ibex cheat sheet</h1>
+    <p class="lead">
+      Practical syntax-first reference for day-to-day Ibex usage.
+      Use this as a quick lookup; see the full docs for deeper semantics.
+    </p>
+  </section>
+
+  <section class="section">
+    <article class="card">
+      <p><strong>Quick terms:</strong> <code>DataFrame</code> means table, <code>TimeFrame</code> means table + time column, and <code>[ ... ]</code> contains query steps like <code>filter</code>, <code>update</code>, and <code>select</code>.</p>
+    </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Start here</p>
+    <h2>Program skeleton</h2>
+<pre><code><span class="cm">// Load file/stream library functions (optional)</span>
+<span class="kw">import</span> <span class="str">"csv"</span>;
+
+<span class="cm">// Read data</span>
+<span class="kw">let</span> df = <span class="fn-name">read_csv</span>(<span class="str">"data.csv"</span>);
+
+<span class="cm">// Transform</span>
+<span class="kw">let</span> out = df[
+    <span class="kw">filter</span> price &gt; <span class="num">0</span>,
+    <span class="kw">update</span> { value = price * qty }
+][
+    <span class="kw">select</span> { total = <span class="fn-name">sum</span>(value) }, <span class="kw">by</span> symbol
+];
+
+<span class="cm">// Save</span>
+<span class="fn-name">write_csv</span>(out, <span class="str">"out.csv"</span>);</code></pre>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Core syntax</p>
+    <h2>Most-used query patterns</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Filter, select, update</h3>
+<pre><code>df[<span class="kw">filter</span> x &gt; <span class="num">10</span>];
+df[<span class="kw">select</span> { a, b, c }];
+df[<span class="kw">update</span> { z = x + y }];
+df[<span class="kw">rename</span> new_x = x];
+df[<span class="kw">order</span> ts, symbol];
+df[<span class="kw">distinct</span>];</code></pre>
+      </article>
+      <article class="card">
+        <h3>Grouped aggregate / update</h3>
+<pre><code><span class="cm">// one row per group</span>
+df[<span class="kw">select</span> { m = <span class="fn-name">mean</span>(x), n = <span class="fn-name">count</span>() },
+   <span class="kw">by</span> symbol];
+
+<span class="cm">// broadcast group metric to rows</span>
+df[<span class="kw">update</span> { gmean = <span class="fn-name">mean</span>(x) }, <span class="kw">by</span> symbol];</code></pre>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Join syntax</p>
+    <h2>Write joins in Ibex syntax</h2>
+    <article class="card">
+<pre><code>df1 <span class="kw">join</span> df2 <span class="kw">on</span> key;
+df1 <span class="kw">left join</span> df2 <span class="kw">on</span> key;
+df1 <span class="kw">right join</span> df2 <span class="kw">on</span> key;
+df1 <span class="kw">outer join</span> df2 <span class="kw">on</span> key;
+df1 <span class="kw">semi join</span> df2 <span class="kw">on</span> key;
+df1 <span class="kw">anti join</span> df2 <span class="kw">on</span> key;
+df1 <span class="kw">cross join</span> df2;
+
+<span class="cm">// multi-key</span>
+df1 <span class="kw">join</span> df2 <span class="kw">on</span> { k1, k2 };</code></pre>
+    </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Time series</p>
+    <h2>Time-indexed tables, windows, and resample</h2>
+    <div class="grid-2">
+      <article class="card">
+<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+
+tf[<span class="kw">window</span> <span class="num">1m</span>, <span class="kw">update</span> {
+    rsum = <span class="fn-name">rolling_sum</span>(price),
+    rmean = <span class="fn-name">rolling_mean</span>(price),
+    prev = <span class="fn-name">lag</span>(price, <span class="num">1</span>)
+}];</code></pre>
+      </article>
+      <article class="card">
+<pre><code><span class="cm">// bucketed aggregates</span>
+tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+    open  = <span class="fn-name">first</span>(price),
+    high  = <span class="fn-name">max</span>(price),
+    low   = <span class="fn-name">min</span>(price),
+    close = <span class="fn-name">last</span>(price)
+}, <span class="kw">by</span> symbol];</code></pre>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Common functions</p>
+    <h2>Quick lookup</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Aggregates</h3>
+        <p><code>sum mean min max count first last median std ewma quantile skew kurtosis</code></p>
+        <h3 style="margin-top:0.8rem;">Null handling</h3>
+        <p><code>fill_null fill_forward fill_backward</code></p>
+        <h3 style="margin-top:0.8rem;">Cumulative</h3>
+        <p><code>cumsum cumprod</code></p>
+      </article>
+      <article class="card">
+        <h3>Scalar/date/casts</h3>
+        <p><code>abs log sqrt year month day hour minute second round</code></p>
+        <p><code>Int64 Int32 Int Float64 Float32</code></p>
+        <h3 style="margin-top:0.8rem;">RNG</h3>
+        <p><code>rand_uniform rand_normal rand_student_t rand_gamma rand_exponential rand_bernoulli rand_poisson rand_int</code></p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">I/O and streams</p>
+    <h2>Plugin and Stream basics</h2>
+    <div class="grid-2">
+      <article class="card">
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"json"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
+
+<span class="kw">let</span> df = <span class="fn-name">read_csv</span>(<span class="str">"in.csv"</span>);
+<span class="fn-name">write_parquet</span>(df, <span class="str">"out.parquet"</span>);</code></pre>
+      </article>
+      <article class="card">
+<pre><code><span class="kw">import</span> <span class="str">"udp"</span>;
+
+<span class="kw">let</span> s = Stream {
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
+    transform = [<span class="kw">filter</span> price &gt; <span class="num">0</span>],
+    sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
+};</code></pre>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Tooling</p>
+    <h2>Run and compile</h2>
+<pre><code><span class="cm"># REPL</span>
+./build-release/tools/ibex --plugin-path ./build-release/libraries
+
+<span class="cm"># Run a script (build + execute)</span>
+scripts/ibex-run.sh examples/quant.ibex
+
+<span class="cm"># Transpile only</span>
+scripts/ibex-build.sh examples/quant.ibex -o quant</code></pre>
+  </section>
+
+  <footer class="footer">
+    <span>Ibex - typed DataFrame pipelines</span>
+    <a href="./index.html">Back to docs</a>
+  </footer>
+
+</main>
+</body>
+</html>

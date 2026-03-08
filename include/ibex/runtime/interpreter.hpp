@@ -25,13 +25,14 @@ using ColumnValue =
     std::variant<Column<std::int64_t>, Column<double>, Column<std::string>, Column<Categorical>,
                  Column<Date>, Column<Timestamp>, Column<bool>>;
 using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
+using ValidityBitmap = Column<bool>;
 
 struct ColumnEntry {
     std::string name;
     std::shared_ptr<ColumnValue> column;
     // Validity bitmap: true = valid (not null), false = null.
     // nullopt means every row is valid — the common case, with zero overhead.
-    std::optional<std::vector<bool>> validity;
+    std::optional<ValidityBitmap> validity;
 };
 
 /// Returns true if row `row` of `entry` is null.
@@ -47,6 +48,8 @@ struct Table {
 
     void add_column(std::string name, ColumnValue column);
     /// Add a column with an explicit validity bitmap (true = valid, false = null).
+    void add_column(std::string name, ColumnValue column, ValidityBitmap validity);
+    /// Convenience overload for callers that still materialize std::vector<bool>.
     void add_column(std::string name, ColumnValue column, std::vector<bool> validity);
     [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;
     [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;

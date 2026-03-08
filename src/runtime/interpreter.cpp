@@ -183,7 +183,7 @@ struct Mask {
     std::vector<uint8_t> value;
     std::optional<std::vector<uint8_t>> valid;  // nullopt = all rows valid
 
-    void apply_validity(const std::vector<bool>* v, std::size_t n) {
+    void apply_validity(const ValidityBitmap* v, std::size_t n) {
         if (v == nullptr)
             return;
         valid.emplace(n, uint8_t{1});
@@ -196,13 +196,13 @@ struct Mask {
 // plus optional validity tracking for null propagation.
 struct ColResult {
     std::variant<const ColumnValue*, ColumnValue> data;
-    const std::vector<bool>* validity = nullptr;      // source column validity (no-copy)
-    std::optional<std::vector<bool>> owned_validity;  // for computed expressions
+    const ValidityBitmap* validity = nullptr;      // source column validity (no-copy)
+    std::optional<ValidityBitmap> owned_validity;  // for computed expressions
 
     explicit ColResult(const ColumnValue* p) : data(p) {}
     explicit ColResult(ColumnValue v) : data(std::move(v)) {}
 
-    [[nodiscard]] const std::vector<bool>* get_validity() const noexcept {
+    [[nodiscard]] const ValidityBitmap* get_validity() const noexcept {
         return owned_validity ? &*owned_validity : validity;
     }
 };
@@ -224,30 +224,30 @@ auto deref_col(const ColResult& r) -> const ColumnValue& {
 auto deref_col(ColResult&&) -> const ColumnValue& = delete;
 auto deref_col(const ColResult&&) -> const ColumnValue& = delete;
 
-auto merge_validity(const std::vector<bool>* a, const std::vector<bool>* b, std::size_t n)
-    -> std::optional<std::vector<bool>> {
+auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
+    -> std::optional<ValidityBitmap> {
     if (!a && !b)
         return std::nullopt;
     if (!a)
-        return std::vector<bool>(*b);
+        return ValidityBitmap(*b);
     if (!b)
-        return std::vector<bool>(*a);
+        return ValidityBitmap(*a);
     if (a == b)
-        return std::vector<bool>(*a);
-    std::vector<bool> out(*a);
-    for (std::size_t i = 0; i < n; ++i) {
-        if (!(*b)[i])
-            out[i] = false;
-    }
+        return ValidityBitmap(*a);
+    ValidityBitmap out(*a);
+    auto* out_data = out.data();
+    const auto* b_data = b->data();
+    for (std::size_t i = 0; i < n; ++i)
+        out_data[i] &= b_data[i];
     return out;
 }
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
 // Returns nullopt if no referenced column has a validity bitmap.
 auto collect_expr_validity(const ir::Expr& expr, const Table& table, std::size_t n)
-    -> std::optional<std::vector<bool>> {
-    std::optional<std::vector<bool>> result;
-    auto merge_in = [&](const std::vector<bool>* v) {
+    -> std::optional<ValidityBitmap> {
+    std::optional<ValidityBitmap> result;
+    auto merge_in = [&](const ValidityBitmap* v) {
         if (!v)
             return;
         result = merge_validity(result ? &*result : nullptr, v, n);
@@ -407,7 +407,7 @@ template <typename T>
 constexpr bool is_string_like_v =
     std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>;
 auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit, std::size_t n,
-                        const std::vector<bool>* validity = nullptr)
+                        const ValidityBitmap* validity = nullptr)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
@@ -752,7 +752,7 @@ auto cmp_into(ir::CompareOp op, const L* __restrict__ lp, const R* __restrict__ 
 
 // Dispatch column-vs-column comparison over all type combinations.
 auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n,
-                 const std::vector<bool>* lv = nullptr, const std::vector<bool>* rv = nullptr)
+                 const ValidityBitmap* lv = nullptr, const ValidityBitmap* rv = nullptr)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
@@ -2857,7 +2857,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         agg_columns.push_back(entry->column.get());
     }
 
-    std::vector<const std::vector<bool>*> agg_validity;
+    std::vector<const ValidityBitmap*> agg_validity;
     agg_validity.reserve(aggregations.size());
     bool has_nullable_agg_inputs = false;
     for (const auto* entry : agg_entries) {
@@ -5278,7 +5278,7 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
 
 struct FillResult {
     ColumnValue column;
-    std::optional<std::vector<bool>> validity;  // nullopt = all rows valid
+    std::optional<ValidityBitmap> validity;  // nullopt = all rows valid
 };
 
 // fill_null(col, value): replace every null cell with the scalar `value`.
@@ -5388,7 +5388,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
             using T = typename ColT::value_type;
             ColT result;
             result.reserve(rows);
-            std::optional<std::vector<bool>> out_validity;
+            std::optional<ValidityBitmap> out_validity;
 
             // carry: last seen valid value (safe for string_view: points into source col).
             T carry{};
@@ -5447,7 +5447,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
             // Scan right-to-left to compute (value, valid) for each row,
             // storing in plain vectors so we can then push_back into ColT.
             std::vector<T> vals(rows);
-            std::optional<std::vector<bool>> out_validity;
+            std::optional<ValidityBitmap> out_validity;
 
             bool have_val = false;
             T next_val{};
@@ -6709,7 +6709,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
         const auto& entry = input.columns[id_idx];
         auto col = make_empty_like(*entry.column);
         std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
-        std::optional<std::vector<bool>> validity;
+        std::optional<ValidityBitmap> validity;
         if (entry.validity.has_value()) {
             validity.emplace();
             validity->reserve(out_rows);
@@ -6741,7 +6741,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
     // "value" column: gather values from each measure column.
     auto value_col = make_empty_like(*input.columns[measure_indices[0]].column);
     std::visit([out_rows](auto& c) { c.reserve(out_rows); }, value_col);
-    std::optional<std::vector<bool>> value_validity;
+    std::optional<ValidityBitmap> value_validity;
 
     for (std::size_t r = 0; r < rows; ++r) {
         for (std::size_t mi = 0; mi < n_measures; ++mi) {
@@ -7293,8 +7293,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         bool null = is_null(src.columns[col], row);
                         if (null) {
                             if (!dst.columns[col].validity.has_value()) {
-                                dst.columns[col].validity = std::vector<bool>(
-                                    column_size(*dst.columns[col].column) - 1, true);
+                                dst.columns[col].validity =
+                                    ValidityBitmap(column_size(*dst.columns[col].column) - 1, true);
                             }
                             dst.columns[col].validity->push_back(false);
                         } else if (dst.columns[col].validity.has_value()) {
@@ -7316,7 +7316,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     out.index[entry.name] = out.columns.size() - 1;
                     append_value(*out.columns.back().column, *entry.column, r);
                     if (is_null(entry, r)) {
-                        out.columns.back().validity = std::vector<bool>{false};
+                        out.columns.back().validity = ValidityBitmap(std::vector<bool>{false});
                     }
                 }
                 out.time_index = src.time_index;
@@ -7553,7 +7553,7 @@ void Table::add_column(std::string name, ColumnValue column) {
     index[columns.back().name] = pos;
 }
 
-void Table::add_column(std::string name, ColumnValue column, std::vector<bool> validity) {
+void Table::add_column(std::string name, ColumnValue column, ValidityBitmap validity) {
     if (auto it = index.find(name); it != index.end()) {
         columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
         columns[it->second].validity = std::move(validity);
@@ -7564,6 +7564,10 @@ void Table::add_column(std::string name, ColumnValue column, std::vector<bool> v
                                   .column = std::make_shared<ColumnValue>(std::move(column)),
                                   .validity = std::move(validity)});
     index[columns.back().name] = pos;
+}
+
+void Table::add_column(std::string name, ColumnValue column, std::vector<bool> validity) {
+    add_column(std::move(name), std::move(column), ValidityBitmap(validity));
 }
 
 auto Table::find_entry(const std::string& name) const -> const ColumnEntry* {

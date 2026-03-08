@@ -32,6 +32,8 @@ Options:
   --repeats <N>             Repeats per side; report median (default: 3)
   --taskset <cpuset>        Pin benchmark runs with taskset -c
   --numa-node <N>           Pin benchmark runs with numactl node/memory bind
+  --ibex-suite <name,...>   Pass suite selection to bench_ibex.sh/ibex_bench
+  --merge-validity-rows <N> Row count for merge_validity micro benchmark
   --csv <path>              prices.csv path
   --csv-multi <path>        prices_multi.csv path
   --csv-trades <path>       trades.csv path
@@ -56,6 +58,8 @@ REPEATS=3
 KEEP_TEMP=0
 TASKSET_CPUSET=""
 NUMA_NODE=""
+IBEX_SUITE=""
+MERGE_VALIDITY_ROWS=""
 
 CSV="$REPO_ROOT/benchmarking/data/prices.csv"
 CSV_MULTI="$REPO_ROOT/benchmarking/data/prices_multi.csv"
@@ -72,6 +76,8 @@ while [[ $# -gt 0 ]]; do
         --repeats) REPEATS="$2"; shift 2 ;;
         --taskset) TASKSET_CPUSET="$2"; shift 2 ;;
         --numa-node) NUMA_NODE="$2"; shift 2 ;;
+        --ibex-suite) IBEX_SUITE="$2"; shift 2 ;;
+        --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
         --csv) CSV="$2"; shift 2 ;;
         --csv-multi) CSV_MULTI="$2"; shift 2 ;;
         --csv-trades) CSV_TRADES="$2"; shift 2 ;;
@@ -83,10 +89,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ ! -f "$CSV" ]]; then
-    echo "error: CSV not found: $CSV" >&2
-    exit 1
-fi
 if [[ ! "$WARMUP" =~ ^[0-9]+$ ]]; then
     echo "error: --warmup must be a non-negative integer" >&2
     exit 1
@@ -99,12 +101,35 @@ if [[ ! "$REPEATS" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: --repeats must be a positive integer" >&2
     exit 1
 fi
+if [[ -n "$MERGE_VALIDITY_ROWS" && ! "$MERGE_VALIDITY_ROWS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: --merge-validity-rows must be a positive integer" >&2
+    exit 1
+fi
 if [[ -n "$TASKSET_CPUSET" ]] && ! command -v taskset >/dev/null 2>&1; then
     echo "error: taskset not found but --taskset was provided" >&2
     exit 1
 fi
 if [[ -n "$NUMA_NODE" ]] && ! command -v numactl >/dev/null 2>&1; then
     echo "error: numactl not found but --numa-node was provided" >&2
+    exit 1
+fi
+
+NEEDS_CSV=1
+if [[ -n "$IBEX_SUITE" ]]; then
+    NEEDS_CSV=0
+    IFS=',' read -r -a SUITE_TOKENS <<< "$IBEX_SUITE"
+    for tok in "${SUITE_TOKENS[@]}"; do
+        tok="${tok//[[:space:]]/}"
+        tok="${tok,,}"
+        tok="${tok//-/_}"
+        if [[ "$tok" != "merge_validity" ]]; then
+            NEEDS_CSV=1
+            break
+        fi
+    done
+fi
+if [[ "$NEEDS_CSV" -eq 1 && ! -f "$CSV" ]]; then
+    echo "error: CSV not found: $CSV" >&2
     exit 1
 fi
 
@@ -201,11 +226,13 @@ run_bench_once() {
     local log_file="$4"
 
     local args=(
-        --csv "$CSV"
         --warmup "$WARMUP"
         --iters "$ITERS"
         --out "$out_tsv"
     )
+    [[ "$NEEDS_CSV" -eq 1 ]] && args+=(--csv "$CSV")
+    [[ -n "$IBEX_SUITE" ]] && args+=(--suite "$IBEX_SUITE")
+    [[ -n "$MERGE_VALIDITY_ROWS" ]] && args+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
     [[ -f "$CSV_MULTI" ]] && args+=(--csv-multi "$CSV_MULTI")
     [[ -f "$CSV_TRADES" ]] && args+=(--csv-trades "$CSV_TRADES")
     [[ -f "$CSV_EVENTS" ]] && args+=(--csv-events "$CSV_EVENTS")
@@ -295,6 +322,10 @@ echo "Benchmarking base:   $BASE_LABEL" >&2
 echo "Benchmarking target: $TARGET_LABEL" >&2
 echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS" >&2
 echo "Pinning: $PIN_DESC" >&2
+echo "Ibex suite: ${IBEX_SUITE:-all}" >&2
+if [[ -n "$MERGE_VALIDITY_ROWS" ]]; then
+    echo "merge_validity rows: $MERGE_VALIDITY_ROWS" >&2
+fi
 
 run_repeated_bench_and_aggregate "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_TSV" "$BASE_LOG"
 run_repeated_bench_and_aggregate "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_TSV" "$TARGET_LOG"

@@ -6,6 +6,7 @@
 #include <fmt/core.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <csv.hpp>
@@ -34,6 +35,16 @@ auto normalize_input(std::string_view input) -> std::string {
         normalized.push_back(';');
     }
     return normalized;
+}
+
+auto normalize_suite_name(std::string name) -> std::string {
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
+        if (ch == '-') {
+            return '_';
+        }
+        return static_cast<char>(std::tolower(ch));
+    });
+    return name;
 }
 
 struct BenchQuery {
@@ -805,6 +816,8 @@ int main(int argc, char** argv) {
     bool verify = false;
     std::size_t verify_rows = 10000;
     std::size_t timeframe_rows = 0;
+    std::size_t merge_validity_rows = 4'000'000;
+    std::vector<std::string> suites;
 
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
     app.add_option("--csv-multi", csv_multi_path,
@@ -835,8 +848,42 @@ int main(int argc, char** argv) {
            "--timeframe-rows", timeframe_rows,
            "Row count for in-memory TimeFrame benchmarks (lag, rolling_*). 0 = skip (default).")
         ->check(CLI::NonNegativeNumber);
+    app.add_option("--merge-validity-rows", merge_validity_rows,
+                   "Row count for merge_validity micro benchmark (default: 4000000)")
+        ->check(CLI::PositiveNumber);
+    app.add_option("--suite", suites,
+                   "Benchmark suite(s) to run (comma-separated or repeated). "
+                   "Supported: all, core, cumulative, rng, fill, null, filter, multi, "
+                   "events, reshape, timeframe, merge_validity")
+        ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
+
+    std::unordered_set<std::string> selected_suites;
+    const std::unordered_set<std::string> allowed_suites = {
+        "all",    "core",  "cumulative", "rng",     "fill",      "null",
+        "filter", "multi", "events",     "reshape", "timeframe", "merge_validity"};
+    for (const auto& token : suites) {
+        auto normalized = normalize_suite_name(token);
+        if (!allowed_suites.contains(normalized)) {
+            fmt::print("error: unknown suite '{}'\n", token);
+            return 1;
+        }
+        selected_suites.insert(std::move(normalized));
+    }
+    if (selected_suites.empty()) {
+        selected_suites.insert("all");
+    }
+    auto run_suite = [&](std::string_view suite) -> bool {
+        if (selected_suites.contains(std::string(suite))) {
+            return true;
+        }
+        if (!selected_suites.contains("all")) {
+            return false;
+        }
+        // Keep legacy --suite all behavior stable; micro suites are opt-in.
+        return suite != "merge_validity";
+    };
 
     int status = 0;
     bool saved_include_parse = include_parse;
@@ -890,24 +937,27 @@ int main(int argc, char** argv) {
 
         // The first three queries benchmark pure execution (use --no-include-parse for isolation).
         // The last three use default include_parse to measure parsing cost.
-        for (std::size_t qi = 0; qi < queries.size(); ++qi) {
-            // parse_* queries always include parsing in the timing
-            bool this_include_parse = (qi >= 3) ? true : saved_include_parse;
-            if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
-                if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
-                    fmt::print("error: verify failed for {}: {}\n", queries[qi].name, *err);
-                    return 1;
+        if (run_suite("core")) {
+            for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+                // parse_* queries always include parsing in the timing
+                bool this_include_parse = (qi >= 3) ? true : saved_include_parse;
+                if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
+                    if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", queries[qi].name, *err);
+                        return 1;
+                    }
                 }
-            }
-            status = run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
-            if (status != 0) {
-                break;
+                status =
+                    run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
+                if (status != 0) {
+                    break;
+                }
             }
         }
 
         // Cumulative function benchmarks: cumsum and cumprod on a 4M-row price
         // column. No grouping — exercises the simple scan-and-accumulate path.
-        if (status == 0) {
+        if (status == 0 && run_suite("cumulative")) {
             fmt::print("\n-- Cumulative function benchmarks ({} prices rows) --\n",
                        tables.at("prices").rows());
             std::vector<BenchQuery> cumulative_queries = {
@@ -924,7 +974,7 @@ int main(int argc, char** argv) {
 
         // Vectorized RNG benchmarks: rand_uniform and rand_normal appended as a
         // new column. Measures the column-at-a-time PRNG throughput.
-        if (status == 0) {
+        if (status == 0 && run_suite("rng")) {
             fmt::print("\n-- RNG benchmarks ({} prices rows) --\n", tables.at("prices").rows());
             std::vector<BenchQuery> rng_queries = {
                 {"rand_uniform", "prices[update { r = rand_uniform(0.0, 1.0) }]"},
@@ -941,7 +991,7 @@ int main(int argc, char** argv) {
         // Fill benchmarks: fill_null, fill_forward (LOCF), fill_backward (NOCB).
         // Uses an in-memory table with alternating valid / null doubles (~50% null).
         // Row count matches the prices table to keep wall-clock times comparable.
-        if (status == 0) {
+        if (status == 0 && run_suite("fill")) {
             std::size_t fill_rows = tables.at("prices").rows();
             ibex::runtime::Table fill_table;
             {
@@ -976,7 +1026,7 @@ int main(int argc, char** argv) {
         // Null benchmarks: left join produces ~50% null right-column values.
         // lookup.csv has half the symbols (first 126 of 252); the other half
         // get null sector values. This exercises validity-bitmap tracking.
-        if (status == 0 && !csv_lookup_path.empty()) {
+        if (status == 0 && run_suite("null") && !csv_lookup_path.empty()) {
             ibex::runtime::Table lookup_table;
             try {
                 lookup_table = read_csv(csv_lookup_path);
@@ -1046,7 +1096,7 @@ int main(int argc, char** argv) {
     }
 
     // Compound filter benchmarks: exercises the recursive FilterExpr evaluator.
-    if (status == 0 && !csv_trades_path.empty()) {
+    if (status == 0 && run_suite("filter") && !csv_trades_path.empty()) {
         ibex::runtime::Table trades_table;
         try {
             trades_table = read_csv(csv_trades_path);
@@ -1087,7 +1137,7 @@ int main(int argc, char** argv) {
     }
 
     // Multi-column group-by: exercises the compound-key fallback path (std::unordered_map<Key>).
-    if (status == 0 && !csv_multi_path.empty()) {
+    if (status == 0 && run_suite("multi") && !csv_multi_path.empty()) {
         ibex::runtime::Table multi_table;
         try {
             multi_table = read_csv(csv_multi_path);
@@ -1139,7 +1189,7 @@ int main(int argc, char** argv) {
     //                   large for L2, revealing the parallelism gap vs polars.
     //   filter_events — gather copies 2M SSO std::string objects; polars copies
     //                   Arrow offset pairs (8 bytes each, done in parallel).
-    if (status == 0 && !csv_events_path.empty()) {
+    if (status == 0 && run_suite("events") && !csv_events_path.empty()) {
         ibex::runtime::Table events_table;
         try {
             events_table = read_csv(csv_events_path);
@@ -1171,7 +1221,7 @@ int main(int argc, char** argv) {
     // Uses prices_multi to build a wide OHLC table via aggregation, then
     // melts it and dcasts it back. This exercises the reshape interpreter paths
     // on a realistic (252 symbols × 4 days = 1008 rows, 4 measure columns) table.
-    if (status == 0 && !csv_multi_path.empty()) {
+    if (status == 0 && run_suite("reshape") && !csv_multi_path.empty()) {
         ibex::runtime::Table multi_table;
         try {
             multi_table = read_csv(csv_multi_path);
@@ -1237,6 +1287,67 @@ int main(int argc, char** argv) {
         }
     }
 
+    // merge_validity micro benchmark: isolates validity bitmap merge cost in
+    // arithmetic expression evaluation on nullable columns.
+    if (status == 0 && run_suite("merge_validity")) {
+        ibex::runtime::Table merge_table;
+        {
+            ibex::Column<double> a_col;
+            ibex::Column<double> b_col;
+            ibex::Column<double> c_col;
+            ibex::Column<double> d_col;
+            std::vector<bool> a_valid;
+            std::vector<bool> b_valid;
+            std::vector<bool> c_valid;
+            std::vector<bool> d_valid;
+
+            a_col.reserve(merge_validity_rows);
+            b_col.reserve(merge_validity_rows);
+            c_col.reserve(merge_validity_rows);
+            d_col.reserve(merge_validity_rows);
+            a_valid.reserve(merge_validity_rows);
+            b_valid.reserve(merge_validity_rows);
+            c_valid.reserve(merge_validity_rows);
+            d_valid.reserve(merge_validity_rows);
+
+            for (std::size_t i = 0; i < merge_validity_rows; ++i) {
+                a_col.push_back(static_cast<double>(i % 251));
+                b_col.push_back(static_cast<double>((i * 3) % 997));
+                c_col.push_back(static_cast<double>((i * 7) % 1009));
+                d_col.push_back(static_cast<double>((i * 11) % 4099));
+
+                a_valid.push_back((i % 2) == 0);
+                b_valid.push_back((i % 3) != 0);
+                c_valid.push_back((i % 5) != 0);
+                d_valid.push_back((i % 7) != 0);
+            }
+
+            merge_table.add_column("a", std::move(a_col), std::move(a_valid));
+            merge_table.add_column("b", std::move(b_col), std::move(b_valid));
+            merge_table.add_column("c", std::move(c_col), std::move(c_valid));
+            merge_table.add_column("d", std::move(d_col), std::move(d_valid));
+        }
+
+        ibex::runtime::TableRegistry merge_tables;
+        merge_tables.emplace("merge_data", std::move(merge_table));
+        if (print_types) {
+            print_table_types("merge_data", merge_tables.find("merge_data")->second);
+        }
+
+        fmt::print("\n-- merge_validity micro benchmarks ({} rows) --\n", merge_validity_rows);
+        std::vector<BenchQuery> merge_queries = {
+            {"merge_validity_pair", "merge_data[update { out = a + b }]"},
+            {"merge_validity_chain8",
+             "merge_data[update { out = ((a + b) + (c + d)) + ((a + c) + (b + d)) }]"},
+        };
+        for (const auto& query : merge_queries) {
+            status = run_benchmark(query, merge_tables, warmup_iters, iters, saved_include_parse);
+            if (status != 0) {
+                break;
+            }
+        }
+    }
+
     // TimeFrame benchmarks: synthetic in-memory data, no CSV required.
     // Pass --timeframe-rows N (e.g. 1000000) to enable.
     //
@@ -1247,7 +1358,7 @@ int main(int argc, char** argv) {
     // Window sizes and expected work per row:
     //   1m  (60 s)  → ~60 rows in window
     //   5m (300 s)  → ~300 rows in window
-    if (status == 0 && timeframe_rows > 0) {
+    if (status == 0 && run_suite("timeframe") && timeframe_rows > 0) {
         ibex::runtime::Table tf_table;
         {
             ibex::Column<ibex::Timestamp> ts_col;

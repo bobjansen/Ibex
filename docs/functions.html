@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Function Reference</title>
+  <meta name="description" content="Ibex function reference for built-ins and bundled plugin extern functions." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Docs</a>
+      <a class="nav-link active" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">Reference</p>
+    <h1>Ibex function reference</h1>
+    <p class="lead">
+      This page lists language built-ins and bundled plugin externs. User-defined
+      <code>fn</code> and custom <code>extern fn</code> are project-specific and are not listed here.
+    </p>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Core</p>
+    <h2>Table and join functions</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Core table functions</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>as_timeframe(df, "time_col")</code></td><td>Promote a DataFrame to a TimeFrame with the given time index column.</td></tr>
+            <tr><td><code>scalar(df, col)</code></td><td>Extract one scalar from a one-row DataFrame.</td></tr>
+            <tr><td><code>order(df, key1, ...)</code></td><td>Return a table ordered by one or more keys.</td></tr>
+            <tr><td><code>print(value)</code></td><td>Print a human-readable value in scripts and REPL sessions.</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="card">
+        <h3>Join functions</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>inner_join(left, right, key1, ...)</code></td><td>Keep rows with matching keys on both sides.</td></tr>
+            <tr><td><code>left_join(left, right, key1, ...)</code></td><td>Keep all left rows, attach right matches when present.</td></tr>
+            <tr><td><code>right_join(left, right, key1, ...)</code></td><td>Keep all right rows, attach left matches when present.</td></tr>
+            <tr><td><code>outer_join(left, right, key1, ...)</code></td><td>Keep all rows from both sides, null-fill missing matches.</td></tr>
+            <tr><td><code>semi_join(left, right, key1, ...)</code></td><td>Keep left rows that have at least one right-side match.</td></tr>
+            <tr><td><code>anti_join(left, right, key1, ...)</code></td><td>Keep left rows that have no right-side match.</td></tr>
+            <tr><td><code>cross_join(left, right)</code></td><td>Cartesian product of left and right rows.</td></tr>
+            <tr><td><code>asof_join(left, right, key1, ...)</code></td><td>Time-aware join for TimeFrames (nearest prior timestamp with key constraints).</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Analytics</p>
+    <h2>Aggregates and time functions</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Aggregate functions</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>sum(col)</code></td><td>Sum of non-null values.</td></tr>
+            <tr><td><code>mean(col)</code></td><td>Arithmetic mean of non-null values.</td></tr>
+            <tr><td><code>min(col)</code></td><td>Minimum non-null value.</td></tr>
+            <tr><td><code>max(col)</code></td><td>Maximum non-null value.</td></tr>
+            <tr><td><code>count()</code></td><td>Row count for the current group/window.</td></tr>
+            <tr><td><code>first(col)</code></td><td>First non-null value in order.</td></tr>
+            <tr><td><code>last(col)</code></td><td>Last non-null value in order.</td></tr>
+            <tr><td><code>median(col)</code></td><td>Median of non-null values.</td></tr>
+            <tr><td><code>std(col)</code></td><td>Sample standard deviation (n-1 denominator).</td></tr>
+            <tr><td><code>ewma(col, alpha)</code></td><td>Exponentially weighted moving average.</td></tr>
+            <tr><td><code>quantile(col, p)</code></td><td>p-quantile with linear interpolation.</td></tr>
+            <tr><td><code>skew(col)</code></td><td>Sample skewness.</td></tr>
+            <tr><td><code>kurtosis(col)</code></td><td>Sample excess kurtosis.</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="card">
+        <h3>Window and cumulative functions</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>rolling_count()</code></td><td>Row count in the active window.</td></tr>
+            <tr><td><code>rolling_sum(col)</code></td><td>Rolling sum over the active window.</td></tr>
+            <tr><td><code>rolling_mean(col)</code></td><td>Rolling mean over the active window.</td></tr>
+            <tr><td><code>rolling_min(col)</code></td><td>Rolling minimum over the active window.</td></tr>
+            <tr><td><code>rolling_max(col)</code></td><td>Rolling maximum over the active window.</td></tr>
+            <tr><td><code>rolling_median(col)</code></td><td>Rolling median over the active window.</td></tr>
+            <tr><td><code>rolling_std(col)</code></td><td>Rolling sample standard deviation.</td></tr>
+            <tr><td><code>rolling_ewma(col, alpha)</code></td><td>Rolling EWMA within each window.</td></tr>
+            <tr><td><code>rolling_quantile(col, p)</code></td><td>Rolling quantile within each window.</td></tr>
+            <tr><td><code>rolling_skew(col)</code></td><td>Rolling sample skewness.</td></tr>
+            <tr><td><code>rolling_kurtosis(col)</code></td><td>Rolling sample excess kurtosis.</td></tr>
+            <tr><td><code>lag(col, n)</code></td><td>Shift backward by <code>n</code> rows (previous values).</td></tr>
+            <tr><td><code>lead(col, n)</code></td><td>Shift forward by <code>n</code> rows (next values).</td></tr>
+            <tr><td><code>cumsum(col)</code></td><td>Prefix sum, one output per row.</td></tr>
+            <tr><td><code>cumprod(col)</code></td><td>Prefix product, one output per row.</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Transforms</p>
+    <h2>Missing data, sequence, and randomness</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Null and sequence functions</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>fill_null(col, value)</code></td><td>Replace nulls in <code>col</code> with a constant <code>value</code>.</td></tr>
+            <tr><td><code>fill_forward(col)</code></td><td>Carry the last valid value forward (LOCF).</td></tr>
+            <tr><td><code>fill_backward(col)</code></td><td>Carry the next valid value backward (NOCB).</td></tr>
+            <tr><td><code>rep(x, times=1, each=1, length_out=-1)</code></td><td>Repeat/cycle a scalar or column to produce a full output column.</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="card">
+        <h3>Vectorized RNG functions</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>rand_uniform(low, high)</code></td><td>Uniform float draws in [low, high).</td></tr>
+            <tr><td><code>rand_normal(mean, stddev)</code></td><td>Normal-distributed float draws.</td></tr>
+            <tr><td><code>rand_student_t(df)</code></td><td>Student-t float draws with <code>df</code> degrees of freedom.</td></tr>
+            <tr><td><code>rand_gamma(shape, scale)</code></td><td>Gamma-distributed float draws.</td></tr>
+            <tr><td><code>rand_exponential(lambda)</code></td><td>Exponential float draws with rate <code>lambda</code>.</td></tr>
+            <tr><td><code>rand_bernoulli(p)</code></td><td>Bernoulli draws as Int (0/1).</td></tr>
+            <tr><td><code>rand_poisson(lambda)</code></td><td>Poisson draws as Int.</td></tr>
+            <tr><td><code>rand_int(lo, hi)</code></td><td>Uniform integer draws in [lo, hi].</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Scalar</p>
+    <h2>Scalar helpers and casts</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Scalar/date functions</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>abs(x)</code></td><td>Absolute value.</td></tr>
+            <tr><td><code>log(x)</code></td><td>Natural logarithm.</td></tr>
+            <tr><td><code>sqrt(x)</code></td><td>Square root.</td></tr>
+            <tr><td><code>year(t)</code></td><td>Year component from Date/Timestamp.</td></tr>
+            <tr><td><code>month(t)</code></td><td>Month component from Date/Timestamp.</td></tr>
+            <tr><td><code>day(t)</code></td><td>Day-of-month component from Date/Timestamp.</td></tr>
+            <tr><td><code>hour(t)</code></td><td>Hour component from Timestamp.</td></tr>
+            <tr><td><code>minute(t)</code></td><td>Minute component from Timestamp.</td></tr>
+            <tr><td><code>second(t)</code></td><td>Second component from Timestamp.</td></tr>
+            <tr><td><code>round(x, mode)</code></td><td>Round Float to Int with mode: <code>nearest</code>, <code>bankers</code>, <code>floor</code>, <code>ceil</code>, or <code>trunc</code>.</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="card">
+        <h3>Cast constructors</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>Int64(x)</code></td><td>Explicit cast to 64-bit integer.</td></tr>
+            <tr><td><code>Int32(x)</code></td><td>Explicit cast to 32-bit integer.</td></tr>
+            <tr><td><code>Int(x)</code></td><td>Alias for <code>Int64(x)</code>.</td></tr>
+            <tr><td><code>Float64(x)</code></td><td>Explicit cast to 64-bit float.</td></tr>
+            <tr><td><code>Float32(x)</code></td><td>Explicit cast to 32-bit float.</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Bundled externs</p>
+    <h2>Plugin functions shipped with Ibex</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>CSV and JSON</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>read_csv(path)</code></td><td>Load a CSV file into a DataFrame.</td></tr>
+            <tr><td><code>write_csv(df, path)</code></td><td>Write a DataFrame as CSV and return row count.</td></tr>
+            <tr><td><code>read_json(path)</code></td><td>Load JSON (array, object, or JSON-lines) into a DataFrame.</td></tr>
+            <tr><td><code>write_json(df, path)</code></td><td>Write a DataFrame to JSON and return row count.</td></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="card">
+        <h3>Parquet and stream I/O</h3>
+        <table class="repl-table">
+          <tbody>
+            <tr><td><code>read_parquet(path)</code></td><td>Load Apache Parquet into a DataFrame.</td></tr>
+            <tr><td><code>write_parquet(df, path)</code></td><td>Write a DataFrame to Parquet and return row count.</td></tr>
+            <tr><td><code>udp_recv(port)</code></td><td>Read rows from UDP into a DataFrame batch.</td></tr>
+            <tr><td><code>udp_send(df, host, port)</code></td><td>Send a DataFrame batch via UDP and return sent-row count.</td></tr>
+            <tr><td><code>ws_listen(port)</code></td><td>Start a WebSocket listener.</td></tr>
+            <tr><td><code>ws_recv(port)</code></td><td>Receive WebSocket messages as DataFrame batches.</td></tr>
+            <tr><td><code>ws_send(df, port)</code></td><td>Broadcast a DataFrame batch to connected WebSocket clients.</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span>Ibex - typed DataFrame pipelines</span>
+    <a href="./index.html">Back to docs</a>
+  </footer>
+
+</main>
+</body>
+</html>

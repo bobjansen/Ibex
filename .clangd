@@ -16,6 +16,7 @@ Diagnostics:
       - performance-*
       - readability-*
     Remove:
+      - cppcoreguidelines-pro-bounds-pointer-arithmetic
       - cppcoreguidelines-avoid-do-while
       - misc-non-private-member-variables-in-classes
       - readability-implicit-bool-conversion

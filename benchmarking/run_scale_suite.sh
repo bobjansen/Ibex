@@ -9,6 +9,7 @@
 #                        [--skip-ibex] [--skip-ibex-compiled]
 #                        [--skip-python] [--skip-r]
 #                        [--skip-pandas] [--skip-dplyr] [--keep-data]
+#                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
 
 set -euo pipefail
 
@@ -31,6 +32,9 @@ SKIP_R=0
 SKIP_PANDAS=0
 SKIP_DPLYR=0
 KEEP_DATA=0
+TO_README=0
+TO_README_ROWS=4000000
+TO_README_OUT=""
 
 # 1M .. 64M (powers of two)
 SIZES=(1000000 2000000 4000000 8000000 16000000 32000000 64000000)
@@ -79,6 +83,16 @@ while [[ $# -gt 0 ]]; do
         --skip-pandas) SKIP_PANDAS=1; shift ;;
         --skip-dplyr)  SKIP_DPLYR=1; shift ;;
         --keep-data)   KEEP_DATA=1; shift ;;
+        --to-readme|--to_readme) TO_README=1; shift ;;
+        --to-readme-rows|--to_readme_rows)
+            parsed="$(parse_size_token "$2")" || {
+                echo "error: invalid value '$2' for --to-readme-rows" >&2
+                exit 1
+            }
+            TO_README_ROWS="$parsed"
+            shift 2
+            ;;
+        --to-readme-out|--to_readme_out) TO_README_OUT="$2"; shift 2 ;;
         *)
             echo "unknown option: $1" >&2
             exit 1
@@ -122,6 +136,132 @@ append_tagged_results() {
             print n, $1, $2, $3, $4, $5, $6, $7, $8, $9
         }
     ' >> "$COMBINED_CSV"
+}
+
+emit_readme_markdown() {
+    local combined_tsv="$1"
+    local out_path="$2"
+    local requested_rows="$3"
+    local warmup="$4"
+    local iters="$5"
+
+    python3 - "$combined_tsv" "$out_path" "$requested_rows" "$warmup" "$iters" <<'PY'
+import csv
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+tsv_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+requested_rows = int(sys.argv[3])
+warmup = int(sys.argv[4])
+iters = int(sys.argv[5])
+
+rows = []
+with tsv_path.open("r", encoding="utf-8", newline="") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for r in reader:
+        r["dataset_rows"] = int(r["dataset_rows"])
+        r["avg_ms"] = float(r["avg_ms"])
+        rows.append(r)
+
+if not rows:
+    raise SystemExit("error: no benchmark rows available to format")
+
+matching = [r for r in rows if r["dataset_rows"] == requested_rows]
+selected_rows = requested_rows
+if not matching:
+    selected_rows = max(r["dataset_rows"] for r in rows)
+    matching = [r for r in rows if r["dataset_rows"] == selected_rows]
+
+preferred_frameworks = ["ibex", "ibex-compiled", "polars", "pandas", "data.table", "dplyr"]
+present_frameworks = {r["framework"] for r in matching}
+frameworks = [fw for fw in preferred_frameworks if fw in present_frameworks]
+for fw in sorted(present_frameworks):
+    # Keep README output focused on user-facing frameworks.
+    if fw == "ibex+parse":
+        continue
+    if fw not in frameworks:
+        frameworks.append(fw)
+
+if not frameworks:
+    raise SystemExit("error: no frameworks available after filtering")
+
+query_order = OrderedDict()
+for r in matching:
+    if r["framework"] == "ibex+parse":
+        continue
+    query_order.setdefault(r["query"], None)
+queries = list(query_order.keys())
+
+vals = {}
+for r in matching:
+    if r["framework"] == "ibex+parse":
+        continue
+    vals[(r["query"], r["framework"])] = r["avg_ms"]
+
+def fmt_ms(v: float) -> str:
+    if v < 1.0:
+        return f"{v:.3f} ms"
+    if v < 10.0:
+        return f"{v:.2f} ms"
+    return f"{v:.1f} ms"
+
+columns = ["query", *frameworks]
+table_rows: list[list[str]] = []
+for q in queries:
+    row = [q]
+    for fw in frameworks:
+        v = vals.get((q, fw))
+        row.append("-" if v is None else fmt_ms(v))
+    table_rows.append(row)
+
+widths = [len(c) for c in columns]
+for row in table_rows:
+    for i, cell in enumerate(row):
+        if len(cell) > widths[i]:
+            widths[i] = len(cell)
+
+def align_cell(value: str, width: int, right: bool) -> str:
+    return value.rjust(width) if right else value.ljust(width)
+
+def md_sep(width: int, right: bool) -> str:
+    width = max(3, width)
+    if right:
+        return "-" * (width - 1) + ":"
+    return "-" * width
+
+lines = []
+lines.append("## Benchmark")
+lines.append("")
+if selected_rows == requested_rows:
+    lines.append(
+        f"Scale benchmark snapshot on **{selected_rows:,} rows** "
+        f"(warmup={warmup}, iters={iters})."
+    )
+else:
+    lines.append(
+        f"Scale benchmark snapshot on **{selected_rows:,} rows** "
+        f"(requested {requested_rows:,}; warmup={warmup}, iters={iters})."
+    )
+lines.append("")
+header_cells = [align_cell(c, widths[i], right=(i > 0)) for i, c in enumerate(columns)]
+lines.append("| " + " | ".join(header_cells) + " |")
+sep_cells = [md_sep(widths[i], right=(i > 0)) for i in range(len(columns))]
+lines.append("| " + " | ".join(sep_cells) + " |")
+for row in table_rows:
+    cells = [align_cell(c, widths[i], right=(i > 0)) for i, c in enumerate(row)]
+    lines.append("| " + " | ".join(cells) + " |")
+lines.append("")
+lines.append(
+    "_Generated by `benchmarking/run_scale_suite.sh --to-readme` from "
+    "`benchmarking/results/scales.tsv`._"
+)
+lines.append("")
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text("\n".join(lines), encoding="utf-8")
+PY
 }
 
 for rows in "${SIZES[@]}"; do
@@ -202,3 +342,13 @@ done
 echo "combined results written to:"
 echo "  $COMBINED_TSV"
 echo "  $COMBINED_CSV"
+
+if [[ $TO_README -eq 1 ]]; then
+    if [[ -z "$TO_README_OUT" ]]; then
+        TO_README_OUT="$SCRIPT_DIR/results/scales_readme.md"
+    fi
+    emit_readme_markdown "$COMBINED_TSV" "$TO_README_OUT" "$TO_README_ROWS" "$WARMUP" "$ITERS"
+    echo
+    echo "README markdown written to:"
+    echo "  $TO_README_OUT"
+fi

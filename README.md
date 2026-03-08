@@ -307,22 +307,37 @@ parallel queries produce independent streams without locking.
 
 ## Benchmark
 
-Aggregation benchmarks on 4 M rows (`prices.csv`, 252 symbols).
-Release build (`-O2`), 5 iterations, 1 warmup, WSL2 / clang++.
+Aggregation benchmarks on 4 M rows.
+Release build (`-O2`), 15 iterations, 2 warmup, WSL2 / clang++.
 
 ```
-query               |     ibex |  polars |   pandas | data.table |    dplyr
---------------------+----------+---------+----------+------------+---------
-mean by symbol      |  28.4 ms | 40.1 ms | 180.7 ms |    36.0 ms |  70.6 ms
-OHLC by symbol      |  34.9 ms | 48.0 ms | 248.7 ms |    34.6 ms |  56.4 ms
-update price×2      |  3.27 ms | 3.33 ms |  5.01 ms |    18.8 ms |  7.20 ms
-count by symbol×day |  12.6 ms | 66.2 ms | 328.3 ms |    43.8 ms | 101.6 ms
-mean by symbol×day  |  14.0 ms | 76.8 ms | 367.4 ms |    32.2 ms | 155.0 ms
-OHLC by symbol×day  |  20.6 ms | 73.9 ms | 400.0 ms |    30.2 ms | 160.8 ms
-filter simple       |  19.5 ms | 8.40 ms |  30.7 ms |    29.6 ms |  32.0 ms
-filter AND          |  10.5 ms | 5.48 ms |  23.1 ms |    30.0 ms |  46.4 ms
-filter arith        |  21.1 ms | 10.9 ms |  47.8 ms |    35.8 ms |  42.4 ms
-filter OR           |  11.1 ms | 7.33 ms |  16.3 ms |    26.2 ms |  35.4 ms
+| query                 |     ibex |   polars |   pandas | data.table |    dplyr |
+| --------------------- | -------: | -------: | -------: | ---------: | -------: |
+| mean_by_symbol        |  26.8 ms |  27.5 ms | 182.8 ms |    20.7 ms |  42.9 ms |
+| ohlc_by_symbol        |  32.5 ms |  25.9 ms | 199.8 ms |    23.1 ms |  49.7 ms |
+| update_price_x2       |  3.43 ms |  2.72 ms |  2.85 ms |    18.5 ms |  6.07 ms |
+| cumsum_price          |  2.87 ms |  12.3 ms |  11.0 ms |    18.0 ms |  8.40 ms |
+| cumprod_price         |  3.65 ms |  12.3 ms |  11.2 ms |   330.4 ms | 327.4 ms |
+| rand_uniform          |  4.31 ms |  7.44 ms |  8.94 ms |    25.5 ms |  21.9 ms |
+| rand_normal           |  23.1 ms |  29.1 ms |  30.7 ms |    80.1 ms |  71.1 ms |
+| fill_null             |  4.14 ms |  3.05 ms |  7.26 ms |    5.27 ms |  12.0 ms |
+| fill_forward          |  3.48 ms |  8.92 ms |  7.52 ms |    7.80 ms |  15.3 ms |
+| fill_backward         |  7.42 ms |  8.54 ms |  7.71 ms |    5.47 ms |  10.9 ms |
+| null_left_join        |  53.4 ms |  28.9 ms | 225.1 ms |   169.8 ms | 169.4 ms |
+| null_semi_join        |  33.1 ms |  24.1 ms | 192.5 ms |    47.2 ms |  90.3 ms |
+| null_anti_join        |  33.6 ms |  21.7 ms | 105.5 ms |    63.7 ms |  96.0 ms |
+| null_cross_join_small |  1.70 ms | 0.671 ms |  4.15 ms |    3.53 ms |  50.3 ms |
+| filter_simple         |  19.0 ms |  7.09 ms |  23.0 ms |    32.0 ms |  43.5 ms |
+| filter_and            |  11.4 ms |  4.30 ms |  17.1 ms |    26.8 ms |  34.5 ms |
+| filter_arith          |  20.3 ms |  8.02 ms |  34.6 ms |    34.6 ms |  30.2 ms |
+| filter_or             |  12.0 ms |  4.59 ms |  13.8 ms |    25.5 ms |  29.9 ms |
+| count_by_symbol_day   |  7.47 ms |  48.9 ms | 327.1 ms |    16.7 ms |  93.9 ms |
+| mean_by_symbol_day    |  8.73 ms |  52.8 ms | 328.7 ms |    21.6 ms | 111.7 ms |
+| ohlc_by_symbol_day    |  14.4 ms |  54.2 ms | 353.7 ms |    27.2 ms | 127.1 ms |
+| sum_by_user           | 131.8 ms |  48.3 ms | 265.3 ms |    46.0 ms | 304.7 ms |
+| filter_events         |  23.5 ms |  6.94 ms |  41.1 ms |    31.8 ms |  33.7 ms |
+| melt_wide_to_long     | 0.037 ms | 0.175 ms |  1.08 ms |   0.067 ms |  1.60 ms |
+| dcast_long_to_wide    | 0.483 ms |  9.48 ms |  2.53 ms |    1.13 ms |  2.80 ms |
 ```
 
 ## Speedup over ibex (geometric mean across available queries)

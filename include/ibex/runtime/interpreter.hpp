@@ -77,4 +77,10 @@ class ExternRegistry;
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)
     -> std::expected<ScalarValue, std::string>;
 
+/// Merge two validity bitmaps (`a && b`) for the first `n` rows.
+/// Returns nullopt when both inputs are nullopt-equivalent (nullptr).
+/// Exposed for micro-benchmarking and runtime-level utilities.
+[[nodiscard]] auto merge_validity_bitmaps(const ValidityBitmap* a, const ValidityBitmap* b,
+                                          std::size_t n) -> std::optional<ValidityBitmap>;
+
 }  // namespace ibex::runtime

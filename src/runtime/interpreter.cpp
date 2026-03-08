@@ -7541,6 +7541,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
 }  // namespace
 
+auto merge_validity_bitmaps(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
+    -> std::optional<ValidityBitmap> {
+    return merge_validity(a, b, n);
+}
+
 void Table::add_column(std::string name, ColumnValue column) {
     if (auto it = index.find(name); it != index.end()) {
         // Reseat the shared_ptr rather than mutating shared data (copy-on-write).

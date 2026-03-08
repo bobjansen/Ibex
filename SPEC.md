@@ -560,8 +560,9 @@ statement       = let_stmt
 let_stmt        = "let" [ "mut" ] IDENT [ ":" type ] "=" expr ";" ;
 assign_stmt     = IDENT "=" expr ";" ;
 extern_decl     = "extern" "fn" IDENT "(" [ param_list ] ")"
-                  "->" type "from" STRING_LIT ";" ;
+                  "->" type [ effect_decl ] "from" STRING_LIT ";" ;
 fn_decl         = "fn" IDENT "(" [ param_list ] ")" "->" type
+                  [ effect_decl ]
                   "{" { fn_stmt } "}" ;
 expr_stmt       = expr ";" ;
 
@@ -690,7 +691,17 @@ join_keys       = IDENT
 (* --- Parameters --- *)
 
 param_list      = param { "," param } [ "," ] ;
-param           = IDENT ":" type ;
+param           = [ param_effect ] IDENT ":" type ;
+param_effect    = "const" | "mutable" | "consume" ;
+
+effect_decl     = "effects" "{" [ effect_spec { "," effect_spec } [ "," ] ] "}" ;
+
+effect_spec     = "io_read" [ "(" STRING_LIT ")" ]
+                | "io_write" [ "(" STRING_LIT ")" ]
+                | "nondet"
+                | "state"
+                | "blocking"
+                | "may_fail" ;
 
 (* --- Operators --- *)
 
@@ -1685,6 +1696,49 @@ Function calls inside DataFrame clause expressions are resolved against
 built-ins or extern functions. User-defined functions are evaluated at the
 statement level in the REPL/runtime.
 
+### 10.1 Function Effect Annotations
+
+Functions may optionally declare tracked effects:
+
+```
+fn score(df: DataFrame) -> DataFrame effects {} {
+    df[update { y = x * 2 }];
+}
+```
+
+`effects {}` means no tracked effects. The checker currently tracks:
+
+- `io_read`
+- `io_write`
+- `nondet`
+- `state`
+- `blocking`
+- `may_fail`
+
+For user-defined `fn`, annotations are checked against inferred effects from
+the body and known callees. If inferred effects are missing from the declared
+set, parsing fails with an error.
+
+### 10.2 Parameter Effect Modifiers
+
+Function and extern parameters may be prefixed with one of:
+
+- `const` (default): argument is read-only
+- `mutable`: callee may mutate argument state
+- `consume`: callee may take ownership / consume the argument
+
+Example:
+
+```
+extern fn write_csv(const df: DataFrame, const path: String) -> Int
+    effects { io_write, may_fail }
+    from "csv.hpp";
+```
+
+These are contextual keywords in parameter position. A parameter named
+`const`, `mutable`, or `consume` is still valid if used without a modifier
+prefix (for example `mutable: Int`).
+
 > Note: transpilation of user-defined function bodies is planned. The current
 > implementation evaluates them in the REPL/runtime.
 
@@ -1707,6 +1761,17 @@ extern fn variance(x: Series<Float64>) -> Float64 from "stats.hpp";
 extern fn zscore(x: Float64, mu: Float64, sigma: Float64) -> Float64
     from "math_utils.hpp";
 ```
+
+Extern declarations may include optional effects:
+
+```
+extern fn read_csv(path: String) -> DataFrame
+    effects { io_read("file"), may_fail }
+    from "csv.hpp";
+```
+
+If omitted, extern effects default conservatively to:
+`io_read`, `io_write`, `nondet`, `state`, `blocking`, `may_fail`.
 
 The `from` clause specifies the C++ header that provides the function. The
 compiler generates the appropriate `#include` directive in the transpiled
@@ -2502,6 +2567,12 @@ Column  Series  DataFrame  TimeFrame
 scalar
 date  timestamp  ts
 sum  mean  min  max  count  first  last  median  std  ewma
+```
+
+**Contextual parameter modifiers** (reserved only before parameter names):
+
+```
+const  mutable  consume
 ```
 
 ---

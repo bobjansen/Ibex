@@ -396,6 +396,7 @@ class Column<std::string> {
         offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
     }
 
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void reserve(size_type n, size_type chars_hint = 0) {
         offsets_.reserve(n + 1);
         if (chars_hint)
@@ -429,6 +430,7 @@ class Column<std::string> {
     }
 
     // Allocate output storage for a gather of n_rows rows with total_chars bytes.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void resize_for_gather(size_type n_rows, size_type total_chars) {
         offsets_.resize(n_rows + 1);
         chars_.resize(total_chars);
@@ -465,34 +467,32 @@ class Column<bool> {
 
     Column() = default;
 
-    explicit Column(std::vector<bool> bools) {
+    explicit Column(const std::vector<bool>& bools) {
         data_.reserve(bools.size());
         for (bool v : bools)
-            data_.push_back(v ? 1u : 0u);
+            data_.push_back(v ? 1U : 0U);
     }
 
     Column(std::initializer_list<bool> init) {
         data_.reserve(init.size());
         for (bool v : init)
-            data_.push_back(v ? 1u : 0u);
+            data_.push_back(v ? 1U : 0U);
     }
 
     [[nodiscard]] auto size() const noexcept -> size_type { return data_.size(); }
     [[nodiscard]] auto empty() const noexcept -> bool { return data_.empty(); }
 
-    [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool {
-        return data_[idx] != 0;
-    }
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool { return data_[idx] != 0; }
 
     /// Mutable byte-level access (for gather/sort paths that do `dst[i] = src[j]`).
     [[nodiscard]] auto byte_at(size_type idx) noexcept -> std::uint8_t& { return data_[idx]; }
 
-    void push_back(bool v) { data_.push_back(v ? 1u : 0u); }
+    void push_back(bool v) { data_.push_back(v ? 1U : 0U); }
 
     void reserve(size_type n) { data_.reserve(n); }
 
     // zero-initialises (false) for resize-based fill in lag/lead paths
-    void resize(size_type n) { data_.resize(n, 0u); }
+    void resize(size_type n) { data_.resize(n, 0U); }
 
     // Raw byte pointer: sizeof(bool)==1 ≡ sizeof(uint8_t), so POD memcpy is safe.
     [[nodiscard]] auto data() const noexcept -> const std::uint8_t* { return data_.data(); }
@@ -502,7 +502,7 @@ class Column<bool> {
     [[nodiscard]] auto span() const noexcept -> std::span<const std::uint8_t> { return data_; }
     [[nodiscard]] auto span() noexcept -> std::span<std::uint8_t> { return data_; }
 
-    void assign(size_type count, bool value) { data_.assign(count, value ? 1u : 0u); }
+    void assign(size_type count, bool value) { data_.assign(count, value ? 1U : 0U); }
 };
 
 }  // namespace ibex

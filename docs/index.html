@@ -77,6 +77,16 @@
         </p>
       </article>
       <article class="card">
+        <h3>Effect annotations</h3>
+        <p>
+          Optional <code>effects { ... }</code> annotations on <code>fn</code> and
+          <code>extern fn</code> let Ibex check side-effect assumptions early.
+          Extern parameters can also declare call semantics with
+          <code>const</code>, <code>mutable</code>, or <code>consume</code>.
+          There is no optimizer pass yet; this is currently a safety check.
+        </p>
+      </article>
+      <article class="card">
         <h3>Strict type system</h3>
         <p>
           No implicit <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
@@ -93,16 +103,6 @@
           uniform, gamma, exponential, Bernoulli, Poisson, Student-t, and integer
           distributions &mdash; generate one draw per row in a single vectorized
           pass with no locking between threads.
-        </p>
-      </article>
-      <article class="card">
-        <h3>WebSocket streaming</h3>
-        <p>
-          <code>import "websocket"</code> starts a TCP WebSocket server on any
-          port. <code>ws_send</code> broadcasts computed results &mdash; OHLC
-          bars, signals, alerts &mdash; to browser clients as JSON text frames.
-          The RFC&nbsp;6455 handshake is handled automatically; dashboards
-          connect with a plain <code>new&nbsp;WebSocket(&hellip;)</code>.
         </p>
       </article>
     </div>

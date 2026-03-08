@@ -9,6 +9,8 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace ibex::parser {
@@ -64,8 +66,7 @@ class Parser {
             // Strip any ".ibex" suffix so both `import "csv"` and
             // `import "csv.ibex"` are equivalent.
             constexpr std::string_view suffix = ".ibex";
-            if (name.size() > suffix.size() &&
-                name.substr(name.size() - suffix.size()) == suffix) {
+            if (name.size() > suffix.size() && name.substr(name.size() - suffix.size()) == suffix) {
                 name.resize(name.size() - suffix.size());
             }
         } else {
@@ -100,19 +101,11 @@ class Parser {
         std::vector<Param> params;
         if (!check(TokenKind::RParen)) {
             do {
-                auto param_name = consume_identifier("expected parameter name");
-                if (!param_name.has_value()) {
+                auto param = parse_param();
+                if (!param.has_value()) {
                     return std::nullopt;
                 }
-                if (!consume(TokenKind::Colon, "expected ':' after parameter name")) {
-                    return std::nullopt;
-                }
-                auto param_type = parse_type();
-                if (!param_type.has_value()) {
-                    return std::nullopt;
-                }
-                params.push_back(
-                    Param{.name = std::move(*param_name), .type = std::move(*param_type)});
+                params.push_back(std::move(*param));
             } while (match(TokenKind::Comma));
         }
         if (!consume(TokenKind::RParen, "expected ')' after parameter list")) {
@@ -123,6 +116,10 @@ class Parser {
         }
         auto return_type = parse_type();
         if (!return_type.has_value()) {
+            return std::nullopt;
+        }
+        std::optional<std::vector<EffectSpec>> effects;
+        if (!parse_optional_effects(effects)) {
             return std::nullopt;
         }
         if (!consume(TokenKind::KeywordFrom, "expected 'from' before extern source")) {
@@ -139,6 +136,7 @@ class Parser {
             .name = std::move(*name),
             .params = std::move(params),
             .return_type = std::move(*return_type),
+            .effects = std::move(effects),
             .source_path = std::move(source_path),
             .start_line = start_line,
             .end_line = previous().line,
@@ -157,19 +155,11 @@ class Parser {
         std::vector<Param> params;
         if (!check(TokenKind::RParen)) {
             do {
-                auto param_name = consume_identifier("expected parameter name");
-                if (!param_name.has_value()) {
+                auto param = parse_param();
+                if (!param.has_value()) {
                     return std::nullopt;
                 }
-                if (!consume(TokenKind::Colon, "expected ':' after parameter name")) {
-                    return std::nullopt;
-                }
-                auto param_type = parse_type();
-                if (!param_type.has_value()) {
-                    return std::nullopt;
-                }
-                params.push_back(
-                    Param{.name = std::move(*param_name), .type = std::move(*param_type)});
+                params.push_back(std::move(*param));
             } while (match(TokenKind::Comma));
         }
         if (!consume(TokenKind::RParen, "expected ')' after parameter list")) {
@@ -180,6 +170,10 @@ class Parser {
         }
         auto return_type = parse_type();
         if (!return_type.has_value()) {
+            return std::nullopt;
+        }
+        std::optional<std::vector<EffectSpec>> effects;
+        if (!parse_optional_effects(effects)) {
             return std::nullopt;
         }
         if (!consume(TokenKind::LBrace, "expected '{' to start function body")) {
@@ -220,10 +214,160 @@ class Parser {
             .name = std::move(*name),
             .params = std::move(params),
             .return_type = std::move(*return_type),
+            .effects = std::move(effects),
             .body = std::move(body),
             .start_line = start_line,
             .end_line = previous().line,
         };
+    }
+
+    auto parse_optional_effects(std::optional<std::vector<EffectSpec>>& out) -> bool {
+        out.reset();
+        if (!check(TokenKind::Identifier) || peek().lexeme != "effects") {
+            return true;
+        }
+        advance();  // consume "effects"
+        if (!consume(TokenKind::LBrace, "expected '{' after effects")) {
+            return false;
+        }
+        std::vector<EffectSpec> effects;
+        std::unordered_set<std::string> seen;
+        if (!check(TokenKind::RBrace)) {
+            do {
+                auto spec = parse_effect_spec();
+                if (!spec.has_value()) {
+                    return false;
+                }
+                auto key = effect_dedup_key(*spec);
+                if (!seen.insert(key).second) {
+                    error_ = make_error(previous(), "duplicate effect annotation: " + key);
+                    return false;
+                }
+                effects.push_back(std::move(*spec));
+            } while (match(TokenKind::Comma));
+        }
+        if (!consume(TokenKind::RBrace, "expected '}' after effects")) {
+            return false;
+        }
+        out = std::move(effects);
+        return true;
+    }
+
+    auto parse_effect_spec() -> std::optional<EffectSpec> {
+        if (!consume(TokenKind::Identifier, "expected effect name")) {
+            return std::nullopt;
+        }
+        std::string effect_name{previous().lexeme};
+        auto kind = effect_kind_from_name(effect_name);
+        if (!kind.has_value()) {
+            error_ = make_error(previous(), "unknown effect kind '" + effect_name + "'");
+            return std::nullopt;
+        }
+        EffectSpec spec{.kind = *kind, .resource = std::nullopt};
+
+        const bool takes_resource =
+            spec.kind == EffectKind::IoRead || spec.kind == EffectKind::IoWrite;
+
+        if (match(TokenKind::LParen)) {
+            if (takes_resource) {
+                if (!consume(TokenKind::StringLiteral,
+                             "expected string resource in io_read/io_write effect")) {
+                    return std::nullopt;
+                }
+                spec.resource = unescape_string(previous().lexeme);
+            } else {
+                error_ =
+                    make_error(previous(), "effect '" + effect_name + "' does not take arguments");
+                return std::nullopt;
+            }
+            if (!consume(TokenKind::RParen, "expected ')' after effect argument")) {
+                return std::nullopt;
+            }
+        }
+
+        return spec;
+    }
+
+    auto parse_param() -> std::optional<Param> {
+        Param::Effect effect = Param::Effect::Const;
+        if (check(TokenKind::Identifier) && peek_next().kind == TokenKind::Identifier) {
+            if (auto parsed = param_effect_from_name(peek().lexeme); parsed.has_value()) {
+                effect = *parsed;
+                advance();
+            }
+        }
+
+        auto param_name = consume_identifier("expected parameter name");
+        if (!param_name.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::Colon, "expected ':' after parameter name")) {
+            return std::nullopt;
+        }
+        auto param_type = parse_type();
+        if (!param_type.has_value()) {
+            return std::nullopt;
+        }
+        return Param{
+            .name = std::move(*param_name),
+            .type = std::move(*param_type),
+            .effect = effect,
+        };
+    }
+
+    static auto effect_kind_from_name(std::string_view name) -> std::optional<EffectKind> {
+        if (name == "io_read")
+            return EffectKind::IoRead;
+        if (name == "io_write")
+            return EffectKind::IoWrite;
+        if (name == "nondet")
+            return EffectKind::Nondet;
+        if (name == "state")
+            return EffectKind::State;
+        if (name == "blocking")
+            return EffectKind::Blocking;
+        if (name == "may_fail")
+            return EffectKind::MayFail;
+        return std::nullopt;
+    }
+
+    static auto effect_dedup_key(const EffectSpec& spec) -> std::string {
+        auto kind_name = [](EffectKind kind) -> std::string_view {
+            switch (kind) {
+                case EffectKind::IoRead:
+                    return "io_read";
+                case EffectKind::IoWrite:
+                    return "io_write";
+                case EffectKind::Nondet:
+                    return "nondet";
+                case EffectKind::State:
+                    return "state";
+                case EffectKind::Blocking:
+                    return "blocking";
+                case EffectKind::MayFail:
+                    return "may_fail";
+            }
+            return "unknown";
+        };
+
+        std::string key(kind_name(spec.kind));
+        if (spec.resource.has_value()) {
+            key.append("(").append(*spec.resource).append(")");
+        }
+        return key;
+    }
+
+    static auto param_effect_from_name(std::string_view name) -> std::optional<Param::Effect> {
+        if (name == "const") {
+            return Param::Effect::Const;
+        }
+        if (name == "mutable") {
+            return Param::Effect::Mutable;
+        }
+        if (name == "consume") {
+            return Param::Effect::Consume;
+        }
+        return std::nullopt;
     }
 
     auto parse_let_stmt() -> std::optional<Stmt> {
@@ -391,8 +535,7 @@ class Parser {
                     if (!on_expr) {
                         return nullptr;
                     }
-                    if (const auto* ident =
-                            std::get_if<IdentifierExpr>(&on_expr->node)) {
+                    if (const auto* ident = std::get_if<IdentifierExpr>(&on_expr->node)) {
                         keys.push_back(ident->name);
                     } else {
                         predicate = std::move(on_expr);
@@ -815,19 +958,21 @@ class Parser {
         std::vector<TableColumnDef> columns;
         if (!check(TokenKind::RBrace)) {
             do {
-                auto col_name = consume_column_identifier("expected column name in Table constructor");
+                auto col_name =
+                    consume_column_identifier("expected column name in Table constructor");
                 if (!col_name.has_value()) {
                     return nullptr;
                 }
-                if (!consume(TokenKind::Eq, "expected '=' after column name in Table constructor")) {
+                if (!consume(TokenKind::Eq,
+                             "expected '=' after column name in Table constructor")) {
                     return nullptr;
                 }
                 auto col_expr = parse_expression();
                 if (!col_expr) {
                     return nullptr;
                 }
-                columns.push_back(TableColumnDef{.name = std::move(*col_name),
-                                                  .expr = std::move(col_expr)});
+                columns.push_back(
+                    TableColumnDef{.name = std::move(*col_name), .expr = std::move(col_expr)});
             } while (match(TokenKind::Comma));
         }
         if (!consume(TokenKind::RBrace, "expected '}' after Table constructor")) {
@@ -912,9 +1057,8 @@ class Parser {
                 }
                 has_sink = true;
             } else {
-                return fail_expr(previous(),
-                                 "unknown Stream field '" + *field +
-                                     "'; expected 'source', 'transform', or 'sink'");
+                return fail_expr(previous(), "unknown Stream field '" + *field +
+                                                 "'; expected 'source', 'transform', or 'sink'");
             }
 
             // Allow an optional trailing comma between fields.
@@ -1751,13 +1895,315 @@ class Parser {
 
 }  // namespace
 
+namespace {
+
+using EffectMask = std::uint32_t;
+
+constexpr EffectMask kEffIoRead = 1u << 0;
+constexpr EffectMask kEffIoWrite = 1u << 1;
+constexpr EffectMask kEffNondet = 1u << 2;
+constexpr EffectMask kEffState = 1u << 3;
+constexpr EffectMask kEffBlocking = 1u << 4;
+constexpr EffectMask kEffMayFail = 1u << 5;
+constexpr EffectMask kEffAllCore =
+    kEffIoRead | kEffIoWrite | kEffNondet | kEffState | kEffBlocking | kEffMayFail;
+
+auto effect_kind_mask(EffectKind kind) -> EffectMask {
+    switch (kind) {
+        case EffectKind::IoRead:
+            return kEffIoRead;
+        case EffectKind::IoWrite:
+            return kEffIoWrite;
+        case EffectKind::Nondet:
+            return kEffNondet;
+        case EffectKind::State:
+            return kEffState;
+        case EffectKind::Blocking:
+            return kEffBlocking;
+        case EffectKind::MayFail:
+            return kEffMayFail;
+    }
+    return 0;
+}
+
+auto mask_from_effect_specs(const std::optional<std::vector<EffectSpec>>& effects) -> EffectMask {
+    if (!effects.has_value()) {
+        return 0;
+    }
+    EffectMask out = 0;
+    for (const auto& eff : *effects) {
+        out |= effect_kind_mask(eff.kind);
+    }
+    return out;
+}
+
+auto format_mask(EffectMask mask) -> std::string {
+    std::string out;
+    auto append = [&](std::string_view name) {
+        if (!out.empty()) {
+            out.append(", ");
+        }
+        out.append(name);
+    };
+    if ((mask & kEffIoRead) != 0)
+        append("io_read");
+    if ((mask & kEffIoWrite) != 0)
+        append("io_write");
+    if ((mask & kEffNondet) != 0)
+        append("nondet");
+    if ((mask & kEffState) != 0)
+        append("state");
+    if ((mask & kEffBlocking) != 0)
+        append("blocking");
+    if ((mask & kEffMayFail) != 0)
+        append("may_fail");
+    if (out.empty()) {
+        out = "<none>";
+    }
+    return out;
+}
+
+auto builtin_effects() -> const std::unordered_map<std::string, EffectMask>& {
+    static const std::unordered_map<std::string, EffectMask> map = {
+        {"print", kEffIoWrite},           {"seed_rng", kEffState},
+        {"rand_uniform", kEffNondet},     {"rand_normal", kEffNondet},
+        {"rand_student_t", kEffNondet},   {"rand_gamma", kEffNondet},
+        {"rand_exponential", kEffNondet}, {"rand_bernoulli", kEffNondet},
+        {"rand_poisson", kEffNondet},     {"rand_int", kEffNondet},
+    };
+    return map;
+}
+
+class EffectChecker {
+   public:
+    explicit EffectChecker(const Program& program) : program_(program) {}
+
+    auto run() -> std::optional<ParseError> {
+        collect_declarations();
+        compute_function_effects();
+        return verify_annotations();
+    }
+
+   private:
+    void collect_declarations() {
+        for (const auto& stmt : program_.statements) {
+            if (const auto* fn = std::get_if<FunctionDecl>(&stmt)) {
+                functions_.insert_or_assign(fn->name, fn);
+            } else if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
+                extern_masks_.insert_or_assign(ext->name, ext->effects.has_value()
+                                                              ? mask_from_effect_specs(ext->effects)
+                                                              : kEffAllCore);
+            }
+        }
+    }
+
+    void apply_call_effect(const std::string& callee, EffectMask& direct,
+                           std::unordered_set<std::string>& deps) const {
+        if (functions_.contains(callee)) {
+            deps.insert(callee);
+            return;
+        }
+        if (auto it = extern_masks_.find(callee); it != extern_masks_.end()) {
+            direct |= it->second;
+            return;
+        }
+        if (auto it = builtin_effects().find(callee); it != builtin_effects().end()) {
+            direct |= it->second;
+        }
+    }
+
+    void collect_clause_effects(const Clause& clause, EffectMask& direct,
+                                std::unordered_set<std::string>& deps) const {
+        std::visit(
+            [&](const auto& c) {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, FilterClause>) {
+                    collect_expr_effects(*c.predicate, direct, deps);
+                } else if constexpr (std::is_same_v<T, SelectClause>) {
+                    for (const auto& f : c.fields) {
+                        collect_expr_effects(*f.expr, direct, deps);
+                    }
+                    for (const auto& tf : c.tuple_fields) {
+                        collect_expr_effects(*tf.expr, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, DistinctClause>) {
+                    for (const auto& f : c.fields) {
+                        collect_expr_effects(*f.expr, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, UpdateClause>) {
+                    for (const auto& f : c.fields) {
+                        collect_expr_effects(*f.expr, direct, deps);
+                    }
+                    for (const auto& tf : c.tuple_fields) {
+                        collect_expr_effects(*tf.expr, direct, deps);
+                    }
+                    if (c.merge_expr) {
+                        collect_expr_effects(*c.merge_expr, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, RenameClause>) {
+                    for (const auto& f : c.fields) {
+                        collect_expr_effects(*f.expr, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, ByClause>) {
+                    for (const auto& f : c.keys) {
+                        collect_expr_effects(*f.expr, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, MeltClause>) {
+                    for (const auto& f : c.id_fields) {
+                        collect_expr_effects(*f.expr, direct, deps);
+                    }
+                }
+            },
+            clause);
+    }
+
+    void collect_expr_effects(const Expr& expr, EffectMask& direct,
+                              std::unordered_set<std::string>& deps) const {
+        std::visit(
+            [&](const auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, CallExpr>) {
+                    apply_call_effect(node.callee, direct, deps);
+                    for (const auto& arg : node.args) {
+                        collect_expr_effects(*arg, direct, deps);
+                    }
+                    for (const auto& named : node.named_args) {
+                        collect_expr_effects(*named.value, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                    collect_expr_effects(*node.expr, direct, deps);
+                } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                    collect_expr_effects(*node.left, direct, deps);
+                    collect_expr_effects(*node.right, direct, deps);
+                } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                    collect_expr_effects(*node.expr, direct, deps);
+                } else if constexpr (std::is_same_v<T, BlockExpr>) {
+                    if (node.base) {
+                        collect_expr_effects(*node.base, direct, deps);
+                    }
+                    for (const auto& clause : node.clauses) {
+                        collect_clause_effects(clause, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, JoinExpr>) {
+                    collect_expr_effects(*node.left, direct, deps);
+                    collect_expr_effects(*node.right, direct, deps);
+                    if (node.predicate.has_value()) {
+                        collect_expr_effects(*node.predicate.value(), direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, StreamExpr>) {
+                    collect_expr_effects(*node.source, direct, deps);
+                    for (const auto& clause : node.transform) {
+                        collect_clause_effects(clause, direct, deps);
+                    }
+                    apply_call_effect(node.sink_callee, direct, deps);
+                    for (const auto& arg : node.sink_args) {
+                        collect_expr_effects(*arg, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, ArrayLiteralExpr>) {
+                    for (const auto& elem : node.elements) {
+                        collect_expr_effects(*elem, direct, deps);
+                    }
+                } else if constexpr (std::is_same_v<T, TableExpr>) {
+                    for (const auto& col : node.columns) {
+                        collect_expr_effects(*col.expr, direct, deps);
+                    }
+                }
+            },
+            expr.node);
+    }
+
+    void compute_function_effects() {
+        for (const auto& [name, fn] : functions_) {
+            EffectMask direct = 0;
+            std::unordered_set<std::string> deps;
+            for (const auto& stmt : fn->body) {
+                std::visit(
+                    [&](const auto& s) {
+                        using T = std::decay_t<decltype(s)>;
+                        if constexpr (std::is_same_v<T, LetStmt>) {
+                            collect_expr_effects(*s.value, direct, deps);
+                        } else if constexpr (std::is_same_v<T, TupleLetStmt>) {
+                            collect_expr_effects(*s.value, direct, deps);
+                        } else if constexpr (std::is_same_v<T, ExprStmt>) {
+                            collect_expr_effects(*s.expr, direct, deps);
+                        }
+                    },
+                    stmt);
+            }
+            deps.erase(name);  // recursion handled by fixpoint below
+            direct_masks_.insert_or_assign(name, direct);
+            dep_graph_.insert_or_assign(name, std::move(deps));
+            inferred_masks_.insert_or_assign(name, direct);
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& [name, fn] : functions_) {
+                (void)fn;
+                EffectMask next = direct_masks_[name];
+                if (auto it = dep_graph_.find(name); it != dep_graph_.end()) {
+                    for (const auto& dep : it->second) {
+                        if (auto dep_it = inferred_masks_.find(dep);
+                            dep_it != inferred_masks_.end()) {
+                            next |= dep_it->second;
+                        }
+                    }
+                }
+                if (next != inferred_masks_[name]) {
+                    inferred_masks_[name] = next;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    auto verify_annotations() const -> std::optional<ParseError> {
+        for (const auto& [name, fn] : functions_) {
+            if (!fn->effects.has_value()) {
+                continue;
+            }
+            const EffectMask declared = mask_from_effect_specs(fn->effects);
+            const EffectMask inferred = inferred_masks_.at(name);
+            const EffectMask missing = inferred & ~declared;
+            if (missing == 0) {
+                continue;
+            }
+            return ParseError{
+                .message = fmt::format("function '{}' effect annotation missing: {}", fn->name,
+                                       format_mask(missing)),
+                .line = fn->start_line,
+                .column = 1,
+            };
+        }
+        return std::nullopt;
+    }
+
+    const Program& program_;
+    std::unordered_map<std::string, const FunctionDecl*> functions_;
+    std::unordered_map<std::string, EffectMask> extern_masks_;
+    std::unordered_map<std::string, EffectMask> direct_masks_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> dep_graph_;
+    std::unordered_map<std::string, EffectMask> inferred_masks_;
+};
+
+}  // namespace
+
 auto ParseError::format() const -> std::string {
     return fmt::format("{}:{}: {}", line, column, message);
 }
 
 auto parse(std::string_view source) -> ParseResult {
     Parser parser(tokenize(source));
-    return parser.parse_program();
+    auto program = parser.parse_program();
+    if (!program.has_value()) {
+        return std::unexpected(program.error());
+    }
+    EffectChecker checker(*program);
+    if (auto err = checker.run(); err.has_value()) {
+        return std::unexpected(*err);
+    }
+    return program;
 }
 
 }  // namespace ibex::parser

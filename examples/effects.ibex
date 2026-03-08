@@ -1,0 +1,23 @@
+// Effect annotation syntax examples.
+//
+// Note: this file demonstrates syntax and checker behavior.
+
+extern fn read_csv(path: String) -> DataFrame
+    effects { io_read("file"), may_fail }
+    from "csv.hpp";
+
+extern fn write_csv(const df: DataFrame, const path: String) -> Int
+    effects { io_write("file"), may_fail }
+    from "csv.hpp";
+
+// Pure table transform (no tracked external effects).
+fn normalize(df: DataFrame) -> DataFrame effects {} {
+    df[update { z = price / 100.0 }];
+}
+
+// Declares io_write because it calls write_csv.
+fn save_norm(path: String) -> Int effects { io_read, io_write, may_fail } {
+    let df = read_csv(path);
+    let out = normalize(df);
+    write_csv(out, "out.csv");
+}

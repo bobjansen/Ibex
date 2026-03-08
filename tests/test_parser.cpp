@@ -71,8 +71,10 @@ TEST_CASE("Parse extern declaration with schema types") {
     REQUIRE(decl.params[0].name == "path");
     REQUIRE(decl.params[0].type.kind == Type::Kind::Scalar);
     REQUIRE(std::get<ScalarType>(decl.params[0].type.arg) == ScalarType::String);
+    REQUIRE(decl.params[0].effect == Param::Effect::Const);
     REQUIRE(decl.params[1].name == "schema");
     REQUIRE(decl.params[1].type.kind == Type::Kind::DataFrame);
+    REQUIRE(decl.params[1].effect == Param::Effect::Const);
     const auto& schema = std::get<SchemaType>(decl.params[1].type.arg);
     REQUIRE(schema.fields.size() == 2);
     REQUIRE(schema.fields[0].name == "id");
@@ -116,13 +118,141 @@ TEST_CASE("Parse function declaration with typed params") {
     REQUIRE(fn.params[0].name == "col");
     REQUIRE(fn.params[0].type.kind == Type::Kind::Series);
     REQUIRE(std::get<ScalarType>(fn.params[0].type.arg) == ScalarType::Int64);
+    REQUIRE(fn.params[0].effect == Param::Effect::Const);
     REQUIRE(fn.params[1].name == "x");
     REQUIRE(fn.params[1].type.kind == Type::Kind::Scalar);
     REQUIRE(std::get<ScalarType>(fn.params[1].type.arg) == ScalarType::Int64);
+    REQUIRE(fn.params[1].effect == Param::Effect::Const);
     REQUIRE(fn.return_type.kind == Type::Kind::Scalar);
     REQUIRE(std::get<ScalarType>(fn.return_type.arg) == ScalarType::Int64);
     REQUIRE(fn.body.size() == 1);
     REQUIRE(std::holds_alternative<ExprStmt>(fn.body.front()));
+}
+
+TEST_CASE("Parse extern and function declarations with effects") {
+    const char* source = R"(
+extern fn read_csv(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
+fn identity(df: DataFrame) -> DataFrame effects {} {
+  df;
+}
+)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 2);
+
+    const auto& ext = std::get<ExternDecl>(result->statements[0]);
+    REQUIRE(ext.effects.has_value());
+    REQUIRE(ext.effects->size() == 2);
+    REQUIRE(ext.effects->at(0).kind == EffectKind::IoRead);
+    REQUIRE(ext.effects->at(0).resource.has_value());
+    REQUIRE(*ext.effects->at(0).resource == "file");
+    REQUIRE(ext.effects->at(1).kind == EffectKind::MayFail);
+
+    const auto& fn = std::get<FunctionDecl>(result->statements[1]);
+    REQUIRE(fn.effects.has_value());
+    REQUIRE(fn.effects->empty());
+}
+
+TEST_CASE("Parse rejects unknown effect kind") {
+    auto result = parse("fn f(x: Int) -> Int effects { unknown_effect } { x; }");
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("unknown effect kind") != std::string::npos);
+}
+
+TEST_CASE("Parse parameter effect modifiers") {
+    const char* source = R"(
+extern fn ext(const path: String, mutable out: DataFrame, consume payload: String)
+    -> Int
+    effects { io_write, may_fail }
+    from "x.hpp";
+fn f(const x: Int, mutable y: Int, consume z: Int) -> Int {
+  x;
+}
+)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 2);
+
+    const auto& ext = std::get<ExternDecl>(result->statements[0]);
+    REQUIRE(ext.params.size() == 3);
+    REQUIRE(ext.params[0].effect == Param::Effect::Const);
+    REQUIRE(ext.params[1].effect == Param::Effect::Mutable);
+    REQUIRE(ext.params[2].effect == Param::Effect::Consume);
+
+    const auto& fn = std::get<FunctionDecl>(result->statements[1]);
+    REQUIRE(fn.params.size() == 3);
+    REQUIRE(fn.params[0].effect == Param::Effect::Const);
+    REQUIRE(fn.params[1].effect == Param::Effect::Mutable);
+    REQUIRE(fn.params[2].effect == Param::Effect::Consume);
+}
+
+TEST_CASE("Parse allows parameter names that match modifier words") {
+    auto result = parse("fn f(mutable: Int, consume: Int, const: Int) -> Int { const; }");
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+    const auto& fn = std::get<FunctionDecl>(result->statements[0]);
+    REQUIRE(fn.params.size() == 3);
+    REQUIRE(fn.params[0].name == "mutable");
+    REQUIRE(fn.params[0].effect == Param::Effect::Const);
+    REQUIRE(fn.params[1].name == "consume");
+    REQUIRE(fn.params[1].effect == Param::Effect::Const);
+    REQUIRE(fn.params[2].name == "const");
+    REQUIRE(fn.params[2].effect == Param::Effect::Const);
+}
+
+TEST_CASE("Effect checking: user fn annotation must include inferred extern effects") {
+    const char* source = R"(
+extern fn write_csv(df: DataFrame, path: String) -> Int effects { io_write } from "csv.hpp";
+fn save(df: DataFrame) -> DataFrame effects {} {
+  write_csv(df, "out.csv");
+  df;
+}
+)";
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("missing: io_write") != std::string::npos);
+}
+
+TEST_CASE("Effect checking: annotation passes when inferred effects are declared") {
+    const char* source = R"(
+extern fn write_csv(df: DataFrame, path: String) -> Int effects { io_write } from "csv.hpp";
+fn save(df: DataFrame) -> DataFrame effects { io_write } {
+  write_csv(df, "out.csv");
+  df;
+}
+)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("Effect checking: unannotated extern defaults to conservative effects") {
+    const char* source = R"(
+extern fn ext(x: Int) -> Int from "x.hpp";
+fn f(x: Int) -> Int effects {} {
+  ext(x);
+  x;
+}
+)";
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("io_read") != std::string::npos);
+}
+
+TEST_CASE("Effect checking: transitive effects through user function calls") {
+    const char* source = R"(
+fn inner() -> Int effects { nondet } {
+  rand_int(1, 6);
+  1;
+}
+fn wrapper() -> Int effects {} {
+  inner();
+  2;
+}
+)";
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("nondet") != std::string::npos);
 }
 
 TEST_CASE("Parse let binding with precedence") {
@@ -770,7 +900,6 @@ TEST_CASE("Parse left join") {
     REQUIRE(join.keys.size() == 1);
     REQUIRE(join.keys[0] == "key");
 }
-
 
 TEST_CASE("Parse right join") {
     const char* source = "a right join b on key;";

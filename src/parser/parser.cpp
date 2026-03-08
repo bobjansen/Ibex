@@ -2017,22 +2017,27 @@ class EffectChecker {
         std::visit(
             [&](const auto& c) {
                 using T = std::decay_t<decltype(c)>;
+                const auto collect_field_expr = [&](const Field& f) {
+                    if (f.expr) {
+                        collect_expr_effects(*f.expr, direct, deps);
+                    }
+                };
                 if constexpr (std::is_same_v<T, FilterClause>) {
                     collect_expr_effects(*c.predicate, direct, deps);
                 } else if constexpr (std::is_same_v<T, SelectClause>) {
                     for (const auto& f : c.fields) {
-                        collect_expr_effects(*f.expr, direct, deps);
+                        collect_field_expr(f);
                     }
                     for (const auto& tf : c.tuple_fields) {
                         collect_expr_effects(*tf.expr, direct, deps);
                     }
                 } else if constexpr (std::is_same_v<T, DistinctClause>) {
                     for (const auto& f : c.fields) {
-                        collect_expr_effects(*f.expr, direct, deps);
+                        collect_field_expr(f);
                     }
                 } else if constexpr (std::is_same_v<T, UpdateClause>) {
                     for (const auto& f : c.fields) {
-                        collect_expr_effects(*f.expr, direct, deps);
+                        collect_field_expr(f);
                     }
                     for (const auto& tf : c.tuple_fields) {
                         collect_expr_effects(*tf.expr, direct, deps);
@@ -2042,15 +2047,15 @@ class EffectChecker {
                     }
                 } else if constexpr (std::is_same_v<T, RenameClause>) {
                     for (const auto& f : c.fields) {
-                        collect_expr_effects(*f.expr, direct, deps);
+                        collect_field_expr(f);
                     }
                 } else if constexpr (std::is_same_v<T, ByClause>) {
                     for (const auto& f : c.keys) {
-                        collect_expr_effects(*f.expr, direct, deps);
+                        collect_field_expr(f);
                     }
                 } else if constexpr (std::is_same_v<T, MeltClause>) {
                     for (const auto& f : c.id_fields) {
-                        collect_expr_effects(*f.expr, direct, deps);
+                        collect_field_expr(f);
                     }
                 }
             },

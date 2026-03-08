@@ -34,6 +34,8 @@ if(IBEX_ENABLE_SANITIZERS)
     include(Sanitizers)
 endif()
 
+include(Coverage)  # no-op unless -DIBEX_COVERAGE=ON
+
 # Core library
 add_subdirectory(src/core)
 add_subdirectory(src/ir)

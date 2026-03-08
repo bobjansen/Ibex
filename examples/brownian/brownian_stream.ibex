@@ -1,0 +1,43 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex Brownian Motion Stream Demo
+//
+//  Receives synthetic multi-symbol tick data over UDP (port 9001), resamples
+//  into 10-second OHLC bars grouped by symbol, and broadcasts each completed
+//  bar to all connected WebSocket clients (port 8765).
+//
+//  Data flow:
+//    tick_gen.py → UDP:9001 → [this binary] → WS:8765 → monitor.py
+//
+//  Wire formats:
+//    UDP in  (port 9001): {"ts":<ns>,"symbol":"AAPL","price":182.3,"volume":400}
+//    WS  out (port 8765): {"ts":<ns>,"symbol":"AAPL","open":182.0,"high":183.1,
+//                          "low":181.8,"close":182.5}
+//
+//  To run the full demo:
+//    ./run_demo.sh
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "udp";
+import "websocket";
+
+// Bind the WebSocket port eagerly so monitor.py can connect before the first
+// bar is emitted.
+ws_listen(8765);
+
+let bars = Stream {
+    // Receive one tick datagram per call; block up to 200 ms then timeout.
+    source    = udp_recv(9001),
+
+    // Group ticks into 10-second buckets per symbol and compute OHLC.
+    transform = [resample 10s, by symbol, select {
+        open  = first(price),
+        high  = max(price),
+        low   = min(price),
+        close = last(price)
+    }],
+
+    // Push each completed bar to all connected WebSocket clients.
+    sink = ws_send(8765)
+};
+
+bars;

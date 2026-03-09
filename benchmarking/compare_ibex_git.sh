@@ -34,6 +34,7 @@ Options:
   --numa-node <N>           Pin benchmark runs with numactl node/memory bind
   --ibex-suite <name,...>   Pass suite selection to bench_ibex.sh/ibex_bench
   --merge-validity-rows <N> Row count for merge_validity micro benchmark
+  --rng-micro-rows <N>      Row count for rng_micro kernel benchmark
   --csv <path>              prices.csv path
   --csv-multi <path>        prices_multi.csv path
   --csv-trades <path>       trades.csv path
@@ -60,6 +61,7 @@ TASKSET_CPUSET=""
 NUMA_NODE=""
 IBEX_SUITE=""
 MERGE_VALIDITY_ROWS=""
+RNG_MICRO_ROWS=""
 
 CSV="$REPO_ROOT/benchmarking/data/prices.csv"
 CSV_MULTI="$REPO_ROOT/benchmarking/data/prices_multi.csv"
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --numa-node) NUMA_NODE="$2"; shift 2 ;;
         --ibex-suite) IBEX_SUITE="$2"; shift 2 ;;
         --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
+        --rng-micro-rows) RNG_MICRO_ROWS="$2"; shift 2 ;;
         --csv) CSV="$2"; shift 2 ;;
         --csv-multi) CSV_MULTI="$2"; shift 2 ;;
         --csv-trades) CSV_TRADES="$2"; shift 2 ;;
@@ -105,6 +108,10 @@ if [[ -n "$MERGE_VALIDITY_ROWS" && ! "$MERGE_VALIDITY_ROWS" =~ ^[1-9][0-9]*$ ]];
     echo "error: --merge-validity-rows must be a positive integer" >&2
     exit 1
 fi
+if [[ -n "$RNG_MICRO_ROWS" && ! "$RNG_MICRO_ROWS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: --rng-micro-rows must be a positive integer" >&2
+    exit 1
+fi
 if [[ -n "$TASKSET_CPUSET" ]] && ! command -v taskset >/dev/null 2>&1; then
     echo "error: taskset not found but --taskset was provided" >&2
     exit 1
@@ -122,7 +129,7 @@ if [[ -n "$IBEX_SUITE" ]]; then
         tok="${tok//[[:space:]]/}"
         tok="${tok,,}"
         tok="${tok//-/_}"
-        if [[ "$tok" != "merge_validity" ]]; then
+        if [[ "$tok" != "merge_validity" && "$tok" != "rng_micro" ]]; then
             NEEDS_CSV=1
             break
         fi
@@ -233,6 +240,7 @@ run_bench_once() {
     [[ "$NEEDS_CSV" -eq 1 ]] && args+=(--csv "$CSV")
     [[ -n "$IBEX_SUITE" ]] && args+=(--suite "$IBEX_SUITE")
     [[ -n "$MERGE_VALIDITY_ROWS" ]] && args+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
+    [[ -n "$RNG_MICRO_ROWS" ]] && args+=(--rng-micro-rows "$RNG_MICRO_ROWS")
     [[ -f "$CSV_MULTI" ]] && args+=(--csv-multi "$CSV_MULTI")
     [[ -f "$CSV_TRADES" ]] && args+=(--csv-trades "$CSV_TRADES")
     [[ -f "$CSV_EVENTS" ]] && args+=(--csv-events "$CSV_EVENTS")
@@ -325,6 +333,9 @@ echo "Pinning: $PIN_DESC" >&2
 echo "Ibex suite: ${IBEX_SUITE:-all}" >&2
 if [[ -n "$MERGE_VALIDITY_ROWS" ]]; then
     echo "merge_validity rows: $MERGE_VALIDITY_ROWS" >&2
+fi
+if [[ -n "$RNG_MICRO_ROWS" ]]; then
+    echo "rng_micro rows: $RNG_MICRO_ROWS" >&2
 fi
 
 run_repeated_bench_and_aggregate "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_TSV" "$BASE_LOG"

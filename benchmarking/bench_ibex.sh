@@ -12,6 +12,7 @@
 # Usage:
 #   ./bench_ibex.sh [--csv path] [--csv-multi path] [--warmup N] [--iters N]
 #                   [--suite name[,name...]] [--merge-validity-rows N]
+#                   [--rng-micro-rows N]
 #                   [--out results/ibex.tsv]
 
 set -euo pipefail
@@ -31,6 +32,7 @@ WARMUP=1
 ITERS=5
 SUITE=""
 MERGE_VALIDITY_ROWS=""
+RNG_MICRO_ROWS=""
 OUT="$SCRIPT_DIR/results/ibex.tsv"
 
 while [[ $# -gt 0 ]]; do
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --iters)       ITERS="$2";       shift 2 ;;
         --suite)       SUITE="$2";       shift 2 ;;
         --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
+        --rng-micro-rows) RNG_MICRO_ROWS="$2"; shift 2 ;;
         --out)         OUT="$2";         shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
@@ -62,7 +65,7 @@ if [[ -n "$SUITE" ]]; then
         tok="${tok//[[:space:]]/}"
         tok="${tok,,}"
         tok="${tok//-/_}"
-        if [[ "$tok" != "merge_validity" ]]; then
+        if [[ "$tok" != "merge_validity" && "$tok" != "rng_micro" ]]; then
             NEEDS_CSV=1
             break
         fi
@@ -85,6 +88,7 @@ BENCH_ARGS=(
 [[ "$NEEDS_CSV" -eq 1 ]] && BENCH_ARGS+=(--csv "$CSV")
 [[ -n "$SUITE" ]] && BENCH_ARGS+=(--suite "$SUITE")
 [[ -n "$MERGE_VALIDITY_ROWS" ]] && BENCH_ARGS+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
+[[ -n "$RNG_MICRO_ROWS" ]] && BENCH_ARGS+=(--rng-micro-rows "$RNG_MICRO_ROWS")
 [[ -f "$CSV_MULTI" ]]   && BENCH_ARGS+=(--csv-multi   "$CSV_MULTI")
 [[ -f "$CSV_TRADES" ]]  && BENCH_ARGS+=(--csv-trades  "$CSV_TRADES")
 [[ -f "$CSV_EVENTS" ]]  && BENCH_ARGS+=(--csv-events  "$CSV_EVENTS")

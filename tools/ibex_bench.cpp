@@ -1,6 +1,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/rng.hpp>
 
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
@@ -745,6 +746,36 @@ auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
     return 0;
 }
 
+template <typename Fn>
+auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
+                                 std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
+    -> int {
+    auto run_and_touch = [&]() {
+        g_bench_sink ^= run_once();
+    };
+
+    for (std::size_t i = 0; i < warmup_iters; ++i) {
+        run_and_touch();
+    }
+
+    std::vector<double> times(iters);
+    for (std::size_t i = 0; i < iters; ++i) {
+        auto t0 = std::chrono::steady_clock::now();
+        run_and_touch();
+        auto t1 = std::chrono::steady_clock::now();
+        times[i] =
+            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
+    }
+
+    auto s = compute_stats(std::move(times));
+    fmt::print(
+        "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
+        "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
+        bench_name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
+        s.p99_ms, rows);
+    return 0;
+}
+
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
                    std::size_t warmup_iters, std::size_t iters, bool include_parse) -> int {
     auto normalized = normalize_input(query.source);
@@ -862,6 +893,7 @@ int main(int argc, char** argv) {
     std::size_t verify_rows = 10000;
     std::size_t timeframe_rows = 0;
     std::size_t merge_validity_rows = 4'000'000;
+    std::size_t rng_micro_rows = 4'000'000;
     std::vector<std::string> suites;
 
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
@@ -896,18 +928,21 @@ int main(int argc, char** argv) {
     app.add_option("--merge-validity-rows", merge_validity_rows,
                    "Row count for merge_validity micro benchmark (default: 4000000)")
         ->check(CLI::PositiveNumber);
+    app.add_option("--rng-micro-rows", rng_micro_rows,
+                   "Row count for rng_micro kernel benchmark (default: 4000000)")
+        ->check(CLI::PositiveNumber);
     app.add_option("--suite", suites,
                    "Benchmark suite(s) to run (comma-separated or repeated). "
                    "Supported: all, core, cumulative, rng, fill, null, filter, multi, "
-                   "events, reshape, timeframe, merge_validity")
+                   "events, reshape, timeframe, merge_validity, rng_micro")
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
-        "all",    "core",  "cumulative", "rng",     "fill",      "null",
-        "filter", "multi", "events",     "reshape", "timeframe", "merge_validity"};
+        "all",   "core",   "cumulative", "rng",       "fill",           "null",     "filter",
+        "multi", "events", "reshape",    "timeframe", "merge_validity", "rng_micro"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -927,7 +962,7 @@ int main(int argc, char** argv) {
             return false;
         }
         // Keep legacy --suite all behavior stable; micro suites are opt-in.
-        return suite != "merge_validity";
+        return suite != "merge_validity" && suite != "rng_micro";
     };
 
     int status = 0;
@@ -1507,6 +1542,191 @@ int main(int argc, char** argv) {
             if (status != 0) {
                 break;
             }
+        }
+    }
+
+    // RNG kernel micro benchmark: isolates scalar-vs-x4 generation cost for
+    // distributions where x4 paths are plausible.
+    if (status == 0 && run_suite("rng_micro")) {
+        constexpr std::uint64_t kSeed = 0x9e3779b97f4a7c15ULL;
+        constexpr double kLambda = 1.7;
+        constexpr double kBernoulliP = 0.3;
+        constexpr std::int64_t kIntLo = 1;
+        constexpr std::int64_t kIntHi = 100;
+        const double inv_lambda = 1.0 / kLambda;
+        const double int_span = static_cast<double>((kIntHi - kIntLo) + 1);
+
+        ibex::Column<double> out_double;
+        out_double.resize(rng_micro_rows);
+        ibex::Column<std::int64_t> out_int;
+        out_int.resize(rng_micro_rows);
+
+        auto digest_double = [&](const ibex::Column<double>& col) -> std::uint64_t {
+            const std::size_t mid = col.size() / 2;
+            const auto a = static_cast<std::uint64_t>(col[0] * 1.0e12);
+            const auto b = static_cast<std::uint64_t>(col[mid] * 1.0e12);
+            const auto c = static_cast<std::uint64_t>(col[col.size() - 1] * 1.0e12);
+            return a ^ (b << 1) ^ (c << 2);
+        };
+        auto digest_int = [&](const ibex::Column<std::int64_t>& col) -> std::uint64_t {
+            const std::size_t mid = col.size() / 2;
+            return static_cast<std::uint64_t>(col[0]) ^
+                   (static_cast<std::uint64_t>(col[mid]) << 1) ^
+                   (static_cast<std::uint64_t>(col[col.size() - 1]) << 2);
+        };
+
+        fmt::print("\n-- RNG kernel micro benchmarks ({} rows) --\n", rng_micro_rows);
+
+        ibex::runtime::reseed_rng(kSeed);
+        status = run_scalar_kernel_benchmark(
+            "rng_uniform_scalar_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                auto& rng = ibex::runtime::get_rng();
+                for (std::size_t i = 0; i < rng_micro_rows; ++i) {
+                    out_double[i] = ibex::runtime::bits_to_01(rng());
+                }
+                return digest_double(out_double);
+            });
+        if (status == 0) {
+            ibex::runtime::reseed_rng_x4(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_uniform_x4_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                    auto& rng4 = ibex::runtime::get_rng_x4_portable();
+                    std::size_t i = 0;
+                    for (; i + 4 <= rng_micro_rows; i += 4) {
+                        const auto bits = rng4();
+                        out_double[i] = ibex::runtime::bits_to_01(bits[0]);
+                        out_double[i + 1] = ibex::runtime::bits_to_01(bits[1]);
+                        out_double[i + 2] = ibex::runtime::bits_to_01(bits[2]);
+                        out_double[i + 3] = ibex::runtime::bits_to_01(bits[3]);
+                    }
+                    if (i < rng_micro_rows) {
+                        const auto bits = rng4();
+                        for (std::size_t lane = 0; i < rng_micro_rows; ++lane, ++i) {
+                            out_double[i] = ibex::runtime::bits_to_01(bits[lane]);
+                        }
+                    }
+                    return digest_double(out_double);
+                });
+        }
+        if (status == 0) {
+            ibex::runtime::reseed_rng(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_exponential_scalar_fn", rng_micro_rows, warmup_iters, iters,
+                [&]() -> std::uint64_t {
+                    auto& rng = ibex::runtime::get_rng();
+                    for (std::size_t i = 0; i < rng_micro_rows; ++i) {
+                        const double u = ibex::runtime::bits_to_01(rng()) + 1e-300;
+                        out_double[i] = -std::log(u) * inv_lambda;
+                    }
+                    return digest_double(out_double);
+                });
+        }
+        if (status == 0) {
+            ibex::runtime::reseed_rng_x4(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_exponential_x4_fn", rng_micro_rows, warmup_iters, iters,
+                [&]() -> std::uint64_t {
+                    auto& rng4 = ibex::runtime::get_rng_x4_portable();
+                    std::size_t i = 0;
+                    for (; i + 4 <= rng_micro_rows; i += 4) {
+                        const auto bits = rng4();
+                        out_double[i] =
+                            -std::log(ibex::runtime::bits_to_01(bits[0]) + 1e-300) * inv_lambda;
+                        out_double[i + 1] =
+                            -std::log(ibex::runtime::bits_to_01(bits[1]) + 1e-300) * inv_lambda;
+                        out_double[i + 2] =
+                            -std::log(ibex::runtime::bits_to_01(bits[2]) + 1e-300) * inv_lambda;
+                        out_double[i + 3] =
+                            -std::log(ibex::runtime::bits_to_01(bits[3]) + 1e-300) * inv_lambda;
+                    }
+                    if (i < rng_micro_rows) {
+                        const auto bits = rng4();
+                        for (std::size_t lane = 0; i < rng_micro_rows; ++lane, ++i) {
+                            out_double[i] =
+                                -std::log(ibex::runtime::bits_to_01(bits[lane]) + 1e-300) *
+                                inv_lambda;
+                        }
+                    }
+                    return digest_double(out_double);
+                });
+        }
+        if (status == 0) {
+            ibex::runtime::reseed_rng(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_bernoulli_scalar_fn", rng_micro_rows, warmup_iters, iters,
+                [&]() -> std::uint64_t {
+                    auto& rng = ibex::runtime::get_rng();
+                    for (std::size_t i = 0; i < rng_micro_rows; ++i) {
+                        out_int[i] = ibex::runtime::bits_to_01(rng()) < kBernoulliP ? 1 : 0;
+                    }
+                    return digest_int(out_int);
+                });
+        }
+        if (status == 0) {
+            ibex::runtime::reseed_rng_x4(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_bernoulli_x4_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                    auto& rng4 = ibex::runtime::get_rng_x4_portable();
+                    std::size_t i = 0;
+                    for (; i + 4 <= rng_micro_rows; i += 4) {
+                        const auto bits = rng4();
+                        out_int[i] = ibex::runtime::bits_to_01(bits[0]) < kBernoulliP ? 1 : 0;
+                        out_int[i + 1] = ibex::runtime::bits_to_01(bits[1]) < kBernoulliP ? 1 : 0;
+                        out_int[i + 2] = ibex::runtime::bits_to_01(bits[2]) < kBernoulliP ? 1 : 0;
+                        out_int[i + 3] = ibex::runtime::bits_to_01(bits[3]) < kBernoulliP ? 1 : 0;
+                    }
+                    if (i < rng_micro_rows) {
+                        const auto bits = rng4();
+                        for (std::size_t lane = 0; i < rng_micro_rows; ++lane, ++i) {
+                            out_int[i] =
+                                ibex::runtime::bits_to_01(bits[lane]) < kBernoulliP ? 1 : 0;
+                        }
+                    }
+                    return digest_int(out_int);
+                });
+        }
+        if (status == 0) {
+            ibex::runtime::reseed_rng(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_int_scalar_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                    auto& rng = ibex::runtime::get_rng();
+                    for (std::size_t i = 0; i < rng_micro_rows; ++i) {
+                        out_int[i] = kIntLo + static_cast<std::int64_t>(
+                                                  ibex::runtime::bits_to_01(rng()) * int_span);
+                    }
+                    return digest_int(out_int);
+                });
+        }
+        if (status == 0) {
+            ibex::runtime::reseed_rng_x4(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_int_x4_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                    auto& rng4 = ibex::runtime::get_rng_x4_portable();
+                    std::size_t i = 0;
+                    for (; i + 4 <= rng_micro_rows; i += 4) {
+                        const auto bits = rng4();
+                        out_int[i] = kIntLo + static_cast<std::int64_t>(
+                                                  ibex::runtime::bits_to_01(bits[0]) * int_span);
+                        out_int[i + 1] =
+                            kIntLo + static_cast<std::int64_t>(ibex::runtime::bits_to_01(bits[1]) *
+                                                               int_span);
+                        out_int[i + 2] =
+                            kIntLo + static_cast<std::int64_t>(ibex::runtime::bits_to_01(bits[2]) *
+                                                               int_span);
+                        out_int[i + 3] =
+                            kIntLo + static_cast<std::int64_t>(ibex::runtime::bits_to_01(bits[3]) *
+                                                               int_span);
+                    }
+                    if (i < rng_micro_rows) {
+                        const auto bits = rng4();
+                        for (std::size_t lane = 0; i < rng_micro_rows; ++lane, ++i) {
+                            out_int[i] =
+                                kIntLo + static_cast<std::int64_t>(
+                                             ibex::runtime::bits_to_01(bits[lane]) * int_span);
+                        }
+                    }
+                    return digest_int(out_int);
+                });
         }
     }
 

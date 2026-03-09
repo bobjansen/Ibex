@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <csv.hpp>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -892,6 +893,7 @@ int main(int argc, char** argv) {
     bool verify = false;
     std::size_t verify_rows = 10000;
     std::size_t timeframe_rows = 0;
+    std::size_t reshape_rows = 100'000;
     std::size_t merge_validity_rows = 4'000'000;
     std::size_t rng_micro_rows = 4'000'000;
     std::vector<std::string> suites;
@@ -925,6 +927,9 @@ int main(int argc, char** argv) {
            "--timeframe-rows", timeframe_rows,
            "Row count for in-memory TimeFrame benchmarks (lag, rolling_*). 0 = skip (default).")
         ->check(CLI::NonNegativeNumber);
+    app.add_option("--reshape-rows", reshape_rows,
+                   "Row count for synthetic reshape benchmark table (default: 100000)")
+        ->check(CLI::PositiveNumber);
     app.add_option("--merge-validity-rows", merge_validity_rows,
                    "Row count for merge_validity micro benchmark (default: 4000000)")
         ->check(CLI::PositiveNumber);
@@ -1300,12 +1305,11 @@ int main(int argc, char** argv) {
     }
 
     // Reshape benchmarks: melt (wide→long) and dcast (long→wide).
-    // Uses a synthetic wide OHLC table (250 symbols × 400 days = 100,000 rows,
-    // 4 measure columns) to exercise the reshape interpreter paths at a meaningful scale.
+    // Uses a synthetic wide OHLC table with configurable row count to exercise
+    // reshape paths at scale.
     if (status == 0 && run_suite("reshape")) {
-        constexpr std::size_t reshape_n_symbols = 250;
         constexpr std::size_t reshape_n_days = 400;
-        constexpr std::size_t reshape_rows = reshape_n_symbols * reshape_n_days;
+        const std::size_t reshape_n_symbols = (reshape_rows + reshape_n_days - 1) / reshape_n_days;
 
         ibex::Column<std::string> sym_col;
         ibex::Column<std::int64_t> day_col;
@@ -1337,7 +1341,9 @@ int main(int argc, char** argv) {
         wide_table.add_column("low", std::move(low_col));
         wide_table.add_column("close", std::move(close_col));
 
-        fmt::print("\n-- Reshape benchmarks ({} wide rows, 4 measure cols) --\n", reshape_rows);
+        fmt::print(
+            "\n-- Reshape benchmarks ({} wide rows, 4 measure cols; {} symbols, {} days) --\n",
+            reshape_rows, reshape_n_symbols, reshape_n_days);
 
         ibex::runtime::TableRegistry reshape_tables;
         reshape_tables.emplace("wide", std::move(wide_table));
@@ -1363,9 +1369,10 @@ int main(int argc, char** argv) {
                            long_result.error());
                 return 1;
             }
+            ibex::runtime::Table long_table = std::move(*long_result);
 
             ibex::runtime::TableRegistry dcast_tables;
-            dcast_tables.emplace("long", std::move(*long_result));
+            dcast_tables.emplace("long", long_table);
 
             // dcast: long→wide (pivot=variable, value=value, by={symbol,day})
             BenchQuery dcast_query{
@@ -1374,6 +1381,79 @@ int main(int argc, char** argv) {
             };
             status =
                 run_benchmark(dcast_query, dcast_tables, warmup_iters, iters, saved_include_parse);
+
+            if (status == 0) {
+                const auto* sym_entry = long_table.find_entry("symbol");
+                const auto* day_entry = long_table.find_entry("day");
+                const auto* value_entry = long_table.find_entry("value");
+                if (sym_entry == nullptr || day_entry == nullptr || value_entry == nullptr) {
+                    fmt::print("error: long table is missing expected columns for typed dcast\n");
+                    return 1;
+                }
+
+                const std::size_t long_rows = long_table.rows();
+
+                auto make_typed_long_table =
+                    [&](ibex::runtime::ColumnValue pivot_column,
+                        const std::string& pivot_name) -> ibex::runtime::Table {
+                    ibex::runtime::Table typed;
+                    typed.columns.reserve(4);
+                    typed.columns.push_back(*sym_entry);
+                    typed.index.emplace("symbol", 0);
+                    typed.columns.push_back(*day_entry);
+                    typed.index.emplace("day", 1);
+                    typed.columns.push_back(*value_entry);
+                    typed.index.emplace("value", 2);
+                    typed.add_column(pivot_name, std::move(pivot_column));
+                    return typed;
+                };
+
+                ibex::Column<std::int64_t> pivot_int_col;
+                pivot_int_col.reserve(long_rows);
+                for (std::size_t i = 0; i < long_rows; ++i) {
+                    pivot_int_col.push_back(static_cast<std::int64_t>(i % 4));
+                }
+                ibex::runtime::TableRegistry dcast_int_tables;
+                dcast_int_tables.emplace(
+                    "long_int", make_typed_long_table(std::move(pivot_int_col), "pivot_id"));
+                BenchQuery dcast_int_query{
+                    "dcast_long_to_wide_int_pivot",
+                    "long_int[dcast pivot_id, select value, by {symbol, day}]",
+                };
+                status = run_benchmark(dcast_int_query, dcast_int_tables, warmup_iters, iters,
+                                       saved_include_parse);
+                if (status != 0) {
+                    return status;
+                }
+
+                using CatCol = ibex::Column<ibex::Categorical>;
+                auto dict = std::make_shared<std::vector<std::string>>();
+                dict->reserve(4);
+                dict->push_back("open");
+                dict->push_back("high");
+                dict->push_back("low");
+                dict->push_back("close");
+                auto index = std::make_shared<CatCol::index_map>();
+                index->reserve(dict->size());
+                for (std::size_t i = 0; i < dict->size(); ++i) {
+                    index->emplace(dict->at(i), static_cast<CatCol::code_type>(i));
+                }
+                std::vector<CatCol::code_type> codes;
+                codes.reserve(long_rows);
+                for (std::size_t i = 0; i < long_rows; ++i) {
+                    codes.push_back(static_cast<CatCol::code_type>(i % 4));
+                }
+                CatCol pivot_cat_col(dict, index, std::move(codes));
+                ibex::runtime::TableRegistry dcast_cat_tables;
+                dcast_cat_tables.emplace(
+                    "long_cat", make_typed_long_table(std::move(pivot_cat_col), "pivot_cat"));
+                BenchQuery dcast_cat_query{
+                    "dcast_long_to_wide_cat_pivot",
+                    "long_cat[dcast pivot_cat, select value, by {symbol, day}]",
+                };
+                status = run_benchmark(dcast_cat_query, dcast_cat_tables, warmup_iters, iters,
+                                       saved_include_parse);
+            }
         }
     }
 

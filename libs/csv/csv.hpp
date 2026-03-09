@@ -94,8 +94,12 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
 
     auto col_names = doc.GetColumnNames();
     ibex::runtime::Table table;
-    constexpr std::size_t kMaxCategoricalUniques = 4096;
-    constexpr double kMaxCategoricalRatio = 0.05;
+    // Categorise string columns when cardinality is low enough that the dictionary is
+    // worthwhile.  Column<Categorical> carries an index_ (std::unordered_map) that costs
+    // ~80 bytes per unique entry.  Break-even vs the flat-buffer Column<std::string>
+    // (4B offset + L chars per row) is roughly r = L/80 ≈ 10% for typical 8-char strings.
+    // Beyond ~10% the categorical representation uses more memory and gives no benefit.
+    constexpr double kMaxCategoricalRatio = 0.10;
 
     for (const auto& name : col_names) {
         std::vector<std::string> vals = doc.GetColumn<std::string>(name);
@@ -200,15 +204,12 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
         // String fallback (with categorical detection)
         const std::size_t n = vals.size();
         if (n > 0) {
-            const std::size_t ratio_limit = std::max<std::size_t>(
+            const std::size_t max_uniques = std::max<std::size_t>(
                 1, static_cast<std::size_t>(static_cast<double>(n) * kMaxCategoricalRatio));
-            const std::size_t max_uniques = std::min(kMaxCategoricalUniques, ratio_limit);
             std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
             codes.reserve(n);
             std::vector<std::string> dict;
-            dict.reserve(std::min(n, max_uniques));
             std::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type> index;
-            index.reserve(std::min(n, max_uniques));
             bool ok = true;
             for (const auto& v : vals) {
                 std::string_view key{v};

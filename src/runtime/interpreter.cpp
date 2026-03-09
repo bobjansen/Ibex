@@ -6801,38 +6801,33 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
 
 // ─── Dcast (long → wide) ────────────────────────────────────────────────────
 
-// Append one key-column value into a flat byte buffer used as a composite hash key.
-// Format: '\x00' for null; '\x01' + raw bytes for non-null scalars;
-//         '\x01' + uint32 length + string bytes for string/categorical.
-// The same format is used for every row so keys are unambiguous across types.
-static void dcast_append_key(std::string& buf, const ColumnValue& col, std::size_t r,
-                             bool null_val) {
-    if (null_val) {
-        buf.push_back('\x00');
-        return;
+// Composite row-key for dcast: up to 8 int64 slots stored inline.
+// String columns are pre-interned to int32 codes so all key fields are integers.
+// Null is encoded as INT64_MIN (reserved sentinel; never a valid interned code).
+// n stores the actual number of key columns so hash and equality only touch the
+// used slots — avoids wasting cache on zero padding for typical 1-2 key cases.
+// Stored inline in robin_hood::unordered_flat_map — no per-key heap allocation.
+struct DcastKey {
+    static constexpr std::size_t kMaxCols = 8;
+    std::array<std::int64_t, kMaxCols> v{};
+    std::uint8_t n{0};
+    auto operator==(const DcastKey& o) const noexcept -> bool {
+        return std::memcmp(v.data(), o.v.data(), n * sizeof(std::int64_t)) == 0;
     }
-    buf.push_back('\x01');
-    std::visit(
-        [&buf, r](const auto& c) {
-            using T = std::decay_t<decltype(c)>;
-            if constexpr (std::is_same_v<T, Column<std::string>>) {
-                const auto& s = c[r];
-                const auto len = static_cast<std::uint32_t>(s.size());
-                buf.append(reinterpret_cast<const char*>(&len), 4);
-                buf.append(s);
-            } else if constexpr (std::is_same_v<T, Column<Categorical>>) {
-                const std::string_view s = c[r];
-                const auto len = static_cast<std::uint32_t>(s.size());
-                buf.append(reinterpret_cast<const char*>(&len), 4);
-                buf.append(s);
-            } else {
-                // int64, double, bool, Date, Timestamp — append raw bytes.
-                const auto v = c[r];
-                buf.append(reinterpret_cast<const char*>(&v), sizeof(v));
-            }
-        },
-        col);
-}
+};
+struct DcastKeyHash {
+    auto operator()(const DcastKey& k) const noexcept -> std::size_t {
+        // splitmix64-style mixing over the n used int64 slots — fast and low-collision.
+        std::uint64_t h = 0;
+        for (std::size_t i = 0; i < k.n; ++i) {
+            h ^= static_cast<std::uint64_t>(k.v[i]);
+            h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+            h ^= h >> 31;
+        }
+        return static_cast<std::size_t>(h);
+    }
+};
 
 auto dcast_table(const Table& input, const std::string& pivot_column,
                  const std::string& value_column, const std::vector<std::string>& row_keys)
@@ -6949,203 +6944,192 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 
     std::size_t n_pivots = pivot_values.size();
 
-    // ── Pass 2: group by row_keys + populate cell_rows ────────────────────────
-    // Key changes vs. old implementation:
-    // (a) No row_pivot_index[rows] array — pivot index resolved inline per row.
-    // (b) cell_rows pre-allocated to expected output size; grows with doubling.
-    // (c) robin_hood flat map with a reused flat byte-string key — avoids the
-    //     per-row heap allocation that Key{vector<ScalarValue>} caused.
+    // ── Pass 2a: intern string key columns ───────────────────────────────────
+    // Convert each Column<std::string> key column to a dense int32 code array so
+    // the main loop works entirely with integers — no string copies, no SSO issues.
+    // Column<Categorical> and Column<int64> are used directly (no pre-pass needed).
+    //
+    // Each str_intern[k] is either empty (non-string column) or has `rows` entries.
+    constexpr std::int64_t kNullKey = std::numeric_limits<std::int64_t>::min();
+    const std::size_t n_keys = key_indices.size();
+    std::vector<std::vector<std::int32_t>> str_intern(n_keys);
+
+    for (std::size_t k = 0; k < n_keys; ++k) {
+        const std::size_t ki = key_indices[k];
+        const auto* str_col = std::get_if<Column<std::string>>(input.columns[ki].column.get());
+        if (str_col == nullptr)
+            continue;
+        auto& codes = str_intern[k];
+        codes.reserve(rows);
+        robin_hood::unordered_flat_map<std::string_view, std::int32_t, StringViewHash, StringViewEq>
+            sv_to_code;
+        sv_to_code.reserve(rows / n_pivots + 1);
+        for (std::size_t r = 0; r < rows; ++r) {
+            if (is_null(input.columns[ki], r)) {
+                codes.push_back(-1);
+                continue;
+            }
+            const std::string_view sv = (*str_col)[r];
+            auto [it, inserted] =
+                sv_to_code.try_emplace(sv, static_cast<std::int32_t>(sv_to_code.size()));
+            codes.push_back(it->second);
+        }
+    }
+
+    // ── Pass 2b: group by row_keys + populate cell_rows ──────────────────────
+    // Two key-path implementations share the same output structures:
+    //   fast  (n_keys ≤ 8): DcastKey inline int64 array — no per-key heap alloc.
+    //   fallback (n_keys > 8): raw-bytes std::string key — correct for any arity.
+    // Both use a previous-key cache to skip hash lookups for consecutive same-key
+    // rows (common in melt output where n_pivots consecutive rows share one key).
     const std::size_t est_out_rows = rows / n_pivots + 1;
 
-    struct SymDayKey {
-        std::uint32_t sym_code{0};
-        std::int64_t day{0};
-        bool sym_null{false};
-        bool day_null{false};
-        auto operator==(const SymDayKey& other) const -> bool {
-            return sym_code == other.sym_code && day == other.day && sym_null == other.sym_null &&
-                   day_null == other.day_null;
-        }
-    };
-    struct SymDayKeyHash {
-        auto operator()(const SymDayKey& key) const noexcept -> std::size_t {
-            std::size_t seed = 0;
-            auto hash_combine = [&](std::size_t value) {
-                seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-            };
-            hash_combine(std::hash<std::uint32_t>{}(key.sym_code));
-            hash_combine(std::hash<std::int64_t>{}(key.day));
-            hash_combine(std::hash<bool>{}(key.sym_null));
-            hash_combine(std::hash<bool>{}(key.day_null));
-            return seed;
-        }
-    };
-
-    const auto is_string_like = [](const ColumnValue& col) -> bool {
-        return std::holds_alternative<Column<std::string>>(col) ||
-               std::holds_alternative<Column<Categorical>>(col);
-    };
-    const auto is_int64_col = [](const ColumnValue& col) -> bool {
-        return std::holds_alternative<Column<std::int64_t>>(col);
-    };
-
-    bool use_sym_day_fast_path = false;
-    std::size_t sym_key_idx = 0;
-    std::size_t day_key_idx = 0;
-    const Column<std::string>* sym_str_col = nullptr;
-    const Column<Categorical>* sym_cat_col = nullptr;
-    const Column<std::int64_t>* day_col = nullptr;
-    if (key_indices.size() == 2) {
-        const std::size_t k0 = key_indices[0];
-        const std::size_t k1 = key_indices[1];
-        const auto& c0 = *input.columns[k0].column;
-        const auto& c1 = *input.columns[k1].column;
-        if (is_string_like(c0) && is_int64_col(c1)) {
-            use_sym_day_fast_path = true;
-            sym_key_idx = k0;
-            day_key_idx = k1;
-        } else if (is_string_like(c1) && is_int64_col(c0)) {
-            use_sym_day_fast_path = true;
-            sym_key_idx = k1;
-            day_key_idx = k0;
-        }
-        if (use_sym_day_fast_path) {
-            const auto& sym_col = *input.columns[sym_key_idx].column;
-            sym_str_col = std::get_if<Column<std::string>>(&sym_col);
-            sym_cat_col = std::get_if<Column<Categorical>>(&sym_col);
-            day_col = std::get_if<Column<std::int64_t>>(&*input.columns[day_key_idx].column);
-            if (day_col == nullptr || (sym_str_col == nullptr && sym_cat_col == nullptr)) {
-                use_sym_day_fast_path = false;
-            }
-        }
-    }
-
-    robin_hood::unordered_map<std::string, std::size_t> key_to_row;
-    robin_hood::unordered_flat_map<SymDayKey, std::size_t, SymDayKeyHash> key_to_row_sym_day;
-    robin_hood::unordered_flat_map<std::string_view, std::uint32_t, StringViewHash, StringViewEq>
-        sym_to_code;
-    if (use_sym_day_fast_path) {
-        key_to_row_sym_day.reserve(est_out_rows);
-        if (sym_str_col != nullptr) {
-            sym_to_code.reserve(est_out_rows);
-        }
-    } else {
-        key_to_row.reserve(est_out_rows);
-    }
     std::vector<std::size_t> first_input_row;
     first_input_row.reserve(est_out_rows);
     // Dense map: (out_row * n_pivots + pvi) → input_row, or kMissingCell.
     std::vector<std::size_t> cell_rows(est_out_rows * n_pivots, kMissingCell);
 
-    // Reused buffer: cleared each row, never deallocated — avoids per-row malloc.
-    std::string key_buf;
-    if (!use_sym_day_fast_path) {
-        key_buf.reserve(64);
-    }
+    // Helper: encode key column k at row r as a single int64.
+    const auto encode_key = [&](std::size_t k, std::size_t r) -> std::int64_t {
+        const std::size_t ki = key_indices[k];
+        if (is_null(input.columns[ki], r))
+            return kNullKey;
+        if (!str_intern[k].empty())
+            return str_intern[k][r];  // interned string code
+        return std::visit(
+            [r](const auto& c) -> std::int64_t {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, Column<Categorical>>)
+                    return static_cast<std::int64_t>(c.code_at(r));
+                else if constexpr (std::is_same_v<T, Column<std::int64_t>>)
+                    return c[r];
+                else if constexpr (std::is_same_v<T, Column<double>>)
+                    return static_cast<std::int64_t>(c[r]);
+                else if constexpr (std::is_same_v<T, Column<bool>>)
+                    return static_cast<std::int64_t>(c[r] ? 1 : 0);
+                else if constexpr (std::is_same_v<T, Column<Date>>)
+                    return static_cast<std::int64_t>(c[r].days);
+                else if constexpr (std::is_same_v<T, Column<Timestamp>>)
+                    return c[r].nanos;
+                else
+                    return kNullKey;  // Column<std::string> — should be pre-interned
+            },
+            *input.columns[ki].column);
+    };
 
-    for (std::size_t r = 0; r < rows; ++r) {
-        // ── inline pivot lookup (no row_pivot_index array) ──
-        std::size_t pvi = kMissingPivot;
-        if (!is_null(input.columns[pivot_idx], r)) {
-            if (!cat_code_to_pvi.empty()) {
-                const auto* cat_col = std::get_if<Column<Categorical>>(&pivot_col);
-                const auto code = cat_col->code_at(r);
-                if (code >= 0) {
-                    const auto ci = static_cast<std::size_t>(code);
-                    if (ci < cat_code_to_pvi.size())
-                        pvi = cat_code_to_pvi[ci];
-                }
-            } else if (!int_pvi_map.empty()) {
-                const auto* int_col = std::get_if<Column<std::int64_t>>(&pivot_col);
-                auto it = int_pvi_map.find((*int_col)[r]);
-                if (it != int_pvi_map.end())
-                    pvi = it->second;
-            } else if (const auto* str_col_ptr = std::get_if<Column<std::string>>(&pivot_col)) {
-                // Fast path for string pivot: look up by direct reference — no copy.
-                auto it = str_pvi_map.find((*str_col_ptr)[r]);
-                if (it != str_pvi_map.end())
-                    pvi = it->second;
+    // ── helper: resolve pivot index for row r (shared by both key paths) ──────
+    const auto resolve_pvi = [&](std::size_t r) -> std::size_t {
+        if (is_null(input.columns[pivot_idx], r))
+            return kMissingPivot;
+        if (!cat_code_to_pvi.empty()) {
+            const auto* cat_col = std::get_if<Column<Categorical>>(&pivot_col);
+            const auto code = cat_col->code_at(r);
+            if (code >= 0) {
+                const auto ci = static_cast<std::size_t>(code);
+                if (ci < cat_code_to_pvi.size())
+                    return cat_code_to_pvi[ci];
+            }
+            return kMissingPivot;
+        }
+        if (!int_pvi_map.empty()) {
+            const auto* int_col = std::get_if<Column<std::int64_t>>(&pivot_col);
+            auto it = int_pvi_map.find((*int_col)[r]);
+            return it != int_pvi_map.end() ? it->second : kMissingPivot;
+        }
+        if (const auto* str_col_ptr = std::get_if<Column<std::string>>(&pivot_col)) {
+            auto it = str_pvi_map.find((*str_col_ptr)[r]);
+            return it != str_pvi_map.end() ? it->second : kMissingPivot;
+        }
+        const std::string pv = std::visit(
+            [r](const auto& col) -> std::string {
+                using ColType = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColType, Column<Categorical>>)
+                    return std::string(col[r]);
+                else if constexpr (std::is_same_v<ColType, Column<double>>)
+                    return std::to_string(col[r]);
+                else if constexpr (std::is_same_v<ColType, Column<bool>>)
+                    return col[r] ? "true" : "false";
+                else
+                    return std::to_string(r);
+            },
+            pivot_col);
+        auto it = str_pvi_map.find(pv);
+        return it != str_pvi_map.end() ? it->second : kMissingPivot;
+    };
+
+    if (n_keys <= DcastKey::kMaxCols) {
+        // ── fast path: DcastKey (inline int64 array, no heap per key) ────────
+        robin_hood::unordered_flat_map<DcastKey, std::size_t, DcastKeyHash> key_to_row;
+        key_to_row.reserve(est_out_rows);
+        DcastKey prev_key{};
+        prev_key.n = static_cast<std::uint8_t>(n_keys);
+        std::size_t prev_out_row = std::numeric_limits<std::size_t>::max();
+
+        for (std::size_t r = 0; r < rows; ++r) {
+            const std::size_t pvi = resolve_pvi(r);
+            if (pvi == kMissingPivot)
+                continue;
+
+            DcastKey key{};
+            key.n = static_cast<std::uint8_t>(n_keys);
+            for (std::size_t k = 0; k < n_keys; ++k)
+                key.v[k] = encode_key(k, r);
+
+            std::size_t out_row;
+            if (key == prev_key && prev_out_row != std::numeric_limits<std::size_t>::max()) {
+                out_row = prev_out_row;
             } else {
-                // Other column types: stringify and look up (uncommon).
-                const std::string pv = std::visit(
-                    [r](const auto& col) -> std::string {
-                        using ColType = std::decay_t<decltype(col)>;
-                        if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                            return std::string(col[r]);
-                        } else if constexpr (std::is_same_v<ColType, Column<double>>) {
-                            return std::to_string(col[r]);
-                        } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
-                            return col[r] ? "true" : "false";
-                        } else {
-                            return std::to_string(r);
-                        }
-                    },
-                    pivot_col);
-                auto it = str_pvi_map.find(pv);
-                if (it != str_pvi_map.end())
-                    pvi = it->second;
+                auto [it, inserted] = key_to_row.try_emplace(key, first_input_row.size());
+                if (inserted) {
+                    first_input_row.push_back(r);
+                    const std::size_t needed = first_input_row.size() * n_pivots;
+                    if (needed > cell_rows.size())
+                        cell_rows.resize(std::max(needed, cell_rows.size() * 2), kMissingCell);
+                }
+                out_row = it->second;
+                prev_key = key;
+                prev_out_row = out_row;
             }
+            cell_rows[out_row * n_pivots + pvi] = r;
         }
-        if (pvi == kMissingPivot)
-            continue;
+    } else {
+        // ── fallback path: raw-byte string key for >8 key columns ────────────
+        // Each key is n_keys*8 bytes (the raw int64 values from encode_key).
+        // Slightly slower due to string allocation but correct for any key count.
+        robin_hood::unordered_map<std::string, std::size_t> key_to_row_str;
+        key_to_row_str.reserve(est_out_rows);
+        const std::size_t key_bytes = n_keys * sizeof(std::int64_t);
+        std::string prev_key_str(key_bytes, '\0');
+        std::size_t prev_out_row = std::numeric_limits<std::size_t>::max();
 
-        std::size_t out_row = 0;
-        if (use_sym_day_fast_path) {
-            SymDayKey key;
-            key.sym_null = is_null(input.columns[sym_key_idx], r);
-            key.day_null = is_null(input.columns[day_key_idx], r);
+        for (std::size_t r = 0; r < rows; ++r) {
+            const std::size_t pvi = resolve_pvi(r);
+            if (pvi == kMissingPivot)
+                continue;
 
-            if (!key.sym_null) {
-                if (sym_str_col != nullptr) {
-                    const std::string_view sym = (*sym_str_col)[r];
-                    auto [it, inserted] = sym_to_code.try_emplace(
-                        sym, static_cast<std::uint32_t>(sym_to_code.size()));
-                    key.sym_code = it->second;
-                    (void)inserted;
-                } else if (sym_cat_col != nullptr) {
-                    const auto code = sym_cat_col->code_at(r);
-                    if (code < 0) {
-                        key.sym_null = true;
-                    } else {
-                        key.sym_code = static_cast<std::uint32_t>(code);
-                    }
+            std::string key(key_bytes, '\0');
+            for (std::size_t k = 0; k < n_keys; ++k) {
+                std::int64_t v = encode_key(k, r);
+                std::memcpy(key.data() + k * sizeof(std::int64_t), &v, sizeof(v));
+            }
+
+            std::size_t out_row;
+            if (key == prev_key_str && prev_out_row != std::numeric_limits<std::size_t>::max()) {
+                out_row = prev_out_row;
+            } else {
+                auto [it, inserted] = key_to_row_str.try_emplace(key, first_input_row.size());
+                if (inserted) {
+                    first_input_row.push_back(r);
+                    const std::size_t needed = first_input_row.size() * n_pivots;
+                    if (needed > cell_rows.size())
+                        cell_rows.resize(std::max(needed, cell_rows.size() * 2), kMissingCell);
                 }
+                out_row = it->second;
+                prev_key_str = std::move(key);
+                prev_out_row = out_row;
             }
-            if (!key.day_null) {
-                key.day = (*day_col)[r];
-            }
-
-            auto [it, inserted] = key_to_row_sym_day.try_emplace(key, first_input_row.size());
-            if (inserted) {
-                const std::size_t new_out = first_input_row.size();
-                first_input_row.push_back(r);
-                const std::size_t needed = (new_out + 1) * n_pivots;
-                if (needed > cell_rows.size()) {
-                    cell_rows.resize(std::max(needed, cell_rows.size() * 2), kMissingCell);
-                }
-            }
-            out_row = it->second;
-        } else {
-            // ── build flat composite key into reused buffer ──
-            key_buf.clear();
-            for (std::size_t ki : key_indices) {
-                dcast_append_key(key_buf, *input.columns[ki].column, r,
-                                 is_null(input.columns[ki], r));
-            }
-
-            auto [it, inserted] = key_to_row.try_emplace(key_buf, first_input_row.size());
-            if (inserted) {
-                const std::size_t new_out = first_input_row.size();
-                first_input_row.push_back(r);
-                // Grow cell_rows with doubling to avoid per-row resize.
-                const std::size_t needed = (new_out + 1) * n_pivots;
-                if (needed > cell_rows.size()) {
-                    cell_rows.resize(std::max(needed, cell_rows.size() * 2), kMissingCell);
-                }
-            }
-            out_row = it->second;
+            cell_rows[out_row * n_pivots + pvi] = r;
         }
-        cell_rows[out_row * n_pivots + pvi] = r;  // last value wins for duplicates
     }
 
     std::size_t out_rows = first_input_row.size();

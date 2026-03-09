@@ -239,17 +239,25 @@ if (!is.null(csv_multi_path)) {
 }
 
 # ── Reshape benchmarks (melt / dcast) ─────────────────────────────────────────
-if (!is.null(csv_multi_path)) {
-    if (!skip_data_table) {
-        message("\ndata.table: loading multi for reshape...")
-        dtm_reshape <- fread(csv_multi_path)
+# Synthetic wide OHLC table: 250 symbols × 400 days = 100,000 rows, 4 measure cols.
+{
+    n_sym <- 250L
+    n_day <- 400L
+    reshape_rows <- n_sym * n_day
+    idx  <- seq_len(reshape_rows) - 1L
+    base <- 100.0 + idx %% 1000L
 
-        # Build the wide OHLC table first
-        wide_dt <- dtm_reshape[, .(open = data.table::first(price),
-                                    high = max(price),
-                                    low  = min(price),
-                                    close = data.table::last(price)),
-                                by = .(symbol, day)]
+    if (!skip_data_table) {
+        message(sprintf("\ndata.table: building synthetic wide table (%d rows)...", reshape_rows))
+
+        wide_dt <- data.table(
+            symbol = sprintf("S%04d", rep(seq_len(n_sym) - 1L, times = n_day)),
+            day    = rep(seq_len(n_day), each = n_sym),
+            open   = base,
+            high   = base + 1.0,
+            low    = base - 1.0,
+            close  = base + 0.5
+        )
         message(sprintf("  data.table: wide table has %d rows", nrow(wide_dt)))
 
         message("\n=== data.table (reshape) ===")
@@ -267,17 +275,17 @@ if (!is.null(csv_multi_path)) {
     }
 
     if (!skip_dplyr) {
-        message("\ndplyr: loading multi for reshape...")
-        tbm_reshape <- as_tibble(fread(csv_multi_path))
         library(tidyr)
+        message(sprintf("\ndplyr: building synthetic wide table (%d rows)...", reshape_rows))
 
-        # Build the wide OHLC table first
-        wide_tb <- tbm_reshape |> group_by(symbol, day) |>
-            summarise(open = dplyr::first(price),
-                      high = max(price),
-                      low  = min(price),
-                      close = dplyr::last(price),
-                      .groups = "drop")
+        wide_tb <- tibble(
+            symbol = sprintf("S%04d", rep(seq_len(n_sym) - 1L, times = n_day)),
+            day    = rep(seq_len(n_day), each = n_sym),
+            open   = base,
+            high   = base + 1.0,
+            low    = base - 1.0,
+            close  = base + 0.5
+        )
         message(sprintf("  dplyr: wide table has %d rows", nrow(wide_tb)))
 
         message("\n=== dplyr (reshape) ===")

@@ -6797,6 +6797,9 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
 auto dcast_table(const Table& input, const std::string& pivot_column,
                  const std::string& value_column, const std::vector<std::string>& row_keys)
     -> std::expected<Table, std::string> {
+    constexpr std::size_t kMissingPivot = std::numeric_limits<std::size_t>::max();
+    constexpr std::size_t kMissingCell = std::numeric_limits<std::size_t>::max();
+
     // Validate columns exist.
     auto pivot_it = input.index.find(pivot_column);
     if (pivot_it == input.index.end()) {
@@ -6826,6 +6829,8 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     // Collect distinct pivot values in insertion order, converted to strings.
     std::vector<std::string> pivot_values;
     std::unordered_map<std::string, std::size_t> pivot_value_index;
+    pivot_value_index.reserve(rows);
+    std::vector<std::size_t> row_pivot_index(rows, kMissingPivot);
     const auto& pivot_col = *input.columns[pivot_idx].column;
 
     for (std::size_t r = 0; r < rows; ++r) {
@@ -6850,10 +6855,11 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 }
             },
             pivot_col);
-        if (!pivot_value_index.contains(pv)) {
-            pivot_value_index[pv] = pivot_values.size();
-            pivot_values.push_back(pv);
+        auto [it, inserted] = pivot_value_index.try_emplace(pv, pivot_values.size());
+        if (inserted) {
+            pivot_values.push_back(it->first);
         }
+        row_pivot_index[r] = it->second;
     }
 
     if (pivot_values.empty()) {
@@ -6871,19 +6877,19 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 
     // Group rows by row_keys. Map from Key → first-seen output row index.
     // Also collect which (output_row, pivot_col_idx) has a value.
-    struct CellInfo {
-        std::size_t input_row;
-    };
-    // output_row → (pivot_col_idx → input_row)
     std::unordered_map<Key, std::size_t, KeyHash, KeyEq> key_to_row;
+    key_to_row.reserve(rows);
     std::vector<std::size_t> first_input_row;  // for each output row, the first input row
-    // Map: (output_row_idx * n_pivots + pivot_col_idx) → input_row
-    std::unordered_map<std::size_t, std::size_t> cell_map;
+    first_input_row.reserve(rows);
+    // Dense map: (output_row_idx * n_pivots + pivot_col_idx) -> input_row, or kMissingCell.
+    std::vector<std::size_t> cell_rows;
     std::size_t n_pivots = pivot_values.size();
 
     for (std::size_t r = 0; r < rows; ++r) {
-        if (is_null(input.columns[pivot_idx], r))
+        const std::size_t pvi = row_pivot_index[r];
+        if (pvi == kMissingPivot) {
             continue;
+        }
 
         Key key;
         key.values.reserve(row_keys.size());
@@ -6898,30 +6904,11 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         auto [it, inserted] = key_to_row.try_emplace(key, first_input_row.size());
         if (inserted) {
             first_input_row.push_back(r);
+            cell_rows.resize(first_input_row.size() * n_pivots, kMissingCell);
         }
         std::size_t out_row = it->second;
-
-        std::string pv = std::visit(
-            [r](const auto& col) -> std::string {
-                using ColType = std::decay_t<decltype(col)>;
-                if constexpr (std::is_same_v<ColType, Column<std::string>>) {
-                    return std::string(col[r]);
-                } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                    return std::string(col[r]);
-                } else if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
-                    return std::to_string(col[r]);
-                } else if constexpr (std::is_same_v<ColType, Column<double>>) {
-                    return std::to_string(col[r]);
-                } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
-                    return col[r] ? "true" : "false";
-                } else {
-                    return std::to_string(r);
-                }
-            },
-            pivot_col);
-        std::size_t pvi = pivot_value_index[pv];
         std::size_t cell_key = out_row * n_pivots + pvi;
-        cell_map[cell_key] = r;  // last value wins for duplicates
+        cell_rows[cell_key] = r;  // last value wins for duplicates
     }
 
     std::size_t out_rows = first_input_row.size();
@@ -6951,10 +6938,10 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 
         for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
             std::size_t cell_key = or_idx * n_pivots + pi;
-            auto cit = cell_map.find(cell_key);
-            if (cit != cell_map.end()) {
-                append_value(col, *value_entry.column, cit->second);
-                bool val_null = is_null(value_entry, cit->second);
+            const std::size_t input_row = cell_rows[cell_key];
+            if (input_row != kMissingCell) {
+                append_value(col, *value_entry.column, input_row);
+                bool val_null = is_null(value_entry, input_row);
                 validity.set(or_idx, !val_null);
                 if (val_null)
                     has_nulls = true;

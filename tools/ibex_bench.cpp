@@ -1269,13 +1269,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // High-cardinality group-by + string-gather filter: exercises ibex's limits.
-    // user_id has 100 000 distinct values (> 4096 categorical threshold) so the
-    // column stays as Column<std::string>.  This stresses:
-    //   sum_by_user   — hash-map pass over 100K string keys; flat accumulator too
-    //                   large for L2, revealing the parallelism gap vs polars.
-    //   filter_events — gather copies 2M SSO std::string objects; polars copies
-    //                   Arrow offset pairs (8 bytes each, done in parallel).
+    // High-cardinality group-by + string-gather filter.
     if (status == 0 && run_suite("events") && !csv_events_path.empty()) {
         ibex::runtime::Table events_table;
         try {

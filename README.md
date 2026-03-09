@@ -319,35 +319,37 @@ This keeps parallel queries lock-free and reproducible when reseeded.
 
 4 M rows, release build (`-O2`), 15 iterations, 2 warmup, WSL2 / clang++.
 
-| query                 |     ibex |   polars |   pandas | data.table |    dplyr |
-| --------------------- | -------: | -------: | -------: | ---------: | -------: |
-| mean_by_symbol        |  31.9 ms |  27.8 ms | 189.4 ms |    23.5 ms |  46.0 ms |
-| ohlc_by_symbol        |  36.4 ms |  31.1 ms | 222.2 ms |    22.8 ms |  52.7 ms |
-| update_price_x2       |  3.30 ms |  2.90 ms |  3.23 ms |    19.4 ms |  5.20 ms |
-| cumsum_price          |  2.95 ms |  13.6 ms |  11.2 ms |    18.2 ms |  9.20 ms |
-| cumprod_price         |  3.80 ms |  12.7 ms |  11.3 ms |   342.4 ms | 341.8 ms |
-| rand_uniform          |  3.53 ms |  7.68 ms |  9.26 ms |    27.1 ms |  23.7 ms |
-| rand_normal           |  24.2 ms |  30.5 ms |  32.9 ms |    84.3 ms |  74.5 ms |
-| rand_int              |  4.73 ms |  7.94 ms |  9.77 ms |    61.5 ms |  63.8 ms |
-| rand_bernoulli        |  2.83 ms |  29.4 ms |  31.4 ms |    57.9 ms |  58.0 ms |
-| fill_null             |  4.15 ms |  3.21 ms |  7.36 ms |    5.60 ms |  13.5 ms |
-| fill_forward          |  3.58 ms |  9.09 ms |  7.49 ms |    13.5 ms |  11.3 ms |
-| fill_backward         |  7.30 ms |  8.46 ms |  8.06 ms |    5.60 ms |  11.5 ms |
-| null_left_join        |  64.2 ms |  30.5 ms | 245.4 ms |   180.7 ms | 169.8 ms |
-| null_semi_join        |  41.8 ms |  21.7 ms | 218.2 ms |    45.2 ms |  92.3 ms |
-| null_anti_join        |  41.5 ms |  21.6 ms | 107.6 ms |    67.2 ms |  98.5 ms |
-| null_cross_join_small |  2.16 ms | 0.526 ms |  5.13 ms |    4.27 ms |  56.9 ms |
-| filter_simple         |  22.1 ms |  7.32 ms |  23.1 ms |    32.3 ms |  29.1 ms |
-| filter_and            |  15.0 ms |  4.62 ms |  17.6 ms |    29.6 ms |  37.3 ms |
-| filter_arith          |  22.0 ms |  8.41 ms |  35.7 ms |    41.5 ms |  34.4 ms |
-| filter_or             |  12.7 ms |  4.85 ms |  14.3 ms |    36.6 ms |  30.7 ms |
-| count_by_symbol_day   |  8.41 ms |  55.4 ms | 342.7 ms |    23.6 ms |  91.3 ms |
-| mean_by_symbol_day    |  10.4 ms |  57.0 ms | 343.4 ms |    25.1 ms | 109.9 ms |
-| ohlc_by_symbol_day    |  18.8 ms |  59.5 ms | 354.4 ms |    28.6 ms | 130.0 ms |
-| sum_by_user           | 147.3 ms |  54.3 ms | 295.3 ms |    55.9 ms | 319.3 ms |
-| filter_events         |  24.6 ms |  7.19 ms |  43.0 ms |    36.5 ms |  35.6 ms |
-| melt_wide_to_long     | 0.044 ms | 0.119 ms |  1.05 ms |   0.067 ms |  1.93 ms |
-| dcast_long_to_wide    | 0.492 ms |  8.99 ms |  2.52 ms |    1.20 ms |  2.93 ms |
+| query                        |      ibex |   polars |    pandas | data.table |     dplyr |
+| ---------------------------- | --------: | -------: | --------: | ---------: | --------: |
+| mean_by_symbol               |   27.4 ms |  23.3 ms |  174.2 ms |    21.4 ms |   44.0 ms |
+| ohlc_by_symbol               |   33.0 ms |  25.8 ms |  189.8 ms |    23.1 ms |   50.3 ms |
+| update_price_x2              |   3.32 ms |  2.87 ms |   2.92 ms |    13.4 ms |   5.07 ms |
+| cumsum_price                 |   3.19 ms |  12.2 ms |   11.0 ms |    13.6 ms |   8.67 ms |
+| cumprod_price                |   3.96 ms |  12.4 ms |   11.1 ms |   328.9 ms |  339.3 ms |
+| rand_uniform                 |   3.64 ms |  7.57 ms |   9.08 ms |    25.7 ms |   25.5 ms |
+| rand_normal                  |   25.1 ms |  29.7 ms |   31.1 ms |    83.7 ms |   74.7 ms |
+| rand_int                     |   3.91 ms |  7.45 ms |   9.23 ms |    59.3 ms |   63.3 ms |
+| rand_bernoulli               |   2.74 ms |  28.8 ms |   30.5 ms |    56.5 ms |   56.1 ms |
+| fill_null                    |   4.46 ms |  2.81 ms |   6.71 ms |    6.80 ms |   12.9 ms |
+| fill_forward                 |   3.73 ms |  8.41 ms |   7.24 ms |    14.2 ms |   10.5 ms |
+| fill_backward                |   7.91 ms |  8.21 ms |   7.61 ms |    5.33 ms |   10.9 ms |
+| null_left_join               |   54.9 ms |  29.1 ms |  216.0 ms |   158.9 ms |  169.7 ms |
+| null_semi_join               |   34.4 ms |  19.6 ms |  188.9 ms |    39.1 ms |   85.9 ms |
+| null_anti_join               |   34.5 ms |  18.4 ms |  100.0 ms |    63.1 ms |   97.0 ms |
+| null_cross_join_small        |   1.72 ms | 0.460 ms |   3.74 ms |    15.1 ms |   51.5 ms |
+| filter_simple                |   19.1 ms |  7.55 ms |   23.9 ms |    30.7 ms |   34.4 ms |
+| filter_and                   |   12.0 ms |  5.21 ms |   16.7 ms |    27.5 ms |   36.6 ms |
+| filter_arith                 |   20.3 ms |  8.24 ms |   35.8 ms |    33.1 ms |   28.9 ms |
+| filter_or                    |   12.3 ms |  5.22 ms |   14.0 ms |    26.6 ms |   30.4 ms |
+| count_by_symbol_day          |   7.42 ms |  51.1 ms |  318.4 ms |    22.9 ms |   91.8 ms |
+| mean_by_symbol_day           |   9.19 ms |  55.1 ms |  317.8 ms |    22.3 ms |  109.5 ms |
+| ohlc_by_symbol_day           |   14.4 ms |  55.2 ms |  336.0 ms |    26.1 ms |  125.6 ms |
+| sum_by_user                  |  134.3 ms |  45.3 ms |  272.3 ms |    43.3 ms |  309.4 ms |
+| filter_events                |   23.4 ms |  6.88 ms |   40.0 ms |    30.5 ms |   29.3 ms |
+| melt_wide_to_long            |  335.8 ms |  41.1 ms |  522.7 ms |   184.2 ms |  281.5 ms |
+| dcast_long_to_wide           | 1017.5 ms | 650.3 ms | 5111.5 ms |  1376.6 ms | 2007.1 ms |
+| dcast_long_to_wide_int_pivot |  744.4 ms |        - |         - |          - |         - |
+| dcast_long_to_wide_cat_pivot |  686.5 ms |        - |         - |          - |         - |
 
 ## Speedup over ibex (geometric mean across available queries)
 

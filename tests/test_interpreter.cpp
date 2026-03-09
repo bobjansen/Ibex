@@ -2748,7 +2748,8 @@ TEST_CASE("rand_bernoulli invalid p") {
 
 // ─── seed_rng / reseed_rng ────────────────────────────────────────────────────
 
-TEST_CASE("reseed_rng produces identical rand_uniform sequence") {
+// rand_uniform uses fill_uniform_x4, so seeding requires reseed_rng_x4.
+TEST_CASE("reseed_rng_x4 produces identical rand_uniform sequence") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(32)));
     runtime::TableRegistry registry;
@@ -2756,14 +2757,12 @@ TEST_CASE("reseed_rng produces identical rand_uniform sequence") {
 
     auto ir = require_ir("t[update { u = rand_uniform(0.0, 1.0) }];");
 
-    // First run
-    runtime::reseed_rng(0xDEADBEEF);
+    runtime::reseed_rng_x4(0xDEADBEEF);
     auto r1 = runtime::interpret(*ir, registry);
     REQUIRE(r1.has_value());
     const auto& c1 = std::get<Column<double>>(*r1->find("u"));
 
-    // Second run with the same seed
-    runtime::reseed_rng(0xDEADBEEF);
+    runtime::reseed_rng_x4(0xDEADBEEF);
     auto r2 = runtime::interpret(*ir, registry);
     REQUIRE(r2.has_value());
     const auto& c2 = std::get<Column<double>>(*r2->find("u"));
@@ -2774,7 +2773,7 @@ TEST_CASE("reseed_rng produces identical rand_uniform sequence") {
     }
 }
 
-TEST_CASE("reseed_rng with different seeds produces different sequences") {
+TEST_CASE("reseed_rng_x4 with different seeds produces different rand_uniform sequences") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(32)));
     runtime::TableRegistry registry;
@@ -2782,12 +2781,12 @@ TEST_CASE("reseed_rng with different seeds produces different sequences") {
 
     auto ir = require_ir("t[update { u = rand_uniform(0.0, 1.0) }];");
 
-    runtime::reseed_rng(1);
+    runtime::reseed_rng_x4(1);
     auto r1 = runtime::interpret(*ir, registry);
     REQUIRE(r1.has_value());
     const auto& c1 = std::get<Column<double>>(*r1->find("u"));
 
-    runtime::reseed_rng(2);
+    runtime::reseed_rng_x4(2);
     auto r2 = runtime::interpret(*ir, registry);
     REQUIRE(r2.has_value());
     const auto& c2 = std::get<Column<double>>(*r2->find("u"));

@@ -1059,6 +1059,8 @@ int main(int argc, char** argv) {
             std::vector<BenchQuery> rng_queries = {
                 {"rand_uniform", "prices[update { r = rand_uniform(0.0, 1.0) }]"},
                 {"rand_normal", "prices[update { n = rand_normal(0.0, 1.0) }]"},
+                {"rand_int", "prices[update { r = rand_int(1, 100) }]"},
+                {"rand_bernoulli", "prices[update { r = rand_bernoulli(0.3) }]"},
             };
             for (const auto& query : rng_queries) {
                 status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse);
@@ -1554,7 +1556,6 @@ int main(int argc, char** argv) {
         constexpr std::int64_t kIntLo = 1;
         constexpr std::int64_t kIntHi = 100;
         const double inv_lambda = 1.0 / kLambda;
-        const double int_span = static_cast<double>((kIntHi - kIntLo) + 1);
 
         ibex::Column<double> out_double;
         out_double.resize(rng_micro_rows);
@@ -1586,6 +1587,14 @@ int main(int argc, char** argv) {
                 }
                 return digest_double(out_double);
             });
+        if (status == 0) {
+            ibex::runtime::reseed_rng_x2(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_uniform_x2_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                    ibex::runtime::fill_uniform_x2(out_double.data(), rng_micro_rows, 0.0, 1.0);
+                    return digest_double(out_double);
+                });
+        }
         if (status == 0) {
             ibex::runtime::reseed_rng_x4(kSeed);
             status = run_scalar_kernel_benchmark(
@@ -1622,6 +1631,15 @@ int main(int argc, char** argv) {
                 });
         }
         if (status == 0) {
+            ibex::runtime::reseed_rng_x2(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_exponential_x2_fn", rng_micro_rows, warmup_iters, iters,
+                [&]() -> std::uint64_t {
+                    ibex::runtime::fill_exponential_x2(out_double.data(), rng_micro_rows, kLambda);
+                    return digest_double(out_double);
+                });
+        }
+        if (status == 0) {
             ibex::runtime::reseed_rng_x4(kSeed);
             status = run_scalar_kernel_benchmark(
                 "rng_exponential_x4_fn", rng_micro_rows, warmup_iters, iters,
@@ -1651,80 +1669,87 @@ int main(int argc, char** argv) {
                 });
         }
         if (status == 0) {
+            // Bernoulli scalar: integer threshold — same algorithm as fill_bernoulli_x4.
+            // Avoids double conversion so the comparison is a plain 64-bit integer op.
+            constexpr double kScale53 = 9007199254740992.0;  // 2^53
+            const auto kBernoulliThreshold = static_cast<std::uint64_t>(kBernoulliP * kScale53);
             ibex::runtime::reseed_rng(kSeed);
             status = run_scalar_kernel_benchmark(
                 "rng_bernoulli_scalar_fn", rng_micro_rows, warmup_iters, iters,
                 [&]() -> std::uint64_t {
                     auto& rng = ibex::runtime::get_rng();
                     for (std::size_t i = 0; i < rng_micro_rows; ++i) {
-                        out_int[i] = ibex::runtime::bits_to_01(rng()) < kBernoulliP ? 1 : 0;
+                        out_int[i] = ((rng() >> 11) < kBernoulliThreshold) ? 1 : 0;
                     }
                     return digest_int(out_int);
                 });
         }
         if (status == 0) {
+            ibex::runtime::reseed_rng_x2(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_bernoulli_x2_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                    ibex::runtime::fill_bernoulli_x2(out_int.data(), rng_micro_rows, kBernoulliP);
+                    return digest_int(out_int);
+                });
+        }
+        if (status == 0) {
+            // Bernoulli x4: delegates to fill_bernoulli_x4 — this is the exact
+            // production code path used by rand_bernoulli() in the interpreter.
             ibex::runtime::reseed_rng_x4(kSeed);
             status = run_scalar_kernel_benchmark(
                 "rng_bernoulli_x4_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
-                    auto& rng4 = ibex::runtime::get_rng_x4_portable();
-                    std::size_t i = 0;
-                    for (; i + 4 <= rng_micro_rows; i += 4) {
-                        const auto bits = rng4();
-                        out_int[i] = ibex::runtime::bits_to_01(bits[0]) < kBernoulliP ? 1 : 0;
-                        out_int[i + 1] = ibex::runtime::bits_to_01(bits[1]) < kBernoulliP ? 1 : 0;
-                        out_int[i + 2] = ibex::runtime::bits_to_01(bits[2]) < kBernoulliP ? 1 : 0;
-                        out_int[i + 3] = ibex::runtime::bits_to_01(bits[3]) < kBernoulliP ? 1 : 0;
-                    }
-                    if (i < rng_micro_rows) {
-                        const auto bits = rng4();
-                        for (std::size_t lane = 0; i < rng_micro_rows; ++lane, ++i) {
-                            out_int[i] =
-                                ibex::runtime::bits_to_01(bits[lane]) < kBernoulliP ? 1 : 0;
-                        }
-                    }
+                    ibex::runtime::fill_bernoulli_x4(out_int.data(), rng_micro_rows, kBernoulliP);
                     return digest_int(out_int);
                 });
         }
         if (status == 0) {
+            // Int scalar: integer multiply-shift to map a raw u64 into [lo, hi].
+            // (bits >> 11) * span >> 53 gives an approximately uniform integer
+            // without any float conversion, keeping both legs in the integer domain.
+            const auto kIntSpan = static_cast<std::uint64_t>(kIntHi - kIntLo + 1);
             ibex::runtime::reseed_rng(kSeed);
             status = run_scalar_kernel_benchmark(
                 "rng_int_scalar_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
                     auto& rng = ibex::runtime::get_rng();
                     for (std::size_t i = 0; i < rng_micro_rows; ++i) {
-                        out_int[i] = kIntLo + static_cast<std::int64_t>(
-                                                  ibex::runtime::bits_to_01(rng()) * int_span);
+                        out_int[i] =
+                            kIntLo + static_cast<std::int64_t>((rng() >> 11) * kIntSpan >> 53);
                     }
                     return digest_int(out_int);
                 });
         }
         if (status == 0) {
+            // Int x2: same integer multiply-shift applied to 2 lanes.
+            const auto kIntSpan = static_cast<std::uint64_t>(kIntHi - kIntLo + 1);
+            ibex::runtime::reseed_rng_x2(kSeed);
+            status = run_scalar_kernel_benchmark(
+                "rng_int_x2_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
+                    auto& rng2 = ibex::runtime::get_rng_x2();
+                    std::size_t i = 0;
+                    for (; i + 2 <= rng_micro_rows; i += 2) {
+                        const auto bits = rng2();
+                        out_int[i] =
+                            kIntLo + static_cast<std::int64_t>((bits[0] >> 11) * kIntSpan >> 53);
+                        out_int[i + 1] =
+                            kIntLo + static_cast<std::int64_t>((bits[1] >> 11) * kIntSpan >> 53);
+                    }
+                    if (i < rng_micro_rows) {
+                        const auto bits = rng2();
+                        out_int[i] =
+                            kIntLo + static_cast<std::int64_t>((bits[0] >> 11) * kIntSpan >> 53);
+                    }
+                    return digest_int(out_int);
+                });
+        }
+        if (status == 0) {
+            // Int x4: production code path — fill_int_x4 uses __uint128_t multiply-shift
+            // so it is correct for any span size.  AVX2 vectorizes the PRNG state update
+            // but NOT the 64-bit multiply (no VPMULLQ until AVX-512DQ).
+            const auto kIntSpan = static_cast<std::uint64_t>(kIntHi - kIntLo + 1);
             ibex::runtime::reseed_rng_x4(kSeed);
             status = run_scalar_kernel_benchmark(
                 "rng_int_x4_fn", rng_micro_rows, warmup_iters, iters, [&]() -> std::uint64_t {
-                    auto& rng4 = ibex::runtime::get_rng_x4_portable();
-                    std::size_t i = 0;
-                    for (; i + 4 <= rng_micro_rows; i += 4) {
-                        const auto bits = rng4();
-                        out_int[i] = kIntLo + static_cast<std::int64_t>(
-                                                  ibex::runtime::bits_to_01(bits[0]) * int_span);
-                        out_int[i + 1] =
-                            kIntLo + static_cast<std::int64_t>(ibex::runtime::bits_to_01(bits[1]) *
-                                                               int_span);
-                        out_int[i + 2] =
-                            kIntLo + static_cast<std::int64_t>(ibex::runtime::bits_to_01(bits[2]) *
-                                                               int_span);
-                        out_int[i + 3] =
-                            kIntLo + static_cast<std::int64_t>(ibex::runtime::bits_to_01(bits[3]) *
-                                                               int_span);
-                    }
-                    if (i < rng_micro_rows) {
-                        const auto bits = rng4();
-                        for (std::size_t lane = 0; i < rng_micro_rows; ++lane, ++i) {
-                            out_int[i] =
-                                kIntLo + static_cast<std::int64_t>(
-                                             ibex::runtime::bits_to_01(bits[lane]) * int_span);
-                        }
-                    }
+                    ibex::runtime::fill_int_x4(out_int.data(), rng_micro_rows, kIntLo, kIntSpan);
                     return digest_int(out_int);
                 });
         }

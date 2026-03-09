@@ -6093,12 +6093,10 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*low >= *high) {
             return std::unexpected("rand_uniform: low must be less than high");
         }
-        // Direct bit→double conversion: faster than uniform_real_distribution.
-        const double range = *high - *low;
+        // x4 fill over independent xoshiro streams.
         Column<double> col;
-        col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i)
-            col.push_back(*low + bits_to_01(rng()) * range);
+        col.resize(rows);
+        fill_uniform_x4(col.data(), rows, *low, *high);
         return col;
     }
 
@@ -6115,9 +6113,7 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*stddev <= 0.0) {
             return std::unexpected("rand_normal: stddev must be positive");
         }
-        // Generate all normals into the column buffer.
-        // fill_normal_x4 dispatches internally: AVX2 + libmvec when available,
-        // portable 4-wide scalar otherwise.  Same seed → same stream on any ISA.
+        // Generate all normals into the column buffer via the portable x4 path.
         Column<double> col;
         col.resize(rows);
         fill_normal_x4(col.data(), rows, *mean, *stddev);
@@ -6176,13 +6172,10 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*lambda <= 0.0) {
             return std::unexpected("rand_exponential: lambda must be positive");
         }
-        // Direct inverse-CDF: X = -ln(U) / lambda where U ~ Uniform(0,1).
+        // Direct inverse-CDF via the x4 engine.
         Column<double> col;
-        col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i) {
-            const double u = bits_to_01(rng()) + 1e-300;
-            col.push_back(-std::log(u) / *lambda);
-        }
+        col.resize(rows);
+        fill_exponential_x4(col.data(), rows, *lambda);
         return col;
     }
 
@@ -6196,11 +6189,9 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (*p < 0.0 || *p > 1.0) {
             return std::unexpected("rand_bernoulli: p must be in [0, 1]");
         }
-        std::bernoulli_distribution dist(*p);
         Column<std::int64_t> col;
-        col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i)
-            col.push_back(dist(rng) ? 1 : 0);
+        col.resize(rows);
+        fill_bernoulli_x4(col.data(), rows, *p);
         return col;
     }
 
@@ -6237,11 +6228,31 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         if (lo > hi) {
             return std::unexpected("rand_int: lo must be <= hi");
         }
-        std::uniform_int_distribution<std::int64_t> dist(lo, hi);
+        // span as uint64: hi - lo + 1. When lo == INT64_MIN and hi == INT64_MAX,
+        // this wraps to 0 (the full 2^64 range). Handle that edge case separately.
+        const auto span = static_cast<std::uint64_t>(hi) - static_cast<std::uint64_t>(lo) + 1;
         Column<std::int64_t> col;
-        col.reserve(rows);
-        for (std::size_t i = 0; i < rows; ++i)
-            col.push_back(dist(rng));
+        col.resize(rows);
+        if (span == 0) {
+            // Full int64 range: every 64-bit word is a valid sample.
+            auto& rng4 = get_rng_x4_portable();
+            std::size_t i = 0;
+            while (i + 4 <= rows) {
+                const auto bits = rng4();
+                col[i] = static_cast<std::int64_t>(bits[0]);
+                col[i + 1] = static_cast<std::int64_t>(bits[1]);
+                col[i + 2] = static_cast<std::int64_t>(bits[2]);
+                col[i + 3] = static_cast<std::int64_t>(bits[3]);
+                i += 4;
+            }
+            if (i < rows) {
+                const auto bits = rng4();
+                for (std::size_t lane = 0; i < rows; ++lane, ++i)
+                    col[i] = static_cast<std::int64_t>(bits[lane]);
+            }
+        } else {
+            fill_int_x4(col.data(), rows, lo, span);
+        }
         return col;
     }
 

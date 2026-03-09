@@ -50,14 +50,23 @@ suppressPackageStartupMessages({
 })
 
 # ── Timing helper ─────────────────────────────────────────────────────────────
+# proc.time()[["elapsed"]] uses gettimeofday() which is non-monotonic: an NTP
+# correction during a long benchmark run can step the clock backward, producing
+# a negative elapsed time.  Retry any such measurement up to 5 times before
+# clamping to 0 as a last resort.
 timer <- function(fn) {
     for (i in seq_len(warmup)) fn()
     times <- numeric(iters)
     r <- NULL
     for (i in seq_len(iters)) {
-        t0    <- proc.time()[["elapsed"]]
-        r     <- fn()
-        times[i] <- (proc.time()[["elapsed"]] - t0) * 1000
+        elapsed <- -1
+        for (attempt in seq_len(5L)) {
+            t0      <- proc.time()[["elapsed"]]
+            r       <- fn()
+            elapsed <- (proc.time()[["elapsed"]] - t0) * 1000
+            if (elapsed >= 0) break
+        }
+        times[i] <- max(elapsed, 0)
     }
     list(
         avg_ms    = mean(times),
@@ -136,6 +145,12 @@ if (!skip_data_table) {
 
     bench("data.table", "rand_normal",
         function() dt[, n := rnorm(.N, 0.0, 1.0)][])
+
+    bench("data.table", "rand_int",
+        function() dt[, r := sample.int(100L, .N, replace = TRUE)][])
+
+    bench("data.table", "rand_bernoulli",
+        function() dt[, r := rbinom(.N, 1L, 0.3)][])
 }
 
 if (!skip_dplyr) {
@@ -167,6 +182,12 @@ if (!skip_dplyr) {
 
     bench("dplyr", "rand_normal",
         function() tb |> mutate(n = rnorm(n(), 0.0, 1.0)))
+
+    bench("dplyr", "rand_int",
+        function() tb |> mutate(r = sample.int(100L, n(), replace = TRUE)))
+
+    bench("dplyr", "rand_bernoulli",
+        function() tb |> mutate(r = rbinom(n(), 1L, 0.3)))
 }
 
 # ── Multi-column group-by ─────────────────────────────────────────────────────

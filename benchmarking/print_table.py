@@ -32,6 +32,8 @@ QUERY_ORDER = [
     "cumprod_price",
     "rand_uniform",
     "rand_normal",
+    "rand_int",
+    "rand_bernoulli",
     # filters
     "filter_simple",
     "filter_and",
@@ -66,6 +68,8 @@ QUERY_LABEL = {
     "cumprod_price": "cumprod price",
     "rand_uniform": "rand uniform",
     "rand_normal": "rand normal",
+    "rand_int": "rand int",
+    "rand_bernoulli": "rand bernoulli",
     "count_by_symbol_day": "count by symbol×day",
     "mean_by_symbol_day": "mean by symbol×day",
     "ohlc_by_symbol_day": "OHLC by symbol×day",

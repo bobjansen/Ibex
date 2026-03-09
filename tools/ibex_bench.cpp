@@ -1300,39 +1300,47 @@ int main(int argc, char** argv) {
     }
 
     // Reshape benchmarks: melt (wide→long) and dcast (long→wide).
-    // Uses prices_multi to build a wide OHLC table via aggregation, then
-    // melts it and dcasts it back. This exercises the reshape interpreter paths
-    // on a realistic (252 symbols × 4 days = 1008 rows, 4 measure columns) table.
-    if (status == 0 && run_suite("reshape") && !csv_multi_path.empty()) {
-        ibex::runtime::Table multi_table;
-        try {
-            multi_table = read_csv(csv_multi_path);
-        } catch (const std::exception& e) {
-            fmt::print("error: failed to read multi CSV for reshape: {}\n", e.what());
-            return 1;
+    // Uses a synthetic wide OHLC table (250 symbols × 400 days = 100,000 rows,
+    // 4 measure columns) to exercise the reshape interpreter paths at a meaningful scale.
+    if (status == 0 && run_suite("reshape")) {
+        constexpr std::size_t reshape_n_symbols = 250;
+        constexpr std::size_t reshape_n_days = 400;
+        constexpr std::size_t reshape_rows = reshape_n_symbols * reshape_n_days;
+
+        ibex::Column<std::string> sym_col;
+        ibex::Column<std::int64_t> day_col;
+        ibex::Column<double> open_col, high_col, low_col, close_col;
+        sym_col.reserve(reshape_rows);
+        day_col.reserve(reshape_rows);
+        open_col.reserve(reshape_rows);
+        high_col.reserve(reshape_rows);
+        low_col.reserve(reshape_rows);
+        close_col.reserve(reshape_rows);
+
+        for (std::size_t i = 0; i < reshape_rows; ++i) {
+            const std::size_t sym_idx = i / reshape_n_days;
+            const std::size_t day_idx = i % reshape_n_days;
+            sym_col.push_back(fmt::format("S{:04d}", sym_idx));
+            day_col.push_back(static_cast<std::int64_t>(day_idx + 1));
+            const double base = 100.0 + static_cast<double>(i % 1000);
+            open_col.push_back(base);
+            high_col.push_back(base + 1.0);
+            low_col.push_back(base - 1.0);
+            close_col.push_back(base + 0.5);
         }
 
-        // First, build the wide OHLC table via aggregation.
-        ibex::runtime::TableRegistry agg_reg;
-        agg_reg.emplace("prices_multi", std::move(multi_table));
+        ibex::runtime::Table wide_table;
+        wide_table.add_column("symbol", std::move(sym_col));
+        wide_table.add_column("day", std::move(day_col));
+        wide_table.add_column("open", std::move(open_col));
+        wide_table.add_column("high", std::move(high_col));
+        wide_table.add_column("low", std::move(low_col));
+        wide_table.add_column("close", std::move(close_col));
 
-        ibex::runtime::ScalarRegistry agg_scalars;
-        auto agg_src = normalize_input(
-            "prices_multi[select {open = first(price), high = max(price), "
-            "low = min(price), close = last(price)}, by {symbol, day}]");
-        auto agg_parsed = ibex::parser::parse(agg_src);
-        auto agg_lowered = ibex::parser::lower(*agg_parsed);
-        auto wide_result = ibex::runtime::interpret(*agg_lowered.value(), agg_reg, &agg_scalars);
-        if (!wide_result) {
-            fmt::print("error: failed to build wide table for reshape: {}\n", wide_result.error());
-            return 1;
-        }
-
-        fmt::print("\n-- Reshape benchmarks ({} wide rows, 4 measure cols) --\n",
-                   wide_result->rows());
+        fmt::print("\n-- Reshape benchmarks ({} wide rows, 4 measure cols) --\n", reshape_rows);
 
         ibex::runtime::TableRegistry reshape_tables;
-        reshape_tables.emplace("wide", std::move(*wide_result));
+        reshape_tables.emplace("wide", std::move(wide_table));
 
         // melt: wide→long (id={symbol,day}, measures=open,high,low,close)
         BenchQuery melt_query{

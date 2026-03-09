@@ -7,6 +7,7 @@
 # Usage:
 #   Rscript bench_r.R --csv data/prices.csv [--csv-multi data/prices_multi.csv]
 #                     [--warmup 1] [--iters 5] [--out results/r.tsv]
+#                     [--reshape-rows 100000] [--fill-rows 4000000]
 #                     [--skip-data-table] [--skip-dplyr]
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -31,6 +32,7 @@ warmup          <- as.integer(parse_arg("--warmup", "1"))
 iters           <- as.integer(parse_arg("--iters",  "5"))
 out_path        <- parse_arg("--out", "results/r.tsv")
 fill_rows       <- as.integer(parse_arg("--fill-rows", "4000000"))
+reshape_rows    <- as.integer(parse_arg("--reshape-rows", "100000"))
 skip_data_table <- parse_flag("--skip-data-table")
 skip_dplyr      <- parse_flag("--skip-dplyr")
 
@@ -239,20 +241,20 @@ if (!is.null(csv_multi_path)) {
 }
 
 # ── Reshape benchmarks (melt / dcast) ─────────────────────────────────────────
-# Synthetic wide OHLC table: 250 symbols × 400 days = 100,000 rows, 4 measure cols.
+# Synthetic wide OHLC table with configurable row count and 4 measure columns.
 {
-    n_sym <- 250L
     n_day <- 400L
-    reshape_rows <- n_sym * n_day
     idx  <- seq_len(reshape_rows) - 1L
+    sym_idx <- idx %/% n_day
+    day_idx <- idx %% n_day + 1L
     base <- 100.0 + idx %% 1000L
 
     if (!skip_data_table) {
         message(sprintf("\ndata.table: building synthetic wide table (%d rows)...", reshape_rows))
 
         wide_dt <- data.table(
-            symbol = sprintf("S%04d", rep(seq_len(n_sym) - 1L, times = n_day)),
-            day    = rep(seq_len(n_day), each = n_sym),
+            symbol = sprintf("S%04d", sym_idx),
+            day    = day_idx,
             open   = base,
             high   = base + 1.0,
             low    = base - 1.0,
@@ -279,8 +281,8 @@ if (!is.null(csv_multi_path)) {
         message(sprintf("\ndplyr: building synthetic wide table (%d rows)...", reshape_rows))
 
         wide_tb <- tibble(
-            symbol = sprintf("S%04d", rep(seq_len(n_sym) - 1L, times = n_day)),
-            day    = rep(seq_len(n_day), each = n_sym),
+            symbol = sprintf("S%04d", sym_idx),
+            day    = day_idx,
             open   = base,
             high   = base + 1.0,
             low    = base - 1.0,

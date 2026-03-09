@@ -12,14 +12,20 @@
 # Usage:
 #   ./bench_ibex.sh [--csv path] [--csv-multi path] [--warmup N] [--iters N]
 #                   [--suite name[,name...]] [--merge-validity-rows N]
-#                   [--rng-micro-rows N]
+#                   [--rng-micro-rows N] [--reshape-rows N]
 #                   [--out results/ibex.tsv]
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
-BUILD_DIR="${BUILD_DIR:-$IBEX_ROOT/build}"
+if [[ -n "${BUILD_DIR:-}" ]]; then
+    : # user-specified, keep it
+elif [[ -x "$IBEX_ROOT/build-release/tools/ibex_bench" ]]; then
+    BUILD_DIR="$IBEX_ROOT/build-release"
+else
+    BUILD_DIR="$IBEX_ROOT/build"
+fi
 IBEX_BENCH="$BUILD_DIR/tools/ibex_bench"
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
@@ -33,6 +39,7 @@ ITERS=5
 SUITE=""
 MERGE_VALIDITY_ROWS=""
 RNG_MICRO_ROWS=""
+RESHAPE_ROWS=""
 OUT="$SCRIPT_DIR/results/ibex.tsv"
 
 while [[ $# -gt 0 ]]; do
@@ -47,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --suite)       SUITE="$2";       shift 2 ;;
         --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
         --rng-micro-rows) RNG_MICRO_ROWS="$2"; shift 2 ;;
+        --reshape-rows) RESHAPE_ROWS="$2"; shift 2 ;;
         --out)         OUT="$2";         shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
@@ -89,6 +97,7 @@ BENCH_ARGS=(
 [[ -n "$SUITE" ]] && BENCH_ARGS+=(--suite "$SUITE")
 [[ -n "$MERGE_VALIDITY_ROWS" ]] && BENCH_ARGS+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
 [[ -n "$RNG_MICRO_ROWS" ]] && BENCH_ARGS+=(--rng-micro-rows "$RNG_MICRO_ROWS")
+[[ -n "$RESHAPE_ROWS" ]] && BENCH_ARGS+=(--reshape-rows "$RESHAPE_ROWS")
 [[ -f "$CSV_MULTI" ]]   && BENCH_ARGS+=(--csv-multi   "$CSV_MULTI")
 [[ -f "$CSV_TRADES" ]]  && BENCH_ARGS+=(--csv-trades  "$CSV_TRADES")
 [[ -f "$CSV_EVENTS" ]]  && BENCH_ARGS+=(--csv-events  "$CSV_EVENTS")

@@ -2,34 +2,36 @@
 
 Scale benchmark snapshot on **4,000,000 rows** (warmup=2, iters=15).
 
-| query                 |     ibex |   polars |   pandas | data.table |    dplyr |
-| --------------------- | -------: | -------: | -------: | ---------: | -------: |
-| mean_by_symbol        |  27.1 ms |  28.4 ms | 188.7 ms |    22.2 ms |  46.1 ms |
-| ohlc_by_symbol        |  32.4 ms |  31.9 ms | 204.3 ms |    21.0 ms |  52.7 ms |
-| update_price_x2       |  3.11 ms |  2.51 ms |  2.97 ms |    22.0 ms |  5.67 ms |
-| cumsum_price          |  2.94 ms |  12.4 ms |  11.7 ms |    21.0 ms |  10.3 ms |
-| cumprod_price         |  3.50 ms |  12.5 ms |  11.7 ms |   346.7 ms | 344.3 ms |
-| rand_uniform          |  3.35 ms |  7.74 ms |  9.37 ms |    27.3 ms |  24.9 ms |
-| rand_normal           |  23.6 ms |  29.8 ms |  31.8 ms |    90.7 ms |  76.7 ms |
-| rand_int              |  3.85 ms |  7.99 ms |  9.67 ms |    62.1 ms |  64.5 ms |
-| rand_bernoulli        |  2.60 ms |  29.0 ms |  31.0 ms |    58.3 ms |  59.3 ms |
-| fill_null             |  4.15 ms |  3.30 ms |  7.46 ms |    5.40 ms |  15.9 ms |
-| fill_forward          |  3.55 ms |  9.71 ms |  8.39 ms |    12.1 ms |  14.8 ms |
-| fill_backward         |  7.51 ms |  8.77 ms |  8.59 ms |    6.67 ms |  13.3 ms |
-| null_left_join        |  53.9 ms |  30.9 ms | 224.6 ms |   173.0 ms | 170.9 ms |
-| null_semi_join        |  32.7 ms |  24.9 ms | 197.7 ms |    47.2 ms |  82.3 ms |
-| null_anti_join        |  32.8 ms |  24.6 ms | 111.2 ms |    60.4 ms |  98.1 ms |
-| null_cross_join_small |  1.72 ms | 0.697 ms |  4.45 ms |    4.00 ms |  56.5 ms |
-| filter_simple         |  19.6 ms |  7.05 ms |  23.7 ms |    35.3 ms |  49.7 ms |
-| filter_and            |  11.7 ms |  4.24 ms |  17.9 ms |    28.6 ms |  36.1 ms |
-| filter_arith          |  20.7 ms |  8.33 ms |  36.8 ms |    36.4 ms |  31.7 ms |
-| filter_or             |  12.7 ms |  4.65 ms |  14.2 ms |    26.7 ms |  33.9 ms |
-| count_by_symbol_day   |  7.86 ms |  56.3 ms | 334.6 ms |    21.5 ms | 115.8 ms |
-| mean_by_symbol_day    |  8.87 ms |  57.3 ms | 337.6 ms |    29.1 ms | 112.5 ms |
-| ohlc_by_symbol_day    |  14.2 ms |  57.4 ms | 354.9 ms |    32.3 ms | 122.7 ms |
-| sum_by_user           | 131.9 ms |  51.7 ms | 281.0 ms |    46.1 ms | 313.3 ms |
-| filter_events         |  23.5 ms |  7.49 ms |  41.4 ms |    34.3 ms |  30.6 ms |
-| melt_wide_to_long     |  5.61 ms | 0.948 ms |  7.27 ms |    1.53 ms |  5.47 ms |
-| dcast_long_to_wide    |  58.0 ms |  16.3 ms |  73.5 ms |    25.9 ms |  23.8 ms |
+| query                        |      ibex |   polars |    pandas | data.table |     dplyr |
+| ---------------------------- | --------: | -------: | --------: | ---------: | --------: |
+| mean_by_symbol               |   27.4 ms |  23.3 ms |  174.2 ms |    21.4 ms |   44.0 ms |
+| ohlc_by_symbol               |   33.0 ms |  25.8 ms |  189.8 ms |    23.1 ms |   50.3 ms |
+| update_price_x2              |   3.32 ms |  2.87 ms |   2.92 ms |    13.4 ms |   5.07 ms |
+| cumsum_price                 |   3.19 ms |  12.2 ms |   11.0 ms |    13.6 ms |   8.67 ms |
+| cumprod_price                |   3.96 ms |  12.4 ms |   11.1 ms |   328.9 ms |  339.3 ms |
+| rand_uniform                 |   3.64 ms |  7.57 ms |   9.08 ms |    25.7 ms |   25.5 ms |
+| rand_normal                  |   25.1 ms |  29.7 ms |   31.1 ms |    83.7 ms |   74.7 ms |
+| rand_int                     |   3.91 ms |  7.45 ms |   9.23 ms |    59.3 ms |   63.3 ms |
+| rand_bernoulli               |   2.74 ms |  28.8 ms |   30.5 ms |    56.5 ms |   56.1 ms |
+| fill_null                    |   4.46 ms |  2.81 ms |   6.71 ms |    6.80 ms |   12.9 ms |
+| fill_forward                 |   3.73 ms |  8.41 ms |   7.24 ms |    14.2 ms |   10.5 ms |
+| fill_backward                |   7.91 ms |  8.21 ms |   7.61 ms |    5.33 ms |   10.9 ms |
+| null_left_join               |   54.9 ms |  29.1 ms |  216.0 ms |   158.9 ms |  169.7 ms |
+| null_semi_join               |   34.4 ms |  19.6 ms |  188.9 ms |    39.1 ms |   85.9 ms |
+| null_anti_join               |   34.5 ms |  18.4 ms |  100.0 ms |    63.1 ms |   97.0 ms |
+| null_cross_join_small        |   1.72 ms | 0.460 ms |   3.74 ms |    15.1 ms |   51.5 ms |
+| filter_simple                |   19.1 ms |  7.55 ms |   23.9 ms |    30.7 ms |   34.4 ms |
+| filter_and                   |   12.0 ms |  5.21 ms |   16.7 ms |    27.5 ms |   36.6 ms |
+| filter_arith                 |   20.3 ms |  8.24 ms |   35.8 ms |    33.1 ms |   28.9 ms |
+| filter_or                    |   12.3 ms |  5.22 ms |   14.0 ms |    26.6 ms |   30.4 ms |
+| count_by_symbol_day          |   7.42 ms |  51.1 ms |  318.4 ms |    22.9 ms |   91.8 ms |
+| mean_by_symbol_day           |   9.19 ms |  55.1 ms |  317.8 ms |    22.3 ms |  109.5 ms |
+| ohlc_by_symbol_day           |   14.4 ms |  55.2 ms |  336.0 ms |    26.1 ms |  125.6 ms |
+| sum_by_user                  |  134.3 ms |  45.3 ms |  272.3 ms |    43.3 ms |  309.4 ms |
+| filter_events                |   23.4 ms |  6.88 ms |   40.0 ms |    30.5 ms |   29.3 ms |
+| melt_wide_to_long            |  335.8 ms |  41.1 ms |  522.7 ms |   184.2 ms |  281.5 ms |
+| dcast_long_to_wide           | 1017.5 ms | 650.3 ms | 5111.5 ms |  1376.6 ms | 2007.1 ms |
+| dcast_long_to_wide_int_pivot |  744.4 ms |        - |         - |          - |         - |
+| dcast_long_to_wide_cat_pivot |  686.5 ms |        - |         - |          - |         - |
 
 _Generated by `benchmarking/run_scale_suite.sh --to-readme` from `benchmarking/results/scales.tsv`._

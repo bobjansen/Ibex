@@ -364,10 +364,9 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
-def bench_pandas_reshape(csv_multi_path, warmup, iters):
+def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
     """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
-    n_sym, n_day = 250, 400
-    reshape_rows = n_sym * n_day
+    n_day = 400
     print(f"pandas: building synthetic wide table ({reshape_rows} rows)...", file=sys.stderr, flush=True)
     rows = []
 
@@ -395,11 +394,13 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters):
             )
         )
 
-    # Build a synthetic wide OHLC table (250 symbols × 400 days)
+    # Build a synthetic wide OHLC table (reshape_rows rows, 4 measure cols).
+    sym = [f"S{i // n_day:04d}" for i in range(reshape_rows)]
+    day = (np.arange(reshape_rows, dtype=np.int64) % n_day) + 1
     base = 100.0 + np.arange(reshape_rows, dtype=float) % 1000
     wide = pd.DataFrame({
-        "symbol": np.tile([f"S{i:04d}" for i in range(n_sym)], n_day),
-        "day":    np.repeat(np.arange(1, n_day + 1, dtype=np.int64), n_sym),
+        "symbol": sym,
+        "day":    day,
         "open":  base,
         "high":  base + 1.0,
         "low":   base - 1.0,
@@ -431,10 +432,9 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters):
     return rows
 
 
-def bench_polars_reshape(csv_multi_path, warmup, iters):
+def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
     """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
-    n_sym, n_day = 250, 400
-    reshape_rows = n_sym * n_day
+    n_day = 400
     print(f"polars: building synthetic wide table ({reshape_rows} rows)...", file=sys.stderr, flush=True)
     rows = []
 
@@ -462,11 +462,13 @@ def bench_polars_reshape(csv_multi_path, warmup, iters):
             )
         )
 
-    # Build a synthetic wide OHLC table (250 symbols × 400 days)
+    # Build a synthetic wide OHLC table (reshape_rows rows, 4 measure cols).
+    sym = [f"S{i // n_day:04d}" for i in range(reshape_rows)]
+    day = (np.arange(reshape_rows, dtype=np.int64) % n_day) + 1
     base = (100.0 + np.arange(reshape_rows, dtype=float) % 1000).tolist()
     wide = pl.DataFrame({
-        "symbol": [f"S{i:04d}" for i in range(n_sym)] * n_day,
-        "day":    np.repeat(np.arange(1, n_day + 1, dtype=np.int64), n_sym).tolist(),
+        "symbol": sym,
+        "day":    day.tolist(),
         "open":  base,
         "high":  [v + 1.0 for v in base],
         "low":   [v - 1.0 for v in base],
@@ -685,6 +687,12 @@ def main():
         default=4_000_000,
         help="Row count for in-memory fill benchmarks (default: 4000000)",
     )
+    ap.add_argument(
+        "--reshape-rows",
+        type=int,
+        default=100_000,
+        help="Row count for synthetic reshape benchmarks (default: 100000)",
+    )
     args = ap.parse_args()
 
     if args.skip_pandas and args.skip_polars:
@@ -701,9 +709,13 @@ def main():
         )
     if args.csv_multi:
         if not args.skip_pandas:
-            all_rows += bench_pandas_reshape(args.csv_multi, args.warmup, args.iters)
+            all_rows += bench_pandas_reshape(
+                args.csv_multi, args.warmup, args.iters, args.reshape_rows
+            )
         if not args.skip_polars:
-            all_rows += bench_polars_reshape(args.csv_multi, args.warmup, args.iters)
+            all_rows += bench_polars_reshape(
+                args.csv_multi, args.warmup, args.iters, args.reshape_rows
+            )
     if args.csv_events:
         if not args.skip_pandas:
             all_rows += bench_pandas_events(args.csv_events, args.warmup, args.iters)

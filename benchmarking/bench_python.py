@@ -98,6 +98,8 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     rng_gen = np.random.default_rng(42)
     run("rand_uniform", lambda: df.assign(r=rng_gen.uniform(0.0, 1.0, len(df))))
     run("rand_normal", lambda: df.assign(n=rng_gen.standard_normal(len(df))))
+    run("rand_int", lambda: df.assign(r=rng_gen.integers(1, 101, len(df))))
+    run("rand_bernoulli", lambda: df.assign(r=rng_gen.binomial(1, 0.3, len(df))))
 
     if csv_multi_path:
         print("pandas: loading multi...", file=sys.stderr, flush=True)
@@ -207,6 +209,14 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run(
         "rand_normal",
         lambda: df.with_columns(pl.Series("n", rng_gen.standard_normal(len(df)))),
+    )
+    run(
+        "rand_int",
+        lambda: df.with_columns(pl.Series("r", rng_gen.integers(1, 101, len(df)))),
+    )
+    run(
+        "rand_bernoulli",
+        lambda: df.with_columns(pl.Series("r", rng_gen.binomial(1, 0.3, len(df)))),
     )
 
     if csv_multi_path:

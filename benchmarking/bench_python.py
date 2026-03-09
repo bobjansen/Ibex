@@ -365,9 +365,10 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
 
 
 def bench_pandas_reshape(csv_multi_path, warmup, iters):
-    """Melt (wide→long) and dcast (long→wide) on an OHLC table."""
-    print("pandas: loading multi for reshape...", file=sys.stderr, flush=True)
-    dfm = pd.read_csv(csv_multi_path)
+    """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
+    n_sym, n_day = 250, 400
+    reshape_rows = n_sym * n_day
+    print(f"pandas: building synthetic wide table ({reshape_rows} rows)...", file=sys.stderr, flush=True)
     rows = []
 
     def run(name, fn):
@@ -394,17 +395,16 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters):
             )
         )
 
-    # Build the wide OHLC table first
-    wide = (
-        dfm.groupby(["symbol", "day"], sort=False)
-        .agg(
-            open=("price", "first"),
-            high=("price", "max"),
-            low=("price", "min"),
-            close=("price", "last"),
-        )
-        .reset_index()
-    )
+    # Build a synthetic wide OHLC table (250 symbols × 400 days)
+    base = 100.0 + np.arange(reshape_rows, dtype=float) % 1000
+    wide = pd.DataFrame({
+        "symbol": np.tile([f"S{i:04d}" for i in range(n_sym)], n_day),
+        "day":    np.repeat(np.arange(1, n_day + 1, dtype=np.int64), n_sym),
+        "open":  base,
+        "high":  base + 1.0,
+        "low":   base - 1.0,
+        "close": base + 0.5,
+    })
     print(f"  pandas: wide table has {len(wide)} rows", file=sys.stderr, flush=True)
 
     # melt: wide → long
@@ -432,9 +432,10 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters):
 
 
 def bench_polars_reshape(csv_multi_path, warmup, iters):
-    """Melt (wide→long) and dcast (long→wide) on an OHLC table."""
-    print("polars: loading multi for reshape...", file=sys.stderr, flush=True)
-    dfm = pl.read_csv(csv_multi_path)
+    """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
+    n_sym, n_day = 250, 400
+    reshape_rows = n_sym * n_day
+    print(f"polars: building synthetic wide table ({reshape_rows} rows)...", file=sys.stderr, flush=True)
     rows = []
 
     def run(name, fn):
@@ -461,13 +462,16 @@ def bench_polars_reshape(csv_multi_path, warmup, iters):
             )
         )
 
-    # Build the wide OHLC table first
-    wide = dfm.group_by(["symbol", "day"]).agg(
-        pl.col("price").first().alias("open"),
-        pl.col("price").max().alias("high"),
-        pl.col("price").min().alias("low"),
-        pl.col("price").last().alias("close"),
-    )
+    # Build a synthetic wide OHLC table (250 symbols × 400 days)
+    base = (100.0 + np.arange(reshape_rows, dtype=float) % 1000).tolist()
+    wide = pl.DataFrame({
+        "symbol": [f"S{i:04d}" for i in range(n_sym)] * n_day,
+        "day":    np.repeat(np.arange(1, n_day + 1, dtype=np.int64), n_sym).tolist(),
+        "open":  base,
+        "high":  [v + 1.0 for v in base],
+        "low":   [v - 1.0 for v in base],
+        "close": [v + 0.5 for v in base],
+    })
     print(f"  polars: wide table has {len(wide)} rows", file=sys.stderr, flush=True)
 
     # melt: wide → long

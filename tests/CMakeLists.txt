@@ -6,6 +6,7 @@ add_executable(ibex_tests
     test_json.cpp
     test_e2e.cpp
     test_ir_node.cpp
+    test_ir_optimizer.cpp
     test_lexer.cpp
     test_parser.cpp
     test_repl.cpp

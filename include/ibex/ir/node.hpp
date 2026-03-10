@@ -615,7 +615,9 @@ class ProgramNode final : public Node {
     [[nodiscard]] auto preamble() const noexcept -> const std::vector<NodePtr>& {
         return preamble_;
     }
+    [[nodiscard]] auto mutable_preamble() noexcept -> std::vector<NodePtr>& { return preamble_; }
     [[nodiscard]] auto main_node() const noexcept -> const Node& { return *main_node_; }
+    [[nodiscard]] auto mutable_main_node() noexcept -> NodePtr& { return main_node_; }
 
    private:
     std::vector<NodePtr> preamble_;

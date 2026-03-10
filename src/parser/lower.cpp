@@ -1,4 +1,6 @@
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/optimizer.hpp>
+#include <ibex/parser/effects.hpp>
 #include <ibex/parser/lower.hpp>
 
 #include <algorithm>
@@ -12,6 +14,51 @@
 namespace ibex::parser {
 
 namespace {
+
+auto to_ir_effect_summary(const EffectSummary& src) -> ir::EffectSummary {
+    return ir::EffectSummary{
+        .mask = src.mask,
+        .io_read_unscoped = src.io_read_unscoped,
+        .io_write_unscoped = src.io_write_unscoped,
+        .io_read_resources = src.io_read_resources,
+        .io_write_resources = src.io_write_resources,
+    };
+}
+
+auto to_ir_arg_mode(Param::Effect effect) -> ir::ArgMode {
+    switch (effect) {
+        case Param::Effect::Const:
+            return ir::ArgMode::Const;
+        case Param::Effect::Mutable:
+            return ir::ArgMode::Mutable;
+        case Param::Effect::Consume:
+            return ir::ArgMode::Consume;
+    }
+    return ir::ArgMode::Const;
+}
+
+auto build_optimization_context(const EffectAnalysis& analysis) -> ir::OptimizationContext {
+    ir::OptimizationContext context;
+    context.callee_summaries.reserve(analysis.user_functions.size() + analysis.externs.size() +
+                                     analysis.builtins.size());
+
+    const auto append = [&](const std::unordered_map<std::string, CallableSummary>& src) {
+        for (const auto& [name, callable] : src) {
+            ir::CallableSummary dst;
+            dst.effects = to_ir_effect_summary(callable.effects);
+            dst.arg_modes.reserve(callable.param_modes.size());
+            for (const auto& mode : callable.param_modes) {
+                dst.arg_modes.push_back(to_ir_arg_mode(mode));
+            }
+            context.callee_summaries.insert_or_assign(name, std::move(dst));
+        }
+    };
+
+    append(analysis.user_functions);
+    append(analysis.externs);
+    append(analysis.builtins);
+    return context;
+}
 
 class Lowerer {
    public:
@@ -215,8 +262,11 @@ class Lowerer {
                 elements.push_back(std::move(ir_lit));
             }
 
-            construct_cols.push_back(
-                ir::ConstructColumn{.name = col_def.name, .elements = std::move(elements)});
+            construct_cols.push_back(ir::ConstructColumn{
+                .name = col_def.name,
+                .elements = std::move(elements),
+                .expr_node = nullptr,
+            });
         }
 
         return builder_.construct(std::move(construct_cols));
@@ -1714,6 +1764,16 @@ class Lowerer {
                                         stream.stream_kind(), stream.bucket_duration());
                 break;
             }
+            case ir::NodeKind::Program: {
+                const auto& prog = static_cast<const ir::ProgramNode&>(node);
+                std::vector<ir::NodePtr> preamble;
+                preamble.reserve(prog.preamble().size());
+                for (const auto& preamble_node : prog.preamble()) {
+                    preamble.push_back(preamble_node ? clone_node(*preamble_node) : nullptr);
+                }
+                clone = builder_.program(std::move(preamble), clone_node(prog.main_node()));
+                break;
+            }
         }
 
         if (!clone) {
@@ -1838,9 +1898,23 @@ class Lowerer {
 }  // namespace
 
 auto lower(const Program& program) -> LowerResult {
+    auto effects = analyze_effects(program);
+    if (!effects.has_value()) {
+        return std::unexpected(LowerError{.message = effects.error().format()});
+    }
+
     std::unordered_map<std::string, ir::NodePtr> bindings;
     Lowerer lowerer(&bindings);
-    return lowerer.lower_program(program);
+    auto lowered = lowerer.lower_program(program);
+    if (!lowered.has_value()) {
+        return lowered;
+    }
+
+    const auto optimization_context = build_optimization_context(*effects);
+    ir::OptimizationStats optimization_stats;
+    auto optimized =
+        ir::optimize_plan(std::move(*lowered), optimization_context, &optimization_stats);
+    return optimized;
 }
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {

@@ -1708,16 +1708,20 @@ fn score(df: DataFrame) -> DataFrame effects {} {
 
 `effects {}` means no tracked effects. The checker currently tracks:
 
-- `io_read`
-- `io_write`
+- `io_read` (optionally resource-scoped: `io_read("...")`)
+- `io_write` (optionally resource-scoped: `io_write("...")`)
 - `nondet`
 - `state`
 - `blocking`
 - `may_fail`
 
 For user-defined `fn`, annotations are checked against inferred effects from
-the body and known callees. If inferred effects are missing from the declared
-set, parsing fails with an error.
+the body and known callees (including resource-scoped `io_read/io_write`
+effects). If inferred effects are missing from the declared set, parsing fails
+with an error.
+
+Effect summaries also feed the optimizer. The first conservative pass elides
+unused top-level calls only when they are proven effect-free (`effects {}`).
 
 ### 10.2 Parameter Effect Modifiers
 

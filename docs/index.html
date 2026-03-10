@@ -83,7 +83,8 @@
           <code>extern fn</code> let Ibex check side-effect assumptions early.
           Extern parameters can also declare call semantics with
           <code>const</code>, <code>mutable</code>, or <code>consume</code>.
-          There is no optimizer pass yet; this is currently a safety check.
+          A first conservative optimizer pass can now elide unused pure
+          top-level calls; richer effect-driven rewrites are planned.
         </p>
       </article>
       <article class="card">

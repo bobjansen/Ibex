@@ -9,7 +9,6 @@ namespace ibex::ir {
 /// Factory for constructing IR nodes with unique IDs.
 ///
 /// Thread-safe ID generation via atomic counter.
-/// TODO: Add plan-level validation and optimization passes.
 class Builder {
    public:
     Builder() = default;

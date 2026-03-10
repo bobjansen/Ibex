@@ -6,6 +6,8 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <emmintrin.h>
@@ -136,13 +138,21 @@ auto column_size(const ColumnValue& column) -> std::size_t {
     return std::visit([](const auto& col) { return col.size(); }, column);
 }
 
+[[noreturn]] void invariant_violation(std::string_view detail) {
+    // This is triggered by a severe bug, everything in here is on a best effort basis
+    (void)std::fputs("ibex internal invariant violated (runtime/interpreter): ", stderr);
+    (void)std::fwrite(detail.data(), sizeof(char), detail.size(), stderr);
+    (void)std::fputc('\n', stderr);
+    std::abort();
+}
+
 auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t index) -> void {
     std::visit(
         [&](auto& dst_col) {
             using ColType = std::decay_t<decltype(dst_col)>;
             const auto* src_col = std::get_if<ColType>(&src);
             if (src_col == nullptr) {
-                throw std::runtime_error("column type mismatch");
+                invariant_violation("append_value: source/destination column type mismatch");
             }
             if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
                 dst_col.push_code(src_col->code_at(index));
@@ -1495,7 +1505,8 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                 using ColT = std::decay_t<decltype(src)>;
                 auto* dst = std::get_if<ColT>(dst_entry.column.get());
                 if (dst == nullptr) {
-                    throw std::runtime_error("filter: column type mismatch");
+                    invariant_violation(
+                        "filter_table: source/destination gather column type mismatch");
                 }
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                     dst->resize(out_n);
@@ -2101,7 +2112,7 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 } else if (const auto* double_value = std::get_if<double>(&value)) {
                     col.push_back(static_cast<std::int64_t>(*double_value));
                 } else {
-                    throw std::runtime_error("type mismatch");
+                    invariant_violation("append_scalar: expected Int64-compatible scalar");
                 }
             } else if constexpr (std::is_same_v<ValueType, double>) {
                 if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
@@ -2109,14 +2120,14 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 } else if (const auto* double_value = std::get_if<double>(&value)) {
                     col.push_back(*double_value);
                 } else {
-                    throw std::runtime_error("type mismatch");
+                    invariant_violation("append_scalar: expected Float64-compatible scalar");
                 }
             } else if constexpr (std::is_same_v<ValueType, std::string_view>) {
                 // Column<std::string> flat-buffer specialization uses value_type=string_view.
                 if (const auto* str_value = std::get_if<std::string>(&value)) {
                     col.push_back(*str_value);
                 } else {
-                    throw std::runtime_error("type mismatch");
+                    invariant_violation("append_scalar: expected String scalar");
                 }
             } else if constexpr (std::is_same_v<ValueType, Date>) {
                 if (const auto* date_value = std::get_if<Date>(&value)) {
@@ -2124,7 +2135,7 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
                     col.push_back(int64_to_date_checked(*int_value));
                 } else {
-                    throw std::runtime_error("type mismatch");
+                    invariant_violation("append_scalar: expected Date-compatible scalar");
                 }
             } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
                 if (const auto* ts_value = std::get_if<Timestamp>(&value)) {
@@ -2132,13 +2143,13 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
                     col.push_back(Timestamp{*int_value});
                 } else {
-                    throw std::runtime_error("type mismatch");
+                    invariant_violation("append_scalar: expected Timestamp-compatible scalar");
                 }
             } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
                 if (const auto* str_value = std::get_if<std::string>(&value)) {
                     col.push_back(*str_value);
                 } else {
-                    throw std::runtime_error("type mismatch");
+                    invariant_violation("append_scalar: expected String scalar for Categorical");
                 }
             }
         },
@@ -2259,7 +2270,7 @@ auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(op.column)) {
         return ts_col->operator[](row).nanos;
     }
-    throw std::runtime_error("type mismatch");
+    invariant_violation("get_int_value: unexpected operand column type");
 }
 
 auto get_double_value(const FastOperand& op, std::size_t row) -> double {
@@ -2287,7 +2298,7 @@ auto get_double_value(const FastOperand& op, std::size_t row) -> double {
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(op.column)) {
         return static_cast<double>(ts_col->operator[](row).nanos);
     }
-    throw std::runtime_error("type mismatch");
+    invariant_violation("get_double_value: unexpected operand column type");
 }
 
 auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_t rows,
@@ -5404,7 +5415,8 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                     } else if (const auto* v = std::get_if<double>(&value.value())) {
                         col.push_back(static_cast<std::int64_t>(*v));
                     } else {
-                        throw std::runtime_error("type mismatch");
+                        invariant_violation(
+                            "eval_expr_column: expected Int64-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, double>) {
                     if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
@@ -5412,13 +5424,14 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                     } else if (const auto* v = std::get_if<double>(&value.value())) {
                         col.push_back(*v);
                     } else {
-                        throw std::runtime_error("type mismatch");
+                        invariant_violation(
+                            "eval_expr_column: expected Float64-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, std::string>) {
                     if (const auto* v = std::get_if<std::string>(&value.value())) {
                         col.push_back(*v);
                     } else {
-                        throw std::runtime_error("type mismatch");
+                        invariant_violation("eval_expr_column: expected String expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, Date>) {
                     if (const auto* v = std::get_if<Date>(&value.value())) {
@@ -5426,7 +5439,8 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                     } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
                         col.push_back(int64_to_date_checked(*v));
                     } else {
-                        throw std::runtime_error("type mismatch");
+                        invariant_violation(
+                            "eval_expr_column: expected Date-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
                     if (const auto* v = std::get_if<Timestamp>(&value.value())) {
@@ -5434,7 +5448,8 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                     } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
                         col.push_back(Timestamp{*v});
                     } else {
-                        throw std::runtime_error("type mismatch");
+                        invariant_violation(
+                            "eval_expr_column: expected Timestamp-compatible expression value");
                     }
                 }
             },
@@ -6880,7 +6895,8 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                         } else if (const auto* double_value = std::get_if<double>(&value.value())) {
                             col.push_back(static_cast<std::int64_t>(*double_value));
                         } else {
-                            throw std::runtime_error("type mismatch");
+                            invariant_violation(
+                                "update_table_window: expected Int64-compatible expression value");
                         }
                     } else if constexpr (std::is_same_v<ValueType, double>) {
                         if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
@@ -6888,13 +6904,16 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                         } else if (const auto* double_value = std::get_if<double>(&value.value())) {
                             col.push_back(*double_value);
                         } else {
-                            throw std::runtime_error("type mismatch");
+                            invariant_violation(
+                                "update_table_window: expected Float64-compatible expression "
+                                "value");
                         }
                     } else if constexpr (std::is_same_v<ValueType, std::string>) {
                         if (const auto* v = std::get_if<std::string>(&value.value())) {
                             col.push_back(*v);
                         } else {
-                            throw std::runtime_error("type mismatch");
+                            invariant_violation(
+                                "update_table_window: expected String expression value");
                         }
                     } else if constexpr (std::is_same_v<ValueType, Date>) {
                         if (const auto* v = std::get_if<Date>(&value.value())) {
@@ -6903,7 +6922,8 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                                        std::get_if<std::int64_t>(&value.value())) {
                             col.push_back(int64_to_date_checked(*int_value));
                         } else {
-                            throw std::runtime_error("type mismatch");
+                            invariant_violation(
+                                "update_table_window: expected Date-compatible expression value");
                         }
                     } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
                         if (const auto* v = std::get_if<Timestamp>(&value.value())) {
@@ -6912,7 +6932,9 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                                        std::get_if<std::int64_t>(&value.value())) {
                             col.push_back(Timestamp{*int_value});
                         } else {
-                            throw std::runtime_error("type mismatch");
+                            invariant_violation(
+                                "update_table_window: expected Timestamp-compatible expression "
+                                "value");
                         }
                     }
                 },
@@ -7212,7 +7234,8 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     const auto& entry = input.columns[measure_indices[mi]];
                     const auto* src = std::get_if<Column<std::string>>(entry.column.get());
                     if (src == nullptr) {
-                        throw std::runtime_error("melt: measure column type mismatch");
+                        invariant_violation(
+                            "melt_table: measure column type mismatch after upfront validation");
                     }
                     measures.push_back(src);
                     const auto* offs = src->offsets_data();
@@ -7247,7 +7270,8 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     const auto& entry = input.columns[measure_indices[mi]];
                     const auto* src = std::get_if<Column<Categorical>>(entry.column.get());
                     if (src == nullptr) {
-                        throw std::runtime_error("melt: measure column type mismatch");
+                        invariant_violation(
+                            "melt_table: measure column type mismatch after upfront validation");
                     }
                     measures.push_back(src);
                 }
@@ -7268,7 +7292,8 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     const auto& entry = input.columns[measure_indices[mi]];
                     const auto* src = std::get_if<SrcCol>(entry.column.get());
                     if (src == nullptr) {
-                        throw std::runtime_error("melt: measure column type mismatch");
+                        invariant_violation(
+                            "melt_table: measure column type mismatch after upfront validation");
                     }
                     measures.push_back(src);
                 }

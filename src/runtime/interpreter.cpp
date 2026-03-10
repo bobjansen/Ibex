@@ -3,6 +3,7 @@
 #include <ibex/runtime/rng.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -411,6 +413,54 @@ auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict__ cp, LitT rv,
     }
 }
 
+template <ir::CompareOp Op>
+auto cmp_col_scalar_into_double_op(const double* __restrict__ cp, double rv,
+                                   uint8_t* __restrict__ mp, std::size_t n) -> void {
+    if constexpr (Op == ir::CompareOp::Eq) {
+        for (std::size_t i = 0; i < n; ++i)
+            mp[i] = cp[i] == rv;
+    } else if constexpr (Op == ir::CompareOp::Ne) {
+        for (std::size_t i = 0; i < n; ++i)
+            mp[i] = cp[i] != rv;
+    } else if constexpr (Op == ir::CompareOp::Lt) {
+        for (std::size_t i = 0; i < n; ++i)
+            mp[i] = cp[i] < rv;
+    } else if constexpr (Op == ir::CompareOp::Le) {
+        for (std::size_t i = 0; i < n; ++i)
+            mp[i] = cp[i] <= rv;
+    } else if constexpr (Op == ir::CompareOp::Gt) {
+        for (std::size_t i = 0; i < n; ++i)
+            mp[i] = cp[i] > rv;
+    } else if constexpr (Op == ir::CompareOp::Ge) {
+        for (std::size_t i = 0; i < n; ++i)
+            mp[i] = cp[i] >= rv;
+    }
+}
+
+auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict__ cp, double rv,
+                                uint8_t* __restrict__ mp, std::size_t n) -> void {
+    switch (op) {
+        case ir::CompareOp::Eq:
+            cmp_col_scalar_into_double_op<ir::CompareOp::Eq>(cp, rv, mp, n);
+            break;
+        case ir::CompareOp::Ne:
+            cmp_col_scalar_into_double_op<ir::CompareOp::Ne>(cp, rv, mp, n);
+            break;
+        case ir::CompareOp::Lt:
+            cmp_col_scalar_into_double_op<ir::CompareOp::Lt>(cp, rv, mp, n);
+            break;
+        case ir::CompareOp::Le:
+            cmp_col_scalar_into_double_op<ir::CompareOp::Le>(cp, rv, mp, n);
+            break;
+        case ir::CompareOp::Gt:
+            cmp_col_scalar_into_double_op<ir::CompareOp::Gt>(cp, rv, mp, n);
+            break;
+        case ir::CompareOp::Ge:
+            cmp_col_scalar_into_double_op<ir::CompareOp::Ge>(cp, rv, mp, n);
+            break;
+    }
+}
+
 // Dispatch column-vs-scalar comparison over all type combinations.
 using LitVal = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
 template <typename T>
@@ -597,12 +647,12 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
     if (const auto* dbl_col = std::get_if<Column<double>>(&col)) {
         const double* cp = dbl_col->data();
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
-            cmp_col_scalar_into(op, cp, *i, mp, n);
+            cmp_col_scalar_into_double(op, cp, static_cast<double>(*i), mp, n);
             result.apply_validity(validity, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
-            cmp_col_scalar_into(op, cp, *d, mp, n);
+            cmp_col_scalar_into_double(op, cp, *d, mp, n);
             result.apply_validity(validity, n);
             return result;
         }
@@ -957,6 +1007,198 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
     return std::unexpected("filter: incompatible column types in comparison");
 }
 
+enum class NumericSpecKind : std::uint8_t {
+    Int64,
+    Double,
+};
+
+struct NumericCmpSpec {
+    NumericSpecKind kind{};
+    ir::CompareOp op{};
+    const std::int64_t* i64 = nullptr;
+    const double* dbl = nullptr;
+    bool lit_is_int = false;
+    std::int64_t lit_i64 = 0;
+    double lit_dbl = 0.0;
+};
+
+auto try_extract_numeric_cmp_spec(const ir::FilterExpr& expr, const Table& table)
+    -> std::optional<NumericCmpSpec> {
+    const auto* cmp = std::get_if<ir::FilterCmp>(&expr.node);
+    if (cmp == nullptr) {
+        return std::nullopt;
+    }
+
+    const ir::FilterColumn* col_node = nullptr;
+    const ir::FilterLiteral* lit_node = nullptr;
+    ir::CompareOp op = cmp->op;
+    if (const auto* lcol = std::get_if<ir::FilterColumn>(&cmp->left->node)) {
+        if (const auto* rlit = std::get_if<ir::FilterLiteral>(&cmp->right->node)) {
+            col_node = lcol;
+            lit_node = rlit;
+        }
+    }
+    if (col_node == nullptr) {
+        if (const auto* llit = std::get_if<ir::FilterLiteral>(&cmp->left->node)) {
+            if (const auto* rcol = std::get_if<ir::FilterColumn>(&cmp->right->node)) {
+                col_node = rcol;
+                lit_node = llit;
+                op = flip_cmp(op);
+            }
+        }
+    }
+    if (col_node == nullptr || lit_node == nullptr) {
+        return std::nullopt;
+    }
+
+    auto it = table.index.find(col_node->name);
+    if (it == table.index.end()) {
+        return std::nullopt;
+    }
+    const auto& entry = table.columns[it->second];
+    if (entry.validity.has_value()) {
+        return std::nullopt;  // 3VL path handles null semantics
+    }
+
+    NumericCmpSpec spec{};
+    spec.op = op;
+    if (const auto* c = std::get_if<Column<std::int64_t>>(entry.column.get())) {
+        spec.kind = NumericSpecKind::Int64;
+        spec.i64 = c->data();
+    } else if (const auto* c = std::get_if<Column<double>>(entry.column.get())) {
+        spec.kind = NumericSpecKind::Double;
+        spec.dbl = c->data();
+    } else {
+        return std::nullopt;
+    }
+
+    if (const auto* i = std::get_if<std::int64_t>(&lit_node->value)) {
+        spec.lit_is_int = true;
+        spec.lit_i64 = *i;
+        spec.lit_dbl = static_cast<double>(*i);
+        return spec;
+    }
+    if (const auto* d = std::get_if<double>(&lit_node->value)) {
+        spec.lit_is_int = false;
+        spec.lit_dbl = *d;
+        return spec;
+    }
+    return std::nullopt;
+}
+
+template <ir::CompareOp Op, typename L, typename R>
+auto cmp_eval(L lhs, R rhs) -> uint8_t {
+    using C = std::common_type_t<L, R>;
+    const C l = static_cast<C>(lhs);
+    const C r = static_cast<C>(rhs);
+    if constexpr (Op == ir::CompareOp::Eq) {
+        return l == r;
+    } else if constexpr (Op == ir::CompareOp::Ne) {
+        return l != r;
+    } else if constexpr (Op == ir::CompareOp::Lt) {
+        return l < r;
+    } else if constexpr (Op == ir::CompareOp::Le) {
+        return l <= r;
+    } else if constexpr (Op == ir::CompareOp::Gt) {
+        return l > r;
+    } else {
+        return l >= r;
+    }
+}
+
+template <ir::CompareOp LOp, ir::CompareOp ROp, bool UseAnd, typename L, typename LLit, typename R,
+          typename RLit>
+auto cmp_pair_mask(const L* __restrict__ lhs_data, LLit lhs_lit, const R* __restrict__ rhs_data,
+                   RLit rhs_lit, uint8_t* __restrict__ out, std::size_t n) -> void {
+    for (std::size_t i = 0; i < n; ++i) {
+        const uint8_t l = cmp_eval<LOp>(lhs_data[i], lhs_lit);
+        const uint8_t r = cmp_eval<ROp>(rhs_data[i], rhs_lit);
+        out[i] = UseAnd ? (l & r) : (l | r);
+    }
+}
+
+template <bool UseAnd, typename L, typename LLit, typename R, typename RLit>
+auto dispatch_cmp_pair_ops(ir::CompareOp lop, ir::CompareOp rop, const L* lhs_data, LLit lhs_lit,
+                           const R* rhs_data, RLit rhs_lit, uint8_t* out, std::size_t n) -> void {
+    auto dispatch_right = [&](auto left_op_tag) {
+        constexpr ir::CompareOp LOp = decltype(left_op_tag)::value;
+        auto apply_right = [&](auto right_op_tag) {
+            constexpr ir::CompareOp ROp = decltype(right_op_tag)::value;
+            cmp_pair_mask<LOp, ROp, UseAnd>(lhs_data, lhs_lit, rhs_data, rhs_lit, out, n);
+        };
+        switch (rop) {
+            case ir::CompareOp::Eq:
+                apply_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Eq>{});
+                break;
+            case ir::CompareOp::Ne:
+                apply_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Ne>{});
+                break;
+            case ir::CompareOp::Lt:
+                apply_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Lt>{});
+                break;
+            case ir::CompareOp::Le:
+                apply_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Le>{});
+                break;
+            case ir::CompareOp::Gt:
+                apply_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Gt>{});
+                break;
+            case ir::CompareOp::Ge:
+                apply_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Ge>{});
+                break;
+        }
+    };
+    switch (lop) {
+        case ir::CompareOp::Eq:
+            dispatch_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Eq>{});
+            break;
+        case ir::CompareOp::Ne:
+            dispatch_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Ne>{});
+            break;
+        case ir::CompareOp::Lt:
+            dispatch_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Lt>{});
+            break;
+        case ir::CompareOp::Le:
+            dispatch_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Le>{});
+            break;
+        case ir::CompareOp::Gt:
+            dispatch_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Gt>{});
+            break;
+        case ir::CompareOp::Ge:
+            dispatch_right(std::integral_constant<ir::CompareOp, ir::CompareOp::Ge>{});
+            break;
+    }
+}
+
+template <bool UseAnd>
+auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
+                                      const NumericCmpSpec& rhs_spec, uint8_t* out, std::size_t n)
+    -> void {
+    auto run_rhs = [&](auto* lhs_data, auto lhs_lit) {
+        auto apply_rhs = [&](auto* rhs_data, auto rhs_lit) {
+            dispatch_cmp_pair_ops<UseAnd>(lhs_spec.op, rhs_spec.op, lhs_data, lhs_lit, rhs_data,
+                                          rhs_lit, out, n);
+        };
+        if (rhs_spec.kind == NumericSpecKind::Int64) {
+            if (rhs_spec.lit_is_int) {
+                apply_rhs(rhs_spec.i64, rhs_spec.lit_i64);
+            } else {
+                apply_rhs(rhs_spec.i64, rhs_spec.lit_dbl);
+            }
+        } else {
+            apply_rhs(rhs_spec.dbl, rhs_spec.lit_dbl);
+        }
+    };
+    if (lhs_spec.kind == NumericSpecKind::Int64) {
+        if (lhs_spec.lit_is_int) {
+            run_rhs(lhs_spec.i64, lhs_spec.lit_i64);
+        } else {
+            run_rhs(lhs_spec.i64, lhs_spec.lit_dbl);
+        }
+    } else {
+        run_rhs(lhs_spec.dbl, lhs_spec.lit_dbl);
+    }
+}
+
 // Evaluate a value sub-expression over all n rows, returning a column.
 // Returns a pointer into the table for simple column references (zero-copy),
 // or an owned ColumnValue for computed intermediates.
@@ -1058,6 +1300,20 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                                        lhs->get_validity(), rhs->get_validity());
                 return res;
             } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
+                // Fast path: two numeric (column cmp literal) terms without nulls.
+                // Evaluate both comparisons and combine (AND) in a single pass.
+                if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table);
+                    lspec.has_value()) {
+                    if (auto rspec = try_extract_numeric_cmp_spec(*node.right, table);
+                        rspec.has_value()) {
+                        Mask fused;
+                        fused.value.resize(n);
+                        uint8_t* out = fused.value.data();
+                        dispatch_numeric_cmp_pair_kernel<true>(*lspec, *rspec, out, n);
+                        return fused;
+                    }
+                }
+
                 // 3VL AND truth table:
                 //   T & T = T (valid), T & F = F (valid), T & null = null
                 //   F & T = F (valid), F & F = F (valid), F & null = F (valid!)
@@ -1088,6 +1344,20 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                 }
                 return std::move(*left);
             } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
+                // Fast path: two numeric (column cmp literal) terms without nulls.
+                // Evaluate both comparisons and combine (OR) in a single pass.
+                if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table);
+                    lspec.has_value()) {
+                    if (auto rspec = try_extract_numeric_cmp_spec(*node.right, table);
+                        rspec.has_value()) {
+                        Mask fused;
+                        fused.value.resize(n);
+                        uint8_t* out = fused.value.data();
+                        dispatch_numeric_cmp_pair_kernel<false>(*lspec, *rspec, out, n);
+                        return fused;
+                    }
+                }
+
                 // 3VL OR truth table:
                 //   T | T = T (valid), T | F = T (valid), T | null = T (valid!)
                 //   F | T = T (valid), F | F = F (valid), F | null = null
@@ -1182,20 +1452,21 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
     const uint8_t* mp = mask_result->value.data();
     const uint8_t* vp = mask_result->valid ? mask_result->valid->data() : nullptr;
 
-    // Count matching rows for pre-allocation.
+    // Block-wise compaction: keep bits per 64-row chunk + popcount for out size.
+    const std::size_t n_words = (n + 63) / 64;
+    std::vector<std::uint64_t> keep_words(n_words, 0);
     std::size_t out_n = 0;
-    for (std::size_t i = 0; i < n; ++i)
-        out_n += vp ? (mp[i] & vp[i]) : mp[i];
-
-    std::vector<std::size_t> selected;
-    selected.resize(out_n);
-    {
-        std::size_t j = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (vp ? (mp[i] & vp[i]) : mp[i]) {
-                selected[j++] = i;
-            }
+    for (std::size_t w = 0; w < n_words; ++w) {
+        const std::size_t base = w * 64;
+        const std::size_t lim = std::min<std::size_t>(64, n - base);
+        std::uint64_t bits = 0;
+        for (std::size_t i = 0; i < lim; ++i) {
+            const std::size_t row = base + i;
+            const bool keep = vp ? ((mp[row] & vp[row]) != 0) : (mp[row] != 0);
+            bits |= static_cast<std::uint64_t>(keep) << i;
         }
+        keep_words[w] = bits;
+        out_n += static_cast<std::size_t>(std::popcount(bits));
     }
 
     // Gather: for each column, copy only the matching rows.
@@ -1208,6 +1479,18 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
     constexpr std::size_t kParallelRows = 200'000;
     const bool use_parallel = out_n >= kParallelRows && input.columns.size() >= 2 &&
                               std::thread::hardware_concurrency() > 1;
+
+    auto for_each_selected = [&](auto&& fn) {
+        for (std::size_t w = 0; w < n_words; ++w) {
+            std::uint64_t bits = keep_words[w];
+            const std::size_t base = w * 64;
+            while (bits != 0) {
+                const unsigned bit = std::countr_zero(bits);
+                fn(base + static_cast<std::size_t>(bit));
+                bits &= (bits - 1);
+            }
+        }
+    };
 
     auto copy_column = [&](std::size_t col_idx) {
         const auto& src_entry = input.columns[col_idx];
@@ -1223,45 +1506,40 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                     dst->resize(out_n);
                     const auto* sp = src.codes_data();
                     auto* dp = dst->codes_data();
-                    for (std::size_t j = 0; j < out_n; ++j) {
-                        dp[j] = sp[selected[j]];
-                    }
+                    std::size_t j = 0;
+                    for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                     // Two-pass flat-buffer gather: compute total bytes, then bulk-memcpy slabs.
                     const uint32_t* src_off = src.offsets_data();
                     std::size_t total_chars = 0;
-                    for (std::size_t j = 0; j < out_n; ++j) {
-                        std::size_t si = selected[j];
-                        total_chars += src_off[si + 1] - src_off[si];
-                    }
+                    for_each_selected(
+                        [&](std::size_t si) { total_chars += src_off[si + 1] - src_off[si]; });
                     dst->resize_for_gather(out_n, total_chars);
                     uint32_t* dst_off = dst->offsets_data();
                     char* dst_char = dst->chars_data();
                     const char* src_char = src.chars_data();
                     dst_off[0] = 0;
                     uint32_t cur = 0;
-                    for (std::size_t j = 0; j < out_n; ++j) {
-                        std::size_t si = selected[j];
+                    std::size_t j = 0;
+                    for_each_selected([&](std::size_t si) {
                         uint32_t len = src_off[si + 1] - src_off[si];
                         std::memcpy(dst_char + cur, src_char + src_off[si], len);
                         cur += len;
-                        dst_off[j + 1] = cur;
-                    }
+                        dst_off[++j] = cur;
+                    });
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     dst->resize(out_n);
                     const std::uint8_t* sp = src.data();
                     std::uint8_t* dp = dst->data();
-                    for (std::size_t j = 0; j < out_n; ++j) {
-                        dp[j] = sp[selected[j]];
-                    }
+                    std::size_t j = 0;
+                    for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
                 } else {
                     using T = typename ColT::value_type;
                     dst->resize(out_n);
                     const T* sp = src.data();
                     T* dp = dst->data();
-                    for (std::size_t j = 0; j < out_n; ++j) {
-                        dp[j] = sp[selected[j]];
-                    }
+                    std::size_t j = 0;
+                    for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
                 }
             },
             *src_entry.column);
@@ -1294,13 +1572,13 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
             copy_column(c);
         }
     }
-    // Propagate validity bitmaps using the same selected[] indices.
+    // Propagate validity bitmaps using the same selected row set.
     for (std::size_t c = 0; c < input.columns.size(); ++c) {
         if (input.columns[c].validity.has_value()) {
             const auto& src_bm = *input.columns[c].validity;
             ValidityBitmap dst_bm(out_n, false);
-            for (std::size_t j = 0; j < out_n; ++j)
-                dst_bm.set(j, src_bm[selected[j]]);
+            std::size_t j = 0;
+            for_each_selected([&](std::size_t si) { dst_bm.set(j++, src_bm[si]); });
             output.columns[c].validity = std::move(dst_bm);
         }
     }

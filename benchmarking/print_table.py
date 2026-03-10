@@ -13,6 +13,7 @@ FRAMEWORK_ORDER = [
     "ibex+parse",
     "ibex-compiled",
     "polars",
+    "polars-st",
     "pandas",
     "data.table",
     "dplyr",

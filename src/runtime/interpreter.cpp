@@ -3865,6 +3865,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             // and the inner loops are simple scatter-updates: accum[gids[row]] op= data[row].
             for (std::size_t agg_i = 0; agg_i < plan.size(); ++agg_i) {
                 const auto& item = plan[agg_i];
+                const auto slot_for = [&](std::uint32_t g) -> AggSlot& {
+                    return fs[(static_cast<std::size_t>(g) * n_aggs) + agg_i];
+                };
 
                 if (item.func == ir::AggFunc::Count) {
                     std::vector<std::int64_t> acc(n_groups, 0);
@@ -3872,7 +3875,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         acc[gids[row]]++;
                     }
                     for (std::uint32_t g = 0; g < n_groups; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = acc[g];
+                        slot_for(g).count = acc[g];
                     }
                     continue;
                 }
@@ -3889,8 +3892,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.int_value = acc[g];
+                            slot.has_value = true;
                         }
                     } else if (item.dbl_col != nullptr) {
                         std::vector<double> acc(n_groups, 0.0);
@@ -3903,8 +3907,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.double_value = acc[g];
+                            slot.has_value = true;
                         }
                     } else if (item.str_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
@@ -3916,9 +3921,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].first_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.first_value = std::move(acc[g]);
+                            slot.has_value = true;
                         }
                     } else if (item.cat_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
@@ -3930,9 +3935,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].first_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.first_value = std::move(acc[g]);
+                            slot.has_value = true;
                         }
                     }
                     continue;
@@ -3945,8 +3950,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             acc[gids[row]] = (*item.int_col)[row];
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.int_value = acc[g];
+                            slot.has_value = true;
                         }
                     } else if (item.dbl_col != nullptr) {
                         std::vector<double> acc(n_groups, 0.0);
@@ -3955,8 +3961,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             acc[gids[row]] = data[row];
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.double_value = acc[g];
+                            slot.has_value = true;
                         }
                     } else if (item.str_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
@@ -3964,9 +3971,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             acc[gids[row]] = (*item.str_col)[row];
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].last_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).last_value = std::move(acc[g]);
+                            slot_for(g).has_value = true;
                         }
                     } else if (item.cat_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
@@ -3974,9 +3980,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             acc[gids[row]] = std::string((*item.cat_col)[row]);
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].last_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).last_value = std::move(acc[g]);
+                            slot_for(g).has_value = true;
                         }
                     }
                     continue;
@@ -3991,9 +3996,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[gids[row]] += data[row];
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
-                                    acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).double_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4006,8 +4010,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 counts[g]++;
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].sum = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = counts[g];
+                                slot_for(g).sum = acc[g];
+                                slot_for(g).count = counts[g];
                             }
                             break;
                         }
@@ -4019,9 +4023,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[g] = std::min(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
-                                    acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).double_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4033,9 +4036,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
-                                    acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).double_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4051,8 +4053,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[gids[row]] += data[row];
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).int_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4065,8 +4067,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 counts[g]++;
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].sum = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = counts[g];
+                                slot_for(g).sum = acc[g];
+                                slot_for(g).count = counts[g];
                             }
                             break;
                         }
@@ -4078,8 +4080,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[g] = std::min(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).int_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4091,8 +4093,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).int_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4324,13 +4326,16 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             // Pass 2: flat accumulators — same structure as the categorical fast path.
             for (std::size_t agg_i = 0; agg_i < n_aggs; ++agg_i) {
                 const auto& item = plan[agg_i];
+                const auto slot_for = [&](std::uint32_t g) -> AggSlot& {
+                    return fs[(static_cast<std::size_t>(g) * n_aggs) + agg_i];
+                };
 
                 if (item.func == ir::AggFunc::Count) {
                     std::vector<std::int64_t> acc(n_groups, 0);
                     for (std::size_t row = 0; row < rows; ++row)
                         acc[gids[row]]++;
                     for (std::uint32_t g = 0; g < n_groups; ++g)
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = acc[g];
+                        slot_for(g).count = acc[g];
                     continue;
                 }
 
@@ -4346,8 +4351,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).int_value = acc[g];
+                            slot_for(g).has_value = true;
                         }
                     } else if (item.dbl_col != nullptr) {
                         std::vector<double> acc(n_groups, 0.0);
@@ -4360,8 +4365,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).double_value = acc[g];
+                            slot_for(g).has_value = true;
                         }
                     } else if (item.str_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
@@ -4373,9 +4378,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].first_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.first_value = std::move(acc[g]);
+                            slot.has_value = true;
                         }
                     } else if (item.cat_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
@@ -4387,9 +4392,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].first_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            auto& slot = slot_for(g);
+                            slot.first_value = std::move(acc[g]);
+                            slot.has_value = true;
                         }
                     }
                     continue;
@@ -4401,8 +4406,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         for (std::size_t row = 0; row < rows; ++row)
                             acc[gids[row]] = (*item.int_col)[row];
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).int_value = acc[g];
+                            slot_for(g).has_value = true;
                         }
                     } else if (item.dbl_col != nullptr) {
                         std::vector<double> acc(n_groups, 0.0);
@@ -4410,26 +4415,24 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         for (std::size_t row = 0; row < rows; ++row)
                             acc[gids[row]] = data[row];
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).double_value = acc[g];
+                            slot_for(g).has_value = true;
                         }
                     } else if (item.str_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
                         for (std::size_t row = 0; row < rows; ++row)
                             acc[gids[row]] = (*item.str_col)[row];
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].last_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).last_value = std::move(acc[g]);
+                            slot_for(g).has_value = true;
                         }
                     } else if (item.cat_col != nullptr) {
                         std::vector<std::string> acc(n_groups);
                         for (std::size_t row = 0; row < rows; ++row)
                             acc[gids[row]] = std::string((*item.cat_col)[row]);
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].last_value =
-                                std::move(acc[g]);
-                            fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                            slot_for(g).last_value = std::move(acc[g]);
+                            slot_for(g).has_value = true;
                         }
                     }
                     continue;
@@ -4443,9 +4446,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             for (std::size_t row = 0; row < rows; ++row)
                                 acc[gids[row]] += data[row];
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
-                                    acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).double_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4458,8 +4460,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 counts[g]++;
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].sum = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = counts[g];
+                                slot_for(g).sum = acc[g];
+                                slot_for(g).count = counts[g];
                             }
                             break;
                         }
@@ -4471,9 +4473,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[g] = std::min(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
-                                    acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).double_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4485,9 +4486,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value =
-                                    acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).double_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4502,8 +4502,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             for (std::size_t row = 0; row < rows; ++row)
                                 acc[gids[row]] += data[row];
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).int_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4516,8 +4516,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 counts[g]++;
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].sum = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = counts[g];
+                                slot_for(g).sum = acc[g];
+                                slot_for(g).count = counts[g];
                             }
                             break;
                         }
@@ -4543,8 +4543,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                 acc[g] = std::max(data[row], acc[g]);
                             }
                             for (std::uint32_t g = 0; g < n_groups; ++g) {
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                                slot_for(g).int_value = acc[g];
+                                slot_for(g).has_value = true;
                             }
                             break;
                         }
@@ -4755,13 +4755,16 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     // ── Pass 2: per-aggregation scatter-accumulate into flat AggSlot[] ───────
     for (std::size_t agg_i = 0; agg_i < plan.size(); ++agg_i) {
         const auto& item = plan[agg_i];
+        const auto slot_for = [&](std::uint32_t g) -> AggSlot& {
+            return fs[(static_cast<std::size_t>(g) * n_aggs) + agg_i];
+        };
 
         if (item.func == ir::AggFunc::Count) {
             std::vector<std::int64_t> acc(n_groups_m, 0);
             for (std::size_t row = 0; row < rows; ++row)
                 acc[gids[row]]++;
             for (std::uint32_t g = 0; g < n_groups_m; ++g)
-                fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = acc[g];
+                slot_for(g).count = acc[g];
             continue;
         }
 
@@ -4777,8 +4780,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    auto& slot = slot_for(g);
+                    slot.int_value = acc[g];
+                    slot.has_value = true;
                 }
             } else if (item.dbl_col != nullptr) {
                 std::vector<double> acc(n_groups_m, 0.0);
@@ -4791,8 +4795,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    auto& slot = slot_for(g);
+                    slot.double_value = acc[g];
+                    slot.has_value = true;
                 }
             } else if (item.str_col != nullptr) {
                 std::vector<std::string> acc(n_groups_m);
@@ -4804,9 +4809,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].first_value =
-                        std::move(acc[g]);
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    auto& slot = slot_for(g);
+                    slot.first_value = std::move(acc[g]);
+                    slot.has_value = true;
                 }
             } else if (item.cat_col != nullptr) {
                 std::vector<std::string> acc(n_groups_m);
@@ -4818,9 +4823,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                 }
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].first_value =
-                        std::move(acc[g]);
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    auto& slot = slot_for(g);
+                    slot.first_value = std::move(acc[g]);
+                    slot.has_value = true;
                 }
             }
             continue;
@@ -4832,8 +4837,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 for (std::size_t row = 0; row < rows; ++row)
                     acc[gids[row]] = (*item.int_col)[row];
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    slot_for(g).int_value = acc[g];
+                    slot_for(g).has_value = true;
                 }
             } else if (item.dbl_col != nullptr) {
                 std::vector<double> acc(n_groups_m, 0.0);
@@ -4841,24 +4846,24 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 for (std::size_t row = 0; row < rows; ++row)
                     acc[gids[row]] = data[row];
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    slot_for(g).double_value = acc[g];
+                    slot_for(g).has_value = true;
                 }
             } else if (item.str_col != nullptr) {
                 std::vector<std::string> acc(n_groups_m);
                 for (std::size_t row = 0; row < rows; ++row)
                     acc[gids[row]] = (*item.str_col)[row];
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].last_value = std::move(acc[g]);
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    slot_for(g).last_value = std::move(acc[g]);
+                    slot_for(g).has_value = true;
                 }
             } else if (item.cat_col != nullptr) {
                 std::vector<std::string> acc(n_groups_m);
                 for (std::size_t row = 0; row < rows; ++row)
                     acc[gids[row]] = std::string((*item.cat_col)[row]);
                 for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].last_value = std::move(acc[g]);
-                    fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                    slot_for(g).last_value = std::move(acc[g]);
+                    slot_for(g).has_value = true;
                 }
             }
             continue;
@@ -4872,8 +4877,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     for (std::size_t row = 0; row < rows; ++row)
                         acc[gids[row]] += data[row];
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                        slot_for(g).double_value = acc[g];
+                        slot_for(g).has_value = true;
                     }
                     break;
                 }
@@ -4886,8 +4891,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         counts[g]++;
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].sum = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = counts[g];
+                        slot_for(g).sum = acc[g];
+                        slot_for(g).count = counts[g];
                     }
                     break;
                 }
@@ -4898,8 +4903,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         acc[g] = std::min(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                        slot_for(g).double_value = acc[g];
+                        slot_for(g).has_value = true;
                     }
                     break;
                 }
@@ -4910,8 +4915,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         acc[g] = std::max(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].double_value = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                        slot_for(g).double_value = acc[g];
+                        slot_for(g).has_value = true;
                     }
                     break;
                 }
@@ -4926,8 +4931,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     for (std::size_t row = 0; row < rows; ++row)
                         acc[gids[row]] += data[row];
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                        slot_for(g).int_value = acc[g];
+                        slot_for(g).has_value = true;
                     }
                     break;
                 }
@@ -4940,8 +4945,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         counts[g]++;
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].sum = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].count = counts[g];
+                        slot_for(g).sum = acc[g];
+                        slot_for(g).count = counts[g];
                     }
                     break;
                 }
@@ -4953,8 +4958,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         acc[g] = std::min(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                        slot_for(g).int_value = acc[g];
+                        slot_for(g).has_value = true;
                     }
                     break;
                 }
@@ -4966,8 +4971,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         acc[g] = std::max(data[row], acc[g]);
                     }
                     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].int_value = acc[g];
-                        fs[static_cast<std::size_t>(g) * n_aggs + agg_i].has_value = true;
+                        slot_for(g).int_value = acc[g];
+                        slot_for(g).has_value = true;
                     }
                     break;
                 }

@@ -8,7 +8,7 @@
 #   ./run_scale_suite.sh [--sizes 1M,2M,4M,...,64M] [--warmup N] [--iters N]
 #                        [--skip-ibex] [--skip-ibex-compiled]
 #                        [--skip-python] [--skip-r]
-#                        [--skip-pandas] [--skip-dplyr] [--keep-data]
+#                        [--skip-pandas] [--skip-dplyr] [--skip-polars-st] [--keep-data]
 #                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
 
 set -euo pipefail
@@ -31,6 +31,7 @@ SKIP_PYTHON=0
 SKIP_R=0
 SKIP_PANDAS=0
 SKIP_DPLYR=0
+SKIP_POLARS_ST=0
 KEEP_DATA=0
 TO_README=0
 TO_README_ROWS=4000000
@@ -82,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --skip-r)      SKIP_R=1; shift ;;
         --skip-pandas) SKIP_PANDAS=1; shift ;;
         --skip-dplyr)  SKIP_DPLYR=1; shift ;;
+        --skip-polars-st) SKIP_POLARS_ST=1; shift ;;
         --keep-data)   KEEP_DATA=1; shift ;;
         --to-readme|--to_readme) TO_README=1; shift ;;
         --to-readme-rows|--to_readme_rows)
@@ -174,7 +176,7 @@ if not matching:
     selected_rows = max(r["dataset_rows"] for r in rows)
     matching = [r for r in rows if r["dataset_rows"] == selected_rows]
 
-preferred_frameworks = ["ibex", "ibex-compiled", "polars", "pandas", "data.table", "dplyr"]
+preferred_frameworks = ["ibex", "ibex-compiled", "polars", "polars-st", "pandas", "data.table", "dplyr"]
 present_frameworks = {r["framework"] for r in matching}
 frameworks = [fw for fw in preferred_frameworks if fw in present_frameworks]
 for fw in sorted(present_frameworks):
@@ -316,6 +318,22 @@ for rows in "${SIZES[@]}"; do
             --out "$size_result_dir/python.tsv" \
             "${py_args[@]}"
         append_tagged_results "$rows" "$size_result_dir/python.tsv"
+
+        if [[ $SKIP_POLARS_ST -eq 0 ]]; then
+            echo "  → polars (single thread)"
+            polars_st_raw="$size_result_dir/polars_st_raw.tsv"
+            polars_st_tsv="$size_result_dir/polars_st.tsv"
+            POLARS_MAX_THREADS=1 uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_python.py" \
+                --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --reshape-rows "$rows" \
+                --fill-rows "$rows" \
+                --warmup "$WARMUP" --iters "$ITERS" \
+                --out "$polars_st_raw"
+            awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1="polars-st"; print }' \
+                "$polars_st_raw" > "$polars_st_tsv"
+            append_tagged_results "$rows" "$polars_st_tsv"
+        fi
     fi
 
     if [[ $SKIP_R -eq 0 ]]; then

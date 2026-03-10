@@ -17,7 +17,6 @@
 #include <set>
 #include <stdexcept>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -1476,10 +1475,6 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
         output.add_column(entry.name, make_empty_like(*entry.column));
     }
 
-    constexpr std::size_t kParallelRows = 200'000;
-    const bool use_parallel = out_n >= kParallelRows && input.columns.size() >= 2 &&
-                              std::thread::hardware_concurrency() > 1;
-
     auto for_each_selected = [&](auto&& fn) {
         for (std::size_t w = 0; w < n_words; ++w) {
             std::uint64_t bits = keep_words[w];
@@ -1545,33 +1540,10 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
             *src_entry.column);
     };
 
-    if (use_parallel) {
-        const std::size_t cols = input.columns.size();
-        const std::size_t hw = std::max<unsigned>(1, std::thread::hardware_concurrency());
-        const std::size_t threads = std::min(cols, hw);
-        const std::size_t chunk = (cols + threads - 1) / threads;
-        std::vector<std::thread> workers;
-        workers.reserve(threads);
-        for (std::size_t t = 0; t < threads; ++t) {
-            std::size_t start = t * chunk;
-            if (start >= cols) {
-                break;
-            }
-            std::size_t end = std::min(cols, start + chunk);
-            workers.emplace_back([&, start, end] {
-                for (std::size_t c = start; c < end; ++c) {
-                    copy_column(c);
-                }
-            });
-        }
-        for (auto& th : workers) {
-            th.join();
-        }
-    } else {
-        for (std::size_t c = 0; c < input.columns.size(); ++c) {
-            copy_column(c);
-        }
+    for (std::size_t c = 0; c < input.columns.size(); ++c) {
+        copy_column(c);
     }
+
     // Propagate validity bitmaps using the same selected row set.
     for (std::size_t c = 0; c < input.columns.size(); ++c) {
         if (input.columns[c].validity.has_value()) {

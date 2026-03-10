@@ -7,9 +7,13 @@
 # Usage:
 #   ./run_scale_suite.sh [--sizes 1M,2M,4M,...,64M] [--warmup N] [--iters N]
 #                        [--skip-ibex] [--skip-ibex-compiled]
-#                        [--skip-python] [--skip-r] [--skip-duckdb]
+#                        [--skip-python] [--skip-r]
+#                        [--skip-duckdb] [--skip-duckdb-st]
+#                        [--skip-datafusion] [--skip-datafusion-st]
+#                        [--skip-clickhouse] [--skip-clickhouse-st]
+#                        [--skip-sqlite]
 #                        [--skip-pandas] [--skip-dplyr] [--skip-polars-st]
-#                        [--skip-duckdb-st] [--keep-data]
+#                        [--keep-data]
 #                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
 
 set -euo pipefail
@@ -35,6 +39,11 @@ SKIP_DPLYR=0
 SKIP_POLARS_ST=0
 SKIP_DUCKDB=0
 SKIP_DUCKDB_ST=0
+SKIP_DATAFUSION=0
+SKIP_DATAFUSION_ST=0
+SKIP_CLICKHOUSE=0
+SKIP_CLICKHOUSE_ST=0
+SKIP_SQLITE=0
 KEEP_DATA=0
 TO_README=0
 TO_README_ROWS=4000000
@@ -89,6 +98,11 @@ while [[ $# -gt 0 ]]; do
         --skip-polars-st) SKIP_POLARS_ST=1; shift ;;
         --skip-duckdb) SKIP_DUCKDB=1; shift ;;
         --skip-duckdb-st) SKIP_DUCKDB_ST=1; shift ;;
+        --skip-datafusion) SKIP_DATAFUSION=1; shift ;;
+        --skip-datafusion-st) SKIP_DATAFUSION_ST=1; shift ;;
+        --skip-clickhouse) SKIP_CLICKHOUSE=1; shift ;;
+        --skip-clickhouse-st) SKIP_CLICKHOUSE_ST=1; shift ;;
+        --skip-sqlite) SKIP_SQLITE=1; shift ;;
         --keep-data)   KEEP_DATA=1; shift ;;
         --to-readme|--to_readme) TO_README=1; shift ;;
         --to-readme-rows|--to_readme_rows)
@@ -181,7 +195,7 @@ if not matching:
     selected_rows = max(r["dataset_rows"] for r in rows)
     matching = [r for r in rows if r["dataset_rows"] == selected_rows]
 
-preferred_frameworks = ["ibex", "ibex-compiled", "polars", "polars-st", "duckdb", "duckdb-st", "pandas", "data.table", "dplyr"]
+preferred_frameworks = ["ibex", "ibex-compiled", "polars", "polars-st", "duckdb", "duckdb-st", "datafusion", "datafusion-st", "clickhouse", "clickhouse-st", "sqlite", "pandas", "data.table", "dplyr"]
 present_frameworks = {r["framework"] for r in matching}
 frameworks = [fw for fw in preferred_frameworks if fw in present_frameworks]
 for fw in sorted(present_frameworks):
@@ -334,6 +348,7 @@ for rows in "${SIZES[@]}"; do
                 --reshape-rows "$rows" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
+                --skip-pandas \
                 --out "$polars_st_raw"
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1="polars-st"; print }' \
                 "$polars_st_raw" > "$polars_st_tsv"
@@ -385,6 +400,76 @@ for rows in "${SIZES[@]}"; do
                 "$duckdb_st_raw" > "$duckdb_st_tsv"
             append_tagged_results "$rows" "$duckdb_st_tsv"
         fi
+    fi
+
+    if [[ $SKIP_DATAFUSION -eq 0 ]]; then
+        echo "  → datafusion"
+        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_datafusion.py" \
+            --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --reshape-rows "$rows" \
+            --fill-rows "$rows" \
+            --warmup "$WARMUP" --iters "$ITERS" \
+            --out "$size_result_dir/datafusion.tsv"
+        append_tagged_results "$rows" "$size_result_dir/datafusion.tsv"
+
+        if [[ $SKIP_DATAFUSION_ST -eq 0 ]]; then
+            echo "  → datafusion (single thread)"
+            datafusion_st_raw="$size_result_dir/datafusion_st_raw.tsv"
+            datafusion_st_tsv="$size_result_dir/datafusion_st.tsv"
+            uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_datafusion.py" \
+                --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --reshape-rows "$rows" \
+                --fill-rows "$rows" \
+                --warmup "$WARMUP" --iters "$ITERS" \
+                --threads 1 \
+                --out "$datafusion_st_raw"
+            awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "datafusion") $1="datafusion-st"; print }' \
+                "$datafusion_st_raw" > "$datafusion_st_tsv"
+            append_tagged_results "$rows" "$datafusion_st_tsv"
+        fi
+    fi
+
+    if [[ $SKIP_CLICKHOUSE -eq 0 ]]; then
+        echo "  → clickhouse (chdb)"
+        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_clickhouse.py" \
+            --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --reshape-rows "$rows" \
+            --fill-rows "$rows" \
+            --warmup "$WARMUP" --iters "$ITERS" \
+            --out "$size_result_dir/clickhouse.tsv"
+        append_tagged_results "$rows" "$size_result_dir/clickhouse.tsv"
+
+        if [[ $SKIP_CLICKHOUSE_ST -eq 0 ]]; then
+            echo "  → clickhouse (single thread)"
+            clickhouse_st_raw="$size_result_dir/clickhouse_st_raw.tsv"
+            clickhouse_st_tsv="$size_result_dir/clickhouse_st.tsv"
+            uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_clickhouse.py" \
+                --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --reshape-rows "$rows" \
+                --fill-rows "$rows" \
+                --warmup "$WARMUP" --iters "$ITERS" \
+                --threads 1 \
+                --out "$clickhouse_st_raw"
+            awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "clickhouse") $1="clickhouse-st"; print }' \
+                "$clickhouse_st_raw" > "$clickhouse_st_tsv"
+            append_tagged_results "$rows" "$clickhouse_st_tsv"
+        fi
+    fi
+
+    if [[ $SKIP_SQLITE -eq 0 ]]; then
+        echo "  → sqlite"
+        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_sqlite.py" \
+            --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --reshape-rows "$rows" \
+            --fill-rows "$rows" \
+            --warmup "$WARMUP" --iters "$ITERS" \
+            --out "$size_result_dir/sqlite.tsv"
+        append_tagged_results "$rows" "$size_result_dir/sqlite.tsv"
     fi
 
     if [[ $KEEP_DATA -eq 0 ]]; then

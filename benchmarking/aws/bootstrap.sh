@@ -47,7 +47,9 @@ IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
         --skip-ibex-compiled \
         --skip-pandas \
         --skip-dplyr \
-        --skip-duckdb-st
+        --skip-duckdb-st \
+        --skip-datafusion-st \
+        --skip-clickhouse-st
 
 # ── Upload results ────────────────────────────────────────────────────────────
 aws s3 cp results/scales.csv \

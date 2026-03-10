@@ -6,4 +6,5 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
     "polars>=1.0",
+    "duckdb>=1.0",
 ]

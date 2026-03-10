@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./run_all.sh [--warmup N] [--iters N] [--skip-ibex] [--skip-ibex-compiled]
-#                [--skip-r] [--skip-pandas] [--skip-dplyr]
+#                [--skip-r] [--skip-pandas] [--skip-dplyr] [--skip-duckdb]
 #
 # Environment overrides:
 #   IBEX_ROOT   — repo root        (default: parent of this script)
@@ -30,6 +30,7 @@ SKIP_PYTHON=0
 SKIP_R=0
 SKIP_PANDAS=0
 SKIP_DPLYR=0
+SKIP_DUCKDB=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --skip-r)      SKIP_R=1;      shift   ;;
         --skip-pandas) SKIP_PANDAS=1; shift   ;;
         --skip-dplyr)  SKIP_DPLYR=1;  shift   ;;
+        --skip-duckdb) SKIP_DUCKDB=1; shift   ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -114,9 +116,20 @@ if [[ $SKIP_R -eq 0 ]]; then
     echo ""
 fi
 
-# ── 5. Print table ────────────────────────────────────────────────────────────
+# ── 5. DuckDB ─────────────────────────────────────────────────────────────────
+if [[ $SKIP_DUCKDB -eq 0 ]]; then
+    echo "━━━ DuckDB ━━━"
+    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_duckdb.py" \
+        --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+        --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
+        --warmup "$WARMUP" --iters "$ITERS" \
+        --out "$RESULTS/duckdb.tsv"
+    echo ""
+fi
+
+# ── 6. Print table ────────────────────────────────────────────────────────────
 echo "━━━ Summary ━━━"
 uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/print_table.py" \
     "$RESULTS"/ibex.tsv "$RESULTS"/ibex_compiled.tsv \
-    "$RESULTS"/python.tsv "$RESULTS"/r.tsv 2>/dev/null \
+    "$RESULTS"/python.tsv "$RESULTS"/r.tsv "$RESULTS"/duckdb.tsv 2>/dev/null \
     || python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*.tsv

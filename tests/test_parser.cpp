@@ -271,6 +271,29 @@ fn wrapper() -> Int effects {} {
     REQUIRE(result.error().message.find("nondet") != std::string::npos);
 }
 
+TEST_CASE("Effect checking: io resource mismatch is reported precisely") {
+    const char* source = R"(
+extern fn read_csv(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
+fn load(path: String) -> DataFrame effects { io_read("s3"), may_fail } {
+  read_csv(path);
+}
+)";
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("io_read(\"file\")") != std::string::npos);
+}
+
+TEST_CASE("Effect checking: unscoped io annotation covers scoped inferred resources") {
+    const char* source = R"(
+extern fn read_csv(path: String) -> DataFrame effects { io_read("file"), may_fail } from "csv.hpp";
+fn load(path: String) -> DataFrame effects { io_read, may_fail } {
+  read_csv(path);
+}
+)";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+}
+
 TEST_CASE("Parse let binding with precedence") {
     const char* source = "let mut x: Int64 = 1 + 2 * 3;";
 

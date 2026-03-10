@@ -1,0 +1,77 @@
+// Optimization showcase for effect checking.
+//
+// Demonstrates:
+// - large pure regions (`effects {}`)
+// - explicit side-effect boundaries
+// - parameter call semantics (`const` / `mutable` / `consume`)
+// - transitive effect annotations on user functions
+
+extern fn read_parquet(const path: String) -> DataFrame
+    effects { io_read("file"), may_fail }
+    from "parquet.hpp";
+
+extern fn write_parquet(const df: DataFrame, const path: String) -> Int
+    effects { io_write("file"), may_fail }
+    from "parquet.hpp";
+
+extern fn ws_send(const df: DataFrame, const endpoint: String) -> Int
+    effects { io_write("ws"), may_fail }
+    from "websocket.hpp";
+
+extern fn normalize_inplace(mutable df: DataFrame) -> DataFrame
+    effects {}
+    from "stats.hpp";
+
+extern fn compress(consume df: DataFrame) -> DataFrame
+    effects {}
+    from "codec.hpp";
+
+extern fn write_blob(consume df: DataFrame, const path: String) -> Int
+    effects { io_write("file"), may_fail }
+    from "blob.hpp";
+
+fn build_features(df: DataFrame) -> DataFrame effects {} {
+    df[
+        update {
+            notional = price * size,
+            spread_bps = 10000.0 * (ask - bid) / mid,
+            imbalance = (bid_sz - ask_sz) / (bid_sz + ask_sz)
+        },
+        select { ts, symbol, notional, spread_bps, imbalance }
+    ];
+}
+
+// Intentional duplicate pure call: optimizer CSE/fusion target.
+fn duplicate_work(df: DataFrame) -> DataFrame effects {} {
+    let a = build_features(df);
+    let b = build_features(df);
+    a join b on { ts, symbol };
+}
+
+// Mutable extern call creates an ordering barrier around this step.
+fn with_inplace_step(df: DataFrame) -> DataFrame effects {} {
+    let base = build_features(df);
+    let norm = normalize_inplace(base);
+    norm[update { score = notional * imbalance }];
+}
+
+// Consume chain: ownership can move through extern calls.
+fn archive_only(df: DataFrame, path: String) -> Int effects { io_write, may_fail } {
+    let c = compress(df);
+    write_blob(c, path);
+}
+
+// Two disjoint sinks (file + ws): future reorder/parallel target.
+fn dual_sink(df: DataFrame, path: String, endpoint: String) -> Int
+    effects { io_write, may_fail } {
+    let out = with_inplace_step(df);
+    let a = write_parquet(out, path);
+    let b = ws_send(out, endpoint);
+    a + b;
+}
+
+fn ingest_and_publish(path_in: String, path_out: String, endpoint: String) -> Int
+    effects { io_read, io_write, may_fail } {
+    let raw = read_parquet(path_in);
+    dual_sink(raw, path_out, endpoint);
+}

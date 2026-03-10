@@ -1,6 +1,7 @@
 add_library(ibex_ir STATIC
-    node.cpp
     builder.cpp
+    node.cpp
+    optimizer.cpp
 )
 add_library(Ibex::ir ALIAS ibex_ir)
 

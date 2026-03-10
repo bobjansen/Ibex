@@ -46,6 +46,42 @@ TEST_CASE("Lower filter and select to IR") {
     REQUIRE(scan->source_name() == "df");
 }
 
+TEST_CASE("Lowering optimizer elides dead pure preamble calls") {
+    auto program = require_parse(R"(
+extern fn warmup(x: Int) -> Int effects {} from "x.hpp";
+warmup(1);
+df;
+)");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    // Preamble is dropped and ProgramNode is unwrapped to its main expression.
+    const auto* scan = as_node<ir::ScanNode>(result->get());
+    REQUIRE(scan != nullptr);
+    REQUIRE(scan->source_name() == "df");
+}
+
+TEST_CASE("Lowering optimizer keeps effectful preamble calls") {
+    auto program = require_parse(R"(
+extern fn init(x: Int) -> Int effects { io_write } from "x.hpp";
+init(1);
+df;
+)");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* prog = as_node<ir::ProgramNode>(result->get());
+    REQUIRE(prog != nullptr);
+    REQUIRE(prog->preamble().size() == 1);
+    const auto* pre = as_node<ir::ExternCallNode>(prog->preamble()[0].get());
+    REQUIRE(pre != nullptr);
+    REQUIRE(pre->callee() == "init");
+
+    const auto* scan = as_node<ir::ScanNode>(&prog->main_node());
+    REQUIRE(scan != nullptr);
+    REQUIRE(scan->source_name() == "df");
+}
+
 TEST_CASE("Lower grouped aggregation to IR") {
     auto program = require_parse("df[select { symbol, total = sum(price) }, by symbol];");
     auto result = parser::lower(program);

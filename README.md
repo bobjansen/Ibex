@@ -645,6 +645,43 @@ let df = my_source("data/file.bin");
 
 All scripts respect `IBEX_ROOT`, `BUILD_DIR`, and `CXX` environment overrides.
 
+### Performance: jemalloc
+
+The ibex runtime allocates and frees large column buffers (often 32–256 MB) on
+every query. With the default glibc allocator, each such free returns the
+physical pages to the OS via `munmap`; the next allocation re-faults them,
+adding 30–100 ms of page-fault overhead per operation at multi-million-row
+scale.
+
+`ibex-build.sh` and `ibex-run.sh` automatically detect and link jemalloc
+(`libjemalloc.so.2`) when it is installed. jemalloc pools freed extents and
+reuses their physical pages, reducing that overhead to near zero after the first
+call.  `ibex-run.sh` additionally sets
+`MALLOC_CONF=dirty_decay_ms:30000,muzzy_decay_ms:30000` at run time, which
+tells jemalloc to retain pages for 30 seconds before returning them to the OS —
+long enough for any interactive or pipeline session to benefit, while still
+releasing idle memory eventually.
+
+**Installing jemalloc (Debian / Ubuntu):**
+
+```bash
+sudo apt install libjemalloc-dev
+```
+
+**Manual transpiler pipelines:** if you invoke `ibex_compile` and `clang++`
+directly rather than through the helper scripts, add jemalloc to your link
+command and set the environment variable before running:
+
+```bash
+clang++ -std=c++23 ... my_program.cpp libibex_runtime.a ... \
+    /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 -o my_program
+
+MALLOC_CONF=dirty_decay_ms:30000,muzzy_decay_ms:30000 ./my_program
+```
+
+If jemalloc is unavailable the binary still runs correctly with the default
+allocator; only the warm-iteration performance degrades.
+
 ## Editor Support
 
 ### VS Code

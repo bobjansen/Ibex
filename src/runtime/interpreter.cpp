@@ -6755,28 +6755,84 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     dst_offs[0] = 0;
                     std::size_t out_i = 0;
                     std::size_t out_char = 0;
-                    for (std::size_t r = 0; r < rows; ++r) {
-                        const std::size_t start = static_cast<std::size_t>(src_offs[r]);
-                        const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
-                        const std::size_t len = end - start;
-                        const char* p = src_chars + start;
-                        const std::size_t row_char_base = out_char;
-                        const std::size_t repeated_chars = len * n_measures;
-                        if (len > 0 && n_measures > 0) {
-                            std::memcpy(dst_chars + row_char_base, p, len);
-                            std::size_t copied = len;
-                            while (copied < repeated_chars) {
-                                const std::size_t chunk = std::min(copied, repeated_chars - copied);
-                                std::memcpy(dst_chars + row_char_base + copied,
-                                            dst_chars + row_char_base, chunk);
-                                copied += chunk;
+                    auto emit_repeat_n = [&]<std::size_t N>() {
+                        for (std::size_t r = 0; r < rows; ++r) {
+                            const std::size_t start = static_cast<std::size_t>(src_offs[r]);
+                            const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
+                            const std::size_t len = end - start;
+                            const char* p = src_chars + start;
+                            const std::size_t row_char_base = out_char;
+                            if (len > 0) {
+                                if constexpr (N >= 1) {
+                                    std::memcpy(dst_chars + row_char_base, p, len);
+                                }
+                                if constexpr (N >= 2) {
+                                    std::memcpy(dst_chars + row_char_base + len, p, len);
+                                }
+                                if constexpr (N >= 3) {
+                                    std::memcpy(dst_chars + row_char_base + 2 * len, p, len);
+                                }
+                                if constexpr (N >= 4) {
+                                    std::memcpy(dst_chars + row_char_base + 3 * len, p, len);
+                                }
                             }
+                            if constexpr (N >= 1) {
+                                dst_offs[++out_i] = static_cast<std::uint32_t>(row_char_base + len);
+                            }
+                            if constexpr (N >= 2) {
+                                dst_offs[++out_i] =
+                                    static_cast<std::uint32_t>(row_char_base + 2 * len);
+                            }
+                            if constexpr (N >= 3) {
+                                dst_offs[++out_i] =
+                                    static_cast<std::uint32_t>(row_char_base + 3 * len);
+                            }
+                            if constexpr (N >= 4) {
+                                dst_offs[++out_i] =
+                                    static_cast<std::uint32_t>(row_char_base + 4 * len);
+                            }
+                            out_char += len * N;
                         }
-                        for (std::size_t m = 0; m < n_measures; ++m) {
-                            dst_offs[++out_i] =
-                                static_cast<std::uint32_t>(row_char_base + (m + 1) * len);
-                        }
-                        out_char += repeated_chars;
+                    };
+                    switch (n_measures) {
+                        case 1:
+                            emit_repeat_n.template operator()<1>();
+                            break;
+                        case 2:
+                            emit_repeat_n.template operator()<2>();
+                            break;
+                        case 3:
+                            emit_repeat_n.template operator()<3>();
+                            break;
+                        case 4:
+                            emit_repeat_n.template operator()<4>();
+                            break;
+                        default:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                const std::size_t start = static_cast<std::size_t>(src_offs[r]);
+                                const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
+                                const std::size_t len = end - start;
+                                const char* p = src_chars + start;
+                                const std::size_t row_char_base = out_char;
+                                const std::size_t repeated_chars = len * n_measures;
+                                if (len > 0 && n_measures > 0) {
+                                    std::memcpy(dst_chars + row_char_base, p, len);
+                                    std::size_t copied = len;
+                                    while (copied < repeated_chars) {
+                                        const std::size_t chunk =
+                                            std::min(copied, repeated_chars - copied);
+                                        std::memcpy(dst_chars + row_char_base + copied,
+                                                    dst_chars + row_char_base, chunk);
+                                        copied += chunk;
+                                    }
+                                }
+                                for (std::size_t m = 0; m < n_measures; ++m) {
+                                    dst_offs[++out_i] =
+                                        static_cast<std::uint32_t>(row_char_base + (m + 1) * len);
+                                }
+                                out_char += repeated_chars;
+                            }
+                            break;
                     }
                     return out_col;
                 } else if constexpr (std::is_same_v<SrcCol, Column<Categorical>>) {
@@ -6793,13 +6849,51 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     return out_col;
                 } else {
                     SrcCol out_col;
+                    out_col.reserve(out_rows);
                     out_col.resize(out_rows);
                     auto* dst = out_col.data();
-                    std::size_t out_i = 0;
-                    for (std::size_t r = 0; r < rows; ++r) {
-                        auto v = src_col[r];
-                        for (std::size_t m = 0; m < n_measures; ++m) {
-                            dst[out_i++] = v;
+                    switch (n_measures) {
+                        case 1:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                dst[r] = src_col[r];
+                            }
+                            break;
+                        case 2:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                auto v = src_col[r];
+                                const std::size_t base = r * 2;
+                                dst[base] = v;
+                                dst[base + 1] = v;
+                            }
+                            break;
+                        case 3:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                auto v = src_col[r];
+                                const std::size_t base = r * 3;
+                                dst[base] = v;
+                                dst[base + 1] = v;
+                                dst[base + 2] = v;
+                            }
+                            break;
+                        case 4:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                auto v = src_col[r];
+                                const std::size_t base = r * 4;
+                                dst[base] = v;
+                                dst[base + 1] = v;
+                                dst[base + 2] = v;
+                                dst[base + 3] = v;
+                            }
+                            break;
+                        default: {
+                            std::size_t out_i = 0;
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                auto v = src_col[r];
+                                for (std::size_t m = 0; m < n_measures; ++m) {
+                                    dst[out_i++] = v;
+                                }
+                            }
+                            break;
                         }
                     }
                     return out_col;
@@ -6821,41 +6915,27 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
             output.add_column(entry.name, std::move(col));
         }
     }
-
-    // "variable" column: repeated measure-name pattern.
-    Column<std::string> var_col;
-    std::size_t name_chars_per_row = 0;
-    std::vector<std::uint32_t> name_row_end_offsets;
-    name_row_end_offsets.reserve(n_measures);
-    std::string name_row_pattern;
-    for (const auto& mname : measure_names) {
-        name_chars_per_row += mname.size();
-        name_row_pattern.append(mname);
-        name_row_end_offsets.push_back(static_cast<std::uint32_t>(name_chars_per_row));
-    }
-    const std::size_t var_total_chars = rows * name_chars_per_row;
-    var_col.resize_for_gather(out_rows, var_total_chars);
-    auto* var_offs = var_col.offsets_data();
-    char* var_chars = var_col.chars_data();
-    var_offs[0] = 0;
-    if (name_chars_per_row > 0 && rows > 0) {
-        std::memcpy(var_chars, name_row_pattern.data(), name_chars_per_row);
-        std::size_t copied = name_chars_per_row;
-        while (copied < var_total_chars) {
-            const std::size_t chunk = std::min(copied, var_total_chars - copied);
-            std::memcpy(var_chars + copied, var_chars, chunk);
+    // "variable" column: Categorical with n_measures dictionary entries.
+    // Using Categorical rather than Column<std::string> avoids writing O(N) character
+    // data for what is at most n_measures distinct strings — only a cyclic int32 code
+    // array is needed (64 MB at 4 M rows × 4 measures), saving ~76 MB of char writes.
+    {
+        // Build with the dict-vector constructor, which calls rebuild_index() internally.
+        Column<Categorical> var_col{std::vector<std::string>(measure_names)};
+        var_col.resize(out_rows);
+        auto* codes = var_col.codes_data();
+        // Fill with repeating cycle [0, 1, 2, ..., n_measures-1, 0, 1, ...].
+        // Write one period then exponentially copy the rest.
+        for (std::size_t mi = 0; mi < n_measures; ++mi)
+            codes[mi] = static_cast<Column<Categorical>::code_type>(mi);
+        std::size_t copied = n_measures;
+        while (copied < out_rows) {
+            const std::size_t chunk = std::min(copied, out_rows - copied);
+            std::memcpy(codes + copied, codes, chunk * sizeof(*codes));
             copied += chunk;
         }
+        output.add_column("variable", std::move(var_col));
     }
-    for (std::size_t r = 0; r < rows; ++r) {
-        const std::size_t row_base = r * name_chars_per_row;
-        for (std::size_t mi = 0; mi < n_measures; ++mi) {
-            var_offs[r * n_measures + mi + 1] =
-                static_cast<std::uint32_t>(row_base + name_row_end_offsets[mi]);
-        }
-    }
-    output.add_column("variable", std::move(var_col));
-
     // "value" column: interleave measure columns in row-major order.
     bool any_measure_validity = false;
     for (std::size_t mi = 0; mi < n_measures; ++mi) {
@@ -6939,10 +7019,58 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                 }
                 out_col.resize(out_rows);
                 auto* dst = out_col.data();
-                std::size_t out_i = 0;
-                for (std::size_t r = 0; r < rows; ++r) {
-                    for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                        dst[out_i++] = (*measures[mi])[r];
+                switch (n_measures) {
+                    case 1: {
+                        const auto* m0 = measures[0]->data();
+                        for (std::size_t r = 0; r < rows; ++r) {
+                            dst[r] = m0[r];
+                        }
+                        break;
+                    }
+                    case 2: {
+                        const auto* m0 = measures[0]->data();
+                        const auto* m1 = measures[1]->data();
+                        for (std::size_t r = 0; r < rows; ++r) {
+                            const std::size_t base = r * 2;
+                            dst[base] = m0[r];
+                            dst[base + 1] = m1[r];
+                        }
+                        break;
+                    }
+                    case 3: {
+                        const auto* m0 = measures[0]->data();
+                        const auto* m1 = measures[1]->data();
+                        const auto* m2 = measures[2]->data();
+                        for (std::size_t r = 0; r < rows; ++r) {
+                            const std::size_t base = r * 3;
+                            dst[base] = m0[r];
+                            dst[base + 1] = m1[r];
+                            dst[base + 2] = m2[r];
+                        }
+                        break;
+                    }
+                    case 4: {
+                        const auto* m0 = measures[0]->data();
+                        const auto* m1 = measures[1]->data();
+                        const auto* m2 = measures[2]->data();
+                        const auto* m3 = measures[3]->data();
+                        for (std::size_t r = 0; r < rows; ++r) {
+                            const std::size_t base = r * 4;
+                            dst[base] = m0[r];
+                            dst[base + 1] = m1[r];
+                            dst[base + 2] = m2[r];
+                            dst[base + 3] = m3[r];
+                        }
+                        break;
+                    }
+                    default: {
+                        std::size_t out_i = 0;
+                        for (std::size_t r = 0; r < rows; ++r) {
+                            for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                                dst[out_i++] = (*measures[mi])[r];
+                            }
+                        }
+                        break;
                     }
                 }
                 return out_col;

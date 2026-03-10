@@ -6737,63 +6737,232 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
     // Build output table.
     Table output;
 
-    // Id columns: repeat each value n_measures times.
+    // Id columns: repeat each source row value n_measures times.
     for (std::size_t id_idx : id_indices) {
         const auto& entry = input.columns[id_idx];
-        auto col = make_empty_like(*entry.column);
-        std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
-        std::optional<ValidityBitmap> validity;
+        auto col = std::visit(
+            [&](const auto& src_col) -> ColumnValue {
+                using SrcCol = std::decay_t<decltype(src_col)>;
+                if constexpr (std::is_same_v<SrcCol, Column<std::string>>) {
+                    Column<std::string> out_col;
+                    const auto* src_offs = src_col.offsets_data();
+                    const char* src_chars = src_col.chars_data();
+                    const std::size_t total_chars =
+                        rows > 0 ? static_cast<std::size_t>(src_offs[rows]) * n_measures : 0;
+                    out_col.resize_for_gather(out_rows, total_chars);
+                    auto* dst_offs = out_col.offsets_data();
+                    char* dst_chars = out_col.chars_data();
+                    dst_offs[0] = 0;
+                    std::size_t out_i = 0;
+                    std::size_t out_char = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        const std::size_t start = static_cast<std::size_t>(src_offs[r]);
+                        const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
+                        const std::size_t len = end - start;
+                        const char* p = src_chars + start;
+                        const std::size_t row_char_base = out_char;
+                        const std::size_t repeated_chars = len * n_measures;
+                        if (len > 0 && n_measures > 0) {
+                            std::memcpy(dst_chars + row_char_base, p, len);
+                            std::size_t copied = len;
+                            while (copied < repeated_chars) {
+                                const std::size_t chunk = std::min(copied, repeated_chars - copied);
+                                std::memcpy(dst_chars + row_char_base + copied,
+                                            dst_chars + row_char_base, chunk);
+                                copied += chunk;
+                            }
+                        }
+                        for (std::size_t m = 0; m < n_measures; ++m) {
+                            dst_offs[++out_i] =
+                                static_cast<std::uint32_t>(row_char_base + (m + 1) * len);
+                        }
+                        out_char += repeated_chars;
+                    }
+                    return out_col;
+                } else if constexpr (std::is_same_v<SrcCol, Column<Categorical>>) {
+                    Column<Categorical> out_col{src_col.dictionary_ptr(), src_col.index_ptr(), {}};
+                    out_col.resize(out_rows);
+                    auto* dst_codes = out_col.codes_data();
+                    std::size_t out_i = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        auto code = src_col.code_at(r);
+                        for (std::size_t m = 0; m < n_measures; ++m) {
+                            dst_codes[out_i++] = code;
+                        }
+                    }
+                    return out_col;
+                } else {
+                    SrcCol out_col;
+                    out_col.resize(out_rows);
+                    auto* dst = out_col.data();
+                    std::size_t out_i = 0;
+                    for (std::size_t r = 0; r < rows; ++r) {
+                        auto v = src_col[r];
+                        for (std::size_t m = 0; m < n_measures; ++m) {
+                            dst[out_i++] = v;
+                        }
+                    }
+                    return out_col;
+                }
+            },
+            *entry.column);
+
         if (entry.validity.has_value()) {
-            validity.emplace();
-            validity->reserve(out_rows);
-        }
-        for (std::size_t r = 0; r < rows; ++r) {
-            for (std::size_t m = 0; m < n_measures; ++m) {
-                append_value(col, *entry.column, r);
-                if (validity.has_value()) {
-                    validity->push_back((*entry.validity)[r]);
+            ValidityBitmap validity;
+            validity.reserve(out_rows);
+            for (std::size_t r = 0; r < rows; ++r) {
+                bool valid = (*entry.validity)[r];
+                for (std::size_t m = 0; m < n_measures; ++m) {
+                    validity.push_back(valid);
                 }
             }
-        }
-        output.add_column(entry.name, std::move(col));
-        if (validity.has_value()) {
-            output.columns.back().validity = std::move(validity);
+            output.add_column(entry.name, std::move(col), std::move(validity));
+        } else {
+            output.add_column(entry.name, std::move(col));
         }
     }
 
-    // "variable" column: column names as strings.
+    // "variable" column: repeated measure-name pattern.
     Column<std::string> var_col;
-    var_col.reserve(out_rows);
+    std::size_t name_chars_per_row = 0;
+    std::vector<std::uint32_t> name_row_end_offsets;
+    name_row_end_offsets.reserve(n_measures);
+    std::string name_row_pattern;
+    for (const auto& mname : measure_names) {
+        name_chars_per_row += mname.size();
+        name_row_pattern.append(mname);
+        name_row_end_offsets.push_back(static_cast<std::uint32_t>(name_chars_per_row));
+    }
+    const std::size_t var_total_chars = rows * name_chars_per_row;
+    var_col.resize_for_gather(out_rows, var_total_chars);
+    auto* var_offs = var_col.offsets_data();
+    char* var_chars = var_col.chars_data();
+    var_offs[0] = 0;
+    if (name_chars_per_row > 0 && rows > 0) {
+        std::memcpy(var_chars, name_row_pattern.data(), name_chars_per_row);
+        std::size_t copied = name_chars_per_row;
+        while (copied < var_total_chars) {
+            const std::size_t chunk = std::min(copied, var_total_chars - copied);
+            std::memcpy(var_chars + copied, var_chars, chunk);
+            copied += chunk;
+        }
+    }
     for (std::size_t r = 0; r < rows; ++r) {
-        for (const auto& mname : measure_names) {
-            var_col.push_back(mname);
+        const std::size_t row_base = r * name_chars_per_row;
+        for (std::size_t mi = 0; mi < n_measures; ++mi) {
+            var_offs[r * n_measures + mi + 1] =
+                static_cast<std::uint32_t>(row_base + name_row_end_offsets[mi]);
         }
     }
     output.add_column("variable", std::move(var_col));
 
-    // "value" column: gather values from each measure column.
-    auto value_col = make_empty_like(*input.columns[measure_indices[0]].column);
-    std::visit([out_rows](auto& c) { c.reserve(out_rows); }, value_col);
-    std::optional<ValidityBitmap> value_validity;
-
-    for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t mi = 0; mi < n_measures; ++mi) {
-            const auto& entry = input.columns[measure_indices[mi]];
-            append_value(value_col, *entry.column, r);
-            bool null = is_null(entry, r);
-            if (null && !value_validity.has_value()) {
-                value_validity.emplace(
-                    output.columns.back().column ? column_size(value_col) - 1 : r * n_measures + mi,
-                    true);
-            }
-            if (value_validity.has_value()) {
-                value_validity->push_back(!null);
-            }
+    // "value" column: interleave measure columns in row-major order.
+    bool any_measure_validity = false;
+    for (std::size_t mi = 0; mi < n_measures; ++mi) {
+        if (input.columns[measure_indices[mi]].validity.has_value()) {
+            any_measure_validity = true;
+            break;
         }
     }
-    output.add_column("value", std::move(value_col));
-    if (value_validity.has_value()) {
-        output.columns.back().validity = std::move(value_validity);
+
+    auto value_col = std::visit(
+        [&](const auto& first_col) -> ColumnValue {
+            using SrcCol = std::decay_t<decltype(first_col)>;
+            if constexpr (std::is_same_v<SrcCol, Column<std::string>>) {
+                Column<std::string> out_col;
+                std::vector<const Column<std::string>*> measures;
+                measures.reserve(n_measures);
+                std::size_t total_chars = 0;
+                for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                    const auto& entry = input.columns[measure_indices[mi]];
+                    const auto* src = std::get_if<Column<std::string>>(entry.column.get());
+                    if (src == nullptr) {
+                        throw std::runtime_error("melt: measure column type mismatch");
+                    }
+                    measures.push_back(src);
+                    const auto* offs = src->offsets_data();
+                    total_chars += rows > 0 ? static_cast<std::size_t>(offs[rows]) : 0;
+                }
+                out_col.resize_for_gather(out_rows, total_chars);
+                auto* dst_offs = out_col.offsets_data();
+                char* dst_chars = out_col.chars_data();
+                dst_offs[0] = 0;
+                std::size_t out_i = 0;
+                std::size_t out_char = 0;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                        const auto* src_offs = measures[mi]->offsets_data();
+                        const char* src_chars = measures[mi]->chars_data();
+                        const std::size_t start = static_cast<std::size_t>(src_offs[r]);
+                        const std::size_t end = static_cast<std::size_t>(src_offs[r + 1]);
+                        const std::size_t len = end - start;
+                        if (len > 0) {
+                            std::memcpy(dst_chars + out_char, src_chars + start, len);
+                        }
+                        out_char += len;
+                        dst_offs[++out_i] = static_cast<std::uint32_t>(out_char);
+                    }
+                }
+                return out_col;
+            } else if constexpr (std::is_same_v<SrcCol, Column<Categorical>>) {
+                Column<Categorical> out_col{first_col.dictionary_ptr(), first_col.index_ptr(), {}};
+                std::vector<const Column<Categorical>*> measures;
+                measures.reserve(n_measures);
+                for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                    const auto& entry = input.columns[measure_indices[mi]];
+                    const auto* src = std::get_if<Column<Categorical>>(entry.column.get());
+                    if (src == nullptr) {
+                        throw std::runtime_error("melt: measure column type mismatch");
+                    }
+                    measures.push_back(src);
+                }
+                out_col.resize(out_rows);
+                auto* dst_codes = out_col.codes_data();
+                std::size_t out_i = 0;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                        dst_codes[out_i++] = measures[mi]->code_at(r);
+                    }
+                }
+                return out_col;
+            } else {
+                SrcCol out_col;
+                std::vector<const SrcCol*> measures;
+                measures.reserve(n_measures);
+                for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                    const auto& entry = input.columns[measure_indices[mi]];
+                    const auto* src = std::get_if<SrcCol>(entry.column.get());
+                    if (src == nullptr) {
+                        throw std::runtime_error("melt: measure column type mismatch");
+                    }
+                    measures.push_back(src);
+                }
+                out_col.resize(out_rows);
+                auto* dst = out_col.data();
+                std::size_t out_i = 0;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                        dst[out_i++] = (*measures[mi])[r];
+                    }
+                }
+                return out_col;
+            }
+        },
+        *input.columns[measure_indices[0]].column);
+
+    if (any_measure_validity) {
+        ValidityBitmap value_validity(out_rows, true);
+        std::size_t out_i = 0;
+        for (std::size_t r = 0; r < rows; ++r) {
+            for (std::size_t mi = 0; mi < n_measures; ++mi, ++out_i) {
+                if (is_null(input.columns[measure_indices[mi]], r)) {
+                    value_validity.set(out_i, false);
+                }
+            }
+        }
+        output.add_column("value", std::move(value_col), std::move(value_validity));
+    } else {
+        output.add_column("value", std::move(value_col));
     }
 
     return output;

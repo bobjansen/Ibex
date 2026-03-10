@@ -7,4 +7,6 @@ dependencies = [
     "pandas>=2.2",
     "polars>=1.0",
     "duckdb>=1.0",
+    "datafusion>=41.0",
+    "chdb>=2.0",
 ]

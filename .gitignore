@@ -28,9 +28,11 @@ benchmarking/results/compiled/**
 *.parquet
 *.so
 tests/data/iris
+Testing/**
 
 # AWS benchmark config (contains bucket name, not secrets but user-specific)
 benchmarking/aws/.config
 
 # Python
 **/__pycache__/**
+

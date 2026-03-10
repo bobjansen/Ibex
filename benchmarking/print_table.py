@@ -14,6 +14,8 @@ FRAMEWORK_ORDER = [
     "ibex-compiled",
     "polars",
     "polars-st",
+    "duckdb",
+    "duckdb-st",
     "pandas",
     "data.table",
     "dplyr",

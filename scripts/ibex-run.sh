@@ -64,6 +64,22 @@ _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
 _spdlog_lib="$BUILD_DIR/_deps/spdlog-build/libspdlog.a"
 [[ -f "$_spdlog_lib" ]] || _spdlog_lib="$BUILD_DIR/_deps/spdlog-build/libspdlogd.a"
 
+# jemalloc: pools large freed allocations instead of returning them to the OS,
+# eliminating page-fault overhead on repeated large-table operations.
+# The versioned .so.2 name is used because most distros don't ship an unversioned symlink.
+_jemalloc=""
+for _candidate in \
+        "$(ldconfig -p 2>/dev/null | awk '/libjemalloc\.so\.2/{print $NF; exit}')" \
+        /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+        /usr/lib/aarch64-linux-gnu/libjemalloc.so.2 \
+        /usr/lib/libjemalloc.so.2 \
+        /usr/local/lib/libjemalloc.so.2; do
+    if [[ -n "$_candidate" && -f "$_candidate" ]]; then
+        _jemalloc="$_candidate"
+        break
+    fi
+done
+
 IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
@@ -71,6 +87,7 @@ IBEX_LIBS=(
     "$_fmt_lib"
     "$_spdlog_lib"
 )
+[[ -n "$_jemalloc" ]] && IBEX_LIBS+=("$_jemalloc")
 
 # ── Transpile → compile → run ─────────────────────────────────────────────────
 TMPDIR_WORK="$(mktemp -d)"
@@ -88,4 +105,11 @@ echo "▸ compiling   $CPP_FILE"
 
 echo "▸ running"
 echo ""
+# When jemalloc is linked, configure a 30-second dirty-page decay window.
+# This keeps recently freed large allocations physically resident so that
+# repeated operations on large tables avoid per-call page-fault overhead.
+# The caller can override by setting MALLOC_CONF in the environment beforehand.
+if [[ -n "$_jemalloc" ]]; then
+    export MALLOC_CONF="${MALLOC_CONF:-dirty_decay_ms:30000,muzzy_decay_ms:30000}"
+fi
 "$BIN_FILE" "${PROG_ARGS[@]}"

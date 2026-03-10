@@ -3489,7 +3489,8 @@ TEST_CASE("melt: basic wide-to-long unpivot", "[melt]") {
     REQUIRE(val != nullptr);
 
     const auto& sym_col = std::get<Column<std::string>>(*sym);
-    const auto& var_col = std::get<Column<std::string>>(*var);
+    // variable column is now Categorical (n_measures distinct values)
+    const auto& var_col = std::get<Column<Categorical>>(*var);
     const auto& val_col = std::get<Column<std::int64_t>>(*val);
 
     // Row order: for each input row, iterate measures in column order.
@@ -3527,7 +3528,8 @@ TEST_CASE("melt: select restricts measure columns", "[melt]") {
 
     const auto* var = result->find("variable");
     REQUIRE(var != nullptr);
-    const auto& var_col = std::get<Column<std::string>>(*var);
+    // variable column is Categorical
+    const auto& var_col = std::get<Column<Categorical>>(*var);
     REQUIRE(var_col[0] == "open");
     REQUIRE(var_col[1] == "close");
 }

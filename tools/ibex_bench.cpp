@@ -6,6 +6,16 @@
 #include <CLI/CLI.hpp>
 #include <fmt/core.h>
 
+// When jemalloc is linked, prevent large allocations from being returned to the OS
+// between benchmark iterations.  By default jemalloc decays dirty pages after 10 s,
+// but on WSL2 huge allocations (>= 2 MB) are munmap'd immediately on free, so every
+// warm iteration re-pays the page-fault cost (~40 ms/128 MB at 4 M rows).
+// Setting dirty_decay_ms:-1 keeps all freed pages in jemalloc's dirty cache so
+// subsequent iterations reuse physical pages at full DRAM bandwidth.
+// jemalloc reads this symbol during its C++ static-init phase, before main().
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+extern "C" const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>

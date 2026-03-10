@@ -43,6 +43,20 @@ if(IBEX_HAS_AVX2)
     target_compile_options(ibex_bench PRIVATE -mavx2 -mfma)
 endif()
 
+# Link jemalloc when available.  jemalloc pools large freed allocations instead of
+# returning them to the OS via munmap.  Without it, glibc mmap-allocates every
+# std::vector > 128 KB and immediately munmaps on free, so every benchmark
+# iteration pays minor page-fault overhead proportional to its output size
+# (≈ 100-150 ms per melt run at 4 M rows).  With jemalloc the warm iterations
+# reuse pooled memory — page faults only on the first two warm-up runs.
+find_library(JEMALLOC_LIB
+    NAMES jemalloc libjemalloc.so.2
+    HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+)
+if(JEMALLOC_LIB)
+    target_link_libraries(ibex_bench PRIVATE ${JEMALLOC_LIB})
+endif()
+
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_bench PRIVATE Ibex::Sanitizers)
 endif()

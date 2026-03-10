@@ -31,6 +31,9 @@ SKIP_R=0
 SKIP_PANDAS=0
 SKIP_DPLYR=0
 SKIP_DUCKDB=0
+SKIP_DATAFUSION=0
+SKIP_CLICKHOUSE=0
+SKIP_SQLITE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,6 +46,9 @@ while [[ $# -gt 0 ]]; do
         --skip-pandas) SKIP_PANDAS=1; shift   ;;
         --skip-dplyr)  SKIP_DPLYR=1;  shift   ;;
         --skip-duckdb) SKIP_DUCKDB=1; shift   ;;
+        --skip-datafusion) SKIP_DATAFUSION=1; shift ;;
+        --skip-clickhouse) SKIP_CLICKHOUSE=1; shift ;;
+        --skip-sqlite) SKIP_SQLITE=1; shift   ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -127,9 +133,41 @@ if [[ $SKIP_DUCKDB -eq 0 ]]; then
     echo ""
 fi
 
-# ── 6. Print table ────────────────────────────────────────────────────────────
+# ── 6. DataFusion ────────────────────────────────────────────────────────────
+if [[ $SKIP_DATAFUSION -eq 0 ]]; then
+    echo "━━━ DataFusion ━━━"
+    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_datafusion.py" \
+        --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+        --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
+        --warmup "$WARMUP" --iters "$ITERS" \
+        --out "$RESULTS/datafusion.tsv"
+    echo ""
+fi
+
+# ── 7. ClickHouse (chdb) ────────────────────────────────────────────────────
+if [[ $SKIP_CLICKHOUSE -eq 0 ]]; then
+    echo "━━━ ClickHouse ━━━"
+    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_clickhouse.py" \
+        --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+        --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
+        --warmup "$WARMUP" --iters "$ITERS" \
+        --out "$RESULTS/clickhouse.tsv"
+    echo ""
+fi
+
+# ── 8. SQLite ────────────────────────────────────────────────────────────────
+if [[ $SKIP_SQLITE -eq 0 ]]; then
+    echo "━━━ SQLite ━━━"
+    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_sqlite.py" \
+        --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
+        --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
+        --warmup "$WARMUP" --iters "$ITERS" \
+        --out "$RESULTS/sqlite.tsv"
+    echo ""
+fi
+
+# ── 9. Print table ────────────────────────────────────────────────────────────
 echo "━━━ Summary ━━━"
 uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/print_table.py" \
-    "$RESULTS"/ibex.tsv "$RESULTS"/ibex_compiled.tsv \
-    "$RESULTS"/python.tsv "$RESULTS"/r.tsv "$RESULTS"/duckdb.tsv 2>/dev/null \
+    "$RESULTS"/*.tsv 2>/dev/null \
     || python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*.tsv

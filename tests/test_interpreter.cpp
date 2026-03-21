@@ -2748,8 +2748,8 @@ TEST_CASE("rand_bernoulli invalid p") {
 
 // ─── seed_rng / reseed_rng ────────────────────────────────────────────────────
 
-// rand_uniform uses fill_uniform_x4, so seeding requires reseed_rng_x4.
-TEST_CASE("reseed_rng_x4 produces identical rand_uniform sequence") {
+// rand_uniform uses zorro::Rng, so seeding requires reseed().
+TEST_CASE("reseed produces identical rand_uniform sequence") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(32)));
     runtime::TableRegistry registry;
@@ -2757,12 +2757,12 @@ TEST_CASE("reseed_rng_x4 produces identical rand_uniform sequence") {
 
     auto ir = require_ir("t[update { u = rand_uniform(0.0, 1.0) }];");
 
-    runtime::reseed_rng_x4(0xDEADBEEF);
+    runtime::reseed(0xDEADBEEF);
     auto r1 = runtime::interpret(*ir, registry);
     REQUIRE(r1.has_value());
     const auto& c1 = std::get<Column<double>>(*r1->find("u"));
 
-    runtime::reseed_rng_x4(0xDEADBEEF);
+    runtime::reseed(0xDEADBEEF);
     auto r2 = runtime::interpret(*ir, registry);
     REQUIRE(r2.has_value());
     const auto& c2 = std::get<Column<double>>(*r2->find("u"));
@@ -2773,7 +2773,7 @@ TEST_CASE("reseed_rng_x4 produces identical rand_uniform sequence") {
     }
 }
 
-TEST_CASE("reseed_rng_x4 with different seeds produces different rand_uniform sequences") {
+TEST_CASE("reseed with different seeds produces different rand_uniform sequences") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(32)));
     runtime::TableRegistry registry;
@@ -2781,12 +2781,12 @@ TEST_CASE("reseed_rng_x4 with different seeds produces different rand_uniform se
 
     auto ir = require_ir("t[update { u = rand_uniform(0.0, 1.0) }];");
 
-    runtime::reseed_rng_x4(1);
+    runtime::reseed(1);
     auto r1 = runtime::interpret(*ir, registry);
     REQUIRE(r1.has_value());
     const auto& c1 = std::get<Column<double>>(*r1->find("u"));
 
-    runtime::reseed_rng_x4(2);
+    runtime::reseed(2);
     auto r2 = runtime::interpret(*ir, registry);
     REQUIRE(r2.has_value());
     const auto& c2 = std::get<Column<double>>(*r2->find("u"));
@@ -2801,7 +2801,7 @@ TEST_CASE("reseed_rng_x4 with different seeds produces different rand_uniform se
     CHECK(any_different);
 }
 
-TEST_CASE("reseed_rng_x4 produces identical rand_normal sequence") {
+TEST_CASE("reseed produces identical rand_normal sequence") {
     runtime::Table table;
     // 33 rows: exercises the 8-wide main loop (4 iterations = 32 rows) and
     // the 1-element scalar tail.
@@ -2811,12 +2811,12 @@ TEST_CASE("reseed_rng_x4 produces identical rand_normal sequence") {
 
     auto ir = require_ir("t[update { n = rand_normal(0.0, 1.0) }];");
 
-    runtime::reseed_rng_x4(0xCAFEBABE);
+    runtime::reseed(0xCAFEBABE);
     auto r1 = runtime::interpret(*ir, registry);
     REQUIRE(r1.has_value());
     const auto& c1 = std::get<Column<double>>(*r1->find("n"));
 
-    runtime::reseed_rng_x4(0xCAFEBABE);
+    runtime::reseed(0xCAFEBABE);
     auto r2 = runtime::interpret(*ir, registry);
     REQUIRE(r2.has_value());
     const auto& c2 = std::get<Column<double>>(*r2->find("n"));

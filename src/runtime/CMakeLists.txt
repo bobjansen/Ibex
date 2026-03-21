@@ -22,20 +22,18 @@ target_link_libraries(ibex_runtime
 )
 
 # ── AVX2 / libmvec ────────────────────────────────────────────────────────────
-# Enable when the compiler supports -mavx2.  The #ifdef __AVX2__ guards in
-# rng.hpp make this a no-op on platforms that lack AVX2.
+# Enable when the compiler supports -mavx2.  zorro.hpp (included via rng.hpp)
+# uses compile-time SIMD dispatch: __AVX512F__ → __AVX2__ → portable.
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag(-mavx2 IBEX_HAS_AVX2)
 if(IBEX_HAS_AVX2)
     target_compile_options(ibex_runtime PRIVATE -mavx2 -mfma)
-    # libmvec (glibc ≥ 2.22) provides 4-wide double transcendentals via the
-    # GNU Vector SIMD ABI (_ZGVdN4v_log/cos/sin).  Define IBEX_HAVE_LIBMVEC so
-    # rng.hpp can gate those declarations — without this guard, non-glibc builds
-    # (musl, macOS) would fail to link even though they have AVX2.
+    # libmvec (glibc ≥ 2.22) provides vectorized transcendentals.
+    # ZORRO_USE_LIBMVEC enables zorro's AVX2/512 log/cos/sin kernels.
     find_library(IBEX_LIBMVEC mvec)
     if(IBEX_LIBMVEC)
         target_link_libraries(ibex_runtime PRIVATE "${IBEX_LIBMVEC}")
-        target_compile_definitions(ibex_runtime PRIVATE IBEX_HAVE_LIBMVEC=1)
+        target_compile_definitions(ibex_runtime PRIVATE ZORRO_USE_LIBMVEC=1)
     endif()
 endif()
 

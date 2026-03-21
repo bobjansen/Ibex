@@ -1018,8 +1018,7 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::unexpected("seed_rng: argument must be an integer");
             }
             const auto seed = static_cast<std::uint64_t>(std::get<std::int64_t>(*seed_val));
-            runtime::reseed_rng(seed);
-            runtime::reseed_rng_x4(seed);
+            runtime::reseed(seed);
             // Return the seed so the REPL can confirm what was set.
             return EvalValue{static_cast<std::int64_t>(seed)};
         }

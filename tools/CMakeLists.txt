@@ -35,10 +35,9 @@ target_link_libraries(ibex_bench
         rapidcsv
 )
 
-# rng.hpp is header-only inline code compiled into ibex_bench.cpp itself.
-# Without -mavx2, the Xoshiro256pp_x4_portable inner loops can't auto-vectorize
-# and the x4 engine gains nothing over scalar.  Mirror the same AVX2 flag used
-# by ibex_runtime so the benchmark measures what actually runs in production.
+# zorro.hpp (included via rng.hpp) uses compile-time SIMD dispatch.
+# Mirror the same AVX2 flag used by ibex_runtime so the benchmark
+# measures what actually runs in production.
 if(IBEX_HAS_AVX2)
     target_compile_options(ibex_bench PRIVATE -mavx2 -mfma)
 endif()

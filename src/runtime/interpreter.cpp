@@ -6373,7 +6373,7 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         // x4 fill over independent xoshiro streams.
         Column<double> col;
         col.resize(rows);
-        fill_uniform_x4(col.data(), rows, *low, *high);
+        fill_uniform(col.data(), rows, *low, *high);
         return col;
     }
 
@@ -6393,7 +6393,7 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         // Generate all normals into the column buffer via the portable x4 path.
         Column<double> col;
         col.resize(rows);
-        fill_normal_x4(col.data(), rows, *mean, *stddev);
+        fill_normal(col.data(), rows, *mean, *stddev);
         return col;
     }
 
@@ -6452,7 +6452,7 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         // Direct inverse-CDF via the x4 engine.
         Column<double> col;
         col.resize(rows);
-        fill_exponential_x4(col.data(), rows, *lambda);
+        fill_exponential(col.data(), rows, *lambda);
         return col;
     }
 
@@ -6468,7 +6468,7 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         }
         Column<std::int64_t> col;
         col.resize(rows);
-        fill_bernoulli_x4(col.data(), rows, *p);
+        fill_bernoulli(col.data(), rows, *p);
         return col;
     }
 
@@ -6512,7 +6512,7 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
         col.resize(rows);
         if (span == 0) {
             // Full int64 range: every 64-bit word is a valid sample.
-            auto& rng4 = get_rng_x4_portable();
+            auto& rng4 = get_rng_x4();
             std::size_t i = 0;
             while (i + 4 <= rows) {
                 const auto bits = rng4();
@@ -6528,7 +6528,7 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
                     col[i] = static_cast<std::int64_t>(bits[lane]);
             }
         } else {
-            fill_int_x4(col.data(), rows, lo, span);
+            fill_int(col.data(), rows, lo, span);
         }
         return col;
     }

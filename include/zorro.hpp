@@ -25,7 +25,12 @@
 // 512-bit sqrt/div serialize on the 256-bit datapath.
 //
 // Optional: #define ZORRO_USE_LIBMVEC before including, and link -lmvec -lm,
-// for fully vectorized log in normal and exponential (glibc only).
+// for exact vectorized log in the libmvec-backed normal/gamma/Student-t paths
+// and the AVX-512 exponential path (glibc only).
+//
+// Optional: #define ZORRO_EXACT_EXPONENTIAL_LOG before including to force the
+// exact AVX2 exponential path as well. By default, AVX2 exponential uses the
+// faster validated approximation.
 
 #include <array>
 #include <cmath>
@@ -310,6 +315,83 @@ inline auto u64_to_uniform01_avx2(__m256i bits) noexcept -> __m256d {
 inline auto u64_to_pm1_avx2(__m256i bits) noexcept -> __m256d {
     return _mm256_sub_pd(_mm256_mul_pd(u64_to_uniform01_avx2(bits), _mm256_set1_pd(2.0)),
                          _mm256_set1_pd(1.0));
+}
+
+inline auto floatbitmask64_avx2(__m256i bits) noexcept -> __m256d {
+    const __m256i exponent = _mm256_set1_epi64x(0x3ff0000000000000ULL);
+    const __m256i mantissa = _mm256_and_si256(
+        bits, _mm256_set1_epi64x(static_cast<std::int64_t>(0x000fffffffffffffULL)));
+    return _mm256_castsi256_pd(_mm256_or_si256(mantissa, exponent));
+}
+
+// Fast AVX2 approximation of -log(u) for u in (0, 1]. This is shared by the
+// exponential path today and is shaped so other log-based transforms can reuse
+// the same mantissa/exponent normalization later.
+inline auto log2_3q_avx2(__m256d v, __m256d e) noexcept -> __m256d {
+    const __m256d c0 = _mm256_set1_pd(0.22119417504560815);
+    const __m256d c1 = _mm256_set1_pd(0.22007686931522777);
+    const __m256d c2 = _mm256_set1_pd(0.26237080574885147);
+    const __m256d c3 = _mm256_set1_pd(0.32059774779444955);
+    const __m256d c4 = _mm256_set1_pd(0.41219859454853247);
+    const __m256d c5 = _mm256_set1_pd(0.5770780162997059);
+    const __m256d c6 = _mm256_set1_pd(0.9617966939260809);
+    const __m256d scale = _mm256_set1_pd(2.8853900817779268);
+
+    const __m256d m1 = _mm256_mul_pd(v, v);
+#ifdef __FMA__
+    const __m256d fma1 = _mm256_fmadd_pd(m1, c0, c1);
+    const __m256d fma2 = _mm256_fmadd_pd(fma1, m1, c2);
+    const __m256d fma3 = _mm256_fmadd_pd(fma2, m1, c3);
+    const __m256d fma4 = _mm256_fmadd_pd(fma3, m1, c4);
+    const __m256d fma5 = _mm256_fmadd_pd(fma4, m1, c5);
+    const __m256d fma6 = _mm256_fmadd_pd(fma5, m1, c6);
+#else
+    const __m256d fma1 = _mm256_add_pd(_mm256_mul_pd(m1, c0), c1);
+    const __m256d fma2 = _mm256_add_pd(_mm256_mul_pd(fma1, m1), c2);
+    const __m256d fma3 = _mm256_add_pd(_mm256_mul_pd(fma2, m1), c3);
+    const __m256d fma4 = _mm256_add_pd(_mm256_mul_pd(fma3, m1), c4);
+    const __m256d fma5 = _mm256_add_pd(_mm256_mul_pd(fma4, m1), c5);
+    const __m256d fma6 = _mm256_add_pd(_mm256_mul_pd(fma5, m1), c6);
+#endif
+
+    const __m256d m2 = _mm256_mul_pd(v, scale);
+    const __m256d a1 = _mm256_add_pd(e, m2);
+    const __m256d s1 = _mm256_sub_pd(e, a1);
+    const __m256d a2 = _mm256_add_pd(m2, s1);
+    const __m256d m3 = _mm256_mul_pd(v, m1);
+#ifdef __FMA__
+    return _mm256_fmadd_pd(fma6, m3, _mm256_add_pd(a1, a2));
+#else
+    return _mm256_add_pd(_mm256_mul_pd(fma6, m3), _mm256_add_pd(a1, a2));
+#endif
+}
+
+inline auto exponent_words_to_log2_bias_avx2(__m256i exponent_words) noexcept -> __m256d {
+    const __m128i lo = _mm256_castsi256_si128(exponent_words);
+    const __m128i hi = _mm256_extracti128_si256(exponent_words, 1);
+    const __m128i pair01 = _mm_unpacklo_epi32(lo, _mm_srli_si128(lo, 8));
+    const __m128i pair23 = _mm_unpacklo_epi32(hi, _mm_srli_si128(hi, 8));
+    const __m128i packed = _mm_unpacklo_epi64(pair01, pair23);
+    const __m256d exponent = _mm256_cvtepi32_pd(packed);
+    return _mm256_add_pd(exponent, _mm256_set1_pd(-1023.0 + 0.4150374992788438));
+}
+
+inline auto fast_neglog01_avx2(__m256d u) noexcept -> __m256d {
+    const __m256i bits = _mm256_castpd_si256(u);
+    const __m256i exponent_mask = _mm256_set1_epi64x(0x7ff0000000000000ULL);
+    const __m256i mantissa_mask = _mm256_set1_epi64x(0x000fffffffffffffULL);
+    const __m256i exponent_bits = _mm256_set1_epi64x(0x3ff0000000000000ULL);
+    const __m256d four_thirds = _mm256_set1_pd(1.3333333333333333);
+    const __m256d neg_ln2 = _mm256_set1_pd(-0.6931471805599453);
+    const __m256i exponent_words = _mm256_srli_epi64(_mm256_and_si256(bits, exponent_mask), 52);
+
+    const __m256d mantissa =
+        _mm256_castsi256_pd(_mm256_or_si256(_mm256_and_si256(bits, mantissa_mask), exponent_bits));
+    const __m256d v =
+        _mm256_div_pd(_mm256_sub_pd(mantissa, four_thirds), _mm256_add_pd(mantissa, four_thirds));
+    const __m256d log2_u = log2_3q_avx2(v, exponent_words_to_log2_bias_avx2(exponent_words));
+    const __m256d neglog_u = _mm256_mul_pd(neg_ln2, log2_u);
+    return _mm256_max_pd(neglog_u, _mm256_setzero_pd());
 }
 
 inline void seed_x8(std::uint64_t seed, std::uint64_t (&sa0)[4], std::uint64_t (&sa1)[4],
@@ -908,7 +990,7 @@ class Rng {
     void fill_exponential_avx2(double* __restrict__ out, std::size_t count,
                                double inv_lambda) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
-#ifdef ZORRO_USE_LIBMVEC
+#if defined(ZORRO_USE_LIBMVEC) && defined(ZORRO_EXACT_EXPONENTIAL_LOG)
         const __m256d neg_inv = _mm256_set1_pd(-inv_lambda);
         std::size_t i = 0;
         while (i + 8 <= count) {
@@ -935,40 +1017,40 @@ class Rng {
                 out[i] = tail[lane];
         }
 #else
-        // SIMD RNG + scalar log
-        alignas(32) double tmp[4];
+        const __m256d one = _mm256_set1_pd(1.0);
+        const __m256d inv = _mm256_set1_pd(inv_lambda);
+        // The approximation is keyed to u in (0, 1], so we generate Exp(1) via
+        // -log(1 - u) instead of -log(u). The distribution is identical.
         std::size_t i = 0;
         while (i + 8 <= count) {
-            _mm256_store_pd(tmp,
-                            detail::u64_to_uniform01_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
-            out[i] = -std::log(tmp[0] + 1e-300) * inv_lambda;
-            out[i + 1] = -std::log(tmp[1] + 1e-300) * inv_lambda;
-            out[i + 2] = -std::log(tmp[2] + 1e-300) * inv_lambda;
-            out[i + 3] = -std::log(tmp[3] + 1e-300) * inv_lambda;
-            _mm256_store_pd(tmp,
-                            detail::u64_to_uniform01_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
-            out[i + 4] = -std::log(tmp[0] + 1e-300) * inv_lambda;
-            out[i + 5] = -std::log(tmp[1] + 1e-300) * inv_lambda;
-            out[i + 6] = -std::log(tmp[2] + 1e-300) * inv_lambda;
-            out[i + 7] = -std::log(tmp[3] + 1e-300) * inv_lambda;
+            _mm256_storeu_pd(
+                out + i, _mm256_mul_pd(inv, detail::fast_neglog01_avx2(_mm256_sub_pd(
+                                                one, detail::u64_to_uniform01_avx2(
+                                                         detail::next_x4_avx2(a0, a1, a2, a3))))));
+            _mm256_storeu_pd(
+                out + i + 4,
+                _mm256_mul_pd(inv, detail::fast_neglog01_avx2(_mm256_sub_pd(
+                                       one, detail::u64_to_uniform01_avx2(
+                                                detail::next_x4_avx2(b0, b1, b2, b3))))));
             i += 8;
         }
         while (i + 4 <= count) {
-            _mm256_store_pd(tmp,
-                            detail::u64_to_uniform01_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
-            out[i] = -std::log(tmp[0] + 1e-300) * inv_lambda;
-            out[i + 1] = -std::log(tmp[1] + 1e-300) * inv_lambda;
-            out[i + 2] = -std::log(tmp[2] + 1e-300) * inv_lambda;
-            out[i + 3] = -std::log(tmp[3] + 1e-300) * inv_lambda;
+            _mm256_storeu_pd(
+                out + i, _mm256_mul_pd(inv, detail::fast_neglog01_avx2(_mm256_sub_pd(
+                                                one, detail::u64_to_uniform01_avx2(
+                                                         detail::next_x4_avx2(a0, a1, a2, a3))))));
             i += 4;
         }
         if (i < count) {
-            _mm256_store_pd(tmp,
-                            detail::u64_to_uniform01_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
+            alignas(32) double tail[4];
+            _mm256_store_pd(
+                tail, _mm256_mul_pd(inv, detail::fast_neglog01_avx2(_mm256_sub_pd(
+                                             one, detail::u64_to_uniform01_avx2(
+                                                      detail::next_x4_avx2(a0, a1, a2, a3))))));
             for (std::size_t lane = 0; i < count; ++lane, ++i)
-                out[i] = -std::log(tmp[lane] + 1e-300) * inv_lambda;
+                out[i] = tail[lane];
         }
-#endif  // ZORRO_USE_LIBMVEC
+#endif
         store_avx2(a0, a1, a2, a3, b0, b1, b2, b3);
     }
 

@@ -2928,6 +2928,71 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // ─── Fast path: single-key Int64 join ────────────────────────────────────
+    // Avoids constructing a Key { vector<ScalarValue> } for every row in the
+    // common single-Int64 equijoin case.
+    if (kind != ir::JoinKind::Asof && keys.size() == 1 &&
+        std::holds_alternative<Column<std::int64_t>>(*left_keys[0])) {
+        const auto& left_ints = std::get<Column<std::int64_t>>(*left_keys[0]);
+        const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
+
+        std::unordered_map<std::int64_t, std::vector<std::size_t>> right_int_index;
+        right_int_index.reserve(right.rows());
+        for (std::size_t r = 0; r < right.rows(); ++r) {
+            right_int_index[right_ints[r]].push_back(r);
+        }
+
+        std::vector<std::uint8_t> right_matched;
+        if (preserve_right_rows) {
+            right_matched.assign(right.rows(), 0U);
+        }
+
+        for (std::size_t l = 0; l < left.rows(); ++l) {
+            auto it = right_int_index.find(left_ints[l]);
+            const bool has_match = (it != right_int_index.end());
+            if (semi_join) {
+                if (has_match) {
+                    append_left_row(l);
+                }
+                continue;
+            }
+            if (anti_join) {
+                if (!has_match) {
+                    append_left_row(l);
+                }
+                continue;
+            }
+            if (!has_match) {
+                if (preserve_left_rows) {
+                    append_left_row(l);
+                    append_right_defaults();
+                }
+                continue;
+            }
+            for (auto r : it->second) {
+                append_left_row(l);
+                append_right_row(r);
+                if (preserve_right_rows) {
+                    right_matched[r] = 1U;
+                }
+            }
+        }
+
+        if (preserve_right_rows) {
+            for (std::size_t r = 0; r < right.rows(); ++r) {
+                if (right_matched[r] == 0U) {
+                    append_left_defaults_from_right(r);
+                    append_right_row(r);
+                }
+            }
+        }
+
+        finalize_left_validity();
+        finalize_right_validity();
+        return output;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (kind == ir::JoinKind::Asof) {
         const std::size_t time_pos = *asof_time_key_pos;
         const auto* left_time_col = left_keys[time_pos];

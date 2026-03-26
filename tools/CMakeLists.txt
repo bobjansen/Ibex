@@ -64,6 +64,37 @@ install(TARGETS ibex_bench
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
 
+add_executable(ibex_join_bench ibex_join_bench.cpp)
+
+target_link_libraries(ibex_join_bench
+    PRIVATE
+        Ibex::parser
+        Ibex::runtime
+        Ibex::CompilerOptions
+        CLI11::CLI11
+        fmt::fmt
+)
+
+if(IBEX_HAS_AVX2)
+    target_compile_options(ibex_join_bench PRIVATE -mavx2 -mfma)
+endif()
+
+find_library(JEMALLOC_LIB_JOIN
+    NAMES jemalloc libjemalloc.so.2
+    HINTS /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu
+)
+if(JEMALLOC_LIB_JOIN)
+    target_link_libraries(ibex_join_bench PRIVATE ${JEMALLOC_LIB_JOIN})
+endif()
+
+if(TARGET Ibex::Sanitizers)
+    target_link_libraries(ibex_join_bench PRIVATE Ibex::Sanitizers)
+endif()
+
+install(TARGETS ibex_join_bench
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+
 add_library(ibex_gen_tf_data_plugin SHARED gen_tf_data.cpp)
 
 set_target_properties(ibex_gen_tf_data_plugin PROPERTIES

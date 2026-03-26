@@ -89,6 +89,27 @@ TEST_CASE("join: inner join on single key", "[join]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 300});
 }
 
+TEST_CASE("join: inner join on Int64 key preserves duplicate matches", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2});
+    lhs.add_column("lval", Column<std::int64_t>{10, 20});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{2, 2, 3});
+    rhs.add_column("rval", Column<std::int64_t>{200, 201, 300});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on id;", tables);
+
+    CHECK(out.rows() == 2);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 2});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 20});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 201});
+}
+
 TEST_CASE("join: left join preserves left rows", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
@@ -208,7 +229,6 @@ TEST_CASE("join: asof join requires time index key in on-list", "[join]") {
     CHECK(error.find("include the time index") != std::string::npos);
 }
 
-
 TEST_CASE("join: semi join keeps matching left rows only", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
@@ -257,11 +277,11 @@ TEST_CASE("join: outer join row count and key values", "[join]") {
     // outer join on id → 4 rows:
     //   id=1 (left-only), id=2 (matched), id=3 (matched), id=4 (right-only)
     runtime::Table lhs;
-    lhs.add_column("id",   Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
     lhs.add_column("lval", Column<std::int64_t>{10, 20, 30});
 
     runtime::Table rhs;
-    rhs.add_column("id",   Column<std::int64_t>{2, 3, 4});
+    rhs.add_column("id", Column<std::int64_t>{2, 3, 4});
     rhs.add_column("rval", Column<std::int64_t>{200, 300, 400});
 
     runtime::TableRegistry tables;
@@ -271,7 +291,7 @@ TEST_CASE("join: outer join row count and key values", "[join]") {
     auto out = interpret_expr("lhs outer join rhs on id;", tables);
 
     REQUIRE(out.rows() == 4);
-    CHECK(col_i64(out, "id")   == std::vector<std::int64_t>{1, 2, 3, 4});
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3, 4});
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 20, 30, 0});
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 200, 300, 400});
 }
@@ -284,11 +304,11 @@ TEST_CASE("join: outer join null semantics — left-only rows null right columns
     //   row 1 → id=2, matched    → score 20.0
     //   row 2 → id=3, right-only → name NULL
     runtime::Table lhs;
-    lhs.add_column("id",   Column<std::int64_t>{1, 2});
+    lhs.add_column("id", Column<std::int64_t>{1, 2});
     lhs.add_column("name", Column<std::string>{"alice", "bob"});
 
     runtime::Table rhs;
-    rhs.add_column("id",    Column<std::int64_t>{2, 3});
+    rhs.add_column("id", Column<std::int64_t>{2, 3});
     rhs.add_column("score", Column<double>{20.0, 30.0});
 
     auto result = runtime::join_tables(lhs, rhs, ir::JoinKind::Outer, {"id"});
@@ -298,19 +318,19 @@ TEST_CASE("join: outer join null semantics — left-only rows null right columns
     REQUIRE(t.rows() == 3);
     CHECK(col_i64(t, "id") == std::vector<std::int64_t>{1, 2, 3});
 
-    const auto& name_entry  = t.columns[t.index.at("name")];
+    const auto& name_entry = t.columns[t.index.at("name")];
     const auto& score_entry = t.columns[t.index.at("score")];
 
     // row 0: id=1, left-only → name valid, score null
-    CHECK_FALSE(runtime::is_null(name_entry,  0));
-    CHECK(      runtime::is_null(score_entry, 0));
+    CHECK_FALSE(runtime::is_null(name_entry, 0));
+    CHECK(runtime::is_null(score_entry, 0));
 
     // row 1: id=2, matched → both valid
-    CHECK_FALSE(runtime::is_null(name_entry,  1));
+    CHECK_FALSE(runtime::is_null(name_entry, 1));
     CHECK_FALSE(runtime::is_null(score_entry, 1));
 
     // row 2: id=3, right-only → name null, score valid
-    CHECK(      runtime::is_null(name_entry,  2));
+    CHECK(runtime::is_null(name_entry, 2));
     CHECK_FALSE(runtime::is_null(score_entry, 2));
 }
 
@@ -318,11 +338,11 @@ TEST_CASE("join: outer join disjoint tables — all rows unmatched", "[join]") {
     // lhs: id {1}, rhs: id {2} — no matches at all
     // 2 rows total; left row gets null rval, right row gets null lval
     runtime::Table lhs;
-    lhs.add_column("id",   Column<std::int64_t>{1});
+    lhs.add_column("id", Column<std::int64_t>{1});
     lhs.add_column("lval", Column<std::int64_t>{10});
 
     runtime::Table rhs;
-    rhs.add_column("id",   Column<std::int64_t>{2});
+    rhs.add_column("id", Column<std::int64_t>{2});
     rhs.add_column("rval", Column<std::int64_t>{20});
 
     auto result = runtime::join_tables(lhs, rhs, ir::JoinKind::Outer, {"id"});
@@ -337,21 +357,21 @@ TEST_CASE("join: outer join disjoint tables — all rows unmatched", "[join]") {
 
     // row 0: id=1, left-only → lval valid, rval null
     CHECK_FALSE(runtime::is_null(lval_entry, 0));
-    CHECK(      runtime::is_null(rval_entry, 0));
+    CHECK(runtime::is_null(rval_entry, 0));
 
     // row 1: id=2, right-only → lval null, rval valid
-    CHECK(      runtime::is_null(lval_entry, 1));
+    CHECK(runtime::is_null(lval_entry, 1));
     CHECK_FALSE(runtime::is_null(rval_entry, 1));
 }
 
 TEST_CASE("join: outer join identical tables — all rows matched, no nulls", "[join]") {
     // When both tables have the same keys, every row matches → no nulls
     runtime::Table lhs;
-    lhs.add_column("id",   Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
     lhs.add_column("lval", Column<std::int64_t>{10, 20, 30});
 
     runtime::Table rhs;
-    rhs.add_column("id",   Column<std::int64_t>{1, 2, 3});
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 3});
     rhs.add_column("rval", Column<std::int64_t>{100, 200, 300});
 
     runtime::TableRegistry tables;
@@ -361,7 +381,7 @@ TEST_CASE("join: outer join identical tables — all rows matched, no nulls", "[
     auto out = interpret_expr("lhs outer join rhs on id;", tables);
 
     REQUIRE(out.rows() == 3);
-    CHECK(col_i64(out, "id")   == std::vector<std::int64_t>{1, 2, 3});
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3});
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 20, 30});
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{100, 200, 300});
 
@@ -378,11 +398,11 @@ TEST_CASE("join: right join preserves right rows", "[join]") {
     // right join on id → 3 rows: id=2, id=3, id=4
     //   id=4 has no left match → lval null
     runtime::Table lhs;
-    lhs.add_column("id",   Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
     lhs.add_column("lval", Column<std::int64_t>{10, 20, 30});
 
     runtime::Table rhs;
-    rhs.add_column("id",   Column<std::int64_t>{2, 3, 4});
+    rhs.add_column("id", Column<std::int64_t>{2, 3, 4});
     rhs.add_column("rval", Column<std::int64_t>{200, 300, 400});
 
     runtime::TableRegistry tables;
@@ -392,7 +412,7 @@ TEST_CASE("join: right join preserves right rows", "[join]") {
     auto out = interpret_expr("lhs right join rhs on id;", tables);
 
     REQUIRE(out.rows() == 3);
-    CHECK(col_i64(out, "id")   == std::vector<std::int64_t>{2, 3, 4});
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 3, 4});
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 300, 400});
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 30, 0});
 
@@ -465,8 +485,8 @@ TEST_CASE("non-equijoin: inner join compound predicate (range)", "[join][non-equ
 
     REQUIRE(out.rows() == 3);
     CHECK(col_i64(out, "val") == std::vector<std::int64_t>{1, 5, 10});
-    CHECK(col_i64(out, "lo")  == std::vector<std::int64_t>{0, 0,  8});
-    CHECK(col_i64(out, "hi")  == std::vector<std::int64_t>{6, 6, 12});
+    CHECK(col_i64(out, "lo") == std::vector<std::int64_t>{0, 0, 8});
+    CHECK(col_i64(out, "hi") == std::vector<std::int64_t>{6, 6, 12});
 }
 
 TEST_CASE("non-equijoin: inner join no matches yields empty table", "[join][non-equijoin]") {

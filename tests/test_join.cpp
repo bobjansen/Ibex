@@ -334,6 +334,30 @@ TEST_CASE("join: anti join preserves left row order when left side is smaller", 
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 30});
 }
 
+TEST_CASE("join: anti join keeps all left rows when smaller left side has no string-key matches",
+          "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("key", Column<std::string>{"K000000", "K000001", "K000002", "K000003"});
+    lhs.add_column("lval", Column<std::int64_t>{10, 11, 12, 13});
+
+    runtime::Table rhs;
+    rhs.add_column("key", Column<std::string>{"Z000000", "Z000001", "Z000002", "Z000003", "Z000004",
+                                              "Z000005"});
+    rhs.add_column("rval", Column<std::int64_t>{100, 101, 102, 103, 104, 105});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs anti join rhs on key;", tables);
+
+    CHECK(out.rows() == 4);
+    CHECK(out.find("rval") == nullptr);
+    CHECK(col_str(out, "key") ==
+          std::vector<std::string>{"K000000", "K000001", "K000002", "K000003"});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 11, 12, 13});
+}
+
 TEST_CASE("join: multi-key semi join preserves left row order when left side is smaller",
           "[join]") {
     runtime::Table lhs;

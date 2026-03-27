@@ -110,6 +110,27 @@ TEST_CASE("join: inner join on Int64 key preserves duplicate matches", "[join]")
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 201});
 }
 
+TEST_CASE("join: inner join preserves left row order when left side is smaller", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{2, 1});
+    lhs.add_column("lval", Column<std::int64_t>{20, 10});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 1, 2, 3});
+    rhs.add_column("rval", Column<std::int64_t>{100, 200, 101, 201, 300});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on id;", tables);
+
+    CHECK(out.rows() == 4);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 2, 1, 1});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 20, 10, 10});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 201, 100, 101});
+}
+
 TEST_CASE("join: left join preserves left rows", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
@@ -250,6 +271,27 @@ TEST_CASE("join: semi join keeps matching left rows only", "[join]") {
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 40});
 }
 
+TEST_CASE("join: semi join preserves left row order when left side is smaller", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{2, 1, 2, 3});
+    lhs.add_column("lval", Column<std::int64_t>{20, 10, 21, 30});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 1, 2, 4});
+    rhs.add_column("rval", Column<std::int64_t>{100, 200, 101, 201, 400});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs semi join rhs on id;", tables);
+
+    CHECK(out.rows() == 3);
+    CHECK(out.find("rval") == nullptr);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 1, 2});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 10, 21});
+}
+
 TEST_CASE("join: anti join keeps non-matching left rows only", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
@@ -269,6 +311,52 @@ TEST_CASE("join: anti join keeps non-matching left rows only", "[join]") {
     CHECK(out.find("rval") == nullptr);
     CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 3});
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 30});
+}
+
+TEST_CASE("join: anti join preserves left row order when left side is smaller", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("key", Column<std::string>{"B", "A", "C", "A"});
+    lhs.add_column("lval", Column<std::int64_t>{20, 10, 30, 11});
+
+    runtime::Table rhs;
+    rhs.add_column("key", Column<std::string>{"A", "A", "D", "E", "F"});
+    rhs.add_column("rval", Column<std::int64_t>{100, 101, 400, 500, 600});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs anti join rhs on key;", tables);
+
+    CHECK(out.rows() == 2);
+    CHECK(out.find("rval") == nullptr);
+    CHECK(col_str(out, "key") == std::vector<std::string>{"B", "C"});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 30});
+}
+
+TEST_CASE("join: multi-key semi join preserves left row order when left side is smaller",
+          "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 1, 2});
+    lhs.add_column("bucket", Column<std::int64_t>{10, 20, 10});
+    lhs.add_column("lval", Column<std::int64_t>{100, 200, 300});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 1, 2, 3});
+    rhs.add_column("bucket", Column<std::int64_t>{20, 20, 10, 30});
+    rhs.add_column("rval", Column<std::int64_t>{500, 501, 600, 700});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs semi join rhs on {id, bucket};", tables);
+
+    CHECK(out.rows() == 2);
+    CHECK(out.find("rval") == nullptr);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2});
+    CHECK(col_i64(out, "bucket") == std::vector<std::int64_t>{20, 10});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{200, 300});
 }
 
 TEST_CASE("join: outer join row count and key values", "[join]") {

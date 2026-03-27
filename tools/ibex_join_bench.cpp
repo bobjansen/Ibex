@@ -304,7 +304,8 @@ auto make_int_fact_table(std::size_t rows, std::size_t n_distinct_ids) -> ibex::
 //   id:     sequential 0..n_ids-1
 //   weight: 1.0 + (i % 100)
 //   bucket: i % 17
-auto make_int_dim_table(std::size_t n_ids) -> ibex::runtime::Table {
+auto make_int_dim_table_with_offset(std::size_t first_id, std::size_t n_ids)
+    -> ibex::runtime::Table {
     ibex::runtime::Table t;
     ibex::Column<std::int64_t> id_col;
     ibex::Column<double> weight_col;
@@ -315,7 +316,7 @@ auto make_int_dim_table(std::size_t n_ids) -> ibex::runtime::Table {
     bucket_col.reserve(n_ids);
 
     for (std::size_t i = 0; i < n_ids; ++i) {
-        id_col.push_back(static_cast<std::int64_t>(i));
+        id_col.push_back(static_cast<std::int64_t>(first_id + i));
         weight_col.push_back(1.0 + static_cast<double>(i % 100));
         bucket_col.push_back(static_cast<std::int64_t>(i % 17));
     }
@@ -324,6 +325,10 @@ auto make_int_dim_table(std::size_t n_ids) -> ibex::runtime::Table {
     t.add_column("weight", std::move(weight_col));
     t.add_column("bucket", std::move(bucket_col));
     return t;
+}
+
+auto make_int_dim_table(std::size_t n_ids) -> ibex::runtime::Table {
+    return make_int_dim_table_with_offset(0, n_ids);
 }
 
 // Build a wide table with many payload columns (for projection pushdown benchmarks).
@@ -518,6 +523,25 @@ int main(int argc, char** argv) {
                 reg, warmup_iters, iters, verify);
         }
 
+        // 1b2. Small-left / large-right inner join: exercises build-side
+        // selection while keeping output linear in the left input size.
+        if (status == 0) {
+            const std::size_t small_left_rows = std::max<std::size_t>(1, rows / 4);
+            auto fact_small = make_fact_table(small_left_rows, small_left_rows, "K");
+            auto dim_large = make_dim_table(rows, "K");
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_small", std::move(fact_small));
+            reg.emplace("dim_large", std::move(dim_large));
+
+            fmt::print("-- hash_join: fact_small({}) x dim_large({}) on key --\n", small_left_rows,
+                       rows);
+            status = run_suite_benchmarks(
+                {
+                    {"hj_inner_small_left", "fact_small join dim_large on key"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
         // 1c. Multi-key equijoin: compound key {key_a, key_b}
         if (status == 0) {
             constexpr std::size_t kNA = 50;
@@ -615,6 +639,45 @@ int main(int argc, char** argv) {
                     {"i64_left_low_sel", "fact_i64 left join dim_i64 on id"},
                     {"i64_semi_low_sel", "fact_i64 semi join dim_i64 on id"},
                     {"i64_anti_low_sel", "fact_i64 anti join dim_i64 on id"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        // 2b2. Small-left / large-right inner join: directly exercises the
+        // Int64 build-left path while preserving left-row output order.
+        if (status == 0) {
+            const std::size_t small_left_rows = std::max<std::size_t>(1, rows / 4);
+            auto fact_small = make_int_fact_table(small_left_rows, small_left_rows);
+            auto dim_large = make_int_dim_table(rows);
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_small_i64", std::move(fact_small));
+            reg.emplace("dim_large_i64", std::move(dim_large));
+
+            fmt::print("-- int_join: fact_small_i64({}) x dim_large_i64({}) on id --\n",
+                       small_left_rows, rows);
+            status = run_suite_benchmarks(
+                {
+                    {"i64_inner_small_left", "fact_small_i64 join dim_large_i64 on id"},
+                    {"i64_semi_small_left", "fact_small_i64 semi join dim_large_i64 on id"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        // 2b3. Small-left anti join with a disjoint large right side: exercises
+        // the build-left membership path when no left ids match.
+        if (status == 0) {
+            const std::size_t small_left_rows = std::max<std::size_t>(1, rows / 4);
+            auto fact_small = make_int_fact_table(small_left_rows, small_left_rows);
+            auto dim_large_miss = make_int_dim_table_with_offset(rows, rows);
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_small_i64", std::move(fact_small));
+            reg.emplace("dim_large_miss_i64", std::move(dim_large_miss));
+
+            fmt::print("-- int_join: fact_small_i64({}) anti dim_large_miss_i64({}) on id --\n",
+                       small_left_rows, rows);
+            status = run_suite_benchmarks(
+                {
+                    {"i64_anti_small_left", "fact_small_i64 anti join dim_large_miss_i64 on id"},
                 },
                 reg, warmup_iters, iters, verify);
         }
@@ -900,6 +963,26 @@ int main(int argc, char** argv) {
                 {"sa_inner_baseline", "fact join dim on key"},
             },
             reg, warmup_iters, iters, verify);
+
+        if (status == 0) {
+            const std::size_t small_left_rows = std::max<std::size_t>(1, rows / 4);
+            auto fact_small = make_fact_table(small_left_rows, small_left_rows, "K");
+            auto dim_large = make_dim_table(rows, "K");
+            auto dim_large_miss = make_dim_table(rows, "Z");
+            ibex::runtime::TableRegistry small_reg;
+            small_reg.emplace("fact_small", std::move(fact_small));
+            small_reg.emplace("dim_large", std::move(dim_large));
+            small_reg.emplace("dim_large_miss", std::move(dim_large_miss));
+
+            fmt::print("-- semi_anti: fact_small({}) vs dim_large({}) on key --\n", small_left_rows,
+                       rows);
+            status = run_suite_benchmarks(
+                {
+                    {"sa_semi_small_left", "fact_small semi join dim_large on key"},
+                    {"sa_anti_small_left", "fact_small anti join dim_large_miss on key"},
+                },
+                small_reg, warmup_iters, iters, verify);
+        }
     }
 
     return status;

@@ -22,6 +22,7 @@ compile_commands.json
 Thumbs.db
 
 # Data
+bench_results/**
 benchmarking/data/**
 benchmarking/results/compiled/**
 *.csv

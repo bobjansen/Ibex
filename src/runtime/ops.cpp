@@ -339,6 +339,12 @@ auto matmul(const runtime::Table& left, const runtime::Table& right) -> runtime:
     return delegate_with_registry(std::move(node), reg);
 }
 
+auto model_coef(const runtime::ModelResult& m) -> runtime::Table { return m.coefficients; }
+auto model_summary(const runtime::ModelResult& m) -> runtime::Table { return m.summary; }
+auto model_fitted(const runtime::ModelResult& m) -> runtime::Table { return m.fitted_values; }
+auto model_residuals(const runtime::ModelResult& m) -> runtime::Table { return m.residuals; }
+auto model_r_squared(const runtime::ModelResult& m) -> double { return m.r_squared; }
+
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.

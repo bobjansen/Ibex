@@ -472,6 +472,16 @@ class Lowerer {
                 LowerError{.message = "cov, corr, and transpose are mutually exclusive"});
         }
 
+        // model is standalone — mutually exclusive with most other clauses.
+        if (state.model &&
+            (state.select || state.update || state.by || state.distinct || state.melt ||
+             state.dcast || state.window || state.resample || state.rename || state.cov ||
+             state.corr || state.transpose)) {
+            return std::unexpected(LowerError{
+                .message = "model is mutually exclusive with select, update, by, distinct, "
+                           "melt, dcast, window, resample, rename, cov, corr, and transpose"});
+        }
+
         auto node = std::move(base.value());
 
         if (state.filter) {
@@ -619,6 +629,18 @@ class Lowerer {
             node = std::move(transpose_node);
         }
 
+        if (state.model) {
+            auto model_result = lower_model(*state.model);
+            if (!model_result.has_value()) {
+                return std::unexpected(model_result.error());
+            }
+            auto& [formula, method, params] = model_result.value();
+            auto model_node =
+                builder_.model(std::move(formula), std::move(method), std::move(params));
+            model_node->add_child(std::move(node));
+            node = std::move(model_node);
+        }
+
         return node;
     }
 
@@ -637,6 +659,7 @@ class Lowerer {
         const CovClause* cov = nullptr;
         const CorrClause* corr = nullptr;
         const TransposeClause* transpose = nullptr;
+        const ModelClause* model = nullptr;
         std::string error;
 
         auto record(const Clause& clause) -> bool {
@@ -750,6 +773,14 @@ class Lowerer {
                     return false;
                 }
                 transpose = &std::get<TransposeClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<ModelClause>(clause)) {
+                if (model != nullptr) {
+                    error = "duplicate model clause";
+                    return false;
+                }
+                model = &std::get<ModelClause>(clause);
                 return true;
             }
             return true;
@@ -984,6 +1015,44 @@ class Lowerer {
             group_by = std::move(keys.value());
         }
         return builder_.update(std::move(fields), std::move(tuple_specs), std::move(group_by));
+    }
+
+    auto lower_model(const ModelClause& clause) -> std::expected<
+        std::tuple<ir::ModelFormula, std::string, std::vector<ir::ModelParamSpec>>, LowerError> {
+        // Convert AST formula → IR formula.
+        ir::ModelFormula formula;
+        formula.response = clause.formula.response;
+        formula.has_intercept = clause.formula.has_intercept;
+        for (const auto& term : clause.formula.terms) {
+            formula.terms.push_back(
+                ir::ModelTerm{.columns = term.columns, .is_dot = term.is_dot});
+        }
+
+        // Extract method name (required).
+        std::string method;
+        std::vector<ir::ModelParamSpec> params;
+        for (const auto& p : clause.params) {
+            if (p.name == "method") {
+                const auto* ident = std::get_if<IdentifierExpr>(&p.value->node);
+                if (ident == nullptr) {
+                    return std::unexpected(
+                        LowerError{.message = "model: method must be an identifier (e.g. ols)"});
+                }
+                method = ident->name;
+            } else {
+                auto expr = lower_expr_to_ir(*p.value);
+                if (!expr.has_value()) {
+                    return std::unexpected(expr.error());
+                }
+                params.push_back(
+                    ir::ModelParamSpec{.name = p.name, .value = std::move(expr.value())});
+            }
+        }
+        if (method.empty()) {
+            return std::unexpected(
+                LowerError{.message = "model clause requires a method parameter (e.g. method = ols)"});
+        }
+        return std::make_tuple(std::move(formula), std::move(method), std::move(params));
     }
 
     static auto lower_rename(const RenameClause& clause)
@@ -1841,6 +1910,12 @@ class Lowerer {
             }
             case ir::NodeKind::Matmul: {
                 clone = builder_.matmul();
+                break;
+            }
+            case ir::NodeKind::Model: {
+                const auto& mn = static_cast<const ir::ModelNode&>(node);
+                clone = builder_.model(mn.formula(), mn.method(),
+                                       std::vector<ir::ModelParamSpec>(mn.params()));
                 break;
             }
             case ir::NodeKind::Construct: {

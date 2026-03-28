@@ -7235,6 +7235,537 @@ auto matmul_table(const Table& left, const Table& right) -> std::expected<Table,
     return out;
 }
 
+// ─── Model Fitting ───────────────────────────────────────────────────────────
+
+/// Build a design matrix from a DataFrame using a model formula.
+/// Returns column names and a row-major matrix (vector of column vectors).
+/// Categorical/String columns are dummy-encoded (treatment coding: first level dropped when
+/// intercept is present).
+static auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
+    -> std::expected<std::pair<std::vector<std::string>, std::vector<std::vector<double>>>,
+                     std::string> {
+    const std::size_t n = input.rows();
+    if (n == 0) {
+        return std::unexpected("model: input table has no rows");
+    }
+
+    // Resolve which columns to include from the formula terms.
+    std::vector<std::string> requested_columns;
+    bool has_dot = false;
+    for (const auto& term : formula.terms) {
+        if (term.is_dot) {
+            has_dot = true;
+        } else {
+            for (const auto& col : term.columns) {
+                requested_columns.push_back(col);
+            }
+        }
+    }
+
+    // If `.` is used, add all columns except the response.
+    if (has_dot) {
+        for (const auto& entry : input.columns) {
+            if (entry.name != formula.response) {
+                bool already = false;
+                for (const auto& r : requested_columns) {
+                    if (r == entry.name) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    requested_columns.push_back(entry.name);
+                }
+            }
+        }
+    }
+
+    std::vector<std::string> col_names;
+    std::vector<std::vector<double>> columns;
+
+    // Intercept column.
+    if (formula.has_intercept) {
+        col_names.push_back("(intercept)");
+        columns.push_back(std::vector<double>(n, 1.0));
+    }
+
+    // Process each formula term.
+    for (const auto& term : formula.terms) {
+        if (term.is_dot) {
+            // Dot expands to all non-response columns (handled above).
+            // Process each as a main-effect term.
+            for (const auto& entry : input.columns) {
+                if (entry.name == formula.response) continue;
+                // Check if already included from explicit terms.
+                bool from_explicit = false;
+                for (const auto& t2 : formula.terms) {
+                    if (!t2.is_dot && t2.columns.size() == 1 && t2.columns[0] == entry.name) {
+                        from_explicit = true;
+                        break;
+                    }
+                }
+                if (from_explicit) continue;
+
+                auto ok = std::visit(
+                    [&](const auto& c) -> bool {
+                        using T = std::decay_t<decltype(c)>;
+                        if constexpr (std::is_same_v<T, Column<double>>) {
+                            std::vector<double> v(n);
+                            for (std::size_t i = 0; i < n; ++i) v[i] = c[i];
+                            col_names.push_back(entry.name);
+                            columns.push_back(std::move(v));
+                            return true;
+                        } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
+                            std::vector<double> v(n);
+                            for (std::size_t i = 0; i < n; ++i)
+                                v[i] = static_cast<double>(c[i]);
+                            col_names.push_back(entry.name);
+                            columns.push_back(std::move(v));
+                            return true;
+                        } else if constexpr (std::is_same_v<T, Column<std::string>>) {
+                            // Dummy-encode string column.
+                            std::vector<std::string> levels;
+                            for (std::size_t i = 0; i < n; ++i) {
+                                bool found = false;
+                                for (const auto& lv : levels) {
+                                    if (lv == c[i]) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found) levels.push_back(std::string(c[i]));
+                            }
+                            std::size_t start = formula.has_intercept ? 1 : 0;
+                            for (std::size_t li = start; li < levels.size(); ++li) {
+                                std::vector<double> dummy(n, 0.0);
+                                for (std::size_t i = 0; i < n; ++i) {
+                                    if (c[i] == levels[li]) dummy[i] = 1.0;
+                                }
+                                col_names.push_back(entry.name + "_" + levels[li]);
+                                columns.push_back(std::move(dummy));
+                            }
+                            return true;
+                        } else {
+                            return false;
+                        }
+                    },
+                    *entry.column);
+                if (!ok) {
+                    return std::unexpected("model: column '" + entry.name +
+                                           "' has unsupported type for model matrix");
+                }
+            }
+            continue;
+        }
+
+        if (term.columns.size() == 1) {
+            // Main effect.
+            const auto& name = term.columns[0];
+            const auto* entry = input.find_entry(name);
+            if (entry == nullptr) {
+                return std::unexpected("model: column not found: " + name);
+            }
+            auto ok = std::visit(
+                [&](const auto& c) -> bool {
+                    using T = std::decay_t<decltype(c)>;
+                    if constexpr (std::is_same_v<T, Column<double>>) {
+                        std::vector<double> v(n);
+                        for (std::size_t i = 0; i < n; ++i) v[i] = c[i];
+                        col_names.push_back(name);
+                        columns.push_back(std::move(v));
+                        return true;
+                    } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
+                        std::vector<double> v(n);
+                        for (std::size_t i = 0; i < n; ++i) v[i] = static_cast<double>(c[i]);
+                        col_names.push_back(name);
+                        columns.push_back(std::move(v));
+                        return true;
+                    } else if constexpr (std::is_same_v<T, Column<std::string>>) {
+                        // Dummy-encode.
+                        std::vector<std::string> levels;
+                        for (std::size_t i = 0; i < n; ++i) {
+                            bool found = false;
+                            for (const auto& lv : levels) {
+                                if (lv == c[i]) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) levels.push_back(std::string(c[i]));
+                        }
+                        std::size_t start = formula.has_intercept ? 1 : 0;
+                        for (std::size_t li = start; li < levels.size(); ++li) {
+                            std::vector<double> dummy(n, 0.0);
+                            for (std::size_t i = 0; i < n; ++i) {
+                                if (std::string_view(c[i]) == levels[li]) dummy[i] = 1.0;
+                            }
+                            col_names.push_back(name + "_" + levels[li]);
+                            columns.push_back(std::move(dummy));
+                        }
+                        return true;
+                    } else {
+                        return false;
+                    }
+                },
+                *entry->column);
+            if (!ok) {
+                return std::unexpected("model: column '" + name +
+                                       "' has unsupported type for model matrix");
+            }
+        } else {
+            // Interaction term: element-wise product of numeric columns.
+            // First, build each factor as a double vector.
+            std::vector<std::vector<double>> factors;
+            std::string interaction_name;
+            for (std::size_t fi = 0; fi < term.columns.size(); ++fi) {
+                const auto& name = term.columns[fi];
+                if (fi > 0) interaction_name += ":";
+                interaction_name += name;
+                const auto* entry = input.find_entry(name);
+                if (entry == nullptr) {
+                    return std::unexpected("model: column not found: " + name);
+                }
+                std::vector<double> v(n);
+                bool ok = std::visit(
+                    [&](const auto& c) -> bool {
+                        using T = std::decay_t<decltype(c)>;
+                        if constexpr (std::is_same_v<T, Column<double>>) {
+                            for (std::size_t i = 0; i < n; ++i) v[i] = c[i];
+                            return true;
+                        } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
+                            for (std::size_t i = 0; i < n; ++i)
+                                v[i] = static_cast<double>(c[i]);
+                            return true;
+                        } else {
+                            return false;
+                        }
+                    },
+                    *entry->column);
+                if (!ok) {
+                    return std::unexpected("model: interaction term requires numeric columns, '" +
+                                           name + "' is not numeric");
+                }
+                factors.push_back(std::move(v));
+            }
+            // Element-wise product of all factors.
+            std::vector<double> product(n, 1.0);
+            for (const auto& f : factors) {
+                for (std::size_t i = 0; i < n; ++i) {
+                    product[i] *= f[i];
+                }
+            }
+            col_names.push_back(interaction_name);
+            columns.push_back(std::move(product));
+        }
+    }
+
+    if (columns.empty()) {
+        return std::unexpected("model: design matrix has no columns");
+    }
+    return std::make_pair(std::move(col_names), std::move(columns));
+}
+
+/// Extract the response column as a double vector.
+static auto extract_response(const Table& input, const std::string& name)
+    -> std::expected<std::vector<double>, std::string> {
+    const auto* entry = input.find_entry(name);
+    if (entry == nullptr) {
+        return std::unexpected("model: response column not found: " + name);
+    }
+    const std::size_t n = input.rows();
+    std::vector<double> y(n);
+    bool ok = std::visit(
+        [&](const auto& c) -> bool {
+            using T = std::decay_t<decltype(c)>;
+            if constexpr (std::is_same_v<T, Column<double>>) {
+                for (std::size_t i = 0; i < n; ++i) y[i] = c[i];
+                return true;
+            } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
+                for (std::size_t i = 0; i < n; ++i) y[i] = static_cast<double>(c[i]);
+                return true;
+            } else {
+                return false;
+            }
+        },
+        *entry->column);
+    if (!ok) {
+        return std::unexpected("model: response column '" + name + "' must be numeric");
+    }
+    return y;
+}
+
+/// Solve a linear system A * x = b using Cholesky decomposition (A must be SPD).
+/// A is p×p (column-major: A[col][row]), b is length p. Returns x.
+static auto solve_spd(const std::vector<std::vector<double>>& A, const std::vector<double>& b)
+    -> std::expected<std::vector<double>, std::string> {
+    const std::size_t p = A.size();
+
+    // Cholesky factorisation: A = L * L^T.
+    std::vector<std::vector<double>> L(p, std::vector<double>(p, 0.0));
+    for (std::size_t j = 0; j < p; ++j) {
+        double sum = 0.0;
+        for (std::size_t k = 0; k < j; ++k) sum += L[j][k] * L[j][k];
+        double diag = A[j][j] - sum;
+        if (diag <= 0.0) {
+            return std::unexpected("model: design matrix is rank-deficient (not positive definite)");
+        }
+        L[j][j] = std::sqrt(diag);
+        for (std::size_t i = j + 1; i < p; ++i) {
+            double s = 0.0;
+            for (std::size_t k = 0; k < j; ++k) s += L[i][k] * L[j][k];
+            L[i][j] = (A[j][i] - s) / L[j][j];  // A[j][i] = A[col=j][row=i]
+        }
+    }
+
+    // Forward substitution: L * z = b.
+    std::vector<double> z(p);
+    for (std::size_t i = 0; i < p; ++i) {
+        double s = 0.0;
+        for (std::size_t k = 0; k < i; ++k) s += L[i][k] * z[k];
+        z[i] = (b[i] - s) / L[i][i];
+    }
+
+    // Back substitution: L^T * x = z.
+    std::vector<double> x(p);
+    for (std::size_t i = p; i-- > 0;) {
+        double s = 0.0;
+        for (std::size_t k = i + 1; k < p; ++k) s += L[k][i] * x[k];
+        x[i] = (z[i] - s) / L[i][i];
+    }
+    return x;
+}
+
+/// Compute X^T * X (p×p) and X^T * y (p×1) from column-major X.
+static auto compute_XtX_Xty(const std::vector<std::vector<double>>& X,
+                             const std::vector<double>& y, std::size_t n, std::size_t p)
+    -> std::pair<std::vector<std::vector<double>>, std::vector<double>> {
+    std::vector<std::vector<double>> XtX(p, std::vector<double>(p, 0.0));
+    std::vector<double> Xty(p, 0.0);
+    for (std::size_t a = 0; a < p; ++a) {
+        for (std::size_t b = a; b < p; ++b) {
+            double s = 0.0;
+            for (std::size_t i = 0; i < n; ++i) s += X[a][i] * X[b][i];
+            XtX[a][b] = s;
+            XtX[b][a] = s;
+        }
+        for (std::size_t i = 0; i < n; ++i) Xty[a] += X[a][i] * y[i];
+    }
+    return {std::move(XtX), std::move(Xty)};
+}
+
+/// Build a full ModelResult from coefficients, design matrix, and response.
+static auto build_model_result(const std::vector<std::string>& col_names,
+                                const std::vector<std::vector<double>>& X,
+                                const std::vector<double>& y,
+                                const std::vector<double>& beta,
+                                const ir::ModelFormula& formula, const std::string& method)
+    -> ModelResult {
+    const std::size_t n = y.size();
+    const std::size_t p = beta.size();
+
+    // Compute fitted values and residuals.
+    std::vector<double> fitted(n, 0.0);
+    std::vector<double> resid(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < p; ++j) {
+            fitted[i] += X[j][i] * beta[j];
+        }
+        resid[i] = y[i] - fitted[i];
+    }
+
+    // R² and adjusted R².
+    double y_mean = 0.0;
+    for (double v : y) y_mean += v;
+    y_mean /= static_cast<double>(n);
+    double ss_tot = 0.0;
+    double ss_res = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        ss_tot += (y[i] - y_mean) * (y[i] - y_mean);
+        ss_res += resid[i] * resid[i];
+    }
+    double r2 = (ss_tot > 0.0) ? 1.0 - ss_res / ss_tot : 0.0;
+    double adj_r2 = (n > p && ss_tot > 0.0)
+                        ? 1.0 - (ss_res / static_cast<double>(n - p)) /
+                                    (ss_tot / static_cast<double>(n - 1))
+                        : 0.0;
+
+    // Standard errors of coefficients.
+    double sigma2 = (n > p) ? ss_res / static_cast<double>(n - p) : 0.0;
+
+    // Compute (X^T X)^{-1} diagonal for standard errors.
+    // We already have X^T X; solve for each unit vector to get inverse diagonal.
+    auto [XtX, _unused] = compute_XtX_Xty(X, y, n, p);
+    std::vector<double> std_errors(p, 0.0);
+    for (std::size_t j = 0; j < p; ++j) {
+        std::vector<double> ej(p, 0.0);
+        ej[j] = 1.0;
+        auto inv_col = solve_spd(XtX, ej);
+        if (inv_col.has_value()) {
+            std_errors[j] = std::sqrt(sigma2 * (*inv_col)[j]);
+        }
+    }
+
+    // Build coefficients table: term | estimate
+    Table coef_table;
+    Column<std::string> term_col;
+    Column<double> est_col;
+    for (std::size_t j = 0; j < p; ++j) {
+        term_col.push_back(col_names[j]);
+        est_col.push_back(beta[j]);
+    }
+    coef_table.add_column("term", std::move(term_col));
+    coef_table.add_column("estimate", std::move(est_col));
+
+    // Build summary table: term | estimate | std_error | t_stat | p_value
+    Table summary_table;
+    Column<std::string> s_term;
+    Column<double> s_est;
+    Column<double> s_se;
+    Column<double> s_tstat;
+    Column<double> s_pval;
+    for (std::size_t j = 0; j < p; ++j) {
+        s_term.push_back(col_names[j]);
+        s_est.push_back(beta[j]);
+        s_se.push_back(std_errors[j]);
+        double t = (std_errors[j] > 0.0) ? beta[j] / std_errors[j] : 0.0;
+        s_tstat.push_back(t);
+        // Approximate two-sided p-value using normal distribution (large-sample).
+        double p_val = 2.0 * std::erfc(std::abs(t) / std::sqrt(2.0));
+        s_pval.push_back(p_val);
+    }
+    summary_table.add_column("term", std::move(s_term));
+    summary_table.add_column("estimate", std::move(s_est));
+    summary_table.add_column("std_error", std::move(s_se));
+    summary_table.add_column("t_stat", std::move(s_tstat));
+    summary_table.add_column("p_value", std::move(s_pval));
+
+    // Build fitted values table.
+    Table fitted_table;
+    fitted_table.add_column("fitted", Column<double>(fitted));
+
+    // Build residuals table.
+    Table resid_table;
+    resid_table.add_column("residual", Column<double>(resid));
+
+    return ModelResult{
+        .coefficients = std::move(coef_table),
+        .summary = std::move(summary_table),
+        .fitted_values = std::move(fitted_table),
+        .residuals = std::move(resid_table),
+        .formula = formula,
+        .method = method,
+        .r_squared = r2,
+        .adj_r_squared = adj_r2,
+        .n_obs = n,
+        .n_params = p,
+    };
+}
+
+/// Fit a model using the specified method.
+static auto fit_model(const Table& input, const ir::ModelFormula& formula,
+                      const std::string& method, const std::vector<ir::ModelParamSpec>& params,
+                      const ScalarRegistry* scalars, const ExternRegistry* /*externs*/)
+    -> std::expected<ModelResult, std::string> {
+    // Build design matrix.
+    auto matrix = build_model_matrix(input, formula);
+    if (!matrix) {
+        return std::unexpected(matrix.error());
+    }
+    auto& [col_names, X] = matrix.value();
+    const std::size_t n = input.rows();
+    const std::size_t p = col_names.size();
+
+    // Extract response.
+    auto y = extract_response(input, formula.response);
+    if (!y) {
+        return std::unexpected(y.error());
+    }
+
+    if (n <= p) {
+        return std::unexpected("model: need more observations (" + std::to_string(n) +
+                               ") than parameters (" + std::to_string(p) + ")");
+    }
+
+    auto [XtX, Xty] = compute_XtX_Xty(X, y.value(), n, p);
+
+    if (method == "ols") {
+        auto beta = solve_spd(XtX, Xty);
+        if (!beta) {
+            return std::unexpected(beta.error());
+        }
+        return build_model_result(col_names, X, y.value(), beta.value(), formula, method);
+    }
+
+    if (method == "ridge") {
+        // Extract lambda parameter.
+        double lambda = 1.0;
+        for (const auto& param : params) {
+            if (param.name == "lambda") {
+                if (const auto* lit = std::get_if<ir::Literal>(&param.value.node)) {
+                    if (const auto* dv = std::get_if<double>(&lit->value)) {
+                        lambda = *dv;
+                    } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                        lambda = static_cast<double>(*iv);
+                    }
+                }
+            }
+        }
+        // Add lambda * I to diagonal (skip intercept if present).
+        for (std::size_t j = 0; j < p; ++j) {
+            if (formula.has_intercept && j == 0) continue;  // don't penalize intercept
+            XtX[j][j] += lambda;
+        }
+        auto beta = solve_spd(XtX, Xty);
+        if (!beta) {
+            return std::unexpected(beta.error());
+        }
+        return build_model_result(col_names, X, y.value(), beta.value(), formula, method);
+    }
+
+    if (method == "wls") {
+        // Extract weights column name.
+        std::string weights_col;
+        for (const auto& param : params) {
+            if (param.name == "weights") {
+                if (const auto* ref = std::get_if<ir::ColumnRef>(&param.value.node)) {
+                    weights_col = ref->name;
+                }
+            }
+        }
+        if (weights_col.empty()) {
+            return std::unexpected("wls: requires weights parameter (e.g. weights = w)");
+        }
+        // Extract weights as double vector.
+        auto w_result = extract_response(input, weights_col);
+        if (!w_result) {
+            return std::unexpected("wls: " + w_result.error());
+        }
+        const auto& w = w_result.value();
+
+        // WLS: minimise sum w_i*(y_i - x_i'*beta)^2
+        // Normal equations: X^T W X beta = X^T W y
+        std::vector<std::vector<double>> XtWX(p, std::vector<double>(p, 0.0));
+        std::vector<double> XtWy(p, 0.0);
+        for (std::size_t a = 0; a < p; ++a) {
+            for (std::size_t b = a; b < p; ++b) {
+                double s = 0.0;
+                for (std::size_t i = 0; i < n; ++i) s += w[i] * X[a][i] * X[b][i];
+                XtWX[a][b] = s;
+                XtWX[b][a] = s;
+            }
+            for (std::size_t i = 0; i < n; ++i) XtWy[a] += w[i] * X[a][i] * y.value()[i];
+        }
+        auto beta = solve_spd(XtWX, XtWy);
+        if (!beta) {
+            return std::unexpected(beta.error());
+        }
+        return build_model_result(col_names, X, y.value(), beta.value(), formula, method);
+    }
+
+    return std::unexpected("model: unknown method '" + method +
+                           "' (supported: ols, ridge, wls)");
+}
+
 // ─── Melt (wide → long) ──────────────────────────────────────────────────────
 
 auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
@@ -8044,7 +8575,8 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
-                    const ScalarRegistry* scalars, const ExternRegistry* externs)
+                    const ScalarRegistry* scalars, const ExternRegistry* externs,
+                    ModelResult* model_out = nullptr)
     -> std::expected<Table, std::string> {
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
@@ -8667,6 +9199,27 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return result;
         }
+        case ir::NodeKind::Model: {
+            const auto& mn = static_cast<const ir::ModelNode&>(node);
+            if (mn.children().empty()) {
+                return std::unexpected("model node missing child");
+            }
+            auto child = interpret_node(*mn.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            auto result = fit_model(child.value(), mn.formula(), mn.method(), mn.params(), scalars,
+                                    externs);
+            if (!result) {
+                return std::unexpected(result.error());
+            }
+            // Extract coefficients before potentially moving the whole result.
+            Table coef = result.value().coefficients;
+            if (model_out != nullptr) {
+                *model_out = std::move(result.value());
+            }
+            return coef;
+        }
         case ir::NodeKind::Program:
             return std::unexpected("ProgramNode cannot be interpreted at runtime");
     }
@@ -8737,8 +9290,9 @@ auto Table::rows() const noexcept -> std::size_t {
 }
 
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
-               const ExternRegistry* externs) -> std::expected<Table, std::string> {
-    return interpret_node(node, registry, scalars, externs);
+               const ExternRegistry* externs, ModelResult* model_out)
+    -> std::expected<Table, std::string> {
+    return interpret_node(node, registry, scalars, externs, model_out);
 }
 
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,

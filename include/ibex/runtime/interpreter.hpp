@@ -186,12 +186,31 @@ struct Table {
 using TableRegistry = std::unordered_map<std::string, Table>;
 using ScalarRegistry = std::unordered_map<std::string, ScalarValue>;
 
+/// Opaque model result produced by the `model { ... }` clause.
+/// Accessor functions (`coef`, `residuals`, `fitted`, `summary`) extract
+/// sub-tables; `predict` applies the stored formula to new data.
+struct ModelResult {
+    Table coefficients;    ///< term | estimate
+    Table summary;         ///< term | estimate | std_error | t_stat | p_value
+    Table fitted_values;   ///< single column: fitted
+    Table residuals;       ///< single column: residual
+    ir::ModelFormula formula;
+    std::string method;
+    double r_squared = 0.0;
+    double adj_r_squared = 0.0;
+    std::size_t n_obs = 0;
+    std::size_t n_params = 0;
+};
+
+using ModelRegistry = std::unordered_map<std::string, ModelResult>;
+
 /// Interpret an IR node tree against a table registry.
 class ExternRegistry;
 
 [[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,
                              const ScalarRegistry* scalars = nullptr,
-                             const ExternRegistry* externs = nullptr)
+                             const ExternRegistry* externs = nullptr,
+                             ModelResult* model_out = nullptr)
     -> std::expected<Table, std::string>;
 
 [[nodiscard]] auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,

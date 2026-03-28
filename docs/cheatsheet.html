@@ -150,6 +150,43 @@ tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw
   </section>
 
   <section class="section">
+    <p class="section-label">Model fitting</p>
+    <h2>R-style regression in one bracket</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Formula syntax</h3>
+<pre><code><span class="cm">// OLS with intercept</span>
+df[<span class="kw">model</span> { y ~ x1 + x2 }];
+
+<span class="cm">// No intercept</span>
+df[<span class="kw">model</span> { y ~ x - <span class="num">1</span> }];
+
+<span class="cm">// Dot = all other columns</span>
+df[<span class="kw">model</span> { y ~ . }];
+
+<span class="cm">// Interaction and crossing</span>
+df[<span class="kw">model</span> { y ~ x1:x2 }];
+df[<span class="kw">model</span> { y ~ x1 * x2 }];</code></pre>
+      </article>
+      <article class="card">
+        <h3>Methods &amp; accessors</h3>
+<pre><code><span class="cm">// Ridge / WLS</span>
+df[<span class="kw">model</span> { y ~ x, method = ridge,
+               lambda = <span class="num">0.1</span> }];
+df[<span class="kw">model</span> { y ~ x, method = wls,
+               weights = w }];
+
+<span class="cm">// Extract results</span>
+<span class="fn-name">model_coef</span>(m);
+<span class="fn-name">model_summary</span>(m);
+<span class="fn-name">model_fitted</span>(m);
+<span class="fn-name">model_residuals</span>(m);
+<span class="fn-name">model_r_squared</span>(m);</code></pre>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
     <p class="section-label">I/O and streams</p>
     <h2>Plugin and Stream basics</h2>
     <div class="grid-2">

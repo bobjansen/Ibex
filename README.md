@@ -232,6 +232,34 @@ long[dcast variable, select value, by symbol]
 // Columns: symbol | open | high | low | close
 ```
 
+### Matrix Operations
+
+Ibex treats any all-numeric DataFrame as a column-major matrix and provides
+four operations for linear-algebra style computation. Non-numeric columns are
+silently dropped for `cov`, `corr`, and `matmul`; `transpose` requires
+homogeneous column types.
+
+```
+// Covariance matrix of numeric columns
+let numeric = prices[select { open, high, low, close }]
+numeric[cov]
+// Result: column: String, open: Float64, high: Float64, low: Float64, close: Float64
+
+// Pearson correlation matrix (diagonal = 1.0)
+numeric[corr]
+
+// Transpose — one optional String/Categorical column names the output columns;
+// if absent, output columns are r0, r1, …
+let labeled = prices[select { symbol, open, close }]
+labeled[transpose]
+// Result columns: column: String, AAPL: Float64, MSFT: Float64, ...
+
+// Matrix multiply: (m×k) × (k×n) → (m×n)
+// Column names of the right-hand table become the output column names
+let weights = Table { w = [0.6, 0.4] }
+matmul(prices[select { open, close }], weights)
+```
+
 ### Scalar functions
 
 ```

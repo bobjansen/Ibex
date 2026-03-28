@@ -1034,9 +1034,10 @@ Stream {
             <code>model_coef</code>, <code>model_summary</code>,
             <code>model_fitted</code>, <code>model_residuals</code>, and
             <code>model_r_squared</code>. The <code>method&nbsp;=</code> parameter
-            duck-types any function with signature
-            <code>(X:&nbsp;Table,&nbsp;y:&nbsp;Table)&nbsp;->&nbsp;Table</code>,
-            so user-defined estimators slot in seamlessly.
+            supports built-ins (<code>ols</code>, <code>ridge</code>,
+            <code>wls</code>) plus plugin methods registered as
+            <code>model_&lt;method&gt;</code> (for example
+            <code>model_lightbm</code>).
           </p>
         </div>
         <div class="tour-code">

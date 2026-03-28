@@ -4019,7 +4019,7 @@ TEST_CASE("transpose: basic numeric float64", "[transpose][matrix]") {
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
-    REQUIRE(result->rows() == 2);   // 2 original columns → 2 rows
+    REQUIRE(result->rows() == 2);  // 2 original columns → 2 rows
     // Without a label column: output columns are "column", "r0", "r1", "r2"
     REQUIRE(result->find("column") != nullptr);
     REQUIRE(result->find("r0") != nullptr);
@@ -4042,8 +4042,8 @@ TEST_CASE("transpose: basic numeric float64", "[transpose][matrix]") {
 TEST_CASE("transpose: uses string label column for output column names", "[transpose][matrix]") {
     runtime::Table t;
     t.add_column("symbol", Column<std::string>{"AAPL", "MSFT"});
-    t.add_column("open",   Column<double>{100.0, 200.0});
-    t.add_column("close",  Column<double>{110.0, 210.0});
+    t.add_column("open", Column<double>{100.0, 200.0});
+    t.add_column("close", Column<double>{110.0, 210.0});
     runtime::TableRegistry registry;
     registry.emplace("t", t);
 
@@ -4130,7 +4130,7 @@ TEST_CASE("matmul: identity matrix leaves operand unchanged", "[matmul][matrix]"
 TEST_CASE("matmul: inner dimension mismatch returns error", "[matmul][matrix]") {
     runtime::Table a, b;
     a.add_column("c0", Column<double>{1.0, 2.0});
-    a.add_column("c1", Column<double>{3.0, 4.0});  // A is 2 rows × 2 cols
+    a.add_column("c1", Column<double>{3.0, 4.0});         // A is 2 rows × 2 cols
     b.add_column("only", Column<double>{5.0, 6.0, 7.0});  // B has 3 rows ≠ 2 cols of A
 
     runtime::TableRegistry registry;
@@ -4347,14 +4347,15 @@ TEST_CASE("model: LightBM plugin method", "[model]") {
 
     runtime::ExternRegistry externs;
     externs.register_scalar_table_consumer(
-        "model_lightbm",
-        runtime::ScalarKind::Int,
-        [](const runtime::Table& design_matrix, const runtime::ExternArgs& args)
-            -> std::expected<runtime::ExternValue, std::string> {
-            REQUIRE(args.size() == 3);
+        "model_lightbm", runtime::ScalarKind::Int,
+        [](const runtime::Table& design_matrix,
+           const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            REQUIRE(args.size() == 5);
             REQUIRE(std::get<std::string>(args[0]) == "__response");
-            REQUIRE(std::get<std::int64_t>(args[1]) == 250);
-            REQUIRE(std::get<double>(args[2]) == Catch::Approx(0.04));
+            REQUIRE(std::get<std::string>(args[1]) == "iterations");
+            REQUIRE(std::get<std::int64_t>(args[2]) == 250);
+            REQUIRE(std::get<std::string>(args[3]) == "learning_rate");
+            REQUIRE(std::get<double>(args[4]) == Catch::Approx(0.04));
 
             const auto* x = std::get_if<Column<double>>(design_matrix.find("x"));
             const auto* y = std::get_if<Column<double>>(design_matrix.find("__response"));
@@ -4413,7 +4414,7 @@ TEST_CASE("model: ModelResult accessor tables", "[model]") {
     // Fitted values
     REQUIRE(model_out.fitted_values.rows() == 5);
     const auto& fitted = std::get<Column<double>>(*model_out.fitted_values.find("fitted"));
-    REQUIRE(fitted[0] == Catch::Approx(3.0));  // 1 + 2*1
+    REQUIRE(fitted[0] == Catch::Approx(3.0));   // 1 + 2*1
     REQUIRE(fitted[4] == Catch::Approx(11.0));  // 1 + 2*5
 
     // Residuals (should be ~0 for perfect fit)

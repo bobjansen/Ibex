@@ -1275,7 +1275,6 @@ df[model { y ~ x - 1, method = ols }]
 | `ols` | — | Ordinary least squares via Cholesky decomposition |
 | `ridge` | `lambda: Float64` | L2-penalized regression (intercept not penalized) |
 | `wls` | `weights: column` | Weighted least squares |
-| `lightbm` | `iterations: Int` (default 200), `learning_rate: Float64` (default 0.05) | Plugin-backed lightweight boosting model. Requires `import "lightbm"` so `model_lightbm` is registered. |
 
 #### ModelResult
 
@@ -1293,10 +1292,26 @@ Accessor functions extract sub-tables from a `ModelResult`:
 | `residuals(m)` | `Table`: residual (y − ŷ) |
 | `r_squared(m)` | `Float64`: coefficient of determination |
 
-`lightbm` is implemented through the plugin infrastructure: the runtime invokes
-the extern table-consumer function `model_lightbm(df, response, iterations, learning_rate)`.
-When the plugin is not loaded, `method = lightbm` returns an error that explains
-to import `"lightbm"` first.
+#### Plugin Model Methods
+
+In addition to built-ins (`ols`, `ridge`, `wls`), the runtime resolves plugin
+methods by name using `model_<method>`.
+
+For example, `method = lightbm` dispatches to `model_lightbm` when a plugin
+registers that extern table-consumer function.
+
+Plugin invocation contract:
+
+- The first scalar arg is the response column name in the provided design matrix
+  (currently `"__response"`).
+- Remaining scalar args are passed as `(name, value)` pairs from model params
+  (excluding `method`), in source order.
+- The plugin must return a `Table` with schema:
+  - `term: String`
+  - `estimate: Float64`
+
+If no built-in or plugin method exists, model evaluation returns an unknown
+method error.
 
 #### Constraints
 

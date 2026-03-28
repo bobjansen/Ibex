@@ -72,6 +72,14 @@ class Builder {
                                           std::move(measure_columns));
     }
 
+    [[nodiscard]] auto cov() -> NodePtr { return std::make_unique<CovNode>(next_id()); }
+
+    [[nodiscard]] auto corr() -> NodePtr { return std::make_unique<CorrNode>(next_id()); }
+
+    [[nodiscard]] auto transpose() -> NodePtr { return std::make_unique<TransposeNode>(next_id()); }
+
+    [[nodiscard]] auto matmul() -> NodePtr { return std::make_unique<MatmulNode>(next_id()); }
+
     [[nodiscard]] auto dcast(std::string pivot_column, std::string value_column,
                              std::vector<std::string> row_keys) -> NodePtr {
         return std::make_unique<DcastNode>(next_id(), std::move(pivot_column),

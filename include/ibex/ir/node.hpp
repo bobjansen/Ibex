@@ -213,6 +213,10 @@ enum class NodeKind : std::uint8_t {
     Stream,
     Construct,  ///< Build a Table from inline literal column vectors.
     Program,    ///< Top-level program: zero or more preamble side-effect calls + one main node.
+    Cov,        ///< Covariance matrix of all numeric columns.
+    Corr,       ///< Pearson correlation matrix of all numeric columns.
+    Transpose,  ///< Transpose: swap rows and columns (homogeneous-type DataFrames).
+    Matmul,     ///< Matrix multiply: (m×k) × (k×n) → (m×n).
 };
 
 /// How a StreamNode triggers output emission.
@@ -622,6 +626,38 @@ class ProgramNode final : public Node {
    private:
     std::vector<NodePtr> preamble_;
     NodePtr main_node_;
+};
+
+/// Cov node: compute covariance matrix of all numeric columns.
+/// Output has a leading "column" String column + N Float64 columns named after the inputs.
+class CovNode final : public Node {
+   public:
+    explicit CovNode(NodeId id) : Node(NodeKind::Cov, id) {}
+};
+
+/// Corr node: compute Pearson correlation matrix of all numeric columns.
+/// Same output shape as CovNode; diagonal values are exactly 1.0.
+class CorrNode final : public Node {
+   public:
+    explicit CorrNode(NodeId id) : Node(NodeKind::Corr, id) {}
+};
+
+/// Transpose node: swap rows and columns.
+/// All data columns must share the same type (homogeneous).
+/// One optional String/Categorical label column names the output columns; if absent
+/// the output columns are named "r0", "r1", …
+class TransposeNode final : public Node {
+   public:
+    explicit TransposeNode(NodeId id) : Node(NodeKind::Transpose, id) {}
+};
+
+/// Matmul node: matrix multiply left × right.
+/// child[0] = left (m×k), child[1] = right (k×n).
+/// Numeric-only columns are extracted from each operand.
+/// Output has nrow(left) rows; columns match the numeric columns of right.
+class MatmulNode final : public Node {
+   public:
+    explicit MatmulNode(NodeId id) : Node(NodeKind::Matmul, id) {}
 };
 
 }  // namespace ibex::ir

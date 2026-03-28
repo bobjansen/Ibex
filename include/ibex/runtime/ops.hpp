@@ -86,6 +86,23 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
                          const std::string& value_col, const std::vector<std::string>& row_keys)
     -> runtime::Table;
 
+/// Covariance matrix of all numeric columns. Drops non-numeric columns.
+/// Output: leading "column" String column + N Float64 columns named after inputs.
+[[nodiscard]] auto cov(const runtime::Table& t) -> runtime::Table;
+
+/// Pearson correlation matrix of all numeric columns. Same shape as cov().
+[[nodiscard]] auto corr(const runtime::Table& t) -> runtime::Table;
+
+/// Transpose a homogeneous-type DataFrame (swap rows ↔ columns).
+/// Optional String/Categorical label column names the output columns;
+/// if absent output columns are named "r0", "r1", …
+[[nodiscard]] auto transpose(const runtime::Table& t) -> runtime::Table;
+
+/// Matrix multiply: left (m×k) × right (k×n) → (m×n).
+/// Numeric-only columns are extracted from each operand.
+[[nodiscard]] auto matmul(const runtime::Table& left, const runtime::Table& right)
+    -> runtime::Table;
+
 [[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,
                               const std::vector<std::string>& keys) -> runtime::Table;
 

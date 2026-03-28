@@ -57,6 +57,9 @@
           <tr><td><code>df[update { x = fill_forward(x) }]</code></td><td>Typical null-fill usage.</td></tr>
           <tr><td><code>df[order key]</code></td><td>Standard ordering syntax (instead of <code>order(df, key)</code>).</td></tr>
           <tr><td><code>import "csv"; read_csv("file.csv")</code></td><td>Typical file I/O usage.</td></tr>
+          <tr><td><code>df[cov]</code> / <code>df[corr]</code></td><td>Covariance or correlation matrix of numeric columns.</td></tr>
+          <tr><td><code>df[transpose]</code></td><td>Swap rows and columns (homogeneous column types required).</td></tr>
+          <tr><td><code>matmul(a, b)</code></td><td>Matrix multiply two DataFrames.</td></tr>
         </tbody>
       </table>
     </article>
@@ -217,6 +220,33 @@
         </table>
       </article>
     </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Matrix</p>
+    <h2>Matrix operations</h2>
+    <article class="card">
+      <p>These treat a DataFrame as a column-major matrix. Non-numeric columns are silently dropped for <code>cov</code>, <code>corr</code>, and <code>matmul</code>; Int64 columns are widened to Float64. <code>transpose</code> requires all data columns to share the same type.</p>
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>df[cov]</code></td><td>Sample covariance matrix of all numeric columns. Returns an N×N Float64 table with a leading <code>column: String</code> label column. Denominator is n−1.</td></tr>
+          <tr><td><code>df[corr]</code></td><td>Pearson correlation matrix of all numeric columns. Same schema as <code>cov</code>; diagonal values are exactly 1.0.</td></tr>
+          <tr><td><code>df[transpose]</code></td><td>Swap rows and columns. All data columns must share the same type. An optional String or Categorical column is used to name output columns; if absent, columns are named <code>r0</code>, <code>r1</code>, …</td></tr>
+          <tr><td><code>matmul(a, b)</code></td><td>Matrix multiply two DataFrames. Inner dimensions must match. Output column names come from <code>b</code>; row count equals <code>nrow(a)</code>.</td></tr>
+        </tbody>
+      </table>
+    </article>
+    <article class="card">
+      <h3>Examples</h3>
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>prices[select { open, high, low, close }][cov]</code></td><td>4×4 covariance matrix of OHLC columns.</td></tr>
+          <tr><td><code>prices[select { open, close }][corr]</code></td><td>2×2 correlation matrix; off-diagonal is the open/close correlation.</td></tr>
+          <tr><td><code>prices[select { symbol, open, close }][transpose]</code></td><td>Transpose with <code>symbol</code> values as output column names.</td></tr>
+          <tr><td><code>matmul(returns[select { open, close }], weights)</code></td><td>Multiply a returns matrix by a weights column — typical portfolio aggregation.</td></tr>
+        </tbody>
+      </table>
+    </article>
   </section>
 
   <section class="section">

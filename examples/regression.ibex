@@ -1,7 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  Ibex Regression Demo  ·  Model Specification Syntax
 //
-//  Demonstrates OLS, ridge, and WLS regression using R-style formula syntax.
+//  Demonstrates OLS, ridge, WLS, and LightBM plugin regression using
+//  R-style formula syntax.
 //  Design matrix construction, categorical dummy encoding, and interaction
 //  terms are handled automatically by the model clause.
 //
@@ -10,6 +11,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "lightbm";
 
 let prices = read_csv("examples/data/ohlcv.csv");
 
@@ -47,3 +49,11 @@ let m7 = prices[model { close ~ open + volume, method = ridge, lambda = 0.1 }];
 // ── 8. Weighted least squares — down-weight high-volume rows ────────────────
 let weighted = prices[update { w = 1.0 / volume }];
 let m8 = weighted[model { close ~ open + high + low, method = wls, weights = w }];
+
+// ── 9. LightBM plugin method — stagewise boosting-style fitter ──────────────
+let m9 = prices[model {
+    close ~ open + high + low + volume,
+    method = lightbm,
+    iterations = 300,
+    learning_rate = 0.03
+}];

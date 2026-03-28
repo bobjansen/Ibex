@@ -217,6 +217,7 @@ enum class NodeKind : std::uint8_t {
     Corr,       ///< Pearson correlation matrix of all numeric columns.
     Transpose,  ///< Transpose: swap rows and columns (homogeneous-type DataFrames).
     Matmul,     ///< Matrix multiply: (m×k) × (k×n) → (m×n).
+    Model,      ///< Model fitting: formula → ModelResult.
 };
 
 /// How a StreamNode triggers output emission.
@@ -658,6 +659,50 @@ class TransposeNode final : public Node {
 class MatmulNode final : public Node {
    public:
     explicit MatmulNode(NodeId id) : Node(NodeKind::Matmul, id) {}
+};
+
+/// A single term in an IR-level model formula.
+struct ModelTerm {
+    std::vector<std::string> columns;
+    bool is_dot = false;
+};
+
+/// IR-level model formula: response ~ terms.
+struct ModelFormula {
+    std::string response;
+    std::vector<ModelTerm> terms;
+    bool has_intercept = true;
+};
+
+/// Named parameter for a model node (e.g. method = "ols", lambda = 0.1).
+struct ModelParamSpec {
+    std::string name;
+    Expr value;  ///< Scalar expression for the parameter value.
+};
+
+/// Model node: fit a statistical model via formula + method.
+/// child[0] = input table.
+/// The node carries the formula, method name, and extra parameters.
+/// Returns a ModelResult (wrapped in the runtime value system).
+class ModelNode final : public Node {
+   public:
+    ModelNode(NodeId id, ModelFormula formula, std::string method,
+              std::vector<ModelParamSpec> params)
+        : Node(NodeKind::Model, id),
+          formula_(std::move(formula)),
+          method_(std::move(method)),
+          params_(std::move(params)) {}
+
+    [[nodiscard]] auto formula() const noexcept -> const ModelFormula& { return formula_; }
+    [[nodiscard]] auto method() const noexcept -> const std::string& { return method_; }
+    [[nodiscard]] auto params() const noexcept -> const std::vector<ModelParamSpec>& {
+        return params_;
+    }
+
+   private:
+    ModelFormula formula_;
+    std::string method_;
+    std::vector<ModelParamSpec> params_;
 };
 
 }  // namespace ibex::ir

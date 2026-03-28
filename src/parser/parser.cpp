@@ -1210,8 +1210,174 @@ class Parser {
         if (match(TokenKind::KeywordTranspose)) {
             return TransposeClause{};
         }
+        if (match(TokenKind::KeywordModel)) {
+            return parse_model_clause();
+        }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
+    }
+
+    /// Parse a formula term: a column name, `.` wildcard, or an interaction `a:b`.
+    auto parse_formula_term() -> std::optional<FormulaTerm> {
+        if (match(TokenKind::Dot)) {
+            return FormulaTerm{.columns = {}, .is_dot = true};
+        }
+        auto name = consume_column_identifier("expected column name in formula");
+        if (!name.has_value()) {
+            return std::nullopt;
+        }
+        FormulaTerm term;
+        term.columns.push_back(std::move(*name));
+        // Parse interaction terms: a:b:c...
+        while (match(TokenKind::Colon)) {
+            auto next = consume_column_identifier("expected column name after ':'");
+            if (!next.has_value()) {
+                return std::nullopt;
+            }
+            term.columns.push_back(std::move(*next));
+        }
+        return term;
+    }
+
+    /// Parse the RHS of a formula: `term + term - 1`, `term * term`, etc.
+    /// The `*` (crossing) operator expands `a * b` to `a + b + a:b`.
+    auto parse_formula_rhs(Formula& formula) -> bool {
+        auto first = parse_formula_term();
+        if (!first.has_value()) {
+            return false;
+        }
+        // Check for crossing: term * term → main effects + interaction
+        if (check(TokenKind::Star)) {
+            // Collect the first term, then handle star
+            std::vector<FormulaTerm> crossing_terms;
+            crossing_terms.push_back(std::move(*first));
+            while (match(TokenKind::Star)) {
+                auto next = parse_formula_term();
+                if (!next.has_value()) {
+                    return false;
+                }
+                crossing_terms.push_back(std::move(*next));
+            }
+            // Expand crossing: add all main effects and all pairwise interactions
+            for (const auto& t : crossing_terms) {
+                formula.terms.push_back(t);
+            }
+            for (std::size_t i = 0; i < crossing_terms.size(); ++i) {
+                for (std::size_t j = i + 1; j < crossing_terms.size(); ++j) {
+                    FormulaTerm interaction;
+                    for (const auto& c : crossing_terms[i].columns) {
+                        interaction.columns.push_back(c);
+                    }
+                    for (const auto& c : crossing_terms[j].columns) {
+                        interaction.columns.push_back(c);
+                    }
+                    formula.terms.push_back(std::move(interaction));
+                }
+            }
+        } else {
+            formula.terms.push_back(std::move(*first));
+        }
+
+        // Parse remaining `+ term` or `- 1` suffixes
+        while (check(TokenKind::Plus) || check(TokenKind::Minus)) {
+            if (match(TokenKind::Minus)) {
+                // Expect `- 1` to remove intercept
+                if (!match(TokenKind::IntLiteral)) {
+                    error_ = make_error(peek(), "expected '1' after '-' in formula");
+                    return false;
+                }
+                if (previous().lexeme != "1") {
+                    error_ = make_error(previous(), "only '- 1' (remove intercept) is supported");
+                    return false;
+                }
+                formula.has_intercept = false;
+                continue;
+            }
+            // Plus
+            advance();  // consume '+'
+            auto term = parse_formula_term();
+            if (!term.has_value()) {
+                return false;
+            }
+            // Check for crossing after '+'
+            if (check(TokenKind::Star)) {
+                std::vector<FormulaTerm> crossing_terms;
+                crossing_terms.push_back(std::move(*term));
+                while (match(TokenKind::Star)) {
+                    auto next = parse_formula_term();
+                    if (!next.has_value()) {
+                        return false;
+                    }
+                    crossing_terms.push_back(std::move(*next));
+                }
+                for (const auto& t : crossing_terms) {
+                    formula.terms.push_back(t);
+                }
+                for (std::size_t i = 0; i < crossing_terms.size(); ++i) {
+                    for (std::size_t j = i + 1; j < crossing_terms.size(); ++j) {
+                        FormulaTerm interaction;
+                        for (const auto& c : crossing_terms[i].columns) {
+                            interaction.columns.push_back(c);
+                        }
+                        for (const auto& c : crossing_terms[j].columns) {
+                            interaction.columns.push_back(c);
+                        }
+                        formula.terms.push_back(std::move(interaction));
+                    }
+                }
+            } else {
+                formula.terms.push_back(std::move(*term));
+            }
+        }
+        return true;
+    }
+
+    /// Parse `model { response ~ terms, method = ols, ... }`.
+    auto parse_model_clause() -> std::optional<Clause> {
+        if (!consume(TokenKind::LBrace, "expected '{' after 'model'")) {
+            return std::nullopt;
+        }
+
+        // Parse the formula: response ~ rhs
+        Formula formula;
+        auto response = consume_column_identifier("expected response column name");
+        if (!response.has_value()) {
+            return std::nullopt;
+        }
+        formula.response = std::move(*response);
+        if (!consume(TokenKind::Tilde, "expected '~' after response variable")) {
+            return std::nullopt;
+        }
+        if (!parse_formula_rhs(formula)) {
+            return std::nullopt;
+        }
+
+        // Parse named parameters: , method = ols, lambda = 0.1, ...
+        std::vector<ModelParam> params;
+        while (match(TokenKind::Comma)) {
+            // Allow trailing comma before '}'
+            if (check(TokenKind::RBrace)) {
+                break;
+            }
+            auto param_name = consume_identifier("expected parameter name");
+            if (!param_name.has_value()) {
+                return std::nullopt;
+            }
+            if (!consume(TokenKind::Eq, "expected '=' after parameter name")) {
+                return std::nullopt;
+            }
+            auto value = parse_expression();
+            if (!value) {
+                return std::nullopt;
+            }
+            params.push_back(ModelParam{.name = std::move(*param_name), .value = std::move(value)});
+        }
+
+        if (!consume(TokenKind::RBrace, "expected '}' to close model clause")) {
+            return std::nullopt;
+        }
+
+        return ModelClause{.formula = std::move(formula), .params = std::move(params)};
     }
 
     auto parse_order_keys() -> std::optional<std::pair<std::vector<OrderKey>, bool>> {

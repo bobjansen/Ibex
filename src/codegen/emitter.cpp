@@ -634,6 +634,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Model: {
+            // Model fitting is not yet supported in codegen — it requires the full
+            // runtime interpreter.  Emit a placeholder that errors at compile time.
+            throw std::runtime_error("model clause is not yet supported in compiled mode");
+        }
+
         case ir::NodeKind::Construct: {
             const auto& cn = static_cast<const ir::ConstructNode&>(node);
             auto var = fresh_var();

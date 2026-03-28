@@ -188,9 +188,20 @@ struct DcastClause {
     std::string pivot_column;
 };
 
+/// Covariance matrix: all numeric columns → N×N Float64 table + leading "column" label column.
+struct CovClause {};
+
+/// Pearson correlation matrix: same shape as CovClause, values in [-1, 1].
+struct CorrClause {};
+
+/// Transpose: rotate rows↔columns. All data columns must share the same type.
+/// One optional String/Categorical label column names the output columns.
+struct TransposeClause {};
+
 using Clause =
     std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
-                 OrderClause, ByClause, WindowClause, ResampleClause, MeltClause, DcastClause>;
+                 OrderClause, ByClause, WindowClause, ResampleClause, MeltClause, DcastClause,
+                 CovClause, CorrClause, TransposeClause>;
 
 struct BlockExpr {
     ExprPtr base;

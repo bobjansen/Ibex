@@ -6953,6 +6953,288 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     return output;
 }
 
+// ─── Matrix Operations ────────────────────────────────────────────────────────
+
+/// Return the numeric columns of `input` as parallel vectors of double.
+/// Int32/Int64/Float32/Float64 columns are included (widened to double).
+/// All other types are silently skipped.
+static auto extract_numeric(const Table& input)
+    -> std::pair<std::vector<std::string>, std::vector<std::vector<double>>> {
+    std::vector<std::string> names;
+    std::vector<std::vector<double>> data;
+    const std::size_t rows = input.rows();
+    for (const auto& entry : input.columns) {
+        std::vector<double> col;
+        col.reserve(rows);
+        bool ok = std::visit(
+            [&](const auto& c) -> bool {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, Column<double>>) {
+                    for (std::size_t i = 0; i < rows; ++i) col.push_back(c[i]);
+                    return true;
+                } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
+                    for (std::size_t i = 0; i < rows; ++i)
+                        col.push_back(static_cast<double>(c[i]));
+                    return true;
+                } else {
+                    return false;
+                }
+            },
+            *entry.column);
+        if (ok) {
+            names.push_back(entry.name);
+            data.push_back(std::move(col));
+        }
+    }
+    return {std::move(names), std::move(data)};
+}
+
+auto cov_table(const Table& input) -> std::expected<Table, std::string> {
+    auto [names, data] = extract_numeric(input);
+    const std::size_t n = names.size();
+    const std::size_t rows = data.empty() ? 0 : data[0].size();
+
+    if (n == 0) {
+        return std::unexpected("cov: no numeric columns found");
+    }
+    if (rows < 2) {
+        return std::unexpected("cov: need at least 2 rows to compute covariance");
+    }
+
+    // Compute column means.
+    std::vector<double> mean(n, 0.0);
+    for (std::size_t j = 0; j < n; ++j) {
+        for (std::size_t i = 0; i < rows; ++i) mean[j] += data[j][i];
+        mean[j] /= static_cast<double>(rows);
+    }
+
+    // Compute upper-triangle covariances; mirror for symmetry.
+    const double denom = static_cast<double>(rows - 1);
+    std::vector<std::vector<double>> cov(n, std::vector<double>(n, 0.0));
+    for (std::size_t a = 0; a < n; ++a) {
+        for (std::size_t b = a; b < n; ++b) {
+            double s = 0.0;
+            for (std::size_t i = 0; i < rows; ++i) {
+                s += (data[a][i] - mean[a]) * (data[b][i] - mean[b]);
+            }
+            cov[a][b] = cov[b][a] = s / denom;
+        }
+    }
+
+    // Build result Table.
+    Table out;
+    // Leading "column" label column.
+    Column<std::string> label_col;
+    for (const auto& nm : names) label_col.push_back(nm);
+    out.add_column("column", std::move(label_col));
+    // N Float64 columns.
+    for (std::size_t b = 0; b < n; ++b) {
+        Column<double> col_data(std::vector<double>(cov[b].begin(), cov[b].end()));
+        out.add_column(names[b], std::move(col_data));
+    }
+    return out;
+}
+
+auto corr_table(const Table& input) -> std::expected<Table, std::string> {
+    auto [names, data] = extract_numeric(input);
+    const std::size_t n = names.size();
+    const std::size_t rows = data.empty() ? 0 : data[0].size();
+
+    if (n == 0) {
+        return std::unexpected("corr: no numeric columns found");
+    }
+    if (rows < 2) {
+        return std::unexpected("corr: need at least 2 rows to compute correlation");
+    }
+
+    std::vector<double> mean(n, 0.0);
+    for (std::size_t j = 0; j < n; ++j) {
+        for (std::size_t i = 0; i < rows; ++i) mean[j] += data[j][i];
+        mean[j] /= static_cast<double>(rows);
+    }
+
+    const double denom = static_cast<double>(rows - 1);
+    std::vector<std::vector<double>> cov(n, std::vector<double>(n, 0.0));
+    for (std::size_t a = 0; a < n; ++a) {
+        for (std::size_t b = a; b < n; ++b) {
+            double s = 0.0;
+            for (std::size_t i = 0; i < rows; ++i) {
+                s += (data[a][i] - mean[a]) * (data[b][i] - mean[b]);
+            }
+            cov[a][b] = cov[b][a] = s / denom;
+        }
+    }
+
+    // Normalise to correlation.
+    std::vector<std::vector<double>> corr_mat(n, std::vector<double>(n, 0.0));
+    for (std::size_t a = 0; a < n; ++a) {
+        for (std::size_t b = 0; b < n; ++b) {
+            const double sigma_a = std::sqrt(cov[a][a]);
+            const double sigma_b = std::sqrt(cov[b][b]);
+            if (sigma_a == 0.0 || sigma_b == 0.0) {
+                corr_mat[a][b] = (a == b) ? 1.0 : 0.0;
+            } else {
+                corr_mat[a][b] = cov[a][b] / (sigma_a * sigma_b);
+            }
+        }
+    }
+
+    Table out;
+    Column<std::string> label_col;
+    for (const auto& nm : names) label_col.push_back(nm);
+    out.add_column("column", std::move(label_col));
+    for (std::size_t b = 0; b < n; ++b) {
+        Column<double> col_data(std::vector<double>(corr_mat[b].begin(), corr_mat[b].end()));
+        out.add_column(names[b], std::move(col_data));
+    }
+    return out;
+}
+
+auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
+    if (input.columns.empty()) {
+        return std::unexpected("transpose: input table has no columns");
+    }
+
+    // Identify the label column: the first String or Categorical column.
+    // All other columns must share the same type (homogeneous constraint).
+    int label_idx = -1;
+    for (int i = 0; i < static_cast<int>(input.columns.size()); ++i) {
+        const auto& cv = *input.columns[static_cast<std::size_t>(i)].column;
+        if (std::holds_alternative<Column<std::string>>(cv) ||
+            std::holds_alternative<Column<Categorical>>(cv)) {
+            if (label_idx == -1) {
+                label_idx = i;
+                break;
+            }
+        }
+    }
+
+    // Collect data column indices (exclude label column).
+    std::vector<std::size_t> data_idxs;
+    for (std::size_t i = 0; i < input.columns.size(); ++i) {
+        if (static_cast<int>(i) != label_idx) data_idxs.push_back(i);
+    }
+
+    if (data_idxs.empty()) {
+        return std::unexpected("transpose: no data columns to transpose");
+    }
+
+    // Validate all data columns share the same type.
+    std::size_t first_type = input.columns[data_idxs[0]].column->index();
+    for (std::size_t idx : data_idxs) {
+        if (input.columns[idx].column->index() != first_type) {
+            return std::unexpected(
+                "transpose: all data columns must have the same type (found mixed types)");
+        }
+    }
+
+    const std::size_t n_data_cols = data_idxs.size();   // becomes number of output rows
+    const std::size_t n_rows = input.rows();             // becomes number of output columns
+
+    // Determine output column names: from label column values, or "r0", "r1", ...
+    std::vector<std::string> out_col_names;
+    out_col_names.reserve(n_rows);
+    if (label_idx >= 0) {
+        const auto& label_entry = input.columns[static_cast<std::size_t>(label_idx)];
+        if (const auto* sc = std::get_if<Column<std::string>>(&*label_entry.column)) {
+            for (std::size_t i = 0; i < n_rows; ++i)
+                out_col_names.push_back(std::string((*sc)[i]));
+        } else if (const auto* cc = std::get_if<Column<Categorical>>(&*label_entry.column)) {
+            for (std::size_t i = 0; i < n_rows; ++i)
+                out_col_names.push_back(std::string((*cc)[i]));
+        }
+    } else {
+        for (std::size_t i = 0; i < n_rows; ++i) out_col_names.push_back("r" + std::to_string(i));
+    }
+
+    // Check for duplicate output column names (would make the output table inconsistent).
+    {
+        std::unordered_set<std::string> seen;
+        for (const auto& name : out_col_names) {
+            if (!seen.insert(name).second) {
+                return std::unexpected("transpose: duplicate label value '" + name +
+                                       "' — output column names must be unique");
+            }
+        }
+    }
+
+    // Build output table: n_rows columns, each with n_data_cols rows.
+    // Leading "column" label column contains the original data column names.
+    Table out;
+    Column<std::string> row_labels;
+    for (std::size_t i : data_idxs) row_labels.push_back(input.columns[i].name);
+    out.add_column("column", std::move(row_labels));
+
+    // For each original row (= output column), extract the value from each data column.
+    // We dispatch by the concrete column type so we can build typed output columns.
+    std::visit(
+        [&](const auto& first_col_ref) {
+            using ColT = std::decay_t<decltype(first_col_ref)>;
+            for (std::size_t r = 0; r < n_rows; ++r) {
+                if constexpr (std::is_same_v<ColT, Column<std::string>> ||
+                              std::is_same_v<ColT, Column<Categorical>>) {
+                    // String-like: emit a Column<std::string> (decode Categoricals).
+                    Column<std::string> out_col;
+                    out_col.reserve(n_data_cols);
+                    for (std::size_t ci : data_idxs) {
+                        const auto& src = std::get<ColT>(*input.columns[ci].column);
+                        out_col.push_back(src[r]);  // src[r] returns string_view for both
+                    }
+                    out.add_column(out_col_names[r], std::move(out_col));
+                } else {
+                    using ElemT = typename ColT::value_type;
+                    Column<ElemT> out_col;
+                    out_col.reserve(n_data_cols);
+                    for (std::size_t ci : data_idxs) {
+                        const auto& src = std::get<ColT>(*input.columns[ci].column);
+                        out_col.push_back(src[r]);
+                    }
+                    out.add_column(out_col_names[r], std::move(out_col));
+                }
+            }
+        },
+        *input.columns[data_idxs[0]].column);
+
+    return out;
+}
+
+auto matmul_table(const Table& left, const Table& right) -> std::expected<Table, std::string> {
+    auto [left_names, left_data] = extract_numeric(left);
+    auto [right_names, right_data] = extract_numeric(right);
+
+    const std::size_t m = left_data.empty() ? 0 : left_data[0].size();  // rows of left
+    const std::size_t k = left_names.size();                              // cols of left = rows of right
+    const std::size_t n = right_names.size();                             // cols of right
+
+    if (k == 0 || n == 0) {
+        return std::unexpected("matmul: no numeric columns found in one or both operands");
+    }
+    if (right_data.empty() || right_data[0].size() != k) {
+        return std::unexpected(
+            "matmul: inner dimensions do not match — left has " + std::to_string(k) +
+            " numeric columns but right has " + std::to_string(right_data[0].size()) + " rows");
+    }
+
+    // Standard triple-loop matrix multiply: C[i,j] = sum_p A[i,p] * B[p,j]
+    // left_data[col][row], right_data[col][row]
+    std::vector<std::vector<double>> result(n, std::vector<double>(m, 0.0));
+    for (std::size_t j = 0; j < n; ++j) {
+        for (std::size_t p = 0; p < k; ++p) {
+            const double bpj = right_data[j][p];
+            for (std::size_t i = 0; i < m; ++i) {
+                result[j][i] += left_data[p][i] * bpj;
+            }
+        }
+    }
+
+    Table out;
+    for (std::size_t j = 0; j < n; ++j) {
+        Column<double> col_data(result[j]);
+        out.add_column(right_names[j], std::move(col_data));
+    }
+    return out;
+}
+
 // ─── Melt (wide → long) ──────────────────────────────────────────────────────
 
 auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
@@ -7574,7 +7856,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         if (!str_intern[k].empty())
             return str_intern[k][r];  // interned string code
         return std::visit(
-            [r](const auto& c) -> std::int64_t {
+            [r, kNullKey](const auto& c) -> std::int64_t {
                 using T = std::decay_t<decltype(c)>;
                 if constexpr (std::is_same_v<T, Column<Categorical>>)
                     return static_cast<std::int64_t>(c.code_at(r));
@@ -8034,6 +8316,50 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             return dcast_table(child.value(), dn.pivot_column(), dn.value_column(), dn.row_keys());
+        }
+        case ir::NodeKind::Cov: {
+            if (node.children().empty()) {
+                return std::unexpected("cov node missing child");
+            }
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return cov_table(child.value());
+        }
+        case ir::NodeKind::Corr: {
+            if (node.children().empty()) {
+                return std::unexpected("corr node missing child");
+            }
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return corr_table(child.value());
+        }
+        case ir::NodeKind::Transpose: {
+            if (node.children().empty()) {
+                return std::unexpected("transpose node missing child");
+            }
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return transpose_table(child.value());
+        }
+        case ir::NodeKind::Matmul: {
+            if (node.children().size() != 2) {
+                return std::unexpected("matmul node expects exactly two children");
+            }
+            auto left = interpret_node(*node.children()[0], registry, scalars, externs);
+            if (!left) {
+                return std::unexpected(left.error());
+            }
+            auto right = interpret_node(*node.children()[1], registry, scalars, externs);
+            if (!right) {
+                return std::unexpected(right.error());
+            }
+            return matmul_table(left.value(), right.value());
         }
         case ir::NodeKind::Stream: {
             const auto& sn = static_cast<const ir::StreamNode&>(node);

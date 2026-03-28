@@ -601,6 +601,39 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Cov: {
+            auto child = emit_node(require_single_child(node, "CovNode"));
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::cov(" << child << ");\n";
+            return var;
+        }
+
+        case ir::NodeKind::Corr: {
+            auto child = emit_node(require_single_child(node, "CorrNode"));
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::corr(" << child << ");\n";
+            return var;
+        }
+
+        case ir::NodeKind::Transpose: {
+            auto child = emit_node(require_single_child(node, "TransposeNode"));
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::transpose(" << child << ");\n";
+            return var;
+        }
+
+        case ir::NodeKind::Matmul: {
+            if (node.children().size() != 2) {
+                throw std::runtime_error("MatmulNode expects exactly two children");
+            }
+            auto left = emit_node(*node.children()[0]);
+            auto right = emit_node(*node.children()[1]);
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::matmul(" << left << ", " << right
+                  << ");\n";
+            return var;
+        }
+
         case ir::NodeKind::Construct: {
             const auto& cn = static_cast<const ir::ConstructNode&>(node);
             auto var = fresh_var();

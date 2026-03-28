@@ -1201,6 +1201,15 @@ class Parser {
             }
             return DcastClause{.pivot_column = std::move(*name)};
         }
+        if (match(TokenKind::KeywordCov)) {
+            return CovClause{};
+        }
+        if (match(TokenKind::KeywordCorr)) {
+            return CorrClause{};
+        }
+        if (match(TokenKind::KeywordTranspose)) {
+            return TransposeClause{};
+        }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
     }

@@ -3903,3 +3903,242 @@ TEST_CASE("update: double column * double column = double", "[update][types]") {
     REQUIRE(col[1] == Catch::Approx(6.0));
     REQUIRE(col[2] == Catch::Approx(12.0));
 }
+
+// ─── Matrix Operations ────────────────────────────────────────────────────────
+
+TEST_CASE("cov: diagonal equals variance", "[cov][matrix]") {
+    // x = [1, 2, 3, 4, 5], y = [2, 4, 6, 8, 10]  (y = 2x)
+    // var(x) = 2.5, var(y) = 10.0, cov(x,y) = 5.0
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{2.0, 4.0, 6.0, 8.0, 10.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[cov];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    REQUIRE(result->rows() == 2);
+    REQUIRE(result->find("column") != nullptr);
+    REQUIRE(result->find("x") != nullptr);
+    REQUIRE(result->find("y") != nullptr);
+
+    const auto& x_col = std::get<Column<double>>(*result->find("x"));
+    const auto& y_col = std::get<Column<double>>(*result->find("y"));
+
+    // Row 0 = covariances with x; row 1 = covariances with y
+    REQUIRE(x_col[0] == Catch::Approx(2.5));   // var(x)
+    REQUIRE(y_col[0] == Catch::Approx(5.0));   // cov(x, y)
+    REQUIRE(x_col[1] == Catch::Approx(5.0));   // cov(y, x)
+    REQUIRE(y_col[1] == Catch::Approx(10.0));  // var(y)
+}
+
+TEST_CASE("cov: drops non-numeric columns silently", "[cov][matrix]") {
+    runtime::Table t;
+    t.add_column("label", Column<std::string>{"a", "b", "c"});
+    t.add_column("v", Column<double>{1.0, 2.0, 3.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[cov];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    // Only the "v" column remains; label column is dropped.
+    REQUIRE(result->find("v") != nullptr);
+    REQUIRE(result->find("label") == nullptr);
+    REQUIRE(result->rows() == 1);
+}
+
+TEST_CASE("cov: integer columns are widened to double", "[cov][matrix]") {
+    runtime::Table t;
+    t.add_column("a", Column<std::int64_t>{1, 2, 3, 4, 5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[cov];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    REQUIRE(result->find("a") != nullptr);
+    const auto& a_col = std::get<Column<double>>(*result->find("a"));
+    REQUIRE(a_col[0] == Catch::Approx(2.5));  // var([1,2,3,4,5])
+}
+
+TEST_CASE("corr: diagonal equals 1.0", "[corr][matrix]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{2.0, 4.0, 6.0, 8.0, 10.0});  // perfect correlation
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[corr];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    REQUIRE(result->rows() == 2);
+    const auto& x_col = std::get<Column<double>>(*result->find("x"));
+    const auto& y_col = std::get<Column<double>>(*result->find("y"));
+
+    REQUIRE(x_col[0] == Catch::Approx(1.0));  // corr(x, x) = 1
+    REQUIRE(y_col[1] == Catch::Approx(1.0));  // corr(y, y) = 1
+    REQUIRE(x_col[1] == Catch::Approx(1.0));  // perfect positive correlation
+    REQUIRE(y_col[0] == Catch::Approx(1.0));
+}
+
+TEST_CASE("corr: off-diagonal in [-1, 1]", "[corr][matrix]") {
+    runtime::Table t;
+    t.add_column("a", Column<double>{1.0, 2.0, 3.0, 4.0});
+    t.add_column("b", Column<double>{4.0, 3.0, 2.0, 1.0});  // perfect negative correlation
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[corr];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& a_col = std::get<Column<double>>(*result->find("a"));
+    const auto& b_col = std::get<Column<double>>(*result->find("b"));
+    REQUIRE(a_col[0] == Catch::Approx(1.0));   // corr(a, a)
+    REQUIRE(b_col[1] == Catch::Approx(1.0));   // corr(b, b)
+    REQUIRE(b_col[0] == Catch::Approx(-1.0));  // perfect negative: corr(a, b)
+    REQUIRE(a_col[1] == Catch::Approx(-1.0));  // symmetric
+}
+
+TEST_CASE("transpose: basic numeric float64", "[transpose][matrix]") {
+    // Input: 3 rows × 2 cols (a, b)
+    // After transpose: 2 rows × 3 cols (r0, r1, r2) + leading "column" label
+    runtime::Table t;
+    t.add_column("a", Column<double>{1.0, 2.0, 3.0});
+    t.add_column("b", Column<double>{4.0, 5.0, 6.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[transpose];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    REQUIRE(result->rows() == 2);   // 2 original columns → 2 rows
+    // Without a label column: output columns are "column", "r0", "r1", "r2"
+    REQUIRE(result->find("column") != nullptr);
+    REQUIRE(result->find("r0") != nullptr);
+    REQUIRE(result->find("r1") != nullptr);
+    REQUIRE(result->find("r2") != nullptr);
+
+    const auto& label = std::get<Column<std::string>>(*result->find("column"));
+    REQUIRE(label[0] == "a");
+    REQUIRE(label[1] == "b");
+
+    const auto& r0 = std::get<Column<double>>(*result->find("r0"));
+    REQUIRE(r0[0] == Catch::Approx(1.0));  // a[0]
+    REQUIRE(r0[1] == Catch::Approx(4.0));  // b[0]
+
+    const auto& r1 = std::get<Column<double>>(*result->find("r1"));
+    REQUIRE(r1[0] == Catch::Approx(2.0));  // a[1]
+    REQUIRE(r1[1] == Catch::Approx(5.0));  // b[1]
+}
+
+TEST_CASE("transpose: uses string label column for output column names", "[transpose][matrix]") {
+    runtime::Table t;
+    t.add_column("symbol", Column<std::string>{"AAPL", "MSFT"});
+    t.add_column("open",   Column<double>{100.0, 200.0});
+    t.add_column("close",  Column<double>{110.0, 210.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[transpose];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    REQUIRE(result->rows() == 2);  // 2 data columns (open, close)
+    REQUIRE(result->find("AAPL") != nullptr);
+    REQUIRE(result->find("MSFT") != nullptr);
+
+    const auto& aapl = std::get<Column<double>>(*result->find("AAPL"));
+    REQUIRE(aapl[0] == Catch::Approx(100.0));  // open[AAPL]
+    REQUIRE(aapl[1] == Catch::Approx(110.0));  // close[AAPL]
+}
+
+TEST_CASE("transpose: mixed-type columns returns error", "[transpose][matrix]") {
+    runtime::Table t;
+    t.add_column("a", Column<double>{1.0, 2.0});
+    t.add_column("b", Column<std::int64_t>{3, 4});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[transpose];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("mixed types") != std::string::npos);
+}
+
+TEST_CASE("matmul: basic (2x2) * (2x2)", "[matmul][matrix]") {
+    // A = [[1, 2], [3, 4]]  →  columns: c0=[1,3], c1=[2,4]
+    // B = [[5, 6], [7, 8]]  →  columns: c0=[5,7], c1=[6,8]
+    // C = A*B = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
+    runtime::Table a, b;
+    a.add_column("c0", Column<double>{1.0, 3.0});
+    a.add_column("c1", Column<double>{2.0, 4.0});
+    b.add_column("c0", Column<double>{5.0, 7.0});
+    b.add_column("c1", Column<double>{6.0, 8.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("matmul(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    REQUIRE(result->rows() == 2);
+    REQUIRE(result->find("c0") != nullptr);
+    REQUIRE(result->find("c1") != nullptr);
+
+    const auto& out_c0 = std::get<Column<double>>(*result->find("c0"));
+    const auto& out_c1 = std::get<Column<double>>(*result->find("c1"));
+
+    REQUIRE(out_c0[0] == Catch::Approx(19.0));
+    REQUIRE(out_c0[1] == Catch::Approx(43.0));
+    REQUIRE(out_c1[0] == Catch::Approx(22.0));
+    REQUIRE(out_c1[1] == Catch::Approx(50.0));
+}
+
+TEST_CASE("matmul: identity matrix leaves operand unchanged", "[matmul][matrix]") {
+    // A = [[1], [2], [3]]  (3-row, 1-col vector)
+    // I = [[1]]             (1x1 identity)
+    // Result = [[1], [2], [3]]
+    runtime::Table a, identity;
+    a.add_column("v", Column<double>{1.0, 2.0, 3.0});
+    identity.add_column("v", Column<double>{1.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("identity", identity);
+
+    auto ir = require_ir("matmul(a, identity);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    REQUIRE(result->rows() == 3);
+    const auto& v = std::get<Column<double>>(*result->find("v"));
+    REQUIRE(v[0] == Catch::Approx(1.0));
+    REQUIRE(v[1] == Catch::Approx(2.0));
+    REQUIRE(v[2] == Catch::Approx(3.0));
+}
+
+TEST_CASE("matmul: inner dimension mismatch returns error", "[matmul][matrix]") {
+    runtime::Table a, b;
+    a.add_column("c0", Column<double>{1.0, 2.0});
+    a.add_column("c1", Column<double>{3.0, 4.0});  // A is 2 rows × 2 cols
+    b.add_column("only", Column<double>{5.0, 6.0, 7.0});  // B has 3 rows ≠ 2 cols of A
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("matmul(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("inner dimensions") != std::string::npos);
+}

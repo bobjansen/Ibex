@@ -6970,7 +6970,8 @@ static auto extract_numeric(const Table& input)
             [&](const auto& c) -> bool {
                 using T = std::decay_t<decltype(c)>;
                 if constexpr (std::is_same_v<T, Column<double>>) {
-                    for (std::size_t i = 0; i < rows; ++i) col.push_back(c[i]);
+                    for (std::size_t i = 0; i < rows; ++i)
+                        col.push_back(c[i]);
                     return true;
                 } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
                     for (std::size_t i = 0; i < rows; ++i)
@@ -7004,7 +7005,8 @@ auto cov_table(const Table& input) -> std::expected<Table, std::string> {
     // Compute column means.
     std::vector<double> mean(n, 0.0);
     for (std::size_t j = 0; j < n; ++j) {
-        for (std::size_t i = 0; i < rows; ++i) mean[j] += data[j][i];
+        for (std::size_t i = 0; i < rows; ++i)
+            mean[j] += data[j][i];
         mean[j] /= static_cast<double>(rows);
     }
 
@@ -7025,7 +7027,8 @@ auto cov_table(const Table& input) -> std::expected<Table, std::string> {
     Table out;
     // Leading "column" label column.
     Column<std::string> label_col;
-    for (const auto& nm : names) label_col.push_back(nm);
+    for (const auto& nm : names)
+        label_col.push_back(nm);
     out.add_column("column", std::move(label_col));
     // N Float64 columns.
     for (std::size_t b = 0; b < n; ++b) {
@@ -7049,7 +7052,8 @@ auto corr_table(const Table& input) -> std::expected<Table, std::string> {
 
     std::vector<double> mean(n, 0.0);
     for (std::size_t j = 0; j < n; ++j) {
-        for (std::size_t i = 0; i < rows; ++i) mean[j] += data[j][i];
+        for (std::size_t i = 0; i < rows; ++i)
+            mean[j] += data[j][i];
         mean[j] /= static_cast<double>(rows);
     }
 
@@ -7081,7 +7085,8 @@ auto corr_table(const Table& input) -> std::expected<Table, std::string> {
 
     Table out;
     Column<std::string> label_col;
-    for (const auto& nm : names) label_col.push_back(nm);
+    for (const auto& nm : names)
+        label_col.push_back(nm);
     out.add_column("column", std::move(label_col));
     for (std::size_t b = 0; b < n; ++b) {
         Column<double> col_data(std::vector<double>(corr_mat[b].begin(), corr_mat[b].end()));
@@ -7112,7 +7117,8 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
     // Collect data column indices (exclude label column).
     std::vector<std::size_t> data_idxs;
     for (std::size_t i = 0; i < input.columns.size(); ++i) {
-        if (static_cast<int>(i) != label_idx) data_idxs.push_back(i);
+        if (static_cast<int>(i) != label_idx)
+            data_idxs.push_back(i);
     }
 
     if (data_idxs.empty()) {
@@ -7128,8 +7134,8 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
         }
     }
 
-    const std::size_t n_data_cols = data_idxs.size();   // becomes number of output rows
-    const std::size_t n_rows = input.rows();             // becomes number of output columns
+    const std::size_t n_data_cols = data_idxs.size();  // becomes number of output rows
+    const std::size_t n_rows = input.rows();           // becomes number of output columns
 
     // Determine output column names: from label column values, or "r0", "r1", ...
     std::vector<std::string> out_col_names;
@@ -7144,7 +7150,8 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
                 out_col_names.push_back(std::string((*cc)[i]));
         }
     } else {
-        for (std::size_t i = 0; i < n_rows; ++i) out_col_names.push_back("r" + std::to_string(i));
+        for (std::size_t i = 0; i < n_rows; ++i)
+            out_col_names.push_back("r" + std::to_string(i));
     }
 
     // Check for duplicate output column names (would make the output table inconsistent).
@@ -7162,7 +7169,8 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
     // Leading "column" label column contains the original data column names.
     Table out;
     Column<std::string> row_labels;
-    for (std::size_t i : data_idxs) row_labels.push_back(input.columns[i].name);
+    for (std::size_t i : data_idxs)
+        row_labels.push_back(input.columns[i].name);
     out.add_column("column", std::move(row_labels));
 
     // For each original row (= output column), extract the value from each data column.
@@ -7203,16 +7211,16 @@ auto matmul_table(const Table& left, const Table& right) -> std::expected<Table,
     auto [right_names, right_data] = extract_numeric(right);
 
     const std::size_t m = left_data.empty() ? 0 : left_data[0].size();  // rows of left
-    const std::size_t k = left_names.size();                              // cols of left = rows of right
-    const std::size_t n = right_names.size();                             // cols of right
+    const std::size_t k = left_names.size();   // cols of left = rows of right
+    const std::size_t n = right_names.size();  // cols of right
 
     if (k == 0 || n == 0) {
         return std::unexpected("matmul: no numeric columns found in one or both operands");
     }
     if (right_data.empty() || right_data[0].size() != k) {
-        return std::unexpected(
-            "matmul: inner dimensions do not match — left has " + std::to_string(k) +
-            " numeric columns but right has " + std::to_string(right_data[0].size()) + " rows");
+        return std::unexpected("matmul: inner dimensions do not match — left has " +
+                               std::to_string(k) + " numeric columns but right has " +
+                               std::to_string(right_data[0].size()) + " rows");
     }
 
     // Standard triple-loop matrix multiply: C[i,j] = sum_p A[i,p] * B[p,j]
@@ -7295,7 +7303,8 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
             // Dot expands to all non-response columns (handled above).
             // Process each as a main-effect term.
             for (const auto& entry : input.columns) {
-                if (entry.name == formula.response) continue;
+                if (entry.name == formula.response)
+                    continue;
                 // Check if already included from explicit terms.
                 bool from_explicit = false;
                 for (const auto& t2 : formula.terms) {
@@ -7304,14 +7313,16 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
                         break;
                     }
                 }
-                if (from_explicit) continue;
+                if (from_explicit)
+                    continue;
 
                 auto ok = std::visit(
                     [&](const auto& c) -> bool {
                         using T = std::decay_t<decltype(c)>;
                         if constexpr (std::is_same_v<T, Column<double>>) {
                             std::vector<double> v(n);
-                            for (std::size_t i = 0; i < n; ++i) v[i] = c[i];
+                            for (std::size_t i = 0; i < n; ++i)
+                                v[i] = c[i];
                             col_names.push_back(entry.name);
                             columns.push_back(std::move(v));
                             return true;
@@ -7333,13 +7344,15 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
                                         break;
                                     }
                                 }
-                                if (!found) levels.push_back(std::string(c[i]));
+                                if (!found)
+                                    levels.push_back(std::string(c[i]));
                             }
                             std::size_t start = formula.has_intercept ? 1 : 0;
                             for (std::size_t li = start; li < levels.size(); ++li) {
                                 std::vector<double> dummy(n, 0.0);
                                 for (std::size_t i = 0; i < n; ++i) {
-                                    if (c[i] == levels[li]) dummy[i] = 1.0;
+                                    if (c[i] == levels[li])
+                                        dummy[i] = 1.0;
                                 }
                                 col_names.push_back(entry.name + "_" + levels[li]);
                                 columns.push_back(std::move(dummy));
@@ -7370,13 +7383,15 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
                     using T = std::decay_t<decltype(c)>;
                     if constexpr (std::is_same_v<T, Column<double>>) {
                         std::vector<double> v(n);
-                        for (std::size_t i = 0; i < n; ++i) v[i] = c[i];
+                        for (std::size_t i = 0; i < n; ++i)
+                            v[i] = c[i];
                         col_names.push_back(name);
                         columns.push_back(std::move(v));
                         return true;
                     } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
                         std::vector<double> v(n);
-                        for (std::size_t i = 0; i < n; ++i) v[i] = static_cast<double>(c[i]);
+                        for (std::size_t i = 0; i < n; ++i)
+                            v[i] = static_cast<double>(c[i]);
                         col_names.push_back(name);
                         columns.push_back(std::move(v));
                         return true;
@@ -7391,13 +7406,15 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
                                     break;
                                 }
                             }
-                            if (!found) levels.push_back(std::string(c[i]));
+                            if (!found)
+                                levels.push_back(std::string(c[i]));
                         }
                         std::size_t start = formula.has_intercept ? 1 : 0;
                         for (std::size_t li = start; li < levels.size(); ++li) {
                             std::vector<double> dummy(n, 0.0);
                             for (std::size_t i = 0; i < n; ++i) {
-                                if (std::string_view(c[i]) == levels[li]) dummy[i] = 1.0;
+                                if (std::string_view(c[i]) == levels[li])
+                                    dummy[i] = 1.0;
                             }
                             col_names.push_back(name + "_" + levels[li]);
                             columns.push_back(std::move(dummy));
@@ -7419,7 +7436,8 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
             std::string interaction_name;
             for (std::size_t fi = 0; fi < term.columns.size(); ++fi) {
                 const auto& name = term.columns[fi];
-                if (fi > 0) interaction_name += ":";
+                if (fi > 0)
+                    interaction_name += ":";
                 interaction_name += name;
                 const auto* entry = input.find_entry(name);
                 if (entry == nullptr) {
@@ -7430,7 +7448,8 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
                     [&](const auto& c) -> bool {
                         using T = std::decay_t<decltype(c)>;
                         if constexpr (std::is_same_v<T, Column<double>>) {
-                            for (std::size_t i = 0; i < n; ++i) v[i] = c[i];
+                            for (std::size_t i = 0; i < n; ++i)
+                                v[i] = c[i];
                             return true;
                         } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
                             for (std::size_t i = 0; i < n; ++i)
@@ -7478,10 +7497,12 @@ static auto extract_response(const Table& input, const std::string& name)
         [&](const auto& c) -> bool {
             using T = std::decay_t<decltype(c)>;
             if constexpr (std::is_same_v<T, Column<double>>) {
-                for (std::size_t i = 0; i < n; ++i) y[i] = c[i];
+                for (std::size_t i = 0; i < n; ++i)
+                    y[i] = c[i];
                 return true;
             } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
-                for (std::size_t i = 0; i < n; ++i) y[i] = static_cast<double>(c[i]);
+                for (std::size_t i = 0; i < n; ++i)
+                    y[i] = static_cast<double>(c[i]);
                 return true;
             } else {
                 return false;
@@ -7504,15 +7525,18 @@ static auto solve_spd(const std::vector<std::vector<double>>& A, const std::vect
     std::vector<std::vector<double>> L(p, std::vector<double>(p, 0.0));
     for (std::size_t j = 0; j < p; ++j) {
         double sum = 0.0;
-        for (std::size_t k = 0; k < j; ++k) sum += L[j][k] * L[j][k];
+        for (std::size_t k = 0; k < j; ++k)
+            sum += L[j][k] * L[j][k];
         double diag = A[j][j] - sum;
         if (diag <= 0.0) {
-            return std::unexpected("model: design matrix is rank-deficient (not positive definite)");
+            return std::unexpected(
+                "model: design matrix is rank-deficient (not positive definite)");
         }
         L[j][j] = std::sqrt(diag);
         for (std::size_t i = j + 1; i < p; ++i) {
             double s = 0.0;
-            for (std::size_t k = 0; k < j; ++k) s += L[i][k] * L[j][k];
+            for (std::size_t k = 0; k < j; ++k)
+                s += L[i][k] * L[j][k];
             L[i][j] = (A[j][i] - s) / L[j][j];  // A[j][i] = A[col=j][row=i]
         }
     }
@@ -7521,7 +7545,8 @@ static auto solve_spd(const std::vector<std::vector<double>>& A, const std::vect
     std::vector<double> z(p);
     for (std::size_t i = 0; i < p; ++i) {
         double s = 0.0;
-        for (std::size_t k = 0; k < i; ++k) s += L[i][k] * z[k];
+        for (std::size_t k = 0; k < i; ++k)
+            s += L[i][k] * z[k];
         z[i] = (b[i] - s) / L[i][i];
     }
 
@@ -7529,36 +7554,38 @@ static auto solve_spd(const std::vector<std::vector<double>>& A, const std::vect
     std::vector<double> x(p);
     for (std::size_t i = p; i-- > 0;) {
         double s = 0.0;
-        for (std::size_t k = i + 1; k < p; ++k) s += L[k][i] * x[k];
+        for (std::size_t k = i + 1; k < p; ++k)
+            s += L[k][i] * x[k];
         x[i] = (z[i] - s) / L[i][i];
     }
     return x;
 }
 
 /// Compute X^T * X (p×p) and X^T * y (p×1) from column-major X.
-static auto compute_XtX_Xty(const std::vector<std::vector<double>>& X,
-                             const std::vector<double>& y, std::size_t n, std::size_t p)
+static auto compute_XtX_Xty(const std::vector<std::vector<double>>& X, const std::vector<double>& y,
+                            std::size_t n, std::size_t p)
     -> std::pair<std::vector<std::vector<double>>, std::vector<double>> {
     std::vector<std::vector<double>> XtX(p, std::vector<double>(p, 0.0));
     std::vector<double> Xty(p, 0.0);
     for (std::size_t a = 0; a < p; ++a) {
         for (std::size_t b = a; b < p; ++b) {
             double s = 0.0;
-            for (std::size_t i = 0; i < n; ++i) s += X[a][i] * X[b][i];
+            for (std::size_t i = 0; i < n; ++i)
+                s += X[a][i] * X[b][i];
             XtX[a][b] = s;
             XtX[b][a] = s;
         }
-        for (std::size_t i = 0; i < n; ++i) Xty[a] += X[a][i] * y[i];
+        for (std::size_t i = 0; i < n; ++i)
+            Xty[a] += X[a][i] * y[i];
     }
     return {std::move(XtX), std::move(Xty)};
 }
 
 /// Build a full ModelResult from coefficients, design matrix, and response.
 static auto build_model_result(const std::vector<std::string>& col_names,
-                                const std::vector<std::vector<double>>& X,
-                                const std::vector<double>& y,
-                                const std::vector<double>& beta,
-                                const ir::ModelFormula& formula, const std::string& method)
+                               const std::vector<std::vector<double>>& X,
+                               const std::vector<double>& y, const std::vector<double>& beta,
+                               const ir::ModelFormula& formula, const std::string& method)
     -> ModelResult {
     const std::size_t n = y.size();
     const std::size_t p = beta.size();
@@ -7575,7 +7602,8 @@ static auto build_model_result(const std::vector<std::string>& col_names,
 
     // R² and adjusted R².
     double y_mean = 0.0;
-    for (double v : y) y_mean += v;
+    for (double v : y)
+        y_mean += v;
     y_mean /= static_cast<double>(n);
     double ss_tot = 0.0;
     double ss_res = 0.0;
@@ -7584,10 +7612,9 @@ static auto build_model_result(const std::vector<std::string>& col_names,
         ss_res += resid[i] * resid[i];
     }
     double r2 = (ss_tot > 0.0) ? 1.0 - ss_res / ss_tot : 0.0;
-    double adj_r2 = (n > p && ss_tot > 0.0)
-                        ? 1.0 - (ss_res / static_cast<double>(n - p)) /
-                                    (ss_tot / static_cast<double>(n - 1))
-                        : 0.0;
+    double adj_r2 = (n > p && ss_tot > 0.0) ? 1.0 - (ss_res / static_cast<double>(n - p)) /
+                                                        (ss_tot / static_cast<double>(n - 1))
+                                            : 0.0;
 
     // Standard errors of coefficients.
     double sigma2 = (n > p) ? ss_res / static_cast<double>(n - p) : 0.0;
@@ -7712,7 +7739,8 @@ static auto fit_model(const Table& input, const ir::ModelFormula& formula,
         }
         // Add lambda * I to diagonal (skip intercept if present).
         for (std::size_t j = 0; j < p; ++j) {
-            if (formula.has_intercept && j == 0) continue;  // don't penalize intercept
+            if (formula.has_intercept && j == 0)
+                continue;  // don't penalize intercept
             XtX[j][j] += lambda;
         }
         auto beta = solve_spd(XtX, Xty);
@@ -7749,11 +7777,13 @@ static auto fit_model(const Table& input, const ir::ModelFormula& formula,
         for (std::size_t a = 0; a < p; ++a) {
             for (std::size_t b = a; b < p; ++b) {
                 double s = 0.0;
-                for (std::size_t i = 0; i < n; ++i) s += w[i] * X[a][i] * X[b][i];
+                for (std::size_t i = 0; i < n; ++i)
+                    s += w[i] * X[a][i] * X[b][i];
                 XtWX[a][b] = s;
                 XtWX[b][a] = s;
             }
-            for (std::size_t i = 0; i < n; ++i) XtWy[a] += w[i] * X[a][i] * y.value()[i];
+            for (std::size_t i = 0; i < n; ++i)
+                XtWy[a] += w[i] * X[a][i] * y.value()[i];
         }
         auto beta = solve_spd(XtWX, XtWy);
         if (!beta) {
@@ -7762,101 +7792,100 @@ static auto fit_model(const Table& input, const ir::ModelFormula& formula,
         return build_model_result(col_names, X, y.value(), beta.value(), formula, method);
     }
 
-    if (method == "lightbm") {
-        if (externs == nullptr) {
-            return std::unexpected(
-                "lightbm: plugin not available (import \"lightbm\" before using method = lightbm)");
-        }
-        const auto* fn = externs->find("model_lightbm");
-        if (fn == nullptr || !fn->first_arg_is_table || !fn->table_consumer_func) {
-            return std::unexpected(
-                "lightbm: plugin method 'model_lightbm' not registered "
-                "(import \"lightbm\" before using method = lightbm)");
-        }
+    if (externs != nullptr) {
+        const std::string fn_name = "model_" + method;
+        const auto* fn = externs->find(fn_name);
+        if (fn != nullptr) {
+            if (!fn->first_arg_is_table || !fn->table_consumer_func) {
+                return std::unexpected("model: plugin method '" + fn_name +
+                                       "' must be registered as a table consumer");
+            }
 
-        std::int64_t iterations = 200;
-        double learning_rate = 0.05;
-        for (const auto& param : params) {
-            if (param.name == "iterations") {
-                if (const auto* lit = std::get_if<ir::Literal>(&param.value.node)) {
-                    if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
-                        iterations = *iv;
-                    } else if (const auto* dv = std::get_if<double>(&lit->value)) {
-                        iterations = static_cast<std::int64_t>(*dv);
-                    }
+            Table design_table;
+            for (std::size_t j = 0; j < p; ++j) {
+                design_table.add_column(col_names[j], Column<double>(X[j]));
+            }
+            design_table.add_column("__response", Column<double>(y.value()));
+
+            ExternArgs plugin_args;
+            plugin_args.emplace_back(ScalarValue{std::string("__response")});
+            for (const auto& param : params) {
+                if (param.name == "method") {
+                    continue;
                 }
-            } else if (param.name == "learning_rate") {
+                plugin_args.emplace_back(ScalarValue{param.name});
                 if (const auto* lit = std::get_if<ir::Literal>(&param.value.node)) {
                     if (const auto* dv = std::get_if<double>(&lit->value)) {
-                        learning_rate = *dv;
+                        plugin_args.emplace_back(ScalarValue{*dv});
                     } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
-                        learning_rate = static_cast<double>(*iv);
+                        plugin_args.emplace_back(ScalarValue{*iv});
+                    } else if (const auto* sv = std::get_if<std::string>(&lit->value)) {
+                        plugin_args.emplace_back(ScalarValue{*sv});
+                    } else if (const auto* date = std::get_if<Date>(&lit->value)) {
+                        plugin_args.emplace_back(ScalarValue{*date});
+                    } else if (const auto* ts = std::get_if<Timestamp>(&lit->value)) {
+                        plugin_args.emplace_back(ScalarValue{*ts});
+                    } else {
+                        return std::unexpected("model: unsupported literal parameter type for '" +
+                                               param.name + "'");
                     }
+                } else if (const auto* ref = std::get_if<ir::ColumnRef>(&param.value.node)) {
+                    plugin_args.emplace_back(ScalarValue{std::string("column:") + ref->name});
+                } else {
+                    return std::unexpected("model: plugin parameter '" + param.name +
+                                           "' must be a literal or column reference");
                 }
             }
-        }
-        if (iterations <= 0) {
-            return std::unexpected("lightbm: iterations must be > 0");
-        }
-        if (!(learning_rate > 0.0 && learning_rate <= 1.0)) {
-            return std::unexpected("lightbm: learning_rate must be in (0, 1]");
-        }
 
-        Table design_table;
-        for (std::size_t j = 0; j < p; ++j) {
-            design_table.add_column(col_names[j], Column<double>(X[j]));
-        }
-        design_table.add_column("__response", Column<double>(y.value()));
-
-        ExternArgs plugin_args;
-        plugin_args.emplace_back(ScalarValue{std::string("__response")});
-        plugin_args.emplace_back(ScalarValue{iterations});
-        plugin_args.emplace_back(ScalarValue{learning_rate});
-
-        auto plugin_result = fn->table_consumer_func(design_table, plugin_args);
-        if (!plugin_result) {
-            return std::unexpected("lightbm: " + plugin_result.error());
-        }
-
-        const auto* coef_table = std::get_if<Table>(&plugin_result.value());
-        if (coef_table == nullptr) {
-            return std::unexpected("lightbm: model_lightbm must return a coefficients table");
-        }
-        const auto* term_any = coef_table->find("term");
-        const auto* estimate_any = coef_table->find("estimate");
-        if (term_any == nullptr || estimate_any == nullptr) {
-            return std::unexpected("lightbm: coefficients table must include 'term' and 'estimate'");
-        }
-        const auto* term_col = std::get_if<Column<std::string>>(term_any);
-        const auto* estimate_col = std::get_if<Column<double>>(estimate_any);
-        if (term_col == nullptr || estimate_col == nullptr) {
-            return std::unexpected(
-                "lightbm: coefficients table columns must be term:String and estimate:Float64");
-        }
-        if (term_col->size() != estimate_col->size()) {
-            return std::unexpected("lightbm: coefficients table term/estimate length mismatch");
-        }
-
-        std::unordered_map<std::string, double> beta_by_term;
-        beta_by_term.reserve(term_col->size());
-        for (std::size_t i = 0; i < term_col->size(); ++i) {
-            beta_by_term.insert_or_assign((*term_col)[i], (*estimate_col)[i]);
-        }
-
-        std::vector<double> beta;
-        beta.reserve(col_names.size());
-        for (const auto& name : col_names) {
-            auto it = beta_by_term.find(name);
-            if (it == beta_by_term.end()) {
-                return std::unexpected("lightbm: missing coefficient for term '" + name + "'");
+            auto plugin_result = fn->table_consumer_func(design_table, plugin_args);
+            if (!plugin_result) {
+                return std::unexpected("model (" + method + "): " + plugin_result.error());
             }
-            beta.push_back(it->second);
+
+            const auto* coef_table = std::get_if<Table>(&plugin_result.value());
+            if (coef_table == nullptr) {
+                return std::unexpected("model (" + method +
+                                       "): plugin must return a coefficients table");
+            }
+            const auto* term_any = coef_table->find("term");
+            const auto* estimate_any = coef_table->find("estimate");
+            if (term_any == nullptr || estimate_any == nullptr) {
+                return std::unexpected("model (" + method +
+                                       "): coefficients table must include 'term' and 'estimate'");
+            }
+            const auto* term_col = std::get_if<Column<std::string>>(term_any);
+            const auto* estimate_col = std::get_if<Column<double>>(estimate_any);
+            if (term_col == nullptr || estimate_col == nullptr) {
+                return std::unexpected(
+                    "model (" + method +
+                    "): coefficient columns must be term:String and estimate:Float64");
+            }
+            if (term_col->size() != estimate_col->size()) {
+                return std::unexpected("model (" + method + "): coefficients length mismatch");
+            }
+
+            std::unordered_map<std::string, double> beta_by_term;
+            beta_by_term.reserve(term_col->size());
+            for (std::size_t i = 0; i < term_col->size(); ++i) {
+                beta_by_term.insert_or_assign((*term_col)[i], (*estimate_col)[i]);
+            }
+
+            std::vector<double> beta;
+            beta.reserve(col_names.size());
+            for (const auto& name : col_names) {
+                auto it = beta_by_term.find(name);
+                if (it == beta_by_term.end()) {
+                    return std::unexpected("model (" + method +
+                                           "): missing coefficient for term '" + name + "'");
+                }
+                beta.push_back(it->second);
+            }
+            return build_model_result(col_names, X, y.value(), std::move(beta), formula, method);
         }
-        return build_model_result(col_names, X, y.value(), std::move(beta), formula, method);
     }
 
     return std::unexpected("model: unknown method '" + method +
-                           "' (supported: ols, ridge, wls, lightbm)");
+                           "' (supported built-ins: ols, ridge, wls; plugins: model_<method>)");
 }
 
 // ─── Melt (wide → long) ──────────────────────────────────────────────────────
@@ -8669,8 +8698,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
-                    ModelResult* model_out = nullptr)
-    -> std::expected<Table, std::string> {
+                    ModelResult* model_out = nullptr) -> std::expected<Table, std::string> {
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
             const auto& scan = static_cast<const ir::ScanNode&>(node);
@@ -9301,8 +9329,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            auto result = fit_model(child.value(), mn.formula(), mn.method(), mn.params(), scalars,
-                                    externs);
+            auto result =
+                fit_model(child.value(), mn.formula(), mn.method(), mn.params(), scalars, externs);
             if (!result) {
                 return std::unexpected(result.error());
             }

@@ -96,35 +96,64 @@ auto fit(const runtime::Table& design_matrix, const std::string& response_col,
 }  // namespace ibex::lightbm
 
 extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
-    registry->register_table(
-        "lightbm_version",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            runtime::Table out;
-            out.add_column("name", Column<std::string>{"lightbm"});
-            out.add_column("version", Column<std::string>{"0.1"});
-            return ibex::runtime::ExternValue{std::move(out)};
-        });
+    registry->register_table("lightbm_version",
+                             [](const ibex::runtime::ExternArgs&)
+                                 -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                 runtime::Table out;
+                                 out.add_column("name", Column<std::string>{"lightbm"});
+                                 out.add_column("version", Column<std::string>{"0.1"});
+                                 return ibex::runtime::ExternValue{std::move(out)};
+                             });
 
     registry->register_scalar_table_consumer(
-        "model_lightbm",
-        ibex::runtime::ScalarKind::Int,
+        "model_lightbm", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& design_matrix, const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
-            if (args.size() != 3) {
+            if (args.empty()) {
                 return std::unexpected(
-                    "model_lightbm(df, response, iterations, learning_rate) expects 3 scalar arguments");
+                    "model_lightbm expects first scalar arg as response column name");
             }
 
             const auto* response = std::get_if<std::string>(&args[0]);
-            const auto* iterations = std::get_if<std::int64_t>(&args[1]);
-            const auto* learning_rate = std::get_if<double>(&args[2]);
-            if (response == nullptr || iterations == nullptr || learning_rate == nullptr) {
-                return std::unexpected(
-                    "model_lightbm expects (String response, Int iterations, Float64 learning_rate)");
+            if (response == nullptr) {
+                return std::unexpected("model_lightbm: response column name must be a string");
             }
 
-            auto table = ibex::lightbm::fit(design_matrix, *response, *iterations, *learning_rate);
+            if ((args.size() - 1) % 2 != 0) {
+                return std::unexpected(
+                    "model_lightbm: expected named parameter pairs after response (name, value, "
+                    "...)");
+            }
+
+            std::int64_t iterations = 200;
+            double learning_rate = 0.05;
+            for (std::size_t i = 1; i < args.size(); i += 2) {
+                const auto* key = std::get_if<std::string>(&args[i]);
+                if (key == nullptr) {
+                    return std::unexpected("model_lightbm: parameter names must be strings");
+                }
+                const auto& value = args[i + 1];
+                if (*key == "iterations") {
+                    if (const auto* iv = std::get_if<std::int64_t>(&value)) {
+                        iterations = *iv;
+                    } else if (const auto* dv = std::get_if<double>(&value)) {
+                        iterations = static_cast<std::int64_t>(*dv);
+                    } else {
+                        return std::unexpected("model_lightbm: iterations must be Int or Float64");
+                    }
+                } else if (*key == "learning_rate") {
+                    if (const auto* dv = std::get_if<double>(&value)) {
+                        learning_rate = *dv;
+                    } else if (const auto* iv = std::get_if<std::int64_t>(&value)) {
+                        learning_rate = static_cast<double>(*iv);
+                    } else {
+                        return std::unexpected(
+                            "model_lightbm: learning_rate must be Float64 or Int");
+                    }
+                }
+            }
+
+            auto table = ibex::lightbm::fit(design_matrix, *response, iterations, learning_rate);
             if (!table) {
                 return std::unexpected(table.error());
             }

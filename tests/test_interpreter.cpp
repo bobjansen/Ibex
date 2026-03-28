@@ -4142,3 +4142,293 @@ TEST_CASE("matmul: inner dimension mismatch returns error", "[matmul][matrix]") 
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("inner dimensions") != std::string::npos);
 }
+
+// ─── Model Specification Tests ───────────────────────────────────────────────
+
+TEST_CASE("model: OLS simple regression", "[model]") {
+    // y = 2*x + 1 (perfect linear relationship)
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ols }];");
+    runtime::ModelResult model_out;
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr, &model_out);
+    REQUIRE(result.has_value());
+
+    // Coefficients table: (intercept) and x
+    REQUIRE(result->rows() == 2);
+    REQUIRE(result->find("term") != nullptr);
+    REQUIRE(result->find("estimate") != nullptr);
+
+    const auto& terms = std::get<Column<std::string>>(*result->find("term"));
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+
+    // With intercept: y = 1 + 2*x
+    REQUIRE(std::string(terms[0]) == "(intercept)");
+    REQUIRE(std::string(terms[1]) == "x");
+    REQUIRE(estimates[0] == Catch::Approx(1.0));
+    REQUIRE(estimates[1] == Catch::Approx(2.0));
+
+    // ModelResult should have R² = 1.0 for perfect fit
+    REQUIRE(model_out.r_squared == Catch::Approx(1.0));
+    REQUIRE(model_out.n_obs == 5);
+    REQUIRE(model_out.n_params == 2);
+}
+
+TEST_CASE("model: OLS multiple regression", "[model]") {
+    // y = 1 + 2*x1 + 3*x2
+    runtime::Table t;
+    t.add_column("x1", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("x2", Column<double>{0.0, 1.0, 0.0, 1.0, 0.0});
+    t.add_column("y", Column<double>{3.0, 8.0, 7.0, 12.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x1 + x2, method = ols }];");
+    runtime::ModelResult model_out;
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr, &model_out);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);  // intercept + x1 + x2
+
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(estimates[0] == Catch::Approx(1.0));  // intercept
+    REQUIRE(estimates[1] == Catch::Approx(2.0));  // x1
+    REQUIRE(estimates[2] == Catch::Approx(3.0));  // x2
+}
+
+TEST_CASE("model: OLS no intercept", "[model]") {
+    // y = 2*x (through origin)
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{2.0, 4.0, 6.0, 8.0, 10.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x - 1, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);  // only x, no intercept
+
+    const auto& terms = std::get<Column<std::string>>(*result->find("term"));
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(std::string(terms[0]) == "x");
+    REQUIRE(estimates[0] == Catch::Approx(2.0));
+}
+
+TEST_CASE("model: OLS with filter", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0, 100.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0, 999.0});
+    t.add_column("id", Column<std::int64_t>{1, 2, 3, 4, 5, 1000});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // Filter out the outlier before fitting
+    auto ir = require_ir("t[filter id < 1000, model { y ~ x, method = ols }];");
+    runtime::ModelResult model_out;
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr, &model_out);
+    REQUIRE(result.has_value());
+
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(estimates[0] == Catch::Approx(1.0));  // intercept
+    REQUIRE(estimates[1] == Catch::Approx(2.0));  // x
+    REQUIRE(model_out.n_obs == 5);
+}
+
+TEST_CASE("model: OLS dot notation (all predictors)", "[model]") {
+    runtime::Table t;
+    t.add_column("x1", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("x2", Column<double>{5.0, 4.0, 3.0, 2.0, 1.0});
+    t.add_column("y", Column<double>{6.0, 6.0, 6.0, 6.0, 6.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ ., method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);  // intercept + x1 + x2
+}
+
+TEST_CASE("model: OLS interaction term", "[model]") {
+    // y = 1 + 2*x1 + 3*x2 + 4*x1*x2, with well-spread data
+    runtime::Table t;
+    t.add_column("x1", Column<double>{1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0});
+    t.add_column("x2", Column<double>{1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0});
+    // y = 1 + 2*x1 + 3*x2 + 4*x1*x2
+    t.add_column("y", Column<double>{10.0, 16.0, 22.0, 17.0, 27.0, 37.0, 24.0, 38.0, 52.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x1 + x2 + x1:x2, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);  // intercept + x1 + x2 + x1:x2
+
+    const auto& terms = std::get<Column<std::string>>(*result->find("term"));
+    REQUIRE(std::string(terms[3]) == "x1:x2");
+
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(estimates[0] == Catch::Approx(1.0).margin(0.01));  // intercept
+    REQUIRE(estimates[1] == Catch::Approx(2.0).margin(0.01));  // x1
+    REQUIRE(estimates[2] == Catch::Approx(3.0).margin(0.01));  // x2
+    REQUIRE(estimates[3] == Catch::Approx(4.0).margin(0.01));  // x1:x2
+}
+
+TEST_CASE("model: OLS crossing operator (*)", "[model]") {
+    // y ~ x1 * x2 should expand to y ~ x1 + x2 + x1:x2
+    runtime::Table t;
+    t.add_column("x1", Column<double>{1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0});
+    t.add_column("x2", Column<double>{1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0});
+    t.add_column("y", Column<double>{10.0, 16.0, 22.0, 17.0, 27.0, 37.0, 24.0, 38.0, 52.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x1 * x2, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);  // intercept + x1 + x2 + x1:x2
+}
+
+TEST_CASE("model: ridge regression", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ridge, lambda = 0.1 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    // Ridge should shrink coefficients slightly toward zero compared to OLS
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    // With small lambda, should be close to OLS (intercept ≈ 1, slope ≈ 2)
+    REQUIRE(estimates[1] == Catch::Approx(2.0).margin(0.2));
+}
+
+TEST_CASE("model: WLS with weights", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+    t.add_column("w", Column<double>{1.0, 1.0, 1.0, 1.0, 1.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = wls, weights = w }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    // With equal weights, WLS = OLS
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(estimates[0] == Catch::Approx(1.0));
+    REQUIRE(estimates[1] == Catch::Approx(2.0));
+}
+
+TEST_CASE("model: ModelResult accessor tables", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ols }];");
+    runtime::ModelResult model_out;
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr, &model_out);
+    REQUIRE(result.has_value());
+
+    // Summary table has std_error, t_stat, p_value columns
+    REQUIRE(model_out.summary.find("std_error") != nullptr);
+    REQUIRE(model_out.summary.find("t_stat") != nullptr);
+    REQUIRE(model_out.summary.find("p_value") != nullptr);
+
+    // Fitted values
+    REQUIRE(model_out.fitted_values.rows() == 5);
+    const auto& fitted = std::get<Column<double>>(*model_out.fitted_values.find("fitted"));
+    REQUIRE(fitted[0] == Catch::Approx(3.0));  // 1 + 2*1
+    REQUIRE(fitted[4] == Catch::Approx(11.0));  // 1 + 2*5
+
+    // Residuals (should be ~0 for perfect fit)
+    REQUIRE(model_out.residuals.rows() == 5);
+    const auto& resid = std::get<Column<double>>(*model_out.residuals.find("residual"));
+    REQUIRE(resid[0] == Catch::Approx(0.0).margin(1e-10));
+    REQUIRE(resid[4] == Catch::Approx(0.0).margin(1e-10));
+}
+
+TEST_CASE("model: integer columns widened", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+    t.add_column("y", Column<std::int64_t>{3, 5, 7, 9, 11});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(estimates[0] == Catch::Approx(1.0));
+    REQUIRE(estimates[1] == Catch::Approx(2.0));
+}
+
+TEST_CASE("model: dummy encoding for string columns", "[model]") {
+    runtime::Table t;
+    t.add_column("region", Column<std::string>{"East", "West", "North", "East", "West", "North"});
+    t.add_column("y", Column<double>{10.0, 20.0, 30.0, 12.0, 22.0, 32.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ region, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    // With intercept: reference level (East) absorbed → intercept + region_West + region_North
+    REQUIRE(result->rows() == 3);
+
+    const auto& terms = std::get<Column<std::string>>(*result->find("term"));
+    REQUIRE(std::string(terms[0]) == "(intercept)");
+    // The dummy columns should be region_West and region_North (East is reference)
+}
+
+TEST_CASE("model: error on unknown method", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = unknown_method }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("unknown method") != std::string::npos);
+}
+
+TEST_CASE("model: error on missing response column", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("response column not found") != std::string::npos);
+}

@@ -198,10 +198,42 @@ struct CorrClause {};
 /// One optional String/Categorical label column names the output columns.
 struct TransposeClause {};
 
+/// A single term in a model formula: column name, interaction (a:b), or the
+/// "all other columns" wildcard (`.`).
+struct FormulaTerm {
+    /// Column names in this term.  A main-effect has one entry; an interaction
+    /// (e.g. `a:b`) has two or more.
+    std::vector<std::string> columns;
+
+    /// True when this term is the `.` (all-other-columns) wildcard.
+    bool is_dot = false;
+};
+
+/// Model formula: `response ~ term + term + ...`.
+/// `- 1` removes the implicit intercept.
+struct Formula {
+    std::string response;
+    std::vector<FormulaTerm> terms;
+    bool has_intercept = true;  ///< false when `- 1` appears on the RHS
+};
+
+/// Named parameter inside a model clause: `method = ols`, `lambda = 0.1`.
+struct ModelParam {
+    std::string name;
+    ExprPtr value;
+};
+
+/// Model clause: `model { y ~ x1 + x2, method = ols }`.
+/// Contains the formula and zero or more named parameters.
+struct ModelClause {
+    Formula formula;
+    std::vector<ModelParam> params;
+};
+
 using Clause =
     std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
                  OrderClause, ByClause, WindowClause, ResampleClause, MeltClause, DcastClause,
-                 CovClause, CorrClause, TransposeClause>;
+                 CovClause, CorrClause, TransposeClause, ModelClause>;
 
 struct BlockExpr {
     ExprPtr base;

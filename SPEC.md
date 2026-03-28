@@ -73,6 +73,10 @@ The canonical order is recommended for readability but not enforced.
 | `window`            | ω (temporal window)       | `WindowNode`    |
 | `melt`              | unpivot (wide → long)     | `MeltNode`      |
 | `dcast`             | pivot (long → wide)       | `DcastNode`     |
+| `cov`               | covariance matrix         | `CovNode`       |
+| `corr`              | correlation matrix        | `CorrNode`      |
+| `transpose`         | row/column swap           | `TransposeNode` |
+| `matmul(a, b)`      | matrix multiply           | `MatmulNode`    |
 | `Table { … }`       | literal construction      | `ConstructNode` |
 
 Every valid block expression maps to a composition of these operators. The
@@ -142,7 +146,7 @@ column names, or function names:
 ```
 let    mut    extern  fn      from
 filter select update  distinct order by window
-rename resample melt  dcast
+rename resample melt  dcast  cov  corr  transpose
 join   left   right   outer   asof   on
 import Stream
 asc    desc
@@ -635,7 +639,10 @@ clause          = filter_clause
                 | by_clause
                 | window_clause
                 | melt_clause
-                | dcast_clause ;
+                | dcast_clause
+                | cov_clause
+                | corr_clause
+                | transpose_clause ;
 
 filter_clause   = "filter" expr ;
 
@@ -661,6 +668,12 @@ window_clause   = "window" DURATION_LIT ;
 melt_clause     = "melt" field_or_list ;
 
 dcast_clause    = "dcast" IDENT ;
+
+cov_clause      = "cov" ;
+
+corr_clause     = "corr" ;
+
+transpose_clause = "transpose" ;
 
 field_or_list   = field
                 | "{" field_list "}" ;
@@ -810,6 +823,10 @@ Within a single block:
 | C16 | `melt` and `dcast` are mutually exclusive with `distinct`, `update`, `order`, `window`, and `resample`. |
 | C17 | `melt` may combine with `select` (to specify measure columns). |
 | C18 | `dcast` may combine with `select` (to specify the value column) and `by` (to specify row keys). |
+| C19 | At most **one** of `cov`, `corr`, `transpose` per block. |
+| C20 | `cov`, `corr`, and `transpose` are mutually exclusive with each other and with `select`, `update`, `by`, `distinct`, `melt`, `dcast`, `window`, and `resample`. |
+| C21 | `cov` and `corr` silently drop non-numeric columns; at least one numeric column must remain. |
+| C22 | `transpose` requires all data columns to share the same type (error on mixed types). |
 
 Violation of any constraint is a **compile-time error**.
 
@@ -1083,6 +1100,100 @@ let wide2 = long[dcast variable, select value, by symbol];
 // wide2 has the same data as wide (column order may differ)
 ```
 
+### 5.3 Matrix Operation Clauses
+
+#### `cov` — Covariance Matrix
+
+```
+df_expr [ cov ]
+```
+
+Computes the sample covariance matrix of all numeric columns in `df_expr`.
+Non-numeric columns (String, Categorical, Bool, Date, Timestamp) are **silently
+dropped** before computation. Int64 columns are **widened to Float64**.
+
+The result has shape N×N (where N = number of numeric columns) plus a leading
+`column: String` label column that names each row.
+
+```
+// Given: prices[select { open, high, low, close }]
+prices[select { open, high, low, close }][cov]
+// Result schema: column: String, open: Float64, high: Float64, low: Float64, close: Float64
+// Result rows:   one per input numeric column
+```
+
+Uses sample covariance (denominator n−1). Requires at least 2 rows; returns an
+error if the input has fewer than 2 rows.
+
+#### `corr` — Pearson Correlation Matrix
+
+```
+df_expr [ corr ]
+```
+
+Computes the Pearson correlation matrix of all numeric columns. Same
+preprocessing rules as `cov` (non-numeric dropped, Int64 widened). Diagonal
+values are exactly 1.0. Off-diagonal values lie in [−1, 1].
+
+The result schema is identical to `cov`: a leading `column: String` label column
+followed by N Float64 columns.
+
+```
+prices[select { open, close }][corr]
+// Result:
+//   column | open | close
+//   open   |  1.0 |  0.98
+//   close  |  0.98|  1.0
+```
+
+#### `transpose` — Transpose Rows and Columns
+
+```
+df_expr [ transpose ]
+```
+
+Swaps rows and columns. **All data columns must share the same type** (homogeneous);
+mixed-type input is an error. One optional String or Categorical column may be
+present as a **label column** — its values become the output column names. If no
+label column is present, output columns are named `r0`, `r1`, …
+
+Unlike `cov`/`corr`, `transpose` does **not** drop non-numeric columns. It works
+on any homogeneous DataFrame (Float64, Int64, String, etc.).
+
+```
+// Float64 table with a String label column
+let t = prices[select { symbol, open, close }]
+t[transpose]
+// Result schema: column: String, AAPL: Float64, MSFT: Float64, ...
+//   (where AAPL, MSFT, ... are the values from the symbol column)
+
+// Numeric table, no label column — output columns r0, r1, ...
+prices[select { open, close }][transpose]
+// Result schema: column: String, r0: Float64, r1: Float64, ...
+```
+
+`transpose` is mutually exclusive with `select`, `update`, `by`, `melt`,
+`dcast`, `window`, `resample`, and `rename` in the same clause block.
+
+#### `matmul(a, b)` — Matrix Multiply
+
+```
+matmul( df_expr_a , df_expr_b )
+```
+
+Multiplies two DataFrames as matrices. Non-numeric columns are silently dropped;
+Int64 columns are widened to Float64. `a` and `b` must have the same number of
+numeric columns after dropping (the inner dimension k). The result has `nrow(a)`
+rows and `ncol(b)` numeric columns; output column names are taken from `b`.
+
+```
+// (30×2) portfolio weights × (2×1) factor exposures → (30×1)
+let w = Table { col1 = [0.6, 0.4] }
+matmul(returns[select { open, close }], w)
+```
+
+Constraint C22 (see §5.2): the inner dimensions of `a` and `b` must match.
+
 ### 5.4 Result Type Rules
 
 | Clauses Present       | Output Type | Schema Derivation |
@@ -1099,6 +1210,10 @@ let wide2 = long[dcast variable, select value, by symbol];
 | `window` + `select`   | `TimeFrame<S'>` | S' = listed fields |
 | `melt`                | `DataFrame<S'>` | S' = id_cols + {variable: String, value: T} |
 | `dcast`               | `DataFrame<S'>` | S' = row_keys + one column per pivot value |
+| `cov`                 | `DataFrame<S'>` | S' = {column: String} + N Float64 (N = numeric cols) |
+| `corr`                | `DataFrame<S'>` | S' = {column: String} + N Float64 (N = numeric cols) |
+| `transpose`           | `DataFrame<S'>` | S' = {column: String} + one col per input row |
+| `matmul(a, b)`        | `DataFrame<S'>` | S' = numeric cols of b; nrow = nrow(a) |
 
 If the input is a `TimeFrame` and no clause removes the time index column,
 the output remains a `TimeFrame`.

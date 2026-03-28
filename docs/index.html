@@ -1016,6 +1016,48 @@ Stream {
         </div>
       </div>
 
+      <!-- 12. Model Specification -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Model Specification</span>
+          <h3>R-style formula syntax for regression, built into the query bracket.</h3>
+          <p>
+            The <code>model</code> clause lets you fit OLS, ridge, or WLS
+            regressions with a familiar <code>y&nbsp;~&nbsp;x1&nbsp;+&nbsp;x2</code>
+            formula. Ibex builds the design matrix automatically — numeric columns
+            pass through, categorical columns are dummy-encoded, and interaction
+            terms (<code>:</code>) and crossing (<code>*</code>) expand just like in R.
+          </p>
+          <p>
+            Results are accessed via S3-style accessor functions:
+            <code>model_coef</code>, <code>model_summary</code>,
+            <code>model_fitted</code>, <code>model_residuals</code>, and
+            <code>model_r_squared</code>. The <code>method&nbsp;=</code> parameter
+            duck-types any function with signature
+            <code>(X:&nbsp;Table,&nbsp;y:&nbsp;Table)&nbsp;->&nbsp;Table</code>,
+            so user-defined estimators slot in seamlessly.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// OLS with filter — all in one bracket</span>
+<span class="kw">let</span> m = prices[
+    <span class="kw">filter</span> volume &gt; <span class="num">1000000</span>,
+    <span class="kw">model</span> { close ~ open + high + low }
+];
+
+<span class="cm">// Accessor functions for detailed results</span>
+<span class="kw">let</span> coefs = <span class="fn-name">model_coef</span>(m);
+<span class="kw">let</span> stats = <span class="fn-name">model_summary</span>(m);
+<span class="kw">let</span> r2    = <span class="fn-name">model_r_squared</span>(m);</code></pre>
+<pre style="margin-top:0.6rem;"><code><span class="cm">// Ridge regression with L2 penalty</span>
+<span class="kw">let</span> ridge = prices[<span class="kw">model</span> {
+    close ~ open + volume,
+    method = ridge,
+    lambda = <span class="num">0.1</span>
+}];</code></pre>
+        </div>
+      </div>
+
     </div><!-- .tour -->
   </section>
 

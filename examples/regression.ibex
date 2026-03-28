@@ -1,0 +1,49 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex Regression Demo  ·  Model Specification Syntax
+//
+//  Demonstrates OLS, ridge, and WLS regression using R-style formula syntax.
+//  Design matrix construction, categorical dummy encoding, and interaction
+//  terms are handled automatically by the model clause.
+//
+//  Python/statsmodels equivalent: ~40 lines.  Raw C++/Eigen: ~120 lines.
+//  Ibex: 30 lines.
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+let prices = read_csv("examples/data/ohlcv.csv");
+
+// ── 1. Simple OLS: close price as a function of open and volume ─────────────
+let m1 = prices[model { close ~ open + volume }];
+
+// m1 is a DataFrame of coefficients: (Intercept), open, volume
+// Access detailed results via accessor functions:
+let coefficients = model_coef(m1);
+let fit_summary  = model_summary(m1);
+let predictions  = model_fitted(m1);
+let resids       = model_residuals(m1);
+let r2           = model_r_squared(m1);
+
+// ── 2. No intercept — force regression through the origin ───────────────────
+let m2 = prices[model { close ~ open + volume - 1 }];
+
+// ── 3. Dot notation — regress close on all other numeric columns ────────────
+let numeric = prices[select { open, high, low, close, volume }];
+let m3 = numeric[model { close ~ . }];
+
+// ── 4. Interaction terms — open:volume adds the element-wise product ────────
+let m4 = prices[model { close ~ open + volume + open:volume }];
+
+// ── 5. Crossing operator — expands to main effects + interaction ────────────
+//    close ~ open * volume  ≡  close ~ open + volume + open:volume
+let m5 = prices[model { close ~ open * volume }];
+
+// ── 6. Filtered regression — only fit on rows matching a condition ───────────
+let m6 = prices[filter volume > 1000000, model { close ~ open + high + low }];
+
+// ── 7. Ridge regression — L2 penalty shrinks coefficients toward zero ───────
+let m7 = prices[model { close ~ open + volume, method = ridge, lambda = 0.1 }];
+
+// ── 8. Weighted least squares — down-weight high-volume rows ────────────────
+let weighted = prices[update { w = 1.0 / volume }];
+let m8 = weighted[model { close ~ open + high + low, method = wls, weights = w }];

@@ -250,6 +250,46 @@
   </section>
 
   <section class="section">
+    <p class="section-label">Model</p>
+    <h2>Model specification</h2>
+    <article class="card">
+      <p>The <code>model</code> clause fits a regression using R-style formula syntax. Numeric columns pass through to the design matrix; String columns are dummy-encoded (treatment coding). The result is a <code>ModelResult</code> — an opaque type accessed via the functions below.</p>
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>df[model { y ~ x1 + x2 }]</code></td><td>OLS regression of <code>y</code> on <code>x1</code> and <code>x2</code> with intercept.</td></tr>
+          <tr><td><code>df[model { y ~ . }]</code></td><td>Regress <code>y</code> on all other columns (dot notation).</td></tr>
+          <tr><td><code>df[model { y ~ x - 1 }]</code></td><td>No intercept — suppress the constant term.</td></tr>
+          <tr><td><code>df[model { y ~ x1 * x2 }]</code></td><td>Crossing: expands to <code>x1 + x2 + x1:x2</code>.</td></tr>
+          <tr><td><code>df[model { y ~ x1 + x2, method = ridge, lambda = 0.1 }]</code></td><td>Ridge regression with L2 penalty <code>lambda</code>.</td></tr>
+          <tr><td><code>df[model { y ~ x, method = wls, weights = w }]</code></td><td>Weighted least squares using column <code>w</code> as weights.</td></tr>
+        </tbody>
+      </table>
+    </article>
+    <article class="card">
+      <h3>Accessor functions</h3>
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>model_coef(m)</code></td><td>Coefficient table with columns <code>term: String</code> and <code>estimate: Float64</code>.</td></tr>
+          <tr><td><code>model_summary(m)</code></td><td>Full summary: <code>term</code>, <code>estimate</code>, <code>std_error</code>, <code>t_stat</code>, <code>p_value</code>.</td></tr>
+          <tr><td><code>model_fitted(m)</code></td><td>Fitted values (ŷ) as a single-column table.</td></tr>
+          <tr><td><code>model_residuals(m)</code></td><td>Residuals (y − ŷ) as a single-column table.</td></tr>
+          <tr><td><code>model_r_squared(m)</code></td><td>R² and adjusted R² as a single-row table.</td></tr>
+        </tbody>
+      </table>
+    </article>
+    <article class="card">
+      <h3>Examples</h3>
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>prices[model { close ~ open + volume }]</code></td><td>Simple OLS of closing price on open and volume.</td></tr>
+          <tr><td><code>prices[filter volume > 1000000, model { close ~ open + high + low }]</code></td><td>Filtered regression — only fit on high-volume rows.</td></tr>
+          <tr><td><code>prices[model { close ~ open * volume, method = ridge, lambda = 0.5 }]</code></td><td>Ridge with main effects and interaction term.</td></tr>
+        </tbody>
+      </table>
+    </article>
+  </section>
+
+  <section class="section">
     <p class="section-label">I/O Libraries</p>
     <h2>File and stream functions shipped with Ibex</h2>
     <div class="grid-2">

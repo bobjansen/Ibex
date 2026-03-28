@@ -260,6 +260,47 @@ let weights = Table { w = [0.6, 0.4] }
 matmul(prices[select { open, close }], weights)
 ```
 
+### Model Specification
+
+Ibex provides an R-style formula syntax for fitting regression models directly
+inside a query bracket. The `model` clause builds a design matrix automatically
+— numeric columns pass through, categorical (String) columns are dummy-encoded
+using treatment coding, and interaction/crossing operators work as in R.
+
+```
+// OLS regression: close ~ open + volume
+let m = prices[model { close ~ open + volume }];
+
+// Accessor functions extract detailed results
+let coefs = model_coef(m);        // coefficient table
+let stats = model_summary(m);     // std errors, t-stats, p-values
+let yhat  = model_fitted(m);      // fitted values
+let e     = model_residuals(m);   // residuals
+let r2    = model_r_squared(m);   // R² as a scalar table
+
+// Dot notation: regress on all other columns
+prices[model { close ~ . }]
+
+// No intercept
+prices[model { close ~ open - 1 }]
+
+// Interaction (open:volume) and crossing (open * volume ≡ open + volume + open:volume)
+prices[model { close ~ open * volume }]
+
+// Filter + model in one bracket
+prices[filter volume > 1000000, model { close ~ open + high + low }]
+
+// Ridge regression with L2 penalty
+prices[model { close ~ open + volume, method = ridge, lambda = 0.1 }]
+
+// Weighted least squares
+prices[model { close ~ open, method = wls, weights = w }]
+```
+
+Built-in methods: `ols` (default), `ridge` (requires `lambda`), `wls` (requires
+`weights`). The `method =` parameter duck-types any function with signature
+`(X: Table, y: Table) -> Table`, so user-defined estimators work too.
+
 ### Scalar functions
 
 ```

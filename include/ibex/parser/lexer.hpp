@@ -42,6 +42,7 @@ enum class TokenKind : std::uint8_t {
     KeywordCov,
     KeywordCorr,
     KeywordTranspose,
+    KeywordModel,
     KeywordJoin,
     KeywordLeft,
     KeywordRight,
@@ -95,6 +96,10 @@ enum class TokenKind : std::uint8_t {
 
     // Scope escape (SPEC.md Section 6.2)
     Caret,  // ^
+
+    // Formula operator
+    Tilde,  // ~
+    Dot,    // .
 
     // Assignment
     Eq,  // =

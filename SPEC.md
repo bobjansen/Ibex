@@ -642,7 +642,8 @@ clause          = filter_clause
                 | dcast_clause
                 | cov_clause
                 | corr_clause
-                | transpose_clause ;
+                | transpose_clause
+                | model_clause ;
 
 filter_clause   = "filter" expr ;
 
@@ -674,6 +675,23 @@ cov_clause      = "cov" ;
 corr_clause     = "corr" ;
 
 transpose_clause = "transpose" ;
+
+model_clause    = "model" "{" formula { "," model_param } [ "," ] "}" ;
+
+formula         = IDENT "~" formula_rhs ;
+
+formula_rhs     = formula_terms ;
+
+formula_terms   = formula_atom { "+" formula_atom }
+                | formula_atom { "+" formula_atom } "-" "1" ;
+
+formula_atom    = formula_term
+                | formula_term { "*" formula_term } ;
+
+formula_term    = IDENT { ":" IDENT }
+                | "." ;
+
+model_param     = IDENT "=" expr ;
 
 field_or_list   = field
                 | "{" field_list "}" ;
@@ -1214,11 +1232,78 @@ Constraint C22 (see §5.2): the inner dimensions of `a` and `b` must match.
 | `corr`                | `DataFrame<S'>` | S' = {column: String} + N Float64 (N = numeric cols) |
 | `transpose`           | `DataFrame<S'>` | S' = {column: String} + one col per input row |
 | `matmul(a, b)`        | `DataFrame<S'>` | S' = numeric cols of b; nrow = nrow(a) |
+| `model { ... }`       | `ModelResult`   | Coefficients table: {term: String, estimate: Float64} |
 
 If the input is a `TimeFrame` and no clause removes the time index column,
 the output remains a `TimeFrame`.
 
-### 5.5 Join Expressions
+### 5.5 Model Specification
+
+The `model` clause fits a statistical model using an R-style formula syntax.
+
+```
+df[model { response ~ predictors, method = ols }]
+df[filter cond, model { y ~ x1 + x2, method = ridge, lambda = 0.1 }]
+df[model { y ~ x1 * x2, method = wls, weights = w }]
+df[model { y ~ ., method = ols }]
+df[model { y ~ x - 1, method = ols }]
+```
+
+#### Formula Syntax
+
+- `y ~ x1 + x2` — response `y`, predictors `x1` and `x2`
+- `y ~ .` — response `y`, all other columns as predictors
+- `y ~ x1:x2` — interaction term (element-wise product)
+- `y ~ x1 * x2` — crossing: expands to `x1 + x2 + x1:x2`
+- `y ~ x - 1` — remove intercept (no constant term)
+
+#### Design Matrix Construction
+
+| Column Type | Treatment |
+|-------------|-----------|
+| Float64 / Int64 | Passed through as numeric predictor |
+| String | Dummy-encoded (treatment coding: first level dropped when intercept present) |
+| Intercept | Column of 1.0 prepended by default; suppressed with `- 1` |
+| Interaction `a:b` | Element-wise product of numeric columns |
+
+#### Built-in Methods
+
+| Method | Parameters | Description |
+|--------|-----------|-------------|
+| `ols` | — | Ordinary least squares via Cholesky decomposition |
+| `ridge` | `lambda: Float64` | L2-penalized regression (intercept not penalized) |
+| `wls` | `weights: column` | Weighted least squares |
+
+#### ModelResult
+
+The `model` clause produces a `ModelResult` — an opaque type wrapping the
+fitted model. When used as a `Table` (e.g. in `let m = df[model {...}]`),
+the coefficients table is returned with schema `{term: String, estimate: Float64}`.
+
+Accessor functions extract sub-tables from a `ModelResult`:
+
+| Accessor | Returns |
+|----------|---------|
+| `coef(m)` | `Table`: term, estimate |
+| `summary(m)` | `Table`: term, estimate, std_error, t_stat, p_value |
+| `fitted(m)` | `Table`: fitted (predicted values) |
+| `residuals(m)` | `Table`: residual (y − ŷ) |
+| `r_squared(m)` | `Float64`: coefficient of determination |
+
+Any function with the duck-typed signature `(X: Table, y: Table) -> Table` can
+be passed as `method = my_fn`, enabling user-defined estimators via the extern
+function system.
+
+#### Constraints
+
+| ID | Constraint |
+|----|-----------|
+| C24 | `model` is mutually exclusive with `select`, `update`, `by`, `distinct`, `melt`, `dcast`, `window`, `resample`, `rename`, `cov`, `corr`, `transpose` |
+| C25 | `model` requires a `method` parameter |
+| C26 | Response column must be numeric (Int64 or Float64) |
+| C27 | Number of observations must exceed number of parameters |
+
+### 5.6 Join Expressions
 
 Join expressions combine two DataFrames or TimeFrames using one or more key
 columns (equijoin) or an arbitrary boolean predicate (non-equijoin / theta join).
@@ -2669,7 +2754,7 @@ Highest precedence at top.
 
 ```
 let  mut  extern  fn  from  filter  select  update  distinct  order  by  window  join  left  right  outer  semi  anti  cross  asof  on
-rename  resample  import  Stream
+rename  resample  import  Stream  model
 asc  desc  true  false
 ```
 

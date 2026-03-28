@@ -39,6 +39,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"cov", TokenKind::KeywordCov},
         {"corr", TokenKind::KeywordCorr},
         {"transpose", TokenKind::KeywordTranspose},
+        {"model", TokenKind::KeywordModel},
         {"join", TokenKind::KeywordJoin},
         {"left", TokenKind::KeywordLeft},
         {"right", TokenKind::KeywordRight},
@@ -322,6 +323,12 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
                 continue;
             case '^':
                 add_token(TokenKind::Caret, token_start, 1, token_line, token_column);
+                continue;
+            case '~':
+                add_token(TokenKind::Tilde, token_start, 1, token_line, token_column);
+                continue;
+            case '.':
+                add_token(TokenKind::Dot, token_start, 1, token_line, token_column);
                 continue;
             case '(':
                 add_token(TokenKind::LParen, token_start, 1, token_line, token_column);

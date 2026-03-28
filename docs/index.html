@@ -1022,7 +1022,8 @@ Stream {
           <span class="tour-tag">Model Specification</span>
           <h3>R-style formula syntax for regression, built into the query bracket.</h3>
           <p>
-            The <code>model</code> clause lets you fit OLS, ridge, or WLS
+            The <code>model</code> clause lets you fit OLS, ridge, WLS, or the
+            plugin-backed <code>lightbm</code> method
             regressions with a familiar <code>y&nbsp;~&nbsp;x1&nbsp;+&nbsp;x2</code>
             formula. Ibex builds the design matrix automatically — numeric columns
             pass through, categorical columns are dummy-encoded, and interaction
@@ -1054,6 +1055,15 @@ Stream {
     close ~ open + volume,
     method = ridge,
     lambda = <span class="num">0.1</span>
+}];
+
+<span class="cm">// LightBM plugin method (load plugin first)</span>
+<span class="kw">import</span> <span class="str">"lightbm"</span>;
+<span class="kw">let</span> boosted = prices[<span class="kw">model</span> {
+    close ~ open + high + low + volume,
+    method = lightbm,
+    iterations = <span class="num">300</span>,
+    learning_rate = <span class="num">0.03</span>
 }];</code></pre>
         </div>
       </div>

@@ -1,0 +1,2 @@
+// LightBM model plugin stub.
+// Importing this file loads lightbm.so and registers `model_lightbm`.

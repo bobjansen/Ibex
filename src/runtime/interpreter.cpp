@@ -7664,7 +7664,7 @@ static auto build_model_result(const std::vector<std::string>& col_names,
 /// Fit a model using the specified method.
 static auto fit_model(const Table& input, const ir::ModelFormula& formula,
                       const std::string& method, const std::vector<ir::ModelParamSpec>& params,
-                      const ScalarRegistry* scalars, const ExternRegistry* /*externs*/)
+                      const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ModelResult, std::string> {
     // Build design matrix.
     auto matrix = build_model_matrix(input, formula);
@@ -7762,8 +7762,101 @@ static auto fit_model(const Table& input, const ir::ModelFormula& formula,
         return build_model_result(col_names, X, y.value(), beta.value(), formula, method);
     }
 
+    if (method == "lightbm") {
+        if (externs == nullptr) {
+            return std::unexpected(
+                "lightbm: plugin not available (import \"lightbm\" before using method = lightbm)");
+        }
+        const auto* fn = externs->find("model_lightbm");
+        if (fn == nullptr || !fn->first_arg_is_table || !fn->table_consumer_func) {
+            return std::unexpected(
+                "lightbm: plugin method 'model_lightbm' not registered "
+                "(import \"lightbm\" before using method = lightbm)");
+        }
+
+        std::int64_t iterations = 200;
+        double learning_rate = 0.05;
+        for (const auto& param : params) {
+            if (param.name == "iterations") {
+                if (const auto* lit = std::get_if<ir::Literal>(&param.value.node)) {
+                    if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                        iterations = *iv;
+                    } else if (const auto* dv = std::get_if<double>(&lit->value)) {
+                        iterations = static_cast<std::int64_t>(*dv);
+                    }
+                }
+            } else if (param.name == "learning_rate") {
+                if (const auto* lit = std::get_if<ir::Literal>(&param.value.node)) {
+                    if (const auto* dv = std::get_if<double>(&lit->value)) {
+                        learning_rate = *dv;
+                    } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                        learning_rate = static_cast<double>(*iv);
+                    }
+                }
+            }
+        }
+        if (iterations <= 0) {
+            return std::unexpected("lightbm: iterations must be > 0");
+        }
+        if (!(learning_rate > 0.0 && learning_rate <= 1.0)) {
+            return std::unexpected("lightbm: learning_rate must be in (0, 1]");
+        }
+
+        Table design_table;
+        for (std::size_t j = 0; j < p; ++j) {
+            design_table.add_column(col_names[j], Column<double>(X[j]));
+        }
+        design_table.add_column("__response", Column<double>(y.value()));
+
+        ExternArgs plugin_args;
+        plugin_args.emplace_back(ScalarValue{std::string("__response")});
+        plugin_args.emplace_back(ScalarValue{iterations});
+        plugin_args.emplace_back(ScalarValue{learning_rate});
+
+        auto plugin_result = fn->table_consumer_func(design_table, plugin_args);
+        if (!plugin_result) {
+            return std::unexpected("lightbm: " + plugin_result.error());
+        }
+
+        const auto* coef_table = std::get_if<Table>(&plugin_result.value());
+        if (coef_table == nullptr) {
+            return std::unexpected("lightbm: model_lightbm must return a coefficients table");
+        }
+        const auto* term_any = coef_table->find("term");
+        const auto* estimate_any = coef_table->find("estimate");
+        if (term_any == nullptr || estimate_any == nullptr) {
+            return std::unexpected("lightbm: coefficients table must include 'term' and 'estimate'");
+        }
+        const auto* term_col = std::get_if<Column<std::string>>(term_any);
+        const auto* estimate_col = std::get_if<Column<double>>(estimate_any);
+        if (term_col == nullptr || estimate_col == nullptr) {
+            return std::unexpected(
+                "lightbm: coefficients table columns must be term:String and estimate:Float64");
+        }
+        if (term_col->size() != estimate_col->size()) {
+            return std::unexpected("lightbm: coefficients table term/estimate length mismatch");
+        }
+
+        std::unordered_map<std::string, double> beta_by_term;
+        beta_by_term.reserve(term_col->size());
+        for (std::size_t i = 0; i < term_col->size(); ++i) {
+            beta_by_term.insert_or_assign((*term_col)[i], (*estimate_col)[i]);
+        }
+
+        std::vector<double> beta;
+        beta.reserve(col_names.size());
+        for (const auto& name : col_names) {
+            auto it = beta_by_term.find(name);
+            if (it == beta_by_term.end()) {
+                return std::unexpected("lightbm: missing coefficient for term '" + name + "'");
+            }
+            beta.push_back(it->second);
+        }
+        return build_model_result(col_names, X, y.value(), std::move(beta), formula, method);
+    }
+
     return std::unexpected("model: unknown method '" + method +
-                           "' (supported: ols, ridge, wls)");
+                           "' (supported: ols, ridge, wls, lightbm)");
 }
 
 // ─── Melt (wide → long) ──────────────────────────────────────────────────────

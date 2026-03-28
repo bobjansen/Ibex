@@ -61,6 +61,7 @@ add_subdirectory(libs/csv)
 add_subdirectory(libs/json)
 add_subdirectory(libs/udp)
 add_subdirectory(libs/websocket)
+add_subdirectory(libs/lightbm)
 
 # Tools
 if(IBEX_BUILD_TOOLS)

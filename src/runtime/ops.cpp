@@ -301,6 +301,44 @@ auto dcast(const runtime::Table& t, const std::string& pivot_col, const std::str
     return delegate(std::move(dcast_node), t);
 }
 
+auto cov(const runtime::Table& t) -> runtime::Table {
+    ir::Builder b;
+    auto scan = b.scan(kSrcKey);
+    auto node = b.cov();
+    node->add_child(std::move(scan));
+    return delegate(std::move(node), t);
+}
+
+auto corr(const runtime::Table& t) -> runtime::Table {
+    ir::Builder b;
+    auto scan = b.scan(kSrcKey);
+    auto node = b.corr();
+    node->add_child(std::move(scan));
+    return delegate(std::move(node), t);
+}
+
+auto transpose(const runtime::Table& t) -> runtime::Table {
+    ir::Builder b;
+    auto scan = b.scan(kSrcKey);
+    auto node = b.transpose();
+    node->add_child(std::move(scan));
+    return delegate(std::move(node), t);
+}
+
+auto matmul(const runtime::Table& left, const runtime::Table& right) -> runtime::Table {
+    constexpr const char* kRightKey = "__ibex_right__";
+    ir::Builder b;
+    auto left_scan = b.scan(kSrcKey);
+    auto right_scan = b.scan(kRightKey);
+    auto node = b.matmul();
+    node->add_child(std::move(left_scan));
+    node->add_child(std::move(right_scan));
+    runtime::TableRegistry reg;
+    reg.emplace(kSrcKey, left);
+    reg.emplace(kRightKey, right);
+    return delegate_with_registry(std::move(node), reg);
+}
+
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.

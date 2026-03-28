@@ -273,6 +273,23 @@ class Lowerer {
     }
 
     auto lower_table_call(const CallExpr& call) -> LowerResult {
+        if (call.callee == "matmul") {
+            if (call.args.size() != 2) {
+                return std::unexpected(LowerError{.message = "matmul expects exactly 2 arguments"});
+            }
+            auto left = lower_expr(*call.args[0]);
+            if (!left.has_value()) {
+                return left;
+            }
+            auto right = lower_expr(*call.args[1]);
+            if (!right.has_value()) {
+                return right;
+            }
+            auto node = builder_.matmul();
+            node->add_child(std::move(left.value()));
+            node->add_child(std::move(right.value()));
+            return node;
+        }
         if (call.callee == "as_timeframe") {
             if (call.args.size() != 2) {
                 return std::unexpected(LowerError{.message = "as_timeframe expects 2 arguments"});
@@ -441,6 +458,19 @@ class Lowerer {
             return std::unexpected(
                 LowerError{.message = "dcast requires a by clause for the row keys"});
         }
+        // cov / corr / transpose are standalone — mutually exclusive with most other clauses.
+        const bool has_matrix_op = state.cov || state.corr || state.transpose;
+        if (has_matrix_op &&
+            (state.select || state.update || state.by || state.distinct || state.melt ||
+             state.dcast || state.window || state.resample || state.rename)) {
+            return std::unexpected(LowerError{
+                .message = "cov/corr/transpose are mutually exclusive with select, update, by, "
+                           "distinct, melt, dcast, window, resample, and rename"});
+        }
+        if ((state.cov ? 1 : 0) + (state.corr ? 1 : 0) + (state.transpose ? 1 : 0) > 1) {
+            return std::unexpected(
+                LowerError{.message = "cov, corr, and transpose are mutually exclusive"});
+        }
 
         auto node = std::move(base.value());
 
@@ -571,6 +601,24 @@ class Lowerer {
             node = std::move(dcast_node);
         }
 
+        if (state.cov) {
+            auto cov_node = builder_.cov();
+            cov_node->add_child(std::move(node));
+            node = std::move(cov_node);
+        }
+
+        if (state.corr) {
+            auto corr_node = builder_.corr();
+            corr_node->add_child(std::move(node));
+            node = std::move(corr_node);
+        }
+
+        if (state.transpose) {
+            auto transpose_node = builder_.transpose();
+            transpose_node->add_child(std::move(node));
+            node = std::move(transpose_node);
+        }
+
         return node;
     }
 
@@ -586,6 +634,9 @@ class Lowerer {
         const ResampleClause* resample = nullptr;
         const MeltClause* melt = nullptr;
         const DcastClause* dcast = nullptr;
+        const CovClause* cov = nullptr;
+        const CorrClause* corr = nullptr;
+        const TransposeClause* transpose = nullptr;
         std::string error;
 
         auto record(const Clause& clause) -> bool {
@@ -675,6 +726,30 @@ class Lowerer {
                     return false;
                 }
                 dcast = &std::get<DcastClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<CovClause>(clause)) {
+                if (cov != nullptr) {
+                    error = "duplicate cov clause";
+                    return false;
+                }
+                cov = &std::get<CovClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<CorrClause>(clause)) {
+                if (corr != nullptr) {
+                    error = "duplicate corr clause";
+                    return false;
+                }
+                corr = &std::get<CorrClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<TransposeClause>(clause)) {
+                if (transpose != nullptr) {
+                    error = "duplicate transpose clause";
+                    return false;
+                }
+                transpose = &std::get<TransposeClause>(clause);
                 return true;
             }
             return true;
@@ -1750,6 +1825,22 @@ class Lowerer {
             case ir::NodeKind::Dcast: {
                 const auto& dn = static_cast<const ir::DcastNode&>(node);
                 clone = builder_.dcast(dn.pivot_column(), dn.value_column(), dn.row_keys());
+                break;
+            }
+            case ir::NodeKind::Cov: {
+                clone = builder_.cov();
+                break;
+            }
+            case ir::NodeKind::Corr: {
+                clone = builder_.corr();
+                break;
+            }
+            case ir::NodeKind::Transpose: {
+                clone = builder_.transpose();
+                break;
+            }
+            case ir::NodeKind::Matmul: {
+                clone = builder_.matmul();
                 break;
             }
             case ir::NodeKind::Construct: {

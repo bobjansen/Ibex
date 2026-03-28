@@ -1245,6 +1245,8 @@ The `model` clause fits a statistical model using an R-style formula syntax.
 df[model { response ~ predictors, method = ols }]
 df[filter cond, model { y ~ x1 + x2, method = ridge, lambda = 0.1 }]
 df[model { y ~ x1 * x2, method = wls, weights = w }]
+import "lightbm";
+df[model { y ~ x1 + x2, method = lightbm, iterations = 300, learning_rate = 0.03 }]
 df[model { y ~ ., method = ols }]
 df[model { y ~ x - 1, method = ols }]
 ```
@@ -1273,6 +1275,7 @@ df[model { y ~ x - 1, method = ols }]
 | `ols` | — | Ordinary least squares via Cholesky decomposition |
 | `ridge` | `lambda: Float64` | L2-penalized regression (intercept not penalized) |
 | `wls` | `weights: column` | Weighted least squares |
+| `lightbm` | `iterations: Int` (default 200), `learning_rate: Float64` (default 0.05) | Plugin-backed lightweight boosting model. Requires `import "lightbm"` so `model_lightbm` is registered. |
 
 #### ModelResult
 
@@ -1290,9 +1293,10 @@ Accessor functions extract sub-tables from a `ModelResult`:
 | `residuals(m)` | `Table`: residual (y − ŷ) |
 | `r_squared(m)` | `Float64`: coefficient of determination |
 
-Any function with the duck-typed signature `(X: Table, y: Table) -> Table` can
-be passed as `method = my_fn`, enabling user-defined estimators via the extern
-function system.
+`lightbm` is implemented through the plugin infrastructure: the runtime invokes
+the extern table-consumer function `model_lightbm(df, response, iterations, learning_rate)`.
+When the plugin is not loaded, `method = lightbm` returns an error that explains
+to import `"lightbm"` first.
 
 #### Constraints
 

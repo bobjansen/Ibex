@@ -16,7 +16,7 @@ import "lightbm";
 let prices = read_csv("examples/data/ohlcv.csv");
 
 // ── 1. Simple OLS: close price as a function of open and volume ─────────────
-let m1 = prices[model { close ~ open + volume }];
+let m1 = prices[model { close ~ open + volume, method=ols }];
 
 // m1 is a DataFrame of coefficients: (Intercept), open, volume
 // Access detailed results via accessor functions:

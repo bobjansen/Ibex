@@ -538,6 +538,9 @@ int main(int argc, char** argv) {
             status = run_suite_benchmarks(
                 {
                     {"hj_inner_small_left", "fact_small join dim_large on key"},
+                    {"hj_left_small_left", "fact_small left join dim_large on key"},
+                    {"hj_right_small_left", "fact_small right join dim_large on key"},
+                    {"hj_outer_small_left", "fact_small outer join dim_large on key"},
                 },
                 reg, warmup_iters, iters, verify);
         }
@@ -658,6 +661,7 @@ int main(int argc, char** argv) {
             status = run_suite_benchmarks(
                 {
                     {"i64_inner_small_left", "fact_small_i64 join dim_large_i64 on id"},
+                    {"i64_left_small_left", "fact_small_i64 left join dim_large_i64 on id"},
                     {"i64_semi_small_left", "fact_small_i64 semi join dim_large_i64 on id"},
                 },
                 reg, warmup_iters, iters, verify);

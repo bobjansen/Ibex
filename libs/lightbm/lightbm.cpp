@@ -35,7 +35,7 @@ auto fit(const runtime::Table& design_matrix, const std::string& response_col,
         if (col.name == response_col) {
             continue;
         }
-        const auto* x = std::get_if<Column<double>>(col.column);
+        const auto* x = std::get_if<Column<double>>(col.column.get());
         if (x == nullptr) {
             return std::unexpected("feature column '" + col.name + "' must be Float64");
         }
@@ -99,9 +99,9 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table("lightbm_version",
                              [](const ibex::runtime::ExternArgs&)
                                  -> std::expected<ibex::runtime::ExternValue, std::string> {
-                                 runtime::Table out;
-                                 out.add_column("name", Column<std::string>{"lightbm"});
-                                 out.add_column("version", Column<std::string>{"0.1"});
+                                 ibex::runtime::Table out;
+                                 out.add_column("name", ibex::Column<std::string>{"lightbm"});
+                                 out.add_column("version", ibex::Column<std::string>{"0.1"});
                                  return ibex::runtime::ExternValue{std::move(out)};
                              });
 

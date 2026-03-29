@@ -7956,7 +7956,7 @@ static auto build_model_result(const std::vector<std::string>& col_names,
 /// Fit a model using the specified method.
 static auto fit_model(const Table& input, const ir::ModelFormula& formula,
                       const std::string& method, const std::vector<ir::ModelParamSpec>& params,
-                      const ScalarRegistry* scalars, const ExternRegistry* externs)
+                      const ScalarRegistry* /*scalars*/, const ExternRegistry* externs)
     -> std::expected<ModelResult, std::string> {
     // Build design matrix.
     auto matrix = build_model_matrix(input, formula);
@@ -8132,7 +8132,7 @@ static auto fit_model(const Table& input, const ir::ModelFormula& formula,
             std::unordered_map<std::string, double> beta_by_term;
             beta_by_term.reserve(term_col->size());
             for (std::size_t i = 0; i < term_col->size(); ++i) {
-                beta_by_term.insert_or_assign((*term_col)[i], (*estimate_col)[i]);
+                beta_by_term.insert_or_assign(std::string((*term_col)[i]), (*estimate_col)[i]);
             }
 
             std::vector<double> beta;
@@ -8774,7 +8774,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         if (!str_intern[k].empty())
             return str_intern[k][r];  // interned string code
         return std::visit(
-            [r, kNullKey](const auto& c) -> std::int64_t {
+            [r](const auto& c) -> std::int64_t {
                 using T = std::decay_t<decltype(c)>;
                 if constexpr (std::is_same_v<T, Column<Categorical>>)
                     return static_cast<std::int64_t>(c.code_at(r));

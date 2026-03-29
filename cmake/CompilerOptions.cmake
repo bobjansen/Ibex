@@ -5,13 +5,38 @@ add_library(Ibex::CompilerOptions ALIAS ibex_compiler_options)
 
 target_compile_features(ibex_compiler_options INTERFACE cxx_std_23)
 
-# Clang paired with libstdc++ reports __cpp_concepts=201907L (the C++20 TS
-# value) instead of 202002L, which is required by libstdc++ 13's <expected>
-# guard. Defining it explicitly unlocks std::expected on this toolchain.
-target_compile_options(ibex_compiler_options
-    INTERFACE
-        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-D__cpp_concepts=202002L>
-)
+# Older Clang + libstdc++ combinations can report __cpp_concepts=201907L,
+# which makes libstdc++ reject <expected>. Probe the active toolchain first
+# and only enable the workaround when it is actually needed.
+include(CheckCXXSourceCompiles)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+    set(_ibex_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+    string(APPEND CMAKE_REQUIRED_FLAGS " -std=c++23")
+    check_cxx_source_compiles(
+        "
+        #include <expected>
+        #ifndef __cpp_concepts
+        #error __cpp_concepts missing
+        #endif
+        static_assert(__cpp_concepts >= 202002L);
+        int main() {
+            std::expected<int, int> x = 1;
+            return *x;
+        }
+        "
+        IBEX_TOOLCHAIN_HAS_WORKING_STD_EXPECTED
+    )
+    set(CMAKE_REQUIRED_FLAGS "${_ibex_saved_required_flags}")
+
+    if(NOT IBEX_TOOLCHAIN_HAS_WORKING_STD_EXPECTED)
+        message(STATUS "Ibex: enabling __cpp_concepts workaround for std::expected")
+        target_compile_options(ibex_compiler_options
+            INTERFACE
+                -D__cpp_concepts=202002L
+        )
+    endif()
+endif()
 
 target_compile_options(ibex_compiler_options
     INTERFACE

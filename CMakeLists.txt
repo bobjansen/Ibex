@@ -41,6 +41,7 @@ add_subdirectory(src/core)
 add_subdirectory(src/ir)
 add_subdirectory(src/parser)
 add_subdirectory(src/runtime)
+add_subdirectory(src/interop)
 add_subdirectory(src/codegen)
 
 # Umbrella interface library
@@ -53,6 +54,7 @@ target_link_libraries(ibex_lib
         Ibex::ir
         Ibex::parser
         Ibex::runtime
+        Ibex::interop
         Ibex::codegen
 )
 

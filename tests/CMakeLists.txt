@@ -3,6 +3,7 @@ include(Catch2Testing)
 add_library(ibex_test_warning_suppressions INTERFACE)
 
 add_executable(ibex_tests
+    test_arrow_c_data.cpp
     test_column.cpp
     test_csv.cpp
     test_json.cpp
@@ -32,6 +33,7 @@ target_link_libraries(ibex_tests
         Ibex::parser
         Ibex::repl
         Ibex::runtime
+        Ibex::interop
         Ibex::codegen
         Ibex::CompilerOptions
         Catch2::Catch2WithMain

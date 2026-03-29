@@ -1,0 +1,74 @@
+// Optiver "Trading at the Close" walkthrough on the local Kaggle dump.
+//
+// Expected local files:
+//   /home/brj/kaggle/data/train.csv
+//
+// The starter Kaggle notebook mostly wires up the evaluation loop. This file
+// does the more interesting part for Ibex: microstructure-style EDA on the
+// training table.
+
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+
+let train = read_csv("/home/brj/kaggle/data/train.csv", "<empty>");
+
+// Basic book- and auction-derived features.
+let book = train[update {
+    spread_bps         = 10000.0 * (ask_price - bid_price) / wap,
+    depth              = bid_size + ask_size,
+    book_imbalance     = (bid_size - ask_size) / (bid_size + ask_size),
+    auction_imbalance  = imbalance_buy_sell_flag * imbalance_size / (matched_size + 1.0),
+    target_sq          = target * target
+}];
+
+// 1. Which names are structurally wide, deep, and noisy?
+book[select {
+    rows                 = count(),
+    avg_spread_bps       = mean(spread_bps),
+    avg_depth            = mean(depth),
+    avg_book_imbalance   = mean(book_imbalance),
+    avg_target           = mean(target),
+    mean_squared_target  = mean(target_sq)
+}, by stock_id]
+[order { mean_squared_target desc }];
+
+// 2. How does the closing auction evolve through the 10-second buckets?
+book[select {
+    avg_spread_bps       = mean(spread_bps),
+    avg_depth            = mean(depth),
+    avg_book_imbalance   = mean(book_imbalance),
+    avg_auction_imbalance = mean(auction_imbalance),
+    avg_target           = mean(target)
+}, by seconds_in_bucket]
+[order { seconds_in_bucket asc }];
+
+// 3. Which stocks are missing far/near auction prices most often?
+let rows_by_stock = book[select { rows = count() }, by stock_id];
+let far_nulls = book[filter { far_price is null },
+                     select { far_null_rows = count() },
+                     by stock_id];
+let near_nulls = book[filter { near_price is null },
+                      select { near_null_rows = count() },
+                      by stock_id];
+
+let null_summary = rows_by_stock
+    left join far_nulls on stock_id
+    left join near_nulls on stock_id;
+
+null_summary[update {
+    far_null_rows  = fill_null(far_null_rows, 0),
+    near_null_rows = fill_null(near_null_rows, 0),
+    far_null_pct   = 100.0 * far_null_rows / rows,
+    near_null_pct  = 100.0 * near_null_rows / rows
+}]
+[order { far_null_pct desc }];
+
+// 4. Daily cross-section summary: dates with unusually large target dispersion.
+book[select {
+    avg_spread_bps       = mean(spread_bps),
+    avg_depth            = mean(depth),
+    avg_book_imbalance   = mean(book_imbalance),
+    avg_auction_imbalance = mean(auction_imbalance),
+    avg_target           = mean(target),
+    mean_squared_target  = mean(target_sq)
+}, by date_id]
+[order { mean_squared_target desc }];

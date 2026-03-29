@@ -75,6 +75,44 @@ TEST_CASE("Column range-for iteration", "[core][column]") {
     REQUIRE(sum == 60);
 }
 
+TEST_CASE("Column<bool> packs bits across word boundaries", "[core][column][bool]") {
+    ibex::Column<bool> col;
+    col.reserve(130);
+    for (std::size_t i = 0; i < 130; ++i) {
+        col.push_back((i % 3) == 0);
+    }
+
+    REQUIRE(col.size() == 130);
+    REQUIRE(col.word_count() == 3);
+    REQUIRE(col[0] == true);
+    REQUIRE(col[1] == false);
+    REQUIRE(col[63] == true);
+    REQUIRE(col[64] == false);
+    REQUIRE(col[129] == true);
+}
+
+TEST_CASE("Column<bool> supports mutation and resize", "[core][column][bool]") {
+    ibex::Column<bool> col{true, false, true};
+
+    col[1] = true;
+    col.resize(6, true);
+    col[4] = false;
+
+    REQUIRE(col.size() == 6);
+    REQUIRE(col[0] == true);
+    REQUIRE(col[1] == true);
+    REQUIRE(col[2] == true);
+    REQUIRE(col[3] == true);
+    REQUIRE(col[4] == false);
+    REQUIRE(col[5] == true);
+
+    col.assign(70, false);
+    REQUIRE(col.size() == 70);
+    REQUIRE(col.word_count() == 2);
+    REQUIRE(col[0] == false);
+    REQUIRE(col[69] == false);
+}
+
 // ─── Column<std::string> flat-buffer specialization ─────────────────────────
 
 TEST_CASE("Column<string> default-constructs empty", "[core][column][string]") {
@@ -177,7 +215,8 @@ TEST_CASE("Categorical push_back and access", "[core][column][categorical]") {
     REQUIRE(col[2] == "AAPL");
 }
 
-TEST_CASE("Categorical shares dictionary codes for repeated values", "[core][column][categorical]") {
+TEST_CASE("Categorical shares dictionary codes for repeated values",
+          "[core][column][categorical]") {
     ibex::Column<ibex::Categorical> col;
     col.push_back("A");
     col.push_back("B");

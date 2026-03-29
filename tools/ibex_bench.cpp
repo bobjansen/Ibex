@@ -906,6 +906,7 @@ int main(int argc, char** argv) {
     std::size_t reshape_rows = 100'000;
     std::size_t merge_validity_rows = 4'000'000;
     std::size_t rng_micro_rows = 4'000'000;
+    std::size_t bool_rows = 4'000'000;
     std::vector<std::string> suites;
 
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
@@ -946,18 +947,21 @@ int main(int argc, char** argv) {
     app.add_option("--rng-micro-rows", rng_micro_rows,
                    "Row count for rng_micro kernel benchmark (default: 4000000)")
         ->check(CLI::PositiveNumber);
+    app.add_option("--bool-rows", bool_rows,
+                   "Row count for bool-column benchmark suite (default: 4000000)")
+        ->check(CLI::PositiveNumber);
     app.add_option("--suite", suites,
                    "Benchmark suite(s) to run (comma-separated or repeated). "
                    "Supported: all, core, cumulative, rng, fill, null, filter, multi, "
-                   "events, reshape, timeframe, merge_validity, rng_micro")
+                   "events, reshape, timeframe, merge_validity, rng_micro, bool")
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
-        "all",   "core",   "cumulative", "rng",       "fill",           "null",     "filter",
-        "multi", "events", "reshape",    "timeframe", "merge_validity", "rng_micro"};
+        "all",   "core",   "cumulative", "rng",       "fill",           "null",      "filter",
+        "multi", "events", "reshape",    "timeframe", "merge_validity", "rng_micro", "bool"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -977,7 +981,7 @@ int main(int argc, char** argv) {
             return false;
         }
         // Keep legacy --suite all behavior stable; micro suites are opt-in.
-        return suite != "merge_validity" && suite != "rng_micro";
+        return suite != "merge_validity" && suite != "rng_micro" && suite != "bool";
     };
 
     int status = 0;
@@ -1633,6 +1637,56 @@ int main(int argc, char** argv) {
 
         for (const auto& query : tf_queries) {
             status = run_benchmark(query, tf_tables, warmup_iters, iters, saved_include_parse);
+            if (status != 0) {
+                break;
+            }
+        }
+    }
+
+    // Bool-column benchmarks: isolate projection/gather/sort/group patterns on
+    // a large in-memory bool column so storage changes can be measured directly.
+    if (status == 0 && run_suite("bool")) {
+        ibex::runtime::Table bool_table;
+        {
+            ibex::Column<std::int64_t> id_col;
+            ibex::Column<double> value_col;
+            ibex::Column<bool> flag_col;
+            ibex::Column<bool> alt_flag_col;
+
+            id_col.reserve(bool_rows);
+            value_col.reserve(bool_rows);
+            flag_col.reserve(bool_rows);
+            alt_flag_col.reserve(bool_rows);
+
+            for (std::size_t i = 0; i < bool_rows; ++i) {
+                id_col.push_back(static_cast<std::int64_t>(i));
+                value_col.push_back(static_cast<double>((i * 17) % 1000));
+                flag_col.push_back((i & 1U) == 0U);
+                alt_flag_col.push_back((i % 3U) == 0U);
+            }
+
+            bool_table.add_column("id", std::move(id_col));
+            bool_table.add_column("value", std::move(value_col));
+            bool_table.add_column("flag", std::move(flag_col));
+            bool_table.add_column("alt_flag", std::move(alt_flag_col));
+        }
+
+        ibex::runtime::TableRegistry bool_tables;
+        bool_tables.emplace("bool_data", std::move(bool_table));
+        if (print_types) {
+            print_table_types("bool_data", bool_tables.find("bool_data")->second);
+        }
+
+        fmt::print("\n-- Bool-column benchmarks ({} rows) --\n", bool_rows);
+        std::vector<BenchQuery> bool_queries = {
+            {"bool_project", "bool_data[select { id, flag, alt_flag }]"},
+            {"bool_filter_project",
+             "bool_data[filter value > 500.0, select { id, flag, alt_flag }]"},
+            {"bool_order", "bool_data[order { flag asc, id asc }]"},
+            {"bool_update_copy", "bool_data[update { flag_copy = flag }]"},
+        };
+        for (const auto& query : bool_queries) {
+            status = run_benchmark(query, bool_tables, warmup_iters, iters, saved_include_parse);
             if (status != 0) {
                 break;
             }

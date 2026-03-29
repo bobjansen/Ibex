@@ -152,6 +152,33 @@ TEST_CASE("join: left join preserves left rows", "[join]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 200, 300});
 }
 
+TEST_CASE("join: left join preserves left row order when left side is smaller", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{2, 1, 4});
+    lhs.add_column("lval", Column<std::int64_t>{20, 10, 40});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 1, 3, 5});
+    rhs.add_column("rval", Column<std::int64_t>{100, 200, 101, 300, 500});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs left join rhs on id;", tables);
+
+    CHECK(out.rows() == 4);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 1, 1, 4});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 10, 10, 40});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 100, 101, 0});
+
+    const auto& rval_entry = out.columns[out.index.at("rval")];
+    CHECK_FALSE(runtime::is_null(rval_entry, 0));
+    CHECK_FALSE(runtime::is_null(rval_entry, 1));
+    CHECK_FALSE(runtime::is_null(rval_entry, 2));
+    CHECK(runtime::is_null(rval_entry, 3));
+}
+
 TEST_CASE("join: multi-key join and duplicate column names", "[join]") {
     runtime::Table lhs;
     lhs.add_column("k1", Column<std::int64_t>{1, 1});
@@ -408,6 +435,38 @@ TEST_CASE("join: outer join row count and key values", "[join]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 200, 300, 400});
 }
 
+TEST_CASE("join: outer join preserves left rows first when left side is smaller", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("key", Column<std::string>{"B", "A", "D"});
+    lhs.add_column("lval", Column<std::int64_t>{20, 10, 40});
+
+    runtime::Table rhs;
+    rhs.add_column("key", Column<std::string>{"A", "C", "B", "E"});
+    rhs.add_column("rval", Column<std::int64_t>{100, 300, 200, 500});
+
+    auto result = runtime::join_tables(lhs, rhs, ir::JoinKind::Outer, {"key"});
+    REQUIRE(result.has_value());
+    auto& t = *result;
+
+    REQUIRE(t.rows() == 5);
+    CHECK(col_str(t, "key") == std::vector<std::string>{"B", "A", "D", "C", "E"});
+    CHECK(col_i64(t, "lval") == std::vector<std::int64_t>{20, 10, 40, 0, 0});
+    CHECK(col_i64(t, "rval") == std::vector<std::int64_t>{200, 100, 0, 300, 500});
+
+    const auto& lval_entry = t.columns[t.index.at("lval")];
+    const auto& rval_entry = t.columns[t.index.at("rval")];
+    CHECK_FALSE(runtime::is_null(lval_entry, 0));
+    CHECK_FALSE(runtime::is_null(lval_entry, 1));
+    CHECK_FALSE(runtime::is_null(lval_entry, 2));
+    CHECK(runtime::is_null(lval_entry, 3));
+    CHECK(runtime::is_null(lval_entry, 4));
+    CHECK_FALSE(runtime::is_null(rval_entry, 0));
+    CHECK_FALSE(runtime::is_null(rval_entry, 1));
+    CHECK(runtime::is_null(rval_entry, 2));
+    CHECK_FALSE(runtime::is_null(rval_entry, 3));
+    CHECK_FALSE(runtime::is_null(rval_entry, 4));
+}
+
 TEST_CASE("join: outer join null semantics — left-only rows null right columns", "[join]") {
     // lhs: id {1, 2},  name {"alice", "bob"}
     // rhs: id {2, 3},  score {20.0, 30.0}
@@ -534,6 +593,68 @@ TEST_CASE("join: right join preserves right rows", "[join]") {
     CHECK_FALSE(runtime::is_null(lval_entry, 1));
     // row 2 (id=4) is right-only → lval null
     CHECK(runtime::is_null(lval_entry, 2));
+}
+
+TEST_CASE(
+    "join: right join appends unmatched right rows after left-ordered matches when left side is "
+    "smaller",
+    "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{2, 1});
+    lhs.add_column("lval", Column<std::int64_t>{20, 10});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 3, 2, 4, 1});
+    rhs.add_column("rval", Column<std::int64_t>{100, 300, 200, 400, 101});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs right join rhs on id;", tables);
+
+    REQUIRE(out.rows() == 5);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 1, 1, 3, 4});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 10, 10, 0, 0});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 100, 101, 300, 400});
+
+    const auto& lval_entry = out.columns[out.index.at("lval")];
+    CHECK_FALSE(runtime::is_null(lval_entry, 0));
+    CHECK_FALSE(runtime::is_null(lval_entry, 1));
+    CHECK_FALSE(runtime::is_null(lval_entry, 2));
+    CHECK(runtime::is_null(lval_entry, 3));
+    CHECK(runtime::is_null(lval_entry, 4));
+}
+
+TEST_CASE("join: multi-key outer join preserves left rows first when left side is smaller",
+          "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{2, 1});
+    lhs.add_column("bucket", Column<std::int64_t>{10, 20});
+    lhs.add_column("lval", Column<std::int64_t>{200, 100});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 3, 2, 4});
+    rhs.add_column("bucket", Column<std::int64_t>{20, 30, 10, 40});
+    rhs.add_column("rval", Column<std::int64_t>{500, 700, 600, 800});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs outer join rhs on {id, bucket};", tables);
+
+    REQUIRE(out.rows() == 4);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 1, 3, 4});
+    CHECK(col_i64(out, "bucket") == std::vector<std::int64_t>{10, 20, 30, 40});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{200, 100, 0, 0});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{600, 500, 700, 800});
+
+    const auto& lval_entry = out.columns[out.index.at("lval")];
+    CHECK_FALSE(runtime::is_null(lval_entry, 0));
+    CHECK_FALSE(runtime::is_null(lval_entry, 1));
+    CHECK(runtime::is_null(lval_entry, 2));
+    CHECK(runtime::is_null(lval_entry, 3));
 }
 
 TEST_CASE("join: cross join returns cartesian product", "[join]") {

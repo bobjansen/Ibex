@@ -2703,24 +2703,37 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
     };
 
-    // Build-left path for inner joins when the left side is smaller.
-    // To preserve the language's left-row ordering contract, scan the right
-    // side twice: first count matches per left row, then fill a flat
-    // right-row buffer grouped by left row, and finally emit in left order.
-    auto emit_inner_matches_from_right_scan = [&](auto&& for_each_left_match_for_right_row) {
+    // Build-left path for equijoins when the left side is smaller.
+    // To preserve the language's row-ordering contract, scan the right side
+    // twice: first count matches per left row and track matched right rows,
+    // then fill a flat right-row buffer grouped by left row, and finally emit
+    // left rows in left order before any unmatched right rows.
+    auto emit_preserving_rows_from_right_scan = [&](auto&& for_each_left_match_for_right_row) {
         std::vector<std::size_t> match_counts(left.rows(), 0);
         std::size_t total_matches = 0;
+        std::vector<std::uint8_t> right_matched_build_left;
+        if (preserve_right_rows) {
+            right_matched_build_left.assign(right.rows(), 0U);
+        }
 
         for (std::size_t r = 0; r < right.rows(); ++r) {
+            bool right_has_match = false;
             for_each_left_match_for_right_row(r, [&](std::size_t l) {
                 ++match_counts[l];
                 ++total_matches;
+                right_has_match = true;
             });
+            if (preserve_right_rows && right_has_match) {
+                right_matched_build_left[r] = 1U;
+            }
         }
 
         std::vector<std::size_t> match_offsets(left.rows() + 1, 0);
+        std::size_t left_phase_rows = 0;
         for (std::size_t l = 0; l < left.rows(); ++l) {
             match_offsets[l + 1] = match_offsets[l] + match_counts[l];
+            left_phase_rows +=
+                match_counts[l] == 0 ? (preserve_left_rows ? 1U : 0U) : match_counts[l];
         }
 
         std::vector<std::size_t> right_matches(total_matches);
@@ -2730,14 +2743,36 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 r, [&](std::size_t l) { right_matches[next_offsets[l]++] = r; });
         }
 
+        std::size_t unmatched_right_rows = 0;
+        if (preserve_right_rows) {
+            unmatched_right_rows = static_cast<std::size_t>(std::count(
+                right_matched_build_left.begin(), right_matched_build_left.end(), std::uint8_t{0}));
+        }
+        const std::size_t total_output_rows = left_phase_rows + unmatched_right_rows;
         for (auto& ce : output.columns) {
-            std::visit([total_matches](auto& c) { c.reserve(total_matches); }, *ce.column);
+            std::visit([total_output_rows](auto& c) { c.reserve(total_output_rows); }, *ce.column);
         }
 
         for (std::size_t l = 0; l < left.rows(); ++l) {
+            if (match_counts[l] == 0) {
+                if (preserve_left_rows) {
+                    append_left_row(l);
+                    append_right_defaults();
+                }
+                continue;
+            }
             for (std::size_t idx = match_offsets[l]; idx < match_offsets[l + 1]; ++idx) {
                 append_left_row(l);
                 append_right_row(right_matches[idx]);
+            }
+        }
+
+        if (preserve_right_rows) {
+            for (std::size_t r = 0; r < right.rows(); ++r) {
+                if (right_matched_build_left[r] == 0U) {
+                    append_left_defaults_from_right(r);
+                    append_right_row(r);
+                }
             }
         }
     };
@@ -2890,7 +2925,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     if (kind != ir::JoinKind::Asof && keys.size() == 1 &&
         (std::holds_alternative<Column<std::string>>(*left_keys[0]) ||
          std::holds_alternative<Column<Categorical>>(*left_keys[0]))) {
-        if (left.rows() < right.rows() && (kind == ir::JoinKind::Inner || semi_join || anti_join)) {
+        if (left.rows() < right.rows()) {
             std::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
                                std::equal_to<std::string_view>>
                 left_sv_index;
@@ -2921,11 +2956,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             };
 
-            if (kind == ir::JoinKind::Inner) {
-                emit_inner_matches_from_right_scan(emit_left_matches_for_right_row);
-            } else {
+            if (semi_join || anti_join) {
                 emit_membership_rows_from_right_scan(emit_left_matches_for_right_row);
+            } else {
+                emit_preserving_rows_from_right_scan(emit_left_matches_for_right_row);
             }
+            finalize_left_validity();
+            finalize_right_validity();
             return output;
         }
 
@@ -3024,7 +3061,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         const auto& left_ints = std::get<Column<std::int64_t>>(*left_keys[0]);
         const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
 
-        if (left.rows() < right.rows() && (kind == ir::JoinKind::Inner || semi_join || anti_join)) {
+        if (left.rows() < right.rows()) {
             std::unordered_map<std::int64_t, std::vector<std::size_t>> left_int_index;
             left_int_index.reserve(left.rows());
             for (std::size_t l = 0; l < left.rows(); ++l) {
@@ -3041,11 +3078,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             };
 
-            if (kind == ir::JoinKind::Inner) {
-                emit_inner_matches_from_right_scan(emit_left_matches_for_right_row);
-            } else {
+            if (semi_join || anti_join) {
                 emit_membership_rows_from_right_scan(emit_left_matches_for_right_row);
+            } else {
+                emit_preserving_rows_from_right_scan(emit_left_matches_for_right_row);
             }
+            finalize_left_validity();
+            finalize_right_validity();
             return output;
         }
 
@@ -3216,7 +3255,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
 
     std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_index;
-    if (left.rows() < right.rows() && (kind == ir::JoinKind::Inner || semi_join || anti_join)) {
+    if (left.rows() < right.rows()) {
         std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> left_index;
         left_index.reserve(left.rows());
         for (std::size_t l = 0; l < left.rows(); ++l) {
@@ -3243,11 +3282,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         };
 
-        if (kind == ir::JoinKind::Inner) {
-            emit_inner_matches_from_right_scan(emit_left_matches_for_right_row);
-        } else {
+        if (semi_join || anti_join) {
             emit_membership_rows_from_right_scan(emit_left_matches_for_right_row);
+        } else {
+            emit_preserving_rows_from_right_scan(emit_left_matches_for_right_row);
         }
+        finalize_left_validity();
+        finalize_right_validity();
         return output;
     }
 

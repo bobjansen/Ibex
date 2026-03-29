@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <emmintrin.h>
+#include <immintrin.h>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -261,6 +262,38 @@ auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_
                                 ((out_words[full_words] & b_words[full_words]) & mask);
     }
     return out;
+}
+
+auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept -> std::uint64_t {
+#if defined(__BMI2__)
+    return _pext_u64(values, mask);
+#else
+    std::uint64_t packed = 0;
+    unsigned out_bit = 0;
+    while (mask != 0) {
+        const unsigned bit = static_cast<unsigned>(std::countr_zero(mask));
+        packed |= ((values >> bit) & std::uint64_t{1}) << out_bit;
+        ++out_bit;
+        mask &= (mask - 1);
+    }
+    return packed;
+#endif
+}
+
+auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
+                             Column<bool>::word_type* dst_words, std::size_t& out_bit) noexcept
+    -> void {
+    if (count == 0) {
+        return;
+    }
+    constexpr std::size_t kBitsPerWord = sizeof(Column<bool>::word_type) * 8;
+    const std::size_t dst_word = out_bit / kBitsPerWord;
+    const unsigned shift = static_cast<unsigned>(out_bit % kBitsPerWord);
+    dst_words[dst_word] |= packed << shift;
+    if (shift != 0 && count > kBitsPerWord - shift) {
+        dst_words[dst_word + 1] |= packed >> (kBitsPerWord - shift);
+    }
+    out_bit += count;
 }
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
@@ -1535,8 +1568,19 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                     });
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     dst->resize(out_n);
-                    std::size_t j = 0;
-                    for_each_selected([&](std::size_t si) { dst->set(j++, src[si]); });
+                    auto* __restrict dst_words = dst->words_data();
+                    const auto* __restrict src_words = src.words_data();
+                    std::size_t out_bit = 0;
+                    for (std::size_t w = 0; w < n_words; ++w) {
+                        const std::uint64_t select = keep_words[w];
+                        if (select == 0) {
+                            continue;
+                        }
+                        const std::uint64_t packed = pack_selected_bool_bits(src_words[w], select);
+                        append_packed_bool_bits(packed,
+                                                static_cast<std::size_t>(std::popcount(select)),
+                                                dst_words, out_bit);
+                    }
                 } else {
                     using T = typename ColT::value_type;
                     dst->resize(out_n);
@@ -7032,6 +7076,18 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 continue;
             }
         }
+        if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
+            const auto* entry = output.find_entry(col_ref->name);
+            if (entry == nullptr) {
+                return std::unexpected("unknown column '" + col_ref->name + "'");
+            }
+            if (entry->validity.has_value()) {
+                output.add_column(field.alias, *entry->column, *entry->validity);
+            } else {
+                output.add_column(field.alias, *entry->column);
+            }
+            continue;
+        }
         auto col = evaluate_field_column(field.expr, output, scalars, externs);
         if (!col) {
             return std::unexpected(col.error());
@@ -7119,6 +7175,18 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+        }
+        if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
+            const auto* entry = output.find_entry(col_ref->name);
+            if (entry == nullptr) {
+                return std::unexpected("unknown column '" + col_ref->name + "'");
+            }
+            if (entry->validity.has_value()) {
+                output.add_column(field.alias, *entry->column, *entry->validity);
+            } else {
+                output.add_column(field.alias, *entry->column);
+            }
+            continue;
         }
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);
         if (!inferred) {

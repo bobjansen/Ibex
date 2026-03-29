@@ -3965,6 +3965,26 @@ TEST_CASE("update: double column * double column = double", "[update][types]") {
     REQUIRE(col[2] == Catch::Approx(12.0));
 }
 
+TEST_CASE("update: direct bool column copy preserves values", "[update][bool]") {
+    runtime::Table table;
+    table.add_column("flag", Column<bool>{true, false, true, true});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { flag_copy = flag }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* copied = std::get_if<Column<bool>>(result->find("flag_copy"));
+    REQUIRE(copied != nullptr);
+    REQUIRE(copied->size() == 4);
+    REQUIRE((*copied)[0] == true);
+    REQUIRE((*copied)[1] == false);
+    REQUIRE((*copied)[2] == true);
+    REQUIRE((*copied)[3] == true);
+}
+
 // ─── Matrix Operations ────────────────────────────────────────────────────────
 
 TEST_CASE("cov: diagonal equals variance", "[cov][matrix]") {

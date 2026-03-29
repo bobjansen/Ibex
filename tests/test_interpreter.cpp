@@ -4179,6 +4179,26 @@ TEST_CASE("model: OLS simple regression", "[model]") {
     REQUIRE(model_out.n_params == 2);
 }
 
+TEST_CASE("model: omitted method defaults to ols", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x }];");
+    runtime::ModelResult model_out;
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr, &model_out);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(estimates[0] == Catch::Approx(1.0));
+    REQUIRE(estimates[1] == Catch::Approx(2.0));
+    REQUIRE(model_out.method == "ols");
+}
+
 TEST_CASE("model: OLS multiple regression", "[model]") {
     // y = 1 + 2*x1 + 3*x2
     runtime::Table t;

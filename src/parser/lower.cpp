@@ -473,10 +473,9 @@ class Lowerer {
         }
 
         // model is standalone — mutually exclusive with most other clauses.
-        if (state.model &&
-            (state.select || state.update || state.by || state.distinct || state.melt ||
-             state.dcast || state.window || state.resample || state.rename || state.cov ||
-             state.corr || state.transpose)) {
+        if (state.model && (state.select || state.update || state.by || state.distinct ||
+                            state.melt || state.dcast || state.window || state.resample ||
+                            state.rename || state.cov || state.corr || state.transpose)) {
             return std::unexpected(LowerError{
                 .message = "model is mutually exclusive with select, update, by, distinct, "
                            "melt, dcast, window, resample, rename, cov, corr, and transpose"});
@@ -1017,19 +1016,19 @@ class Lowerer {
         return builder_.update(std::move(fields), std::move(tuple_specs), std::move(group_by));
     }
 
-    auto lower_model(const ModelClause& clause) -> std::expected<
-        std::tuple<ir::ModelFormula, std::string, std::vector<ir::ModelParamSpec>>, LowerError> {
+    auto lower_model(const ModelClause& clause)
+        -> std::expected<std::tuple<ir::ModelFormula, std::string, std::vector<ir::ModelParamSpec>>,
+                         LowerError> {
         // Convert AST formula → IR formula.
         ir::ModelFormula formula;
         formula.response = clause.formula.response;
         formula.has_intercept = clause.formula.has_intercept;
         for (const auto& term : clause.formula.terms) {
-            formula.terms.push_back(
-                ir::ModelTerm{.columns = term.columns, .is_dot = term.is_dot});
+            formula.terms.push_back(ir::ModelTerm{.columns = term.columns, .is_dot = term.is_dot});
         }
 
-        // Extract method name (required).
-        std::string method;
+        // Extract method name; default to OLS when omitted.
+        std::string method = "ols";
         std::vector<ir::ModelParamSpec> params;
         for (const auto& p : clause.params) {
             if (p.name == "method") {
@@ -1047,10 +1046,6 @@ class Lowerer {
                 params.push_back(
                     ir::ModelParamSpec{.name = p.name, .value = std::move(expr.value())});
             }
-        }
-        if (method.empty()) {
-            return std::unexpected(
-                LowerError{.message = "model clause requires a method parameter (e.g. method = ols)"});
         }
         return std::make_tuple(std::move(formula), std::move(method), std::move(params));
     }

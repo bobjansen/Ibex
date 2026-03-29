@@ -81,6 +81,23 @@ filtered[select { price }];
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("REPL supports model bindings with default ols and model accessors") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let t = Table { x = [1.0, 2.0, 3.0, 4.0, 5.0], y = [3.0, 5.0, 7.0, 9.0, 11.0] };
+let m = t[model { y ~ x }];
+let coefs = model_coef(m);
+let stats = model_summary(m);
+let yhat = model_fitted(m);
+let resid = model_residuals(m);
+let r2 = model_r_squared(m);
+r2;
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
 TEST_CASE("REPL returns false on parse error") {
     ibex::runtime::ExternRegistry registry;
     // Missing closing bracket
@@ -135,14 +152,14 @@ TEST_CASE("REPL executes tuple let binding from DataFrame") {
     ibex::runtime::ExternRegistry registry;
 
     // Returns a 2-column DataFrame: (x, y)
-    registry.register_table(
-        "make_xy",
-        [](const ibex::runtime::ExternArgs&) -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("x", ibex::Column<std::int64_t>{1, 2, 3});
-            t.add_column("y", ibex::Column<std::int64_t>{4, 5, 6});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("make_xy",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("x", ibex::Column<std::int64_t>{1, 2, 3});
+                                t.add_column("y", ibex::Column<std::int64_t>{4, 5, 6});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn make_xy() -> DataFrame from "fake.hpp";
@@ -155,14 +172,14 @@ x;
 TEST_CASE("REPL tuple let binding: column count mismatch fails") {
     ibex::runtime::ExternRegistry registry;
 
-    registry.register_table(
-        "make_two",
-        [](const ibex::runtime::ExternArgs&) -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("a", ibex::Column<std::int64_t>{1, 2});
-            t.add_column("b", ibex::Column<std::int64_t>{3, 4});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("make_two",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("a", ibex::Column<std::int64_t>{1, 2});
+                                t.add_column("b", ibex::Column<std::int64_t>{3, 4});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn make_two() -> DataFrame from "fake.hpp";
@@ -192,14 +209,14 @@ TEST_CASE("seed_rng rejects wrong argument count") {
 TEST_CASE("REPL tuple let binding: bound columns usable in expressions") {
     ibex::runtime::ExternRegistry registry;
 
-    registry.register_table(
-        "make_cols",
-        [](const ibex::runtime::ExternArgs&) -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("p", ibex::Column<std::int64_t>{10, 20, 30});
-            t.add_column("q", ibex::Column<std::int64_t>{1, 2, 3});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("make_cols",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("p", ibex::Column<std::int64_t>{10, 20, 30});
+                                t.add_column("q", ibex::Column<std::int64_t>{1, 2, 3});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     // After tuple binding, each name should be available as a Series in further expressions.
     const char* src = R"(
@@ -284,14 +301,13 @@ f(1.5);
 
 TEST_CASE("type annotation: DataFrame schema validates correct column types") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("price", ibex::Column<double>{1.0, 2.0});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("price", ibex::Column<double>{1.0, 2.0});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";
@@ -303,15 +319,14 @@ df;
 
 TEST_CASE("type annotation: DataFrame schema allows extra columns") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("price", ibex::Column<double>{1.0, 2.0});
-            t.add_column("symbol", ibex::Column<std::string>{"A", "B"});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("price", ibex::Column<double>{1.0, 2.0});
+                                t.add_column("symbol", ibex::Column<std::string>{"A", "B"});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     // Schema only declares 'price'; 'symbol' is an extra column and should be allowed.
     const char* src = R"(
@@ -324,15 +339,14 @@ df;
 
 TEST_CASE("type annotation: DataFrame schema rejects wrong column type") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            // price is Int64 but schema declares Float64
-            t.add_column("price", ibex::Column<std::int64_t>{1, 2});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                // price is Int64 but schema declares Float64
+                                t.add_column("price", ibex::Column<std::int64_t>{1, 2});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";
@@ -344,14 +358,13 @@ df;
 
 TEST_CASE("type annotation: DataFrame schema rejects missing column") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("symbol", ibex::Column<std::string>{"A", "B"});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("symbol", ibex::Column<std::string>{"A", "B"});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     // Schema requires 'price' which is absent from the table.
     const char* src = R"(
@@ -364,14 +377,13 @@ df;
 
 TEST_CASE("type annotation: bare DataFrame schema (no fields) skips validation") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("price", ibex::Column<std::int64_t>{1, 2});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("price", ibex::Column<std::int64_t>{1, 2});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     // Bare DataFrame with no schema should not validate column types.
     const char* src = R"(
@@ -448,14 +460,13 @@ TEST_CASE("cast: let binding Int64 from fractional Float is a runtime error") {
 
 TEST_CASE("cast: Float64 applied to Int column converts element types") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("n", ibex::Column<std::int64_t>{1, 2, 3});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("n", ibex::Column<std::int64_t>{1, 2, 3});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";
@@ -469,14 +480,13 @@ f;
 
 TEST_CASE("cast: Int64 applied to whole-number Float column converts element types") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("v", ibex::Column<double>{1.0, 2.0, 3.0});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("v", ibex::Column<double>{1.0, 2.0, 3.0});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";
@@ -490,14 +500,13 @@ i;
 
 TEST_CASE("cast: Int64 applied to fractional Float column is a runtime error") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("v", ibex::Column<double>{1.1, 2.9, 3.5});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("v", ibex::Column<double>{1.1, 2.9, 3.5});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";
@@ -556,14 +565,13 @@ TEST_CASE("round: Int argument is an error") {
 
 TEST_CASE("round: applied to Float column with nearest mode") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("v", ibex::Column<double>{1.4, 2.5, 3.6});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("v", ibex::Column<double>{1.4, 2.5, 3.6});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";
@@ -577,14 +585,13 @@ r;
 
 TEST_CASE("round: applied to Int column is an error") {
     ibex::runtime::ExternRegistry registry;
-    registry.register_table(
-        "get_data",
-        [](const ibex::runtime::ExternArgs&)
-            -> std::expected<ibex::runtime::ExternValue, std::string> {
-            ibex::runtime::Table t;
-            t.add_column("n", ibex::Column<std::int64_t>{1, 2, 3});
-            return ibex::runtime::ExternValue{std::move(t)};
-        });
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("n", ibex::Column<std::int64_t>{1, 2, 3});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";

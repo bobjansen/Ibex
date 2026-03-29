@@ -1242,13 +1242,13 @@ the output remains a `TimeFrame`.
 The `model` clause fits a statistical model using an R-style formula syntax.
 
 ```
-df[model { response ~ predictors, method = ols }]
+df[model { response ~ predictors }]
 df[filter cond, model { y ~ x1 + x2, method = ridge, lambda = 0.1 }]
 df[model { y ~ x1 * x2, method = wls, weights = w }]
 import "lightbm";
 df[model { y ~ x1 + x2, method = lightbm, iterations = 300, learning_rate = 0.03 }]
-df[model { y ~ ., method = ols }]
-df[model { y ~ x - 1, method = ols }]
+df[model { y ~ . }]
+df[model { y ~ x - 1 }]
 ```
 
 #### Formula Syntax
@@ -1268,6 +1268,8 @@ df[model { y ~ x - 1, method = ols }]
 | Intercept | Column of 1.0 prepended by default; suppressed with `- 1` |
 | Interaction `a:b` | Element-wise product of numeric columns |
 
+The `method` parameter is optional; when omitted, Ibex uses `ols`.
+
 #### Built-in Methods
 
 | Method | Parameters | Description |
@@ -1286,11 +1288,11 @@ Accessor functions extract sub-tables from a `ModelResult`:
 
 | Accessor | Returns |
 |----------|---------|
-| `coef(m)` | `Table`: term, estimate |
-| `summary(m)` | `Table`: term, estimate, std_error, t_stat, p_value |
-| `fitted(m)` | `Table`: fitted (predicted values) |
-| `residuals(m)` | `Table`: residual (y − ŷ) |
-| `r_squared(m)` | `Float64`: coefficient of determination |
+| `coef(m)` / `model_coef(m)` | `Table`: term, estimate |
+| `summary(m)` / `model_summary(m)` | `Table`: term, estimate, std_error, t_stat, p_value |
+| `fitted(m)` / `model_fitted(m)` | `Table`: fitted (predicted values) |
+| `residuals(m)` / `model_residuals(m)` | `Table`: residual (y − ŷ) |
+| `r_squared(m)` / `model_r_squared(m)` | `Float64`: coefficient of determination |
 
 #### Plugin Model Methods
 

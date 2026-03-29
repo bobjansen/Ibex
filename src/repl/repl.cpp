@@ -39,6 +39,7 @@ namespace {
 using FunctionRegistry = std::unordered_map<std::string, parser::FunctionDecl>;
 using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
 using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
+using ModelRegistry = std::unordered_map<std::string, runtime::ModelResult>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
 #ifdef IBEX_HAS_READLINE
@@ -915,35 +916,96 @@ auto column_name_from_expr(const parser::Expr& expr) -> std::optional<std::strin
     return std::nullopt;
 }
 
+auto has_model_result(const runtime::ModelResult& model) -> bool {
+    return !model.method.empty();
+}
+
+auto is_model_table_accessor(std::string_view callee) -> bool {
+    return callee == "coef" || callee == "model_coef" || callee == "summary" ||
+           callee == "model_summary" || callee == "fitted" || callee == "model_fitted" ||
+           callee == "residuals" || callee == "model_residuals";
+}
+
+auto is_model_scalar_accessor(std::string_view callee) -> bool {
+    return callee == "r_squared" || callee == "model_r_squared";
+}
+
+auto lookup_model_binding(const parser::CallExpr& call, const ModelRegistry& models)
+    -> std::expected<const runtime::ModelResult*, std::string> {
+    if (call.args.size() != 1 || !call.named_args.empty()) {
+        return std::unexpected(call.callee + ": expected exactly one model binding argument");
+    }
+    const auto* ident = std::get_if<parser::IdentifierExpr>(&call.args[0]->node);
+    if (ident == nullptr) {
+        return std::unexpected(call.callee + ": argument must be a model binding name");
+    }
+    auto it = models.find(ident->name);
+    if (it == models.end()) {
+        return std::unexpected(call.callee + ": unknown model binding '" + ident->name + "'");
+    }
+    return &it->second;
+}
+
+auto eval_model_table_accessor(const parser::CallExpr& call, const ModelRegistry& models)
+    -> std::expected<runtime::Table, std::string> {
+    auto model = lookup_model_binding(call, models);
+    if (!model) {
+        return std::unexpected(model.error());
+    }
+    if (call.callee == "coef" || call.callee == "model_coef") {
+        return model.value()->coefficients;
+    }
+    if (call.callee == "summary" || call.callee == "model_summary") {
+        return model.value()->summary;
+    }
+    if (call.callee == "fitted" || call.callee == "model_fitted") {
+        return model.value()->fitted_values;
+    }
+    return model.value()->residuals;
+}
+
+auto eval_model_scalar_accessor(const parser::CallExpr& call, const ModelRegistry& models)
+    -> std::expected<runtime::ScalarValue, std::string> {
+    auto model = lookup_model_binding(call, models);
+    if (!model) {
+        return std::unexpected(model.error());
+    }
+    return runtime::ScalarValue{model.value()->r_squared};
+}
+
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
-                     const runtime::ExternRegistry& externs)
+                     ModelRegistry& models, const FunctionRegistry& functions,
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
+                     runtime::ModelResult* model_out = nullptr)
     -> std::expected<runtime::Table, std::string>;
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                      ModelRegistry& models, const FunctionRegistry& functions,
+                      const ExternDeclRegistry& extern_decls,
                       const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string>;
 
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                        ModelRegistry& models, const FunctionRegistry& functions,
+                        const ExternDeclRegistry& extern_decls,
                         const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string>;
 
 auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
-                     const runtime::ExternRegistry& externs)
+                     ModelRegistry& models, const FunctionRegistry& functions,
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
+                     runtime::ModelResult* model_out = nullptr)
     -> std::expected<EvalValue, std::string> {
     if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
         std::holds_alternative<parser::UnaryExpr>(expr.node) ||
         std::holds_alternative<parser::GroupExpr>(expr.node)) {
-        auto scalar =
-            eval_scalar_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
+        auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
+                                       extern_decls, externs);
         if (!scalar) {
             return std::unexpected(scalar.error());
         }
@@ -958,9 +1020,23 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (is_model_table_accessor(call->callee)) {
+            auto table = eval_model_table_accessor(*call, models);
+            if (!table) {
+                return std::unexpected(table.error());
+            }
+            return EvalValue{std::move(table.value())};
+        }
+        if (is_model_scalar_accessor(call->callee)) {
+            auto scalar = eval_model_scalar_accessor(*call, models);
+            if (!scalar) {
+                return std::unexpected(scalar.error());
+            }
+            return EvalValue{std::move(scalar.value())};
+        }
         if (is_cast_callee(call->callee) && call->args.size() == 1) {
-            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, functions,
-                                         extern_decls, externs);
+            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, models,
+                                         functions, extern_decls, externs);
             if (!inner) {
                 return std::unexpected(inner.error());
             }
@@ -985,8 +1061,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!mode) {
                 return std::unexpected(mode.error());
             }
-            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, functions,
-                                         extern_decls, externs);
+            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, models,
+                                         functions, extern_decls, externs);
             if (!inner) {
                 return std::unexpected(inner.error());
             }
@@ -1009,8 +1085,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             if (call->args.size() != 1 || !call->named_args.empty()) {
                 return std::unexpected("seed_rng: expected exactly one argument (seed: Int)");
             }
-            auto seed_val = eval_scalar_expr(*call->args[0], tables, scalars, columns, functions,
-                                             extern_decls, externs);
+            auto seed_val = eval_scalar_expr(*call->args[0], tables, scalars, columns, models,
+                                             functions, extern_decls, externs);
             if (!seed_val) {
                 return std::unexpected(seed_val.error());
             }
@@ -1023,36 +1099,37 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             return EvalValue{static_cast<std::int64_t>(seed)};
         }
         if (call->callee == "scalar") {
-            auto scalar =
-                eval_scalar_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
+            auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
+                                           extern_decls, externs);
             if (!scalar) {
                 return std::unexpected(scalar.error());
             }
             return EvalValue{std::move(scalar.value())};
         }
         if (functions.contains(call->callee)) {
-            return eval_function_call(*call, tables, scalars, columns, functions, extern_decls,
-                                      externs);
+            return eval_function_call(*call, tables, scalars, columns, models, functions,
+                                      extern_decls, externs);
         }
         if (extern_decls.contains(call->callee)) {
             const auto& decl = extern_decls.at(call->callee);
             if (decl.return_type.kind == parser::Type::Kind::Scalar) {
-                auto scalar = eval_scalar_expr(expr, tables, scalars, columns, functions,
+                auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
                                                extern_decls, externs);
                 if (!scalar) {
                     return std::unexpected(scalar.error());
                 }
                 return EvalValue{std::move(scalar.value())};
             }
-            auto table =
-                eval_table_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
+            auto table = eval_table_expr(expr, tables, scalars, columns, models, functions,
+                                         extern_decls, externs, model_out);
             if (!table) {
                 return std::unexpected(table.error());
             }
             return EvalValue{std::move(table.value())};
         }
     }
-    auto table = eval_table_expr(expr, tables, scalars, columns, functions, extern_decls, externs);
+    auto table = eval_table_expr(expr, tables, scalars, columns, models, functions, extern_decls,
+                                 externs, model_out);
     if (!table) {
         return std::unexpected(table.error());
     }
@@ -1061,7 +1138,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                      ModelRegistry& models, const FunctionRegistry& functions,
+                      const ExternDeclRegistry& extern_decls,
                       const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string> {
     if (const auto* literal = std::get_if<parser::LiteralExpr>(&expr.node)) {
@@ -1086,11 +1164,11 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unknown scalar: " + ident->name);
     }
     if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
-        return eval_scalar_expr(*group->expr, tables, scalars, columns, functions, extern_decls,
-                                externs);
+        return eval_scalar_expr(*group->expr, tables, scalars, columns, models, functions,
+                                extern_decls, externs);
     }
     if (const auto* unary = std::get_if<parser::UnaryExpr>(&expr.node)) {
-        auto value = eval_scalar_expr(*unary->expr, tables, scalars, columns, functions,
+        auto value = eval_scalar_expr(*unary->expr, tables, scalars, columns, models, functions,
                                       extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
@@ -1111,12 +1189,12 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unsupported unary operand type");
     }
     if (const auto* binary = std::get_if<parser::BinaryExpr>(&expr.node)) {
-        auto left = eval_scalar_expr(*binary->left, tables, scalars, columns, functions,
+        auto left = eval_scalar_expr(*binary->left, tables, scalars, columns, models, functions,
                                      extern_decls, externs);
         if (!left) {
             return std::unexpected(left.error());
         }
-        auto right = eval_scalar_expr(*binary->right, tables, scalars, columns, functions,
+        auto right = eval_scalar_expr(*binary->right, tables, scalars, columns, models, functions,
                                       extern_decls, externs);
         if (!right) {
             return std::unexpected(right.error());
@@ -1167,6 +1245,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (is_model_scalar_accessor(call->callee)) {
+            return eval_model_scalar_accessor(*call, models);
+        }
         if (call->callee == "scalar") {
             if (call->args.size() != 2) {
                 return std::unexpected("scalar() expects (table, column)");
@@ -1175,8 +1256,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!column_name.has_value()) {
                 return std::unexpected("scalar() column must be identifier or string");
             }
-            auto table = eval_table_expr(*call->args[0], tables, scalars, columns, functions,
-                                         extern_decls, externs);
+            auto table = eval_table_expr(*call->args[0], tables, scalars, columns, models,
+                                         functions, extern_decls, externs);
             if (!table) {
                 return std::unexpected(table.error());
             }
@@ -1187,7 +1268,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return scalar.value();
         }
         if (functions.contains(call->callee)) {
-            auto value = eval_function_call(*call, tables, scalars, columns, functions,
+            auto value = eval_function_call(*call, tables, scalars, columns, models, functions,
                                             extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
@@ -1214,15 +1295,15 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 if (call->args.empty()) {
                     return std::unexpected(call->callee + "() requires a DataFrame first argument");
                 }
-                auto table = eval_table_expr(*call->args[0], tables, scalars, columns, functions,
-                                             extern_decls, externs);
+                auto table = eval_table_expr(*call->args[0], tables, scalars, columns, models,
+                                             functions, extern_decls, externs);
                 if (!table) {
                     return std::unexpected(table.error());
                 }
                 runtime::ExternArgs scalar_args;
                 scalar_args.reserve(call->args.size() - 1);
                 for (std::size_t i = 1; i < call->args.size(); ++i) {
-                    auto value = eval_scalar_expr(*call->args[i], tables, scalars, columns,
+                    auto value = eval_scalar_expr(*call->args[i], tables, scalars, columns, models,
                                                   functions, extern_decls, externs);
                     if (!value) {
                         return std::unexpected(value.error());
@@ -1241,7 +1322,7 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             runtime::ExternArgs args;
             args.reserve(call->args.size());
             for (const auto& arg : call->args) {
-                auto value = eval_scalar_expr(*arg, tables, scalars, columns, functions,
+                auto value = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
                                               extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
@@ -1261,8 +1342,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (call->args.size() != 1) {
                 return std::unexpected(call->callee + "(): expects exactly one argument");
             }
-            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, functions,
-                                          extern_decls, externs);
+            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, models,
+                                          functions, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -1277,8 +1358,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!mode) {
                 return std::unexpected(mode.error());
             }
-            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, functions,
-                                          extern_decls, externs);
+            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, models,
+                                          functions, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -1295,8 +1376,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
 
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
-                     const runtime::ExternRegistry& externs)
+                     ModelRegistry& models, const FunctionRegistry& functions,
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
+                     runtime::ModelResult* model_out)
     -> std::expected<runtime::Table, std::string> {
     auto eval_extern_table_call =
         [&](parser::CallExpr& call) -> std::expected<runtime::Table, std::string> {
@@ -1317,8 +1399,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         runtime::ExternArgs args;
         args.reserve(call.args.size());
         for (const auto& arg : call.args) {
-            auto value =
-                eval_scalar_expr(*arg, tables, scalars, columns, functions, extern_decls, externs);
+            auto value = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
+                                          extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -1338,7 +1420,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (block->base && std::holds_alternative<parser::CallExpr>(block->base->node)) {
             auto* call = std::get_if<parser::CallExpr>(&block->base->node);
             if (call != nullptr && functions.contains(call->callee)) {
-                auto value = eval_function_call(*call, tables, scalars, columns, functions,
+                auto value = eval_function_call(*call, tables, scalars, columns, models, functions,
                                                 extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
@@ -1364,8 +1446,11 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (is_model_table_accessor(call->callee)) {
+            return eval_model_table_accessor(*call, models);
+        }
         if (functions.contains(call->callee)) {
-            auto value = eval_function_call(*call, tables, scalars, columns, functions,
+            auto value = eval_function_call(*call, tables, scalars, columns, models, functions,
                                             extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
@@ -1407,16 +1492,22 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     if (!lowered) {
         return std::unexpected(lowered.error().message);
     }
-    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars, &externs);
+    runtime::ModelResult captured_model;
+    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars, &externs,
+                                        model_out != nullptr ? &captured_model : nullptr);
     if (!evaluated) {
         return std::unexpected(evaluated.error());
+    }
+    if (model_out != nullptr) {
+        *model_out = std::move(captured_model);
     }
     return std::move(evaluated.value());
 }
 
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
+                        ModelRegistry& models, const FunctionRegistry& functions,
+                        const ExternDeclRegistry& extern_decls,
                         const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string> {
     auto it = functions.find(call.callee);
@@ -1432,13 +1523,14 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     runtime::TableRegistry local_tables = tables;
     runtime::ScalarRegistry local_scalars = scalars;
     ColumnRegistry local_columns = columns;
+    ModelRegistry local_models = models;
 
     for (std::size_t i = 0; i < fn.params.size(); ++i) {
         const auto& param = fn.params[i];
         auto& arg = *call.args[i];
         switch (param.type.kind) {
             case parser::Type::Kind::Scalar: {
-                auto value = eval_scalar_expr(arg, tables, scalars, columns, functions,
+                auto value = eval_scalar_expr(arg, tables, scalars, columns, models, functions,
                                               extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
@@ -1455,8 +1547,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             }
             case parser::Type::Kind::DataFrame:
             case parser::Type::Kind::TimeFrame: {
-                auto value = eval_table_expr(arg, tables, scalars, columns, functions, extern_decls,
-                                             externs);
+                auto value = eval_table_expr(arg, tables, scalars, columns, models, functions,
+                                             extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -1468,7 +1560,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 break;
             }
             case parser::Type::Kind::Series:
-                if (auto value = eval_expr_value(arg, tables, scalars, columns, functions,
+                if (auto value = eval_expr_value(arg, tables, scalars, columns, models, functions,
                                                  extern_decls, externs)) {
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                         local_columns.insert_or_assign(param.name, std::move(*col));
@@ -1498,8 +1590,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                                  (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
                                   let_stmt.type->kind == parser::Type::Kind::TimeFrame);
             if (type_is_scalar) {
-                auto value = eval_scalar_expr(*let_stmt.value, local_tables, local_scalars,
-                                              local_columns, functions, extern_decls, externs);
+                auto value =
+                    eval_scalar_expr(*let_stmt.value, local_tables, local_scalars, local_columns,
+                                     local_models, functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -1510,9 +1603,12 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                                            std::string(scalar_value_type_name(value.value())));
                 }
                 local_scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
+                local_models.erase(let_stmt.name);
             } else if (type_is_table) {
-                auto value = eval_table_expr(*let_stmt.value, local_tables, local_scalars,
-                                             local_columns, functions, extern_decls, externs);
+                runtime::ModelResult model_value;
+                auto value =
+                    eval_table_expr(*let_stmt.value, local_tables, local_scalars, local_columns,
+                                    local_models, functions, extern_decls, externs, &model_value);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -1520,10 +1616,16 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     return std::unexpected("type error: '" + let_stmt.name + "': " + *err);
                 }
                 local_tables.insert_or_assign(let_stmt.name, std::move(value.value()));
+                if (has_model_result(model_value)) {
+                    local_models.insert_or_assign(let_stmt.name, std::move(model_value));
+                } else {
+                    local_models.erase(let_stmt.name);
+                }
             } else if (let_stmt.type.has_value() &&
                        let_stmt.type->kind == parser::Type::Kind::Series) {
-                auto value = eval_expr_value(*let_stmt.value, local_tables, local_scalars,
-                                             local_columns, functions, extern_decls, externs);
+                auto value =
+                    eval_expr_value(*let_stmt.value, local_tables, local_scalars, local_columns,
+                                    local_models, functions, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -1537,19 +1639,29 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 } else {
                     return std::unexpected("Column binding must be a column or table");
                 }
+                local_models.erase(let_stmt.name);
             } else {
-                auto value = eval_expr_value(*let_stmt.value, local_tables, local_scalars,
-                                             local_columns, functions, extern_decls, externs);
+                runtime::ModelResult model_value;
+                auto value =
+                    eval_expr_value(*let_stmt.value, local_tables, local_scalars, local_columns,
+                                    local_models, functions, extern_decls, externs, &model_value);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
                 if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
                     local_scalars.insert_or_assign(let_stmt.name, std::move(*scalar));
+                    local_models.erase(let_stmt.name);
                 } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                     local_columns.insert_or_assign(let_stmt.name, std::move(*col));
+                    local_models.erase(let_stmt.name);
                 } else {
                     local_tables.insert_or_assign(
                         let_stmt.name, std::get<runtime::Table>(std::move(value.value())));
+                    if (has_model_result(model_value)) {
+                        local_models.insert_or_assign(let_stmt.name, std::move(model_value));
+                    } else {
+                        local_models.erase(let_stmt.name);
+                    }
                 }
             }
             continue;
@@ -1557,7 +1669,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
             const auto& tlet = std::get<parser::TupleLetStmt>(stmt);
             auto value = eval_expr_value(*tlet.value, local_tables, local_scalars, local_columns,
-                                         functions, extern_decls, externs);
+                                         local_models, functions, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -1576,7 +1688,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         }
         const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
         auto value = eval_expr_value(*expr_stmt.expr, local_tables, local_scalars, local_columns,
-                                     functions, extern_decls, externs);
+                                     local_models, functions, extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -1694,8 +1806,8 @@ auto find_library_source(const std::string& name, const std::vector<std::string>
 
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        FunctionRegistry& functions, ExternDeclRegistry& extern_decls,
-                        runtime::ExternRegistry& externs,
+                        ModelRegistry& models, FunctionRegistry& functions,
+                        ExternDeclRegistry& extern_decls, runtime::ExternRegistry& externs,
                         const std::vector<std::string>& plugin_search_paths,
                         std::unordered_set<std::string>& loaded_plugins,
                         const std::vector<std::string>& import_search_paths = {},
@@ -1722,6 +1834,11 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::ImportDecl>(stmt)) {
             const auto& imp = std::get<parser::ImportDecl>(stmt);
+            auto plugin_result =
+                try_load_plugin(imp.name, plugin_search_paths, loaded_plugins, externs);
+            if (plugin_result.status == PluginLoadStatus::LoadError) {
+                fmt::print("warning: {}\n", plugin_result.message);
+            }
             // Prefer explicit import_search_paths; fall back to plugin_search_paths so
             // that .ibex stubs can live alongside their .so files in the same directory.
             const auto& primary_paths =
@@ -1744,7 +1861,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             }
             // Recursively execute the imported file's statements (which will typically
             // only contain extern fn and fn declarations).
-            if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
+            if (!execute_statements(parsed->statements, tables, scalars, columns, models, functions,
                                     extern_decls, externs, plugin_search_paths, loaded_plugins,
                                     import_search_paths)) {
                 return false;
@@ -1764,7 +1881,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                     let_stmt.type->kind == parser::Type::Kind::TimeFrame;
                 bool expect_column = let_stmt.type->kind == parser::Type::Kind::Series;
                 if (expect_scalar) {
-                    auto value = eval_scalar_expr(*let_stmt.value, tables, scalars, columns,
+                    auto value = eval_scalar_expr(*let_stmt.value, tables, scalars, columns, models,
                                                   functions, extern_decls, externs);
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
@@ -1777,11 +1894,13 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         return false;
                     }
                     scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
+                    models.erase(let_stmt.name);
                     continue;
                 }
                 if (expect_table) {
-                    auto value = eval_table_expr(*let_stmt.value, tables, scalars, columns,
-                                                 functions, extern_decls, externs);
+                    runtime::ModelResult model_value;
+                    auto value = eval_table_expr(*let_stmt.value, tables, scalars, columns, models,
+                                                 functions, extern_decls, externs, &model_value);
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
                         return false;
@@ -1791,10 +1910,15 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         return false;
                     }
                     tables.insert_or_assign(let_stmt.name, std::move(value.value()));
+                    if (has_model_result(model_value)) {
+                        models.insert_or_assign(let_stmt.name, std::move(model_value));
+                    } else {
+                        models.erase(let_stmt.name);
+                    }
                     continue;
                 }
                 if (expect_column) {
-                    auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns,
+                    auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns, models,
                                                  functions, extern_decls, externs);
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
@@ -1802,6 +1926,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     }
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                         columns.insert_or_assign(let_stmt.name, std::move(*col));
+                        models.erase(let_stmt.name);
                         continue;
                     }
                     if (auto* table = std::get_if<runtime::Table>(&value.value())) {
@@ -1810,6 +1935,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             return false;
                         }
                         columns.insert_or_assign(let_stmt.name, *table->columns.front().column);
+                        models.erase(let_stmt.name);
                         continue;
                     }
                     fmt::print("error: expected column return for {}\n", let_stmt.name);
@@ -1817,25 +1943,33 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 }
             }
 
-            auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns, functions,
-                                         extern_decls, externs);
+            runtime::ModelResult model_value;
+            auto value = eval_expr_value(*let_stmt.value, tables, scalars, columns, models,
+                                         functions, extern_decls, externs, &model_value);
             if (!value) {
                 fmt::print("error: {}\n", value.error());
                 return false;
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
                 scalars.insert_or_assign(let_stmt.name, std::move(*scalar));
+                models.erase(let_stmt.name);
             } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                 columns.insert_or_assign(let_stmt.name, std::move(*col));
+                models.erase(let_stmt.name);
             } else {
                 tables.insert_or_assign(let_stmt.name,
                                         std::get<runtime::Table>(std::move(value.value())));
+                if (has_model_result(model_value)) {
+                    models.insert_or_assign(let_stmt.name, std::move(model_value));
+                } else {
+                    models.erase(let_stmt.name);
+                }
             }
             continue;
         }
         if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
             const auto& tlet = std::get<parser::TupleLetStmt>(stmt);
-            auto value = eval_expr_value(*tlet.value, tables, scalars, columns, functions,
+            auto value = eval_expr_value(*tlet.value, tables, scalars, columns, models, functions,
                                          extern_decls, externs);
             if (!value) {
                 fmt::print("error: {}\n", value.error());
@@ -1858,8 +1992,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::ExprStmt>(stmt)) {
             const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-            auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, functions,
-                                         extern_decls, externs);
+            auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, models,
+                                         functions, extern_decls, externs);
             if (!value) {
                 fmt::print("error: {}\n", value.error());
                 return false;
@@ -1898,12 +2032,13 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry) 
     auto tables = build_builtin_tables();
     runtime::ScalarRegistry scalars;
     ColumnRegistry columns;
+    ModelRegistry models;
     FunctionRegistry functions;
     ExternDeclRegistry extern_decls;
     std::vector<std::string> no_paths;
     std::unordered_set<std::string> loaded_plugins;
-    return execute_statements(parsed->statements, tables, scalars, columns, functions, extern_decls,
-                              registry, no_paths, loaded_plugins);
+    return execute_statements(parsed->statements, tables, scalars, columns, models, functions,
+                              extern_decls, registry, no_paths, loaded_plugins);
 }
 
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
@@ -1914,6 +2049,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     auto tables = build_builtin_tables();
     runtime::ScalarRegistry scalars;
     ColumnRegistry columns;
+    ModelRegistry models;
     FunctionRegistry functions;
     ExternDeclRegistry extern_decls;
     std::unordered_set<std::string> loaded_plugins;
@@ -2091,7 +2227,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 comment_groups = build_statement_comment_groups(parsed->statements, comments);
                 comment_groups_ptr = &comment_groups;
             }
-            if (!execute_statements(parsed->statements, tables, scalars, columns, functions,
+            if (!execute_statements(parsed->statements, tables, scalars, columns, models, functions,
                                     extern_decls, registry, config.plugin_search_paths,
                                     loaded_plugins, config.import_search_paths,
                                     comment_groups_ptr)) {
@@ -2109,8 +2245,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
 
-        execute_statements(parsed->statements, tables, scalars, columns, functions, extern_decls,
-                           registry, config.plugin_search_paths, loaded_plugins,
+        execute_statements(parsed->statements, tables, scalars, columns, models, functions,
+                           extern_decls, registry, config.plugin_search_paths, loaded_plugins,
                            config.import_search_paths);
         report_timing();
     }

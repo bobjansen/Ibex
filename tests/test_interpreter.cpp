@@ -886,6 +886,26 @@ TEST_CASE("lag(val, 0) is identity") {
     REQUIRE((*same)[1] == 99);
 }
 
+TEST_CASE("lag on bool column preserves packed values", "[lag][bool]") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("flag", Column<bool>{true, false, true});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { prev = lag(flag, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* prev = std::get_if<Column<bool>>(result->find("prev"));
+    REQUIRE(prev != nullptr);
+    REQUIRE((*prev)[0] == false);
+    REQUIRE((*prev)[1] == true);
+    REQUIRE((*prev)[2] == false);
+}
+
 TEST_CASE("lag on non-TimeFrame returns error") {
     runtime::Table table;
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
@@ -3532,6 +3552,47 @@ TEST_CASE("melt: select restricts measure columns", "[melt]") {
     const auto& var_col = std::get<Column<Categorical>>(*var);
     REQUIRE(var_col[0] == "open");
     REQUIRE(var_col[1] == "close");
+}
+
+TEST_CASE("melt: bool measure columns preserve row-major values", "[melt][bool]") {
+    runtime::TableRegistry registry;
+    runtime::Table wide;
+    wide.add_column("symbol", Column<std::string>{"AAPL", "GOOG"});
+    wide.add_column("halted", Column<bool>{true, false});
+    wide.add_column("crossed", Column<bool>{false, true});
+    registry["wide"] = std::move(wide);
+
+    auto ir = require_ir("wide[melt symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto* sym = result->find("symbol");
+    const auto* var = result->find("variable");
+    const auto* val = result->find("value");
+    REQUIRE(sym != nullptr);
+    REQUIRE(var != nullptr);
+    REQUIRE(val != nullptr);
+
+    const auto& sym_col = std::get<Column<std::string>>(*sym);
+    const auto& var_col = std::get<Column<Categorical>>(*var);
+    const auto& val_col = std::get<Column<bool>>(*val);
+
+    REQUIRE(sym_col[0] == "AAPL");
+    REQUIRE(var_col[0] == "halted");
+    REQUIRE(val_col[0] == true);
+
+    REQUIRE(sym_col[1] == "AAPL");
+    REQUIRE(var_col[1] == "crossed");
+    REQUIRE(val_col[1] == false);
+
+    REQUIRE(sym_col[2] == "GOOG");
+    REQUIRE(var_col[2] == "halted");
+    REQUIRE(val_col[2] == false);
+
+    REQUIRE(sym_col[3] == "GOOG");
+    REQUIRE(var_col[3] == "crossed");
+    REQUIRE(val_col[3] == true);
 }
 
 TEST_CASE("melt: multiple id columns", "[melt]") {

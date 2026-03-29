@@ -1535,10 +1535,8 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                     });
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     dst->resize(out_n);
-                    const std::uint8_t* sp = src.data();
-                    std::uint8_t* dp = dst->data();
                     std::size_t j = 0;
-                    for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
+                    for_each_selected([&](std::size_t si) { dst->set(j++, src[si]); });
                 } else {
                     using T = typename ColT::value_type;
                     dst->resize(out_n);
@@ -2032,7 +2030,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                         ColT dst;
                         dst.resize(rows);
                         for (std::size_t pos = 0; pos < rows; ++pos)
-                            dst.byte_at(pos) = src[static_cast<std::size_t>(idx[pos])] ? 1U : 0U;
+                            dst.set(pos, src[static_cast<std::size_t>(idx[pos])]);
                         return dst;
                     } else {
                         ColT dst;
@@ -5769,12 +5767,24 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                 // POD column: zero-fill then bulk-copy the shifted region.
                 using T = typename ColT::value_type;
                 result.resize(rows);  // zero-initialises
-                if (is_lag) {
-                    if (n < rows)
-                        std::memcpy(result.data() + n, col.data(), (rows - n) * sizeof(T));
+                if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    if (is_lag) {
+                        for (std::size_t i = n; i < rows; ++i) {
+                            result.set(i, col[i - n]);
+                        }
+                    } else {
+                        for (std::size_t i = 0; i + n < rows; ++i) {
+                            result.set(i, col[i + n]);
+                        }
+                    }
                 } else {
-                    if (n < rows)
-                        std::memcpy(result.data(), col.data() + n, (rows - n) * sizeof(T));
+                    if (is_lag) {
+                        if (n < rows)
+                            std::memcpy(result.data() + n, col.data(), (rows - n) * sizeof(T));
+                    } else {
+                        if (n < rows)
+                            std::memcpy(result.data(), col.data() + n, (rows - n) * sizeof(T));
+                    }
                 }
             }
             return result;
@@ -8328,49 +8338,96 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     SrcCol out_col;
                     out_col.reserve(out_rows);
                     out_col.resize(out_rows);
-                    auto* dst = out_col.data();
-                    switch (n_measures) {
-                        case 1:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                dst[r] = src_col[r];
-                            }
-                            break;
-                        case 2:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                auto v = src_col[r];
-                                const std::size_t base = r * 2;
-                                dst[base] = v;
-                                dst[base + 1] = v;
-                            }
-                            break;
-                        case 3:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                auto v = src_col[r];
-                                const std::size_t base = r * 3;
-                                dst[base] = v;
-                                dst[base + 1] = v;
-                                dst[base + 2] = v;
-                            }
-                            break;
-                        case 4:
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                auto v = src_col[r];
-                                const std::size_t base = r * 4;
-                                dst[base] = v;
-                                dst[base + 1] = v;
-                                dst[base + 2] = v;
-                                dst[base + 3] = v;
-                            }
-                            break;
-                        default: {
-                            std::size_t out_i = 0;
-                            for (std::size_t r = 0; r < rows; ++r) {
-                                auto v = src_col[r];
-                                for (std::size_t m = 0; m < n_measures; ++m) {
-                                    dst[out_i++] = v;
+                    if constexpr (std::is_same_v<SrcCol, Column<bool>>) {
+                        switch (n_measures) {
+                            case 1:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    out_col.set(r, src_col[r]);
                                 }
+                                break;
+                            case 2:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    const bool v = src_col[r];
+                                    const std::size_t base = r * 2;
+                                    out_col.set(base, v);
+                                    out_col.set(base + 1, v);
+                                }
+                                break;
+                            case 3:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    const bool v = src_col[r];
+                                    const std::size_t base = r * 3;
+                                    out_col.set(base, v);
+                                    out_col.set(base + 1, v);
+                                    out_col.set(base + 2, v);
+                                }
+                                break;
+                            case 4:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    const bool v = src_col[r];
+                                    const std::size_t base = r * 4;
+                                    out_col.set(base, v);
+                                    out_col.set(base + 1, v);
+                                    out_col.set(base + 2, v);
+                                    out_col.set(base + 3, v);
+                                }
+                                break;
+                            default: {
+                                std::size_t out_i = 0;
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    const bool v = src_col[r];
+                                    for (std::size_t m = 0; m < n_measures; ++m) {
+                                        out_col.set(out_i++, v);
+                                    }
+                                }
+                                break;
                             }
-                            break;
+                        }
+                    } else {
+                        auto* dst = out_col.data();
+                        switch (n_measures) {
+                            case 1:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    dst[r] = src_col[r];
+                                }
+                                break;
+                            case 2:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    auto v = src_col[r];
+                                    const std::size_t base = r * 2;
+                                    dst[base] = v;
+                                    dst[base + 1] = v;
+                                }
+                                break;
+                            case 3:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    auto v = src_col[r];
+                                    const std::size_t base = r * 3;
+                                    dst[base] = v;
+                                    dst[base + 1] = v;
+                                    dst[base + 2] = v;
+                                }
+                                break;
+                            case 4:
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    auto v = src_col[r];
+                                    const std::size_t base = r * 4;
+                                    dst[base] = v;
+                                    dst[base + 1] = v;
+                                    dst[base + 2] = v;
+                                    dst[base + 3] = v;
+                                }
+                                break;
+                            default: {
+                                std::size_t out_i = 0;
+                                for (std::size_t r = 0; r < rows; ++r) {
+                                    auto v = src_col[r];
+                                    for (std::size_t m = 0; m < n_measures; ++m) {
+                                        dst[out_i++] = v;
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
                     return out_col;
@@ -8498,59 +8555,102 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     measures.push_back(src);
                 }
                 out_col.resize(out_rows);
-                auto* dst = out_col.data();
-                switch (n_measures) {
-                    case 1: {
-                        const auto* m0 = measures[0]->data();
-                        for (std::size_t r = 0; r < rows; ++r) {
-                            dst[r] = m0[r];
-                        }
-                        break;
-                    }
-                    case 2: {
-                        const auto* m0 = measures[0]->data();
-                        const auto* m1 = measures[1]->data();
-                        for (std::size_t r = 0; r < rows; ++r) {
-                            const std::size_t base = r * 2;
-                            dst[base] = m0[r];
-                            dst[base + 1] = m1[r];
-                        }
-                        break;
-                    }
-                    case 3: {
-                        const auto* m0 = measures[0]->data();
-                        const auto* m1 = measures[1]->data();
-                        const auto* m2 = measures[2]->data();
-                        for (std::size_t r = 0; r < rows; ++r) {
-                            const std::size_t base = r * 3;
-                            dst[base] = m0[r];
-                            dst[base + 1] = m1[r];
-                            dst[base + 2] = m2[r];
-                        }
-                        break;
-                    }
-                    case 4: {
-                        const auto* m0 = measures[0]->data();
-                        const auto* m1 = measures[1]->data();
-                        const auto* m2 = measures[2]->data();
-                        const auto* m3 = measures[3]->data();
-                        for (std::size_t r = 0; r < rows; ++r) {
-                            const std::size_t base = r * 4;
-                            dst[base] = m0[r];
-                            dst[base + 1] = m1[r];
-                            dst[base + 2] = m2[r];
-                            dst[base + 3] = m3[r];
-                        }
-                        break;
-                    }
-                    default: {
-                        std::size_t out_i = 0;
-                        for (std::size_t r = 0; r < rows; ++r) {
-                            for (std::size_t mi = 0; mi < n_measures; ++mi) {
-                                dst[out_i++] = (*measures[mi])[r];
+                if constexpr (std::is_same_v<SrcCol, Column<bool>>) {
+                    switch (n_measures) {
+                        case 1:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                out_col.set(r, (*measures[0])[r]);
                             }
+                            break;
+                        case 2:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                const std::size_t base = r * 2;
+                                out_col.set(base, (*measures[0])[r]);
+                                out_col.set(base + 1, (*measures[1])[r]);
+                            }
+                            break;
+                        case 3:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                const std::size_t base = r * 3;
+                                out_col.set(base, (*measures[0])[r]);
+                                out_col.set(base + 1, (*measures[1])[r]);
+                                out_col.set(base + 2, (*measures[2])[r]);
+                            }
+                            break;
+                        case 4:
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                const std::size_t base = r * 4;
+                                out_col.set(base, (*measures[0])[r]);
+                                out_col.set(base + 1, (*measures[1])[r]);
+                                out_col.set(base + 2, (*measures[2])[r]);
+                                out_col.set(base + 3, (*measures[3])[r]);
+                            }
+                            break;
+                        default: {
+                            std::size_t out_i = 0;
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                                    out_col.set(out_i++, (*measures[mi])[r]);
+                                }
+                            }
+                            break;
                         }
-                        break;
+                    }
+                } else {
+                    auto* dst = out_col.data();
+                    switch (n_measures) {
+                        case 1: {
+                            const auto* m0 = measures[0]->data();
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                dst[r] = m0[r];
+                            }
+                            break;
+                        }
+                        case 2: {
+                            const auto* m0 = measures[0]->data();
+                            const auto* m1 = measures[1]->data();
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                const std::size_t base = r * 2;
+                                dst[base] = m0[r];
+                                dst[base + 1] = m1[r];
+                            }
+                            break;
+                        }
+                        case 3: {
+                            const auto* m0 = measures[0]->data();
+                            const auto* m1 = measures[1]->data();
+                            const auto* m2 = measures[2]->data();
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                const std::size_t base = r * 3;
+                                dst[base] = m0[r];
+                                dst[base + 1] = m1[r];
+                                dst[base + 2] = m2[r];
+                            }
+                            break;
+                        }
+                        case 4: {
+                            const auto* m0 = measures[0]->data();
+                            const auto* m1 = measures[1]->data();
+                            const auto* m2 = measures[2]->data();
+                            const auto* m3 = measures[3]->data();
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                const std::size_t base = r * 4;
+                                dst[base] = m0[r];
+                                dst[base + 1] = m1[r];
+                                dst[base + 2] = m2[r];
+                                dst[base + 3] = m3[r];
+                            }
+                            break;
+                        }
+                        default: {
+                            std::size_t out_i = 0;
+                            for (std::size_t r = 0; r < rows; ++r) {
+                                for (std::size_t mi = 0; mi < n_measures; ++mi) {
+                                    dst[out_i++] = (*measures[mi])[r];
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 return out_col;

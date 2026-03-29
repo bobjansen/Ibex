@@ -454,88 +454,182 @@ class Column<std::string> {
 
 /// Explicit specialisation for bool.
 ///
-/// `std::vector<bool>` is a space-optimised bitset and lacks `data()`, so it
-/// cannot be used as a POD column.  We store booleans as `uint8_t` (0 = false,
-/// non-zero = true) and present a `bool` value interface.
+/// `std::vector<bool>` is a space-optimised bitset with awkward proxy semantics
+/// and no stable raw data pointer. We keep an explicit packed bitset instead so
+/// bool columns use 1 bit per row while preserving a predictable value API.
 template <>
 class Column<bool> {
-    std::vector<std::uint8_t> data_;
+   public:
+    using value_type = bool;
+    using size_type = std::size_t;
+    using word_type = std::uint64_t;
+
+   private:
+    static constexpr size_type kBitsPerWord = sizeof(word_type) * 8;
+
+    static constexpr auto word_index(size_type bit) noexcept -> size_type {
+        return bit / kBitsPerWord;
+    }
+    static constexpr auto bit_offset(size_type bit) noexcept -> size_type {
+        return bit % kBitsPerWord;
+    }
+    static constexpr auto bit_mask(size_type bit) noexcept -> word_type {
+        return word_type{1} << bit_offset(bit);
+    }
+    static constexpr auto words_for_bits(size_type bits) noexcept -> size_type {
+        return (bits + kBitsPerWord - 1) / kBitsPerWord;
+    }
+    static constexpr auto low_bits_mask(size_type bits) noexcept -> word_type {
+        if (bits == 0) {
+            return word_type{0};
+        }
+        if (bits >= kBitsPerWord) {
+            return ~word_type{0};
+        }
+        return (word_type{1} << bits) - 1;
+    }
+
+    std::vector<word_type> words_;
+    size_type size_bits_ = 0;
+
+    auto clear_unused_tail_bits() noexcept -> void {
+        if (words_.empty()) {
+            return;
+        }
+        const size_type rem = bit_offset(size_bits_);
+        if (rem == 0) {
+            return;
+        }
+        words_.back() &= low_bits_mask(rem);
+    }
 
    public:
     class Reference {
-        std::uint8_t* byte_ = nullptr;
+        word_type* word_ = nullptr;
+        word_type mask_ = 0;
 
        public:
-        explicit Reference(std::uint8_t* byte) : byte_(byte) {}
+        explicit Reference(word_type* word, word_type mask) : word_(word), mask_(mask) {}
 
         auto operator=(bool v) -> Reference& {
-            *byte_ = v ? 1U : 0U;
+            if (v) {
+                *word_ |= mask_;
+            } else {
+                *word_ &= ~mask_;
+            }
             return *this;
         }
 
         auto operator=(const Reference& other) -> Reference& {
-            *byte_ = static_cast<bool>(other) ? 1U : 0U;
-            return *this;
+            return *this = static_cast<bool>(other);
         }
 
-        [[nodiscard]] operator bool() const { return *byte_ != 0; }
+        [[nodiscard]] operator bool() const { return (*word_ & mask_) != 0; }
     };
-
-    using value_type = bool;
-    using size_type = std::size_t;
 
     Column() = default;
 
-    explicit Column(size_type count, bool value = false) : data_(count, value ? 1U : 0U) {}
+    explicit Column(size_type count, bool value = false) { assign(count, value); }
 
     Column(const std::vector<bool>& bools) {
-        data_.reserve(bools.size());
+        reserve(bools.size());
         for (bool v : bools)
-            data_.push_back(v ? 1U : 0U);
+            push_back(v);
     }
 
     Column(std::initializer_list<bool> init) {
-        data_.reserve(init.size());
+        reserve(init.size());
         for (bool v : init)
-            data_.push_back(v ? 1U : 0U);
+            push_back(v);
     }
 
-    [[nodiscard]] auto size() const noexcept -> size_type { return data_.size(); }
-    [[nodiscard]] auto empty() const noexcept -> bool { return data_.empty(); }
+    [[nodiscard]] auto size() const noexcept -> size_type { return size_bits_; }
+    [[nodiscard]] auto empty() const noexcept -> bool { return size_bits_ == 0; }
+    [[nodiscard]] auto word_count() const noexcept -> size_type { return words_.size(); }
 
-    [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool { return data_[idx] != 0; }
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool {
+        return (words_[word_index(idx)] & bit_mask(idx)) != 0;
+    }
     [[nodiscard]] auto operator[](size_type idx) noexcept -> Reference {
-        return Reference(&data_[idx]);
+        return Reference(&words_[word_index(idx)], bit_mask(idx));
     }
 
     auto operator=(const std::vector<bool>& bools) -> Column& {
-        data_.clear();
-        data_.reserve(bools.size());
+        clear();
+        reserve(bools.size());
         for (bool v : bools)
-            data_.push_back(v ? 1U : 0U);
+            push_back(v);
         return *this;
     }
 
-    /// Mutable byte-level access (for gather/sort paths that do `dst[i] = src[j]`).
-    [[nodiscard]] auto byte_at(size_type idx) noexcept -> std::uint8_t& { return data_[idx]; }
+    auto set(size_type idx, bool value) noexcept -> void {
+        auto& word = words_[word_index(idx)];
+        const word_type mask = bit_mask(idx);
+        if (value) {
+            word |= mask;
+        } else {
+            word &= ~mask;
+        }
+    }
 
-    void push_back(bool v) { data_.push_back(v ? 1U : 0U); }
+    void push_back(bool value) {
+        const size_type idx = size_bits_;
+        if (bit_offset(idx) == 0) {
+            words_.push_back(0);
+        }
+        if (value) {
+            words_.back() |= bit_mask(idx);
+        }
+        ++size_bits_;
+    }
 
-    void reserve(size_type n) { data_.reserve(n); }
+    void reserve(size_type n) { words_.reserve(words_for_bits(n)); }
 
     // zero-initialises (false) for resize-based fill in lag/lead paths
-    void resize(size_type n) { data_.resize(n, 0U); }
-    void resize(size_type n, bool value) { data_.resize(n, value ? 1U : 0U); }
+    void resize(size_type n) { resize(n, false); }
+    void resize(size_type n, bool value) {
+        const size_type old_size = size_bits_;
+        if (n == old_size) {
+            return;
+        }
+        words_.resize(words_for_bits(n), 0);
+        size_bits_ = n;
+        if (n > old_size && value) {
+            for (size_type i = old_size; i < n; ++i) {
+                set(i, true);
+            }
+        }
+        clear_unused_tail_bits();
+    }
 
-    // Raw byte pointer: sizeof(bool)==1 ≡ sizeof(uint8_t), so POD memcpy is safe.
-    [[nodiscard]] auto data() const noexcept -> const std::uint8_t* { return data_.data(); }
-    [[nodiscard]] auto data() noexcept -> std::uint8_t* { return data_.data(); }
+    [[nodiscard]] auto words_data() const noexcept -> const word_type* { return words_.data(); }
+    [[nodiscard]] auto words_data() noexcept -> word_type* { return words_.data(); }
 
-    // Span access (returns uint8_t span; callers that need bool can cast 0/!0).
-    [[nodiscard]] auto span() const noexcept -> std::span<const std::uint8_t> { return data_; }
-    [[nodiscard]] auto span() noexcept -> std::span<std::uint8_t> { return data_; }
+    void clear() noexcept {
+        words_.clear();
+        size_bits_ = 0;
+    }
 
-    void assign(size_type count, bool value) { data_.assign(count, value ? 1U : 0U); }
+    void assign(size_type count, bool value) {
+        words_.assign(words_for_bits(count), value ? ~word_type{0} : word_type{0});
+        size_bits_ = count;
+        clear_unused_tail_bits();
+    }
+
+    struct Iterator {
+        const Column* col = nullptr;
+        size_type i = 0;
+        auto operator*() const -> bool { return (*col)[i]; }
+        auto operator++() -> Iterator& {
+            ++i;
+            return *this;
+        }
+        auto operator==(const Iterator& other) const -> bool { return i == other.i; }
+        auto operator!=(const Iterator& other) const -> bool { return i != other.i; }
+    };
+
+    [[nodiscard]] auto begin() const noexcept -> Iterator { return {this, 0}; }
+    [[nodiscard]] auto end() const noexcept -> Iterator { return {this, size()}; }
 };
 
 }  // namespace ibex

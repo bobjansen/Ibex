@@ -1,5 +1,7 @@
 include(Catch2Testing)
 
+add_library(ibex_test_warning_suppressions INTERFACE)
+
 add_executable(ibex_tests
     test_column.cpp
     test_csv.cpp
@@ -33,6 +35,7 @@ target_link_libraries(ibex_tests
         Ibex::codegen
         Ibex::CompilerOptions
         Catch2::Catch2WithMain
+        ibex_test_warning_suppressions
         rapidcsv
         nlohmann_json::nlohmann_json
 )
@@ -51,6 +54,14 @@ endif()
 if(IBEX_HAS_AVX2)
     target_compile_options(ibex_tests PRIVATE -mavx2 -mfma)
 endif()
+
+# Catch2 uses __COUNTER__ heavily in its test macros, which Clang diagnoses as
+# a C2y extension under -Wpedantic. Keep the shared warnings for project code,
+# but suppress this one test-framework-specific diagnostic after those flags.
+target_compile_options(ibex_test_warning_suppressions
+    INTERFACE
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-c2y-extensions>
+)
 
 catch_discover_tests(ibex_tests)
 

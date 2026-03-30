@@ -9,10 +9,14 @@ import pandas as pd
 import pyarrow as pa
 
 
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
 def add_bridge_module_path() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
+    root = repo_root()
     for build_dir_name in ("build-release", "build"):
-        candidate = repo_root / build_dir_name / "python"
+        candidate = root / build_dir_name / "python"
         if candidate.is_dir():
             sys.path.insert(0, str(candidate))
             return
@@ -25,17 +29,19 @@ import ibex_pyarrow
 
 
 def default_plugin_paths() -> list[str]:
-    repo_root = Path(__file__).resolve().parents[1]
+    root = repo_root()
     paths: list[str] = []
     for build_dir_name in ("build-release", "build"):
         for relative in ("tools", "libraries"):
-            candidate = repo_root / build_dir_name / relative
+            candidate = root / build_dir_name / relative
             if candidate.is_dir():
                 paths.append(str(candidate))
     return paths
 
 
 def main() -> int:
+    iris_csv = repo_root() / "data" / "iris.csv"
+
     table = ibex_pyarrow.eval_table(
         """
         Table {
@@ -189,10 +195,10 @@ def main() -> int:
     }
 
     from_csv = ibex_pyarrow.eval_table(
-        """
+        f"""
         extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 
-        read_csv("data/iris.csv")[select total = count()];
+        read_csv("{iris_csv}")[select total = count()];
         """,
         plugin_paths=default_plugin_paths(),
     )
@@ -204,9 +210,9 @@ def main() -> int:
     session = ibex_pyarrow.create_session(plugin_paths=default_plugin_paths())
     define_result = ibex_pyarrow.session_eval_table(
         session,
-        """
+        f"""
         extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-        let iris = read_csv("data/iris.csv");
+        let iris = read_csv("{iris_csv}");
         """,
     )
     assert define_result is None

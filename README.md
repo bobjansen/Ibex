@@ -97,7 +97,9 @@ Reset the hidden Ibex session with:
 
 Supported magic options:
 
-- `--bind ibex_name=python_var` to pass pandas/pyarrow tables or Python `int`/`float`/`string` scalars into Ibex
+- `--bind ibex_name=python_var` to pass pandas/pyarrow tables or Python scalar values into Ibex
+- supported scalar bindings currently include `int`, `float`, `bool`, `str`, `datetime.date`, and `datetime.datetime`
+- Python `datetime.date` maps to Ibex `Date`, and `datetime.datetime` maps to Ibex `Timestamp`
 - `--as pyarrow|pandas` to control the returned result type
 - `--out var_name` to choose the output variable name
 - `--quiet` to suppress immediate display

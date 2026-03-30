@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import sys
 import tempfile
 from pathlib import Path
@@ -121,6 +122,30 @@ def main() -> int:
     print(scalar_bound.to_pydict())
     assert scalar_bound.to_pydict() == {
         "qty_plus_offset": [13, 14, 15],
+    }
+
+    temporal_scalars = ibex_pyarrow.eval_table(
+        """
+        Table { x = [1] }[update {
+            keep = enabled,
+            d = trade_day,
+            ts = cutoff
+        }];
+        """,
+        scalars={
+            "enabled": True,
+            "trade_day": dt.date(2024, 1, 2),
+            "cutoff": dt.datetime(2024, 1, 2, 3, 4, 5, 6000),
+        },
+    )
+    print("\ntemporal-scalar table:")
+    print(temporal_scalars)
+    print(temporal_scalars.to_pydict())
+    assert temporal_scalars.to_pydict() == {
+        "x": [1],
+        "keep": [True],
+        "d": [dt.date(2024, 1, 2)],
+        "ts": [dt.datetime(2024, 1, 2, 3, 4, 5, 6000)],
     }
 
     arrow_orders = pa.table(

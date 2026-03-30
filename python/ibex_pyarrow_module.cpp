@@ -5,6 +5,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <datetime.h>
 #include <dlfcn.h>
 #include <expected>
 #include <filesystem>
@@ -532,6 +533,47 @@ auto parse_plugin_paths(PyObject* plugin_paths_obj)
     return paths;
 }
 
+auto date_from_ymd(int year, int month, int day) -> ibex::Date {
+    using namespace std::chrono;
+    const auto ymd =
+        year_month_day{std::chrono::year{year}, std::chrono::month{static_cast<unsigned>(month)},
+                       std::chrono::day{static_cast<unsigned>(day)}};
+    const auto sys = sys_days{ymd};
+    return ibex::Date{static_cast<std::int32_t>(sys.time_since_epoch().count())};
+}
+
+auto timestamp_from_python_datetime(PyObject* value)
+    -> std::expected<ibex::Timestamp, std::string> {
+    using namespace std::chrono;
+    const auto y = PyDateTime_GET_YEAR(value);
+    const auto m = PyDateTime_GET_MONTH(value);
+    const auto d = PyDateTime_GET_DAY(value);
+    const auto hh = PyDateTime_DATE_GET_HOUR(value);
+    const auto mm = PyDateTime_DATE_GET_MINUTE(value);
+    const auto ss = PyDateTime_DATE_GET_SECOND(value);
+    const auto us = PyDateTime_DATE_GET_MICROSECOND(value);
+
+    const auto day_point =
+        sys_days{year{y} / month{static_cast<unsigned>(m)} / day{static_cast<unsigned>(d)}};
+    auto total = duration_cast<nanoseconds>(day_point.time_since_epoch()) + hours{hh} +
+                 minutes{mm} + seconds{ss} + microseconds{us};
+
+    OwnedPyObject offset(PyObject_CallMethod(value, "utcoffset", nullptr));
+    if (!offset.get()) {
+        auto message = current_python_error_message();
+        PyErr_Clear();
+        return std::unexpected(message);
+    }
+    if (offset.get() != Py_None) {
+        const auto delta_days = PyDateTime_DELTA_GET_DAYS(offset.get());
+        const auto delta_seconds = PyDateTime_DELTA_GET_SECONDS(offset.get());
+        const auto delta_micros = PyDateTime_DELTA_GET_MICROSECONDS(offset.get());
+        total -= days{delta_days} + seconds{delta_seconds} + microseconds{delta_micros};
+    }
+
+    return ibex::Timestamp{total.count()};
+}
+
 auto build_scalar_registry_from_python(PyObject* scalars_obj)
     -> std::expected<ibex::runtime::ScalarRegistry, std::string> {
     ibex::runtime::ScalarRegistry registry;
@@ -551,8 +593,8 @@ auto build_scalar_registry_from_python(PyObject* scalars_obj)
             return std::unexpected(name.error());
         }
         if (PyBool_Check(value)) {
-            return std::unexpected("scalar '" + *name +
-                                   "': Bool bindings are not supported by Ibex scalars");
+            registry.emplace(*name, value == Py_True);
+            continue;
         }
         if (PyLong_Check(value)) {
             long long as_i64 = PyLong_AsLongLong(value);
@@ -572,6 +614,20 @@ auto build_scalar_registry_from_python(PyObject* scalars_obj)
                 return std::unexpected("scalar '" + *name + "': " + message);
             }
             registry.emplace(*name, as_f64);
+            continue;
+        }
+        if (PyDateTime_Check(value)) {
+            auto ts = timestamp_from_python_datetime(value);
+            if (!ts.has_value()) {
+                return std::unexpected("scalar '" + *name + "': " + ts.error());
+            }
+            registry.emplace(*name, *ts);
+            continue;
+        }
+        if (PyDate_Check(value)) {
+            registry.emplace(*name,
+                             date_from_ymd(PyDateTime_GET_YEAR(value), PyDateTime_GET_MONTH(value),
+                                           PyDateTime_GET_DAY(value)));
             continue;
         }
         if (PyUnicode_Check(value)) {
@@ -1142,5 +1198,6 @@ PyModuleDef kModuleDef = {
 }  // namespace
 
 PyMODINIT_FUNC PyInit_ibex_pyarrow() {
+    PyDateTime_IMPORT;
     return PyModule_Create(&kModuleDef);
 }

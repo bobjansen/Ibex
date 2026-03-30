@@ -876,7 +876,7 @@ class Lowerer {
                 return std::unexpected(value.error());
             auto wrapped = std::visit(
                 [](const auto& v)
-                    -> std::variant<std::int64_t, double, std::string, Date, Timestamp> {
+                    -> std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> {
                     return v;
                 },
                 value.value());
@@ -1742,13 +1742,16 @@ class Lowerer {
     }
 
     static auto lower_literal(const LiteralExpr& literal)
-        -> std::expected<std::variant<std::int64_t, double, std::string, Date, Timestamp>,
+        -> std::expected<std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>,
                          LowerError> {
         if (const auto* int_value = std::get_if<std::int64_t>(&literal.value)) {
             return *int_value;
         }
         if (const auto* double_value = std::get_if<double>(&literal.value)) {
             return *double_value;
+        }
+        if (const auto* bool_value = std::get_if<bool>(&literal.value)) {
+            return *bool_value;
         }
         if (const auto* str_value = std::get_if<std::string>(&literal.value)) {
             return *str_value;

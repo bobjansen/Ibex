@@ -388,6 +388,30 @@ TEST_CASE("Interpret update with scalar reference") {
     REQUIRE((*price_ints)[2] == 13);
 }
 
+TEST_CASE("Interpret update with bool scalar reference") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("enabled", true);
+
+    auto ir = require_ir("trades[update { keep = enabled }];");
+    auto result = runtime::interpret(*ir, registry, &scalars);
+    REQUIRE(result.has_value());
+
+    const auto* keep_col = result->find("keep");
+    REQUIRE(keep_col != nullptr);
+    const auto* keep_bools = std::get_if<Column<bool>>(keep_col);
+    REQUIRE(keep_bools != nullptr);
+    REQUIRE(keep_bools->size() == 3);
+    REQUIRE((*keep_bools)[0] == true);
+    REQUIRE((*keep_bools)[1] == true);
+    REQUIRE((*keep_bools)[2] == true);
+}
+
 TEST_CASE("Interpret order descending") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{10, 30, 20});

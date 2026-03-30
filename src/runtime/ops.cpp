@@ -339,11 +339,21 @@ auto matmul(const runtime::Table& left, const runtime::Table& right) -> runtime:
     return delegate_with_registry(std::move(node), reg);
 }
 
-auto model_coef(const runtime::ModelResult& m) -> runtime::Table { return m.coefficients; }
-auto model_summary(const runtime::ModelResult& m) -> runtime::Table { return m.summary; }
-auto model_fitted(const runtime::ModelResult& m) -> runtime::Table { return m.fitted_values; }
-auto model_residuals(const runtime::ModelResult& m) -> runtime::Table { return m.residuals; }
-auto model_r_squared(const runtime::ModelResult& m) -> double { return m.r_squared; }
+auto model_coef(const runtime::ModelResult& m) -> runtime::Table {
+    return m.coefficients;
+}
+auto model_summary(const runtime::ModelResult& m) -> runtime::Table {
+    return m.summary;
+}
+auto model_fitted(const runtime::ModelResult& m) -> runtime::Table {
+    return m.fitted_values;
+}
+auto model_residuals(const runtime::ModelResult& m) -> runtime::Table {
+    return m.residuals;
+}
+auto model_r_squared(const runtime::ModelResult& m) -> double {
+    return m.r_squared;
+}
 
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
@@ -543,28 +553,33 @@ auto filter_col(std::string name) -> ir::FilterExprPtr {
 }
 
 auto filter_int(std::int64_t v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
+        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_dbl(double v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
+        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
+}
+
+auto filter_bool(bool v) -> ir::FilterExprPtr {
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
+        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_str(std::string v) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
-        std::variant<std::int64_t, double, std::string, Date, Timestamp>{std::move(v)}}});
+        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{std::move(v)}}});
 }
 
 auto filter_date(Date v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
+        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        ir::FilterLiteral{std::variant<std::int64_t, double, std::string, Date, Timestamp>{v}}});
+    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
+        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
 }
 
 auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)

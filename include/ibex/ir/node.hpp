@@ -140,7 +140,7 @@ struct FilterColumn {
 };
 /// Literal value in a filter expression.
 struct FilterLiteral {
-    std::variant<std::int64_t, double, std::string, Date, Timestamp> value;
+    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> value;
 };
 /// Arithmetic on two value expressions.
 struct FilterArith {

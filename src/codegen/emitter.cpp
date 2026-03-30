@@ -120,6 +120,8 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
                         out << "std::int64_t{" << v << "}";
                     } else if constexpr (std::is_same_v<V, double>) {
                         out << format_double(v);
+                    } else if constexpr (std::is_same_v<V, bool>) {
+                        out << (v ? "true" : "false");
                     } else if constexpr (std::is_same_v<V, std::string>) {
                         out << "\"" << escape_string(v) << "\"";
                     } else if constexpr (std::is_same_v<V, Date>) {
@@ -909,6 +911,9 @@ auto Emitter::emit_filter_expr(const ir::FilterExpr& expr) -> std::string {
                             return "ibex::ops::filter_int(std::int64_t{" + std::to_string(v) + "})";
                         } else if constexpr (std::is_same_v<V, double>) {
                             return "ibex::ops::filter_dbl(" + format_double(v) + ")";
+                        } else if constexpr (std::is_same_v<V, bool>) {
+                            return std::string("ibex::ops::filter_bool(") + (v ? "true" : "false") +
+                                   ")";
                         } else if constexpr (std::is_same_v<V, std::string>) {
                             return "ibex::ops::filter_str(\"" + escape_string(v) + "\")";
                         } else if constexpr (std::is_same_v<V, Date>) {

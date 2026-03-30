@@ -357,6 +357,7 @@ auto session_from_capsule(PyObject* capsule) -> std::expected<SessionState*, std
 }
 
 auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegistry& registry,
+                     const ibex::runtime::ScalarRegistry& scalars,
                      const std::vector<std::string>& plugin_search_paths)
     -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
     auto parsed = ibex::parser::parse(source);
@@ -377,7 +378,7 @@ auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegist
         return std::unexpected(lowered.error().message);
     }
 
-    auto evaluated = ibex::runtime::interpret(*lowered.value(), registry, nullptr,
+    auto evaluated = ibex::runtime::interpret(*lowered.value(), registry, &scalars,
                                               plugin_search_paths.empty() ? nullptr : &externs);
     if (!evaluated.has_value()) {
         return std::unexpected(evaluated.error());
@@ -395,8 +396,18 @@ auto merge_registries(const ibex::runtime::TableRegistry& base,
     return merged;
 }
 
+auto merge_scalars(const ibex::runtime::ScalarRegistry& base,
+                   const ibex::runtime::ScalarRegistry& extra) -> ibex::runtime::ScalarRegistry {
+    ibex::runtime::ScalarRegistry merged = base;
+    for (const auto& [name, value] : extra) {
+        merged.insert_or_assign(name, value);
+    }
+    return merged;
+}
+
 auto eval_table_in_session(SessionState& session, const std::string& source,
-                           const ibex::runtime::TableRegistry& extra_tables)
+                           const ibex::runtime::TableRegistry& extra_tables,
+                           const ibex::runtime::ScalarRegistry& extra_scalars)
     -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
     auto parsed = ibex::parser::parse(source);
     if (!parsed.has_value()) {
@@ -430,6 +441,7 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         context.sink_externs = session.sink_externs;
 
         auto runtime_registry = merge_registries(session.tables, extra_tables);
+        auto runtime_scalars = merge_scalars({}, extra_scalars);
 
         if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
             auto lowered = ibex::parser::lower_expr(*let_stmt->value, context);
@@ -438,8 +450,8 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
                     "ibex_pyarrow sessions currently support only table-valued let bindings: " +
                     lowered.error().message);
             }
-            auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry, nullptr,
-                                                      &session.externs);
+            auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
+                                                      &runtime_scalars, &session.externs);
             if (!evaluated.has_value()) {
                 return std::unexpected(evaluated.error());
             }
@@ -454,8 +466,8 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
                 "ibex_pyarrow sessions currently support only table-valued expressions: " +
                 lowered.error().message);
         }
-        auto evaluated =
-            ibex::runtime::interpret(*lowered.value(), runtime_registry, nullptr, &session.externs);
+        auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
+                                                  &runtime_scalars, &session.externs);
         if (!evaluated.has_value()) {
             return std::unexpected(evaluated.error());
         }
@@ -518,6 +530,64 @@ auto parse_plugin_paths(PyObject* plugin_paths_obj)
         paths.push_back(*path);
     }
     return paths;
+}
+
+auto build_scalar_registry_from_python(PyObject* scalars_obj)
+    -> std::expected<ibex::runtime::ScalarRegistry, std::string> {
+    ibex::runtime::ScalarRegistry registry;
+    if (scalars_obj == nullptr || scalars_obj == Py_None) {
+        return registry;
+    }
+    if (!PyDict_Check(scalars_obj)) {
+        return std::unexpected("'scalars' must be a dict from name to Python scalar");
+    }
+
+    Py_ssize_t pos = 0;
+    PyObject* key = nullptr;
+    PyObject* value = nullptr;
+    while (PyDict_Next(scalars_obj, &pos, &key, &value) != 0) {
+        auto name = to_utf8_string(key, "scalar binding name");
+        if (!name.has_value()) {
+            return std::unexpected(name.error());
+        }
+        if (PyBool_Check(value)) {
+            return std::unexpected("scalar '" + *name +
+                                   "': Bool bindings are not supported by Ibex scalars");
+        }
+        if (PyLong_Check(value)) {
+            long long as_i64 = PyLong_AsLongLong(value);
+            if (PyErr_Occurred()) {
+                auto message = current_python_error_message();
+                PyErr_Clear();
+                return std::unexpected("scalar '" + *name + "': " + message);
+            }
+            registry.emplace(*name, static_cast<std::int64_t>(as_i64));
+            continue;
+        }
+        if (PyFloat_Check(value)) {
+            double as_f64 = PyFloat_AsDouble(value);
+            if (PyErr_Occurred()) {
+                auto message = current_python_error_message();
+                PyErr_Clear();
+                return std::unexpected("scalar '" + *name + "': " + message);
+            }
+            registry.emplace(*name, as_f64);
+            continue;
+        }
+        if (PyUnicode_Check(value)) {
+            auto text = to_utf8_string(value, "scalar binding value");
+            if (!text.has_value()) {
+                return std::unexpected("scalar '" + *name + "': " + text.error());
+            }
+            registry.emplace(*name, *text);
+            continue;
+        }
+        OwnedPyObject repr(PyObject_Repr(value));
+        const char* utf8 = repr ? PyUnicode_AsUTF8(repr.get()) : nullptr;
+        return std::unexpected("scalar '" + *name + "': unsupported Python scalar type " +
+                               std::string(utf8 != nullptr ? utf8 : "<unprintable>"));
+    }
+    return registry;
 }
 
 auto classify_scalar(PyObject* value) -> std::expected<ImportedColumnKind, std::string> {
@@ -884,12 +954,13 @@ PyObject* py_reset_session(PyObject* /*self*/, PyObject* args, PyObject* kwargs)
 }
 
 PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
-    static const char* kwlist[] = {"source", "tables", "plugin_paths", nullptr};
+    static const char* kwlist[] = {"source", "tables", "scalars", "plugin_paths", nullptr};
     const char* source = nullptr;
     PyObject* tables_obj = Py_None;
+    PyObject* scalars_obj = Py_None;
     PyObject* plugin_paths_obj = Py_None;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OO", const_cast<char**>(kwlist), &source,
-                                     &tables_obj, &plugin_paths_obj)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OOO", const_cast<char**>(kwlist), &source,
+                                     &tables_obj, &scalars_obj, &plugin_paths_obj)) {
         return nullptr;
     }
 
@@ -898,12 +969,17 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
         return set_python_error_from_message(PyExc_RuntimeError, registry.error());
     }
 
+    auto scalars = build_scalar_registry_from_python(scalars_obj);
+    if (!scalars.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, scalars.error());
+    }
+
     auto plugin_paths = parse_plugin_paths(plugin_paths_obj);
     if (!plugin_paths.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, plugin_paths.error());
     }
 
-    auto evaluated = eval_table_impl(source, *registry, *plugin_paths);
+    auto evaluated = eval_table_impl(source, *registry, *scalars, *plugin_paths);
     if (!evaluated.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }
@@ -912,12 +988,13 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
 }
 
 PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
-    static const char* kwlist[] = {"path", "tables", "plugin_paths", nullptr};
+    static const char* kwlist[] = {"path", "tables", "scalars", "plugin_paths", nullptr};
     const char* path = nullptr;
     PyObject* tables_obj = Py_None;
+    PyObject* scalars_obj = Py_None;
     PyObject* plugin_paths_obj = Py_None;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OO", const_cast<char**>(kwlist), &path,
-                                     &tables_obj, &plugin_paths_obj)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OOO", const_cast<char**>(kwlist), &path,
+                                     &tables_obj, &scalars_obj, &plugin_paths_obj)) {
         return nullptr;
     }
 
@@ -931,12 +1008,17 @@ PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
         return set_python_error_from_message(PyExc_RuntimeError, registry.error());
     }
 
+    auto scalars = build_scalar_registry_from_python(scalars_obj);
+    if (!scalars.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, scalars.error());
+    }
+
     auto plugin_paths = parse_plugin_paths(plugin_paths_obj);
     if (!plugin_paths.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, plugin_paths.error());
     }
 
-    auto evaluated = eval_table_impl(*source, *registry, *plugin_paths);
+    auto evaluated = eval_table_impl(*source, *registry, *scalars, *plugin_paths);
     if (!evaluated.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }
@@ -945,12 +1027,13 @@ PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
 }
 
 PyObject* py_session_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
-    static const char* kwlist[] = {"session", "source", "tables", nullptr};
+    static const char* kwlist[] = {"session", "source", "tables", "scalars", nullptr};
     PyObject* session_obj = Py_None;
     const char* source = nullptr;
     PyObject* tables_obj = Py_None;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|O", const_cast<char**>(kwlist), &session_obj,
-                                     &source, &tables_obj)) {
+    PyObject* scalars_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OO", const_cast<char**>(kwlist),
+                                     &session_obj, &source, &tables_obj, &scalars_obj)) {
         return nullptr;
     }
 
@@ -964,7 +1047,12 @@ PyObject* py_session_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kw
         return set_python_error_from_message(PyExc_RuntimeError, extra_tables.error());
     }
 
-    auto evaluated = eval_table_in_session(**session, source, *extra_tables);
+    auto extra_scalars = build_scalar_registry_from_python(scalars_obj);
+    if (!extra_scalars.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, extra_scalars.error());
+    }
+
+    auto evaluated = eval_table_in_session(**session, source, *extra_tables, *extra_scalars);
     if (!evaluated.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }
@@ -973,12 +1061,13 @@ PyObject* py_session_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kw
 }
 
 PyObject* py_session_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
-    static const char* kwlist[] = {"session", "path", "tables", nullptr};
+    static const char* kwlist[] = {"session", "path", "tables", "scalars", nullptr};
     PyObject* session_obj = Py_None;
     const char* path = nullptr;
     PyObject* tables_obj = Py_None;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|O", const_cast<char**>(kwlist), &session_obj,
-                                     &path, &tables_obj)) {
+    PyObject* scalars_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OO", const_cast<char**>(kwlist),
+                                     &session_obj, &path, &tables_obj, &scalars_obj)) {
         return nullptr;
     }
 
@@ -997,7 +1086,12 @@ PyObject* py_session_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwa
         return set_python_error_from_message(PyExc_RuntimeError, extra_tables.error());
     }
 
-    auto evaluated = eval_table_in_session(**session, *source, *extra_tables);
+    auto extra_scalars = build_scalar_registry_from_python(scalars_obj);
+    if (!extra_scalars.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, extra_scalars.error());
+    }
+
+    auto evaluated = eval_table_in_session(**session, *source, *extra_tables, *extra_scalars);
     if (!evaluated.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }

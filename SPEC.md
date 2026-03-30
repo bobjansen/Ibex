@@ -2902,11 +2902,13 @@ points are provided:
 - `eval_file(path, tables=None)` evaluates a `.ibex` file from disk
 
 The optional `tables` binding map copies Python-side table data into owned Ibex
-tables before evaluation. The first implementation supports:
+tables before evaluation. An optional `scalars` binding map passes Python
+scalars through Ibex’s existing scalar registry. The first implementation supports:
 
 - plain Python column dictionaries
 - `pyarrow.Table` inputs
 - pandas `DataFrame` inputs
+- Python `int`, `float`, and `string` scalar bindings
 
 On top of that bridge, Ibex provides an IPython extension, loadable with:
 
@@ -2922,7 +2924,7 @@ The extension exposes two magics:
 
 Both magics support the following options:
 
-- `--bind ibex_name=python_var` to bind Python tables into the Ibex script
+- `--bind ibex_name=python_var` to bind Python tables or Python scalar variables into the Ibex script
 - `--as pyarrow|pandas` to choose the returned result type
 - `--out var_name` to store the result in a chosen Python variable
 - `--quiet` to suppress immediate display
@@ -2951,11 +2953,13 @@ quotes = pd.DataFrame({
     "bid": [101.0, 101.2, 299.5],
     "ask": [101.1, 101.3, 300.0],
 })
+threshold = 0.09
 ```
 
 ```python
-%%ibex --bind quotes=quotes --as pandas --out spread_summary
+%%ibex --bind quotes=quotes --bind threshold=threshold --as pandas --out spread_summary
 quotes[
+    filter ask - bid > threshold,
     select { mean_spread = mean(ask - bid) },
     by symbol,
     order symbol

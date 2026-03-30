@@ -23,21 +23,25 @@ def main() -> int:
             "qty": [3, 4, 5],
         }
     )
+    shell.user_ns["offset"] = 10
     result = shell.run_cell_magic(
         "ibex",
-        "--bind trades=trades_df --as pandas --out grouped --quiet",
+        "--bind trades=trades_df --bind offset=offset --as pandas --out grouped --quiet",
         """
-        trades[select { total_qty = sum(qty) }, by symbol, order symbol];
+        trades[
+            update { qty_plus_offset = qty + offset }
+        ]
+        [select { total_qty = sum(qty_plus_offset) }, by symbol, order symbol];
         """,
     )
     assert isinstance(result, pd.DataFrame)
     assert result.to_dict(orient="list") == {
         "symbol": ["A", "B"],
-        "total_qty": [7, 5],
+        "total_qty": [27, 15],
     }
     assert shell.user_ns["grouped"].to_dict(orient="list") == {
         "symbol": ["A", "B"],
-        "total_qty": [7, 5],
+        "total_qty": [27, 15],
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:

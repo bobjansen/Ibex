@@ -5339,6 +5339,7 @@ constexpr auto is_rng_func(std::string_view name) -> bool;
 constexpr auto rng_func_returns_int(std::string_view name) -> bool;
 constexpr auto is_cum_func(std::string_view name) -> bool;
 constexpr auto is_fill_func(std::string_view name) -> bool;
+constexpr auto is_float_clean_func(std::string_view name) -> bool;
 
 auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                      const ExternRegistry* externs) -> std::expected<ExprType, std::string> {
@@ -5421,6 +5422,44 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                                        col_ref->name + "'");
             }
             return expr_type_for_column(*source);
+        }
+        if (is_float_clean_func(call->callee)) {
+            if (call->args.size() != 1) {
+                return std::unexpected(std::string(call->callee) + ": expected 1 argument");
+            }
+            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+            if (!col_ref) {
+                return std::unexpected(std::string(call->callee) +
+                                       ": argument must be a column name");
+            }
+            const auto* source = input.find(col_ref->name);
+            if (!source) {
+                return std::unexpected(std::string(call->callee) + ": unknown column '" +
+                                       col_ref->name + "'");
+            }
+            auto kind = expr_type_for_column(*source);
+            if (kind != ExprType::Double) {
+                return std::unexpected(std::string(call->callee) + ": column must be Float64");
+            }
+            return ExprType::Double;
+        }
+        if (call->callee == "is_nan") {
+            if (call->args.size() != 1) {
+                return std::unexpected("is_nan: expected 1 argument");
+            }
+            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+            if (!col_ref) {
+                return std::unexpected("is_nan: argument must be a column name");
+            }
+            const auto* source = input.find(col_ref->name);
+            if (!source) {
+                return std::unexpected("is_nan: unknown column '" + col_ref->name + "'");
+            }
+            auto kind = expr_type_for_column(*source);
+            if (kind != ExprType::Double) {
+                return std::unexpected("is_nan: column must be Float64");
+            }
+            return ExprType::Bool;
         }
         // Cumulative functions (cumsum / cumprod)
         if (is_cum_func(call->callee)) {
@@ -5640,6 +5679,19 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         }
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "is_nan") {
+            if (call->args.size() != 1) {
+                return std::unexpected("is_nan: expected 1 argument");
+            }
+            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
+            if (!arg) {
+                return arg;
+            }
+            if (const auto* value = std::get_if<double>(&arg.value())) {
+                return static_cast<std::int64_t>(std::isnan(*value));
+            }
+            return std::unexpected("is_nan: argument must be Float64");
+        }
         if (externs == nullptr) {
             return std::unexpected("unknown function in expression: " + call->callee);
         }
@@ -5733,6 +5785,13 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                     } else {
                         invariant_violation(
                             "eval_expr_column: expected Float64-compatible expression value");
+                    }
+                } else if constexpr (std::is_same_v<ValueType, bool>) {
+                    if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(*v != 0);
+                    } else {
+                        invariant_violation(
+                            "eval_expr_column: expected Bool-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, std::string>) {
                     if (const auto* v = std::get_if<std::string>(&value.value())) {
@@ -5890,6 +5949,11 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
 struct FillResult {
     ColumnValue column;
     std::optional<ValidityBitmap> validity;  // nullopt = all rows valid
+};
+
+enum class FloatCleanMode : std::uint8_t {
+    NullIfNan,
+    NullIfNotFinite,
 };
 
 // fill_null(col, value): replace every null cell with the scalar `value`.
@@ -6090,8 +6154,91 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
         *entry->column);
 }
 
+auto eval_float_clean(const ir::CallExpr& call, const Table& input, FloatCleanMode mode)
+    -> std::expected<FillResult, std::string> {
+    const std::string_view fname =
+        mode == FloatCleanMode::NullIfNan ? "null_if_nan" : "null_if_not_finite";
+    if (call.args.size() != 1) {
+        return std::unexpected(std::string(fname) + ": expected 1 argument (col)");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected(std::string(fname) + ": argument must be a column name");
+    }
+    const auto* entry = input.find_entry(col_ref->name);
+    if (!entry) {
+        return std::unexpected(std::string(fname) + ": unknown column '" + col_ref->name + "'");
+    }
+    const auto* src = std::get_if<Column<double>>(entry->column.get());
+    if (src == nullptr) {
+        return std::unexpected(std::string(fname) + ": column must be Float64");
+    }
+
+    Column<double> result = *src;
+    std::optional<ValidityBitmap> validity;
+    if (entry->validity.has_value()) {
+        validity = *entry->validity;
+    }
+
+    bool changed = false;
+    for (std::size_t i = 0; i < result.size(); ++i) {
+        const bool is_valid = !validity.has_value() || (*validity)[i];
+        if (!is_valid) {
+            continue;
+        }
+        const double value = result[i];
+        const bool should_null =
+            mode == FloatCleanMode::NullIfNan ? std::isnan(value) : !std::isfinite(value);
+        if (!should_null) {
+            continue;
+        }
+        if (!validity.has_value()) {
+            validity.emplace(result.size(), true);
+        }
+        validity->set(i, false);
+        changed = true;
+    }
+
+    if (!changed && !entry->validity.has_value()) {
+        validity.reset();
+    }
+    return FillResult{ColumnValue{std::move(result)}, std::move(validity)};
+}
+
+auto eval_is_nan(const ir::CallExpr& call, const Table& input)
+    -> std::expected<ColumnValue, std::string> {
+    if (call.args.size() != 1) {
+        return std::unexpected("is_nan: expected 1 argument (col)");
+    }
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (!col_ref) {
+        return std::unexpected("is_nan: argument must be a column name");
+    }
+    const auto* entry = input.find_entry(col_ref->name);
+    if (!entry) {
+        return std::unexpected("is_nan: unknown column '" + col_ref->name + "'");
+    }
+    const auto* src = std::get_if<Column<double>>(entry->column.get());
+    if (src == nullptr) {
+        return std::unexpected("is_nan: column must be Float64");
+    }
+
+    Column<bool> result;
+    result.resize(src->size());
+    const bool has_validity = entry->validity.has_value();
+    for (std::size_t i = 0; i < src->size(); ++i) {
+        const bool is_valid = !has_validity || (*entry->validity)[i];
+        result.set(i, is_valid && std::isnan((*src)[i]));
+    }
+    return ColumnValue{std::move(result)};
+}
+
 constexpr auto is_fill_func(std::string_view name) -> bool {
     return name == "fill_null" || name == "fill_forward" || name == "fill_backward";
+}
+
+constexpr auto is_float_clean_func(std::string_view name) -> bool {
+    return name == "null_if_nan" || name == "null_if_not_finite";
 }
 
 // Find the first row index lo in [0, row] where time[lo] >= time[row] - duration.
@@ -7061,6 +7208,27 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                     output.add_column(field.alias, std::move(res->column));
                 continue;
             }
+            if (is_float_clean_func(call->callee)) {
+                auto res = eval_float_clean(*call, output,
+                                            call->callee == "null_if_nan"
+                                                ? FloatCleanMode::NullIfNan
+                                                : FloatCleanMode::NullIfNotFinite);
+                if (!res)
+                    return std::unexpected(res.error());
+                if (res->validity)
+                    output.add_column(field.alias, std::move(res->column),
+                                      std::move(*res->validity));
+                else
+                    output.add_column(field.alias, std::move(res->column));
+                continue;
+            }
+            if (call->callee == "is_nan") {
+                auto col = eval_is_nan(*call, output);
+                if (!col)
+                    return std::unexpected(col.error());
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, output.rows());
                 if (!col)
@@ -7161,6 +7329,27 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                     output.add_column(field.alias, std::move(res->column));
                 continue;
             }
+            if (is_float_clean_func(call->callee)) {
+                auto res = eval_float_clean(*call, output,
+                                            call->callee == "null_if_nan"
+                                                ? FloatCleanMode::NullIfNan
+                                                : FloatCleanMode::NullIfNotFinite);
+                if (!res)
+                    return std::unexpected(res.error());
+                if (res->validity)
+                    output.add_column(field.alias, std::move(res->column),
+                                      std::move(*res->validity));
+                else
+                    output.add_column(field.alias, std::move(res->column));
+                continue;
+            }
+            if (call->callee == "is_nan") {
+                auto col = eval_is_nan(*call, output);
+                if (!col)
+                    return std::unexpected(col.error());
+                output.add_column(field.alias, std::move(col.value()));
+                continue;
+            }
             if (is_rng_func(call->callee)) {
                 auto col = apply_rng_func(*call, rows);
                 if (!col)
@@ -7250,6 +7439,13 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                             invariant_violation(
                                 "update_table_window: expected Float64-compatible expression "
                                 "value");
+                        }
+                    } else if constexpr (std::is_same_v<ValueType, bool>) {
+                        if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                            col.push_back(*int_value != 0);
+                        } else {
+                            invariant_violation(
+                                "update_table_window: expected Bool-compatible expression value");
                         }
                     } else if constexpr (std::is_same_v<ValueType, std::string>) {
                         if (const auto* v = std::get_if<std::string>(&value.value())) {

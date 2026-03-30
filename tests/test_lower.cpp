@@ -97,6 +97,35 @@ TEST_CASE("Lower grouped aggregation to IR") {
     REQUIRE(agg->aggregations()[0].func == ir::AggFunc::Sum);
 }
 
+TEST_CASE("Lower grouped aggregation with null cleanup wrapper to IR") {
+    auto program =
+        require_parse("df[select { symbol, avg_price = mean(null_if_nan(price)) }, by symbol];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* agg = as_node<ir::AggregateNode>(result->get());
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->group_by().size() == 1);
+    REQUIRE(agg->group_by()[0].name == "symbol");
+    REQUIRE(agg->aggregations().size() == 1);
+    REQUIRE(agg->aggregations()[0].alias == "avg_price");
+    REQUIRE(agg->aggregations()[0].column.name == "_agg0");
+    REQUIRE(agg->aggregations()[0].func == ir::AggFunc::Mean);
+
+    REQUIRE(agg->children().size() == 1);
+    const auto* update = as_node<ir::UpdateNode>(agg->children()[0].get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->fields().size() == 1);
+    REQUIRE(update->fields()[0].alias == "_agg0");
+    const auto* call = std::get_if<ir::CallExpr>(&update->fields()[0].expr.node);
+    REQUIRE(call != nullptr);
+    REQUIRE(call->callee == "null_if_nan");
+    REQUIRE(call->args.size() == 1);
+    const auto* arg = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+    REQUIRE(arg != nullptr);
+    REQUIRE(arg->name == "price");
+}
+
 TEST_CASE("Lower update with by to IR") {
     auto program = require_parse("df[update { avg = price }, by symbol];");
     auto result = parser::lower(program);

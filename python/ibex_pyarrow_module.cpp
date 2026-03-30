@@ -93,6 +93,10 @@ auto set_python_error_from_message(PyObject* exc_type, const std::string& messag
     return nullptr;
 }
 
+auto format_ibex_pyarrow_error(std::string_view stage, const std::string& message) -> std::string {
+    return "ibex_pyarrow " + std::string(stage) + ": " + message;
+}
+
 auto current_python_error_message() -> std::string {
     PyObject* type_raw = nullptr;
     PyObject* value_raw = nullptr;
@@ -363,26 +367,27 @@ auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegist
     -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
     auto parsed = ibex::parser::parse(source);
     if (!parsed.has_value()) {
-        return std::unexpected(parsed.error().format());
+        return std::unexpected(format_ibex_pyarrow_error("parse error", parsed.error().format()));
     }
 
     ibex::runtime::ExternRegistry externs;
     if (!plugin_search_paths.empty()) {
         auto loaded = load_source_plugins(*parsed, plugin_search_paths, externs);
         if (!loaded.has_value()) {
-            return std::unexpected(loaded.error());
+            return std::unexpected(format_ibex_pyarrow_error("plugin load error", loaded.error()));
         }
     }
 
     auto lowered = ibex::parser::lower(*parsed);
     if (!lowered.has_value()) {
-        return std::unexpected(lowered.error().message);
+        return std::unexpected(
+            format_ibex_pyarrow_error("lowering error", lowered.error().message));
     }
 
     auto evaluated = ibex::runtime::interpret(*lowered.value(), registry, &scalars,
                                               plugin_search_paths.empty() ? nullptr : &externs);
     if (!evaluated.has_value()) {
-        return std::unexpected(evaluated.error());
+        return std::unexpected(format_ibex_pyarrow_error("runtime error", evaluated.error()));
     }
 
     return std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
@@ -412,7 +417,7 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
     -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
     auto parsed = ibex::parser::parse(source);
     if (!parsed.has_value()) {
-        return std::unexpected(parsed.error().format());
+        return std::unexpected(format_ibex_pyarrow_error("parse error", parsed.error().format()));
     }
 
     std::shared_ptr<const ibex::runtime::Table> last_table;
@@ -420,21 +425,25 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
             auto registered = register_extern_decl(*decl, session);
             if (!registered.has_value()) {
-                return std::unexpected(registered.error());
+                return std::unexpected(
+                    format_ibex_pyarrow_error("plugin load error", registered.error()));
             }
             continue;
         }
         if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
-            return std::unexpected(
-                "ibex_pyarrow sessions do not yet support import declarations; use explicit extern "
-                "fn declarations");
+            return std::unexpected(format_ibex_pyarrow_error(
+                "session error",
+                "import declarations are not supported in ibex_pyarrow sessions; use explicit "
+                "extern fn declarations"));
         }
         if (std::holds_alternative<ibex::parser::FunctionDecl>(stmt)) {
-            return std::unexpected(
-                "ibex_pyarrow sessions do not yet support function declarations");
+            return std::unexpected(format_ibex_pyarrow_error(
+                "session error",
+                "function declarations are not supported in ibex_pyarrow sessions"));
         }
         if (std::holds_alternative<ibex::parser::TupleLetStmt>(stmt)) {
-            return std::unexpected("ibex_pyarrow sessions do not yet support tuple let bindings");
+            return std::unexpected(format_ibex_pyarrow_error(
+                "session error", "tuple let bindings are not supported in ibex_pyarrow sessions"));
         }
 
         ibex::parser::LowerContext context;
@@ -447,14 +456,16 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
             auto lowered = ibex::parser::lower_expr(*let_stmt->value, context);
             if (!lowered.has_value()) {
-                return std::unexpected(
+                return std::unexpected(format_ibex_pyarrow_error(
+                    "lowering error",
                     "ibex_pyarrow sessions currently support only table-valued let bindings: " +
-                    lowered.error().message);
+                        lowered.error().message));
             }
             auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
                                                       &runtime_scalars, &session.externs);
             if (!evaluated.has_value()) {
-                return std::unexpected(evaluated.error());
+                return std::unexpected(
+                    format_ibex_pyarrow_error("runtime error", evaluated.error()));
             }
             session.tables.insert_or_assign(let_stmt->name, std::move(*evaluated));
             continue;
@@ -463,14 +474,15 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         const auto& expr_stmt = std::get<ibex::parser::ExprStmt>(stmt);
         auto lowered = ibex::parser::lower_expr(*expr_stmt.expr, context);
         if (!lowered.has_value()) {
-            return std::unexpected(
+            return std::unexpected(format_ibex_pyarrow_error(
+                "lowering error",
                 "ibex_pyarrow sessions currently support only table-valued expressions: " +
-                lowered.error().message);
+                    lowered.error().message));
         }
         auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
                                                   &runtime_scalars, &session.externs);
         if (!evaluated.has_value()) {
-            return std::unexpected(evaluated.error());
+            return std::unexpected(format_ibex_pyarrow_error("runtime error", evaluated.error()));
         }
         last_table = std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
     }
@@ -481,13 +493,15 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
 auto read_text_file(const std::string& path) -> std::expected<std::string, std::string> {
     std::ifstream in(path);
     if (!in.is_open()) {
-        return std::unexpected("failed to open ibex file: " + path);
+        return std::unexpected(
+            format_ibex_pyarrow_error("file error", "failed to open Ibex file '" + path + "'"));
     }
 
     std::ostringstream buffer;
     buffer << in.rdbuf();
     if (!in.good() && !in.eof()) {
-        return std::unexpected("failed to read ibex file: " + path);
+        return std::unexpected(
+            format_ibex_pyarrow_error("file error", "failed to read Ibex file '" + path + "'"));
     }
     return buffer.str();
 }
@@ -1022,17 +1036,21 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
 
     auto registry = build_table_registry_from_python(tables_obj);
     if (!registry.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, registry.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError, format_ibex_pyarrow_error("table import error", registry.error()));
     }
 
     auto scalars = build_scalar_registry_from_python(scalars_obj);
     if (!scalars.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, scalars.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError, format_ibex_pyarrow_error("scalar import error", scalars.error()));
     }
 
     auto plugin_paths = parse_plugin_paths(plugin_paths_obj);
     if (!plugin_paths.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, plugin_paths.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError,
+            format_ibex_pyarrow_error("plugin path error", plugin_paths.error()));
     }
 
     auto evaluated = eval_table_impl(source, *registry, *scalars, *plugin_paths);
@@ -1061,17 +1079,21 @@ PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
 
     auto registry = build_table_registry_from_python(tables_obj);
     if (!registry.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, registry.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError, format_ibex_pyarrow_error("table import error", registry.error()));
     }
 
     auto scalars = build_scalar_registry_from_python(scalars_obj);
     if (!scalars.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, scalars.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError, format_ibex_pyarrow_error("scalar import error", scalars.error()));
     }
 
     auto plugin_paths = parse_plugin_paths(plugin_paths_obj);
     if (!plugin_paths.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, plugin_paths.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError,
+            format_ibex_pyarrow_error("plugin path error", plugin_paths.error()));
     }
 
     auto evaluated = eval_table_impl(*source, *registry, *scalars, *plugin_paths);
@@ -1100,12 +1122,16 @@ PyObject* py_session_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kw
 
     auto extra_tables = build_table_registry_from_python(tables_obj);
     if (!extra_tables.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, extra_tables.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError,
+            format_ibex_pyarrow_error("table import error", extra_tables.error()));
     }
 
     auto extra_scalars = build_scalar_registry_from_python(scalars_obj);
     if (!extra_scalars.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, extra_scalars.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError,
+            format_ibex_pyarrow_error("scalar import error", extra_scalars.error()));
     }
 
     auto evaluated = eval_table_in_session(**session, source, *extra_tables, *extra_scalars);
@@ -1139,12 +1165,16 @@ PyObject* py_session_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwa
 
     auto extra_tables = build_table_registry_from_python(tables_obj);
     if (!extra_tables.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, extra_tables.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError,
+            format_ibex_pyarrow_error("table import error", extra_tables.error()));
     }
 
     auto extra_scalars = build_scalar_registry_from_python(scalars_obj);
     if (!extra_scalars.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, extra_scalars.error());
+        return set_python_error_from_message(
+            PyExc_RuntimeError,
+            format_ibex_pyarrow_error("scalar import error", extra_scalars.error()));
     }
 
     auto evaluated = eval_table_in_session(**session, *source, *extra_tables, *extra_scalars);

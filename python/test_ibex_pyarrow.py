@@ -41,6 +41,8 @@ def default_plugin_paths() -> list[str]:
 
 def main() -> int:
     iris_csv = repo_root() / "data" / "iris.csv"
+    missing_csv = repo_root() / "data" / "__definitely_missing__.csv"
+    missing_ibex = repo_root() / "__definitely_missing__.ibex"
 
     table = ibex_pyarrow.eval_table(
         """
@@ -227,6 +229,32 @@ def main() -> int:
     print(session_result.to_pydict())
     assert session_result.to_pydict() == {"total": [150]}
     ibex_pyarrow.reset_session(session)
+
+    try:
+        ibex_pyarrow.eval_file(str(missing_ibex))
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "ibex_pyarrow file error:" in message
+        assert str(missing_ibex) in message
+    else:
+        raise AssertionError("expected eval_file() to fail for a missing .ibex file")
+
+    try:
+        ibex_pyarrow.eval_table(
+            f"""
+            extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+            read_csv("{missing_csv}")[select total = count()];
+            """,
+            plugin_paths=default_plugin_paths(),
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "ibex_pyarrow runtime error:" in message
+        assert "read_csv: file not found:" in message
+        assert str(missing_csv) in message
+    else:
+        raise AssertionError("expected plugin-backed read_csv() to fail for a missing CSV path")
 
     return 0
 

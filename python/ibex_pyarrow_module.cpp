@@ -1,15 +1,21 @@
 #include <ibex/interop/arrow_c_data.hpp>
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <dlfcn.h>
 #include <expected>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <Python.h>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -203,11 +209,107 @@ auto import_pyarrow_table(PyObject* schema_capsule, PyObject* array_capsule) -> 
     return table;
 }
 
-auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegistry& registry)
+auto plugin_stem(const std::string& source_path) -> std::string {
+    std::filesystem::path p(source_path);
+    return p.stem().string();
+}
+
+enum class PluginLoadStatus : std::uint8_t { Loaded, NotFound, LoadError };
+
+struct PluginLoadResult {
+    PluginLoadStatus status;
+    std::string message;
+};
+
+auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
+                     std::unordered_set<std::string>& loaded_plugins,
+                     ibex::runtime::ExternRegistry& externs) -> PluginLoadResult {
+    if (loaded_plugins.contains(stem)) {
+        return {PluginLoadStatus::Loaded, ""};
+    }
+
+    const std::string filename = stem + ".so";
+    std::string last_error;
+    std::string last_candidate;
+    for (const auto& dir : search_paths) {
+        auto full_path = std::filesystem::path(dir) / filename;
+        void* handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) {
+            if (std::filesystem::exists(full_path)) {
+                if (const char* err = dlerror()) {
+                    last_error = err;
+                }
+                last_candidate = full_path.string();
+            }
+            continue;
+        }
+
+        using RegisterFn = void (*)(ibex::runtime::ExternRegistry*);
+        auto* fn = reinterpret_cast<RegisterFn>(dlsym(handle, "ibex_register"));
+        if (fn == nullptr) {
+            dlclose(handle);
+            last_candidate = full_path.string();
+            last_error = "missing ibex_register symbol";
+            continue;
+        }
+
+        fn(&externs);
+        loaded_plugins.insert(stem);
+        return {PluginLoadStatus::Loaded, ""};
+    }
+
+    if (!last_candidate.empty()) {
+        return {PluginLoadStatus::LoadError,
+                "failed to load '" + last_candidate +
+                    "': " + (last_error.empty() ? "unknown error" : last_error)};
+    }
+    return {PluginLoadStatus::NotFound, ""};
+}
+
+auto load_source_plugins(const ibex::parser::Program& program,
+                         const std::vector<std::string>& plugin_search_paths,
+                         ibex::runtime::ExternRegistry& externs)
+    -> std::expected<void, std::string> {
+    std::unordered_set<std::string> loaded_plugins;
+    for (const auto& stmt : program.statements) {
+        if (auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+            if (decl->source_path.empty()) {
+                continue;
+            }
+            auto stem = plugin_stem(decl->source_path);
+            auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
+            if (result.status == PluginLoadStatus::NotFound) {
+                return std::unexpected("could not find plugin '" + stem + ".so' in search path");
+            }
+            if (result.status == PluginLoadStatus::LoadError) {
+                return std::unexpected(result.message);
+            }
+            continue;
+        }
+
+        if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
+            return std::unexpected(
+                "ibex_pyarrow does not yet support import declarations; use explicit extern fn "
+                "declarations with plugin_paths");
+        }
+    }
+    return {};
+}
+
+auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegistry& registry,
+                     const std::vector<std::string>& plugin_search_paths)
     -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
     auto parsed = ibex::parser::parse(source);
     if (!parsed.has_value()) {
         return std::unexpected(parsed.error().format());
+    }
+
+    ibex::runtime::ExternRegistry externs;
+    if (!plugin_search_paths.empty()) {
+        auto loaded = load_source_plugins(*parsed, plugin_search_paths, externs);
+        if (!loaded.has_value()) {
+            return std::unexpected(loaded.error());
+        }
     }
 
     auto lowered = ibex::parser::lower(*parsed);
@@ -215,7 +317,8 @@ auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegist
         return std::unexpected(lowered.error().message);
     }
 
-    auto evaluated = ibex::runtime::interpret(*lowered.value(), registry);
+    auto evaluated = ibex::runtime::interpret(*lowered.value(), registry, nullptr,
+                                              plugin_search_paths.empty() ? nullptr : &externs);
     if (!evaluated.has_value()) {
         return std::unexpected(evaluated.error());
     }
@@ -248,6 +351,34 @@ auto to_utf8_string(PyObject* obj, const char* context) -> std::expected<std::st
         return std::unexpected(message);
     }
     return std::string(utf8);
+}
+
+auto parse_plugin_paths(PyObject* plugin_paths_obj)
+    -> std::expected<std::vector<std::string>, std::string> {
+    std::vector<std::string> paths;
+    if (plugin_paths_obj == nullptr || plugin_paths_obj == Py_None) {
+        return paths;
+    }
+
+    OwnedPyObject fast(
+        PySequence_Fast(plugin_paths_obj, "'plugin_paths' must be a sequence of strings"));
+    if (!fast) {
+        auto message = current_python_error_message();
+        PyErr_Clear();
+        return std::unexpected(message);
+    }
+
+    const auto size = PySequence_Fast_GET_SIZE(fast.get());
+    PyObject** items = PySequence_Fast_ITEMS(fast.get());
+    paths.reserve(static_cast<std::size_t>(size));
+    for (Py_ssize_t i = 0; i < size; ++i) {
+        auto path = to_utf8_string(items[i], "plugin path");
+        if (!path.has_value()) {
+            return std::unexpected(path.error());
+        }
+        paths.push_back(*path);
+    }
+    return paths;
 }
 
 auto classify_scalar(PyObject* value) -> std::expected<ImportedColumnKind, std::string> {
@@ -559,11 +690,12 @@ auto build_table_registry_from_python(PyObject* tables_obj)
 }
 
 PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
-    static const char* kwlist[] = {"source", "tables", nullptr};
+    static const char* kwlist[] = {"source", "tables", "plugin_paths", nullptr};
     const char* source = nullptr;
     PyObject* tables_obj = Py_None;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|O", const_cast<char**>(kwlist), &source,
-                                     &tables_obj)) {
+    PyObject* plugin_paths_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OO", const_cast<char**>(kwlist), &source,
+                                     &tables_obj, &plugin_paths_obj)) {
         return nullptr;
     }
 
@@ -572,7 +704,12 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
         return set_python_error_from_message(PyExc_RuntimeError, registry.error());
     }
 
-    auto evaluated = eval_table_impl(source, *registry);
+    auto plugin_paths = parse_plugin_paths(plugin_paths_obj);
+    if (!plugin_paths.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, plugin_paths.error());
+    }
+
+    auto evaluated = eval_table_impl(source, *registry, *plugin_paths);
     if (!evaluated.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }
@@ -591,11 +728,12 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
 }
 
 PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
-    static const char* kwlist[] = {"path", "tables", nullptr};
+    static const char* kwlist[] = {"path", "tables", "plugin_paths", nullptr};
     const char* path = nullptr;
     PyObject* tables_obj = Py_None;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|O", const_cast<char**>(kwlist), &path,
-                                     &tables_obj)) {
+    PyObject* plugin_paths_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|OO", const_cast<char**>(kwlist), &path,
+                                     &tables_obj, &plugin_paths_obj)) {
         return nullptr;
     }
 
@@ -609,7 +747,12 @@ PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
         return set_python_error_from_message(PyExc_RuntimeError, registry.error());
     }
 
-    auto evaluated = eval_table_impl(*source, *registry);
+    auto plugin_paths = parse_plugin_paths(plugin_paths_obj);
+    if (!plugin_paths.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, plugin_paths.error());
+    }
+
+    auto evaluated = eval_table_impl(*source, *registry, *plugin_paths);
     if (!evaluated.has_value()) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }

@@ -139,6 +139,13 @@
             loads alive across cells, and keep plotting in Python.
           </p>
           <p>
+            Scalar bindings currently support Python <code>int</code>,
+            <code>float</code>, <code>bool</code>, <code>str</code>,
+            <code>datetime.date</code>, and <code>datetime.datetime</code>,
+            with the last two mapped to Ibex <code>Date</code> and
+            <code>Timestamp</code>.
+          </p>
+          <p>
             This keeps Ibex focused on joins, aggregations, reshaping, and
             time-series work, while reusing pandas, matplotlib, and the rest of
             the notebook ecosystem for presentation.

@@ -35,6 +35,7 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto filter_col(std::string name) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_int(std::int64_t v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_dbl(double v) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_bool(bool v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_str(std::string v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_date(Date v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr;

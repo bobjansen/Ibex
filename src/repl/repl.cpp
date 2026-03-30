@@ -607,6 +607,8 @@ auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view
         return "Int64";
     if (std::holds_alternative<double>(val))
         return "Float64";
+    if (std::holds_alternative<bool>(val))
+        return "Bool";
     if (std::holds_alternative<std::string>(val))
         return "String";
     if (std::holds_alternative<Date>(val))
@@ -624,14 +626,14 @@ auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType exp
         case parser::ScalarType::Float32:
         case parser::ScalarType::Float64:
             return std::holds_alternative<double>(val);
+        case parser::ScalarType::Bool:
+            return std::holds_alternative<bool>(val);
         case parser::ScalarType::String:
             return std::holds_alternative<std::string>(val);
         case parser::ScalarType::Date:
             return std::holds_alternative<Date>(val);
         case parser::ScalarType::Timestamp:
             return std::holds_alternative<Timestamp>(val);
-        case parser::ScalarType::Bool:
-            return false;  // Bool is not a ScalarValue variant
     }
     return false;
 }
@@ -1149,6 +1151,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (const auto* double_value = std::get_if<double>(&literal->value)) {
             return runtime::ScalarValue{*double_value};
         }
+        if (const auto* bool_value = std::get_if<bool>(&literal->value)) {
+            return runtime::ScalarValue{*bool_value};
+        }
         if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
             return runtime::ScalarValue{*str_value};
         }
@@ -1180,6 +1185,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             std::holds_alternative<Timestamp>(value.value())) {
             return std::unexpected("date/time arithmetic not supported");
         }
+        if (std::holds_alternative<bool>(value.value())) {
+            return std::unexpected("boolean arithmetic not supported");
+        }
         if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
             return runtime::ScalarValue{-(*int_value)};
         }
@@ -1204,6 +1212,10 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             std::holds_alternative<Timestamp>(left.value()) ||
             std::holds_alternative<Timestamp>(right.value())) {
             return std::unexpected("date/time arithmetic not supported");
+        }
+        if (std::holds_alternative<bool>(left.value()) ||
+            std::holds_alternative<bool>(right.value())) {
+            return std::unexpected("boolean arithmetic not supported");
         }
         bool left_double = std::holds_alternative<double>(left.value());
         bool right_double = std::holds_alternative<double>(right.value());

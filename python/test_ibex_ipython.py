@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 import tempfile
 from pathlib import Path
@@ -24,12 +25,13 @@ def main() -> int:
         }
     )
     shell.user_ns["offset"] = 10
+    shell.user_ns["enabled"] = True
     result = shell.run_cell_magic(
         "ibex",
-        "--bind trades=trades_df --bind offset=offset --as pandas --out grouped --quiet",
+        "--bind trades=trades_df --bind offset=offset --bind enabled=enabled --as pandas --out grouped --quiet",
         """
         trades[
-            update { qty_plus_offset = qty + offset }
+            update { qty_plus_offset = qty + offset, keep = enabled }
         ]
         [select { total_qty = sum(qty_plus_offset) }, by symbol, order symbol];
         """,
@@ -42,6 +44,22 @@ def main() -> int:
     assert shell.user_ns["grouped"].to_dict(orient="list") == {
         "symbol": ["A", "B"],
         "total_qty": [27, 15],
+    }
+
+    shell.user_ns["trade_day"] = dt.date(2024, 1, 2)
+    shell.user_ns["cutoff"] = dt.datetime(2024, 1, 2, 3, 4, 5, 6000)
+    temporal = shell.run_cell_magic(
+        "ibex",
+        "--bind trade_day=trade_day --bind cutoff=cutoff --as pyarrow --out temporal --quiet",
+        """
+        Table { x = [1] }[update { d = trade_day, ts = cutoff }];
+        """,
+    )
+    assert isinstance(temporal, pa.Table)
+    assert temporal.to_pydict() == {
+        "x": [1],
+        "d": [dt.date(2024, 1, 2)],
+        "ts": [dt.datetime(2024, 1, 2, 3, 4, 5, 6000)],
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:

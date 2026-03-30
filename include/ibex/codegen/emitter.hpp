@@ -19,7 +19,7 @@ namespace ibex::codegen {
 class Emitter {
    public:
     struct Config {
-        using ScalarValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
+        using ScalarValue = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
 
         /// Header files to #include (from extern fn declarations).
         std::vector<std::string> extern_headers;

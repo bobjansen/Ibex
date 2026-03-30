@@ -504,7 +504,7 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict__ cp,
 }
 
 // Dispatch column-vs-scalar comparison over all type combinations.
-using LitVal = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
+using LitVal = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
 template <typename T>
 constexpr bool is_string_like_v =
     std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>;
@@ -1733,7 +1733,7 @@ enum class ExprType : std::uint8_t {
     Timestamp,
 };
 
-using ExprValue = std::variant<std::int64_t, double, std::string, Date, Timestamp>;
+using ExprValue = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
 
 struct AggSlot {
     ir::AggFunc func = ir::AggFunc::Sum;
@@ -1783,9 +1783,6 @@ auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarVal
             } else if constexpr (std::is_same_v<ColType, Column<Date>> ||
                                  std::is_same_v<ColType, Column<Timestamp>>) {
                 return col[row];
-            } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
-                // ScalarValue has no bool: represent as 0/1 int64
-                return static_cast<std::int64_t>(col[row] ? 1 : 0);
             } else {
                 return col[row];
             }
@@ -2164,6 +2161,14 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
                 } else {
                     invariant_violation("append_scalar: expected Float64-compatible scalar");
                 }
+            } else if constexpr (std::is_same_v<ValueType, bool>) {
+                if (const auto* bool_value = std::get_if<bool>(&value)) {
+                    col.push_back(*bool_value);
+                } else if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
+                    col.push_back(*int_value != 0);
+                } else {
+                    invariant_violation("append_scalar: expected Bool-compatible scalar");
+                }
             } else if constexpr (std::is_same_v<ValueType, std::string_view>) {
                 // Column<std::string> flat-buffer specialization uses value_type=string_view.
                 if (const auto* str_value = std::get_if<std::string>(&value)) {
@@ -2198,6 +2203,17 @@ auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
         column);
 }
 
+auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) -> ColumnValue {
+    return std::visit(
+        [rows](const auto& v) -> ColumnValue {
+            using V = std::decay_t<decltype(v)>;
+            Column<V> col;
+            col.resize(rows, v);
+            return ColumnValue{std::move(col)};
+        },
+        value);
+}
+
 struct FastOperand {
     bool is_column = false;
     const ColumnValue* column = nullptr;
@@ -2212,6 +2228,9 @@ auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {
     if (std::holds_alternative<double>(value)) {
         return ExprType::Double;
     }
+    if (std::holds_alternative<bool>(value)) {
+        return ExprType::Bool;
+    }
     if (std::holds_alternative<Date>(value)) {
         return ExprType::Date;
     }
@@ -2225,12 +2244,7 @@ auto scalar_from_literal(const ir::Literal& literal) -> ScalarValue {
     return std::visit(
         [](const auto& v) -> ScalarValue {
             using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, bool>) {
-                // ScalarValue has no bool: represent as 0/1 int64
-                return static_cast<std::int64_t>(v ? 1 : 0);
-            } else {
-                return v;
-            }
+            return v;
         },
         literal.value);
 }
@@ -5354,6 +5368,9 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                     if (std::holds_alternative<double>(it->second)) {
                         return ExprType::Double;
                     }
+                    if (std::holds_alternative<bool>(it->second)) {
+                        return ExprType::Bool;
+                    }
                     if (std::holds_alternative<Date>(it->second)) {
                         return ExprType::Date;
                     }
@@ -5565,6 +5582,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 return ExprType::Int;
             case ScalarKind::Double:
                 return ExprType::Double;
+            case ScalarKind::Bool:
+                return ExprType::Bool;
             case ScalarKind::String:
                 return ExprType::String;
             case ScalarKind::Date:
@@ -5596,9 +5615,6 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
                               std::is_same_v<ColType, Column<std::string>>) {
                     return std::string(column[row]);
-                } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
-                    // ExprValue has no bool: represent as 0/1 int64
-                    return static_cast<std::int64_t>(column[row] ? 1 : 0);
                 } else {
                     return column[row];
                 }
@@ -5606,17 +5622,7 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             *source);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        return std::visit(
-            [](const auto& v) -> ExprValue {
-                using T = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<T, bool>) {
-                    // ExprValue has no bool: represent as 0/1 int64
-                    return static_cast<std::int64_t>(v ? 1 : 0);
-                } else {
-                    return v;
-                }
-            },
-            lit->value);
+        return std::visit([](const auto& v) -> ExprValue { return v; }, lit->value);
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
         auto left = eval_expr(*bin->left, input, row, scalars, externs);
@@ -5636,6 +5642,10 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             std::holds_alternative<Timestamp>(left.value()) ||
             std::holds_alternative<Timestamp>(right.value())) {
             return std::unexpected("date/time arithmetic not supported");
+        }
+        if (std::holds_alternative<bool>(left.value()) ||
+            std::holds_alternative<bool>(right.value())) {
+            return std::unexpected("boolean arithmetic not supported");
         }
         auto to_double = [](const ExprValue& v) -> double {
             if (const auto* i = std::get_if<std::int64_t>(&v)) {
@@ -5787,7 +5797,9 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                             "eval_expr_column: expected Float64-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, bool>) {
-                    if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
+                    if (const auto* v = std::get_if<bool>(&value.value())) {
+                        col.push_back(*v);
+                    } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
                         col.push_back(*v != 0);
                     } else {
                         invariant_violation(
@@ -7160,6 +7172,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                            ir::Duration duration, const ScalarRegistry* scalars,
                            const ExternRegistry* externs) -> std::expected<Table, std::string> {
     Table output = std::move(input);
+    std::size_t rows = output.rows();
     if (!output.time_index.has_value()) {
         return std::unexpected("window: requires a TimeFrame");
     }
@@ -7246,15 +7259,21 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
             const auto* entry = output.find_entry(col_ref->name);
-            if (entry == nullptr) {
-                return std::unexpected("unknown column '" + col_ref->name + "'");
+            if (entry != nullptr) {
+                if (entry->validity.has_value()) {
+                    output.add_column(field.alias, *entry->column, *entry->validity);
+                } else {
+                    output.add_column(field.alias, *entry->column);
+                }
+                continue;
             }
-            if (entry->validity.has_value()) {
-                output.add_column(field.alias, *entry->column, *entry->validity);
-            } else {
-                output.add_column(field.alias, *entry->column);
+            if (scalars != nullptr) {
+                if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
+                    output.add_column(field.alias, broadcast_scalar_column(it->second, rows));
+                    continue;
+                }
             }
-            continue;
+            return std::unexpected("unknown column '" + col_ref->name + "'");
         }
         auto col = evaluate_field_column(field.expr, output, scalars, externs);
         if (!col) {
@@ -7367,15 +7386,21 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
             const auto* entry = output.find_entry(col_ref->name);
-            if (entry == nullptr) {
-                return std::unexpected("unknown column '" + col_ref->name + "'");
+            if (entry != nullptr) {
+                if (entry->validity.has_value()) {
+                    output.add_column(field.alias, *entry->column, *entry->validity);
+                } else {
+                    output.add_column(field.alias, *entry->column);
+                }
+                continue;
             }
-            if (entry->validity.has_value()) {
-                output.add_column(field.alias, *entry->column, *entry->validity);
-            } else {
-                output.add_column(field.alias, *entry->column);
+            if (scalars != nullptr) {
+                if (auto it = scalars->find(col_ref->name); it != scalars->end()) {
+                    output.add_column(field.alias, broadcast_scalar_column(it->second, rows));
+                    continue;
+                }
             }
-            continue;
+            return std::unexpected("unknown column '" + col_ref->name + "'");
         }
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);
         if (!inferred) {

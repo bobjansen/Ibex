@@ -2898,8 +2898,8 @@ Ibex currently exposes a Python extension module named `ibex_pyarrow` that
 evaluates Ibex source and returns results as `pyarrow.Table` objects. Two entry
 points are provided:
 
-- `eval_table(source, tables=None)` evaluates an in-memory Ibex source string
-- `eval_file(path, tables=None)` evaluates a `.ibex` file from disk
+- `eval_table(source, tables=None, scalars=None)` evaluates an in-memory Ibex source string
+- `eval_file(path, tables=None, scalars=None)` evaluates a `.ibex` file from disk
 
 The optional `tables` binding map copies Python-side table data into owned Ibex
 tables before evaluation. An optional `scalars` binding map passes Python
@@ -2908,7 +2908,9 @@ scalars through Ibex’s existing scalar registry. The first implementation supp
 - plain Python column dictionaries
 - `pyarrow.Table` inputs
 - pandas `DataFrame` inputs
-- Python `int`, `float`, and `string` scalar bindings
+- Python `int`, `float`, `bool`, and `string` scalar bindings
+- Python `datetime.date` scalar bindings, mapped to Ibex `Date`
+- Python `datetime.datetime` scalar bindings, mapped to Ibex `Timestamp`
 
 On top of that bridge, Ibex provides an IPython extension, loadable with:
 

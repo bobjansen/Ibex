@@ -74,12 +74,31 @@ to keep the result as a `pyarrow.Table`, or `%ibexfile` to run a checked-in
 %ibexfile --as pyarrow --out result python/plot_ibex_pyarrow_demo.ibex
 ```
 
+Notebook cells are stateful by default. A `%%ibex` cell can define a table once
+and later cells can reuse it without rerunning the load:
+
+```python
+%%ibex --quiet
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+let train = read_csv("../../kaggle/data/train.csv", "<empty>");
+
+%%ibex --as pandas --out bucket_summary
+train[select { rows = count() }, by seconds_in_bucket, order seconds_in_bucket];
+```
+
+Reset the hidden Ibex session with:
+
+```python
+%ibexreset
+```
+
 Supported magic options:
 
 - `--bind ibex_name=python_var` to pass pandas, pyarrow, or plain Python table data into Ibex
 - `--as pyarrow|pandas` to control the returned result type
 - `--out var_name` to choose the output variable name
 - `--quiet` to suppress immediate display
+- `%ibexreset` to clear persisted Ibex notebook bindings
 
 This is the fastest way to get Ibex into a notebook today without inventing a
 separate plotting system or a full standalone kernel.

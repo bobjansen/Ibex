@@ -1,44 +1,75 @@
 cmake_minimum_required(VERSION 3.26)
 
-project(ibex_parquet_plugin LANGUAGES CXX)
+set(IBEX_PARQUET_STANDALONE OFF)
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(IBEX_PARQUET_STANDALONE ON)
+    project(ibex_parquet_plugin LANGUAGES CXX)
 
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
-endif()
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
+    endif()
 
-if(NOT CMAKE_INSTALL_PREFIX)
-    set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/_install" CACHE PATH "" FORCE)
+    if(NOT CMAKE_INSTALL_PREFIX)
+        set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/_install" CACHE PATH "" FORCE)
+    endif()
 endif()
 
 include(FetchContent)
 
-# Config inputs
-if(NOT DEFINED IBEX_ROOT)
-    set(IBEX_ROOT "" CACHE PATH "Ibex repository root")
-endif()
-if(NOT DEFINED IBEX_BUILD_DIR)
-    set(IBEX_BUILD_DIR "" CACHE PATH "Ibex build directory (for static libs)")
+if(IBEX_PARQUET_STANDALONE)
+    if(NOT DEFINED IBEX_ROOT)
+        set(IBEX_ROOT "" CACHE PATH "Ibex repository root")
+    endif()
+    if(NOT DEFINED IBEX_BUILD_DIR)
+        set(IBEX_BUILD_DIR "" CACHE PATH "Ibex build directory (for static libs)")
+    endif()
+
+    if(IBEX_ROOT STREQUAL "" AND DEFINED ENV{IBEX_ROOT})
+        set(IBEX_ROOT "$ENV{IBEX_ROOT}" CACHE PATH "" FORCE)
+    endif()
+    if(IBEX_BUILD_DIR STREQUAL "" AND DEFINED ENV{IBEX_BUILD_DIR})
+        set(IBEX_BUILD_DIR "$ENV{IBEX_BUILD_DIR}" CACHE PATH "" FORCE)
+    endif()
+
+    if(IBEX_ROOT STREQUAL "")
+        message(FATAL_ERROR "IBEX_ROOT is required")
+    endif()
+    if(IBEX_BUILD_DIR STREQUAL "")
+        message(FATAL_ERROR "IBEX_BUILD_DIR is required")
+    endif()
+
+    set(_ibex_parquet_output_dir "${IBEX_ROOT}/libraries")
+else()
+    set(IBEX_ROOT "${PROJECT_SOURCE_DIR}")
+    set(IBEX_BUILD_DIR "${PROJECT_BINARY_DIR}")
+    set(_ibex_parquet_output_dir "${IBEX_PLUGIN_OUTPUT_DIR}")
 endif()
 
-if(IBEX_ROOT STREQUAL "" AND DEFINED ENV{IBEX_ROOT})
-    set(IBEX_ROOT "$ENV{IBEX_ROOT}" CACHE PATH "" FORCE)
-endif()
-if(IBEX_BUILD_DIR STREQUAL "" AND DEFINED ENV{IBEX_BUILD_DIR})
-    set(IBEX_BUILD_DIR "$ENV{IBEX_BUILD_DIR}" CACHE PATH "" FORCE)
-endif()
-
-if(IBEX_ROOT STREQUAL "")
-    message(FATAL_ERROR "IBEX_ROOT is required")
-endif()
-if(IBEX_BUILD_DIR STREQUAL "")
-    message(FATAL_ERROR "IBEX_BUILD_DIR is required")
+set(_ibex_need_matching_clang_c OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+    if(NOT DEFINED CMAKE_C_COMPILER OR CMAKE_C_COMPILER STREQUAL "")
+        set(_ibex_need_matching_clang_c ON)
+    elseif(NOT CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
+        set(_ibex_need_matching_clang_c ON)
+    endif()
 endif()
 
-# Apache Arrow + Parquet (standalone)
+if(_ibex_need_matching_clang_c)
+    get_filename_component(_ibex_cxx_compiler_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(_ibex_matching_clang_c
+        NAMES clang
+        PATHS "${_ibex_cxx_compiler_dir}"
+    )
+    if(_ibex_matching_clang_c)
+        set(CMAKE_C_COMPILER "${_ibex_matching_clang_c}" CACHE FILEPATH
+            "C compiler used for parquet dependency builds" FORCE)
+    endif()
+endif()
+
 FetchContent_Declare(
     arrow
     GIT_REPOSITORY https://github.com/apache/arrow.git
@@ -67,45 +98,60 @@ set(Boost_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(BOOST_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(arrow)
 
-add_library(ibex_parquet_plugin SHARED
-    ${IBEX_ROOT}/libs/parquet/parquet.cpp
-)
+add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
 set_target_properties(ibex_parquet_plugin PROPERTIES
     OUTPUT_NAME parquet
     PREFIX ""
-    LIBRARY_OUTPUT_DIRECTORY "${IBEX_ROOT}/libraries"
+    LIBRARY_OUTPUT_DIRECTORY "${_ibex_parquet_output_dir}"
+    RUNTIME_OUTPUT_DIRECTORY "${_ibex_parquet_output_dir}"
 )
 
 target_include_directories(ibex_parquet_plugin
     PRIVATE
-        "${IBEX_ROOT}/libs/parquet"
+        "${CMAKE_CURRENT_SOURCE_DIR}"
         "${IBEX_ROOT}/include"
-        "${IBEX_BUILD_DIR}/_deps/fmt-src/include"
-        "${IBEX_BUILD_DIR}/_deps/spdlog-src/include"
-        "${IBEX_BUILD_DIR}/_deps/robin_hood-src/src/include"
         "${arrow_SOURCE_DIR}/cpp/src"
         "${arrow_SOURCE_DIR}/cpp/src/generated"
         "${arrow_BINARY_DIR}/src"
 )
 
-set(_ibex_fmt_lib "${IBEX_BUILD_DIR}/_deps/fmt-build/libfmt.a")
-if(NOT EXISTS "${_ibex_fmt_lib}")
-    set(_ibex_fmt_lib "${IBEX_BUILD_DIR}/_deps/fmt-build/libfmtd.a")
-endif()
-set(_ibex_spdlog_lib "${IBEX_BUILD_DIR}/_deps/spdlog-build/libspdlog.a")
-if(NOT EXISTS "${_ibex_spdlog_lib}")
-    set(_ibex_spdlog_lib "${IBEX_BUILD_DIR}/_deps/spdlog-build/libspdlogd.a")
-endif()
+if(IBEX_PARQUET_STANDALONE)
+    target_include_directories(ibex_parquet_plugin
+        PRIVATE
+            "${IBEX_BUILD_DIR}/_deps/fmt-src/include"
+            "${IBEX_BUILD_DIR}/_deps/spdlog-src/include"
+            "${IBEX_BUILD_DIR}/_deps/robin_hood-src/src/include"
+    )
 
-target_link_libraries(ibex_parquet_plugin
-    PRIVATE
-        ${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a
-        ${IBEX_BUILD_DIR}/src/ir/libibex_ir.a
-        ${IBEX_BUILD_DIR}/src/core/libibex_core.a
-        ${_ibex_fmt_lib}
-        ${_ibex_spdlog_lib}
-)
+    set(_ibex_fmt_lib "${IBEX_BUILD_DIR}/_deps/fmt-build/libfmt.a")
+    if(NOT EXISTS "${_ibex_fmt_lib}")
+        set(_ibex_fmt_lib "${IBEX_BUILD_DIR}/_deps/fmt-build/libfmtd.a")
+    endif()
+    set(_ibex_spdlog_lib "${IBEX_BUILD_DIR}/_deps/spdlog-build/libspdlog.a")
+    if(NOT EXISTS "${_ibex_spdlog_lib}")
+        set(_ibex_spdlog_lib "${IBEX_BUILD_DIR}/_deps/spdlog-build/libspdlogd.a")
+    endif()
+
+    target_link_libraries(ibex_parquet_plugin
+        PRIVATE
+            ${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a
+            ${IBEX_BUILD_DIR}/src/ir/libibex_ir.a
+            ${IBEX_BUILD_DIR}/src/core/libibex_core.a
+            ${_ibex_fmt_lib}
+            ${_ibex_spdlog_lib}
+    )
+else()
+    target_link_libraries(ibex_parquet_plugin
+        PRIVATE
+            Ibex::runtime
+            Ibex::CompilerOptions
+    )
+
+    if(TARGET Ibex::Sanitizers)
+        target_link_libraries(ibex_parquet_plugin PRIVATE Ibex::Sanitizers)
+    endif()
+endif()
 
 if(TARGET arrow_shared AND TARGET parquet_shared)
     target_link_libraries(ibex_parquet_plugin PRIVATE arrow_shared parquet_shared)
@@ -121,11 +167,9 @@ else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()
 
-# Copy the library stub to the plugin output directory so that
-# `import "parquet";` works when IBEX_LIBRARY_PATH points to that directory.
 add_custom_command(TARGET ibex_parquet_plugin POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${IBEX_ROOT}/libs/parquet/parquet.ibex"
-        "${IBEX_ROOT}/libraries/parquet.ibex"
+        "${CMAKE_CURRENT_SOURCE_DIR}/parquet.ibex"
+        "${_ibex_parquet_output_dir}/parquet.ibex"
     COMMENT "Installing parquet.ibex stub"
 )

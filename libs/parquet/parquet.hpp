@@ -423,10 +423,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish date failed");
                 return arr;
-            } else {
-                // Column<Timestamp> — store as INT64 (nanoseconds since epoch)
-                static_assert(std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>,
-                              "unhandled column type in write_parquet");
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
                 arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::NANO),
                                                 arrow::default_memory_pool());
                 auto st = builder.Reserve(static_cast<int64_t>(n));
@@ -446,6 +443,27 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish timestamp failed");
                 return arr;
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<bool>>) {
+                arrow::BooleanBuilder builder;
+                auto st = builder.Reserve(static_cast<int64_t>(n));
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: reserve failed");
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (ibex::runtime::is_null(entry, i)) {
+                        st = builder.AppendNull();
+                    } else {
+                        st = builder.Append(col[i]);
+                    }
+                    if (!st.ok())
+                        throw std::runtime_error("write_parquet: append bool failed");
+                }
+                std::shared_ptr<arrow::Array> arr;
+                st = builder.Finish(&arr);
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish bool failed");
+                return arr;
+            } else {
+                static_assert(std::is_same_v<ColT, void>, "unhandled column type in write_parquet");
             }
         },
         *entry.column);

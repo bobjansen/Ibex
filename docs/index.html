@@ -1366,6 +1366,7 @@ Stream {
         <p class="step-label">1 &mdash; Clone and build</p>
 <pre><code><span class="cm"># Debug build (ASan + UBSan)</span>
 cmake -B build -G Ninja \
+  -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Debug \
   -DIBEX_ENABLE_SANITIZERS=ON
@@ -1373,6 +1374,7 @@ cmake --build build
 
 <span class="cm"># Release build</span>
 cmake -B build-release -G Ninja \
+  -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release</code></pre>

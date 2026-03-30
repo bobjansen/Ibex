@@ -66,14 +66,28 @@ TEST_CASE("compute_accept_key matches RFC 6455 §1.3 test vector") {
 TEST_CASE("ws_send: handshake and single-row broadcast") {
     constexpr int kPort = 17765;
 
-    ibex_ws::ws_listen(kPort);
+    try {
+        ibex_ws::ws_listen(kPort);
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        if (msg.find("Operation not permitted") != std::string::npos ||
+            msg.find("Permission denied") != std::string::npos) {
+            SKIP("websocket test requires socket permissions");
+        }
+        throw;
+    }
 
     std::string received_json;
     bool handshake_ok = false;
 
     std::thread client([&]() {
         int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-        REQUIRE(sock >= 0);
+        if (sock < 0) {
+            if (errno == EPERM || errno == EACCES) {
+                return;
+            }
+            REQUIRE(sock >= 0);
+        }
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;

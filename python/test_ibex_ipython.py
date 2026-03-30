@@ -15,6 +15,8 @@ import ibex_ipython
 
 
 def main() -> int:
+    iris_csv = Path(__file__).resolve().parents[1] / "data" / "iris.csv"
+
     shell = InteractiveShell.instance()
     ibex_ipython.load_ipython_extension(shell)
 
@@ -87,10 +89,10 @@ def main() -> int:
     csv_result = shell.run_cell_magic(
         "ibex",
         "--as pyarrow --out iris_count --quiet",
-        """
+        f"""
         extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 
-        read_csv("data/iris.csv")[select total = count()];
+        read_csv("{iris_csv}")[select total = count()];
         """,
     )
     assert isinstance(csv_result, pa.Table)

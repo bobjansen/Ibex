@@ -1,9 +1,24 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 
+import pandas as pd
 import pyarrow as pa
+
+
+def add_bridge_module_path() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    for build_dir_name in ("build-release", "build"):
+        candidate = repo_root / build_dir_name / "python"
+        if candidate.is_dir():
+            sys.path.insert(0, str(candidate))
+            return
+    raise RuntimeError("could not find a built ibex_pyarrow module under build-release/python or build/python")
+
+
+add_bridge_module_path()
 
 import ibex_pyarrow
 
@@ -59,6 +74,65 @@ def main() -> int:
             "symbol": ["A", "B"],
             "qty": [7, 9],
         }
+
+    from_dict = ibex_pyarrow.eval_table(
+        """
+        trades[select { total_qty = sum(qty) }, by symbol, order symbol];
+        """,
+        tables={
+            "trades": {
+                "symbol": ["A", "A", "B"],
+                "qty": [3, 4, 5],
+            }
+        },
+    )
+    print("\ndict-bound table:")
+    print(from_dict)
+    print(from_dict.to_pydict())
+    assert from_dict.to_pydict() == {
+        "symbol": ["A", "B"],
+        "total_qty": [7, 5],
+    }
+
+    arrow_orders = pa.table(
+        {
+            "symbol": pa.array(["A", "B", "B", None]),
+            "px": pa.array([10.5, 20.0, 21.5, 99.0]),
+        }
+    )
+    from_arrow = ibex_pyarrow.eval_table(
+        """
+        orders[filter symbol is not null, select { avg_px = mean(px) }, by symbol, order symbol];
+        """,
+        tables={"orders": arrow_orders},
+    )
+    print("\npyarrow-bound table:")
+    print(from_arrow)
+    print(from_arrow.to_pydict())
+    assert from_arrow.to_pydict() == {
+        "symbol": ["A", "B"],
+        "avg_px": [10.5, 20.75],
+    }
+
+    pandas_quotes = pd.DataFrame(
+        {
+            "venue": ["XNAS", "BATS", "XNAS"],
+            "spread_bps": [5.0, 7.5, 6.0],
+        }
+    )
+    from_pandas = ibex_pyarrow.eval_table(
+        """
+        quotes[select { avg_spread = mean(spread_bps) }, by venue, order venue];
+        """,
+        tables={"quotes": pandas_quotes},
+    )
+    print("\npandas-bound table:")
+    print(from_pandas)
+    print(from_pandas.to_pydict())
+    assert from_pandas.to_pydict() == {
+        "venue": ["BATS", "XNAS"],
+        "avg_spread": [7.5, 5.5],
+    }
 
     return 0
 

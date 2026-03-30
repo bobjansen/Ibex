@@ -11,17 +11,17 @@
 //
 // Compile with: -I$(IBEX_ROOT)/libraries
 
-#include <ibex/runtime/interpreter.hpp>
 #include <ibex/core/column.hpp>
+#include <ibex/runtime/interpreter.hpp>
 
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/util/formatting.h>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
-
-#include <cstdint>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -223,25 +223,36 @@ inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& 
 }  // namespace
 
 inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
-    auto input_result = arrow::io::ReadableFile::Open(std::string(path));
+    std::string path_string{path};
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path_string, ec);
+    if (ec) {
+        throw std::runtime_error("read_parquet: failed to inspect path '" + path_string +
+                                 "': " + ec.message());
+    }
+    if (!exists) {
+        throw std::runtime_error("read_parquet: file not found: '" + path_string + "'");
+    }
+
+    auto input_result = arrow::io::ReadableFile::Open(path_string);
     if (!input_result.ok()) {
-        throw std::runtime_error("read_parquet: failed to open: " + std::string(path) + " (" +
+        throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
                                  input_result.status().ToString() + ")");
     }
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    auto st = parquet::arrow::OpenFile(input_result.ValueOrDie(), arrow::default_memory_pool(),
-                                       &reader);
+    auto st =
+        parquet::arrow::OpenFile(input_result.ValueOrDie(), arrow::default_memory_pool(), &reader);
     if (!st.ok()) {
-        throw std::runtime_error("read_parquet: failed to read: " + std::string(path) + " (" +
+        throw std::runtime_error("read_parquet: failed to read: " + path_string + " (" +
                                  st.ToString() + ")");
     }
 
     std::shared_ptr<arrow::Table> table;
     st = reader->ReadTable(&table);
     if (!st.ok()) {
-        throw std::runtime_error("read_parquet: failed to load table: " + std::string(path) +
-                                 " (" + st.ToString() + ")");
+        throw std::runtime_error("read_parquet: failed to load table: " + path_string + " (" +
+                                 st.ToString() + ")");
     }
 
     ibex::runtime::Table out;
@@ -322,34 +333,40 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
             if constexpr (std::is_same_v<ColT, ibex::Column<std::int64_t>>) {
                 arrow::Int64Builder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok()) throw std::runtime_error("write_parquet: reserve failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
                     } else {
                         st = builder.Append(col[i]);
                     }
-                    if (!st.ok()) throw std::runtime_error("write_parquet: append int64 failed");
+                    if (!st.ok())
+                        throw std::runtime_error("write_parquet: append int64 failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
-                if (!st.ok()) throw std::runtime_error("write_parquet: finish int64 failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish int64 failed");
                 return arr;
             } else if constexpr (std::is_same_v<ColT, ibex::Column<double>>) {
                 arrow::DoubleBuilder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok()) throw std::runtime_error("write_parquet: reserve failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
                     } else {
                         st = builder.Append(col[i]);
                     }
-                    if (!st.ok()) throw std::runtime_error("write_parquet: append double failed");
+                    if (!st.ok())
+                        throw std::runtime_error("write_parquet: append double failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
-                if (!st.ok()) throw std::runtime_error("write_parquet: finish double failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish double failed");
                 return arr;
             } else if constexpr (std::is_same_v<ColT, ibex::Column<std::string>>) {
                 arrow::StringBuilder builder;
@@ -361,11 +378,13 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                         auto sv = col[i];
                         st = builder.Append(sv.data(), static_cast<int32_t>(sv.size()));
                     }
-                    if (!st.ok()) throw std::runtime_error("write_parquet: append string failed");
+                    if (!st.ok())
+                        throw std::runtime_error("write_parquet: append string failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 auto st = builder.Finish(&arr);
-                if (!st.ok()) throw std::runtime_error("write_parquet: finish string failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish string failed");
                 return arr;
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Categorical>>) {
                 arrow::StringBuilder builder;
@@ -382,23 +401,27 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 }
                 std::shared_ptr<arrow::Array> arr;
                 auto st = builder.Finish(&arr);
-                if (!st.ok()) throw std::runtime_error("write_parquet: finish categorical failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish categorical failed");
                 return arr;
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Date>>) {
                 arrow::Date32Builder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok()) throw std::runtime_error("write_parquet: reserve failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
                     } else {
                         st = builder.Append(col[i].days);
                     }
-                    if (!st.ok()) throw std::runtime_error("write_parquet: append date failed");
+                    if (!st.ok())
+                        throw std::runtime_error("write_parquet: append date failed");
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
-                if (!st.ok()) throw std::runtime_error("write_parquet: finish date failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish date failed");
                 return arr;
             } else {
                 // Column<Timestamp> — store as INT64 (nanoseconds since epoch)
@@ -407,7 +430,8 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::NANO),
                                                 arrow::default_memory_pool());
                 auto st = builder.Reserve(static_cast<int64_t>(n));
-                if (!st.ok()) throw std::runtime_error("write_parquet: reserve failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: reserve failed");
                 for (std::size_t i = 0; i < n; ++i) {
                     if (ibex::runtime::is_null(entry, i)) {
                         st = builder.AppendNull();
@@ -419,7 +443,8 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 }
                 std::shared_ptr<arrow::Array> arr;
                 st = builder.Finish(&arr);
-                if (!st.ok()) throw std::runtime_error("write_parquet: finish timestamp failed");
+                if (!st.ok())
+                    throw std::runtime_error("write_parquet: finish timestamp failed");
                 return arr;
             }
         },

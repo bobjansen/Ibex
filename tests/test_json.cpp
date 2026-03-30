@@ -1,9 +1,10 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
-#include <json.hpp>
 #include <filesystem>
 #include <fstream>
+#include <json.hpp>
 #include <string>
 
 namespace {
@@ -42,7 +43,8 @@ auto is_null_at(const ibex::runtime::Table& table, const char* name, std::size_t
 
 TEST_CASE("Read JSON - int and string columns from array") {
     auto path = tmp("ibex_test_json_simple.json");
-    write_file(path, R"([{"price":10,"symbol":"A"},{"price":20,"symbol":"B"},{"price":30,"symbol":"A"}])");
+    write_file(
+        path, R"([{"price":10,"symbol":"A"},{"price":20,"symbol":"B"},{"price":30,"symbol":"A"}])");
 
     auto table = read_json(path.string());
     REQUIRE(table.rows() == 3);
@@ -181,6 +183,15 @@ TEST_CASE("Read JSON - empty array produces empty table") {
 
     auto table = read_json(path.string());
     REQUIRE(table.rows() == 0);
+}
+
+TEST_CASE("Read JSON - missing path reports file not found") {
+    auto path = tmp("ibex_test_json_missing_file.json");
+    std::filesystem::remove(path);
+
+    REQUIRE_THROWS_WITH(read_json(path.string()),
+                        Catch::Matchers::ContainsSubstring("read_json: file not found:") &&
+                            Catch::Matchers::ContainsSubstring(path.string()));
 }
 
 // ---------------------------------------------------------------------------

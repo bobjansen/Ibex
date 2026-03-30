@@ -39,9 +39,18 @@ def default_plugin_paths() -> list[str]:
     return paths
 
 
+def plugin_available(stem: str) -> bool:
+    for plugin_dir in default_plugin_paths():
+        if (Path(plugin_dir) / f"{stem}.so").is_file():
+            return True
+    return False
+
+
 def main() -> int:
     iris_csv = repo_root() / "data" / "iris.csv"
     missing_csv = repo_root() / "data" / "__definitely_missing__.csv"
+    missing_json = repo_root() / "data" / "__definitely_missing__.json"
+    missing_parquet = repo_root() / "data" / "__definitely_missing__.parquet"
     missing_ibex = repo_root() / "__definitely_missing__.ibex"
 
     table = ibex_pyarrow.eval_table(
@@ -255,6 +264,43 @@ def main() -> int:
         assert str(missing_csv) in message
     else:
         raise AssertionError("expected plugin-backed read_csv() to fail for a missing CSV path")
+
+    try:
+        ibex_pyarrow.eval_table(
+            f"""
+            extern fn read_json(path: String) -> DataFrame from "json.hpp";
+
+            read_json("{missing_json}")[select total = count()];
+            """,
+            plugin_paths=default_plugin_paths(),
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "ibex_pyarrow runtime error:" in message
+        assert "read_json: file not found:" in message
+        assert str(missing_json) in message
+    else:
+        raise AssertionError("expected plugin-backed read_json() to fail for a missing JSON path")
+
+    if plugin_available("parquet"):
+        try:
+            ibex_pyarrow.eval_table(
+                f"""
+                extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+                read_parquet("{missing_parquet}")[select total = count()];
+                """,
+                plugin_paths=default_plugin_paths(),
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            assert "ibex_pyarrow runtime error:" in message
+            assert "read_parquet: file not found:" in message
+            assert str(missing_parquet) in message
+        else:
+            raise AssertionError(
+                "expected plugin-backed read_parquet() to fail for a missing Parquet path"
+            )
 
     return 0
 

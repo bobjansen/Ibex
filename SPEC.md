@@ -2918,6 +2918,7 @@ The extension exposes two magics:
 
 - `%%ibex` evaluates an inline Ibex cell
 - `%ibexfile` evaluates a `.ibex` file
+- `%ibexreset` clears the hidden persistent Ibex notebook session
 
 Both magics support the following options:
 
@@ -2925,6 +2926,19 @@ Both magics support the following options:
 - `--as pyarrow|pandas` to choose the returned result type
 - `--out var_name` to store the result in a chosen Python variable
 - `--quiet` to suppress immediate display
+
+The notebook magics are stateful by default: table-valued `let` bindings
+persist across `%%ibex` / `%ibexfile` invocations in the same IPython kernel.
+That makes expensive data loads practical:
+
+```python
+%%ibex --quiet
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+let train = read_csv("../../kaggle/data/train.csv", "<empty>");
+
+%%ibex --as pandas --out bucket_summary
+train[select { rows = count() }, by seconds_in_bucket, order seconds_in_bucket];
+```
 
 Example:
 

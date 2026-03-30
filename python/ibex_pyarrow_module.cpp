@@ -78,6 +78,15 @@ struct ExportedArrowCapsules {
     }
 };
 
+struct SessionState {
+    ibex::runtime::TableRegistry tables;
+    std::unordered_set<std::string> table_externs;
+    std::unordered_set<std::string> sink_externs;
+    ibex::runtime::ExternRegistry externs;
+    std::unordered_set<std::string> loaded_plugins;
+    std::vector<std::string> plugin_paths;
+};
+
 auto set_python_error_from_message(PyObject* exc_type, const std::string& message) -> PyObject* {
     PyErr_SetString(exc_type, message.c_str());
     return nullptr;
@@ -214,6 +223,16 @@ auto plugin_stem(const std::string& source_path) -> std::string {
     return p.stem().string();
 }
 
+void session_capsule_destructor(PyObject* capsule) {
+    auto* session =
+        static_cast<SessionState*>(PyCapsule_GetPointer(capsule, "ibex_pyarrow.session"));
+    if (session == nullptr) {
+        PyErr_Clear();
+        return;
+    }
+    delete session;
+}
+
 enum class PluginLoadStatus : std::uint8_t { Loaded, NotFound, LoadError };
 
 struct PluginLoadResult {
@@ -296,6 +315,47 @@ auto load_source_plugins(const ibex::parser::Program& program,
     return {};
 }
 
+auto register_extern_decl(const ibex::parser::ExternDecl& decl, SessionState& session)
+    -> std::expected<void, std::string> {
+    if (decl.return_type.kind == ibex::parser::Type::Kind::DataFrame ||
+        decl.return_type.kind == ibex::parser::Type::Kind::TimeFrame) {
+        session.table_externs.insert(decl.name);
+    }
+    if (!decl.params.empty() && decl.params[0].type.kind == ibex::parser::Type::Kind::DataFrame) {
+        session.sink_externs.insert(decl.name);
+    }
+    if (decl.source_path.empty()) {
+        return {};
+    }
+    auto stem = plugin_stem(decl.source_path);
+    auto result =
+        try_load_plugin(stem, session.plugin_paths, session.loaded_plugins, session.externs);
+    if (result.status == PluginLoadStatus::NotFound) {
+        return std::unexpected("could not find plugin '" + stem + ".so' in search path");
+    }
+    if (result.status == PluginLoadStatus::LoadError) {
+        return std::unexpected(result.message);
+    }
+    return {};
+}
+
+auto session_from_capsule(PyObject* capsule) -> std::expected<SessionState*, std::string> {
+    if (capsule == nullptr || capsule == Py_None) {
+        return std::unexpected("'session' is required");
+    }
+    if (!PyCapsule_CheckExact(capsule)) {
+        return std::unexpected("'session' must be an ibex_pyarrow session");
+    }
+    auto* session =
+        static_cast<SessionState*>(PyCapsule_GetPointer(capsule, "ibex_pyarrow.session"));
+    if (session == nullptr) {
+        auto message = current_python_error_message();
+        PyErr_Clear();
+        return std::unexpected(message.empty() ? "invalid ibex_pyarrow session" : message);
+    }
+    return session;
+}
+
 auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegistry& registry,
                      const std::vector<std::string>& plugin_search_paths)
     -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
@@ -324,6 +384,85 @@ auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegist
     }
 
     return std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
+}
+
+auto merge_registries(const ibex::runtime::TableRegistry& base,
+                      const ibex::runtime::TableRegistry& extra) -> ibex::runtime::TableRegistry {
+    ibex::runtime::TableRegistry merged = base;
+    for (const auto& [name, table] : extra) {
+        merged.insert_or_assign(name, table);
+    }
+    return merged;
+}
+
+auto eval_table_in_session(SessionState& session, const std::string& source,
+                           const ibex::runtime::TableRegistry& extra_tables)
+    -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
+    auto parsed = ibex::parser::parse(source);
+    if (!parsed.has_value()) {
+        return std::unexpected(parsed.error().format());
+    }
+
+    std::shared_ptr<const ibex::runtime::Table> last_table;
+    for (const auto& stmt : parsed->statements) {
+        if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+            auto registered = register_extern_decl(*decl, session);
+            if (!registered.has_value()) {
+                return std::unexpected(registered.error());
+            }
+            continue;
+        }
+        if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
+            return std::unexpected(
+                "ibex_pyarrow sessions do not yet support import declarations; use explicit extern "
+                "fn declarations");
+        }
+        if (std::holds_alternative<ibex::parser::FunctionDecl>(stmt)) {
+            return std::unexpected(
+                "ibex_pyarrow sessions do not yet support function declarations");
+        }
+        if (std::holds_alternative<ibex::parser::TupleLetStmt>(stmt)) {
+            return std::unexpected("ibex_pyarrow sessions do not yet support tuple let bindings");
+        }
+
+        ibex::parser::LowerContext context;
+        context.table_externs = session.table_externs;
+        context.sink_externs = session.sink_externs;
+
+        auto runtime_registry = merge_registries(session.tables, extra_tables);
+
+        if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
+            auto lowered = ibex::parser::lower_expr(*let_stmt->value, context);
+            if (!lowered.has_value()) {
+                return std::unexpected(
+                    "ibex_pyarrow sessions currently support only table-valued let bindings: " +
+                    lowered.error().message);
+            }
+            auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry, nullptr,
+                                                      &session.externs);
+            if (!evaluated.has_value()) {
+                return std::unexpected(evaluated.error());
+            }
+            session.tables.insert_or_assign(let_stmt->name, std::move(*evaluated));
+            continue;
+        }
+
+        const auto& expr_stmt = std::get<ibex::parser::ExprStmt>(stmt);
+        auto lowered = ibex::parser::lower_expr(*expr_stmt.expr, context);
+        if (!lowered.has_value()) {
+            return std::unexpected(
+                "ibex_pyarrow sessions currently support only table-valued expressions: " +
+                lowered.error().message);
+        }
+        auto evaluated =
+            ibex::runtime::interpret(*lowered.value(), runtime_registry, nullptr, &session.externs);
+        if (!evaluated.has_value()) {
+            return std::unexpected(evaluated.error());
+        }
+        last_table = std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
+    }
+
+    return last_table;
 }
 
 auto read_text_file(const std::string& path) -> std::expected<std::string, std::string> {
@@ -689,6 +828,61 @@ auto build_table_registry_from_python(PyObject* tables_obj)
     return registry;
 }
 
+PyObject* export_result_table_or_none(const std::shared_ptr<const ibex::runtime::Table>& table) {
+    if (!table) {
+        Py_RETURN_NONE;
+    }
+
+    auto capsules = wrap_arrow_export(table);
+    if (!capsules.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, capsules.error());
+    }
+
+    PyObject* py_table = import_pyarrow_table(capsules->schema_capsule, capsules->array_capsule);
+    if (py_table == nullptr) {
+        return nullptr;
+    }
+    return py_table;
+}
+
+PyObject* py_create_session(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"plugin_paths", nullptr};
+    PyObject* plugin_paths_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O", const_cast<char**>(kwlist),
+                                     &plugin_paths_obj)) {
+        return nullptr;
+    }
+
+    auto plugin_paths = parse_plugin_paths(plugin_paths_obj);
+    if (!plugin_paths.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, plugin_paths.error());
+    }
+
+    auto* session = new SessionState();
+    session->plugin_paths = std::move(*plugin_paths);
+    return PyCapsule_New(session, "ibex_pyarrow.session", session_capsule_destructor);
+}
+
+PyObject* py_reset_session(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"session", nullptr};
+    PyObject* session_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", const_cast<char**>(kwlist), &session_obj)) {
+        return nullptr;
+    }
+
+    auto session = session_from_capsule(session_obj);
+    if (!session.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, session.error());
+    }
+
+    (*session)->tables.clear();
+    (*session)->table_externs.clear();
+    (*session)->sink_externs.clear();
+    (*session)->externs = ibex::runtime::ExternRegistry{};
+    (*session)->loaded_plugins.clear();
+    Py_RETURN_NONE;
+}
+
 PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
     static const char* kwlist[] = {"source", "tables", "plugin_paths", nullptr};
     const char* source = nullptr;
@@ -714,17 +908,7 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }
 
-    auto capsules = wrap_arrow_export(std::move(*evaluated));
-    if (!capsules.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, capsules.error());
-    }
-
-    PyObject* table = import_pyarrow_table(capsules->schema_capsule, capsules->array_capsule);
-    if (table == nullptr) {
-        return nullptr;
-    }
-
-    return table;
+    return export_result_table_or_none(*evaluated);
 }
 
 PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
@@ -757,17 +941,68 @@ PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
         return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
     }
 
-    auto capsules = wrap_arrow_export(std::move(*evaluated));
-    if (!capsules.has_value()) {
-        return set_python_error_from_message(PyExc_RuntimeError, capsules.error());
-    }
+    return export_result_table_or_none(*evaluated);
+}
 
-    PyObject* table = import_pyarrow_table(capsules->schema_capsule, capsules->array_capsule);
-    if (table == nullptr) {
+PyObject* py_session_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"session", "source", "tables", nullptr};
+    PyObject* session_obj = Py_None;
+    const char* source = nullptr;
+    PyObject* tables_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|O", const_cast<char**>(kwlist), &session_obj,
+                                     &source, &tables_obj)) {
         return nullptr;
     }
 
-    return table;
+    auto session = session_from_capsule(session_obj);
+    if (!session.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, session.error());
+    }
+
+    auto extra_tables = build_table_registry_from_python(tables_obj);
+    if (!extra_tables.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, extra_tables.error());
+    }
+
+    auto evaluated = eval_table_in_session(**session, source, *extra_tables);
+    if (!evaluated.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
+    }
+
+    return export_result_table_or_none(*evaluated);
+}
+
+PyObject* py_session_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"session", "path", "tables", nullptr};
+    PyObject* session_obj = Py_None;
+    const char* path = nullptr;
+    PyObject* tables_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|O", const_cast<char**>(kwlist), &session_obj,
+                                     &path, &tables_obj)) {
+        return nullptr;
+    }
+
+    auto session = session_from_capsule(session_obj);
+    if (!session.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, session.error());
+    }
+
+    auto source = read_text_file(path);
+    if (!source.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, source.error());
+    }
+
+    auto extra_tables = build_table_registry_from_python(tables_obj);
+    if (!extra_tables.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, extra_tables.error());
+    }
+
+    auto evaluated = eval_table_in_session(**session, *source, *extra_tables);
+    if (!evaluated.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
+    }
+
+    return export_result_table_or_none(*evaluated);
 }
 
 #if defined(__clang__)
@@ -775,10 +1010,23 @@ PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
 #pragma clang diagnostic ignored "-Wcast-function-type-mismatch"
 #endif
 PyMethodDef kModuleMethods[] = {
+    {"create_session", reinterpret_cast<PyCFunction>(py_create_session),
+     METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Create a persistent Ibex session for repeated evaluation.")},
+    {"reset_session", reinterpret_cast<PyCFunction>(py_reset_session), METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Reset a persistent Ibex session.")},
     {"eval_table", reinterpret_cast<PyCFunction>(py_eval_table), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Evaluate an Ibex source string and return a pyarrow.Table.")},
     {"eval_file", reinterpret_cast<PyCFunction>(py_eval_file), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Evaluate an Ibex file and return a pyarrow.Table.")},
+    {"session_eval_table", reinterpret_cast<PyCFunction>(py_session_eval_table),
+     METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Evaluate an Ibex source string within a persistent session and return a "
+               "pyarrow.Table or None.")},
+    {"session_eval_file", reinterpret_cast<PyCFunction>(py_session_eval_file),
+     METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR(
+         "Evaluate an Ibex file within a persistent session and return a pyarrow.Table or None.")},
     {nullptr, nullptr, 0, nullptr},
 };
 #if defined(__clang__)

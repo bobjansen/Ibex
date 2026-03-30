@@ -158,6 +158,27 @@ def main() -> int:
     print(from_csv.to_pydict())
     assert from_csv.to_pydict() == {"total": [150]}
 
+    session = ibex_pyarrow.create_session(plugin_paths=default_plugin_paths())
+    define_result = ibex_pyarrow.session_eval_table(
+        session,
+        """
+        extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+        let iris = read_csv("data/iris.csv");
+        """,
+    )
+    assert define_result is None
+    session_result = ibex_pyarrow.session_eval_table(
+        session,
+        """
+        iris[select total = count()];
+        """,
+    )
+    print("\nsession-backed table:")
+    print(session_result)
+    print(session_result.to_pydict())
+    assert session_result.to_pydict() == {"total": [150]}
+    ibex_pyarrow.reset_session(session)
+
     return 0
 
 

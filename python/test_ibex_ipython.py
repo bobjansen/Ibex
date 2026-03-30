@@ -75,6 +75,40 @@ def main() -> int:
     assert csv_result.to_pydict() == {"total": [150]}
     assert shell.user_ns["iris_count"].to_pydict() == {"total": [150]}
 
+    define_only = shell.run_cell_magic(
+        "ibex",
+        "--quiet",
+        """
+        let train = Table { x = [1, 2, 3], y = [10, 20, 30] };
+        """,
+    )
+    assert define_only is None
+
+    persisted = shell.run_cell_magic(
+        "ibex",
+        "--as pyarrow --out persisted --quiet",
+        """
+        train[select { total = sum(y) }];
+        """,
+    )
+    assert isinstance(persisted, pa.Table)
+    assert persisted.to_pydict() == {"total": [60]}
+    assert shell.user_ns["persisted"].to_pydict() == {"total": [60]}
+
+    shell.run_line_magic("ibexreset", "")
+    try:
+        shell.run_cell_magic(
+            "ibex",
+            "--quiet",
+            """
+            train[select { total = sum(y) }];
+            """,
+        )
+    except Exception:
+        pass
+    else:
+        raise AssertionError("expected train binding to be cleared after %ibexreset")
+
     return 0
 
 

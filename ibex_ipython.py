@@ -9,6 +9,8 @@ from IPython.core.error import UsageError
 from IPython.core.magic import Magics, cell_magic, line_magic, magics_class
 from IPython.display import display
 
+_SESSION_KEY = "_ibex_session"
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parent
@@ -103,9 +105,19 @@ def _resolve_bindings(shell, bind_specs: list[str]) -> dict[str, object]:
 
 
 def _convert_result(result, result_format: str):
+    if result is None:
+        return None
     if result_format == "pandas":
         return result.to_pandas()
     return result
+
+
+def _get_or_create_session(shell):
+    session = shell.user_ns.get(_SESSION_KEY)
+    if session is None:
+        session = ibex_pyarrow.create_session(plugin_paths=default_plugin_paths())
+        shell.user_ns[_SESSION_KEY] = session
+    return session
 
 
 @magics_class
@@ -114,13 +126,13 @@ class IbexMagics(Magics):
     def ibex(self, line: str, cell: str):
         args = _parse_args(line, "%%ibex")
         bindings = _resolve_bindings(self.shell, args.bind)
-        result = ibex_pyarrow.eval_table(
-            cell, tables=bindings or None, plugin_paths=default_plugin_paths()
+        result = ibex_pyarrow.session_eval_table(
+            _get_or_create_session(self.shell), cell, tables=bindings or None
         )
         converted = _convert_result(result, args.result_format)
         target_name = args.out or "_ibex"
         self.shell.user_ns[target_name] = converted
-        if not args.quiet:
+        if converted is not None and not args.quiet:
             display(converted)
         return converted
 
@@ -128,15 +140,28 @@ class IbexMagics(Magics):
     def ibexfile(self, line: str):
         args = _parse_file_args(line)
         bindings = _resolve_bindings(self.shell, args.bind)
-        result = ibex_pyarrow.eval_file(
-            args.path, tables=bindings or None, plugin_paths=default_plugin_paths()
+        result = ibex_pyarrow.session_eval_file(
+            _get_or_create_session(self.shell), args.path, tables=bindings or None
         )
         converted = _convert_result(result, args.result_format)
         target_name = args.out or "_ibex"
         self.shell.user_ns[target_name] = converted
-        if not args.quiet:
+        if converted is not None and not args.quiet:
             display(converted)
         return converted
+
+    @line_magic
+    def ibexreset(self, line: str):
+        if line.strip():
+            raise UsageError("%ibexreset takes no arguments")
+        session = self.shell.user_ns.get(_SESSION_KEY)
+        if session is None:
+            return None
+        ibex_pyarrow.reset_session(session)
+        self.shell.user_ns[_SESSION_KEY] = ibex_pyarrow.create_session(
+            plugin_paths=default_plugin_paths()
+        )
+        return None
 
 
 def load_ipython_extension(ipython) -> None:

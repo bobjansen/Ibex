@@ -25,6 +25,65 @@ let annotated = prices[update { price_k = price / 1000.0 }];
 let enriched = prices join ohlc on symbol;
 ```
 
+## IPython and Jupyter
+
+Ibex now has a Python bridge that returns `pyarrow.Table` objects and an
+IPython extension for notebook-style workflows. The intended split is simple:
+keep joins, filters, aggregations, and reshaping in Ibex; use Python for plots,
+notebooks, and downstream ML.
+
+Build the bridge first:
+
+```bash
+cmake --build build-release --parallel --target ibex_pyarrow
+uv sync
+```
+
+Then start IPython from the repository root and load the extension:
+
+```python
+%load_ext ibex_ipython
+```
+
+Inline cell example with a pandas binding:
+
+```python
+import pandas as pd
+
+trades = pd.DataFrame({
+    "symbol": ["AAPL", "AAPL", "MSFT"],
+    "qty": [10, 15, 7],
+    "px": [101.2, 101.5, 299.8],
+})
+```
+
+```python
+%%ibex --bind trades=trades --as pandas --out grouped
+trades[
+    select { total_qty = sum(qty), avg_px = mean(px) },
+    by symbol,
+    order symbol
+];
+```
+
+The result is stored in `grouped` as a pandas `DataFrame`. Use `--as pyarrow`
+to keep the result as a `pyarrow.Table`, or `%ibexfile` to run a checked-in
+`.ibex` script directly:
+
+```python
+%ibexfile --as pyarrow --out result python/plot_ibex_pyarrow_demo.ibex
+```
+
+Supported magic options:
+
+- `--bind ibex_name=python_var` to pass pandas, pyarrow, or plain Python table data into Ibex
+- `--as pyarrow|pandas` to control the returned result type
+- `--out var_name` to choose the output variable name
+- `--quiet` to suppress immediate display
+
+This is the fastest way to get Ibex into a notebook today without inventing a
+separate plotting system or a full standalone kernel.
+
 ## Language at a glance
 
 ### Inline table construction
@@ -774,7 +833,7 @@ Fully restart VS Code after copying. `.ibex` files will be highlighted automatic
 ## Roadmap
 
 - [ ] Query optimizer (predicate pushdown, projection pruning)
-- [ ] Python FFI bindings (pybind11) and C API
+- [x] Python `pyarrow` bridge and IPython/Jupyter magics
 - [ ] R bindings (Rcpp)
-- [ ] Arrow C Data Interface export (zero-copy interop)
+- [x] Arrow C Data Interface export (zero-copy interop)
 - [ ] REPL tab completion and history

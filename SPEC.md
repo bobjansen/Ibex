@@ -2852,3 +2852,69 @@ join_form:
 
 The parser is fully deterministic with 1-token lookahead after consuming the
 leading token of each production.
+
+---
+
+## Appendix D: Python and IPython Integration (Non-Normative)
+
+This appendix documents the current Python-facing tooling around Ibex. It is
+not part of the core language semantics, but it is part of the intended user
+workflow for notebook-style analysis.
+
+Ibex currently exposes a Python extension module named `ibex_pyarrow` that
+evaluates Ibex source and returns results as `pyarrow.Table` objects. Two entry
+points are provided:
+
+- `eval_table(source, tables=None)` evaluates an in-memory Ibex source string
+- `eval_file(path, tables=None)` evaluates a `.ibex` file from disk
+
+The optional `tables` binding map copies Python-side table data into owned Ibex
+tables before evaluation. The first implementation supports:
+
+- plain Python column dictionaries
+- `pyarrow.Table` inputs
+- pandas `DataFrame` inputs
+
+On top of that bridge, Ibex provides an IPython extension, loadable with:
+
+```python
+%load_ext ibex_ipython
+```
+
+The extension exposes two magics:
+
+- `%%ibex` evaluates an inline Ibex cell
+- `%ibexfile` evaluates a `.ibex` file
+
+Both magics support the following options:
+
+- `--bind ibex_name=python_var` to bind Python tables into the Ibex script
+- `--as pyarrow|pandas` to choose the returned result type
+- `--out var_name` to store the result in a chosen Python variable
+- `--quiet` to suppress immediate display
+
+Example:
+
+```python
+import pandas as pd
+%load_ext ibex_ipython
+
+quotes = pd.DataFrame({
+    "symbol": ["AAPL", "AAPL", "MSFT"],
+    "bid": [101.0, 101.2, 299.5],
+    "ask": [101.1, 101.3, 300.0],
+})
+```
+
+```python
+%%ibex --bind quotes=quotes --as pandas --out spread_summary
+quotes[
+    select { mean_spread = mean(ask - bid) },
+    by symbol,
+    order symbol
+];
+```
+
+This tooling is intentionally layered on top of the language rather than baked
+into the syntax. Ibex remains the table DSL; Python, pandas, pyarrow, and
+matplotlib provide notebook ergonomics, plotting, and ecosystem integration.

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pyarrow as pa
 
 import ibex_pyarrow
@@ -39,6 +42,23 @@ def main() -> int:
         "x": [3, 4],
         "flag": [True, False],
     }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = Path(tmpdir) / "demo.ibex"
+        script_path.write_text(
+            """
+            Table { symbol = ["A", "B"], qty = [7, 9] };
+            """,
+            encoding="utf-8",
+        )
+        from_file = ibex_pyarrow.eval_file(str(script_path))
+        print("\nfile table:")
+        print(from_file)
+        print(from_file.to_pydict())
+        assert from_file.to_pydict() == {
+            "symbol": ["A", "B"],
+            "qty": [7, 9],
+        }
 
     return 0
 

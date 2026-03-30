@@ -558,10 +558,11 @@ let clean = quotes[update {
 clean[select { avg_px = mean(px_clean), sum_px = sum(px_clean) }, by symbol];
 ```
 
-For grouped aggregates, the cleanup wrappers can also be used directly as the
-aggregate input:
+For grouped aggregates, any scalar expression can be used directly as the
+aggregate input. Ibex lowers that expression to a hidden pre-aggregate column:
 
 ```
+quotes[select { avg_notional = mean(price * volume) }, by symbol];
 quotes[select { avg_px = mean(null_if_nan(px)) }, by symbol];
 ```
 

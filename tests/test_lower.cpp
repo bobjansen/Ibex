@@ -126,6 +126,40 @@ TEST_CASE("Lower grouped aggregation with null cleanup wrapper to IR") {
     REQUIRE(arg->name == "price");
 }
 
+TEST_CASE("Lower grouped aggregation with computed input to IR") {
+    auto program =
+        require_parse("df[select { symbol, avg_price = mean(price + fee) }, by symbol];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* agg = as_node<ir::AggregateNode>(result->get());
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->aggregations().size() == 1);
+    REQUIRE(agg->aggregations()[0].alias == "avg_price");
+    REQUIRE(agg->aggregations()[0].column.name == "_agg0");
+
+    REQUIRE(agg->children().size() == 1);
+    const auto* update = as_node<ir::UpdateNode>(agg->children()[0].get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->fields().size() == 1);
+    REQUIRE(update->fields()[0].alias == "_agg0");
+    const auto* bin = std::get_if<ir::BinaryExpr>(&update->fields()[0].expr.node);
+    REQUIRE(bin != nullptr);
+    const auto* left = std::get_if<ir::ColumnRef>(&bin->left->node);
+    const auto* right = std::get_if<ir::ColumnRef>(&bin->right->node);
+    REQUIRE(left != nullptr);
+    REQUIRE(right != nullptr);
+    REQUIRE(left->name == "price");
+    REQUIRE(right->name == "fee");
+}
+
+TEST_CASE("Lowering rejects nested aggregate input") {
+    auto program = require_parse("df[select { symbol, bad = sum(mean(price)) }, by symbol];");
+    auto result = parser::lower(program);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message == "nested aggregate function calls are not allowed");
+}
+
 TEST_CASE("Lower update with by to IR") {
     auto program = require_parse("df[update { avg = price }, by symbol];");
     auto result = parser::lower(program);

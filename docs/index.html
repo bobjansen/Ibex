@@ -815,7 +815,8 @@ quotes[<span class="kw">update</span> {
 }]
 [<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(px_clean) }, <span class="kw">by</span> symbol];
 
-<span class="cm">// Direct aggregate input is also allowed</span>
+<span class="cm">// Direct aggregate expressions are also allowed</span>
+quotes[<span class="kw">select</span> { avg_notional = <span class="fn-name">mean</span>(price * volume) }, <span class="kw">by</span> symbol];
 quotes[<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(<span class="fn-name">null_if_nan</span>(px)) }, <span class="kw">by</span> symbol];</code></pre>
         </div>
       </div>

@@ -11,4 +11,5 @@ dependencies = [
     "datafusion>=41.0",
     "chdb>=2.0",
     "matplotlib>=3.10.8",
+    "ipython>=9.10.1",
 ]

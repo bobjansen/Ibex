@@ -4,8 +4,10 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <expected>
+#include <fstream>
 #include <memory>
 #include <Python.h>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -165,6 +167,20 @@ auto eval_table_impl(const std::string& source)
     return std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
 }
 
+auto read_text_file(const std::string& path) -> std::expected<std::string, std::string> {
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return std::unexpected("failed to open ibex file: " + path);
+    }
+
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    if (!in.good() && !in.eof()) {
+        return std::unexpected("failed to read ibex file: " + path);
+    }
+    return buffer.str();
+}
+
 PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
     static const char* kwlist[] = {"source", nullptr};
     const char* source = nullptr;
@@ -190,6 +206,36 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
     return table;
 }
 
+PyObject* py_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
+    static const char* kwlist[] = {"path", nullptr};
+    const char* path = nullptr;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s", const_cast<char**>(kwlist), &path)) {
+        return nullptr;
+    }
+
+    auto source = read_text_file(path);
+    if (!source.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, source.error());
+    }
+
+    auto evaluated = eval_table_impl(*source);
+    if (!evaluated.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, evaluated.error());
+    }
+
+    auto capsules = wrap_arrow_export(std::move(*evaluated));
+    if (!capsules.has_value()) {
+        return set_python_error_from_message(PyExc_RuntimeError, capsules.error());
+    }
+
+    PyObject* table = import_pyarrow_table(capsules->schema_capsule, capsules->array_capsule);
+    if (table == nullptr) {
+        return nullptr;
+    }
+
+    return table;
+}
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wcast-function-type-mismatch"
@@ -197,6 +243,8 @@ PyObject* py_eval_table(PyObject* /*self*/, PyObject* args, PyObject* kwargs) {
 PyMethodDef kModuleMethods[] = {
     {"eval_table", reinterpret_cast<PyCFunction>(py_eval_table), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Evaluate an Ibex source string and return a pyarrow.Table.")},
+    {"eval_file", reinterpret_cast<PyCFunction>(py_eval_file), METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Evaluate an Ibex file and return a pyarrow.Table.")},
     {nullptr, nullptr, 0, nullptr},
 };
 #if defined(__clang__)

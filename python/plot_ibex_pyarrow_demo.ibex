@@ -1,0 +1,31 @@
+Table {
+    stock = [
+        "ALPHA", "ALPHA", "ALPHA", "ALPHA", "ALPHA", "ALPHA",
+        "BETA",  "BETA",  "BETA",  "BETA",  "BETA",  "BETA"
+    ],
+    bucket = [0, 10, 20, 30, 40, 50, 0, 10, 20, 30, 40, 50],
+    bid = [
+        100.00, 100.08, 100.18, 100.31, 100.45, 100.60,
+        49.90, 49.98, 50.07, 50.17, 50.28, 50.40
+    ],
+    ask = [
+        100.14, 100.19, 100.27, 100.38, 100.50, 100.64,
+        50.06, 50.11, 50.17, 50.25, 50.33, 50.44
+    ],
+    bid_sz = [4800.0, 5100.0, 5450.0, 5850.0, 6200.0, 6600.0, 3000.0, 3250.0, 3480.0, 3660.0, 3910.0, 4200.0],
+    ask_sz = [5200.0, 5500.0, 5800.0, 6100.0, 6500.0, 6900.0, 3200.0, 3410.0, 3590.0, 3840.0, 4020.0, 4310.0]
+}[update {
+    mid = (bid + ask) / 2.0,
+    spread_bps = ((ask - bid) / ((bid + ask) / 2.0)) * 10000.0,
+    depth = bid_sz + ask_sz,
+    book_imbalance = (bid_sz - ask_sz) / (bid_sz + ask_sz)
+}][
+    select {
+        bucket,
+        avg_spread_bps = mean(spread_bps),
+        avg_depth = mean(depth),
+        avg_book_imbalance = mean(book_imbalance)
+    },
+    by bucket,
+    order bucket
+];

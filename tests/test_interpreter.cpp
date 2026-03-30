@@ -3244,6 +3244,145 @@ TEST_CASE("fill_forward wrong argument count returns error", "[null][fill]") {
     CHECK(result.error().find("fill_forward") != std::string::npos);
 }
 
+TEST_CASE("is_nan returns Bool mask for Float64 columns", "[nan][clean]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(), 3.0, 0.0},
+                 std::vector<bool>{true, true, true, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { bad = is_nan(x) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("bad");
+    REQUIRE(entry != nullptr);
+    CHECK_FALSE(entry->validity.has_value());
+    const auto& bad = std::get<Column<bool>>(*entry->column);
+    CHECK(bad[0] == false);
+    CHECK(bad[1] == true);
+    CHECK(bad[2] == false);
+    CHECK(bad[3] == false);
+}
+
+TEST_CASE("null_if_nan marks NaN values as null", "[nan][clean]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(), 3.0, 0.0},
+                 std::vector<bool>{true, true, true, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { x_clean = null_if_nan(x) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("x_clean");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    const auto& x_clean = std::get<Column<double>>(*entry->column);
+    CHECK(x_clean[0] == Catch::Approx(1.0));
+    CHECK(runtime::is_null(*entry, 1));
+    CHECK(x_clean[2] == Catch::Approx(3.0));
+    CHECK(runtime::is_null(*entry, 3));
+}
+
+TEST_CASE("null_if_not_finite marks NaN and infinities as null", "[nan][clean]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::infinity(),
+                                     -std::numeric_limits<double>::infinity(), 5.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { x_clean = null_if_not_finite(x) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("x_clean");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    const auto& x_clean = std::get<Column<double>>(*entry->column);
+    CHECK(x_clean[0] == Catch::Approx(1.0));
+    CHECK(runtime::is_null(*entry, 1));
+    CHECK(runtime::is_null(*entry, 2));
+    CHECK(runtime::is_null(*entry, 3));
+    CHECK(x_clean[4] == Catch::Approx(5.0));
+}
+
+TEST_CASE("aggregates ignore values nulled by null_if_nan", "[nan][clean][agg]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 2, 2});
+    t.add_column("x", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(), 3.0,
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::quiet_NaN()});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[update { x_clean = null_if_nan(x) }]"
+        "[select { g, sx = sum(x_clean), mx = mean(x_clean) }, by g, order g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->find("g"));
+    const auto* sx_entry = result->find_entry("sx");
+    const auto* mx_entry = result->find_entry("mx");
+    REQUIRE(sx_entry != nullptr);
+    REQUIRE(mx_entry != nullptr);
+    const auto& sx = std::get<Column<double>>(*sx_entry->column);
+    const auto& mx = std::get<Column<double>>(*mx_entry->column);
+
+    CHECK(g[0] == 1);
+    CHECK(sx[0] == Catch::Approx(4.0));
+    CHECK(mx[0] == Catch::Approx(2.0));
+    CHECK_FALSE(runtime::is_null(*sx_entry, 0));
+    CHECK_FALSE(runtime::is_null(*mx_entry, 0));
+
+    CHECK(g[1] == 2);
+    CHECK(runtime::is_null(*sx_entry, 1));
+    CHECK(runtime::is_null(*mx_entry, 1));
+}
+
+TEST_CASE("aggregates accept direct null_if_nan wrapper", "[nan][clean][agg]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 2, 2});
+    t.add_column("x", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(), 3.0,
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::quiet_NaN()});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[select { g, sx = sum(null_if_nan(x)), mx = mean(null_if_nan(x)) }, by g, order g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->find("g"));
+    const auto* sx_entry = result->find_entry("sx");
+    const auto* mx_entry = result->find_entry("mx");
+    REQUIRE(sx_entry != nullptr);
+    REQUIRE(mx_entry != nullptr);
+    const auto& sx = std::get<Column<double>>(*sx_entry->column);
+    const auto& mx = std::get<Column<double>>(*mx_entry->column);
+
+    CHECK(g[0] == 1);
+    CHECK(sx[0] == Catch::Approx(4.0));
+    CHECK(mx[0] == Catch::Approx(2.0));
+    CHECK_FALSE(runtime::is_null(*sx_entry, 0));
+    CHECK_FALSE(runtime::is_null(*mx_entry, 0));
+
+    CHECK(g[1] == 2);
+    CHECK(runtime::is_null(*sx_entry, 1));
+    CHECK(runtime::is_null(*mx_entry, 1));
+}
+
 TEST_CASE("rep missing positional argument returns error") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3});

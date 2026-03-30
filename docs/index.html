@@ -296,7 +296,9 @@ prices[
             Aggregate functions: <code>first</code>, <code>last</code>,
             <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>,
             <code>count</code>, <code>median</code>, <code>std</code>,
-            <code>ewma</code>. All skip null rows by default.
+            <code>ewma</code>. All skip null rows by default. IEEE
+            <code>NaN</code> / <code>Inf</code> are not nulls, so normalize them
+            explicitly before aggregation when needed.
           </p>
         </div>
         <div class="tour-code">
@@ -536,6 +538,12 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
             <code>skew</code> on fewer than 3, <code>kurtosis</code> on
             fewer than 4).
           </p>
+          <p>
+            Floating-point <code>NaN</code> and <code>Inf</code> values are
+            separate from nulls. Use <code>null_if_nan</code> or
+            <code>null_if_not_finite</code> to convert them into nulls before
+            grouped reductions.
+          </p>
         </div>
         <div class="tour-code">
 <pre><code><span class="cm">// Left join introduces nulls for unmatched rows</span>
@@ -758,11 +766,11 @@ tf[<span class="kw">update</span> { running_vol = <span class="fn-name">cumsum</
         </div>
       </div>
 
-      <!-- 10. Null fill -->
+      <!-- 10. Null / NaN cleanup -->
       <div class="tour-item">
         <div class="tour-text">
-          <span class="tour-tag">Null Fill</span>
-          <h3>Fill missing values with three strategies.</h3>
+          <span class="tour-tag">Null / NaN Cleanup</span>
+          <h3>Clean missing and dirty float values before aggregation.</h3>
           <p>
             Three built-in functions cover data.table&rsquo;s
             <code>nafill</code> semantics in a single O(n) pass:
@@ -778,6 +786,13 @@ tf[<span class="kw">update</span> { running_vol = <span class="fn-name">cumsum</
             <code>select</code> or <code>update</code> blocks.
             Unfillable leading (LOCF) or trailing (NOCB) nulls remain null.
           </p>
+          <p>
+            For dirty <code>Float64</code> columns, Ibex also provides
+            <code>is_nan(col)</code>, <code>null_if_nan(col)</code>, and
+            <code>null_if_not_finite(col)</code>. These are the right way to
+            make grouped <code>mean</code> / <code>sum</code> ignore
+            <code>NaN</code> and infinities.
+          </p>
         </div>
         <div class="tour-code">
 <pre><code><span class="cm">// Constant fill: replace null prices with 0</span>
@@ -791,7 +806,17 @@ df[<span class="kw">update</span> { price = <span class="fn-name">fill_backward<
 
 <span class="cm">// Chain: LOCF then fill remaining leading nulls with 0</span>
 df[<span class="kw">update</span> { price = <span class="fn-name">fill_forward</span>(price) }]
-  [<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];</code></pre>
+  [<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];
+
+<span class="cm">// Float cleanup: turn NaN / Inf into null before aggregation</span>
+quotes[<span class="kw">update</span> {
+    px_bad   = <span class="fn-name">is_nan</span>(px),
+    px_clean = <span class="fn-name">null_if_not_finite</span>(px)
+}]
+[<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(px_clean) }, <span class="kw">by</span> symbol];
+
+<span class="cm">// Direct aggregate input is also allowed</span>
+quotes[<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(<span class="fn-name">null_if_nan</span>(px)) }, <span class="kw">by</span> symbol];</code></pre>
         </div>
       </div>
 

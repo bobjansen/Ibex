@@ -88,8 +88,19 @@ def _parse_file_args(line: str) -> argparse.Namespace:
     return args
 
 
-def _resolve_bindings(shell, bind_specs: list[str]) -> dict[str, object]:
-    bindings: dict[str, object] = {}
+def _looks_like_table_binding(value: object) -> bool:
+    if hasattr(value, "to_pydict"):
+        return True
+    if hasattr(value, "to_dict") and hasattr(value, "columns"):
+        return True
+    if isinstance(value, dict):
+        return True
+    return False
+
+
+def _resolve_bindings(shell, bind_specs: list[str]) -> tuple[dict[str, object], dict[str, object]]:
+    table_bindings: dict[str, object] = {}
+    scalar_bindings: dict[str, object] = {}
     for spec in bind_specs:
         if "=" not in spec:
             raise UsageError(f"--bind expects IBEX=PYTHON, got: {spec}")
@@ -100,8 +111,12 @@ def _resolve_bindings(shell, bind_specs: list[str]) -> dict[str, object]:
             raise UsageError(f"--bind expects IBEX=PYTHON, got: {spec}")
         if python_name not in shell.user_ns:
             raise UsageError(f"Python variable not found for binding: {python_name}")
-        bindings[ibex_name] = shell.user_ns[python_name]
-    return bindings
+        value = shell.user_ns[python_name]
+        if _looks_like_table_binding(value):
+            table_bindings[ibex_name] = value
+        else:
+            scalar_bindings[ibex_name] = value
+    return table_bindings, scalar_bindings
 
 
 def _convert_result(result, result_format: str):
@@ -125,9 +140,12 @@ class IbexMagics(Magics):
     @cell_magic
     def ibex(self, line: str, cell: str):
         args = _parse_args(line, "%%ibex")
-        bindings = _resolve_bindings(self.shell, args.bind)
+        table_bindings, scalar_bindings = _resolve_bindings(self.shell, args.bind)
         result = ibex_pyarrow.session_eval_table(
-            _get_or_create_session(self.shell), cell, tables=bindings or None
+            _get_or_create_session(self.shell),
+            cell,
+            tables=table_bindings or None,
+            scalars=scalar_bindings or None,
         )
         converted = _convert_result(result, args.result_format)
         target_name = args.out or "_ibex"
@@ -139,9 +157,12 @@ class IbexMagics(Magics):
     @line_magic
     def ibexfile(self, line: str):
         args = _parse_file_args(line)
-        bindings = _resolve_bindings(self.shell, args.bind)
+        table_bindings, scalar_bindings = _resolve_bindings(self.shell, args.bind)
         result = ibex_pyarrow.session_eval_file(
-            _get_or_create_session(self.shell), args.path, tables=bindings or None
+            _get_or_create_session(self.shell),
+            args.path,
+            tables=table_bindings or None,
+            scalars=scalar_bindings or None,
         )
         converted = _convert_result(result, args.result_format)
         target_name = args.out or "_ibex"

@@ -2,8 +2,8 @@
 """Benchmark examples/quant.* across ibex, pandas, and polars.
 
 Usage:
-  uv run --project benchmarking benchmarking/bench_quant.py
-  uv run --project benchmarking benchmarking/bench_quant.py --min-seconds 3 --scale 50
+  uv run --project . benchmarking/bench_quant.py
+  uv run --project . benchmarking/bench_quant.py --min-seconds 3 --scale 50
 """
 
 from __future__ import annotations

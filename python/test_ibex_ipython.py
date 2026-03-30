@@ -57,10 +57,23 @@ def main() -> int:
             "x": [2, 3],
             "y": [20, 30],
         }
-        assert shell.user_ns["filtered"].to_pydict() == {
-            "x": [2, 3],
-            "y": [20, 30],
-        }
+    assert shell.user_ns["filtered"].to_pydict() == {
+        "x": [2, 3],
+        "y": [20, 30],
+    }
+
+    csv_result = shell.run_cell_magic(
+        "ibex",
+        "--as pyarrow --out iris_count --quiet",
+        """
+        extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+        read_csv("data/iris.csv")[select total = count()];
+        """,
+    )
+    assert isinstance(csv_result, pa.Table)
+    assert csv_result.to_pydict() == {"total": [150]}
+    assert shell.user_ns["iris_count"].to_pydict() == {"total": [150]}
 
     return 0
 

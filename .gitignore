@@ -22,6 +22,9 @@ compile_commands.json
 Thumbs.db
 
 # Data
+.ipynb_checkpoints/**
+notebooks/.ipynb_checkpoints/**
+ibex_benchmarks.egg-info/**
 bench_results/**
 benchmarking/data/**
 benchmarking/results/compiled/**

@@ -23,6 +23,17 @@ add_bridge_module_path()
 import ibex_pyarrow
 
 
+def default_plugin_paths() -> list[str]:
+    repo_root = Path(__file__).resolve().parents[1]
+    paths: list[str] = []
+    for build_dir_name in ("build-release", "build"):
+        for relative in ("tools", "libraries"):
+            candidate = repo_root / build_dir_name / relative
+            if candidate.is_dir():
+                paths.append(str(candidate))
+    return paths
+
+
 def main() -> int:
     table = ibex_pyarrow.eval_table(
         """
@@ -133,6 +144,19 @@ def main() -> int:
         "venue": ["BATS", "XNAS"],
         "avg_spread": [7.5, 5.5],
     }
+
+    from_csv = ibex_pyarrow.eval_table(
+        """
+        extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+        read_csv("data/iris.csv")[select total = count()];
+        """,
+        plugin_paths=default_plugin_paths(),
+    )
+    print("\nplugin-backed csv table:")
+    print(from_csv)
+    print(from_csv.to_pydict())
+    assert from_csv.to_pydict() == {"total": [150]}
 
     return 0
 

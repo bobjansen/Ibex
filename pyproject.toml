@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ibex-benchmarks"
 version = "0.1.0"
@@ -13,3 +17,6 @@ dependencies = [
     "matplotlib>=3.10.8",
     "ipython>=9.10.1",
 ]
+
+[tool.setuptools]
+py-modules = ["ibex_ipython"]

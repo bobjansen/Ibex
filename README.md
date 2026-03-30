@@ -657,6 +657,7 @@ Requirements: Clang 17+, CMake 3.26+, Ninja (recommended).
 ```bash
 # Debug (with sanitizers)
 cmake -B build -G Ninja \
+  -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Debug \
   -DIBEX_ENABLE_SANITIZERS=ON
@@ -665,6 +666,7 @@ ctest --test-dir build --output-on-failure
 
 # Release
 cmake -B build-release -G Ninja \
+  -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release

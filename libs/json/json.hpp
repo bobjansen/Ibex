@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -41,17 +42,23 @@ using json = nlohmann::json;
 enum class JsonColType { Unknown, Int, Double, Bool, String };
 
 inline auto json_classify(const json& val) -> JsonColType {
-    if (val.is_number_integer()) return JsonColType::Int;
-    if (val.is_number_float()) return JsonColType::Double;
-    if (val.is_boolean()) return JsonColType::Bool;
-    if (val.is_string()) return JsonColType::String;
+    if (val.is_number_integer())
+        return JsonColType::Int;
+    if (val.is_number_float())
+        return JsonColType::Double;
+    if (val.is_boolean())
+        return JsonColType::Bool;
+    if (val.is_string())
+        return JsonColType::String;
     return JsonColType::Unknown;
 }
 
 /// Widen the column type when values disagree.
 inline auto json_widen(JsonColType current, JsonColType incoming) -> JsonColType {
-    if (current == JsonColType::Unknown) return incoming;
-    if (current == incoming) return current;
+    if (current == JsonColType::Unknown)
+        return incoming;
+    if (current == incoming)
+        return current;
     // Int + Double -> Double
     if ((current == JsonColType::Int && incoming == JsonColType::Double) ||
         (current == JsonColType::Double && incoming == JsonColType::Int)) {
@@ -64,9 +71,19 @@ inline auto json_widen(JsonColType current, JsonColType incoming) -> JsonColType
 /// Parse JSON from a file, supporting both array-of-objects and JSON-Lines.
 inline auto json_parse_file(std::string_view path) -> std::vector<json> {
     std::string path_str{path};
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path_str, ec);
+    if (ec) {
+        throw std::runtime_error("read_json: failed to inspect path '" + path_str +
+                                 "': " + ec.message());
+    }
+    if (!exists) {
+        throw std::runtime_error("read_json: file not found: '" + path_str + "'");
+    }
+
     std::ifstream ifs{path_str};
     if (!ifs) {
-        throw std::runtime_error("read_json: cannot open: " + path_str);
+        throw std::runtime_error("read_json: failed to open '" + path_str + "'");
     }
 
     // Try to parse as a single JSON value first (array or object).
@@ -147,7 +164,8 @@ inline auto read_json(std::string_view path) -> ibex::runtime::Table {
 
     // Default unknown columns to String.
     for (auto& t : col_types) {
-        if (t == JsonColType::Unknown) t = JsonColType::String;
+        if (t == JsonColType::Unknown)
+            t = JsonColType::String;
     }
 
     const std::size_t n_rows = rows.size();

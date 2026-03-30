@@ -3383,6 +3383,32 @@ TEST_CASE("aggregates accept direct null_if_nan wrapper", "[nan][clean][agg]") {
     CHECK(runtime::is_null(*mx_entry, 1));
 }
 
+TEST_CASE("aggregates accept direct computed inputs", "[agg]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("x", Column<double>{1.0, 3.0, 10.0, 14.0});
+    t.add_column("y", Column<double>{2.0, 4.0, 20.0, 22.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[select { g, mx = mean(x + y), sx = sum(x + y) }, by g, order g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->find("g"));
+    const auto& mx = std::get<Column<double>>(*result->find("mx"));
+    const auto& sx = std::get<Column<double>>(*result->find("sx"));
+
+    CHECK(g[0] == 1);
+    CHECK(mx[0] == Catch::Approx(5.0));
+    CHECK(sx[0] == Catch::Approx(10.0));
+    CHECK(g[1] == 2);
+    CHECK(mx[1] == Catch::Approx(33.0));
+    CHECK(sx[1] == Catch::Approx(66.0));
+}
+
 TEST_CASE("rep missing positional argument returns error") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3});

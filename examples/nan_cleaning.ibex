@@ -31,3 +31,7 @@ cleaned[select {
 dirty[select {
     avg_px_direct = mean(null_if_nan(px))
 }, by symbol, order symbol];
+
+quotes[select {
+    avg_num_plus_den = mean(num + den)
+}, by symbol, order symbol];

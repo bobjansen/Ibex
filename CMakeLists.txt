@@ -22,6 +22,7 @@ option(IBEX_ENABLE_SANITIZERS "Enable ASan + UBSan in Debug" OFF)
 option(IBEX_BUILD_TESTS "Build tests" ON)
 option(IBEX_BUILD_TOOLS "Build REPL and other tools" ON)
 option(IBEX_BUILD_EXAMPLES "Build examples" ON)
+option(IBEX_BUILD_PYTHON_BRIDGE "Build the experimental pyarrow-backed Python bridge" ON)
 set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
     "Directory for bundled Ibex plugins (csv/gen_tf_data)")
 
@@ -71,9 +72,18 @@ if(IBEX_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
-# Tests
+# Tests must be enabled before optional subdirectories that register tests.
 if(IBEX_BUILD_TESTS)
     enable_testing()
+endif()
+
+# Python bridge
+if(IBEX_BUILD_PYTHON_BRIDGE)
+    add_subdirectory(python)
+endif()
+
+# Tests
+if(IBEX_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 

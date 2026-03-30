@@ -127,7 +127,7 @@ for rows in "${SIZES[@]}"; do
     mkdir -p "$size_result_dir"
 
     echo "━━━ Dataset: ${rows} rows ━━━"
-    uv run --project "$SCRIPT_DIR" "$GEN_DATA" "$size_data_dir" --rows "$rows"
+    uv run --project "$IBEX_ROOT" "$GEN_DATA" "$size_data_dir" --rows "$rows"
 
     csv="$size_data_dir/prices.csv"
     csv_multi="$size_data_dir/prices_multi.csv"
@@ -149,7 +149,7 @@ for rows in "${SIZES[@]}"; do
 
     if [[ $SKIP_POLARS -eq 0 ]]; then
         echo "  → polars (default threads)"
-        uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/bench_python.py" \
+        uv run --project "$IBEX_ROOT" python3 "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$rows" \
@@ -164,7 +164,7 @@ for rows in "${SIZES[@]}"; do
         echo "  → polars (single thread)"
         local_polars_st_raw="$size_result_dir/polars_st_raw.tsv"
         local_polars_st="$size_result_dir/polars_st.tsv"
-        POLARS_MAX_THREADS=1 uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/bench_python.py" \
+        POLARS_MAX_THREADS=1 uv run --project "$IBEX_ROOT" python3 "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$rows" \

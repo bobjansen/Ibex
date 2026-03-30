@@ -73,7 +73,7 @@ echo "✓ Python: $(python3 --version)"
 echo "✓ uv: $(uv --version)"
 echo ""
 
-# Python packages are managed by uv via benchmarking/pyproject.toml.
+# Python packages are managed by uv via the repo-root pyproject.toml.
 # The first `uv run` invocation will automatically install:
 #   numpy, pandas, polars, duckdb
 echo "Python packages (numpy, pandas, polars, duckdb) will be installed"

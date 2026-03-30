@@ -1,0 +1,33 @@
+// NaN / Inf cleanup before aggregation.
+//
+// These helpers are for Float64 columns:
+//   is_nan(col)
+//   null_if_nan(col)
+//   null_if_not_finite(col)
+//
+// Typical workflow: normalize dirty float payloads into nulls, then aggregate.
+
+let quotes = Table {
+    symbol = ["AAPL", "AAPL", "MSFT", "MSFT", "MSFT"],
+    num    = [101.2, 0.0, 299.8, 1.0, 300.2],
+    den    = [1.0, 0.0, 1.0, 0.0, 1.0]
+};
+
+let dirty = quotes[update {
+    px = num / den
+}];
+
+let cleaned = dirty[update {
+    px_is_nan = is_nan(px),
+    px_null   = null_if_nan(px),
+    px_finite = null_if_not_finite(px)
+}];
+
+cleaned[select {
+    avg_px = mean(px_finite),
+    sum_px = sum(px_finite)
+}, by symbol, order symbol];
+
+dirty[select {
+    avg_px_direct = mean(null_if_nan(px))
+}, by symbol, order symbol];

@@ -124,6 +124,9 @@ auto builtin_summaries() -> const std::unordered_map<std::string, CallableSummar
         {"rand_bernoulli", make_builtin_summary(kEffNondet)},
         {"rand_poisson", make_builtin_summary(kEffNondet)},
         {"rand_int", make_builtin_summary(kEffNondet)},
+        {"is_nan", make_builtin_summary(EffectMask{0})},
+        {"null_if_nan", make_builtin_summary(EffectMask{0})},
+        {"null_if_not_finite", make_builtin_summary(EffectMask{0})},
     };
     return builtins;
 }

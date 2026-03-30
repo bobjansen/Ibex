@@ -1172,6 +1172,7 @@ class Lowerer {
         }
 
         std::vector<ir::AggSpec> aggs;
+        std::vector<ir::FieldSpec> preagg_updates;
         std::vector<ir::FieldSpec> updates;
         std::vector<std::string> final_columns;
         std::unordered_map<std::string, bool> temp_columns;
@@ -1179,6 +1180,50 @@ class Lowerer {
 
         auto make_temp = [&]() -> std::string {
             return "_agg" + std::to_string(temp_counter++);
+        };
+
+        std::function<const IdentifierExpr*(const Expr&)> extract_column_ident;
+        extract_column_ident = [&](const Expr& expr) -> const IdentifierExpr* {
+            if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+                return ident;
+            }
+            if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+                return extract_column_ident(*group->expr);
+            }
+            return nullptr;
+        };
+
+        auto lower_agg_arg =
+            [&](const Expr& expr,
+                std::string_view arg_error) -> std::expected<std::string, LowerError> {
+            if (const auto* ident = extract_column_ident(expr)) {
+                return ident->name;
+            }
+            if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+                const bool is_cleanup =
+                    call->callee == "null_if_nan" || call->callee == "null_if_not_finite";
+                if (is_cleanup) {
+                    if (call->args.size() != 1) {
+                        return std::unexpected(
+                            LowerError{.message = call->callee + "() takes one argument"});
+                    }
+                    if (extract_column_ident(*call->args[0]) == nullptr) {
+                        return std::unexpected(LowerError{.message = std::string(arg_error)});
+                    }
+                    auto lowered = lower_expr_to_ir(expr);
+                    if (!lowered.has_value()) {
+                        return std::unexpected(lowered.error());
+                    }
+                    std::string alias = make_temp();
+                    preagg_updates.push_back(ir::FieldSpec{
+                        .alias = alias,
+                        .expr = std::move(lowered.value()),
+                    });
+                    temp_columns[alias] = true;
+                    return alias;
+                }
+            }
+            return std::unexpected(LowerError{.message = std::string(arg_error)});
         };
 
         std::function<std::expected<ir::Expr, LowerError>(const Expr&)> lower_agg_expr;
@@ -1227,10 +1272,12 @@ class Lowerer {
                         return std::unexpected(LowerError{
                             .message = "ewma() takes two arguments: ewma(column, alpha)"});
                     }
-                    const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
-                    if (ident == nullptr) {
-                        return std::unexpected(LowerError{
-                            .message = "first argument of ewma() must be a column name"});
+                    auto column_name =
+                        lower_agg_arg(*call->args[0],
+                                      "first argument of ewma() must be a column name or cleanup "
+                                      "wrapper");
+                    if (!column_name.has_value()) {
+                        return std::unexpected(column_name.error());
                     }
                     double alpha = 0.0;
                     if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
@@ -1250,7 +1297,7 @@ class Lowerer {
                     }
                     aggs.push_back(ir::AggSpec{
                         .func = func.value(),
-                        .column = ir::ColumnRef{.name = ident->name},
+                        .column = ir::ColumnRef{.name = std::move(column_name.value())},
                         .alias = alias,
                         .param = alpha,
                     });
@@ -1262,10 +1309,12 @@ class Lowerer {
                         return std::unexpected(LowerError{
                             .message = "quantile() takes two arguments: quantile(column, p)"});
                     }
-                    const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
-                    if (ident == nullptr) {
-                        return std::unexpected(LowerError{
-                            .message = "first argument of quantile() must be a column name"});
+                    auto column_name =
+                        lower_agg_arg(*call->args[0],
+                                      "first argument of quantile() must be a column name or "
+                                      "cleanup wrapper");
+                    if (!column_name.has_value()) {
+                        return std::unexpected(column_name.error());
                     }
                     double p = 0.0;
                     if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
@@ -1285,7 +1334,7 @@ class Lowerer {
                     }
                     aggs.push_back(ir::AggSpec{
                         .func = func.value(),
-                        .column = ir::ColumnRef{.name = ident->name},
+                        .column = ir::ColumnRef{.name = std::move(column_name.value())},
                         .alias = alias,
                         .param = p,
                     });
@@ -1296,14 +1345,14 @@ class Lowerer {
                     return std::unexpected(
                         LowerError{.message = "aggregate functions take one argument"});
                 }
-                const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
-                if (ident == nullptr) {
-                    return std::unexpected(
-                        LowerError{.message = "aggregate argument must be a column"});
+                auto column_name = lower_agg_arg(
+                    *call->args[0], "aggregate argument must be a column or cleanup wrapper");
+                if (!column_name.has_value()) {
+                    return std::unexpected(column_name.error());
                 }
                 aggs.push_back(ir::AggSpec{
                     .func = func.value(),
-                    .column = ir::ColumnRef{.name = ident->name},
+                    .column = ir::ColumnRef{.name = std::move(column_name.value())},
                     .alias = alias,
                 });
                 temp_columns[alias] = true;
@@ -1368,10 +1417,12 @@ class Lowerer {
                             return std::unexpected(LowerError{
                                 .message = "ewma() takes two arguments: ewma(column, alpha)"});
                         }
-                        const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
-                        if (ident == nullptr) {
-                            return std::unexpected(LowerError{
-                                .message = "first argument of ewma() must be a column name"});
+                        auto column_name =
+                            lower_agg_arg(*call->args[0],
+                                          "first argument of ewma() must be a column name or "
+                                          "cleanup wrapper");
+                        if (!column_name.has_value()) {
+                            return std::unexpected(column_name.error());
                         }
                         double alpha = 0.0;
                         if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
@@ -1391,7 +1442,7 @@ class Lowerer {
                         }
                         aggs.push_back(ir::AggSpec{
                             .func = func.value(),
-                            .column = ir::ColumnRef{.name = ident->name},
+                            .column = ir::ColumnRef{.name = std::move(column_name.value())},
                             .alias = field.name,
                             .param = alpha,
                         });
@@ -1403,10 +1454,12 @@ class Lowerer {
                             return std::unexpected(LowerError{
                                 .message = "quantile() takes two arguments: quantile(column, p)"});
                         }
-                        const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
-                        if (ident == nullptr) {
-                            return std::unexpected(LowerError{
-                                .message = "first argument of quantile() must be a column name"});
+                        auto column_name =
+                            lower_agg_arg(*call->args[0],
+                                          "first argument of quantile() must be a column name or "
+                                          "cleanup wrapper");
+                        if (!column_name.has_value()) {
+                            return std::unexpected(column_name.error());
                         }
                         double p = 0.0;
                         if (const auto* lit = std::get_if<LiteralExpr>(&call->args[1]->node)) {
@@ -1426,7 +1479,7 @@ class Lowerer {
                         }
                         aggs.push_back(ir::AggSpec{
                             .func = func.value(),
-                            .column = ir::ColumnRef{.name = ident->name},
+                            .column = ir::ColumnRef{.name = std::move(column_name.value())},
                             .alias = field.name,
                             .param = p,
                         });
@@ -1437,14 +1490,14 @@ class Lowerer {
                         return std::unexpected(
                             LowerError{.message = "aggregate functions take one argument"});
                     }
-                    const auto* ident = std::get_if<IdentifierExpr>(&call->args[0]->node);
-                    if (ident == nullptr) {
-                        return std::unexpected(
-                            LowerError{.message = "aggregate argument must be a column"});
+                    auto column_name = lower_agg_arg(
+                        *call->args[0], "aggregate argument must be a column or cleanup wrapper");
+                    if (!column_name.has_value()) {
+                        return std::unexpected(column_name.error());
                     }
                     aggs.push_back(ir::AggSpec{
                         .func = func.value(),
-                        .column = ir::ColumnRef{.name = ident->name},
+                        .column = ir::ColumnRef{.name = std::move(column_name.value())},
                         .alias = field.name,
                     });
                     final_columns.push_back(field.name);
@@ -1463,10 +1516,16 @@ class Lowerer {
             final_columns.push_back(field.name);
         }
 
-        auto aggregate = builder_.aggregate(std::move(group_by), std::move(aggs));
-        aggregate->add_child(std::move(child));
+        ir::NodePtr node = std::move(child);
+        if (!preagg_updates.empty()) {
+            auto preagg = builder_.update(std::move(preagg_updates));
+            preagg->add_child(std::move(node));
+            node = std::move(preagg);
+        }
 
-        ir::NodePtr node = std::move(aggregate);
+        auto aggregate = builder_.aggregate(std::move(group_by), std::move(aggs));
+        aggregate->add_child(std::move(node));
+        node = std::move(aggregate);
         if (!updates.empty()) {
             auto update = builder_.update(std::move(updates));
             update->add_child(std::move(node));

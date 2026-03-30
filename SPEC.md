@@ -468,13 +468,17 @@ Nulls arise from:
 Aggregate functions skip null rows by default:
 
 ```
-sum(col)    // sums only non-null values; returns 0 for an all-null group
+sum(col)    // sums only non-null values; returns null for an all-null group
 count()     // counts all rows regardless of null
 mean(col)   // averages only non-null values
 median(col) // ignores null rows
 std(col)    // ignores null rows; returns null if fewer than 2 non-null values
 ewma(col, alpha)  // ignores null rows; returns null for an empty group
 ```
+
+IEEE floating-point `NaN`, `+Inf`, and `-Inf` values are **not** null. They are
+stored as ordinary `Float64` payloads and are therefore not skipped
+automatically by aggregate functions.
 
 #### Null-Fill Functions
 
@@ -531,6 +535,34 @@ Chain operations using multiple `update` blocks to combine strategies:
 // Fill forward first, then replace any remaining leading nulls with 0
 df[update { price = fill_forward(price) }]
   [update { price = fill_null(price, 0) }]
+```
+
+#### NaN / Infinity Cleanup
+
+Floating-point cleanup uses a separate set of `Float64`-only built-ins:
+
+| Function | Description |
+|----------|-------------|
+| `is_nan(col)` | Returns a `Bool` column: `true` where `col` stores `NaN`, otherwise `false` |
+| `null_if_nan(col)` | Preserves finite values and turns `NaN` cells into null |
+| `null_if_not_finite(col)` | Preserves finite values and turns `NaN`, `+Inf`, and `-Inf` cells into null |
+
+Typical workflow:
+
+```
+let clean = quotes[update {
+    px_bad   = is_nan(px),
+    px_clean = null_if_not_finite(px)
+}];
+
+clean[select { avg_px = mean(px_clean), sum_px = sum(px_clean) }, by symbol];
+```
+
+For grouped aggregates, the cleanup wrappers can also be used directly as the
+aggregate input:
+
+```
+quotes[select { avg_px = mean(null_if_nan(px)) }, by symbol];
 ```
 
 #### Column Storage
@@ -1526,7 +1558,7 @@ The following built-in functions are **aggregate functions**. They consume a
 
 | Function              | Input              | Output     | Notes |
 |-----------------------|--------------------|------------|-------|
-| `sum(col)`            | `Series<Numeric>`  | Same numeric type | |
+| `sum(col)`            | `Series<Numeric>`  | Same numeric type | Returns null for an all-null group. |
 | `mean(col)`           | `Series<Numeric>`  | `Float64`  | |
 | `min(col)`            | `Series<T>`        | `T`        | |
 | `max(col)`            | `Series<T>`        | `T`        | |

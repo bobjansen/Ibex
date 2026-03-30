@@ -10,4 +10,5 @@ dependencies = [
     "duckdb>=1.0",
     "datafusion>=41.0",
     "chdb>=2.0",
+    "matplotlib>=3.10.8",
 ]

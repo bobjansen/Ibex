@@ -106,6 +106,67 @@
           pass with no locking between threads.
         </p>
       </article>
+      <article class="card">
+        <h3>Notebook-ready</h3>
+        <p>
+          Load <code>ibex_ipython</code> in IPython or Jupyter, bind pandas or
+          Arrow tables into Ibex with <code>%%ibex</code>, and hand the result
+          straight back to <code>pyarrow</code>, pandas, or matplotlib for
+          inspection and plotting.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Notebook integration</p>
+    <h2>Run Ibex inside IPython and Jupyter.</h2>
+    <p class="section-sub">Keep heavy table manipulation in Ibex, then plot and explore the result with the Python ecosystem.</p>
+
+    <div class="tour">
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Python Bridge</span>
+          <h3>Use Ibex as a DSL inside a real notebook workflow.</h3>
+          <p>
+            The <code>ibex_pyarrow</code> bridge evaluates Ibex code and returns
+            a <code>pyarrow.Table</code>. The <code>ibex_ipython</code> extension
+            adds <code>%%ibex</code> and <code>%ibexfile</code>, so notebooks can
+            bind pandas or Arrow tables into Ibex and keep plotting in Python.
+          </p>
+          <p>
+            This keeps Ibex focused on joins, aggregations, reshaping, and
+            time-series work, while reusing pandas, matplotlib, and the rest of
+            the notebook ecosystem for presentation.
+          </p>
+          <p>
+            Build the bridge with
+            <code>cmake --build build-release --parallel --target ibex_pyarrow</code>,
+            then start IPython from the repository root and load the extension.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm"># IPython / Jupyter</span>
+%load_ext ibex_ipython
+
+<span class="kw">import</span> pandas <span class="kw">as</span> pd
+
+trades = pd.DataFrame({
+    <span class="str">"symbol"</span>: [<span class="str">"AAPL"</span>, <span class="str">"AAPL"</span>, <span class="str">"MSFT"</span>],
+    <span class="str">"qty"</span>: [<span class="num">10</span>, <span class="num">15</span>, <span class="num">7</span>],
+    <span class="str">"px"</span>: [<span class="num">101.2</span>, <span class="num">101.5</span>, <span class="num">299.8</span>],
+})
+
+%%ibex --bind trades=trades --as pandas --out grouped
+trades[
+    <span class="kw">select</span> { total_qty = <span class="fn-name">sum</span>(qty), avg_px = <span class="fn-name">mean</span>(px) },
+    <span class="kw">by</span> symbol,
+    <span class="kw">order</span> symbol
+];
+
+grouped.plot(kind=<span class="str">"bar"</span>, x=<span class="str">"symbol"</span>, y=<span class="str">"total_qty"</span>);</code></pre>
+        </div>
+      </div>
     </div>
   </section>
 

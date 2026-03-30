@@ -1,9 +1,17 @@
 cmake_minimum_required(VERSION 3.26)
 
+if(NOT DEFINED CMAKE_C_COMPILER AND DEFINED CMAKE_CXX_COMPILER)
+    if(CMAKE_CXX_COMPILER MATCHES "clang\\+\\+$")
+        string(REGEX REPLACE "clang\\+\\+$" "clang" CMAKE_C_COMPILER "${CMAKE_CXX_COMPILER}")
+        set(CMAKE_C_COMPILER "${CMAKE_C_COMPILER}" CACHE FILEPATH
+            "C compiler matched to the configured C++ compiler" FORCE)
+    endif()
+endif()
+
 project(Ibex
     VERSION 0.1.0
     DESCRIPTION "Statically typed DSL for columnar DataFrame manipulation"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # Prevent in-source builds
@@ -23,6 +31,7 @@ option(IBEX_BUILD_TESTS "Build tests" ON)
 option(IBEX_BUILD_TOOLS "Build REPL and other tools" ON)
 option(IBEX_BUILD_EXAMPLES "Build examples" ON)
 option(IBEX_BUILD_PYTHON_BRIDGE "Build the experimental pyarrow-backed Python bridge" ON)
+option(IBEX_BUILD_PARQUET "Build the bundled Parquet plugin" ON)
 set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
     "Directory for bundled Ibex plugins (csv/gen_tf_data)")
 
@@ -65,6 +74,9 @@ add_subdirectory(libs/json)
 add_subdirectory(libs/udp)
 add_subdirectory(libs/websocket)
 add_subdirectory(libs/lightbm)
+if(IBEX_BUILD_PARQUET)
+    add_subdirectory(libs/parquet)
+endif()
 
 # Tools
 if(IBEX_BUILD_TOOLS)

@@ -6,13 +6,13 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 
 ## Build
 - Clang 20, CMake 3.31+, Ninja
-- Debug: `cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug`
-- Release: `cmake -B build-release -S . -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DIBEX_ENABLE_MARCH_NATIVE=ON`
+- Debug: `cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug`
+- Release: `cmake -B build-release -S . -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DIBEX_ENABLE_MARCH_NATIVE=ON`
 - `cmake --build build --parallel && ctest --test-dir build --output-on-failure`
 - **Always benchmark against `build-release/`, not `build/` (debug is ~4× slower)**
 - Fix build warnings as they pop up
 - LTO (`-DIBEX_ENABLE_LTO=ON`) gives negligible benefit — hot paths are within single TUs
-- Parquet plugin is built standalone: `scripts/ibex-parquet-build.sh` (after Ibex build).
+- Parquet plugin is built as part of the normal CMake build; `scripts/ibex-parquet-build.sh` rebuilds just that target.
 - End-to-end checks: `scripts/ibex-e2e.sh` (REPL + transpile + plugins).
 - Git hooks: `scripts/install-hooks.sh` (enables clang-format pre-commit check).
 - Format tool: `scripts/clang-format.sh` (uses newest available clang-format).

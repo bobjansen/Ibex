@@ -16,6 +16,13 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def module_build_root() -> Path | None:
+    module_path = getattr(ibex_pyarrow, "__file__", None)
+    if not module_path:
+        return None
+    return Path(module_path).resolve().parents[1]
+
+
 def add_bridge_module_path() -> None:
     root = repo_root()
     for build_dir_name in ("build-release", "build"):
@@ -34,13 +41,27 @@ import ibex_pyarrow
 
 
 def default_plugin_paths() -> list[str]:
-    root = repo_root()
+    candidate_roots: list[Path] = []
+    build_root = module_build_root()
+    if build_root is not None:
+        candidate_roots.append(build_root)
+    candidate_roots.append(repo_root())
     paths: list[str] = []
-    for build_dir_name in ("build-release", "build"):
-        for relative in ("tools", "libraries"):
-            candidate = root / build_dir_name / relative
-            if candidate.is_dir():
-                paths.append(str(candidate))
+    seen: set[Path] = set()
+    for root in candidate_roots:
+        if (root / "python").is_dir():
+            for relative in ("tools", "libraries"):
+                candidate = root / relative
+                if candidate.is_dir() and candidate not in seen:
+                    seen.add(candidate)
+                    paths.append(str(candidate))
+            continue
+        for build_dir_name in ("build-release", "build"):
+            for relative in ("tools", "libraries"):
+                candidate = root / build_dir_name / relative
+                if candidate.is_dir() and candidate not in seen:
+                    seen.add(candidate)
+                    paths.append(str(candidate))
     return paths
 
 

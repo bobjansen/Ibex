@@ -12,7 +12,7 @@ independent of plugins. Plugins can be built separately.
 ## Build (Debug)
 
 ```
-cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
@@ -20,7 +20,7 @@ ctest --test-dir build --output-on-failure
 ## Build (Release)
 
 ```
-cmake -B build-release -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+cmake -B build-release -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --parallel
 ```
 
@@ -45,11 +45,17 @@ let df = read_csv("data.csv");
 write_json(df, "data.json");
 ```
 
-## Parquet Plugin (standalone)
+## Parquet Plugin
+
+```
+cmake --build build --parallel
+IBEX_LIBRARY_PATH=./build/tools ./build/tools/ibex
+```
+
+To rebuild just the Parquet plugin:
 
 ```
 ./scripts/ibex-parquet-build.sh
-IBEX_LIBRARY_PATH=./libraries ./build/tools/ibex
 ```
 
 ## End-to-End Checks

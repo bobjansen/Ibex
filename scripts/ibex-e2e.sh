@@ -37,7 +37,7 @@ done
 
 if [[ "$SKIP_BUILD" == false ]]; then
     echo "▸ configuring debug build"
-    cmake -B "$BUILD_DIR" -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug
+    cmake -B "$BUILD_DIR" -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug
     echo "▸ building debug"
     cmake --build "$BUILD_DIR" --parallel
 fi
@@ -49,14 +49,14 @@ fi
 
 if [[ "$SKIP_RELEASE" == false ]]; then
     echo "▸ configuring release build"
-    cmake -B "$RELEASE_DIR" -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+    cmake -B "$RELEASE_DIR" -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
     echo "▸ building release"
     cmake --build "$RELEASE_DIR" --parallel
 fi
 
 if [[ "$SKIP_PARQUET" == false ]]; then
     echo "▸ building parquet plugin"
-    BUILD_TYPE=Release IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" "$IBEX_ROOT/scripts/ibex-parquet-build.sh"
+    IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" "$IBEX_ROOT/scripts/ibex-parquet-build.sh"
 fi
 
 if [[ "$SKIP_REPL" == false ]]; then
@@ -79,7 +79,7 @@ if [[ "$SKIP_REPL" == false ]]; then
     echo "▸ REPL smoke (parquet plugin)"
     repl_out="$(mktemp)"
     printf ":load tests/data/parquet_smoke.ibex\n:quit\n" \
-        | IBEX_LIBRARY_PATH="$IBEX_ROOT/libraries" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+        | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
     if rg -n "error:" "$repl_out" >/dev/null; then
         cat "$repl_out" >&2
         rm -f "$repl_out"

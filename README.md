@@ -45,7 +45,7 @@ Then start IPython from the repository root and load the extension:
 %load_ext ibex_ipython
 ```
 
-Inline cell example with a pandas binding:
+Inline cell example with a pandas table binding and a Python scalar binding:
 
 ```python
 import pandas as pd
@@ -55,12 +55,15 @@ trades = pd.DataFrame({
     "qty": [10, 15, 7],
     "px": [101.2, 101.5, 299.8],
 })
+offset = 10
 ```
 
 ```python
-%%ibex --bind trades=trades --as pandas --out grouped
+%%ibex --bind trades=trades --bind offset=offset --as pandas --out grouped
 trades[
-    select { total_qty = sum(qty), avg_px = mean(px) },
+    update { qty_plus_offset = qty + offset }
+][
+    select { total_qty = sum(qty_plus_offset), avg_px = mean(px) },
     by symbol,
     order symbol
 ];
@@ -94,7 +97,7 @@ Reset the hidden Ibex session with:
 
 Supported magic options:
 
-- `--bind ibex_name=python_var` to pass pandas, pyarrow, or plain Python table data into Ibex
+- `--bind ibex_name=python_var` to pass pandas/pyarrow tables or Python `int`/`float`/`string` scalars into Ibex
 - `--as pyarrow|pandas` to control the returned result type
 - `--out var_name` to choose the output variable name
 - `--quiet` to suppress immediate display

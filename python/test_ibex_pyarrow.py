@@ -105,6 +105,24 @@ def main() -> int:
         "total_qty": [7, 5],
     }
 
+    scalar_bound = ibex_pyarrow.eval_table(
+        """
+        trades[update { qty_plus_offset = qty + offset }][select { qty_plus_offset }];
+        """,
+        tables={
+            "trades": {
+                "qty": [3, 4, 5],
+            }
+        },
+        scalars={"offset": 10},
+    )
+    print("\nscalar-bound table:")
+    print(scalar_bound)
+    print(scalar_bound.to_pydict())
+    assert scalar_bound.to_pydict() == {
+        "qty_plus_offset": [13, 14, 15],
+    }
+
     arrow_orders = pa.table(
         {
             "symbol": pa.array(["A", "B", "B", None]),

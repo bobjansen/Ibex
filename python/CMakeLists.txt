@@ -49,6 +49,13 @@ execute_process(
     ERROR_QUIET
 )
 
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import IPython"
+    RESULT_VARIABLE IBEX_IPYTHON_IMPORT_RESULT
+    OUTPUT_QUIET
+    ERROR_QUIET
+)
+
 if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
     add_test(
         NAME ibex_pyarrow_smoke
@@ -59,4 +66,16 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
 elseif(IBEX_BUILD_TESTS)
     message(STATUS
         "Skipping ibex_pyarrow_smoke: pyarrow is not importable in ${Python3_EXECUTABLE}")
+endif()
+
+if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0 AND IBEX_IPYTHON_IMPORT_RESULT EQUAL 0)
+    add_test(
+        NAME ibex_ipython_smoke
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+            "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_ipython.py"
+    )
+elseif(IBEX_BUILD_TESTS)
+    message(STATUS
+        "Skipping ibex_ipython_smoke: IPython or pyarrow is not importable in ${Python3_EXECUTABLE}")
 endif()

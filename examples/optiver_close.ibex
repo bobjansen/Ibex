@@ -1,7 +1,7 @@
 // Optiver "Trading at the Close" walkthrough on the local Kaggle dump.
 //
 // Expected local files:
-//   /home/brj/kaggle/data/train.csv
+//   ../kaggle/data/train.csv
 //
 // The starter Kaggle notebook mostly wires up the evaluation loop. This file
 // does the more interesting part for Ibex: microstructure-style EDA on the
@@ -9,7 +9,7 @@
 
 extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
 
-let train = read_csv("/home/brj/kaggle/data/train.csv", "<empty>");
+let train = read_csv("../kaggle/data/train.csv", "<empty>");
 
 // Basic book- and auction-derived features.
 let book = train[update {

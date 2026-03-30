@@ -1,124 +1,20 @@
 from __future__ import annotations
 
-import argparse
-import shlex
-import sys
+import importlib.util
 from pathlib import Path
 
-from IPython.core.error import UsageError
-from IPython.core.magic import Magics, cell_magic, line_magic, magics_class
-from IPython.display import display
 
+_ROOT_IMPL = Path(__file__).resolve().parents[1] / "ibex_ipython.py"
+_SPEC = importlib.util.spec_from_file_location("_ibex_ipython_impl", _ROOT_IMPL)
+if _SPEC is None or _SPEC.loader is None:
+    raise RuntimeError(f"could not load ibex_ipython implementation from {_ROOT_IMPL}")
 
-def add_bridge_module_path() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    for build_dir_name in ("build-release", "build"):
-        candidate = repo_root / build_dir_name / "python"
-        if candidate.is_dir():
-            path = str(candidate)
-            if path not in sys.path:
-                sys.path.insert(0, path)
-            return
-    raise RuntimeError("could not find a built ibex_pyarrow module under build-release/python or build/python")
+_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
 
+for _name in dir(_MODULE):
+    if _name.startswith("_"):
+        continue
+    globals()[_name] = getattr(_MODULE, _name)
 
-add_bridge_module_path()
-
-import ibex_pyarrow
-
-
-def _build_parser(prog: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=prog, add_help=False)
-    parser.add_argument("--as", dest="result_format", choices=("pyarrow", "pandas"), default="pyarrow")
-    parser.add_argument("--out", default=None, help="store the result in this Python variable")
-    parser.add_argument(
-        "--bind",
-        action="append",
-        default=[],
-        metavar="IBEX=PYTHON",
-        help="bind a Python table-like object into the Ibex script",
-    )
-    parser.add_argument("--quiet", action="store_true", help="do not display the resulting table")
-    parser.add_argument("-h", "--help", action="store_true")
-    return parser
-
-
-def _build_file_parser() -> argparse.ArgumentParser:
-    parser = _build_parser("%ibexfile")
-    parser.add_argument("path")
-    return parser
-
-
-def _parse_args(line: str, prog: str) -> argparse.Namespace:
-    parser = _build_parser(prog)
-    try:
-        args = parser.parse_args(shlex.split(line))
-    except SystemExit as exc:
-        raise UsageError(f"{prog}: invalid arguments") from exc
-    if args.help:
-        raise UsageError(parser.format_help().rstrip())
-    return args
-
-
-def _parse_file_args(line: str) -> argparse.Namespace:
-    parser = _build_file_parser()
-    try:
-        args = parser.parse_args(shlex.split(line))
-    except SystemExit as exc:
-        raise UsageError("%ibexfile: invalid arguments") from exc
-    if args.help:
-        raise UsageError(parser.format_help().rstrip())
-    return args
-
-
-def _resolve_bindings(shell, bind_specs: list[str]) -> dict[str, object]:
-    bindings: dict[str, object] = {}
-    for spec in bind_specs:
-        if "=" not in spec:
-            raise UsageError(f"--bind expects IBEX=PYTHON, got: {spec}")
-        ibex_name, python_name = spec.split("=", 1)
-        ibex_name = ibex_name.strip()
-        python_name = python_name.strip()
-        if not ibex_name or not python_name:
-            raise UsageError(f"--bind expects IBEX=PYTHON, got: {spec}")
-        if python_name not in shell.user_ns:
-            raise UsageError(f"Python variable not found for binding: {python_name}")
-        bindings[ibex_name] = shell.user_ns[python_name]
-    return bindings
-
-
-def _convert_result(result, result_format: str):
-    if result_format == "pandas":
-        return result.to_pandas()
-    return result
-
-
-@magics_class
-class IbexMagics(Magics):
-    @cell_magic
-    def ibex(self, line: str, cell: str):
-        args = _parse_args(line, "%%ibex")
-        bindings = _resolve_bindings(self.shell, args.bind)
-        result = ibex_pyarrow.eval_table(cell, tables=bindings or None)
-        converted = _convert_result(result, args.result_format)
-        target_name = args.out or "_ibex"
-        self.shell.user_ns[target_name] = converted
-        if not args.quiet:
-            display(converted)
-        return converted
-
-    @line_magic
-    def ibexfile(self, line: str):
-        args = _parse_file_args(line)
-        bindings = _resolve_bindings(self.shell, args.bind)
-        result = ibex_pyarrow.eval_file(args.path, tables=bindings or None)
-        converted = _convert_result(result, args.result_format)
-        target_name = args.out or "_ibex"
-        self.shell.user_ns[target_name] = converted
-        if not args.quiet:
-            display(converted)
-        return converted
-
-
-def load_ipython_extension(ipython) -> None:
-    ipython.register_magics(IbexMagics)
+__all__ = [name for name in globals() if not name.startswith("_")]

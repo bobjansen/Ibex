@@ -63,7 +63,7 @@ RESULTS="$SCRIPT_DIR/results"
 
 # ── 1. Generate data ──────────────────────────────────────────────────────────
 echo "━━━ Generating data ━━━"
-uv run --project "$SCRIPT_DIR" "$DATA/gen_data.py" "$DATA"
+uv run --project "$IBEX_ROOT" "$DATA/gen_data.py" "$DATA"
 echo ""
 
 # ── 2. ibex ───────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ if [[ $SKIP_PYTHON -eq 0 ]]; then
     if [[ $SKIP_PANDAS -eq 1 ]]; then
         PY_ARGS+=(--skip-pandas)
     fi
-    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_python.py" \
+    uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
         --warmup "$WARMUP" --iters "$ITERS" \
@@ -125,7 +125,7 @@ fi
 # ── 5. DuckDB ─────────────────────────────────────────────────────────────────
 if [[ $SKIP_DUCKDB -eq 0 ]]; then
     echo "━━━ DuckDB ━━━"
-    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_duckdb.py" \
+    uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
         --warmup "$WARMUP" --iters "$ITERS" \
@@ -136,7 +136,7 @@ fi
 # ── 6. DataFusion ────────────────────────────────────────────────────────────
 if [[ $SKIP_DATAFUSION -eq 0 ]]; then
     echo "━━━ DataFusion ━━━"
-    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_datafusion.py" \
+    uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
         --warmup "$WARMUP" --iters "$ITERS" \
@@ -147,7 +147,7 @@ fi
 # ── 7. ClickHouse (chdb) ────────────────────────────────────────────────────
 if [[ $SKIP_CLICKHOUSE -eq 0 ]]; then
     echo "━━━ ClickHouse ━━━"
-    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_clickhouse.py" \
+    uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
         --warmup "$WARMUP" --iters "$ITERS" \
@@ -158,7 +158,7 @@ fi
 # ── 8. SQLite ────────────────────────────────────────────────────────────────
 if [[ $SKIP_SQLITE -eq 0 ]]; then
     echo "━━━ SQLite ━━━"
-    uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_sqlite.py" \
+    uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_sqlite.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
         --warmup "$WARMUP" --iters "$ITERS" \
@@ -168,6 +168,6 @@ fi
 
 # ── 9. Print table ────────────────────────────────────────────────────────────
 echo "━━━ Summary ━━━"
-uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/print_table.py" \
+uv run --project "$IBEX_ROOT" python3 "$SCRIPT_DIR/print_table.py" \
     "$RESULTS"/*.tsv 2>/dev/null \
     || python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*.tsv

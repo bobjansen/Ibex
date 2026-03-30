@@ -75,12 +75,12 @@ done
 
 if [[ ! -f "$CSV" ]]; then
     echo "error: missing $CSV" >&2
-    echo "hint: run 'uv run --project benchmarking benchmarking/data/gen_data.py benchmarking/data'" >&2
+    echo "hint: run 'uv run --project . benchmarking/data/gen_data.py benchmarking/data'" >&2
     exit 1
 fi
 if [[ ! -f "$CSV_MULTI" ]]; then
     echo "error: missing $CSV_MULTI" >&2
-    echo "hint: run 'uv run --project benchmarking benchmarking/data/gen_data.py benchmarking/data'" >&2
+    echo "hint: run 'uv run --project . benchmarking/data/gen_data.py benchmarking/data'" >&2
     exit 1
 fi
 

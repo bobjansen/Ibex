@@ -291,7 +291,7 @@ for rows in "${SIZES[@]}"; do
     mkdir -p "$size_result_dir"
 
     echo "━━━ Dataset: ${rows} rows ━━━"
-    uv run --project "$SCRIPT_DIR" "$GEN_DATA" "$size_data_dir" --rows "$rows"
+    uv run --project "$IBEX_ROOT" "$GEN_DATA" "$size_data_dir" --rows "$rows"
 
     csv="$size_data_dir/prices.csv"
     csv_multi="$size_data_dir/prices_multi.csv"
@@ -328,7 +328,7 @@ for rows in "${SIZES[@]}"; do
         if [[ $SKIP_PANDAS -eq 1 ]]; then
             py_args+=(--skip-pandas)
         fi
-        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_python.py" \
+        uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$rows" \
@@ -342,7 +342,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → polars (single thread)"
             polars_st_raw="$size_result_dir/polars_st_raw.tsv"
             polars_st_tsv="$size_result_dir/polars_st.tsv"
-            POLARS_MAX_THREADS=1 uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_python.py" \
+            POLARS_MAX_THREADS=1 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$rows" \
@@ -375,7 +375,7 @@ for rows in "${SIZES[@]}"; do
 
     if [[ $SKIP_DUCKDB -eq 0 ]]; then
         echo "  → duckdb"
-        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_duckdb.py" \
+        uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$rows" \
@@ -388,7 +388,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → duckdb (single thread)"
             duckdb_st_raw="$size_result_dir/duckdb_st_raw.tsv"
             duckdb_st_tsv="$size_result_dir/duckdb_st.tsv"
-            uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_duckdb.py" \
+            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$rows" \
@@ -404,7 +404,7 @@ for rows in "${SIZES[@]}"; do
 
     if [[ $SKIP_DATAFUSION -eq 0 ]]; then
         echo "  → datafusion"
-        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_datafusion.py" \
+        uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$rows" \
@@ -417,7 +417,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → datafusion (single thread)"
             datafusion_st_raw="$size_result_dir/datafusion_st_raw.tsv"
             datafusion_st_tsv="$size_result_dir/datafusion_st.tsv"
-            uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_datafusion.py" \
+            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$rows" \
@@ -433,7 +433,7 @@ for rows in "${SIZES[@]}"; do
 
     if [[ $SKIP_CLICKHOUSE -eq 0 ]]; then
         echo "  → clickhouse (chdb)"
-        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_clickhouse.py" \
+        uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$rows" \
@@ -446,7 +446,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → clickhouse (single thread)"
             clickhouse_st_raw="$size_result_dir/clickhouse_st_raw.tsv"
             clickhouse_st_tsv="$size_result_dir/clickhouse_st.tsv"
-            uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_clickhouse.py" \
+            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$rows" \
@@ -462,7 +462,7 @@ for rows in "${SIZES[@]}"; do
 
     if [[ $SKIP_SQLITE -eq 0 ]]; then
         echo "  → sqlite"
-        uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/bench_sqlite.py" \
+        uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_sqlite.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$rows" \

@@ -468,7 +468,7 @@ ibex> :load benchmarking/analyze_scales.ibex
 For fair comparison, use the compute-only harness:
 
 ```bash
-uv run --project benchmarking benchmarking/bench_quant.py \
+uv run --project . benchmarking/bench_quant.py \
   --min-seconds 3 --scale 50
 ```
 

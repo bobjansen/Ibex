@@ -19,6 +19,7 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <rapidcsv.h>
@@ -87,7 +88,22 @@ inline auto csv_try_double(const std::string& text, double& out) -> bool {
 
 inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& options)
     -> ibex::runtime::Table {
-    rapidcsv::Document doc(std::string(path),
+    const std::string path_string(path);
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path_string, ec);
+    if (ec) {
+        throw std::runtime_error("read_csv: failed to inspect path '" + path_string +
+                                 "': " + ec.message());
+    }
+    if (!exists) {
+        throw std::runtime_error("read_csv: file not found: '" + path_string + "'");
+    }
+    std::ifstream check(path_string);
+    if (!check.is_open()) {
+        throw std::runtime_error("read_csv: failed to open '" + path_string + "'");
+    }
+
+    rapidcsv::Document doc(path_string,
                            rapidcsv::LabelParams(0, -1),   // row 0 = header, no row-index column
                            rapidcsv::SeparatorParams(',')  // handles RFC 4180 quoting
     );

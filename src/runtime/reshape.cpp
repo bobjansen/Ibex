@@ -905,13 +905,11 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             std::string pv = std::visit(
                 [r](const auto& col) -> std::string {
                     using ColType = std::decay_t<decltype(col)>;
-                    if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                    if constexpr (std::is_same_v<ColType, Column<std::string>> ||
+                                  std::is_same_v<ColType, Column<Categorical>>) {
                         return std::string(col[r]);
-                    } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                        return std::string(col[r]);
-                    } else if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
-                        return std::to_string(col[r]);
-                    } else if constexpr (std::is_same_v<ColType, Column<double>>) {
+                    } else if constexpr (std::is_same_v<ColType, Column<std::int64_t>> ||
+                                         std::is_same_v<ColType, Column<double>>) {
                         return std::to_string(col[r]);
                     } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
                         return col[r] ? "true" : "false";

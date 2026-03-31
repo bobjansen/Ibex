@@ -69,8 +69,8 @@ struct DcastKey {
 struct DcastKeyHash {
     auto operator()(const DcastKey& k) const noexcept -> std::size_t {
         std::uint64_t h = 0;
-        for (std::size_t i = 0; i < k.n; ++i) {
-            h ^= static_cast<std::uint64_t>(k.v[i]);
+        for (const auto elem : std::span(k.v.data(), k.n)) {
+            h ^= static_cast<std::uint64_t>(elem);
             h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
             h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
             h ^= h >> 31;

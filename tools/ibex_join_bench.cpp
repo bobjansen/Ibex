@@ -11,6 +11,7 @@
 //   6. asof_join_*        — TimeFrame as-of joins (sorted binary search)
 //   7. theta_join_*       — non-equijoin (nested loop) at various sizes
 //   8. semi_anti_*        — membership-style joins
+//   9. join_defaults_*    — unmatched-row null-padding/default emission
 //
 // Usage:
 //   ibex_join_bench [--rows N] [--iters N] [--warmup N] [--suite name,...]
@@ -451,14 +452,16 @@ int main(int argc, char** argv) {
     app.add_option("--suite", suites,
                    "Suite(s) to run (comma-separated). "
                    "Supported: all, hash_join, int_join, join_chain, filter_pushdown, "
-                   "projection_waste, asof_join, theta_join, semi_anti")
+                   "projection_waste, asof_join, theta_join, semi_anti, join_defaults")
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
 
     const std::unordered_set<std::string> allowed = {
-        "all",       "hash_join",  "int_join", "join_chain", "filter_pushdown", "projection_waste",
-        "asof_join", "theta_join", "semi_anti"};
+        "all",          "hash_join",       "int_join",
+        "join_chain",   "filter_pushdown", "projection_waste",
+        "asof_join",    "theta_join",      "semi_anti",
+        "join_defaults"};
     std::unordered_set<std::string> selected;
     for (const auto& s : suites) {
         auto n = normalize_suite_name(s);
@@ -986,6 +989,47 @@ int main(int argc, char** argv) {
                     {"sa_anti_small_left", "fact_small anti join dim_large_miss on key"},
                 },
                 small_reg, warmup_iters, iters, verify);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Suite 9: join_defaults — unmatched-row null/default emission
+    // Focuses on the paths that synthesize placeholder values and validity
+    // bits for left/right/outer joins when one side has no matches.
+    // ═══════════════════════════════════════════════════════════════════════
+    if (status == 0 && want("join_defaults")) {
+        fmt::print("\n══ join_defaults suite ({} rows) ══\n", rows);
+
+        {
+            auto fact_miss = make_fact_table(rows, rows, "K");
+            auto dim_miss = make_dim_table(rows, "Z");
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_miss", std::move(fact_miss));
+            reg.emplace("dim_miss", std::move(dim_miss));
+
+            fmt::print("-- join_defaults: string-key all-miss joins at {} rows --\n", rows);
+            status = run_suite_benchmarks(
+                {
+                    {"jd_left_all_miss", "fact_miss left join dim_miss on key"},
+                    {"jd_right_all_miss", "fact_miss right join dim_miss on key"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            auto fact_miss_i64 = make_int_fact_table(rows, rows);
+            auto dim_miss_i64 = make_int_dim_table_with_offset(rows, rows);
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_miss_i64", std::move(fact_miss_i64));
+            reg.emplace("dim_miss_i64", std::move(dim_miss_i64));
+
+            fmt::print("-- join_defaults: Int64-key all-miss joins at {} rows --\n", rows);
+            status = run_suite_benchmarks(
+                {
+                    {"jd_i64_left_all_miss", "fact_miss_i64 left join dim_miss_i64 on id"},
+                    {"jd_i64_right_all_miss", "fact_miss_i64 right join dim_miss_i64 on id"},
+                },
+                reg, warmup_iters, iters, verify);
         }
     }
 

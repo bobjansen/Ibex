@@ -1523,7 +1523,7 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
             std::uint64_t bits = keep_words[w];
             const std::size_t base = w * 64;
             while (bits != 0) {
-                const unsigned bit = std::countr_zero(bits);
+                const int bit = std::countr_zero(bits);
                 fn(base + static_cast<std::size_t>(bit));
                 bits &= (bits - 1);
             }
@@ -1850,7 +1850,7 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
     std::vector<Idx> dst_idx(rows);
     std::iota(src_idx.begin(), src_idx.end(), Idx{0});
 
-    std::array<std::size_t, 256> cnt;
+    std::array<std::size_t, 256> cnt;  //  NOLINT(cppcoreguidelines-pro-type-member-init)
     for (std::size_t pass = 0; pass < 8; ++pass) {
         const auto& h = hists[pass];
         // Skip pass if all elements have the same byte value.
@@ -2113,19 +2113,22 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         for (const auto& fk : flat_keys) {
             switch (fk.kind) {
                 case FlatKind::I64: {
-                    auto l = fk.u64[lhs], r = fk.u64[rhs];
+                    auto l = fk.u64[lhs];
+                    auto r = fk.u64[rhs];
                     if (l != r)
                         return fk.ascending ? (l < r) : (l > r);
                     break;
                 }
                 case FlatKind::F64: {
-                    auto l = fk.f64[lhs], r = fk.f64[rhs];
+                    auto l = fk.f64[lhs];
+                    auto r = fk.f64[rhs];
                     if (l != r)
                         return fk.ascending ? (l < r) : (l > r);
                     break;
                 }
                 case FlatKind::Str: {
-                    auto l = fk.str[lhs], r = fk.str[rhs];
+                    auto l = fk.str[lhs];
+                    auto r = fk.str[rhs];
                     if (l != r)
                         return fk.ascending ? (l < r) : (l > r);
                     break;
@@ -2241,30 +2244,34 @@ auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {
 }
 
 auto scalar_from_literal(const ir::Literal& literal) -> ScalarValue {
-    return std::visit(
-        [](const auto& v) -> ScalarValue {
-            using T = std::decay_t<decltype(v)>;
-            return v;
-        },
-        literal.value);
+    return std::visit([](const auto& v) -> ScalarValue { return v; }, literal.value);
 }
 
 auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
     -> std::optional<FastOperand> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
         if (const auto* source = input.find(col->name); source != nullptr) {
-            return FastOperand{true, source, ScalarValue{}, expr_type_for_column(*source)};
+            return FastOperand{.is_column = true,
+                               .column = source,
+                               .literal = ScalarValue{},
+                               .kind = expr_type_for_column(*source)};
         }
         if (scalars != nullptr) {
             if (auto it = scalars->find(col->name); it != scalars->end()) {
-                return FastOperand{false, nullptr, it->second, scalar_kind_from_value(it->second)};
+                return FastOperand{.is_column = false,
+                                   .column = nullptr,
+                                   .literal = it->second,
+                                   .kind = scalar_kind_from_value(it->second)};
             }
         }
         return std::nullopt;
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         ScalarValue value = scalar_from_literal(*lit);
-        return FastOperand{false, nullptr, value, scalar_kind_from_value(value)};
+        return FastOperand{.is_column = false,
+                           .column = nullptr,
+                           .literal = value,
+                           .kind = scalar_kind_from_value(value)};
     }
     return std::nullopt;
 }
@@ -3581,7 +3588,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
             if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Quantile ||
                 agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) {
-                double x;
+                double x{};
                 if (std::holds_alternative<Column<std::int64_t>>(column)) {
                     x = static_cast<double>(
                         std::get<std::int64_t>(scalar_from_column(column, row)));
@@ -3592,7 +3599,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 continue;
             }
             if (agg.func == ir::AggFunc::Stddev) {
-                double x;
+                double x{};
                 if (std::holds_alternative<Column<std::int64_t>>(column)) {
                     x = static_cast<double>(
                         std::get<std::int64_t>(scalar_from_column(column, row)));
@@ -3607,7 +3614,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 continue;
             }
             if (agg.func == ir::AggFunc::Ewma) {
-                double x;
+                double x{};
                 if (std::holds_alternative<Column<std::int64_t>>(column)) {
                     x = static_cast<double>(
                         std::get<std::int64_t>(scalar_from_column(column, row)));
@@ -3618,7 +3625,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     slot.double_value = x;
                     slot.has_value = true;
                 } else {
-                    slot.double_value = slot.param * x + (1.0 - slot.param) * slot.double_value;
+                    slot.double_value = (slot.param * x) + ((1.0 - slot.param) * slot.double_value);
                 }
                 continue;
             }
@@ -3924,10 +3931,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         append_scalar(*column, 0.0);
                     } else {
                         std::vector<double> sorted = slot.values;
-                        std::sort(sorted.begin(), sorted.end());
+                        std::ranges::sort(sorted);
                         std::size_t n = sorted.size();
                         double med = (n % 2 == 1) ? sorted[n / 2]
-                                                  : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+                                                  : (sorted[(n / 2) - 1] + sorted[n / 2]) / 2.0;
                         append_scalar(*column, med);
                     }
                     break;
@@ -3953,7 +3960,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         std::size_t lo = static_cast<std::size_t>(idx);
                         std::size_t hi = lo + 1 < sorted.size() ? lo + 1 : lo;
                         double frac = idx - static_cast<double>(lo);
-                        append_scalar(*column, sorted[lo] + frac * (sorted[hi] - sorted[lo]));
+                        append_scalar(*column, sorted[lo] + (frac * (sorted[hi] - sorted[lo])));
                     }
                     break;
                 }
@@ -3966,7 +3973,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         for (double x : slot.values)
                             mean += x;
                         mean /= static_cast<double>(n);
-                        double m2 = 0.0, m3 = 0.0;
+                        double m2 = 0.0;
+                        double m3 = 0.0;
                         for (double x : slot.values) {
                             double d = x - mean;
                             m2 += d * d;
@@ -3993,7 +4001,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         for (double x : slot.values)
                             mean += x;
                         mean /= static_cast<double>(n);
-                        double m2 = 0.0, m4 = 0.0;
+                        double m2 = 0.0;
+                        double m4 = 0.0;
                         for (double x : slot.values) {
                             double d = x - mean;
                             double d2 = d * d;
@@ -4003,7 +4012,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         if (m2 == 0.0) {
                             append_scalar(*column, 0.0);
                         } else {
-                            double dn = static_cast<double>(n);
+                            auto dn = static_cast<double>(n);
                             // Fisher excess kurtosis (unbiased, matches scipy/pandas default):
                             // G2 = (n-1)/((n-2)*(n-3)) * [(n+1)*n*m4/m2^2 - 3*(n-1)]
                             double kurt = (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
@@ -4167,7 +4176,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
                 for (std::size_t row = 0; row < rows; ++row) {
                     auto key = codes[row];
-                    std::uint32_t gid;
+                    std::uint32_t gid{};
                     if (key == prev_key) {
                         gid = prev_gid;
                     } else {
@@ -4630,7 +4639,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
                 for (std::size_t row = 0; row < rows; ++row) {
                     std::string_view key{src_chars + src_off[row], src_off[row + 1] - src_off[row]};
-                    std::uint32_t gid;
+                    std::uint32_t gid{};
                     if (key == prev_key) {
                         gid = prev_gid;
                     } else {
@@ -4902,8 +4911,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else {
                     append_scalar(*column, std::string(key_sv));
                 }
-                if (auto err = append_agg_values_flat(*output,
-                                                      fs + static_cast<std::size_t>(g) * n_aggs)) {
+                if (auto err = append_agg_values_flat(
+                        *output, fs + (static_cast<std::size_t>(g) * n_aggs))) {
                     return std::unexpected(*err);
                 }
             }
@@ -4974,7 +4983,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     std::uint32_t prev_code = std::numeric_limits<std::uint32_t>::max();
                     for (std::size_t row = 0; row < rows; ++row) {
                         std::string_view key{col[row]};
-                        std::uint32_t code;
+                        std::uint32_t code{};
                         if (key == prev_key) {
                             code = prev_code;
                         } else {
@@ -5001,7 +5010,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     for (std::size_t row = 0; row < rows; ++row) {
                         T key = col[row];
                         auto it = map.find(key);
-                        std::uint32_t code;
+                        std::uint32_t code{};
                         if (it == map.end()) {
                             code = cc.n_distinct++;
                             map.emplace(key, code);
@@ -5321,7 +5330,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     }
     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
         const std::uint32_t* gc =
-            group_col_codes_flat.data() + static_cast<std::size_t>(g) * n_keys;
+            group_col_codes_flat.data() + (static_cast<std::size_t>(g) * n_keys);
         for (std::size_t ci = 0; ci < n_keys; ++ci) {
             auto* column = output->find(group_by[ci].name);
             if (column == nullptr) {
@@ -6258,9 +6267,10 @@ constexpr auto is_float_clean_func(std::string_view name) -> bool {
 auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration duration) -> std::size_t {
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(&time_col)) {
         std::int64_t threshold = (*ts_col)[row].nanos - duration.count();
-        std::size_t lo = 0, hi = row;
+        std::size_t lo = 0;
+        std::size_t hi = row;
         while (lo < hi) {
-            std::size_t mid = lo + (hi - lo) / 2;
+            std::size_t mid = lo + ((hi - lo) / 2);
             if ((*ts_col)[mid].nanos < threshold) {
                 lo = mid + 1;
             } else {
@@ -6274,9 +6284,10 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
     static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
     auto duration_days = static_cast<std::int32_t>(duration.count() / kNsPerDay);
     std::int32_t threshold = date_col[row].days - duration_days;
-    std::size_t lo = 0, hi = row;
+    std::size_t lo = 0;
+    std::size_t hi = row;
     while (lo < hi) {
-        std::size_t mid = lo + (hi - lo) / 2;
+        std::size_t mid = lo + ((hi - lo) / 2);
         if (date_col[mid].days < threshold) {
             lo = mid + 1;
         } else {
@@ -6533,7 +6544,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         std::size_t lo = window_lo(time_col, i, duration);
                         double ewma = static_cast<double>(col[lo]);
                         for (std::size_t j = lo + 1; j <= i; ++j)
-                            ewma = alpha * static_cast<double>(col[j]) + (1.0 - alpha) * ewma;
+                            ewma = (alpha * static_cast<double>(col[j])) + ((1.0 - alpha) * ewma);
                         result[i] = ewma;
                     }
                     return result;
@@ -6581,7 +6592,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         std::size_t idx_lo = static_cast<std::size_t>(idx);
                         std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
                         double frac = idx - static_cast<double>(idx_lo);
-                        result[i] = window[idx_lo] + frac * (window[idx_hi] - window[idx_lo]);
+                        result[i] = window[idx_lo] + (frac * (window[idx_hi] - window[idx_lo]));
                     }
                     return result;
                 }
@@ -6609,7 +6620,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         for (std::size_t j = lo; j <= i; ++j)
                             mean += static_cast<double>(col[j]);
                         mean /= static_cast<double>(n);
-                        double m2 = 0.0, m3 = 0.0;
+                        double m2 = 0.0;
+                        double m3 = 0.0;
                         for (std::size_t j = lo; j <= i; ++j) {
                             double d = static_cast<double>(col[j]) - mean;
                             m2 += d * d;
@@ -6618,7 +6630,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         if (m2 == 0.0) {
                             result[i] = 0.0;
                         } else {
-                            double dn = static_cast<double>(n);
+                            auto dn = static_cast<double>(n);
                             result[i] =
                                 (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
                         }
@@ -6650,7 +6662,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         for (std::size_t j = lo; j <= i; ++j)
                             mean += static_cast<double>(col[j]);
                         mean /= static_cast<double>(n);
-                        double m2 = 0.0, m4 = 0.0;
+                        double m2 = 0.0;
+                        double m4 = 0.0;
                         for (std::size_t j = lo; j <= i; ++j) {
                             double d = static_cast<double>(col[j]) - mean;
                             double d2 = d * d;
@@ -7152,11 +7165,7 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
                     std::size_t pos_in_each_seq = pos_in_pattern % (src_len * n_each);
                     // Index into original column
                     std::size_t src_idx = pos_in_each_seq / n_each;
-                    if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                        result.push_back(col[src_idx]);
-                    } else {
-                        result.push_back(col[src_idx]);
-                    }
+                    result.push_back(col[src_idx]);
                 }
                 return result;
             },
@@ -7522,7 +7531,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
 /// Return the numeric columns of `input` as parallel vectors of double.
 /// Int32/Int64/Float32/Float64 columns are included (widened to double).
 /// All other types are silently skipped.
-static auto extract_numeric(const Table& input)
+auto extract_numeric(const Table& input)
     -> std::pair<std::vector<std::string>, std::vector<std::vector<double>>> {
     std::vector<std::string> names;
     std::vector<std::vector<double>> data;
@@ -7813,7 +7822,7 @@ auto matmul_table(const Table& left, const Table& right) -> std::expected<Table,
 /// Returns column names and a row-major matrix (vector of column vectors).
 /// Categorical/String columns are dummy-encoded (treatment coding: first level dropped when
 /// intercept is present).
-static auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
+auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
     -> std::expected<std::pair<std::vector<std::string>, std::vector<std::vector<double>>>,
                      std::string> {
     const std::size_t n = input.rows();
@@ -8049,7 +8058,7 @@ static auto build_model_matrix(const Table& input, const ir::ModelFormula& formu
 }
 
 /// Extract the response column as a double vector.
-static auto extract_response(const Table& input, const std::string& name)
+auto extract_response(const Table& input, const std::string& name)
     -> std::expected<std::vector<double>, std::string> {
     const auto* entry = input.find_entry(name);
     if (entry == nullptr) {
@@ -8081,7 +8090,7 @@ static auto extract_response(const Table& input, const std::string& name)
 
 /// Solve a linear system A * x = b using Cholesky decomposition (A must be SPD).
 /// A is p×p (column-major: A[col][row]), b is length p. Returns x.
-static auto solve_spd(const std::vector<std::vector<double>>& A, const std::vector<double>& b)
+auto solve_spd(const std::vector<std::vector<double>>& A, const std::vector<double>& b)
     -> std::expected<std::vector<double>, std::string> {
     const std::size_t p = A.size();
 
@@ -8126,8 +8135,8 @@ static auto solve_spd(const std::vector<std::vector<double>>& A, const std::vect
 }
 
 /// Compute X^T * X (p×p) and X^T * y (p×1) from column-major X.
-static auto compute_XtX_Xty(const std::vector<std::vector<double>>& X, const std::vector<double>& y,
-                            std::size_t n, std::size_t p)
+auto compute_XtX_Xty(const std::vector<std::vector<double>>& X, const std::vector<double>& y,
+                     std::size_t n, std::size_t p)
     -> std::pair<std::vector<std::vector<double>>, std::vector<double>> {
     std::vector<std::vector<double>> XtX(p, std::vector<double>(p, 0.0));
     std::vector<double> Xty(p, 0.0);
@@ -8175,10 +8184,11 @@ static auto build_model_result(const std::vector<std::string>& col_names,
         ss_tot += (y[i] - y_mean) * (y[i] - y_mean);
         ss_res += resid[i] * resid[i];
     }
-    double r2 = (ss_tot > 0.0) ? 1.0 - ss_res / ss_tot : 0.0;
-    double adj_r2 = (n > p && ss_tot > 0.0) ? 1.0 - (ss_res / static_cast<double>(n - p)) /
-                                                        (ss_tot / static_cast<double>(n - 1))
-                                            : 0.0;
+    double r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
+    double adj_r2 =
+        (n > p && ss_tot > 0.0)
+            ? 1.0 - ((ss_res / static_cast<double>(n - p)) / (ss_tot / static_cast<double>(n - 1)))
+            : 0.0;
 
     // Standard errors of coefficients.
     double sigma2 = (n > p) ? ss_res / static_cast<double>(n - p) : 0.0;
@@ -8253,10 +8263,9 @@ static auto build_model_result(const std::vector<std::string>& col_names,
 }
 
 /// Fit a model using the specified method.
-static auto fit_model(const Table& input, const ir::ModelFormula& formula,
-                      const std::string& method, const std::vector<ir::ModelParamSpec>& params,
-                      const ScalarRegistry* /*scalars*/, const ExternRegistry* externs)
-    -> std::expected<ModelResult, std::string> {
+auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::string& method,
+               const std::vector<ir::ModelParamSpec>& params, const ScalarRegistry* /*scalars*/,
+               const ExternRegistry* externs) -> std::expected<ModelResult, std::string> {
     // Build design matrix.
     auto matrix = build_model_matrix(input, formula);
     if (!matrix) {
@@ -8444,7 +8453,7 @@ static auto fit_model(const Table& input, const ir::ModelFormula& formula,
                 }
                 beta.push_back(it->second);
             }
-            return build_model_result(col_names, X, y.value(), std::move(beta), formula, method);
+            return build_model_result(col_names, X, y.value(), beta, formula, method);
         }
     }
 
@@ -8546,10 +8555,10 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                                     std::memcpy(dst_chars + row_char_base + len, p, len);
                                 }
                                 if constexpr (N >= 3) {
-                                    std::memcpy(dst_chars + row_char_base + 2 * len, p, len);
+                                    std::memcpy(dst_chars + row_char_base + (2 * len), p, len);
                                 }
                                 if constexpr (N >= 4) {
-                                    std::memcpy(dst_chars + row_char_base + 3 * len, p, len);
+                                    std::memcpy(dst_chars + row_char_base + (3 * len), p, len);
                                 }
                             }
                             if constexpr (N >= 1) {
@@ -8557,15 +8566,15 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                             }
                             if constexpr (N >= 2) {
                                 dst_offs[++out_i] =
-                                    static_cast<std::uint32_t>(row_char_base + 2 * len);
+                                    static_cast<std::uint32_t>(row_char_base + (2 * len));
                             }
                             if constexpr (N >= 3) {
                                 dst_offs[++out_i] =
-                                    static_cast<std::uint32_t>(row_char_base + 3 * len);
+                                    static_cast<std::uint32_t>(row_char_base + (3 * len));
                             }
                             if constexpr (N >= 4) {
                                 dst_offs[++out_i] =
-                                    static_cast<std::uint32_t>(row_char_base + 4 * len);
+                                    static_cast<std::uint32_t>(row_char_base + (4 * len));
                             }
                             out_char += len * N;
                         }
@@ -8604,7 +8613,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                                 }
                                 for (std::size_t m = 0; m < n_measures; ++m) {
                                     dst_offs[++out_i] =
-                                        static_cast<std::uint32_t>(row_char_base + (m + 1) * len);
+                                        static_cast<std::uint32_t>(row_char_base + ((m + 1) * len));
                                 }
                                 out_char += repeated_chars;
                             }
@@ -9129,7 +9138,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         codes.reserve(rows);
         robin_hood::unordered_flat_map<std::string_view, std::int32_t, StringViewHash, StringViewEq>
             sv_to_code;
-        sv_to_code.reserve(rows / n_pivots + 1);
+        sv_to_code.reserve((rows / n_pivots) + 1);
         for (std::size_t r = 0; r < rows; ++r) {
             if (is_null(input.columns[ki], r)) {
                 codes.push_back(-1);
@@ -9148,7 +9157,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     //   fallback (n_keys > 8): raw-bytes std::string key — correct for any arity.
     // Both use a previous-key cache to skip hash lookups for consecutive same-key
     // rows (common in melt output where n_pivots consecutive rows share one key).
-    const std::size_t est_out_rows = rows / n_pivots + 1;
+    const std::size_t est_out_rows = (rows / n_pivots) + 1;
 
     std::vector<std::size_t> first_input_row;
     first_input_row.reserve(est_out_rows);
@@ -9241,7 +9250,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             for (std::size_t k = 0; k < n_keys; ++k)
                 key.v[k] = encode_key(k, r);
 
-            std::size_t out_row;
+            std::size_t out_row{};
             if (key == prev_key && prev_out_row != std::numeric_limits<std::size_t>::max()) {
                 out_row = prev_out_row;
             } else {
@@ -9256,7 +9265,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 prev_key = key;
                 prev_out_row = out_row;
             }
-            cell_rows[out_row * n_pivots + pvi] = r;
+            cell_rows[(out_row * n_pivots) + pvi] = r;
         }
     } else {
         // ── fallback path: raw-byte string key for >8 key columns ────────────
@@ -9276,10 +9285,10 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             std::string key(key_bytes, '\0');
             for (std::size_t k = 0; k < n_keys; ++k) {
                 std::int64_t v = encode_key(k, r);
-                std::memcpy(key.data() + k * sizeof(std::int64_t), &v, sizeof(v));
+                std::memcpy(key.data() + (k * sizeof(std::int64_t)), &v, sizeof(v));
             }
 
-            std::size_t out_row;
+            std::size_t out_row{};
             if (key == prev_key_str && prev_out_row != std::numeric_limits<std::size_t>::max()) {
                 out_row = prev_out_row;
             } else {
@@ -9294,7 +9303,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 prev_key_str = std::move(key);
                 prev_out_row = out_row;
             }
-            cell_rows[out_row * n_pivots + pvi] = r;
+            cell_rows[(out_row * n_pivots) + pvi] = r;
         }
     }
 
@@ -9324,7 +9333,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         bool has_nulls = false;
 
         for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
-            std::size_t cell_key = or_idx * n_pivots + pi;
+            std::size_t cell_key = (or_idx * n_pivots) + pi;
             const std::size_t input_row = cell_rows[cell_key];
             if (input_row != kMissingCell) {
                 append_value(col, *value_entry.column, input_row);

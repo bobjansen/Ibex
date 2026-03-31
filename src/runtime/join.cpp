@@ -152,17 +152,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         left_validity.resize(left.columns.size());
     }
 
-    auto append_left_row = [&](std::size_t row) {
-        for (std::size_t i = 0; i < left.columns.size(); ++i) {
-            append_value(*output.columns[i].column, *left.columns[i].column, row);
-        }
-        if (track_left_nulls) {
-            for (auto& bm : left_validity) {
-                bm.push_back(true);
-            }
-        }
-    };
-
     const bool track_right_nulls = preserve_left_rows;
     bool right_had_nulls = false;
     std::vector<ValidityBitmap> right_validity;
@@ -170,100 +159,137 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         right_validity.resize(right_out.size());
     }
 
-    auto append_right_row = [&](std::size_t row) {
-        for (const auto& item : right_out) {
-            append_value(*output.columns[item.out_index].column, *item.column, row);
-        }
-        if (track_right_nulls) {
-            for (auto& bm : right_validity) {
-                bm.push_back(true);
-            }
-        }
-    };
+    struct JoinEmitter {
+        const Table& left;
+        const Table& right;
+        Table& output;
+        const std::unordered_set<std::string>& key_set;
+        const std::vector<RightOut>& right_out;
+        bool track_left_nulls;
+        bool& left_had_nulls;
+        std::vector<ValidityBitmap>& left_validity;
+        bool track_right_nulls;
+        bool& right_had_nulls;
+        std::vector<ValidityBitmap>& right_validity;
 
-    auto append_right_defaults = [&]() {
-        for (const auto& item : right_out) {
-            std::visit(
-                [](auto& col) {
-                    using ColType = std::decay_t<decltype(col)>;
-                    if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
-                        col.push_back(std::int64_t{0});
-                    } else if constexpr (std::is_same_v<ColType, Column<double>>) {
-                        col.push_back(0.0);
-                    } else if constexpr (std::is_same_v<ColType, Column<std::string>>) {
-                        col.push_back(std::string_view{});
-                    } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                        col.push_code(0);
-                    } else {
-                        col.push_back({});
-                    }
-                },
-                *output.columns[item.out_index].column);
-        }
-        if (track_right_nulls) {
-            right_had_nulls = true;
-            for (auto& bm : right_validity) {
-                bm.push_back(false);
-            }
-        }
-    };
-
-    auto append_left_defaults_from_right = [&](std::size_t right_row) {
-        for (std::size_t i = 0; i < left.columns.size(); ++i) {
-            const auto& left_entry = left.columns[i];
-            if (key_set.contains(left_entry.name)) {
-                const auto* right_key_col = right.find(left_entry.name);
-                if (right_key_col == nullptr) {
-                    throw std::runtime_error("join key not found in right during row emission: " +
-                                             left_entry.name);
-                }
-                append_value(*output.columns[i].column, *right_key_col, right_row);
-                if (track_left_nulls) {
-                    left_validity[i].push_back(true);
-                }
-                continue;
-            }
-
-            std::visit(
-                [](auto& col) {
-                    using ColType = std::decay_t<decltype(col)>;
-                    if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
-                        col.push_back(std::int64_t{0});
-                    } else if constexpr (std::is_same_v<ColType, Column<double>>) {
-                        col.push_back(0.0);
-                    } else if constexpr (std::is_same_v<ColType, Column<std::string>>) {
-                        col.push_back(std::string_view{});
-                    } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                        col.push_code(0);
-                    } else {
-                        col.push_back({});
-                    }
-                },
-                *output.columns[i].column);
-            if (track_left_nulls) {
-                left_validity[i].push_back(false);
-            }
-        }
-        if (track_left_nulls) {
-            left_had_nulls = true;
-        }
-    };
-
-    auto finalize_left_validity = [&]() {
-        if (left_had_nulls) {
+        auto append_left_row(std::size_t row) -> void {
             for (std::size_t i = 0; i < left.columns.size(); ++i) {
-                output.columns[i].validity = std::move(left_validity[i]);
+                append_value(*output.columns[i].column, *left.columns[i].column, row);
+            }
+            if (track_left_nulls) {
+                for (auto& bm : left_validity) {
+                    bm.push_back(true);
+                }
+            }
+        }
+
+        auto append_right_row(std::size_t row) -> void {
+            for (const auto& item : right_out) {
+                append_value(*output.columns[item.out_index].column, *item.column, row);
+            }
+            if (track_right_nulls) {
+                for (auto& bm : right_validity) {
+                    bm.push_back(true);
+                }
+            }
+        }
+
+        auto append_right_defaults() -> void {
+            for (const auto& item : right_out) {
+                std::visit(
+                    [](auto& col) {
+                        using ColType = std::decay_t<decltype(col)>;
+                        if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
+                            col.push_back(std::int64_t{0});
+                        } else if constexpr (std::is_same_v<ColType, Column<double>>) {
+                            col.push_back(0.0);
+                        } else if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                            col.push_back(std::string_view{});
+                        } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                            col.push_code(0);
+                        } else {
+                            col.push_back({});
+                        }
+                    },
+                    *output.columns[item.out_index].column);
+            }
+            if (track_right_nulls) {
+                right_had_nulls = true;
+                for (auto& bm : right_validity) {
+                    bm.push_back(false);
+                }
+            }
+        }
+
+        auto append_left_defaults_from_right(std::size_t right_row) -> void {
+            for (std::size_t i = 0; i < left.columns.size(); ++i) {
+                const auto& left_entry = left.columns[i];
+                if (key_set.contains(left_entry.name)) {
+                    const auto* right_key_col = right.find(left_entry.name);
+                    if (right_key_col == nullptr) {
+                        throw std::runtime_error(
+                            "join key not found in right during row emission: " + left_entry.name);
+                    }
+                    append_value(*output.columns[i].column, *right_key_col, right_row);
+                    if (track_left_nulls) {
+                        left_validity[i].push_back(true);
+                    }
+                    continue;
+                }
+
+                std::visit(
+                    [](auto& col) {
+                        using ColType = std::decay_t<decltype(col)>;
+                        if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
+                            col.push_back(std::int64_t{0});
+                        } else if constexpr (std::is_same_v<ColType, Column<double>>) {
+                            col.push_back(0.0);
+                        } else if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                            col.push_back(std::string_view{});
+                        } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                            col.push_code(0);
+                        } else {
+                            col.push_back({});
+                        }
+                    },
+                    *output.columns[i].column);
+                if (track_left_nulls) {
+                    left_validity[i].push_back(false);
+                }
+            }
+            if (track_left_nulls) {
+                left_had_nulls = true;
+            }
+        }
+
+        auto finalize_left_validity() -> void {
+            if (left_had_nulls) {
+                for (std::size_t i = 0; i < left.columns.size(); ++i) {
+                    output.columns[i].validity = std::move(left_validity[i]);
+                }
+            }
+        }
+
+        auto finalize_right_validity() -> void {
+            if (right_had_nulls) {
+                for (std::size_t i = 0; i < right_out.size(); ++i) {
+                    output.columns[right_out[i].out_index].validity = std::move(right_validity[i]);
+                }
             }
         }
     };
 
-    auto finalize_right_validity = [&]() {
-        if (right_had_nulls) {
-            for (std::size_t i = 0; i < right_out.size(); ++i) {
-                output.columns[right_out[i].out_index].validity = std::move(right_validity[i]);
-            }
-        }
-    };
+    JoinEmitter emitter{left,
+                        right,
+                        output,
+                        key_set,
+                        right_out,
+                        track_left_nulls,
+                        left_had_nulls,
+                        left_validity,
+                        track_right_nulls,
+                        right_had_nulls,
+                        right_validity};
 
     if (predicate != nullptr) {
         if (mask_evaluator == nullptr) {
@@ -326,14 +352,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
                 left_had_match = true;
                 if (semi_join) {
-                    append_left_row(l);
+                    emitter.append_left_row(l);
                     break;
                 }
                 if (anti_join) {
                     break;
                 }
-                append_left_row(l);
-                append_right_row(j);
+                emitter.append_left_row(l);
+                emitter.append_right_row(j);
                 if (preserve_right_rows) {
                     right_matched_pred[j] = 1U;
                 }
@@ -341,10 +367,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
             if (!left_had_match) {
                 if (anti_join) {
-                    append_left_row(l);
+                    emitter.append_left_row(l);
                 } else if (preserve_left_rows) {
-                    append_left_row(l);
-                    append_right_defaults();
+                    emitter.append_left_row(l);
+                    emitter.append_right_defaults();
                 }
             }
         }
@@ -352,14 +378,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < n_right; ++r) {
                 if (right_matched_pred[r] == 0U) {
-                    append_left_defaults_from_right(r);
-                    append_right_row(r);
+                    emitter.append_left_defaults_from_right(r);
+                    emitter.append_right_row(r);
                 }
             }
         }
 
-        finalize_left_validity();
-        finalize_right_validity();
+        emitter.finalize_left_validity();
+        emitter.finalize_right_validity();
         normalize_time_index(output);
         return output;
     }
@@ -412,22 +438,22 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         for (std::size_t l = 0; l < left.rows(); ++l) {
             if (match_counts[l] == 0) {
                 if (preserve_left_rows) {
-                    append_left_row(l);
-                    append_right_defaults();
+                    emitter.append_left_row(l);
+                    emitter.append_right_defaults();
                 }
                 continue;
             }
             for (std::size_t idx = match_offsets[l]; idx < match_offsets[l + 1]; ++idx) {
-                append_left_row(l);
-                append_right_row(right_matches[idx]);
+                emitter.append_left_row(l);
+                emitter.append_right_row(right_matches[idx]);
             }
         }
 
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < right.rows(); ++r) {
                 if (right_matched_build_left[r] == 0U) {
-                    append_left_defaults_from_right(r);
-                    append_right_row(r);
+                    emitter.append_left_defaults_from_right(r);
+                    emitter.append_right_row(r);
                 }
             }
         }
@@ -446,7 +472,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         for (std::size_t l = 0; l < left.rows(); ++l) {
             const bool has_match = left_matched[l] != 0U;
             if ((semi_join && has_match) || (anti_join && !has_match)) {
-                append_left_row(l);
+                emitter.append_left_row(l);
             }
         }
     };
@@ -500,8 +526,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             } else {
                 emit_preserving_rows_from_right_scan(emit_left_matches_for_right_row);
             }
-            finalize_left_validity();
-            finalize_right_validity();
+            emitter.finalize_left_validity();
+            emitter.finalize_right_validity();
             return output;
         }
 
@@ -528,14 +554,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             auto it = right_sv_index.find(sv);
             if (it == right_sv_index.end()) {
                 if (preserve_left_rows) {
-                    append_left_row(l);
-                    append_right_defaults();
+                    emitter.append_left_row(l);
+                    emitter.append_right_defaults();
                 }
                 return;
             }
             for (auto r : it->second) {
-                append_left_row(l);
-                append_right_row(r);
+                emitter.append_left_row(l);
+                emitter.append_right_row(r);
                 if (preserve_right_rows) {
                     right_matched[r] = 1U;
                 }
@@ -556,14 +582,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 const auto* matches = code_to_right[static_cast<std::size_t>(codes[l])];
                 if (matches == nullptr) {
                     if (preserve_left_rows) {
-                        append_left_row(l);
-                        append_right_defaults();
+                        emitter.append_left_row(l);
+                        emitter.append_right_defaults();
                     }
                     continue;
                 }
                 for (auto r : *matches) {
-                    append_left_row(l);
-                    append_right_row(r);
+                    emitter.append_left_row(l);
+                    emitter.append_right_row(r);
                     if (preserve_right_rows) {
                         right_matched[r] = 1U;
                     }
@@ -579,14 +605,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < right.rows(); ++r) {
                 if (right_matched[r] == 0U) {
-                    append_left_defaults_from_right(r);
-                    append_right_row(r);
+                    emitter.append_left_defaults_from_right(r);
+                    emitter.append_right_row(r);
                 }
             }
         }
 
-        finalize_left_validity();
-        finalize_right_validity();
+        emitter.finalize_left_validity();
+        emitter.finalize_right_validity();
         return output;
     }
 
@@ -617,8 +643,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             } else {
                 emit_preserving_rows_from_right_scan(emit_left_matches_for_right_row);
             }
-            finalize_left_validity();
-            finalize_right_validity();
+            emitter.finalize_left_validity();
+            emitter.finalize_right_validity();
             return output;
         }
 
@@ -638,26 +664,26 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             const bool has_match = (it != right_int_index.end());
             if (semi_join) {
                 if (has_match) {
-                    append_left_row(l);
+                    emitter.append_left_row(l);
                 }
                 continue;
             }
             if (anti_join) {
                 if (!has_match) {
-                    append_left_row(l);
+                    emitter.append_left_row(l);
                 }
                 continue;
             }
             if (!has_match) {
                 if (preserve_left_rows) {
-                    append_left_row(l);
-                    append_right_defaults();
+                    emitter.append_left_row(l);
+                    emitter.append_right_defaults();
                 }
                 continue;
             }
             for (auto r : it->second) {
-                append_left_row(l);
-                append_right_row(r);
+                emitter.append_left_row(l);
+                emitter.append_right_row(r);
                 if (preserve_right_rows) {
                     right_matched[r] = 1U;
                 }
@@ -667,14 +693,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < right.rows(); ++r) {
                 if (right_matched[r] == 0U) {
-                    append_left_defaults_from_right(r);
-                    append_right_row(r);
+                    emitter.append_left_defaults_from_right(r);
+                    emitter.append_right_row(r);
                 }
             }
         }
 
-        finalize_left_validity();
-        finalize_right_validity();
+        emitter.finalize_left_validity();
+        emitter.finalize_right_validity();
         return output;
     }
 
@@ -752,7 +778,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         right_pos.reserve(right_groups.size());
 
         for (std::size_t l = 0; l < left.rows(); ++l) {
-            append_left_row(l);
+            emitter.append_left_row(l);
 
             Key group;
             group.values.reserve(left_eq_keys.size());
@@ -762,7 +788,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
             auto it = right_groups.find(group);
             if (it == right_groups.end()) {
-                append_right_defaults();
+                emitter.append_right_defaults();
                 continue;
             }
 
@@ -775,15 +801,15 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
 
             if (pos == 0) {
-                append_right_defaults();
+                emitter.append_right_defaults();
             } else {
-                append_right_row(rows[pos - 1]);
+                emitter.append_right_row(rows[pos - 1]);
             }
         }
 
         output.time_index = left.time_index;
         normalize_time_index(output);
-        finalize_right_validity();
+        emitter.finalize_right_validity();
         return output;
     }
 
@@ -820,8 +846,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         } else {
             emit_preserving_rows_from_right_scan(emit_left_matches_for_right_row);
         }
-        finalize_left_validity();
-        finalize_right_validity();
+        emitter.finalize_left_validity();
+        emitter.finalize_right_validity();
         return output;
     }
 
@@ -850,26 +876,26 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         const bool has_match = (it != right_index.end());
         if (semi_join) {
             if (has_match) {
-                append_left_row(l);
+                emitter.append_left_row(l);
             }
             continue;
         }
         if (anti_join) {
             if (!has_match) {
-                append_left_row(l);
+                emitter.append_left_row(l);
             }
             continue;
         }
         if (!has_match) {
             if (preserve_left_rows) {
-                append_left_row(l);
-                append_right_defaults();
+                emitter.append_left_row(l);
+                emitter.append_right_defaults();
             }
             continue;
         }
         for (auto r : it->second) {
-            append_left_row(l);
-            append_right_row(r);
+            emitter.append_left_row(l);
+            emitter.append_right_row(r);
             if (preserve_right_rows) {
                 right_matched[r] = 1U;
             }
@@ -879,14 +905,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     if (preserve_right_rows) {
         for (std::size_t r = 0; r < right.rows(); ++r) {
             if (right_matched[r] == 0U) {
-                append_left_defaults_from_right(r);
-                append_right_row(r);
+                emitter.append_left_defaults_from_right(r);
+                emitter.append_right_row(r);
             }
         }
     }
 
-    finalize_left_validity();
-    finalize_right_validity();
+    emitter.finalize_left_validity();
+    emitter.finalize_right_validity();
     return output;
 }
 

@@ -1,68 +1,19 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <robin_hood.h>
-#include <string_view>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "reshape_internal.hpp"
+#include "runtime_internal.hpp"
 
 namespace ibex::runtime {
 
 namespace {
-
-auto is_simple_identifier(std::string_view name) -> bool {
-    if (name.empty()) {
-        return false;
-    }
-    auto is_alpha = [](unsigned char ch) -> bool {
-        return std::isalpha(ch) != 0;
-    };
-    auto is_alnum = [](unsigned char ch) -> bool {
-        return std::isalnum(ch) != 0;
-    };
-    auto first = static_cast<unsigned char>(name.front());
-    if (!is_alpha(first) && first != '_') {
-        return false;
-    }
-    for (std::size_t i = 1; i < name.size(); ++i) {
-        unsigned char ch = static_cast<unsigned char>(name[i]);
-        if (!is_alnum(ch) && ch != '_') {
-            return false;
-        }
-    }
-    return true;
-}
-
-auto format_columns(const Table& table) -> std::string {
-    if (table.columns.empty()) {
-        return "<none>";
-    }
-    std::string out;
-    for (std::size_t i = 0; i < table.columns.size(); ++i) {
-        if (i > 0) {
-            out.append(", ");
-        }
-        const auto& name = table.columns[i].name;
-        if (is_simple_identifier(name)) {
-            out.append(name);
-        } else {
-            out.push_back('`');
-            out.append(name);
-            out.push_back('`');
-        }
-    }
-    return out;
-}
 
 [[noreturn]] void invariant_violation(std::string_view detail) {
     (void)std::fputs("ibex internal invariant violated (runtime/reshape): ", stderr);
@@ -70,49 +21,6 @@ auto format_columns(const Table& table) -> std::string {
     (void)std::fputc('\n', stderr);
     std::abort();
 }
-
-auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t index) -> void {
-    std::visit(
-        [&](auto& dst_col) {
-            using ColType = std::decay_t<decltype(dst_col)>;
-            const auto* src_col = std::get_if<ColType>(&src);
-            if (src_col == nullptr) {
-                invariant_violation("append_value: source/destination column type mismatch");
-            }
-            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                dst_col.push_code(src_col->code_at(index));
-            } else {
-                dst_col.push_back((*src_col)[index]);
-            }
-        },
-        out);
-}
-
-auto make_empty_like(const ColumnValue& src) -> ColumnValue {
-    return std::visit(
-        [](const auto& col) -> ColumnValue {
-            using ColType = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                return Column<Categorical>{col.dictionary_ptr(), col.index_ptr(), {}};
-            }
-            return ColType{};
-        },
-        src);
-}
-
-struct StringViewHash {
-    using is_transparent = void;
-    auto operator()(std::string_view sv) const noexcept -> std::size_t {
-        return std::hash<std::string_view>{}(sv);
-    }
-};
-
-struct StringViewEq {
-    using is_transparent = void;
-    auto operator()(std::string_view a, std::string_view b) const noexcept -> bool {
-        return a == b;
-    }
-};
 
 auto extract_numeric(const Table& input)
     -> std::pair<std::vector<std::string>, std::vector<std::vector<double>>> {

@@ -5,6 +5,7 @@ add_library(ibex_runtime STATIC
     model.cpp
     ops.cpp
     reshape.cpp
+    runtime_internal.cpp
 )
 add_library(Ibex::runtime ALIAS ibex_runtime)
 

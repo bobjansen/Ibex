@@ -5,13 +5,15 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <Python.h>
+
 #include <datetime.h>
+
 #include <dlfcn.h>
 #include <expected>
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <Python.h>
 #include <sstream>
 #include <string>
 #include <unordered_set>

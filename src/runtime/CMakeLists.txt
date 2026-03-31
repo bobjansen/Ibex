@@ -1,6 +1,7 @@
 add_library(ibex_runtime STATIC
     extern_registry.cpp
     interpreter.cpp
+    model.cpp
     ops.cpp
 )
 add_library(Ibex::runtime ALIAS ibex_runtime)

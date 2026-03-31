@@ -18,11 +18,9 @@
 #include <random>
 #include <robin_hood.h>
 #include <set>
-#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "join_internal.hpp"
@@ -796,26 +794,26 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
     if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Date>>(&rhs)) {
             for (std::size_t i = 0; i < n; ++i) {
-                const auto lv = l->data()[i].days;
-                const auto rv = r->data()[i].days;
+                const auto left_value = l->data()[i].days;
+                const auto right_value = r->data()[i].days;
                 switch (op) {
                     case ir::CompareOp::Eq:
-                        mp[i] = lv == rv;
+                        mp[i] = left_value == right_value;
                         break;
                     case ir::CompareOp::Ne:
-                        mp[i] = lv != rv;
+                        mp[i] = left_value != right_value;
                         break;
                     case ir::CompareOp::Lt:
-                        mp[i] = lv < rv;
+                        mp[i] = left_value < right_value;
                         break;
                     case ir::CompareOp::Le:
-                        mp[i] = lv <= rv;
+                        mp[i] = left_value <= right_value;
                         break;
                     case ir::CompareOp::Gt:
-                        mp[i] = lv > rv;
+                        mp[i] = left_value > right_value;
                         break;
                     case ir::CompareOp::Ge:
-                        mp[i] = lv >= rv;
+                        mp[i] = left_value >= right_value;
                         break;
                 }
             }
@@ -829,26 +827,26 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
     if (const auto* l = std::get_if<Column<Timestamp>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Timestamp>>(&rhs)) {
             for (std::size_t i = 0; i < n; ++i) {
-                const auto lv = l->data()[i].nanos;
-                const auto rv = r->data()[i].nanos;
+                const auto left_value = l->data()[i].nanos;
+                const auto right_value = r->data()[i].nanos;
                 switch (op) {
                     case ir::CompareOp::Eq:
-                        mp[i] = lv == rv;
+                        mp[i] = left_value == right_value;
                         break;
                     case ir::CompareOp::Ne:
-                        mp[i] = lv != rv;
+                        mp[i] = left_value != right_value;
                         break;
                     case ir::CompareOp::Lt:
-                        mp[i] = lv < rv;
+                        mp[i] = left_value < right_value;
                         break;
                     case ir::CompareOp::Le:
-                        mp[i] = lv <= rv;
+                        mp[i] = left_value <= right_value;
                         break;
                     case ir::CompareOp::Gt:
-                        mp[i] = lv > rv;
+                        mp[i] = left_value > right_value;
                         break;
                     case ir::CompareOp::Ge:
-                        mp[i] = lv >= rv;
+                        mp[i] = left_value >= right_value;
                         break;
                 }
             }

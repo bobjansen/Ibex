@@ -1,6 +1,7 @@
 add_library(ibex_runtime STATIC
     extern_registry.cpp
     interpreter.cpp
+    join.cpp
     model.cpp
     ops.cpp
     reshape.cpp

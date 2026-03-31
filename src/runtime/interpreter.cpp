@@ -1687,6 +1687,7 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
 // Keys must already be sign-flipped (int64 XOR 1<<63) so unsigned order == signed order.
 // All 8 byte histograms are built in a single pass; passes where every element
 // shares the same byte value are skipped (common for clustered timestamps).
+// NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
 template <typename Idx>
 auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> std::vector<Idx> {
     // Build all 8 byte-histograms in one sequential scan.
@@ -1739,6 +1740,7 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
     }
     return src_idx;
 }
+// NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
 
 // Dispatch to 32-bit indices for tables that fit, 64-bit otherwise.
 // Keys are taken by move — caller's FlatKey::u64 is consumed, no copy needed.
@@ -4806,6 +4808,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         // Timestamp is {int64_t nanos} — pointer-cast avoids an 8 MB copy.
         static_assert(sizeof(Timestamp) == sizeof(std::int64_t) &&
                       alignof(Timestamp) == alignof(std::int64_t));
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
         time_vals = reinterpret_cast<const std::int64_t*>(ts_col->data());
         dur_val = duration.count();
     } else {

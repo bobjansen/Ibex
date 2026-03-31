@@ -30,7 +30,7 @@ auto is_simple_identifier(std::string_view name) -> bool {
     auto is_alnum = [](unsigned char ch) -> bool {
         return std::isalnum(ch) != 0;
     };
-    unsigned char first = static_cast<unsigned char>(name.front());
+    auto first = static_cast<unsigned char>(name.front());
     if (!is_alpha(first) && first != '_') {
         return false;
     }

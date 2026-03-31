@@ -34,6 +34,21 @@ struct StringViewEq {
     }
 };
 
+struct Mask {
+    std::vector<uint8_t> value;
+    std::optional<std::vector<uint8_t>> valid;  // nullopt = all rows valid
+
+    void apply_validity(const ValidityBitmap* v, std::size_t n) {
+        if (v == nullptr) {
+            return;
+        }
+        valid.emplace(n, uint8_t{1});
+        for (std::size_t i = 0; i < n; ++i) {
+            (*valid)[i] = static_cast<uint8_t>((*v)[i]);
+        }
+    }
+};
+
 [[nodiscard]] auto is_simple_identifier(std::string_view name) -> bool;
 [[nodiscard]] auto format_columns(const Table& table) -> std::string;
 auto normalize_time_index(Table& table) -> void;

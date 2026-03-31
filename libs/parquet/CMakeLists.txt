@@ -1,11 +1,15 @@
 cmake_minimum_required(VERSION 3.26)
 
+if(POLICY CMP0177)
+    cmake_policy(SET CMP0177 NEW)
+endif()
+
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 set(IBEX_PARQUET_STANDALONE OFF)
 if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     set(IBEX_PARQUET_STANDALONE ON)
     project(ibex_parquet_plugin LANGUAGES CXX)
-
-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
     set(CMAKE_CXX_STANDARD 23)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -85,7 +89,11 @@ set(ARROW_PARQUET ON CACHE BOOL "" FORCE)
 set(ARROW_IPC ON CACHE BOOL "" FORCE)
 set(ARROW_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)
 set(ARROW_RUNTIME_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)
+set(BUILD_WARNING_LEVEL "PRODUCTION" CACHE STRING "" FORCE)
+set(BUILD_WARNING_FLAGS "-w" CACHE STRING "" FORCE)
 set(ARROW_CXXFLAGS "-Wno-deprecated-literal-operator -Wno-error=deprecated-literal-operator -Wno-documentation -Wno-error=documentation -Wno-deprecated-declarations -Wno-error=deprecated-declarations" CACHE STRING "" FORCE)
+set(_ibex_saved_suppress_dev_warnings "${CMAKE_SUPPRESS_DEVELOPER_WARNINGS}")
+set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1)
 set(ARROW_WITH_THRIFT ON CACHE BOOL "" FORCE)
 set(Thrift_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(ARROW_WITH_ZLIB OFF CACHE BOOL "" FORCE)
@@ -97,6 +105,7 @@ set(Snappy_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(Boost_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(BOOST_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(arrow)
+set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
 
 add_library(ibex_parquet_plugin SHARED parquet.cpp)
 

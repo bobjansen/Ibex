@@ -25,12 +25,17 @@ IncludeCategories:
   # Project headers
   - Regex: '^<ibex/'
     Priority: 1
+  # CPython requires Python.h before helper headers like datetime.h.
+  - Regex: '^<Python\.h>$'
+    Priority: 2
+  - Regex: '^<datetime\.h>$'
+    Priority: 3
   # Third-party headers
   - Regex: '^<(fmt|spdlog|CLI|catch2)/'
-    Priority: 2
+    Priority: 4
   # System headers
   - Regex: '^<'
-    Priority: 3
+    Priority: 5
 
 # Alignment
 AlignAfterOpenBracket: Align

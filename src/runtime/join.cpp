@@ -40,10 +40,11 @@ struct KeyEq {
 
 }  // namespace
 
-auto join_table_no_predicate(const Table& left, const Table& right, ir::JoinKind kind,
-                             const std::vector<std::string>& keys)
+auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
+                     const std::vector<std::string>& keys, const ir::FilterExpr* predicate,
+                     const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator)
     -> std::expected<Table, std::string> {
-    if (kind != ir::JoinKind::Cross && keys.empty()) {
+    if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
     }
 
@@ -263,6 +264,105 @@ auto join_table_no_predicate(const Table& left, const Table& right, ir::JoinKind
             }
         }
     };
+
+    if (predicate != nullptr) {
+        if (mask_evaluator == nullptr) {
+            return std::unexpected("join predicate evaluation callback is not available");
+        }
+
+        struct NLJRightCol {
+            const ColumnValue* column = nullptr;
+            std::string batch_name;
+        };
+        std::vector<NLJRightCol> nlj_right;
+        nlj_right.reserve(right.columns.size());
+        {
+            std::unordered_set<std::string> batch_left_names;
+            for (const auto& entry : left.columns) {
+                batch_left_names.insert(entry.name);
+            }
+            for (const auto& entry : right.columns) {
+                std::string name = entry.name;
+                while (batch_left_names.contains(name)) {
+                    name += "_right";
+                }
+                batch_left_names.insert(name);
+                nlj_right.push_back({entry.column.get(), std::move(name)});
+            }
+        }
+
+        const std::size_t n_right = right.rows();
+        std::vector<std::uint8_t> right_matched_pred;
+        if (preserve_right_rows) {
+            right_matched_pred.assign(n_right, 0U);
+        }
+
+        for (std::size_t l = 0; l < left.rows(); ++l) {
+            Table batch;
+            batch.columns.reserve(left.columns.size() + nlj_right.size());
+
+            for (std::size_t ci = 0; ci < left.columns.size(); ++ci) {
+                auto col = make_empty_like(*left.columns[ci].column);
+                for (std::size_t j = 0; j < n_right; ++j) {
+                    append_value(col, *left.columns[ci].column, l);
+                }
+                batch.add_column(output.columns[ci].name, std::move(col));
+            }
+            for (const auto& item : nlj_right) {
+                batch.add_column(item.batch_name, *item.column);
+            }
+
+            auto mask_res = mask_evaluator(*predicate, batch, scalars, n_right);
+            if (!mask_res) {
+                return std::unexpected(mask_res.error());
+            }
+
+            bool left_had_match = false;
+            for (std::size_t j = 0; j < n_right; ++j) {
+                const bool match =
+                    mask_res->value[j] != 0 && (!mask_res->valid || (*mask_res->valid)[j] != 0);
+                if (!match) {
+                    continue;
+                }
+                left_had_match = true;
+                if (semi_join) {
+                    append_left_row(l);
+                    break;
+                }
+                if (anti_join) {
+                    break;
+                }
+                append_left_row(l);
+                append_right_row(j);
+                if (preserve_right_rows) {
+                    right_matched_pred[j] = 1U;
+                }
+            }
+
+            if (!left_had_match) {
+                if (anti_join) {
+                    append_left_row(l);
+                } else if (preserve_left_rows) {
+                    append_left_row(l);
+                    append_right_defaults();
+                }
+            }
+        }
+
+        if (preserve_right_rows) {
+            for (std::size_t r = 0; r < n_right; ++r) {
+                if (right_matched_pred[r] == 0U) {
+                    append_left_defaults_from_right(r);
+                    append_right_row(r);
+                }
+            }
+        }
+
+        finalize_left_validity();
+        finalize_right_validity();
+        normalize_time_index(output);
+        return output;
+    }
 
     auto emit_preserving_rows_from_right_scan = [&](auto&& for_each_left_match_for_right_row) {
         std::vector<std::size_t> match_counts(left.rows(), 0);

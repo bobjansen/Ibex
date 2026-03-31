@@ -28,54 +28,11 @@
 #include "join_internal.hpp"
 #include "model_internal.hpp"
 #include "reshape_internal.hpp"
+#include "runtime_internal.hpp"
 
 namespace ibex::runtime {
 
 namespace {
-
-auto is_simple_identifier(std::string_view name) -> bool {
-    if (name.empty()) {
-        return false;
-    }
-    auto is_alpha = [](unsigned char ch) -> bool {
-        return std::isalpha(ch) != 0;
-    };
-    auto is_alnum = [](unsigned char ch) -> bool {
-        return std::isalnum(ch) != 0;
-    };
-    unsigned char first = static_cast<unsigned char>(name.front());
-    if (!is_alpha(first) && first != '_') {
-        return false;
-    }
-    for (std::size_t i = 1; i < name.size(); ++i) {
-        unsigned char ch = static_cast<unsigned char>(name[i]);
-        if (!is_alnum(ch) && ch != '_') {
-            return false;
-        }
-    }
-    return true;
-}
-
-auto format_columns(const Table& table) -> std::string {
-    if (table.columns.empty()) {
-        return "<none>";
-    }
-    std::string out;
-    for (std::size_t i = 0; i < table.columns.size(); ++i) {
-        if (i > 0) {
-            out.append(", ");
-        }
-        const auto& name = table.columns[i].name;
-        if (is_simple_identifier(name)) {
-            out.append(name);
-        } else {
-            out.push_back('`');
-            out.append(name);
-            out.push_back('`');
-        }
-    }
-    return out;
-}
 
 auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
                            const std::unordered_map<std::string, std::size_t>& index) -> bool {
@@ -98,25 +55,6 @@ auto ordering_keys_for_table(const Table& input, const std::vector<ir::OrderKey>
         resolved.push_back(ir::OrderKey{.name = entry.name, .ascending = true});
     }
     return resolved;
-}
-
-auto normalize_time_index(Table& table) -> void {
-    if (!table.time_index.has_value()) {
-        return;
-    }
-    if (table.ordering.has_value() && table.ordering->size() == 1 &&
-        table.ordering->front().name == *table.time_index && table.ordering->front().ascending) {
-        return;
-    }
-    table.ordering = std::vector<ir::OrderKey>{{.name = *table.time_index, .ascending = true}};
-}
-
-auto int64_to_date_checked(std::int64_t value) -> Date {
-    if (value < std::numeric_limits<std::int32_t>::min() ||
-        value > std::numeric_limits<std::int32_t>::max()) {
-        throw std::runtime_error("date out of range");
-    }
-    return Date{static_cast<std::int32_t>(value)};
 }
 
 auto format_tables(const TableRegistry& registry) -> std::string {
@@ -149,35 +87,6 @@ auto column_size(const ColumnValue& column) -> std::size_t {
     (void)std::fwrite(detail.data(), sizeof(char), detail.size(), stderr);
     (void)std::fputc('\n', stderr);
     std::abort();
-}
-
-auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t index) -> void {
-    std::visit(
-        [&](auto& dst_col) {
-            using ColType = std::decay_t<decltype(dst_col)>;
-            const auto* src_col = std::get_if<ColType>(&src);
-            if (src_col == nullptr) {
-                invariant_violation("append_value: source/destination column type mismatch");
-            }
-            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                dst_col.push_code(src_col->code_at(index));
-            } else {
-                dst_col.push_back((*src_col)[index]);
-            }
-        },
-        out);
-}
-
-auto make_empty_like(const ColumnValue& src) -> ColumnValue {
-    return std::visit(
-        [](const auto& col) -> ColumnValue {
-            using ColType = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                return Column<Categorical>{col.dictionary_ptr(), col.index_ptr(), {}};
-            }
-            return ColType{};
-        },
-        src);
 }
 
 // ─── Vectorized filter ────────────────────────────────────────────────────────
@@ -1712,15 +1621,6 @@ struct KeyEq {
     auto operator()(const Key& a, const Key& b) const -> bool { return a.values == b.values; }
 };
 
-enum class ExprType : std::uint8_t {
-    Int,
-    Double,
-    Bool,
-    String,
-    Date,
-    Timestamp,
-};
-
 using ExprValue = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
 
 struct AggSlot {
@@ -1761,23 +1661,6 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     return ExprType::String;
 }
 
-auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarValue {
-    return std::visit(
-        [&](const auto& col) -> ScalarValue {
-            using ColType = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColType, Column<Categorical>> ||
-                          std::is_same_v<ColType, Column<std::string>>) {
-                return std::string(col[row]);
-            } else if constexpr (std::is_same_v<ColType, Column<Date>> ||
-                                 std::is_same_v<ColType, Column<Timestamp>>) {
-                return col[row];
-            } else {
-                return col[row];
-            }
-        },
-        column);
-}
-
 auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
     if (input.columns.empty()) {
         Table output = input;
@@ -1815,8 +1698,6 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
     output.time_index.reset();
     return output;
 }
-
-auto column_kind(const ColumnValue& column) -> ExprType;
 
 // LSD radix sort over pre-sign-flipped uint64 keys.
 // Idx is the index type: uint32_t for tables ≤ UINT32_MAX rows, uint64_t otherwise.
@@ -2506,25 +2387,6 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
         return ColumnValue{std::move(out)};
     }
     return std::nullopt;
-}
-
-auto column_kind(const ColumnValue& column) -> ExprType {
-    if (std::holds_alternative<Column<std::int64_t>>(column)) {
-        return ExprType::Int;
-    }
-    if (std::holds_alternative<Column<double>>(column)) {
-        return ExprType::Double;
-    }
-    if (std::holds_alternative<Column<bool>>(column)) {
-        return ExprType::Bool;
-    }
-    if (std::holds_alternative<Column<Date>>(column)) {
-        return ExprType::Date;
-    }
-    if (std::holds_alternative<Column<Timestamp>>(column)) {
-        return ExprType::Timestamp;
-    }
-    return ExprType::String;
 }
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,

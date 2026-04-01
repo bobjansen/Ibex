@@ -24,7 +24,7 @@ knitr::opts_chunk$set(
 This R Markdown document translates the local Kaggle notebook
 `baseline-lgb-xgb-and-catboost.ipynb` into a pure R workflow that:
 
-- uses `ribex` to load the Optiver CSV once and build the feature table
+- uses `ribex` to stage the Optiver CSV to Parquet once, then reuse Parquet on later runs
 - keeps the notebook's pairwise and triple-price imbalance features
 - trains whichever of `lightgbm`, `xgboost`, and `catboost` are available
 - evaluates them with a simple fold split and an equal-weight ensemble
@@ -64,6 +64,8 @@ repo_root <- resolve_repo_root()
 notebook_dir <- file.path(repo_root, "notebooks")
 train_csv <- normalizePath(file.path(notebook_dir, params$train_csv), winslash = "/", mustWork = TRUE)
 plugin_paths <- ribex::default_plugin_paths()
+cache_dir <- file.path(notebook_dir, "_cache")
+train_parquet <- file.path(cache_dir, "optiver-train.parquet")
 
 if (!length(plugin_paths)) {
   stop("Could not find any Ibex plugin directories. Set IBEX_BUILD_DIR or IBEX_LIBRARY_PATH.")
@@ -75,23 +77,77 @@ available_models <- optional_models[vapply(optional_models, requireNamespace, lo
 list(
   repo_root = repo_root,
   train_csv = train_csv,
+  train_parquet = train_parquet,
   plugin_paths = plugin_paths,
   available_models = available_models
 )
 ```
 
-## Load the CSV Once in an Ibex Session
+## Stage CSV to Parquet and Load Once in an Ibex Session
 
 ```{r load-train}
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+escape_ibex_string <- function(x) {
+  x <- gsub("\\\\", "\\\\\\\\", x)
+  gsub('"', '\\"', x, fixed = TRUE)
+}
+
+ensure_optiver_parquet <- function(train_csv, train_parquet, plugin_paths, repo_root) {
+  if (file.exists(train_parquet)) {
+    return(invisible(train_parquet))
+  }
+
+  ibex_bin <- file.path(repo_root, "build-release", "tools", "ibex")
+  if (!file.exists(ibex_bin)) {
+    stop("Could not find the Ibex REPL binary at ", ibex_bin)
+  }
+
+  stage_script <- tempfile(pattern = "optiver_stage_", fileext = ".ibex")
+  on.exit(unlink(stage_script), add = TRUE)
+
+  script_lines <- c(
+    'extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";',
+    'extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";',
+    sprintf('let train = read_csv("%s", "<empty>");', escape_ibex_string(train_csv)),
+    sprintf('write_parquet(train, "%s");', escape_ibex_string(train_parquet)),
+    'train[select { rows = count() }];'
+  )
+  writeLines(script_lines, stage_script)
+
+  ibex_env <- c(sprintf("IBEX_LIBRARY_PATH=%s", paste(plugin_paths, collapse = .Platform$path.sep)))
+  out <- system2(
+    ibex_bin,
+    args = c("--plugin-path", plugin_paths[[1L]]),
+    input = c(sprintf(":load %s", stage_script), ":q"),
+    stdout = TRUE,
+    stderr = TRUE,
+    env = ibex_env
+  )
+
+  status <- attr(out, "status")
+  if (!is.null(status) && status != 0) {
+    stop("Ibex Parquet staging failed:\n", paste(out, collapse = "\n"))
+  }
+  if (!file.exists(train_parquet)) {
+    stop("Ibex Parquet staging did not create ", train_parquet,
+         "\nOutput:\n", paste(out, collapse = "\n"))
+  }
+
+  invisible(train_parquet)
+}
+
+ensure_optiver_parquet(train_csv, train_parquet, plugin_paths, repo_root)
+
 sess <- create_session(plugin_paths = plugin_paths)
 
 session_eval(
   sess,
   '
-  extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-  let train = read_csv(train_csv, "<empty>");
+  extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+  let train = read_parquet(train_parquet);
   ',
-  scalars = list(train_csv = train_csv)
+  scalars = list(train_parquet = train_parquet)
 )
 
 if (!is.null(params$max_date_id)) {

@@ -10,6 +10,8 @@ Description: Pure-R bindings for the Ibex dataframe DSL. Queries are parsed and
 Depends: R (>= 4.4)
 Imports:
     nanoarrow
+Suggests:
+    knitr
 SystemRequirements: C++23, an existing Ibex build tree
 License: file LICENSE
 Encoding: UTF-8

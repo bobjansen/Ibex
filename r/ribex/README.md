@@ -7,6 +7,8 @@ Current shape:
 - `eval_file()` evaluates a `.ibex` file.
 - `create_session()`, `session_eval()`, and `session_eval_file()` keep table-valued `let`
   bindings alive across calls.
+- `register_knitr_engines()` adds a `{ibex}` knitr engine for R Markdown.
+- `knitr_session(name)` returns the named engine-backed session for mixed R / Ibex notebooks.
 - `tables = list(name = data.frame(...))` binds R tables into Ibex by copy.
 - `scalars = list(x = 1L, flag = TRUE, day = as.Date(...), ts = as.POSIXct(...))`
   binds R scalars into Ibex by copy.
@@ -62,6 +64,28 @@ summary <- session_eval(sess, '
 
 ggplot(summary, aes(Species, avg_sepal)) + geom_col()
 ```
+
+R Markdown engine example:
+
+```r
+library(ribex)
+ribex::register_knitr_engines()
+```
+
+````
+```{ibex, session="demo", quiet=TRUE}
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+let iris = read_csv("data/iris.csv", "");
+```
+
+```{ibex, session="demo", assign="summary"}
+iris[select { avg_sepal = mean(Sepal_Length) }, by Species, order Species];
+```
+
+```{r}
+ggplot(summary, aes(Species, avg_sepal)) + geom_col()
+```
+````
 
 For plugin-backed queries, make sure the plugin path is discoverable:
 - set `IBEX_BUILD_DIR`

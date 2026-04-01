@@ -1,0 +1,416 @@
+---
+title: "Optiver Baseline in Ibex + R"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+params:
+  train_csv: "../../kaggle/data/train.csv"
+  max_date_id: 40
+  sample_rows: 250000
+  n_folds: 5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## Goal
+
+This R Markdown document translates the local Kaggle notebook
+`baseline-lgb-xgb-and-catboost.ipynb` into a pure R workflow that:
+
+- uses `ribex` to load the Optiver CSV once and build the feature table
+- keeps the notebook's pairwise and triple-price imbalance features
+- trains whichever of `lightgbm`, `xgboost`, and `catboost` are available
+- evaluates them with a simple fold split and an equal-weight ensemble
+
+The original Python notebook defaults to inference with pretrained models.
+Here, the R translation is set up for local training instead.
+
+Render from the repo root with:
+
+```sh
+./scripts/render-optiver-baseline-rmd.sh
+```
+
+Or choose another `rmarkdown` output format explicitly:
+
+```sh
+./scripts/render-optiver-baseline-rmd.sh pdf_document
+```
+
+## Packages and Paths
+
+```{r packages}
+library(ribex)
+library(ggplot2)
+
+resolve_repo_root <- function() {
+  candidates <- c(getwd(), normalizePath("..", winslash = "/", mustWork = FALSE))
+  for (candidate in unique(candidates)) {
+    if (file.exists(file.path(candidate, "r", "ribex", "DESCRIPTION"))) {
+      return(normalizePath(candidate, winslash = "/", mustWork = TRUE))
+    }
+  }
+  stop("Could not locate the Ibex repo root from the current working directory.")
+}
+
+repo_root <- resolve_repo_root()
+notebook_dir <- file.path(repo_root, "notebooks")
+train_csv <- normalizePath(file.path(notebook_dir, params$train_csv), winslash = "/", mustWork = TRUE)
+plugin_paths <- ribex::default_plugin_paths()
+
+if (!length(plugin_paths)) {
+  stop("Could not find any Ibex plugin directories. Set IBEX_BUILD_DIR or IBEX_LIBRARY_PATH.")
+}
+
+optional_models <- c("lightgbm", "xgboost", "catboost")
+available_models <- optional_models[vapply(optional_models, requireNamespace, logical(1), quietly = TRUE)]
+
+list(
+  repo_root = repo_root,
+  train_csv = train_csv,
+  plugin_paths = plugin_paths,
+  available_models = available_models
+)
+```
+
+## Load the CSV Once in an Ibex Session
+
+```{r load-train}
+sess <- create_session(plugin_paths = plugin_paths)
+
+session_eval(
+  sess,
+  '
+  extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+  let train = read_csv(train_csv, "<empty>");
+  ',
+  scalars = list(train_csv = train_csv)
+)
+
+if (!is.null(params$max_date_id)) {
+  session_eval(
+    sess,
+    "
+    let train_work = train[filter date_id <= max_date_id];
+    ",
+    scalars = list(max_date_id = as.integer(params$max_date_id))
+  )
+} else {
+  session_eval(sess, "let train_work = train;")
+}
+
+train_rows <- session_eval(sess, "train_work[select { rows = count() }];")
+train_rows
+```
+
+## Generate the Ibex Feature Query
+
+```{r feature-query}
+price_cols <- c("reference_price", "far_price", "near_price", "ask_price", "bid_price", "wap")
+
+base_features <- c(
+  "seconds_in_bucket",
+  "imbalance_buy_sell_flag",
+  "imbalance_size",
+  "matched_size",
+  "bid_size",
+  "ask_size",
+  "reference_price",
+  "far_price",
+  "near_price",
+  "ask_price",
+  "bid_price",
+  "wap",
+  "imb_s1",
+  "imb_s2"
+)
+
+safe_div <- function(num, den) sprintf("((%s) / (%s))", num, den)
+
+pair_feature_specs <- list()
+for (i in seq_along(price_cols)) {
+  for (j in seq_along(price_cols)) {
+    if (i > j) {
+      a <- price_cols[[i]]
+      b <- price_cols[[j]]
+      name <- sprintf("%s_%s_imb", a, b)
+      expr <- safe_div(sprintf("(%s - %s)", a, b), sprintf("(%s + %s)", a, b))
+      pair_feature_specs[[length(pair_feature_specs) + 1L]] <- list(name = name, expr = expr)
+    }
+  }
+}
+
+triple_feature_names <- c()
+for (i in seq_along(price_cols)) {
+  for (j in seq_along(price_cols)) {
+    for (k in seq_along(price_cols)) {
+      if (i > j && j > k) {
+        triple_feature_names <- c(
+          triple_feature_names,
+          sprintf("%s_%s_%s_imb2", price_cols[[i]], price_cols[[j]], price_cols[[k]])
+        )
+      }
+    }
+  }
+}
+
+derived_assignments <- c(
+  sprintf("imb_s1 = %s", safe_div("(bid_size - ask_size)", "(bid_size + ask_size)")),
+  sprintf("imb_s2 = %s", safe_div("(imbalance_size - matched_size)", "(matched_size + imbalance_size)")),
+  vapply(pair_feature_specs, function(spec) sprintf("%s = %s", spec$name, spec$expr), character(1))
+)
+
+feature_cols <- c(
+  base_features,
+  vapply(pair_feature_specs, `[[`, character(1), "name"),
+  triple_feature_names
+)
+
+build_feature_query <- function(table_name = "train_work") {
+  paste0(
+    table_name,
+    "[update {\n",
+    paste0("  ", derived_assignments, collapse = ",\n"),
+    "\n}];"
+  )
+}
+
+feature_query <- build_feature_query()
+cat(substr(feature_query, 1L, 1500L))
+if (nchar(feature_query) > 1500L) {
+  cat("\n...\n")
+}
+
+length(feature_cols)
+```
+
+## Materialize the Feature Table
+
+```{r features, cache=TRUE}
+train_features <- session_eval(sess, feature_query, format = "data.frame")
+
+dim(train_features)
+head(train_features[, c("stock_id", "date_id", "seconds_in_bucket", "target", feature_cols[1:8])])
+```
+
+## Add the Triple-Price Imbalance Features in R
+
+The original notebook computes the 3-price imbalance terms row-wise with
+`max`, `min`, and `mid`. The current interpreted `ribex` session runtime still
+lacks the scalar `abs` / `sqrt` support needed to express the same row-wise
+formula entirely inside the notebook session, so this final feature family is
+added in R after the Ibex result comes back.
+
+```{r triple-features}
+add_triple_features <- function(df, prices) {
+  out <- df
+  for (i in seq_along(prices)) {
+    for (j in seq_along(prices)) {
+      for (k in seq_along(prices)) {
+        if (i > j && j > k) {
+          a <- prices[[i]]
+          b <- prices[[j]]
+          c <- prices[[k]]
+          max_ <- pmax(out[[a]], out[[b]], out[[c]], na.rm = FALSE)
+          min_ <- pmin(out[[a]], out[[b]], out[[c]], na.rm = FALSE)
+          mid_ <- out[[a]] + out[[b]] + out[[c]] - max_ - min_
+          name <- sprintf("%s_%s_%s_imb2", a, b, c)
+          out[[name]] <- (max_ - mid_) / (mid_ - min_)
+        }
+      }
+    }
+  }
+  out
+}
+
+train_features <- add_triple_features(train_features, price_cols)
+
+head(train_features[, c("wap_bid_price_ask_price_imb2", "wap_bid_price_near_price_imb2")])
+```
+
+## Prepare the Training Matrix
+
+```{r training-data}
+model_df <- train_features[is.finite(train_features$target), c("row_id", "target", feature_cols)]
+
+if (!is.null(params$sample_rows) && nrow(model_df) > params$sample_rows) {
+  set.seed(42)
+  take <- sample.int(nrow(model_df), size = params$sample_rows)
+  model_df <- model_df[take, , drop = FALSE]
+}
+
+fold_id <- (seq_len(nrow(model_df)) - 1L) %% params$n_folds
+X <- as.matrix(model_df[, feature_cols, drop = FALSE])
+y <- model_df$target
+
+list(
+  rows = nrow(model_df),
+  cols = ncol(X),
+  folds = params$n_folds,
+  missing_share = mean(!is.finite(X) | is.na(X))
+)
+```
+
+## Train Optional Baseline Models
+
+```{r train-models}
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted))
+}
+
+fit_lightgbm <- function(X, y, fold_id, n_folds) {
+  oof <- rep(NA_real_, length(y))
+  models <- vector("list", n_folds)
+  for (i in seq_len(n_folds) - 1L) {
+    train_idx <- fold_id != i
+    valid_idx <- fold_id == i
+    dtrain <- lightgbm::lgb.Dataset(X[train_idx, , drop = FALSE], label = y[train_idx])
+    dvalid <- lightgbm::lgb.Dataset(X[valid_idx, , drop = FALSE], label = y[valid_idx])
+    models[[i + 1L]] <- lightgbm::lgb.train(
+      params = list(objective = "regression_l1", metric = "l1"),
+      data = dtrain,
+      valids = list(valid = dvalid),
+      nrounds = 500,
+      early_stopping_rounds = 100,
+      verbose = 10
+    )
+    oof[valid_idx] <- predict(models[[i + 1L]], X[valid_idx, , drop = FALSE])
+  }
+  list(name = "lightgbm", models = models, oof = oof, mae = mae(y, oof))
+}
+
+fit_xgboost <- function(X, y, fold_id, n_folds) {
+  oof <- rep(NA_real_, length(y))
+  models <- vector("list", n_folds)
+  for (i in seq_len(n_folds) - 1L) {
+    train_idx <- fold_id != i
+    valid_idx <- fold_id == i
+    dtrain <- xgboost::xgb.DMatrix(X[train_idx, , drop = FALSE], label = y[train_idx], missing = NA)
+    dvalid <- xgboost::xgb.DMatrix(X[valid_idx, , drop = FALSE], label = y[valid_idx], missing = NA)
+    models[[i + 1L]] <- xgboost::xgb.train(
+      params = list(
+        objective = "reg:absoluteerror",
+        eval_metric = "mae",
+        tree_method = "hist"
+      ),
+      data = dtrain,
+      watchlist = list(valid = dvalid),
+      nrounds = 500,
+      early_stopping_rounds = 100,
+      verbose = 10
+    )
+    oof[valid_idx] <- predict(models[[i + 1L]], dvalid)
+  }
+  list(name = "xgboost", models = models, oof = oof, mae = mae(y, oof))
+}
+
+fit_catboost <- function(X, y, fold_id, n_folds) {
+  oof <- rep(NA_real_, length(y))
+  models <- vector("list", n_folds)
+  for (i in seq_len(n_folds) - 1L) {
+    train_idx <- fold_id != i
+    valid_idx <- fold_id == i
+    train_pool <- catboost::catboost.load_pool(X[train_idx, , drop = FALSE], label = y[train_idx])
+    valid_pool <- catboost::catboost.load_pool(X[valid_idx, , drop = FALSE], label = y[valid_idx])
+    models[[i + 1L]] <- catboost::catboost.train(
+      learn_pool = train_pool,
+      test_pool = valid_pool,
+      params = list(
+        loss_function = "MAE",
+        iterations = 3000,
+        verbose = 100
+      )
+    )
+    oof[valid_idx] <- catboost::catboost.predict(models[[i + 1L]], valid_pool)
+  }
+  list(name = "catboost", models = models, oof = oof, mae = mae(y, oof))
+}
+
+model_results <- list()
+
+if ("lightgbm" %in% available_models) {
+  model_results[["lightgbm"]] <- fit_lightgbm(X, y, fold_id, params$n_folds)
+}
+if ("xgboost" %in% available_models) {
+  model_results[["xgboost"]] <- fit_xgboost(X, y, fold_id, params$n_folds)
+}
+if ("catboost" %in% available_models) {
+  model_results[["catboost"]] <- fit_catboost(X, y, fold_id, params$n_folds)
+}
+
+if (!length(model_results)) {
+  message("No optional model packages are installed. Install one or more of: ",
+          paste(optional_models, collapse = ", "))
+}
+
+metrics <- if (length(model_results)) {
+  data.frame(
+    model = vapply(model_results, `[[`, character(1), "name"),
+    mae = vapply(model_results, `[[`, numeric(1), "mae")
+  )
+} else {
+  data.frame(model = character(), mae = numeric())
+}
+
+metrics
+```
+
+## Ensemble and Diagnostics
+
+```{r diagnostics}
+if (length(model_results)) {
+  pred_matrix <- do.call(cbind, lapply(model_results, `[[`, "oof"))
+  ensemble_pred <- rowMeans(pred_matrix)
+  ensemble_mae <- mae(y, ensemble_pred)
+
+  metrics <- rbind(
+    metrics,
+    data.frame(model = "ensemble_mean", mae = ensemble_mae)
+  )
+
+  print(metrics[order(metrics$mae), , drop = FALSE])
+
+  metrics_plot <- ggplot(metrics, aes(x = reorder(model, mae), y = mae)) +
+    geom_col(fill = "#3b7ea1") +
+    coord_flip() +
+    labs(
+      title = "Fold MAE by model",
+      x = NULL,
+      y = "MAE"
+    ) +
+    theme_minimal(base_size = 12)
+
+  print(metrics_plot)
+
+  sample_n <- min(5000L, length(y))
+  set.seed(42)
+  idx <- sample.int(length(y), sample_n)
+  scatter_df <- data.frame(actual = y[idx], predicted = ensemble_pred[idx])
+
+  scatter_plot <- ggplot(scatter_df, aes(actual, predicted)) +
+    geom_point(alpha = 0.25, size = 0.7, color = "#1f4e5f") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#b22222") +
+    labs(
+      title = "Ensemble predictions vs actual target",
+      x = "Actual target",
+      y = "Predicted target"
+    ) +
+    theme_minimal(base_size = 12)
+
+  print(scatter_plot)
+}
+```
+
+## Notes
+
+- The original notebook used pretrained models for Kaggle inference. This R version is set up for local training instead.
+- The expensive part remains `read_csv(...)`; using an Ibex session ensures it happens once per knit.
+- The feature engineering stays close to the notebook logic. Import, the core features, and the pairwise price imbalance terms run in Ibex; the 3-price imbalance terms are added in R because the current interpreted runtime still lacks row-wise scalar `abs` / `sqrt`.
+- If you want a full-size run, increase `params$max_date_id` or set it to `NULL`, and increase `params$sample_rows`.

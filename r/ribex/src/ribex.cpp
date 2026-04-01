@@ -37,6 +37,15 @@ struct PluginLoadResult {
     std::string message;
 };
 
+struct SessionState {
+    ibex::runtime::TableRegistry tables;
+    std::unordered_set<std::string> table_externs;
+    std::unordered_set<std::string> sink_externs;
+    ibex::runtime::ExternRegistry externs;
+    std::unordered_set<std::string> loaded_plugins;
+    std::vector<std::string> plugin_paths;
+};
+
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
                      std::unordered_set<std::string>& loaded_plugins,
                      ibex::runtime::ExternRegistry& externs) -> PluginLoadResult {
@@ -180,6 +189,104 @@ auto eval_table_impl(const std::string& source, const std::vector<std::string>& 
     return std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
 }
 
+auto register_extern_decl(const ibex::parser::ExternDecl& decl, SessionState& session)
+    -> std::expected<void, std::string> {
+    if (decl.return_type.kind == ibex::parser::Type::Kind::DataFrame ||
+        decl.return_type.kind == ibex::parser::Type::Kind::TimeFrame) {
+        session.table_externs.insert(decl.name);
+    }
+    if (!decl.params.empty() && decl.params[0].type.kind == ibex::parser::Type::Kind::DataFrame) {
+        session.sink_externs.insert(decl.name);
+    }
+    if (decl.source_path.empty()) {
+        return {};
+    }
+
+    auto stem = plugin_stem(decl.source_path);
+    auto result =
+        try_load_plugin(stem, session.plugin_paths, session.loaded_plugins, session.externs);
+    if (result.status == PluginLoadStatus::NotFound) {
+        return std::unexpected("could not find plugin '" + stem + ".so' in search path");
+    }
+    if (result.status == PluginLoadStatus::LoadError) {
+        return std::unexpected(result.message);
+    }
+    return {};
+}
+
+auto eval_table_in_session(SessionState& session, const std::string& source)
+    -> std::expected<std::shared_ptr<const ibex::runtime::Table>, std::string> {
+    auto parsed = ibex::parser::parse(source);
+    if (!parsed.has_value()) {
+        return std::unexpected(make_error("parse error", parsed.error().format()));
+    }
+
+    std::shared_ptr<const ibex::runtime::Table> last_table;
+    for (const auto& stmt : parsed->statements) {
+        if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+            auto registered = register_extern_decl(*decl, session);
+            if (!registered.has_value()) {
+                return std::unexpected(make_error("plugin load error", registered.error()));
+            }
+            continue;
+        }
+        if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
+            return std::unexpected(
+                make_error("session error",
+                           "import declarations are not supported in ribex sessions; use "
+                           "explicit extern fn declarations"));
+        }
+        if (std::holds_alternative<ibex::parser::FunctionDecl>(stmt)) {
+            return std::unexpected(make_error(
+                "session error", "function declarations are not supported in ribex sessions"));
+        }
+        if (std::holds_alternative<ibex::parser::TupleLetStmt>(stmt)) {
+            return std::unexpected(make_error(
+                "session error", "tuple let bindings are not supported in ribex sessions"));
+        }
+
+        ibex::parser::LowerContext context;
+        context.table_externs = session.table_externs;
+        context.sink_externs = session.sink_externs;
+
+        if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
+            auto lowered = ibex::parser::lower_expr(*let_stmt->value, context);
+            if (!lowered.has_value()) {
+                return std::unexpected(
+                    make_error("lowering error",
+                               "ribex sessions currently support only table-valued let bindings: " +
+                                   lowered.error().message));
+            }
+            ibex::runtime::ScalarRegistry scalars;
+            auto evaluated = ibex::runtime::interpret(*lowered.value(), session.tables, &scalars,
+                                                      &session.externs);
+            if (!evaluated.has_value()) {
+                return std::unexpected(make_error("runtime error", evaluated.error()));
+            }
+            session.tables.insert_or_assign(let_stmt->name, std::move(*evaluated));
+            continue;
+        }
+
+        const auto& expr_stmt = std::get<ibex::parser::ExprStmt>(stmt);
+        auto lowered = ibex::parser::lower_expr(*expr_stmt.expr, context);
+        if (!lowered.has_value()) {
+            return std::unexpected(
+                make_error("lowering error",
+                           "ribex sessions currently support only table-valued expressions: " +
+                               lowered.error().message));
+        }
+        ibex::runtime::ScalarRegistry scalars;
+        auto evaluated =
+            ibex::runtime::interpret(*lowered.value(), session.tables, &scalars, &session.externs);
+        if (!evaluated.has_value()) {
+            return std::unexpected(make_error("runtime error", evaluated.error()));
+        }
+        last_table = std::make_shared<ibex::runtime::Table>(std::move(*evaluated));
+    }
+
+    return last_table;
+}
+
 void schema_finalizer(SEXP ext) {
     auto* schema = static_cast<ArrowSchema*>(R_ExternalPtrAddr(ext));
     if (schema == nullptr) {
@@ -197,6 +304,15 @@ void array_finalizer(SEXP ext) {
     }
     ibex::interop::release_arrow_array(array);
     delete array;
+    R_ClearExternalPtr(ext);
+}
+
+void session_finalizer(SEXP ext) {
+    auto* session = static_cast<SessionState*>(R_ExternalPtrAddr(ext));
+    if (session == nullptr) {
+        return;
+    }
+    delete session;
     R_ClearExternalPtr(ext);
 }
 
@@ -243,6 +359,17 @@ auto scalar_string(SEXP value, const char* what) -> std::expected<std::string, s
         return std::unexpected(std::string(what) + " must be a length-1 character value");
     }
     return std::string(CHAR(STRING_ELT(value, 0)));
+}
+
+auto session_from_sexp(SEXP session_sexp) -> std::expected<SessionState*, std::string> {
+    if (TYPEOF(session_sexp) != EXTPTRSXP) {
+        return std::unexpected("'session' must be a ribex session");
+    }
+    auto* session = static_cast<SessionState*>(R_ExternalPtrAddr(session_sexp));
+    if (session == nullptr) {
+        return std::unexpected("invalid ribex session");
+    }
+    return session;
 }
 
 }  // namespace
@@ -297,5 +424,93 @@ extern "C" SEXP ribex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp) {
         Rf_error("%s", payload.error().c_str());
     }
 
+    return *payload;
+}
+
+extern "C" SEXP ribex_c_create_session(SEXP plugin_paths_sexp) {
+    auto plugin_paths = parse_plugin_paths(plugin_paths_sexp);
+    if (!plugin_paths.has_value()) {
+        Rf_error("%s", plugin_paths.error().c_str());
+    }
+
+    auto* session = new SessionState();
+    session->plugin_paths = std::move(*plugin_paths);
+
+    SEXP ext = PROTECT(R_MakeExternalPtr(session, Rf_install("ribex_session"), R_NilValue));
+    R_RegisterCFinalizerEx(ext, session_finalizer, TRUE);
+    SEXP cls = PROTECT(Rf_mkString("ribex_session"));
+    Rf_classgets(ext, cls);
+    UNPROTECT(2);
+    return ext;
+}
+
+extern "C" SEXP ribex_c_reset_session(SEXP session_sexp) {
+    auto session = session_from_sexp(session_sexp);
+    if (!session.has_value()) {
+        Rf_error("%s", session.error().c_str());
+    }
+
+    auto plugin_paths = (*session)->plugin_paths;
+    delete *session;
+    auto* fresh = new SessionState();
+    fresh->plugin_paths = std::move(plugin_paths);
+    R_SetExternalPtrAddr(session_sexp, fresh);
+    return session_sexp;
+}
+
+extern "C" SEXP ribex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp) {
+    auto session = session_from_sexp(session_sexp);
+    if (!session.has_value()) {
+        Rf_error("%s", session.error().c_str());
+    }
+
+    auto query = scalar_string(query_sexp, "'query'");
+    if (!query.has_value()) {
+        Rf_error("%s", query.error().c_str());
+    }
+
+    auto evaluated = eval_table_in_session(**session, *query);
+    if (!evaluated.has_value()) {
+        Rf_error("%s", evaluated.error().c_str());
+    }
+    if (!*evaluated) {
+        return R_NilValue;
+    }
+
+    auto payload = export_table_payload(std::move(*evaluated));
+    if (!payload.has_value()) {
+        Rf_error("%s", payload.error().c_str());
+    }
+    return *payload;
+}
+
+extern "C" SEXP ribex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp) {
+    auto session = session_from_sexp(session_sexp);
+    if (!session.has_value()) {
+        Rf_error("%s", session.error().c_str());
+    }
+
+    auto path = scalar_string(path_sexp, "'path'");
+    if (!path.has_value()) {
+        Rf_error("%s", path.error().c_str());
+    }
+
+    auto source = read_text_file(*path);
+    if (!source.has_value()) {
+        Rf_error("%s", source.error().c_str());
+    }
+
+    auto evaluated = eval_table_in_session(**session, *source);
+    if (!evaluated.has_value()) {
+        Rf_error("%s", evaluated.error().c_str());
+    }
+    if (!*evaluated) {
+        return R_NilValue;
+    }
+
+    auto payload = export_table_payload(std::move(*evaluated));
+    if (!payload.has_value()) {
+        Rf_error("%s", payload.error().c_str());
+    }
     return *payload;
 }

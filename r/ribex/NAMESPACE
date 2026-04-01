@@ -1,5 +1,9 @@
 useDynLib(ribex, .registration = TRUE)
 
+export(create_session)
 export(default_plugin_paths)
 export(eval_file)
 export(eval_ibex)
+export(reset_session)
+export(session_eval)
+export(session_eval_file)

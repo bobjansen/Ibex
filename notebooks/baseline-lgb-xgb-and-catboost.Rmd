@@ -292,6 +292,8 @@ if (!is.null(params$sample_rows) && nrow(model_df) > params$sample_rows) {
 
 fold_id <- (seq_len(nrow(model_df)) - 1L) %% params$n_folds
 X <- as.matrix(model_df[, feature_cols, drop = FALSE])
+storage.mode(X) <- "double"
+X[!is.finite(X)] <- NA_real_
 y <- model_df$target
 
 list(

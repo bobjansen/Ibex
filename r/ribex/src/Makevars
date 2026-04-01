@@ -1,0 +1,10 @@
+CXX_STD = CXX23
+PKG_CPPFLAGS = -I/home/brj/ibex/include
+PKG_LIBS = /home/brj/ibex/build-release/src/parser/libibex_parser.a \
+	/home/brj/ibex/build-release/src/runtime/libibex_runtime.a \
+	/home/brj/ibex/build-release/src/interop/libibex_interop.a \
+	/home/brj/ibex/build-release/src/ir/libibex_ir.a \
+	/home/brj/ibex/build-release/src/core/libibex_core.a \
+	/home/brj/ibex/build-release/_deps/fmt-build/libfmt.a \
+	/home/brj/ibex/build-release/_deps/spdlog-build/libspdlog.a \
+	-ldl

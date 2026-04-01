@@ -1,0 +1,32 @@
+# ribex
+
+Experimental pure-R bindings for Ibex.
+
+Current shape:
+- `eval_ibex()` evaluates an inline Ibex query.
+- `eval_file()` evaluates a `.ibex` file.
+- results return as a `data.frame` by default for immediate `ggplot2` use
+- `format = "nanoarrow"` returns the lower-level Arrow-backed nanoarrow array
+
+Install from the repo checkout with an existing `build-release`:
+
+```sh
+IBEX_ROOT=/path/to/ibex \
+IBEX_BUILD_DIR=/path/to/ibex/build-release \
+R CMD INSTALL r/ribex
+```
+
+Example:
+
+```r
+library(ribex)
+library(ggplot2)
+
+df <- eval_ibex('Table { x = [1, 2, 3], y = [10.0, 20.0, 30.0] };')
+ggplot(df, aes(x, y)) + geom_line()
+```
+
+For plugin-backed queries, make sure the plugin path is discoverable:
+- set `IBEX_BUILD_DIR`
+- or set `IBEX_LIBRARY_PATH`
+- or pass `plugin_paths = c(".../build-release/tools")`

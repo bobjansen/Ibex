@@ -50,6 +50,8 @@ Or choose another `rmarkdown` output format explicitly:
 library(ribex)
 library(ggplot2)
 
+ribex::register_knitr_engines()
+
 resolve_repo_root <- function() {
   candidates <- c(getwd(), normalizePath("..", winslash = "/", mustWork = FALSE))
   for (candidate in unique(candidates)) {
@@ -85,7 +87,7 @@ list(
 
 ## Stage CSV to Parquet and Load Once in an Ibex Session
 
-```{r load-train}
+```{r stage}
 dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
 
 escape_ibex_string <- function(x) {
@@ -140,29 +142,32 @@ ensure_optiver_parquet <- function(train_csv, train_parquet, plugin_paths, repo_
 ensure_optiver_parquet(train_csv, train_parquet, plugin_paths, repo_root)
 
 sess <- create_session(plugin_paths = plugin_paths)
+```
 
-session_eval(
-  sess,
-  '
-  extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
-  let train = read_parquet(train_parquet);
-  ',
-  scalars = list(train_parquet = train_parquet)
-)
+```{ibex load-train, session="optiver", scalars=list(train_parquet=train_parquet), quiet=TRUE}
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+let train = read_parquet(train_parquet);
+```
 
+```{r define-train-work}
 if (!is.null(params$max_date_id)) {
   session_eval(
-    sess,
+    get_knitr_session("optiver", plugin_paths),
     "
     let train_work = train[filter date_id <= max_date_id];
     ",
     scalars = list(max_date_id = as.integer(params$max_date_id))
   )
 } else {
-  session_eval(sess, "let train_work = train;")
+  session_eval(get_knitr_session("optiver", plugin_paths), "let train_work = train;")
 }
+```
 
-train_rows <- session_eval(sess, "train_work[select { rows = count() }];")
+```{ibex train-rows, session="optiver", assign="train_rows", quiet=TRUE}
+train_work[select { rows = count() }];
+```
+
+```{r train-rows-print}
 train_rows
 ```
 
@@ -273,7 +278,7 @@ length(feature_cols)
 ## Materialize the Feature Table
 
 ```{r features}
-train_features <- session_eval(sess, feature_query, format = "data.frame")
+train_features <- session_eval(ribex::knitr_session("optiver", plugin_paths), feature_query, format = "data.frame")
 
 dim(train_features)
 head(train_features[, c("stock_id", "date_id", "seconds_in_bucket", "target", feature_cols[1:8])])

@@ -1,3 +1,10 @@
+knitr_state <- new.env(parent = emptyenv())
+knitr_state$sessions <- new.env(parent = emptyenv())
+
+`%||%` <- function(lhs, rhs) {
+    if (is.null(lhs)) rhs else lhs
+}
+
 default_plugin_paths <- function() {
     split_env_paths <- function(value) {
         if (!nzchar(value)) {
@@ -91,4 +98,67 @@ eval_file <- function(path,
     stopifnot(is.character(path), length(path) == 1L)
     payload <- .Call(ribex_c_eval_file, path, plugin_paths, tables, scalars)
     as_ribex_result(payload, format)
+}
+
+get_knitr_session <- function(name, plugin_paths) {
+    stopifnot(is.character(name), length(name) == 1L, nzchar(name))
+    if (!exists(name, envir = knitr_state$sessions, inherits = FALSE)) {
+        assign(name, create_session(plugin_paths = plugin_paths), envir = knitr_state$sessions)
+    }
+    get(name, envir = knitr_state$sessions, inherits = FALSE)
+}
+
+knitr_session <- function(name = "default",
+                          plugin_paths = default_plugin_paths()) {
+    get_knitr_session(name, plugin_paths)
+}
+
+format_knitr_output <- function(result) {
+    if (is.null(result)) {
+        return(character())
+    }
+    paste(capture.output(print(result)), collapse = "\n")
+}
+
+register_knitr_engines <- function() {
+    if (!requireNamespace("knitr", quietly = TRUE)) {
+        stop("register_knitr_engines() requires the 'knitr' package")
+    }
+
+    knitr::knit_engines$set(ibex = function(options) {
+        code <- paste(options$code, collapse = "\n")
+        format <- if (is.null(options$format)) "data.frame" else options$format
+        plugin_paths <- if (is.null(options$plugin_paths)) default_plugin_paths() else options$plugin_paths
+        tables <- if (is.null(options$tables)) NULL else options$tables
+        scalars <- if (is.null(options$scalars)) NULL else options$scalars
+        quiet <- isTRUE(options$quiet)
+        assign_name <- options$assign %||% NULL
+        session_name <- options$session %||% NULL
+
+        if (isTRUE(options$reset) && !is.null(session_name)) {
+            reset_session(get_knitr_session(session_name, plugin_paths))
+        }
+
+        result <- if (is.null(session_name)) {
+            eval_ibex(code, plugin_paths = plugin_paths, tables = tables, scalars = scalars, format = format)
+        } else {
+            session_eval(get_knitr_session(session_name, plugin_paths),
+                         code, tables = tables, scalars = scalars, format = format)
+        }
+
+        if (!is.null(assign_name)) {
+            assign(assign_name, result, envir = knitr::knit_global())
+        }
+
+        rendered <- if (quiet) character() else format_knitr_output(result)
+        knitr::engine_output(options, options$code, rendered)
+    })
+
+    invisible(TRUE)
+}
+
+.onLoad <- function(libname, pkgname) {
+    if (requireNamespace("knitr", quietly = TRUE)) {
+        register_knitr_engines()
+    }
 }

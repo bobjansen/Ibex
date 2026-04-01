@@ -229,6 +229,12 @@ train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>
             once and then be reused across later calls.
           </p>
           <p>
+            For literate reports, <code>ribex</code> can also register a real
+            <code>{ibex}</code> knitr engine inside R Markdown, so Ibex chunks
+            and ordinary R / <code>ggplot2</code> chunks can share one named
+            session.
+          </p>
+          <p>
             R input bindings are available by copy for named
             <code>data.frame</code> tables and named scalar lists. Scalars
             currently support R <code>integer</code>, <code>double</code>,
@@ -240,6 +246,8 @@ train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>
 <pre><code><span class="cm"># R</span>
 library(ribex)
 library(ggplot2)
+
+ribex::register_knitr_engines()
 
 sess &lt;- create_session(
   plugin_paths = c(<span class="str">"build-release/tools"</span>)

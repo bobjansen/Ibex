@@ -3925,6 +3925,32 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         return ExprType::Int;
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "abs") {
+            if (call->args.size() != 1) {
+                return std::unexpected("abs: expected 1 argument");
+            }
+            auto arg_type = infer_expr_type(*call->args[0], input, scalars, externs);
+            if (!arg_type) {
+                return arg_type;
+            }
+            if (arg_type.value() == ExprType::Int || arg_type.value() == ExprType::Double) {
+                return arg_type.value();
+            }
+            return std::unexpected("abs: argument must be numeric");
+        }
+        if (call->callee == "sqrt") {
+            if (call->args.size() != 1) {
+                return std::unexpected("sqrt: expected 1 argument");
+            }
+            auto arg_type = infer_expr_type(*call->args[0], input, scalars, externs);
+            if (!arg_type) {
+                return arg_type;
+            }
+            if (arg_type.value() == ExprType::Int || arg_type.value() == ExprType::Double) {
+                return ExprType::Double;
+            }
+            return std::unexpected("sqrt: argument must be numeric");
+        }
         // Null-fill functions (fill_null / fill_forward / fill_backward)
         if (is_fill_func(call->callee)) {
             if (call->args.empty()) {
@@ -4192,6 +4218,38 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         }
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "abs") {
+            if (call->args.size() != 1) {
+                return std::unexpected("abs: expected 1 argument");
+            }
+            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
+            if (!arg) {
+                return arg;
+            }
+            if (const auto* value = std::get_if<std::int64_t>(&arg.value())) {
+                return std::int64_t{std::abs(*value)};
+            }
+            if (const auto* value = std::get_if<double>(&arg.value())) {
+                return std::abs(*value);
+            }
+            return std::unexpected("abs: argument must be numeric");
+        }
+        if (call->callee == "sqrt") {
+            if (call->args.size() != 1) {
+                return std::unexpected("sqrt: expected 1 argument");
+            }
+            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
+            if (!arg) {
+                return arg;
+            }
+            if (const auto* value = std::get_if<std::int64_t>(&arg.value())) {
+                return std::sqrt(static_cast<double>(*value));
+            }
+            if (const auto* value = std::get_if<double>(&arg.value())) {
+                return std::sqrt(*value);
+            }
+            return std::unexpected("sqrt: argument must be numeric");
+        }
         if (call->callee == "is_nan") {
             if (call->args.size() != 1) {
                 return std::unexpected("is_nan: expected 1 argument");

@@ -1,2 +1,5 @@
 *_cache/**
 *.pdf
+*.json
+*.tfevents
+*.tsv

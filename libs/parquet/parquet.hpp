@@ -27,17 +27,6 @@
 #include <string_view>
 #include <vector>
 
-#if defined(__clang__)
-#define IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH _Pragma("clang diagnostic push")
-#define IBEX_PARQUET_CLANG_DIAGNOSTIC_POP _Pragma("clang diagnostic pop")
-#define IBEX_PARQUET_CLANG_IGNORE_DEPRECATED \
-    _Pragma("clang diagnostic ignored \"-Wdeprecated-declarations\"")
-#else
-#define IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH
-#define IBEX_PARQUET_CLANG_DIAGNOSTIC_POP
-#define IBEX_PARQUET_CLANG_IGNORE_DEPRECATED
-#endif
-
 namespace {
 
 inline void append_int_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
@@ -245,25 +234,22 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
         throw std::runtime_error("read_parquet: file not found: '" + path_string + "'");
     }
 
-    IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH
-    IBEX_PARQUET_CLANG_IGNORE_DEPRECATED
     auto input_result = arrow::io::ReadableFile::Open(path_string);
-    IBEX_PARQUET_CLANG_DIAGNOSTIC_POP
     if (!input_result.ok()) {
         throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
                                  input_result.status().ToString() + ")");
     }
 
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    auto st =
-        parquet::arrow::OpenFile(input_result.ValueOrDie(), arrow::default_memory_pool(), &reader);
-    if (!st.ok()) {
+    auto reader_result =
+        parquet::arrow::OpenFile(input_result.ValueOrDie(), arrow::default_memory_pool());
+    if (!reader_result.ok()) {
         throw std::runtime_error("read_parquet: failed to read: " + path_string + " (" +
-                                 st.ToString() + ")");
+                                 reader_result.status().ToString() + ")");
     }
+    std::unique_ptr<parquet::arrow::FileReader> reader = std::move(reader_result).ValueOrDie();
 
     std::shared_ptr<arrow::Table> table;
-    st = reader->ReadTable(&table);
+    auto st = reader->ReadTable(&table);
     if (!st.ok()) {
         throw std::runtime_error("read_parquet: failed to load table: " + path_string + " (" +
                                  st.ToString() + ")");
@@ -540,10 +526,7 @@ inline auto write_parquet(const ibex::runtime::Table& table, std::string_view pa
     auto arrow_table = arrow::Table::Make(schema, arrays);
 
     // Open output file
-    IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH
-    IBEX_PARQUET_CLANG_IGNORE_DEPRECATED
     auto sink_result = arrow::io::FileOutputStream::Open(std::string(path));
-    IBEX_PARQUET_CLANG_DIAGNOSTIC_POP
     if (!sink_result.ok()) {
         throw std::runtime_error("write_parquet: cannot open for writing: " + std::string(path) +
                                  " (" + sink_result.status().ToString() + ")");

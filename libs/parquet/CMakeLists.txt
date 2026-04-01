@@ -77,7 +77,7 @@ endif()
 FetchContent_Declare(
     arrow
     GIT_REPOSITORY https://github.com/apache/arrow.git
-    GIT_TAG        apache-arrow-15.0.2
+    GIT_TAG        apache-arrow-22.0.0
     GIT_SHALLOW    TRUE
     SOURCE_SUBDIR  cpp
 )
@@ -96,12 +96,15 @@ set(_ibex_saved_suppress_dev_warnings "${CMAKE_SUPPRESS_DEVELOPER_WARNINGS}")
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1)
 set(ARROW_WITH_THRIFT ON CACHE BOOL "" FORCE)
 set(Thrift_SOURCE "BUNDLED" CACHE STRING "" FORCE)
-set(ARROW_WITH_ZLIB OFF CACHE BOOL "" FORCE)
+set(ARROW_WITH_ZLIB ON CACHE BOOL "" FORCE)
+set(ZLIB_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(ARROW_WITH_ZSTD OFF CACHE BOOL "" FORCE)
 set(ARROW_WITH_BROTLI OFF CACHE BOOL "" FORCE)
 set(ARROW_WITH_LZ4 OFF CACHE BOOL "" FORCE)
 set(ARROW_WITH_SNAPPY ON CACHE BOOL "" FORCE)
 set(Snappy_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+set(ARROW_WITH_RAPIDJSON ON CACHE BOOL "" FORCE)
+set(RapidJSON_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(Boost_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(BOOST_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(arrow)
@@ -111,7 +114,7 @@ add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
 target_compile_options(ibex_parquet_plugin
     PRIVATE
-        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-deprecated-declarations -Wno-missing-designated-field-initializers>
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-missing-designated-field-initializers>
 )
 
 set_target_properties(ibex_parquet_plugin PROPERTIES

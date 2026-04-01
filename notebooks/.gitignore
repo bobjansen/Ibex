@@ -1,4 +1,5 @@
 *_cache/**
+catboost_info/**
 *.pdf
 *.json
 *.tfevents

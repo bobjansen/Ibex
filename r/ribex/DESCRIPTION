@@ -1,0 +1,16 @@
+Package: ribex
+Type: Package
+Title: R Interface for Ibex
+Version: 0.0.1
+Authors@R: c(person("Ibex", "Developers", email = "ibex@example.invalid", role = c("aut", "cre")))
+Description: Pure-R bindings for the Ibex dataframe DSL. Queries are parsed and
+    executed by the Ibex C++ runtime and results are imported into R through the
+    Arrow C Data Interface using nanoarrow. Results can be returned as a nanoarrow
+    array or converted directly to a data.frame for immediate use with ggplot2.
+Depends: R (>= 4.4)
+Imports:
+    nanoarrow
+SystemRequirements: C++23, an existing Ibex build tree
+License: file LICENSE
+Encoding: UTF-8
+LazyData: false

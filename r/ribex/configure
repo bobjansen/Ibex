@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${IBEX_ROOT:-}" ]; then
+  echo "configure: error: IBEX_ROOT is required (path to the Ibex repo root)" >&2
+  exit 1
+fi
+
+if [ -z "${IBEX_BUILD_DIR:-}" ]; then
+  echo "configure: error: IBEX_BUILD_DIR is required (path to the Ibex build tree)" >&2
+  exit 1
+fi
+
+if [ ! -d "${IBEX_ROOT}/include/ibex" ]; then
+  echo "configure: error: IBEX_ROOT does not look like an Ibex checkout: ${IBEX_ROOT}" >&2
+  exit 1
+fi
+
+if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
+  echo "configure: error: IBEX_BUILD_DIR is missing libibex_runtime.a: ${IBEX_BUILD_DIR}" >&2
+  exit 1
+fi
+
+sed \
+  -e "s|@IBEX_ROOT@|${IBEX_ROOT}|g" \
+  -e "s|@IBEX_BUILD_DIR@|${IBEX_BUILD_DIR}|g" \
+  src/Makevars.in > src/Makevars

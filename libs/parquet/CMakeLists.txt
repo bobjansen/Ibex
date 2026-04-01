@@ -109,6 +109,11 @@ set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
 
 add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
+target_compile_options(ibex_parquet_plugin
+    PRIVATE
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-deprecated-declarations -Wno-missing-designated-field-initializers>
+)
+
 set_target_properties(ibex_parquet_plugin PROPERTIES
     OUTPUT_NAME parquet
     PREFIX ""
@@ -120,6 +125,10 @@ target_include_directories(ibex_parquet_plugin
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${IBEX_ROOT}/include"
+)
+
+target_include_directories(ibex_parquet_plugin
+    SYSTEM PRIVATE
         "${arrow_SOURCE_DIR}/cpp/src"
         "${arrow_SOURCE_DIR}/cpp/src/generated"
         "${arrow_BINARY_DIR}/src"

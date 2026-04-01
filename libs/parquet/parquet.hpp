@@ -27,6 +27,17 @@
 #include <string_view>
 #include <vector>
 
+#if defined(__clang__)
+#define IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH _Pragma("clang diagnostic push")
+#define IBEX_PARQUET_CLANG_DIAGNOSTIC_POP _Pragma("clang diagnostic pop")
+#define IBEX_PARQUET_CLANG_IGNORE_DEPRECATED \
+    _Pragma("clang diagnostic ignored \"-Wdeprecated-declarations\"")
+#else
+#define IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH
+#define IBEX_PARQUET_CLANG_DIAGNOSTIC_POP
+#define IBEX_PARQUET_CLANG_IGNORE_DEPRECATED
+#endif
+
 namespace {
 
 inline void append_int_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
@@ -234,7 +245,10 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
         throw std::runtime_error("read_parquet: file not found: '" + path_string + "'");
     }
 
+    IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH
+    IBEX_PARQUET_CLANG_IGNORE_DEPRECATED
     auto input_result = arrow::io::ReadableFile::Open(path_string);
+    IBEX_PARQUET_CLANG_DIAGNOSTIC_POP
     if (!input_result.ok()) {
         throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
                                  input_result.status().ToString() + ")");
@@ -269,7 +283,7 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
             case arrow::Type::UINT32:
             case arrow::Type::UINT64: {
                 std::vector<std::int64_t> values;
-                values.reserve(col->length());
+                values.reserve(static_cast<std::size_t>(col->length()));
                 append_int_column(col, values);
                 out.add_column(field->name(), ibex::Column<std::int64_t>{std::move(values)});
                 break;
@@ -277,7 +291,7 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
             case arrow::Type::FLOAT:
             case arrow::Type::DOUBLE: {
                 std::vector<double> values;
-                values.reserve(col->length());
+                values.reserve(static_cast<std::size_t>(col->length()));
                 append_double_column(col, values);
                 out.add_column(field->name(), ibex::Column<double>{std::move(values)});
                 break;
@@ -285,28 +299,28 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
             case arrow::Type::STRING:
             case arrow::Type::LARGE_STRING: {
                 std::vector<std::string> values;
-                values.reserve(col->length());
+                values.reserve(static_cast<std::size_t>(col->length()));
                 append_string_column(col, values);
                 out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
                 break;
             }
             case arrow::Type::DATE32: {
                 std::vector<std::string> values;
-                values.reserve(col->length());
+                values.reserve(static_cast<std::size_t>(col->length()));
                 append_date32_column(col, values);
                 out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
                 break;
             }
             case arrow::Type::DATE64: {
                 std::vector<std::string> values;
-                values.reserve(col->length());
+                values.reserve(static_cast<std::size_t>(col->length()));
                 append_date64_column(col, values);
                 out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
                 break;
             }
             case arrow::Type::TIMESTAMP: {
                 std::vector<std::string> values;
-                values.reserve(col->length());
+                values.reserve(static_cast<std::size_t>(col->length()));
                 append_timestamp_column(col, col->type(), values);
                 out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
                 break;
@@ -526,7 +540,10 @@ inline auto write_parquet(const ibex::runtime::Table& table, std::string_view pa
     auto arrow_table = arrow::Table::Make(schema, arrays);
 
     // Open output file
+    IBEX_PARQUET_CLANG_DIAGNOSTIC_PUSH
+    IBEX_PARQUET_CLANG_IGNORE_DEPRECATED
     auto sink_result = arrow::io::FileOutputStream::Open(std::string(path));
+    IBEX_PARQUET_CLANG_DIAGNOSTIC_POP
     if (!sink_result.ok()) {
         throw std::runtime_error("write_parquet: cannot open for writing: " + std::string(path) +
                                  " (" + sink_result.status().ToString() + ")");

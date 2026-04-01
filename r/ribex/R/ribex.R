@@ -51,36 +51,44 @@ reset_session <- function(session) {
 
 session_eval <- function(session,
                          query,
+                         tables = NULL,
+                         scalars = NULL,
                          format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(query), length(query) == 1L)
-    payload <- .Call(ribex_c_session_eval_ibex, session, query)
+    payload <- .Call(ribex_c_session_eval_ibex, session, query, tables, scalars)
     as_ribex_result(payload, format)
 }
 
 session_eval_file <- function(session,
                               path,
+                              tables = NULL,
+                              scalars = NULL,
                               format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(path), length(path) == 1L)
-    payload <- .Call(ribex_c_session_eval_file, session, path)
+    payload <- .Call(ribex_c_session_eval_file, session, path, tables, scalars)
     as_ribex_result(payload, format)
 }
 
 eval_ibex <- function(query,
                       plugin_paths = default_plugin_paths(),
+                      tables = NULL,
+                      scalars = NULL,
                       format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(query), length(query) == 1L)
-    payload <- .Call(ribex_c_eval_ibex, query, plugin_paths)
+    payload <- .Call(ribex_c_eval_ibex, query, plugin_paths, tables, scalars)
     as_ribex_result(payload, format)
 }
 
 eval_file <- function(path,
                       plugin_paths = default_plugin_paths(),
+                      tables = NULL,
+                      scalars = NULL,
                       format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(path), length(path) == 1L)
-    payload <- .Call(ribex_c_eval_file, path, plugin_paths)
+    payload <- .Call(ribex_c_eval_file, path, plugin_paths, tables, scalars)
     as_ribex_result(payload, format)
 }

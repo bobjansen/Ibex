@@ -7,6 +7,9 @@ Current shape:
 - `eval_file()` evaluates a `.ibex` file.
 - `create_session()`, `session_eval()`, and `session_eval_file()` keep table-valued `let`
   bindings alive across calls.
+- `tables = list(name = data.frame(...))` binds R tables into Ibex by copy.
+- `scalars = list(x = 1L, flag = TRUE, day = as.Date(...), ts = as.POSIXct(...))`
+  binds R scalars into Ibex by copy.
 - results return as a `data.frame` by default for immediate `ggplot2` use
 - `format = "nanoarrow"` returns the lower-level Arrow-backed nanoarrow array
 
@@ -26,6 +29,22 @@ library(ggplot2)
 
 df <- eval_ibex('Table { x = [1, 2, 3], y = [10.0, 20.0, 30.0] };')
 ggplot(df, aes(x, y)) + geom_line()
+```
+
+Input binding example:
+
+```r
+base <- data.frame(x = c(10L, 20L))
+
+out <- eval_ibex(
+  'base[update { off = offset, when = day, tag = label }];',
+  tables = list(base = base),
+  scalars = list(
+    offset = 7L,
+    day = as.Date("2024-02-03"),
+    label = "demo"
+  )
+)
 ```
 
 Session example:

@@ -134,6 +134,22 @@ base_features <- c(
 
 safe_div <- function(num, den) sprintf("((%s) / (%s))", num, den)
 
+row_max2 <- function(a, b) {
+  sprintf("(0.5 * ((%s) + (%s) + sqrt(((%s) - (%s)) * ((%s) - (%s)))))", a, b, a, b, a, b)
+}
+
+row_min2 <- function(a, b) {
+  sprintf("(0.5 * ((%s) + (%s) - sqrt(((%s) - (%s)) * ((%s) - (%s)))))", a, b, a, b, a, b)
+}
+
+row_max3 <- function(a, b, c) {
+  row_max2(row_max2(a, b), c)
+}
+
+row_min3 <- function(a, b, c) {
+  row_min2(row_min2(a, b), c)
+}
+
 pair_feature_specs <- list()
 for (i in seq_along(price_cols)) {
   for (j in seq_along(price_cols)) {
@@ -147,15 +163,21 @@ for (i in seq_along(price_cols)) {
   }
 }
 
-triple_feature_names <- c()
+triple_feature_specs <- list()
 for (i in seq_along(price_cols)) {
   for (j in seq_along(price_cols)) {
     for (k in seq_along(price_cols)) {
       if (i > j && j > k) {
-        triple_feature_names <- c(
-          triple_feature_names,
-          sprintf("%s_%s_%s_imb2", price_cols[[i]], price_cols[[j]], price_cols[[k]])
-        )
+        a <- price_cols[[i]]
+        b <- price_cols[[j]]
+        c <- price_cols[[k]]
+        max_expr <- row_max3(a, b, c)
+        min_expr <- row_min3(a, b, c)
+        mid_expr <- sprintf("((%s + %s + %s) - (%s) - (%s))", a, b, c, max_expr, min_expr)
+        name <- sprintf("%s_%s_%s_imb2", a, b, c)
+        expr <- safe_div(sprintf("((%s) - (%s))", max_expr, mid_expr),
+                         sprintf("((%s) - (%s))", mid_expr, min_expr))
+        triple_feature_specs[[length(triple_feature_specs) + 1L]] <- list(name = name, expr = expr)
       }
     }
   }
@@ -164,13 +186,14 @@ for (i in seq_along(price_cols)) {
 derived_assignments <- c(
   sprintf("imb_s1 = %s", safe_div("(bid_size - ask_size)", "(bid_size + ask_size)")),
   sprintf("imb_s2 = %s", safe_div("(imbalance_size - matched_size)", "(matched_size + imbalance_size)")),
-  vapply(pair_feature_specs, function(spec) sprintf("%s = %s", spec$name, spec$expr), character(1))
+  vapply(pair_feature_specs, function(spec) sprintf("%s = %s", spec$name, spec$expr), character(1)),
+  vapply(triple_feature_specs, function(spec) sprintf("%s = %s", spec$name, spec$expr), character(1))
 )
 
 feature_cols <- c(
   base_features,
   vapply(pair_feature_specs, `[[`, character(1), "name"),
-  triple_feature_names
+  vapply(triple_feature_specs, `[[`, character(1), "name")
 )
 
 build_feature_query <- function(table_name = "train_work") {
@@ -193,46 +216,11 @@ length(feature_cols)
 
 ## Materialize the Feature Table
 
-```{r features, cache=TRUE}
+```{r features}
 train_features <- session_eval(sess, feature_query, format = "data.frame")
 
 dim(train_features)
 head(train_features[, c("stock_id", "date_id", "seconds_in_bucket", "target", feature_cols[1:8])])
-```
-
-## Add the Triple-Price Imbalance Features in R
-
-The original notebook computes the 3-price imbalance terms row-wise with
-`max`, `min`, and `mid`. The current interpreted `ribex` session runtime still
-lacks the scalar `abs` / `sqrt` support needed to express the same row-wise
-formula entirely inside the notebook session, so this final feature family is
-added in R after the Ibex result comes back.
-
-```{r triple-features}
-add_triple_features <- function(df, prices) {
-  out <- df
-  for (i in seq_along(prices)) {
-    for (j in seq_along(prices)) {
-      for (k in seq_along(prices)) {
-        if (i > j && j > k) {
-          a <- prices[[i]]
-          b <- prices[[j]]
-          c <- prices[[k]]
-          max_ <- pmax(out[[a]], out[[b]], out[[c]], na.rm = FALSE)
-          min_ <- pmin(out[[a]], out[[b]], out[[c]], na.rm = FALSE)
-          mid_ <- out[[a]] + out[[b]] + out[[c]] - max_ - min_
-          name <- sprintf("%s_%s_%s_imb2", a, b, c)
-          out[[name]] <- (max_ - mid_) / (mid_ - min_)
-        }
-      }
-    }
-  }
-  out
-}
-
-train_features <- add_triple_features(train_features, price_cols)
-
-head(train_features[, c("wap_bid_price_ask_price_imb2", "wap_bid_price_near_price_imb2")])
 ```
 
 ## Prepare the Training Matrix
@@ -412,5 +400,5 @@ if (length(model_results)) {
 
 - The original notebook used pretrained models for Kaggle inference. This R version is set up for local training instead.
 - The expensive part remains `read_csv(...)`; using an Ibex session ensures it happens once per knit.
-- The feature engineering stays close to the notebook logic. Import, the core features, and the pairwise price imbalance terms run in Ibex; the 3-price imbalance terms are added in R because the current interpreted runtime still lacks row-wise scalar `abs` / `sqrt`.
+- The feature engineering stays close to the notebook logic and now runs fully through the Ibex feature query before the model handoff to R.
 - If you want a full-size run, increase `params$max_date_id` or set it to `NULL`, and increase `params$sample_rows`.

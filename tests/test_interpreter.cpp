@@ -3433,6 +3433,63 @@ TEST_CASE("aggregates accept direct computed inputs", "[agg]") {
     CHECK(sx[1] == Catch::Approx(66.0));
 }
 
+TEST_CASE("update: abs and sqrt work in interpreted expressions", "[update][math]") {
+    runtime::Table table;
+    table.add_column("x", Column<double>{-4.0, -9.0, 16.0});
+    table.add_column("y", Column<std::int64_t>{-3, 0, 12});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { abs_x = abs(x), abs_y = abs(y), root = sqrt(abs(x)) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& abs_x = std::get<Column<double>>(*result->find("abs_x"));
+    const auto& abs_y = std::get<Column<std::int64_t>>(*result->find("abs_y"));
+    const auto& root = std::get<Column<double>>(*result->find("root"));
+
+    CHECK(abs_x[0] == Catch::Approx(4.0));
+    CHECK(abs_x[1] == Catch::Approx(9.0));
+    CHECK(abs_x[2] == Catch::Approx(16.0));
+
+    CHECK(abs_y[0] == 3);
+    CHECK(abs_y[1] == 0);
+    CHECK(abs_y[2] == 12);
+
+    CHECK(root[0] == Catch::Approx(2.0));
+    CHECK(root[1] == Catch::Approx(3.0));
+    CHECK(root[2] == Catch::Approx(4.0));
+}
+
+TEST_CASE("update: notebook-style rowwise max/min algebra works with sqrt", "[update][math]") {
+    runtime::Table table;
+    table.add_column("a", Column<double>{10.0, 10.2});
+    table.add_column("b", Column<double>{9.9, 10.1});
+    table.add_column("c", Column<double>{10.1, 10.3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[update { "
+        "max_ab = 0.5 * (a + b + sqrt((a - b) * (a - b))), "
+        "min_ab = 0.5 * (a + b - sqrt((a - b) * (a - b))), "
+        "max_abc = 0.5 * (max_ab + c + sqrt((max_ab - c) * (max_ab - c))), "
+        "min_abc = 0.5 * (min_ab + c - sqrt((min_ab - c) * (min_ab - c))) "
+        "}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& max_abc = std::get<Column<double>>(*result->find("max_abc"));
+    const auto& min_abc = std::get<Column<double>>(*result->find("min_abc"));
+
+    CHECK(max_abc[0] == Catch::Approx(10.1));
+    CHECK(min_abc[0] == Catch::Approx(9.9));
+    CHECK(max_abc[1] == Catch::Approx(10.3));
+    CHECK(min_abc[1] == Catch::Approx(10.1));
+}
+
 TEST_CASE("rep missing positional argument returns error") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3});

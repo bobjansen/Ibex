@@ -23,6 +23,10 @@ default_plugin_paths <- function() {
 }
 
 as_ribex_result <- function(payload, format) {
+    if (is.null(payload)) {
+        return(invisible(NULL))
+    }
+
     stopifnot(is.list(payload), all(c("array", "schema") %in% names(payload)))
 
     array <- payload$array
@@ -35,6 +39,32 @@ as_ribex_result <- function(payload, format) {
     }
 
     as.data.frame(array)
+}
+
+create_session <- function(plugin_paths = default_plugin_paths()) {
+    .Call(ribex_c_create_session, plugin_paths)
+}
+
+reset_session <- function(session) {
+    invisible(.Call(ribex_c_reset_session, session))
+}
+
+session_eval <- function(session,
+                         query,
+                         format = c("data.frame", "nanoarrow")) {
+    format <- match.arg(format)
+    stopifnot(is.character(query), length(query) == 1L)
+    payload <- .Call(ribex_c_session_eval_ibex, session, query)
+    as_ribex_result(payload, format)
+}
+
+session_eval_file <- function(session,
+                              path,
+                              format = c("data.frame", "nanoarrow")) {
+    format <- match.arg(format)
+    stopifnot(is.character(path), length(path) == 1L)
+    payload <- .Call(ribex_c_session_eval_file, session, path)
+    as_ribex_result(payload, format)
 }
 
 eval_ibex <- function(query,

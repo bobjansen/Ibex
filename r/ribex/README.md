@@ -5,6 +5,8 @@ Experimental pure-R bindings for Ibex.
 Current shape:
 - `eval_ibex()` evaluates an inline Ibex query.
 - `eval_file()` evaluates a `.ibex` file.
+- `create_session()`, `session_eval()`, and `session_eval_file()` keep table-valued `let`
+  bindings alive across calls.
 - results return as a `data.frame` by default for immediate `ggplot2` use
 - `format = "nanoarrow"` returns the lower-level Arrow-backed nanoarrow array
 
@@ -24,6 +26,22 @@ library(ggplot2)
 
 df <- eval_ibex('Table { x = [1, 2, 3], y = [10.0, 20.0, 30.0] };')
 ggplot(df, aes(x, y)) + geom_line()
+```
+
+Session example:
+
+```r
+sess <- create_session()
+session_eval(sess, '
+  extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+  let train = read_csv("data/iris.csv", "");
+')
+
+summary <- session_eval(sess, '
+  train[select { avg_sepal = mean(Sepal_Length) }, by Species];
+')
+
+ggplot(summary, aes(Species, avg_sepal)) + geom_col()
 ```
 
 For plugin-backed queries, make sure the plugin path is discoverable:

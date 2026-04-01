@@ -117,13 +117,23 @@
           <code>%ibexreset</code>.
         </p>
       </article>
+      <article class="card">
+        <h3>R and ggplot2</h3>
+        <p>
+          The experimental <code>ribex</code> package runs Ibex from pure R,
+          returns a <code>data.frame</code> by default for immediate
+          <code>ggplot2</code> use, and can keep Ibex table bindings alive
+          across calls with a persistent session. Lower-level
+          <code>nanoarrow</code> output is available when you want it.
+        </p>
+      </article>
     </div>
   </section>
 
   <section class="section">
     <p class="section-label">Notebook integration</p>
-    <h2>Run Ibex inside IPython and Jupyter.</h2>
-    <p class="section-sub">Keep heavy table manipulation in Ibex, then plot and explore the result with the Python ecosystem.</p>
+    <h2>Run Ibex inside Python or R notebook workflows.</h2>
+    <p class="section-sub">Keep heavy table manipulation in Ibex, then plot and explore the result with the surrounding language ecosystem.</p>
 
     <div class="tour">
       <div class="tour-item">
@@ -200,6 +210,62 @@ let train = read_csv(<span class="str">"../../kaggle/data/train.csv"</span>, <sp
 train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>() }, <span class="kw">by</span> seconds_in_bucket, <span class="kw">order</span> seconds_in_bucket];
 
 %ibexreset  <span class="cm"># clear the hidden session</span></code></pre>
+        </div>
+      </div>
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">R Package</span>
+          <h3>Use Ibex from pure R and hand results straight to ggplot2.</h3>
+          <p>
+            The in-repo <code>ribex</code> package evaluates inline Ibex queries
+            or <code>.ibex</code> files from R. Results come back as a
+            <code>data.frame</code> by default, so the common
+            <code>ggplot2</code> path is immediate. For lower-level interop,
+            <code>format = "nanoarrow"</code> returns the Arrow-backed result.
+          </p>
+          <p>
+            Like the Python notebook path, <code>ribex</code> supports a
+            persistent Ibex session, so large CSV or parquet loads can happen
+            once and then be reused across later calls.
+          </p>
+          <p>
+            R input bindings are available by copy for named
+            <code>data.frame</code> tables and named scalar lists. Scalars
+            currently support R <code>integer</code>, <code>double</code>,
+            <code>logical</code>, <code>character</code>, <code>Date</code>,
+            and <code>POSIXct</code>.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm"># R</span>
+library(ribex)
+library(ggplot2)
+
+sess &lt;- create_session(
+  plugin_paths = c(<span class="str">"build-release/tools"</span>)
+)
+
+session_eval(
+  sess,
+  <span class="str">'
+  extern fn read_csv(path: String, nulls: String) -&gt; DataFrame from "csv.hpp";
+  let iris = read_csv("data/iris.csv", "");
+  '</span>
+)
+
+summary &lt;- session_eval(
+  sess,
+  <span class="str">'
+  iris[
+      select { mean_sl = mean(Sepal_Length), n = count() },
+      by Species,
+      order Species
+  ];
+  '</span>
+)
+
+ggplot(summary, aes(Species, mean_sl)) +
+  geom_col()</code></pre>
         </div>
       </div>
     </div>

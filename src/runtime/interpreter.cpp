@@ -4007,6 +4007,35 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             return ExprType::Bool;
         }
+        if (call->callee == "pmin" || call->callee == "pmax") {
+            if (call->args.size() < 2) {
+                return std::unexpected(call->callee + ": expected at least 2 arguments");
+            }
+            std::optional<ExprType> result_type;
+            for (const auto& arg : call->args) {
+                auto arg_type = infer_expr_type(*arg, input, scalars, externs);
+                if (!arg_type) {
+                    return arg_type;
+                }
+                if (!result_type.has_value()) {
+                    result_type = *arg_type;
+                    continue;
+                }
+                if ((*result_type == ExprType::Int && *arg_type == ExprType::Double) ||
+                    (*result_type == ExprType::Double && *arg_type == ExprType::Int)) {
+                    result_type = ExprType::Double;
+                    continue;
+                }
+                if (*result_type != *arg_type) {
+                    return std::unexpected(call->callee +
+                                           ": arguments must all be comparable and of one type");
+                }
+            }
+            if (*result_type == ExprType::Bool) {
+                return std::unexpected(call->callee + ": Bool arguments are not supported");
+            }
+            return *result_type;
+        }
         // Cumulative functions (cumsum / cumprod)
         if (is_cum_func(call->callee)) {
             if (call->args.size() != 1) {
@@ -4249,6 +4278,72 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 return std::sqrt(*value);
             }
             return std::unexpected("sqrt: argument must be numeric");
+        }
+        if (call->callee == "pmin" || call->callee == "pmax") {
+            if (call->args.size() < 2) {
+                return std::unexpected(call->callee + ": expected at least 2 arguments");
+            }
+            auto compare = [&](const ExprValue& lhs,
+                               const ExprValue& rhs) -> std::expected<bool, std::string> {
+                if (std::holds_alternative<std::int64_t>(lhs) &&
+                    std::holds_alternative<std::int64_t>(rhs)) {
+                    return call->callee == "pmin"
+                               ? std::get<std::int64_t>(lhs) < std::get<std::int64_t>(rhs)
+                               : std::get<std::int64_t>(lhs) > std::get<std::int64_t>(rhs);
+                }
+                if ((std::holds_alternative<std::int64_t>(lhs) ||
+                     std::holds_alternative<double>(lhs)) &&
+                    (std::holds_alternative<std::int64_t>(rhs) ||
+                     std::holds_alternative<double>(rhs))) {
+                    double lhs_d = std::holds_alternative<double>(lhs)
+                                       ? std::get<double>(lhs)
+                                       : static_cast<double>(std::get<std::int64_t>(lhs));
+                    double rhs_d = std::holds_alternative<double>(rhs)
+                                       ? std::get<double>(rhs)
+                                       : static_cast<double>(std::get<std::int64_t>(rhs));
+                    return call->callee == "pmin" ? lhs_d < rhs_d : lhs_d > rhs_d;
+                }
+                if (std::holds_alternative<std::string>(lhs) &&
+                    std::holds_alternative<std::string>(rhs)) {
+                    return call->callee == "pmin"
+                               ? std::get<std::string>(lhs) < std::get<std::string>(rhs)
+                               : std::get<std::string>(lhs) > std::get<std::string>(rhs);
+                }
+                if (std::holds_alternative<Date>(lhs) && std::holds_alternative<Date>(rhs)) {
+                    return call->callee == "pmin" ? std::get<Date>(lhs) < std::get<Date>(rhs)
+                                                  : std::get<Date>(lhs) > std::get<Date>(rhs);
+                }
+                if (std::holds_alternative<Timestamp>(lhs) &&
+                    std::holds_alternative<Timestamp>(rhs)) {
+                    return call->callee == "pmin"
+                               ? std::get<Timestamp>(lhs) < std::get<Timestamp>(rhs)
+                               : std::get<Timestamp>(lhs) > std::get<Timestamp>(rhs);
+                }
+                return std::unexpected(call->callee +
+                                       ": arguments must all be comparable and of one type");
+            };
+
+            auto best = eval_expr(*call->args[0], input, row, scalars, externs);
+            if (!best) {
+                return best;
+            }
+            if (std::holds_alternative<bool>(best.value())) {
+                return std::unexpected(call->callee + ": Bool arguments are not supported");
+            }
+            for (std::size_t i = 1; i < call->args.size(); ++i) {
+                auto candidate = eval_expr(*call->args[i], input, row, scalars, externs);
+                if (!candidate) {
+                    return candidate;
+                }
+                auto take_candidate = compare(candidate.value(), best.value());
+                if (!take_candidate) {
+                    return std::unexpected(take_candidate.error());
+                }
+                if (*take_candidate) {
+                    best = std::move(candidate);
+                }
+            }
+            return best;
         }
         if (call->callee == "is_nan") {
             if (call->args.size() != 1) {

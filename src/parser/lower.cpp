@@ -20,6 +20,498 @@ struct LoweredAggList {
     std::vector<ir::FieldSpec> preagg_updates;
 };
 
+struct CompileTimeValue {
+    std::variant<std::int64_t, bool, std::string> value;
+};
+
+auto clone_expr(const Expr& expr) -> ExprPtr;
+
+auto clone_field(const Field& field) -> Field {
+    return Field{
+        .name = field.name,
+        .expr = field.expr ? clone_expr(*field.expr) : nullptr,
+    };
+}
+
+auto clone_tuple_field(const TupleField& field) -> TupleField {
+    return TupleField{
+        .names = field.names,
+        .expr = field.expr ? clone_expr(*field.expr) : nullptr,
+    };
+}
+
+auto clone_map_field(const MapField& field) -> MapField {
+    return MapField{
+        .bindings = field.bindings,
+        .where_expr = field.where_expr ? clone_expr(*field.where_expr) : nullptr,
+        .alias_template = field.alias_template,
+        .expr = field.expr ? clone_expr(*field.expr) : nullptr,
+    };
+}
+
+auto clone_clause(const Clause& clause) -> Clause {
+    return std::visit(
+        [](const auto& c) -> Clause {
+            using T = std::decay_t<decltype(c)>;
+            if constexpr (std::is_same_v<T, FilterClause>) {
+                return FilterClause{.predicate = clone_expr(*c.predicate)};
+            } else if constexpr (std::is_same_v<T, SelectClause>) {
+                SelectClause out;
+                out.fields.reserve(c.fields.size());
+                for (const auto& f : c.fields) {
+                    out.fields.push_back(clone_field(f));
+                }
+                out.tuple_fields.reserve(c.tuple_fields.size());
+                for (const auto& tf : c.tuple_fields) {
+                    out.tuple_fields.push_back(clone_tuple_field(tf));
+                }
+                out.map_fields.reserve(c.map_fields.size());
+                for (const auto& mf : c.map_fields) {
+                    out.map_fields.push_back(clone_map_field(mf));
+                }
+                return out;
+            } else if constexpr (std::is_same_v<T, DistinctClause>) {
+                DistinctClause out;
+                out.fields.reserve(c.fields.size());
+                for (const auto& f : c.fields) {
+                    out.fields.push_back(clone_field(f));
+                }
+                return out;
+            } else if constexpr (std::is_same_v<T, UpdateClause>) {
+                UpdateClause out;
+                out.fields.reserve(c.fields.size());
+                for (const auto& f : c.fields) {
+                    out.fields.push_back(clone_field(f));
+                }
+                out.tuple_fields.reserve(c.tuple_fields.size());
+                for (const auto& tf : c.tuple_fields) {
+                    out.tuple_fields.push_back(clone_tuple_field(tf));
+                }
+                out.map_fields.reserve(c.map_fields.size());
+                for (const auto& mf : c.map_fields) {
+                    out.map_fields.push_back(clone_map_field(mf));
+                }
+                out.merge_expr = c.merge_expr ? clone_expr(*c.merge_expr) : nullptr;
+                return out;
+            } else if constexpr (std::is_same_v<T, RenameClause>) {
+                RenameClause out;
+                out.fields.reserve(c.fields.size());
+                for (const auto& f : c.fields) {
+                    out.fields.push_back(clone_field(f));
+                }
+                return out;
+            } else if constexpr (std::is_same_v<T, ByClause>) {
+                ByClause out{.is_braced = c.is_braced};
+                out.keys.reserve(c.keys.size());
+                for (const auto& f : c.keys) {
+                    out.keys.push_back(clone_field(f));
+                }
+                return out;
+            } else if constexpr (std::is_same_v<T, MeltClause>) {
+                MeltClause out;
+                out.id_fields.reserve(c.id_fields.size());
+                for (const auto& f : c.id_fields) {
+                    out.id_fields.push_back(clone_field(f));
+                }
+                return out;
+            } else if constexpr (std::is_same_v<T, ModelClause>) {
+                ModelClause out{.formula = c.formula};
+                out.params.reserve(c.params.size());
+                for (const auto& p : c.params) {
+                    out.params.push_back(ModelParam{.name = p.name, .value = clone_expr(*p.value)});
+                }
+                return out;
+            } else {
+                return Clause{c};
+            }
+        },
+        clause);
+}
+
+auto clone_expr(const Expr& expr) -> ExprPtr {
+    return std::visit(
+        [](const auto& node) -> ExprPtr {
+            using T = std::decay_t<decltype(node)>;
+            auto out = std::make_unique<Expr>();
+            if constexpr (std::is_same_v<T, IdentifierExpr> || std::is_same_v<T, LiteralExpr>) {
+                out->node = node;
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                CallExpr call{.callee = node.callee};
+                call.args.reserve(node.args.size());
+                for (const auto& arg : node.args) {
+                    call.args.push_back(clone_expr(*arg));
+                }
+                call.named_args.reserve(node.named_args.size());
+                for (const auto& named : node.named_args) {
+                    call.named_args.push_back(
+                        NamedArg{.name = named.name, .value = clone_expr(*named.value)});
+                }
+                out->node = std::move(call);
+            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                out->node = UnaryExpr{.op = node.op, .expr = clone_expr(*node.expr)};
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                out->node = BinaryExpr{
+                    .op = node.op,
+                    .left = clone_expr(*node.left),
+                    .right = clone_expr(*node.right),
+                };
+            } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                out->node = GroupExpr{.expr = clone_expr(*node.expr)};
+            } else if constexpr (std::is_same_v<T, BlockExpr>) {
+                BlockExpr block{.base = clone_expr(*node.base)};
+                block.clauses.reserve(node.clauses.size());
+                for (const auto& clause : node.clauses) {
+                    block.clauses.push_back(clone_clause(clause));
+                }
+                out->node = std::move(block);
+            } else if constexpr (std::is_same_v<T, JoinExpr>) {
+                JoinExpr join{
+                    .kind = node.kind,
+                    .left = clone_expr(*node.left),
+                    .right = clone_expr(*node.right),
+                    .keys = node.keys,
+                };
+                if (node.predicate.has_value()) {
+                    join.predicate = clone_expr(**node.predicate);
+                }
+                out->node = std::move(join);
+            } else if constexpr (std::is_same_v<T, StreamExpr>) {
+                StreamExpr stream{
+                    .source = clone_expr(*node.source),
+                    .sink_callee = node.sink_callee,
+                };
+                stream.transform.reserve(node.transform.size());
+                for (const auto& clause : node.transform) {
+                    stream.transform.push_back(clone_clause(clause));
+                }
+                stream.sink_args.reserve(node.sink_args.size());
+                for (const auto& arg : node.sink_args) {
+                    stream.sink_args.push_back(clone_expr(*arg));
+                }
+                out->node = std::move(stream);
+            } else if constexpr (std::is_same_v<T, ArrayLiteralExpr>) {
+                ArrayLiteralExpr arr;
+                arr.elements.reserve(node.elements.size());
+                for (const auto& elem : node.elements) {
+                    arr.elements.push_back(clone_expr(*elem));
+                }
+                out->node = std::move(arr);
+            } else {
+                TableExpr table;
+                table.columns.reserve(node.columns.size());
+                for (const auto& col : node.columns) {
+                    table.columns.push_back(
+                        TableColumnDef{.name = col.name, .expr = clone_expr(*col.expr)});
+                }
+                out->node = std::move(table);
+            }
+            return out;
+        },
+        expr.node);
+}
+
+auto extract_string_list(const Expr& expr) -> std::optional<std::vector<std::string>> {
+    const auto* array = std::get_if<ArrayLiteralExpr>(&expr.node);
+    if (array == nullptr) {
+        return std::nullopt;
+    }
+    std::vector<std::string> values;
+    values.reserve(array->elements.size());
+    for (const auto& elem : array->elements) {
+        const auto* lit = std::get_if<LiteralExpr>(&elem->node);
+        if (lit == nullptr) {
+            return std::nullopt;
+        }
+        const auto* text = std::get_if<std::string>(&lit->value);
+        if (text == nullptr) {
+            return std::nullopt;
+        }
+        values.push_back(*text);
+    }
+    return values;
+}
+
+auto compile_value_as_bool(const CompileTimeValue& value) -> std::optional<bool> {
+    if (const auto* b = std::get_if<bool>(&value.value)) {
+        return *b;
+    }
+    return std::nullopt;
+}
+
+auto compile_value_as_int(const CompileTimeValue& value) -> std::optional<std::int64_t> {
+    if (const auto* i = std::get_if<std::int64_t>(&value.value)) {
+        return *i;
+    }
+    return std::nullopt;
+}
+
+auto compile_values_equal(const CompileTimeValue& lhs, const CompileTimeValue& rhs) -> bool {
+    return lhs.value == rhs.value;
+}
+
+auto eval_compile_expr(const Expr& expr,
+                       const std::unordered_map<std::string, CompileTimeValue>& env)
+    -> std::expected<CompileTimeValue, LowerError> {
+    return std::visit(
+        [&](const auto& node) -> std::expected<CompileTimeValue, LowerError> {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, IdentifierExpr>) {
+                auto it = env.find(node.name);
+                if (it == env.end()) {
+                    return std::unexpected(
+                        LowerError{.message = "unknown compile-time map variable: " + node.name});
+                }
+                return it->second;
+            } else if constexpr (std::is_same_v<T, LiteralExpr>) {
+                if (const auto* i = std::get_if<std::int64_t>(&node.value)) {
+                    return CompileTimeValue{.value = *i};
+                }
+                if (const auto* b = std::get_if<bool>(&node.value)) {
+                    return CompileTimeValue{.value = *b};
+                }
+                if (const auto* s = std::get_if<std::string>(&node.value)) {
+                    return CompileTimeValue{.value = *s};
+                }
+                return std::unexpected(
+                    LowerError{.message = "unsupported literal in compile-time map expression"});
+            } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                return eval_compile_expr(*node.expr, env);
+            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                auto inner = eval_compile_expr(*node.expr, env);
+                if (!inner.has_value()) {
+                    return inner;
+                }
+                if (node.op == UnaryOp::Not) {
+                    auto b = compile_value_as_bool(*inner);
+                    if (!b.has_value()) {
+                        return std::unexpected(LowerError{
+                            .message = "compile-time map 'where' expects boolean expression"});
+                    }
+                    return CompileTimeValue{.value = !*b};
+                }
+                if (node.op == UnaryOp::Negate) {
+                    auto i = compile_value_as_int(*inner);
+                    if (!i.has_value()) {
+                        return std::unexpected(LowerError{
+                            .message = "compile-time map arithmetic expects integer operands"});
+                    }
+                    return CompileTimeValue{.value = -*i};
+                }
+                return std::unexpected(
+                    LowerError{.message = "unsupported unary operator in compile-time map where"});
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                auto left = eval_compile_expr(*node.left, env);
+                if (!left.has_value()) {
+                    return left;
+                }
+                auto right = eval_compile_expr(*node.right, env);
+                if (!right.has_value()) {
+                    return right;
+                }
+                switch (node.op) {
+                    case BinaryOp::And: {
+                        auto lb = compile_value_as_bool(*left);
+                        auto rb = compile_value_as_bool(*right);
+                        if (!lb.has_value() || !rb.has_value()) {
+                            return std::unexpected(LowerError{
+                                .message = "compile-time map 'where' expects boolean operands"});
+                        }
+                        return CompileTimeValue{.value = *lb && *rb};
+                    }
+                    case BinaryOp::Or: {
+                        auto lb = compile_value_as_bool(*left);
+                        auto rb = compile_value_as_bool(*right);
+                        if (!lb.has_value() || !rb.has_value()) {
+                            return std::unexpected(LowerError{
+                                .message = "compile-time map 'where' expects boolean operands"});
+                        }
+                        return CompileTimeValue{.value = *lb || *rb};
+                    }
+                    case BinaryOp::Eq:
+                        return CompileTimeValue{
+                            .value = compile_values_equal(*left, *right),
+                        };
+                    case BinaryOp::Ne:
+                        return CompileTimeValue{
+                            .value = !compile_values_equal(*left, *right),
+                        };
+                    case BinaryOp::Lt:
+                    case BinaryOp::Le:
+                    case BinaryOp::Gt:
+                    case BinaryOp::Ge:
+                    case BinaryOp::Add:
+                    case BinaryOp::Sub: {
+                        auto li = compile_value_as_int(*left);
+                        auto ri = compile_value_as_int(*right);
+                        if (!li.has_value() || !ri.has_value()) {
+                            return std::unexpected(LowerError{
+                                .message = "compile-time map arithmetic expects integer operands"});
+                        }
+                        switch (node.op) {
+                            case BinaryOp::Lt:
+                                return CompileTimeValue{.value = *li < *ri};
+                            case BinaryOp::Le:
+                                return CompileTimeValue{.value = *li <= *ri};
+                            case BinaryOp::Gt:
+                                return CompileTimeValue{.value = *li > *ri};
+                            case BinaryOp::Ge:
+                                return CompileTimeValue{.value = *li >= *ri};
+                            case BinaryOp::Add:
+                                return CompileTimeValue{.value = *li + *ri};
+                            case BinaryOp::Sub:
+                                return CompileTimeValue{.value = *li - *ri};
+                            default:
+                                break;
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                return std::unexpected(
+                    LowerError{.message = "unsupported operator in compile-time map where"});
+            } else {
+                return std::unexpected(
+                    LowerError{.message = "unsupported expression in compile-time map where"});
+            }
+        },
+        expr.node);
+}
+
+auto render_alias_template(const std::string& alias_template,
+                           const std::unordered_map<std::string, CompileTimeValue>& env)
+    -> std::expected<std::string, LowerError> {
+    std::string rendered;
+    rendered.reserve(alias_template.size());
+    for (std::size_t i = 0; i < alias_template.size(); ++i) {
+        if (alias_template[i] == '$' && i + 1 < alias_template.size() &&
+            alias_template[i + 1] == '{') {
+            std::size_t end = alias_template.find('}', i + 2);
+            if (end == std::string::npos) {
+                return std::unexpected(
+                    LowerError{.message = "unterminated ${...} in map field alias"});
+            }
+            std::string key = alias_template.substr(i + 2, end - (i + 2));
+            auto it = env.find(key);
+            if (it == env.end()) {
+                return std::unexpected(
+                    LowerError{.message = "unknown compile-time map variable in alias: " + key});
+            }
+            if (const auto* s = std::get_if<std::string>(&it->second.value)) {
+                rendered += *s;
+            } else if (const auto* n = std::get_if<std::int64_t>(&it->second.value)) {
+                rendered += std::to_string(*n);
+            } else if (const auto* b = std::get_if<bool>(&it->second.value)) {
+                rendered += *b ? "true" : "false";
+            }
+            i = end;
+            continue;
+        }
+        rendered.push_back(alias_template[i]);
+    }
+    return rendered;
+}
+
+auto substitute_map_expr(const Expr& expr,
+                         const std::unordered_map<std::string, CompileTimeValue>& env)
+    -> std::expected<ExprPtr, LowerError> {
+    return std::visit(
+        [&](const auto& node) -> std::expected<ExprPtr, LowerError> {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, IdentifierExpr> || std::is_same_v<T, LiteralExpr>) {
+                auto out = std::make_unique<Expr>();
+                out->node = node;
+                return out;
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                if (node.callee == "get" && node.args.size() == 1 && node.named_args.empty()) {
+                    if (const auto* ident = std::get_if<IdentifierExpr>(&node.args[0]->node)) {
+                        auto it = env.find(ident->name);
+                        if (it == env.end()) {
+                            return std::unexpected(LowerError{
+                                .message =
+                                    "unknown compile-time map variable in get(): " + ident->name});
+                        }
+                        const auto* name = std::get_if<std::string>(&it->second.value);
+                        if (name == nullptr) {
+                            return std::unexpected(LowerError{
+                                .message = "get() expects a compile-time string variable"});
+                        }
+                        auto out = std::make_unique<Expr>();
+                        out->node = IdentifierExpr{.name = *name};
+                        return out;
+                    }
+                    if (const auto* lit = std::get_if<LiteralExpr>(&node.args[0]->node)) {
+                        if (const auto* name = std::get_if<std::string>(&lit->value)) {
+                            auto out = std::make_unique<Expr>();
+                            out->node = IdentifierExpr{.name = *name};
+                            return out;
+                        }
+                    }
+                    return std::unexpected(LowerError{
+                        .message =
+                            "get() inside compile-time map expects an identifier or string"});
+                }
+                CallExpr call{.callee = node.callee};
+                call.args.reserve(node.args.size());
+                for (const auto& arg : node.args) {
+                    auto lowered = substitute_map_expr(*arg, env);
+                    if (!lowered.has_value()) {
+                        return lowered;
+                    }
+                    call.args.push_back(std::move(*lowered));
+                }
+                call.named_args.reserve(node.named_args.size());
+                for (const auto& named : node.named_args) {
+                    auto lowered = substitute_map_expr(*named.value, env);
+                    if (!lowered.has_value()) {
+                        return lowered;
+                    }
+                    call.named_args.push_back(
+                        NamedArg{.name = named.name, .value = std::move(*lowered)});
+                }
+                auto out = std::make_unique<Expr>();
+                out->node = std::move(call);
+                return out;
+            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                auto inner = substitute_map_expr(*node.expr, env);
+                if (!inner.has_value()) {
+                    return inner;
+                }
+                auto out = std::make_unique<Expr>();
+                out->node = UnaryExpr{.op = node.op, .expr = std::move(*inner)};
+                return out;
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                auto left = substitute_map_expr(*node.left, env);
+                if (!left.has_value()) {
+                    return left;
+                }
+                auto right = substitute_map_expr(*node.right, env);
+                if (!right.has_value()) {
+                    return right;
+                }
+                auto out = std::make_unique<Expr>();
+                out->node = BinaryExpr{
+                    .op = node.op,
+                    .left = std::move(*left),
+                    .right = std::move(*right),
+                };
+                return out;
+            } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                auto inner = substitute_map_expr(*node.expr, env);
+                if (!inner.has_value()) {
+                    return inner;
+                }
+                auto out = std::make_unique<Expr>();
+                out->node = GroupExpr{.expr = std::move(*inner)};
+                return out;
+            } else {
+                auto cloned = clone_expr(expr);
+                return cloned;
+            }
+        },
+        expr.node);
+}
+
 auto to_ir_effect_summary(const EffectSummary& src) -> ir::EffectSummary {
     return ir::EffectSummary{
         .mask = src.mask,
@@ -67,10 +559,13 @@ auto build_optimization_context(const EffectAnalysis& analysis) -> ir::Optimizat
 
 class Lowerer {
    public:
-    explicit Lowerer(std::unordered_map<std::string, ir::NodePtr>* bindings,
-                     std::unordered_set<std::string> initial_table_externs = {},
-                     std::unordered_set<std::string> initial_sink_externs = {})
+    explicit Lowerer(
+        std::unordered_map<std::string, ir::NodePtr>* bindings,
+        std::unordered_map<std::string, std::vector<std::string>> initial_compile_time_lists = {},
+        std::unordered_set<std::string> initial_table_externs = {},
+        std::unordered_set<std::string> initial_sink_externs = {})
         : bindings_(bindings),
+          compile_time_lists_(std::move(initial_compile_time_lists)),
           table_externs_(std::move(initial_table_externs)),
           sink_externs_(std::move(initial_sink_externs)) {}
 
@@ -102,6 +597,12 @@ class Lowerer {
             }
             if (std::holds_alternative<LetStmt>(stmt)) {
                 const auto& let_stmt = std::get<LetStmt>(stmt);
+                if (auto string_list = extract_string_list(*let_stmt.value);
+                    string_list.has_value()) {
+                    compile_time_lists_[let_stmt.name] = std::move(*string_list);
+                } else {
+                    compile_time_lists_.erase(let_stmt.name);
+                }
                 auto value = lower_expr(*let_stmt.value);
                 if (!value.has_value()) {
                     // Scalar let bindings are handled by the REPL/tooling layer;
@@ -109,6 +610,9 @@ class Lowerer {
                     // expressions can still be lowered.
                     auto scalar = lower_expr_to_ir(*let_stmt.value);
                     if (!scalar.has_value()) {
+                        if (extract_string_list(*let_stmt.value).has_value()) {
+                            continue;
+                        }
                         return std::unexpected(value.error());
                     }
                     continue;
@@ -403,6 +907,85 @@ class Lowerer {
         return node;
     }
 
+    auto expand_map_fields(const std::vector<Field>& base_fields,
+                           const std::vector<MapField>& map_fields)
+        -> std::expected<std::vector<Field>, LowerError> {
+        std::vector<Field> expanded;
+        expanded.reserve(base_fields.size() + map_fields.size());
+        for (const auto& field : base_fields) {
+            expanded.push_back(clone_field(field));
+        }
+        for (const auto& map_field : map_fields) {
+            auto generated = expand_one_map_field(map_field);
+            if (!generated.has_value()) {
+                return std::unexpected(generated.error());
+            }
+            for (auto& field : *generated) {
+                expanded.push_back(std::move(field));
+            }
+        }
+        return expanded;
+    }
+
+    auto expand_one_map_field(const MapField& map_field)
+        -> std::expected<std::vector<Field>, LowerError> {
+        std::vector<Field> expanded;
+        std::unordered_map<std::string, CompileTimeValue> env;
+        auto step = [&](auto&& self, std::size_t binding_idx) -> std::expected<void, LowerError> {
+            if (binding_idx == map_field.bindings.size()) {
+                if (map_field.where_expr) {
+                    auto where_value = eval_compile_expr(*map_field.where_expr, env);
+                    if (!where_value.has_value()) {
+                        return std::unexpected(where_value.error());
+                    }
+                    auto keep = compile_value_as_bool(*where_value);
+                    if (!keep.has_value()) {
+                        return std::unexpected(LowerError{
+                            .message = "compile-time map where-clause must evaluate to Bool"});
+                    }
+                    if (!*keep) {
+                        return {};
+                    }
+                }
+                auto alias = render_alias_template(map_field.alias_template, env);
+                if (!alias.has_value()) {
+                    return std::unexpected(alias.error());
+                }
+                auto expr = substitute_map_expr(*map_field.expr, env);
+                if (!expr.has_value()) {
+                    return std::unexpected(expr.error());
+                }
+                expanded.push_back(Field{.name = std::move(*alias), .expr = std::move(*expr)});
+                return {};
+            }
+
+            const auto& binding = map_field.bindings[binding_idx];
+            auto it = compile_time_lists_.find(binding.source_name);
+            if (it == compile_time_lists_.end()) {
+                return std::unexpected(LowerError{
+                    .message = "unknown compile-time string list in map: " + binding.source_name});
+            }
+            for (std::size_t idx = 0; idx < it->second.size(); ++idx) {
+                env[binding.value_name] = CompileTimeValue{.value = it->second[idx]};
+                if (binding.index_name.has_value()) {
+                    env[*binding.index_name] =
+                        CompileTimeValue{.value = static_cast<std::int64_t>(idx)};
+                }
+                auto next = self(self, binding_idx + 1);
+                if (!next.has_value()) {
+                    return next;
+                }
+            }
+            return {};
+        };
+
+        auto status = step(step, 0);
+        if (!status.has_value()) {
+            return std::unexpected(status.error());
+        }
+        return expanded;
+    }
+
     auto lower_block(const BlockExpr& block) -> LowerResult {
         return lower_block(*block.base, block.clauses);
     }
@@ -508,16 +1091,25 @@ class Lowerer {
             node = std::move(rename_node);
         }
 
+        std::vector<Field> expanded_select_fields;
+        if (state.select) {
+            auto expanded = expand_map_fields(state.select->fields, state.select->map_fields);
+            if (!expanded.has_value()) {
+                return std::unexpected(expanded.error());
+            }
+            expanded_select_fields = std::move(*expanded);
+        }
+
         if (!state.resample && !state.melt && !state.dcast && state.select &&
-            (state.by || select_has_aggregate(*state.select))) {
-            auto aggregate = lower_aggregate(state.by, *state.select, std::move(node));
+            (state.by || select_has_aggregate(expanded_select_fields))) {
+            auto aggregate = lower_aggregate(state.by, expanded_select_fields, std::move(node));
             if (!aggregate.has_value()) {
                 return std::unexpected(aggregate.error());
             }
             node = std::move(aggregate.value());
         } else if (!state.resample && !state.melt && !state.dcast && state.select) {
-            auto project = lower_select_projection(state.select->fields, state.select->tuple_fields,
-                                                   std::move(node));
+            auto project = lower_select_projection(expanded_select_fields,
+                                                   state.select->tuple_fields, std::move(node));
             if (!project.has_value()) {
                 return std::unexpected(project.error());
             }
@@ -533,7 +1125,12 @@ class Lowerer {
         }
 
         if (state.update) {
-            auto update = lower_update(state.by, *state.update);
+            auto expanded = expand_map_fields(state.update->fields, state.update->map_fields);
+            if (!expanded.has_value()) {
+                return std::unexpected(expanded.error());
+            }
+            auto update = lower_update(state.by, *expanded, state.update->tuple_fields,
+                                       state.update->merge_expr);
             if (!update.has_value()) {
                 return std::unexpected(update.error());
             }
@@ -980,11 +1577,12 @@ class Lowerer {
         return project;
     }
 
-    auto lower_update(const ByClause* by, const UpdateClause& clause)
+    auto lower_update(const ByClause* by, const std::vector<Field>& clause_fields,
+                      const std::vector<TupleField>& tuple_fields, const ExprPtr& merge_expr)
         -> std::expected<ir::NodePtr, LowerError> {
         // `update = expr`: merge all columns of the result table.
-        if (clause.merge_expr) {
-            auto src = lower_expr(*clause.merge_expr);
+        if (merge_expr) {
+            auto src = lower_expr(*merge_expr);
             if (!src.has_value()) {
                 return std::unexpected(src.error());
             }
@@ -994,7 +1592,7 @@ class Lowerer {
             return builder_.update({}, std::move(tuple_specs));
         }
         std::vector<ir::FieldSpec> fields;
-        for (const auto& field : clause.fields) {
+        for (const auto& field : clause_fields) {
             if (field.expr == nullptr) {
                 return std::unexpected(LowerError{.message = "update field requires expression"});
             }
@@ -1008,7 +1606,7 @@ class Lowerer {
             });
         }
         std::vector<ir::TupleFieldSpec> tuple_specs;
-        for (const auto& tf : clause.tuple_fields) {
+        for (const auto& tf : tuple_fields) {
             auto src = lower_expr(*tf.expr);
             if (!src.has_value()) {
                 return std::unexpected(src.error());
@@ -1166,8 +1764,8 @@ class Lowerer {
         return std::unexpected(LowerError{.message = "unsupported expression"});
     }
 
-    auto lower_aggregate(const ByClause* by, const SelectClause& select, ir::NodePtr child)
-        -> std::expected<ir::NodePtr, LowerError> {
+    auto lower_aggregate(const ByClause* by, const std::vector<Field>& select_fields,
+                         ir::NodePtr child) -> std::expected<ir::NodePtr, LowerError> {
         std::vector<ir::ColumnRef> group_by;
         if (by != nullptr) {
             auto group_by_result = lower_group_by(*by);
@@ -1396,7 +1994,7 @@ class Lowerer {
             return std::unexpected(LowerError{.message = "unsupported aggregate expression"});
         };
 
-        for (const auto& field : select.fields) {
+        for (const auto& field : select_fields) {
             if (field.expr == nullptr) {
                 if (!group_keys.contains(field.name)) {
                     return std::unexpected(LowerError{
@@ -1551,7 +2149,7 @@ class Lowerer {
         return node;
     }
 
-    static auto select_has_aggregate(const SelectClause& select) -> bool {
+    static auto select_has_aggregate(const std::vector<Field>& fields) -> bool {
         std::function<bool(const Expr&)> has_agg;
         has_agg = [&](const Expr& expr) -> bool {
             if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
@@ -1570,7 +2168,7 @@ class Lowerer {
             return false;
         };
 
-        return std::ranges::any_of(select.fields, [&](const auto& field) {
+        return std::ranges::any_of(fields, [&](const auto& field) {
             return field.expr != nullptr && has_agg(*field.expr);
         });
     }
@@ -2174,6 +2772,7 @@ class Lowerer {
 
     ir::Builder builder_;
     std::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
+    std::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     std::unordered_set<std::string> table_externs_;
     std::unordered_set<std::string> sink_externs_;
 };
@@ -2201,7 +2800,8 @@ auto lower(const Program& program) -> LowerResult {
 }
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
-    Lowerer lowerer(&context.bindings, context.table_externs, context.sink_externs);
+    Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,
+                    context.sink_externs);
     return lowerer.lower_expression(expr);
 }
 

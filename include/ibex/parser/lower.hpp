@@ -18,6 +18,7 @@ using LowerResult = std::expected<ir::NodePtr, LowerError>;
 
 struct LowerContext {
     std::unordered_map<std::string, ir::NodePtr> bindings;
+    std::unordered_map<std::string, std::vector<std::string>> compile_time_lists;
     /// Names of extern functions whose return type is DataFrame/TimeFrame.
     /// Populate before calling lower_expr so that tuple-LHS RHS expressions
     /// that call table-returning externs are lowered correctly.

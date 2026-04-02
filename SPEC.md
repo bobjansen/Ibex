@@ -914,6 +914,58 @@ trades[select { price * 2 }]    // ERROR: computed field must be named
 trades[select { doubled = price * 2 }]  // OK
 ```
 
+**Compile-time `map` field generation**
+
+Inside braced `select` and `update` blocks, a `map` item expands to one or
+more ordinary named fields at compile time:
+
+```
+let measures = ["price", "fee"];
+
+trades[select {
+    symbol,
+    map m in measures => `avg_${m}` = mean(get(m))
+}, by symbol];
+```
+
+This is equivalent to:
+
+```
+trades[select {
+    symbol,
+    avg_price = mean(price),
+    avg_fee = mean(fee)
+}, by symbol];
+```
+
+Rules:
+
+- `map` is only valid inside braced `select { ... }` and `update { ... }`
+  field lists.
+- Each `map` item expands to one or more named fields; the body must have the
+  form ``alias_template = expr``.
+- The source after `in` must be an earlier `let` binding whose RHS is a string
+  array literal (for example `let cols = ["a", "b"];`).
+- Bindings may be unindexed (`c in cols`) or indexed (`(i, c) in cols`).
+- Multiple bindings form a Cartesian product.
+- An optional `where` clause filters expansions using compile-time binding
+  variables.
+- Backtick aliases may interpolate compile-time variables with `${name}`.
+- `get(name)` is only special inside a `map` body; it resolves a compile-time
+  string variable to an input column reference.
+
+Example:
+
+```
+let price_cols = ["ask_price", "bid_price", "wap"];
+
+book[update {
+    map (i, a) in price_cols, (j, b) in price_cols
+        where i > j
+        => `${a}_${b}_imb` = (get(a) - get(b)) / (get(a) + get(b))
+}];
+```
+
 **Tuple-LHS assignment in `select`**
 
 When the RHS of an assignment evaluates to a multi-column DataFrame, the
@@ -950,6 +1002,16 @@ trades[update { log_price = log(price) }]
 If `name` matches an existing column, it is replaced. If `name` is new, it is
 appended. The output schema is the input schema with the specified
 modifications.
+
+`update` supports the same compile-time `map` form as `select`:
+
+```
+let cols = ["bid", "ask"];
+
+quotes[update {
+    map c in cols => `abs_${c}` = abs(get(c))
+}];
+```
 
 **Tuple-LHS assignment in `update`**
 
@@ -2210,6 +2272,8 @@ extern implementations. The recommended path for custom scalar logic is
 | `abs(x)`        | `Numeric -> Numeric`               |
 | `log(x)`        | `Numeric -> Float64`               |
 | `sqrt(x)`       | `Numeric -> Float64`               |
+| `pmin(x, y, ...)`| `Comparable{2+} -> Comparable`    |
+| `pmax(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `year(t)`       | `Date|Timestamp -> Int32`          |
 | `month(t)`      | `Date|Timestamp -> Int32`          |
 | `day(t)`        | `Date|Timestamp -> Int32`          |
@@ -2232,6 +2296,12 @@ extern implementations. The recommended path for custom scalar logic is
 `bankers` uses IEEE 754 default rounding (`FE_TONEAREST`): 0.5 rounds to the
 nearest even integer, so 2.5 → 2 and 3.5 → 4. This is the statistically
 unbiased choice for repeated rounding.
+
+`pmin(x, y, ...)` and `pmax(x, y, ...)` with 2 or more arguments are row-wise
+scalar functions. Aggregate `min(col)` / `max(col)` remain aggregate-only,
+for contexts such as `select { hi = max(price) }, by symbol`. Row-wise
+`pmin` / `pmax` require comparable arguments of one type; `Int64` and
+`Float64` may be mixed and widen to `Float64`.
 
 Passing an `Int` or `Int` column is a type error. An unknown mode identifier
 is a runtime error.

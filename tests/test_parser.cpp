@@ -560,6 +560,61 @@ TEST_CASE("Parse update without braces") {
     REQUIRE(update.fields[0].expr != nullptr);
 }
 
+TEST_CASE("Parse select map field") {
+    const char* source = R"(
+let cols = ["price", "fee"];
+df[select { map c in cols => `avg_${c}` = mean(get(c)) }, by symbol];
+)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 2);
+
+    const auto& stmt = result->statements[1];
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 2);
+
+    const auto& select = std::get<SelectClause>(block.clauses[0]);
+    REQUIRE(select.fields.empty());
+    REQUIRE(select.map_fields.size() == 1);
+    REQUIRE(select.map_fields[0].bindings.size() == 1);
+    REQUIRE(select.map_fields[0].bindings[0].value_name == "c");
+    REQUIRE_FALSE(select.map_fields[0].bindings[0].index_name.has_value());
+    REQUIRE(select.map_fields[0].bindings[0].source_name == "cols");
+    REQUIRE(select.map_fields[0].alias_template == "avg_${c}");
+    REQUIRE(select.map_fields[0].expr != nullptr);
+}
+
+TEST_CASE("Parse update map field with indexed bindings and where clause") {
+    const char* source = R"(
+let cols = ["ask_price", "bid_price", "wap"];
+df[update {
+    map (i, a) in cols, (j, b) in cols where i > j => `${a}_${b}_imb` = (get(a) - get(b)) / (get(a) + get(b))
+}];
+)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 2);
+
+    const auto& stmt = result->statements[1];
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.empty());
+    REQUIRE(update.map_fields.size() == 1);
+    REQUIRE(update.map_fields[0].bindings.size() == 2);
+    REQUIRE(update.map_fields[0].bindings[0].index_name == "i");
+    REQUIRE(update.map_fields[0].bindings[0].value_name == "a");
+    REQUIRE(update.map_fields[0].bindings[1].index_name == "j");
+    REQUIRE(update.map_fields[0].bindings[1].value_name == "b");
+    REQUIRE(update.map_fields[0].where_expr != nullptr);
+    REQUIRE(update.map_fields[0].alias_template == "${a}_${b}_imb");
+}
+
 TEST_CASE("Parse quoted identifiers in column references") {
     const char* source = "df[filter `Sepal.Length` > 10, select { `Sepal.Length` }];";
 

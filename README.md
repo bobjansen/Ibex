@@ -25,6 +25,18 @@ let annotated = prices[update { price_k = price / 1000.0 }];
 let enriched = prices join ohlc on symbol;
 ```
 
+Compile-time field generation is available inside braced `select` and `update`
+blocks:
+
+```ibex
+let measures = ["price", "fee"];
+
+trades[select {
+    symbol,
+    map m in measures => `avg_${m}` = mean(get(m))
+}, by symbol];
+```
+
 ## IPython and Jupyter
 
 Ibex now has a Python bridge that returns `pyarrow.Table` objects and an

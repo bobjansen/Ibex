@@ -510,6 +510,9 @@ class Column<bool> {
 
        public:
         explicit Reference(word_type* word, word_type mask) : word_(word), mask_(mask) {}
+        Reference(const Reference&) = default;
+        Reference(Reference&&) = default;
+        ~Reference() = default;
 
         auto operator=(bool v) -> Reference& {
             if (v) {
@@ -520,7 +523,12 @@ class Column<bool> {
             return *this;
         }
 
+        // NOLINTNEXTLINE(cert-oop54-cpp, bugprone-unhandled-self-assignment)
         auto operator=(const Reference& other) -> Reference& {
+            return *this = static_cast<bool>(other);
+        }
+
+        auto operator=(Reference&& other) noexcept -> Reference& {
             return *this = static_cast<bool>(other);
         }
 

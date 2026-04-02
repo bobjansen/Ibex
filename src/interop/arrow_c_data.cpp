@@ -1,3 +1,5 @@
+// Arrow C Data Interface requires C-style arrays for ABI compatibility.
+// NOLINTBEGIN(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
 #include <ibex/interop/arrow_c_data.hpp>
 
 #include <bit>
@@ -6,7 +8,6 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -218,7 +219,7 @@ auto export_column_schema(const runtime::ColumnEntry& entry, ArrowSchema* out_sc
                 finalize_schema(state->dictionary.get(), std::move(dict_state));
                 finalize_schema(out_schema, std::move(state));
                 out_schema->flags =
-                    (nullable ? kArrowFlagNullable : 0) | kArrowFlagDictionaryOrdered * 0;
+                    (nullable ? kArrowFlagNullable : 0) | (kArrowFlagDictionaryOrdered * 0);
             } else {
                 return std::unexpected("unsupported column type for Arrow schema export");
             }
@@ -346,7 +347,7 @@ auto ensure_export_target(ArrowArray* out_array, ArrowSchema* out_schema)
     return {};
 }
 
-auto export_table_impl(std::shared_ptr<const runtime::Table> table, ArrowArray* out_array,
+auto export_table_impl(const std::shared_ptr<const runtime::Table>& table, ArrowArray* out_array,
                        ArrowSchema* out_schema) -> std::expected<void, std::string> {
     auto ready = ensure_export_target(out_array, out_schema);
     if (!ready) {
@@ -445,12 +446,14 @@ auto export_table_to_arrow(const runtime::Table& table, ArrowArray* out_array,
     return export_table_impl(std::make_shared<runtime::Table>(table), out_array, out_schema);
 }
 
-auto export_table_to_arrow(std::shared_ptr<const runtime::Table> table, ArrowArray* out_array,
-                           ArrowSchema* out_schema) -> std::expected<void, std::string> {
+auto export_table_to_arrow(const std::shared_ptr<const runtime::Table>& table,
+                           ArrowArray* out_array, ArrowSchema* out_schema)
+    -> std::expected<void, std::string> {
     if (!table) {
         return std::unexpected("Arrow export requires a non-null table");
     }
-    return export_table_impl(std::move(table), out_array, out_schema);
+    return export_table_impl(table, out_array, out_schema);
 }
 
 }  // namespace ibex::interop
+// NOLINTEND(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)

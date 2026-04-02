@@ -186,6 +186,10 @@ struct HeadClause {
     std::int64_t count = 0;
 };
 
+struct TailClause {
+    std::int64_t count = 0;
+};
+
 struct ByClause {
     std::vector<Field> keys;
     bool is_braced = false;
@@ -251,8 +255,8 @@ struct ModelClause {
 
 using Clause =
     std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
-                 OrderClause, HeadClause, ByClause, WindowClause, ResampleClause, MeltClause,
-                 DcastClause, CovClause, CorrClause, TransposeClause, ModelClause>;
+                 OrderClause, HeadClause, TailClause, ByClause, WindowClause, ResampleClause,
+                 MeltClause, DcastClause, CovClause, CorrClause, TransposeClause, ModelClause>;
 
 struct BlockExpr {
     ExprPtr base;

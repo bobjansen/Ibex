@@ -574,8 +574,8 @@ trades[
       <!-- 5. Order, Head & Distinct -->
       <div class="tour-item">
         <div class="tour-text">
-          <span class="tour-tag">Order, Head &amp; Distinct</span>
-          <h3>Sort, keep the first rows, and deduplicate with explicit intent.</h3>
+          <span class="tour-tag">Order, Head, Tail &amp; Distinct</span>
+          <h3>Sort, keep the first or last rows, and deduplicate with explicit intent.</h3>
           <p>
             <code>order</code> accepts a single column, a multi-key block with
             <code>asc</code>&thinsp;/&thinsp;<code>desc</code> annotations, or no
@@ -583,8 +583,8 @@ trades[
           </p>
           <p>
             <code>head</code> keeps the first <code>n</code> rows in the current
-            order, or the first <code>n</code> rows per group when combined with
-            <code>by</code>.
+            order, while <code>tail</code> keeps the last <code>n</code> rows.
+            Both work per group when combined with <code>by</code>.
           </p>
           <p>
             <code>distinct</code> deduplicates on a single column or a set.
@@ -602,6 +602,12 @@ results[<span class="kw">head</span> <span class="num">10</span>];
 
 <span class="cm">// Top 3 rows per symbol after sorting</span>
 results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }, <span class="kw">head</span> <span class="num">3</span>, <span class="kw">by</span> symbol];
+
+<span class="cm">// Keep the last 10 rows in current order</span>
+results[<span class="kw">tail</span> <span class="num">10</span>];
+
+<span class="cm">// Bottom 3 rows per symbol after sorting</span>
+results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }, <span class="kw">tail</span> <span class="num">3</span>, <span class="kw">by</span> symbol];
 
 <span class="cm">// Sort by all columns in schema order</span>
 iris[<span class="kw">order</span>];

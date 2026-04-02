@@ -307,6 +307,23 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Tail: {
+            const auto& tail = static_cast<const ir::TailNode&>(node);
+            auto child = emit_node(require_single_child(tail, "TailNode"));
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::tail(" << child << ", " << tail.count()
+                  << ", {";
+            bool first = true;
+            for (const auto& key : tail.group_by()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(key.name) << '"';
+            }
+            *out_ << "});\n";
+            return var;
+        }
+
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);
             auto child = emit_node(require_single_child(agg, "AggregateNode"));

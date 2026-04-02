@@ -100,6 +100,8 @@ auto clone_clause(const Clause& clause) -> Clause {
                     out.fields.push_back(clone_field(f));
                 }
                 return out;
+            } else if constexpr (std::is_same_v<T, HeadClause>) {
+                return Clause{c};
             } else if constexpr (std::is_same_v<T, ByClause>) {
                 ByClause out{.is_braced = c.is_braced};
                 out.keys.reserve(c.keys.size());
@@ -1013,8 +1015,9 @@ class Lowerer {
         if (state.distinct && state.by) {
             return std::unexpected(LowerError{.message = "distinct cannot be used with by"});
         }
-        if (state.by && !state.select && !state.update && !state.resample && !state.dcast) {
-            return std::unexpected(LowerError{.message = "by requires select or update"});
+        if (state.by && !state.select && !state.update && !state.head && !state.resample &&
+            !state.dcast) {
+            return std::unexpected(LowerError{.message = "by requires select, update, or head"});
         }
         if (state.resample && state.window) {
             return std::unexpected(
@@ -1248,6 +1251,21 @@ class Lowerer {
             node = std::move(model_node);
         }
 
+        if (state.head) {
+            std::vector<ir::ColumnRef> head_group_by;
+            if (state.by != nullptr) {
+                auto group_by_result = lower_group_by(*state.by);
+                if (!group_by_result.has_value()) {
+                    return std::unexpected(group_by_result.error());
+                }
+                head_group_by = std::move(group_by_result.value());
+            }
+            auto head_node = builder_.head(static_cast<std::size_t>(state.head->count),
+                                           std::move(head_group_by));
+            head_node->add_child(std::move(node));
+            node = std::move(head_node);
+        }
+
         return node;
     }
 
@@ -1258,6 +1276,7 @@ class Lowerer {
         const UpdateClause* update = nullptr;
         const RenameClause* rename = nullptr;
         const OrderClause* order = nullptr;
+        const HeadClause* head = nullptr;
         const ByClause* by = nullptr;
         const WindowClause* window = nullptr;
         const ResampleClause* resample = nullptr;
@@ -1316,6 +1335,14 @@ class Lowerer {
                     return false;
                 }
                 order = &std::get<OrderClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<HeadClause>(clause)) {
+                if (head != nullptr) {
+                    error = "duplicate head clause";
+                    return false;
+                }
+                head = &std::get<HeadClause>(clause);
                 return true;
             }
             if (std::holds_alternative<ByClause>(clause)) {
@@ -2554,6 +2581,11 @@ class Lowerer {
             case ir::NodeKind::Order: {
                 const auto& order = static_cast<const ir::OrderNode&>(node);
                 clone = builder_.order(order.keys());
+                break;
+            }
+            case ir::NodeKind::Head: {
+                const auto& head = static_cast<const ir::HeadNode&>(node);
+                clone = builder_.head(head.count(), head.group_by());
                 break;
             }
             case ir::NodeKind::Aggregate: {

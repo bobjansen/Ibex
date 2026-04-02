@@ -199,6 +199,15 @@ auto order(const runtime::Table& t, const std::vector<ir::OrderKey>& keys) -> ru
     return delegate(std::move(order_node), t);
 }
 
+auto head(const runtime::Table& t, std::size_t count, const std::vector<std::string>& group_by)
+    -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto head_node = b.head(count, to_col_refs(group_by));
+    head_node->add_child(std::move(scan_node));
+    return delegate(std::move(head_node), t);
+}
+
 auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                const std::vector<ir::AggSpec>& aggs) -> runtime::Table {
     ir::Builder b;

@@ -13,7 +13,12 @@
 namespace ibex::ir {
 
 /// Unique identifier for IR nodes.
-using NodeId = std::uint64_t;
+struct NodeId {
+    std::uint64_t value;
+
+    auto operator==(const NodeId&) const noexcept -> bool = default;
+    auto operator<=>(const NodeId&) const noexcept = default;
+};
 
 /// Duration type for window specifications (nanoseconds).
 using Duration = std::chrono::nanoseconds;
@@ -25,7 +30,7 @@ using NodePtr = std::unique_ptr<Node>;
 /// Column reference in the IR.
 struct ColumnRef {
     std::string name;
-    NodeId source = 0;
+    NodeId source = {0};
 };
 
 /// Expression node for computed fields.
@@ -200,6 +205,7 @@ enum class NodeKind : std::uint8_t {
     Project,
     Distinct,
     Order,
+    Head,
     Aggregate,
     Update,
     Rename,
@@ -313,6 +319,22 @@ class OrderNode final : public Node {
 
    private:
     std::vector<OrderKey> keys_;
+};
+
+/// Head node: keep the first N rows, optionally per group.
+class HeadNode final : public Node {
+   public:
+    HeadNode(NodeId id, std::size_t count, std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Head, id), count_(count), group_by_(std::move(group_by)) {}
+
+    [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
+    [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
+        return group_by_;
+    }
+
+   private:
+    std::size_t count_;
+    std::vector<ColumnRef> group_by_;
 };
 
 /// Aggregate node: groups and aggregates.

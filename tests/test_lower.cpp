@@ -190,6 +190,36 @@ df[update {
     REQUIRE(update->fields()[2].alias == "wap_bid_price_imb");
 }
 
+TEST_CASE("Lower head to IR") {
+    auto program = require_parse("df[order price desc, head 10];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* head = as_node<ir::HeadNode>(result->get());
+    REQUIRE(head != nullptr);
+    REQUIRE(head->count() == 10);
+    REQUIRE(head->group_by().empty());
+
+    REQUIRE(head->children().size() == 1);
+    const auto* order = as_node<ir::OrderNode>(head->children()[0].get());
+    REQUIRE(order != nullptr);
+    REQUIRE(order->keys().size() == 1);
+    REQUIRE(order->keys()[0].name == "price");
+    REQUIRE(order->keys()[0].ascending == false);
+}
+
+TEST_CASE("Lower grouped head to IR") {
+    auto program = require_parse("df[order score desc, head 3, by symbol];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* head = as_node<ir::HeadNode>(result->get());
+    REQUIRE(head != nullptr);
+    REQUIRE(head->count() == 3);
+    REQUIRE(head->group_by().size() == 1);
+    REQUIRE(head->group_by()[0].name == "symbol");
+}
+
 TEST_CASE("Lowering rejects nested aggregate input") {
     auto program = require_parse("df[select { symbol, bad = sum(mean(price)) }, by symbol];");
     auto result = parser::lower(program);

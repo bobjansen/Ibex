@@ -1682,6 +1682,75 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
     return output;
 }
 
+template <typename Idx>
+auto gather_rows(const Table& input, const std::vector<Idx>& idx,
+                 std::optional<std::vector<ir::OrderKey>> ordering = std::nullopt) -> Table {
+    const std::size_t rows = idx.size();
+    Table output;
+    output.columns.reserve(input.columns.size());
+    for (const auto& entry : input.columns) {
+        ColumnValue gathered = std::visit(
+            [&](const auto& src) -> ColumnValue {
+                using ColT = std::decay_t<decltype(src)>;
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    std::vector<Column<Categorical>::code_type> codes(rows);
+                    const auto* sp = src.codes_data();
+                    for (std::size_t pos = 0; pos < rows; ++pos)
+                        codes[pos] = sp[static_cast<std::size_t>(idx[pos])];
+                    return Column<Categorical>(src.dictionary_ptr(), src.index_ptr(),
+                                               std::move(codes));
+                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    std::size_t total_chars = 0;
+                    const auto* src_off = src.offsets_data();
+                    const auto* src_char = src.chars_data();
+                    for (std::size_t pos = 0; pos < rows; ++pos) {
+                        std::size_t si = static_cast<std::size_t>(idx[pos]);
+                        total_chars += src_off[si + 1] - src_off[si];
+                    }
+                    ColT dst;
+                    dst.resize_for_gather(rows, total_chars);
+                    auto* dst_off = dst.offsets_data();
+                    auto* dst_char = dst.chars_data();
+                    dst_off[0] = 0;
+                    std::uint32_t cur = 0;
+                    for (std::size_t pos = 0; pos < rows; ++pos) {
+                        std::size_t si = static_cast<std::size_t>(idx[pos]);
+                        std::uint32_t len = src_off[si + 1] - src_off[si];
+                        std::memcpy(dst_char + cur, src_char + src_off[si], len);
+                        cur += len;
+                        dst_off[pos + 1] = cur;
+                    }
+                    return dst;
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    ColT dst;
+                    dst.resize(rows);
+                    for (std::size_t pos = 0; pos < rows; ++pos)
+                        dst.set(pos, src[static_cast<std::size_t>(idx[pos])]);
+                    return dst;
+                } else {
+                    ColT dst;
+                    dst.resize(rows);
+                    for (std::size_t pos = 0; pos < rows; ++pos)
+                        dst[pos] = src[static_cast<std::size_t>(idx[pos])];
+                    return dst;
+                }
+            },
+            *entry.column);
+        output.add_column(entry.name, std::move(gathered));
+        if (entry.validity.has_value()) {
+            const auto& src_bm = *entry.validity;
+            ValidityBitmap dst_bm(rows, false);
+            for (std::size_t pos = 0; pos < rows; ++pos)
+                dst_bm.set(pos, src_bm[static_cast<std::size_t>(idx[pos])]);
+            output.columns.back().validity = std::move(dst_bm);
+        }
+    }
+    output.ordering = ordering.has_value() ? std::move(*ordering) : input.ordering;
+    output.time_index = input.time_index;
+    normalize_time_index(output);
+    return output;
+}
+
 // LSD radix sort over pre-sign-flipped uint64 keys.
 // Idx is the index type: uint32_t for tables ≤ UINT32_MAX rows, uint64_t otherwise.
 // Keys must already be sign-flipped (int64 XOR 1<<63) so unsigned order == signed order.
@@ -1882,81 +1951,12 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         flat_keys.push_back(std::move(fk));
     }
 
-    // Column-major gather parameterised on index type (uint32_t or size_t).
-    auto do_gather = [&]<typename Idx>(const std::vector<Idx>& idx) -> Table {
-        Table output;
-        output.columns.reserve(input.columns.size());
-        for (const auto& entry : input.columns) {
-            ColumnValue gathered = std::visit(
-                [&](const auto& src) -> ColumnValue {
-                    using ColT = std::decay_t<decltype(src)>;
-                    if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                        // Gather codes only; dictionary and index are shared.
-                        std::vector<Column<Categorical>::code_type> codes(rows);
-                        const auto* sp = src.codes_data();
-                        for (std::size_t pos = 0; pos < rows; ++pos)
-                            codes[pos] = sp[static_cast<std::size_t>(idx[pos])];
-                        return Column<Categorical>(src.dictionary_ptr(), src.index_ptr(),
-                                                   std::move(codes));
-                    } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                        // Two-pass flat-buffer gather: compute total bytes, then memcpy slabs.
-                        const auto* src_off = src.offsets_data();
-                        const auto* src_char = src.chars_data();
-                        std::size_t total_chars = 0;
-                        for (std::size_t pos = 0; pos < rows; ++pos) {
-                            std::size_t si = static_cast<std::size_t>(idx[pos]);
-                            total_chars += src_off[si + 1] - src_off[si];
-                        }
-                        ColT dst;
-                        dst.resize_for_gather(rows, total_chars);
-                        auto* dst_off = dst.offsets_data();
-                        auto* dst_char = dst.chars_data();
-                        dst_off[0] = 0;
-                        std::uint32_t cur = 0;
-                        for (std::size_t pos = 0; pos < rows; ++pos) {
-                            std::size_t si = static_cast<std::size_t>(idx[pos]);
-                            std::uint32_t len = src_off[si + 1] - src_off[si];
-                            std::memcpy(dst_char + cur, src_char + src_off[si], len);
-                            cur += len;
-                            dst_off[pos + 1] = cur;
-                        }
-                        return dst;
-                    } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                        ColT dst;
-                        dst.resize(rows);
-                        for (std::size_t pos = 0; pos < rows; ++pos)
-                            dst.set(pos, src[static_cast<std::size_t>(idx[pos])]);
-                        return dst;
-                    } else {
-                        ColT dst;
-                        dst.resize(rows);
-                        for (std::size_t pos = 0; pos < rows; ++pos)
-                            dst[pos] = src[static_cast<std::size_t>(idx[pos])];
-                        return dst;
-                    }
-                },
-                *entry.column);
-            output.add_column(entry.name, std::move(gathered));
-            if (entry.validity.has_value()) {
-                const auto& src_bm = *entry.validity;
-                ValidityBitmap dst_bm(rows, false);
-                for (std::size_t pos = 0; pos < rows; ++pos)
-                    dst_bm.set(pos, src_bm[static_cast<std::size_t>(idx[pos])]);
-                output.columns.back().validity = std::move(dst_bm);
-            }
-        }
-        output.ordering = std::move(resolved_keys);
-        output.time_index = input.time_index;
-        normalize_time_index(output);
-        return output;
-    };
-
     // Fast path: single ascending I64 key — radix sort (pre-sorted case already handled above).
     if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 && flat_keys[0].ascending) {
         auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
-                return do_gather(idx);
+                return gather_rows(input, idx, resolved_keys);
             },
             sort_result);
     }
@@ -1994,7 +1994,61 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), 0);
     std::stable_sort(idx.begin(), idx.end(), compare_row);
-    return do_gather(idx);
+    return gather_rows(input, idx, std::move(resolved_keys));
+}
+
+auto head_table(const Table& input, std::size_t count, const std::vector<ir::ColumnRef>& group_by)
+    -> std::expected<Table, std::string> {
+    if (count == 0) {
+        Table output;
+        for (const auto& entry : input.columns) {
+            output.add_column(entry.name, make_empty_like(*entry.column));
+        }
+        output.ordering = input.ordering;
+        output.time_index = input.time_index;
+        normalize_time_index(output);
+        return output;
+    }
+
+    const std::size_t rows = input.rows();
+    if (rows <= count && group_by.empty()) {
+        Table output = input;
+        normalize_time_index(output);
+        return output;
+    }
+
+    if (group_by.empty()) {
+        std::vector<std::size_t> idx(std::min(rows, count));
+        std::iota(idx.begin(), idx.end(), 0);
+        return gather_rows(input, idx);
+    }
+
+    robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> seen_counts;
+    seen_counts.reserve(rows);
+    std::vector<std::size_t> idx;
+    idx.reserve(
+        std::min(rows, count * std::max<std::size_t>(1, rows / std::max<std::size_t>(1, count))));
+
+    for (std::size_t row = 0; row < rows; ++row) {
+        Key key;
+        key.values.reserve(group_by.size());
+        for (const auto& ref : group_by) {
+            const auto* column = input.find(ref.name);
+            if (column == nullptr) {
+                return std::unexpected("head group-by column not found: " + ref.name +
+                                       " (available: " + format_columns(input) + ")");
+            }
+            key.values.push_back(scalar_from_column(*column, row));
+        }
+        auto& seen = seen_counts[key];
+        if (seen >= count) {
+            continue;
+        }
+        ++seen;
+        idx.push_back(row);
+    }
+
+    return gather_rows(input, idx);
 }
 
 auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
@@ -6232,6 +6286,17 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             return order_table(child.value(), order.keys());
+        }
+        case ir::NodeKind::Head: {
+            const auto& head = static_cast<const ir::HeadNode&>(node);
+            if (head.children().empty()) {
+                return std::unexpected("head node missing child");
+            }
+            auto child = interpret_node(*head.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return head_table(child.value(), head.count(), head.group_by());
         }
         case ir::NodeKind::Update: {
             const auto& update = static_cast<const ir::UpdateNode&>(node);

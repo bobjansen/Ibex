@@ -33,6 +33,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"update", TokenKind::KeywordUpdate},
         {"distinct", TokenKind::KeywordDistinct},
         {"order", TokenKind::KeywordOrder},
+        {"head", TokenKind::KeywordHead},
         {"by", TokenKind::KeywordBy},
         {"window", TokenKind::KeywordWindow},
         {"resample", TokenKind::KeywordResample},

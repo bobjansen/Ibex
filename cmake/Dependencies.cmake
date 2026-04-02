@@ -2,6 +2,40 @@
 
 include(FetchContent)
 
+function(ibex_mark_target_system_headers target_name)
+    if(NOT TARGET "${target_name}")
+        return()
+    endif()
+
+    get_target_property(_ibex_aliased_target "${target_name}" ALIASED_TARGET)
+    if(_ibex_aliased_target AND NOT _ibex_aliased_target STREQUAL "_ibex_aliased_target-NOTFOUND")
+        set(target_name "${_ibex_aliased_target}")
+    endif()
+
+    set_property(TARGET "${target_name}" PROPERTY SYSTEM ON)
+endfunction()
+
+function(ibex_silence_external_target target_name)
+    if(NOT TARGET "${target_name}")
+        return()
+    endif()
+
+    get_target_property(_ibex_aliased_target "${target_name}" ALIASED_TARGET)
+    if(_ibex_aliased_target AND NOT _ibex_aliased_target STREQUAL "_ibex_aliased_target-NOTFOUND")
+        set(target_name "${_ibex_aliased_target}")
+    endif()
+
+    ibex_mark_target_system_headers("${target_name}")
+
+    get_target_property(_ibex_target_type "${target_name}" TYPE)
+    if(_ibex_target_type AND NOT _ibex_target_type STREQUAL "INTERFACE_LIBRARY")
+        target_compile_options("${target_name}" PRIVATE
+            $<$<COMPILE_LANGUAGE:C>:-w>
+            $<$<COMPILE_LANGUAGE:CXX>:-w>
+        )
+    endif()
+endfunction()
+
 # fmt — modern formatting library
 FetchContent_Declare(
     fmt
@@ -30,6 +64,9 @@ FetchContent_Declare(
 set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(fmt spdlog CLI11)
+ibex_silence_external_target(fmt)
+ibex_silence_external_target(spdlog)
+ibex_silence_external_target(CLI11)
 
 # robin-hood-hashing — fast open-addressing hash map (header-only)
 FetchContent_Declare(
@@ -39,6 +76,7 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(robin_hood)
+ibex_mark_target_system_headers(robin_hood::robin_hood)
 
 # rapidcsv — header-only RFC 4180 CSV parser (MIT)
 FetchContent_Declare(
@@ -48,6 +86,7 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(rapidcsv)
+ibex_mark_target_system_headers(rapidcsv)
 
 # nlohmann/json — header-only JSON library (MIT)
 FetchContent_Declare(
@@ -58,6 +97,7 @@ FetchContent_Declare(
 )
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nlohmann_json)
+ibex_mark_target_system_headers(nlohmann_json::nlohmann_json)
 
 # Catch2 — testing framework (only when tests enabled)
 if(IBEX_BUILD_TESTS)
@@ -68,5 +108,7 @@ if(IBEX_BUILD_TESTS)
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(Catch2)
+    ibex_silence_external_target(Catch2)
+    ibex_silence_external_target(Catch2WithMain)
     list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
 endif()

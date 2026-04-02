@@ -100,10 +100,8 @@ auto clone_clause(const Clause& clause) -> Clause {
                     out.fields.push_back(clone_field(f));
                 }
                 return out;
-            } else if constexpr (std::is_same_v<T, HeadClause>) {
-                return Clause{c};
             } else if constexpr (std::is_same_v<T, ByClause>) {
-                ByClause out{.is_braced = c.is_braced};
+                ByClause out{.keys = {}, .is_braced = c.is_braced};
                 out.keys.reserve(c.keys.size());
                 for (const auto& f : c.keys) {
                     out.keys.push_back(clone_field(f));
@@ -117,7 +115,7 @@ auto clone_clause(const Clause& clause) -> Clause {
                 }
                 return out;
             } else if constexpr (std::is_same_v<T, ModelClause>) {
-                ModelClause out{.formula = c.formula};
+                ModelClause out{.formula = c.formula, .params = {}};
                 out.params.reserve(c.params.size());
                 for (const auto& p : c.params) {
                     out.params.push_back(ModelParam{.name = p.name, .value = clone_expr(*p.value)});
@@ -138,7 +136,7 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
             if constexpr (std::is_same_v<T, IdentifierExpr> || std::is_same_v<T, LiteralExpr>) {
                 out->node = node;
             } else if constexpr (std::is_same_v<T, CallExpr>) {
-                CallExpr call{.callee = node.callee};
+                CallExpr call{.callee = node.callee, .args = {}, .named_args = {}};
                 call.args.reserve(node.args.size());
                 for (const auto& arg : node.args) {
                     call.args.push_back(clone_expr(*arg));
@@ -160,28 +158,27 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
             } else if constexpr (std::is_same_v<T, GroupExpr>) {
                 out->node = GroupExpr{.expr = clone_expr(*node.expr)};
             } else if constexpr (std::is_same_v<T, BlockExpr>) {
-                BlockExpr block{.base = clone_expr(*node.base)};
+                BlockExpr block{.base = clone_expr(*node.base), .clauses = {}};
                 block.clauses.reserve(node.clauses.size());
                 for (const auto& clause : node.clauses) {
                     block.clauses.push_back(clone_clause(clause));
                 }
                 out->node = std::move(block);
             } else if constexpr (std::is_same_v<T, JoinExpr>) {
-                JoinExpr join{
-                    .kind = node.kind,
-                    .left = clone_expr(*node.left),
-                    .right = clone_expr(*node.right),
-                    .keys = node.keys,
-                };
+                JoinExpr join{.kind = node.kind,
+                              .left = clone_expr(*node.left),
+                              .right = clone_expr(*node.right),
+                              .keys = node.keys,
+                              .predicate = {}};
                 if (node.predicate.has_value()) {
                     join.predicate = clone_expr(**node.predicate);
                 }
                 out->node = std::move(join);
             } else if constexpr (std::is_same_v<T, StreamExpr>) {
-                StreamExpr stream{
-                    .source = clone_expr(*node.source),
-                    .sink_callee = node.sink_callee,
-                };
+                StreamExpr stream{.source = clone_expr(*node.source),
+                                  .transform = {},
+                                  .sink_callee = node.sink_callee,
+                                  .sink_args = {}};
                 stream.transform.reserve(node.transform.size());
                 for (const auto& clause : node.transform) {
                     stream.transform.push_back(clone_clause(clause));
@@ -453,7 +450,7 @@ auto substitute_map_expr(const Expr& expr,
                         .message =
                             "get() inside compile-time map expects an identifier or string"});
                 }
-                CallExpr call{.callee = node.callee};
+                CallExpr call{.callee = node.callee, .args = {}, .named_args = {}};
                 call.args.reserve(node.args.size());
                 for (const auto& arg : node.args) {
                     auto lowered = substitute_map_expr(*arg, env);
@@ -683,7 +680,7 @@ class Lowerer {
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
             return lower_table_call(*call);
         }
-        if (auto* stream = std::get_if<StreamExpr>(const_cast<decltype(expr.node)*>(&expr.node))) {
+        if (const auto* stream = std::get_if<StreamExpr>(&expr.node)) {
             return lower_stream(*stream);
         }
         if (const auto* tbl = std::get_if<TableExpr>(&expr.node)) {
@@ -754,17 +751,10 @@ class Lowerer {
                 std::visit(
                     [&](const auto& v) {
                         using T = std::decay_t<decltype(v)>;
-                        if constexpr (std::is_same_v<T, std::int64_t>) {
-                            ir_lit.value = v;
-                        } else if constexpr (std::is_same_v<T, double>) {
-                            ir_lit.value = v;
-                        } else if constexpr (std::is_same_v<T, bool>) {
-                            ir_lit.value = v;
-                        } else if constexpr (std::is_same_v<T, std::string>) {
-                            ir_lit.value = v;
-                        } else if constexpr (std::is_same_v<T, Date>) {
-                            ir_lit.value = v;
-                        } else if constexpr (std::is_same_v<T, Timestamp>) {
+                        if constexpr (std::is_same_v<T, std::int64_t> ||
+                                      std::is_same_v<T, double> || std::is_same_v<T, bool> ||
+                                      std::is_same_v<T, std::string> || std::is_same_v<T, Date> ||
+                                      std::is_same_v<T, Timestamp>) {
                             ir_lit.value = v;
                         }
                         // DurationLiteral already excluded above.
@@ -1189,11 +1179,13 @@ class Lowerer {
 
         if (state.melt) {
             std::vector<std::string> id_cols;
+            id_cols.reserve(state.melt->id_fields.size());
             for (const auto& field : state.melt->id_fields) {
                 id_cols.push_back(field.name);
             }
             std::vector<std::string> measure_cols;
             if (state.select) {
+                measure_cols.reserve(state.select->fields.size());
                 for (const auto& field : state.select->fields) {
                     measure_cols.push_back(field.name);
                 }
@@ -1212,6 +1204,7 @@ class Lowerer {
             }
             std::string value_col = state.select->fields[0].name;
             std::vector<std::string> row_keys;
+            row_keys.reserve(state.by->keys.size());
             for (const auto& key : state.by->keys) {
                 row_keys.push_back(key.name);
             }
@@ -2735,7 +2728,7 @@ class Lowerer {
     /// its implicit base.  The stream kind is inferred from the transform IR:
     ///   - ResampleNode present → TimeBucket (emit when bucket boundary crossed)
     ///   - otherwise            → PerRow     (emit on every incoming row)
-    auto lower_stream(StreamExpr& stream) -> LowerResult {
+    auto lower_stream(const StreamExpr& stream) -> LowerResult {
         // --- source ---
         const auto* src_call = std::get_if<CallExpr>(&stream.source->node);
         if (src_call == nullptr) {
@@ -2773,13 +2766,11 @@ class Lowerer {
         }
 
         // --- transform ---
-        // Synthesise a BlockExpr with "__stream_input__" as the base so that the existing
-        // lower_block path handles clause ordering and validation.
-        auto base_ident = std::make_unique<Expr>();
-        base_ident->node = IdentifierExpr{.name = "__stream_input__"};
-        BlockExpr synthetic_block{.base = std::move(base_ident),
-                                  .clauses = std::move(stream.transform)};
-        auto transform_ir = lower_block(synthetic_block);
+        // Use the two-arg lower_block directly with a synthetic base identifier,
+        // avoiding the need to move clauses out of the const StreamExpr.
+        Expr base_ident;
+        base_ident.node = IdentifierExpr{.name = "__stream_input__"};
+        auto transform_ir = lower_block(base_ident, stream.transform);
         if (!transform_ir.has_value()) {
             return transform_ir;
         }

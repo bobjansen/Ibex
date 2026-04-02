@@ -524,6 +524,22 @@ TEST_CASE("Parse order clause with no keys") {
     REQUIRE(order.keys.empty());
 }
 
+TEST_CASE("Parse head clause") {
+    const char* source = "df[head 10];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& head = std::get<HeadClause>(block.clauses[0]);
+    REQUIRE(head.count == 10);
+}
+
 TEST_CASE("Parse select assignment without braces") {
     const char* source = "df[select total = price * 2];";
 

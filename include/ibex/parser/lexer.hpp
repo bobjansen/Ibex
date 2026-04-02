@@ -36,6 +36,7 @@ enum class TokenKind : std::uint8_t {
     KeywordUpdate,
     KeywordDistinct,
     KeywordOrder,
+    KeywordHead,
     KeywordBy,
     KeywordWindow,
     KeywordResample,

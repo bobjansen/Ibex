@@ -1,0 +1,13 @@
+let trades = Table {
+    symbol = ["A", "A", "B", "A", "B"],
+    score  = [5, 7, 1, 6, 3]
+};
+
+// First two rows in current order.
+trades[head 2];
+
+// Top two rows overall after ordering.
+trades[order { score desc }, head 2];
+
+// Top two rows per symbol after ordering.
+trades[order { score desc }, head 2, by symbol];

@@ -76,6 +76,18 @@ TEST_CASE("OrderNode kind", "[ir][order]") {
     REQUIRE(order->keys()[0].ascending == false);
 }
 
+TEST_CASE("HeadNode stores count and optional group-by", "[ir][head]") {
+    ibex::ir::Builder builder;
+    auto node = builder.head(3, {ibex::ir::ColumnRef{.name = "symbol"}});
+
+    auto* head = dynamic_cast<ibex::ir::HeadNode*>(node.get());
+    REQUIRE(head != nullptr);
+    REQUIRE(head->kind() == ibex::ir::NodeKind::Head);
+    REQUIRE(head->count() == 3);
+    REQUIRE(head->group_by().size() == 1);
+    REQUIRE(head->group_by()[0].name == "symbol");
+}
+
 TEST_CASE("AggregateNode stores group-by and aggregations", "[ir][aggregate]") {
     ibex::ir::Builder builder;
 

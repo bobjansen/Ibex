@@ -571,15 +571,20 @@ trades[
         </div>
       </div>
 
-      <!-- 5. Order & Distinct -->
+      <!-- 5. Order, Head & Distinct -->
       <div class="tour-item">
         <div class="tour-text">
-          <span class="tour-tag">Order &amp; Distinct</span>
-          <h3>Sort and deduplicate with explicit intent.</h3>
+          <span class="tour-tag">Order, Head &amp; Distinct</span>
+          <h3>Sort, keep the first rows, and deduplicate with explicit intent.</h3>
           <p>
             <code>order</code> accepts a single column, a multi-key block with
             <code>asc</code>&thinsp;/&thinsp;<code>desc</code> annotations, or no
             argument at all to sort by every column in schema order.
+          </p>
+          <p>
+            <code>head</code> keeps the first <code>n</code> rows in the current
+            order, or the first <code>n</code> rows per group when combined with
+            <code>by</code>.
           </p>
           <p>
             <code>distinct</code> deduplicates on a single column or a set.
@@ -591,6 +596,12 @@ iris[<span class="kw">order</span> `Sepal.Length`];
 
 <span class="cm">// Multi-key sort with explicit directions</span>
 results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span>, symbol <span class="kw">asc</span> }];
+
+<span class="cm">// Keep the first 10 rows in current order</span>
+results[<span class="kw">head</span> <span class="num">10</span>];
+
+<span class="cm">// Top 3 rows per symbol after sorting</span>
+results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }, <span class="kw">head</span> <span class="num">3</span>, <span class="kw">by</span> symbol];
 
 <span class="cm">// Sort by all columns in schema order</span>
 iris[<span class="kw">order</span>];

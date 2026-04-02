@@ -2712,6 +2712,7 @@ class Lowerer {
     /// Walk an IR tree and return the Duration of the first ResampleNode found.
     static auto find_resample_duration(const ir::Node& node) -> std::optional<ir::Duration> {
         if (node.kind() == ir::NodeKind::Resample) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
             return static_cast<const ir::ResampleNode&>(node).duration();
         }
         for (const auto& child : node.children()) {

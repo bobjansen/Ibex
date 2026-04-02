@@ -478,6 +478,78 @@ TEST_CASE("Interpret order on empty table") {
     REQUIRE(result->rows() == 0);
 }
 
+TEST_CASE("Interpret global head preserves current order") {
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{10, 20, 30, 40});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[head 2];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == 2);
+    REQUIRE((*x)[0] == 10);
+    REQUIRE((*x)[1] == 20);
+}
+
+TEST_CASE("Interpret grouped head keeps first rows per group in encounter order") {
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "A", "B"});
+    table.add_column("x", Column<std::int64_t>{10, 20, 30, 40, 50});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[head 2, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(x != nullptr);
+    REQUIRE(symbol->size() == 4);
+    REQUIRE((*symbol)[0] == "A");
+    REQUIRE((*x)[0] == 10);
+    REQUIRE((*symbol)[1] == "B");
+    REQUIRE((*x)[1] == 20);
+    REQUIRE((*symbol)[2] == "A");
+    REQUIRE((*x)[2] == 30);
+    REQUIRE((*symbol)[3] == "B");
+    REQUIRE((*x)[3] == 50);
+}
+
+TEST_CASE("Interpret ordered grouped head returns top-k per group") {
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{"A", "A", "B", "A", "B"});
+    table.add_column("score", Column<std::int64_t>{5, 7, 1, 6, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[order score desc, head 2, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* score = std::get_if<Column<std::int64_t>>(result->find("score"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(score != nullptr);
+    REQUIRE(symbol->size() == 4);
+    REQUIRE((*symbol)[0] == "A");
+    REQUIRE((*score)[0] == 7);
+    REQUIRE((*symbol)[1] == "A");
+    REQUIRE((*score)[1] == 6);
+    REQUIRE((*symbol)[2] == "B");
+    REQUIRE((*score)[2] == 3);
+    REQUIRE((*symbol)[3] == "B");
+    REQUIRE((*score)[3] == 1);
+}
+
 TEST_CASE("Interpret distinct on empty table") {
     runtime::Table table;
     table.add_column("symbol", Column<std::string>{});

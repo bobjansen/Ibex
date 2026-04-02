@@ -48,6 +48,7 @@ normalizes all blocks to the canonical evaluation order:
 4. `rename` — column renaming (relational ρ)
 5. `order` — row ordering (relational τ)
 6. `window` — temporal windowing (relational ω)
+7. `head` — keep the first `n` rows (globally or per group)
 
 The following two expressions are equivalent:
 
@@ -67,6 +68,7 @@ The canonical order is recommended for readability but not enforced.
 | `distinct`          | δ (duplicate removal)     | `DistinctNode`  |
 | `rename`            | ρ (renaming)              | `RenameNode`    |
 | `order`             | τ (ordering)              | `OrderNode`     |
+| `head`              | first-`n` row slice       | `HeadNode`      |
 | `select` + `by`     | γ (aggregation)           | `AggregateNode` |
 | `update`            | ε (extended projection)   | `UpdateNode`    |
 | `update` + `by`     | grouped ε (window-like)   | `UpdateNode`    |
@@ -145,7 +147,7 @@ column names, or function names:
 
 ```
 let    mut    extern  fn      from
-filter select update  distinct order by window
+filter select update  distinct order head by window
 rename resample melt  dcast  cov  corr  transpose
 join   left   right   outer   asof   on
 import Stream
@@ -669,6 +671,7 @@ clause          = filter_clause
                 | distinct_clause
                 | update_clause
                 | order_clause
+                | head_clause
                 | by_clause
                 | window_clause
                 | melt_clause
@@ -688,6 +691,8 @@ update_clause   = "update" field_or_list ;
 
 order_clause    = "order"
                 | "order" order_keys ;
+
+head_clause     = "head" INT_LIT ;
 
 order_keys      = order_key
                 | "{" order_key { "," order_key } [ "," ] "}" ;
@@ -862,22 +867,23 @@ Within a single block:
 | C4 | At most **one** `update` clause. |
 | C5 | `select`, `distinct`, and `update` are **mutually exclusive**. |
 | C6 | At most **one** `order` clause. |
-| C7 | At most **one** `by` clause. |
-| C8 | At most **one** `window` clause. |
-| C9 | `by` requires either `select` or `update`. |
-| C10 | `window` requires the operand to be a `TimeFrame`. |
-| C11 | At most **one** `rename` clause. |
-| C12 | `rename` is mutually compatible with `filter`, `select`, `update`, `distinct`, `order`, and `by`. |
-| C13 | At most **one** `melt` clause. |
-| C14 | At most **one** `dcast` clause. |
-| C15 | `melt` and `dcast` are **mutually exclusive**. |
-| C16 | `melt` and `dcast` are mutually exclusive with `distinct`, `update`, `order`, `window`, and `resample`. |
-| C17 | `melt` may combine with `select` (to specify measure columns). |
-| C18 | `dcast` may combine with `select` (to specify the value column) and `by` (to specify row keys). |
-| C19 | At most **one** of `cov`, `corr`, `transpose` per block. |
-| C20 | `cov`, `corr`, and `transpose` are mutually exclusive with each other and with `select`, `update`, `by`, `distinct`, `melt`, `dcast`, `window`, and `resample`. |
-| C21 | `cov` and `corr` silently drop non-numeric columns; at least one numeric column must remain. |
-| C22 | `transpose` requires all data columns to share the same type (error on mixed types). |
+| C7 | At most **one** `head` clause. |
+| C8 | At most **one** `by` clause. |
+| C9 | At most **one** `window` clause. |
+| C10 | `by` requires either `select`, `update`, or `head`. |
+| C11 | `window` requires the operand to be a `TimeFrame`. |
+| C12 | At most **one** `rename` clause. |
+| C13 | `rename` is mutually compatible with `filter`, `select`, `update`, `distinct`, `order`, `head`, and `by`. |
+| C14 | At most **one** `melt` clause. |
+| C15 | At most **one** `dcast` clause. |
+| C16 | `melt` and `dcast` are **mutually exclusive**. |
+| C17 | `melt` and `dcast` are mutually exclusive with `distinct`, `update`, `order`, `window`, and `resample`. |
+| C18 | `melt` may combine with `select` (to specify measure columns). |
+| C19 | `dcast` may combine with `select` (to specify the value column) and `by` (to specify row keys). |
+| C20 | At most **one** of `cov`, `corr`, `transpose` per block. |
+| C21 | `cov`, `corr`, and `transpose` are mutually exclusive with each other and with `select`, `update`, `by`, `distinct`, `melt`, `dcast`, `window`, and `resample`. |
+| C22 | `cov` and `corr` silently drop non-numeric columns; at least one numeric column must remain. |
+| C23 | `transpose` requires all data columns to share the same type (error on mixed types). |
 
 Violation of any constraint is a **compile-time error**.
 
@@ -1131,6 +1137,31 @@ Preservation rules (normative minimums):
 For `TimeFrame`, the only valid ordering constraint is ascending order on the
 time index column. Using `order` with any other key list is a compile-time
 error; ordering by the time index is a no-op.
+
+**`head <n>`**
+
+Keeps the first `n` rows of the current result. When combined with `order`,
+this gives the usual “top-k” behaviour:
+
+```
+trades[order { score desc }, head 10]
+```
+
+When combined with `by`, `head` keeps the first `n` rows **per group** in the
+current row order:
+
+```
+trades[order { score desc }, head 3, by symbol]
+```
+
+Rules:
+
+- `head 0` returns the same schema with zero rows.
+- Without `order`, “first” means encounter order of the input/result rows.
+- With `by`, the implementation counts rows per group while scanning the
+  current row order; rows that exceed the per-group quota are dropped.
+- `head` is applied after other clauses in the block have produced their
+  result table.
 
 **`window <duration>`**
 

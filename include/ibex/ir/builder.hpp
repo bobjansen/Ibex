@@ -31,6 +31,10 @@ class Builder {
         return std::make_unique<OrderNode>(next_id(), std::move(keys));
     }
 
+    [[nodiscard]] auto head(std::size_t count, std::vector<ColumnRef> group_by = {}) -> NodePtr {
+        return std::make_unique<HeadNode>(next_id(), count, std::move(group_by));
+    }
+
     [[nodiscard]] auto aggregate(std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
         -> NodePtr {
         return std::make_unique<AggregateNode>(next_id(), std::move(group_by),

@@ -2047,6 +2047,70 @@ auto head_table(const Table& input, std::size_t count, const std::vector<ir::Col
     return gather_rows(input, idx);
 }
 
+auto tail_table(const Table& input, std::size_t count, const std::vector<ir::ColumnRef>& group_by)
+    -> std::expected<Table, std::string> {
+    if (count == 0) {
+        Table output;
+        for (const auto& entry : input.columns) {
+            output.add_column(entry.name, make_empty_like(*entry.column));
+        }
+        output.ordering = input.ordering;
+        output.time_index = input.time_index;
+        normalize_time_index(output);
+        return output;
+    }
+
+    const std::size_t rows = input.rows();
+    if (rows <= count && group_by.empty()) {
+        Table output = input;
+        normalize_time_index(output);
+        return output;
+    }
+
+    if (group_by.empty()) {
+        const std::size_t keep = std::min(rows, count);
+        std::vector<std::size_t> idx(keep);
+        const std::size_t start = rows - keep;
+        std::iota(idx.begin(), idx.end(), start);
+        return gather_rows(input, idx);
+    }
+
+    robin_hood::unordered_flat_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> groups;
+    groups.reserve(rows);
+    std::vector<Key> order;
+    order.reserve(rows);
+
+    for (std::size_t row = 0; row < rows; ++row) {
+        Key key;
+        key.values.reserve(group_by.size());
+        for (const auto& ref : group_by) {
+            const auto* column = input.find(ref.name);
+            if (column == nullptr) {
+                return std::unexpected("tail group-by column not found: " + ref.name +
+                                       " (available: " + format_columns(input) + ")");
+            }
+            key.values.push_back(scalar_from_column(*column, row));
+        }
+        auto [it, inserted] = groups.try_emplace(key);
+        if (inserted) {
+            order.push_back(key);
+        }
+        it->second.push_back(row);
+    }
+
+    std::vector<std::size_t> idx;
+    idx.reserve(rows);
+    for (const auto& key : order) {
+        const auto& group_rows = groups.find(key)->second;
+        const std::size_t keep = std::min(group_rows.size(), count);
+        const std::size_t start = group_rows.size() - keep;
+        idx.insert(idx.end(), group_rows.begin() + static_cast<std::ptrdiff_t>(start),
+                   group_rows.end());
+    }
+
+    return gather_rows(input, idx);
+}
+
 auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void {
     std::visit(
         [&](auto& col) {
@@ -6293,6 +6357,17 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             return head_table(child.value(), head.count(), head.group_by());
+        }
+        case ir::NodeKind::Tail: {
+            const auto& tail = static_cast<const ir::TailNode&>(node);
+            if (tail.children().empty()) {
+                return std::unexpected("tail node missing child");
+            }
+            auto child = interpret_node(*tail.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            return tail_table(child.value(), tail.count(), tail.group_by());
         }
         case ir::NodeKind::Update: {
             const auto& update = static_cast<const ir::UpdateNode&>(node);

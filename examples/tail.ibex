@@ -1,0 +1,13 @@
+let trades = Table {
+    symbol = ["A", "A", "B", "A", "B"],
+    score = [5, 7, 1, 6, 3]
+};
+
+// Last 2 rows in current order.
+trades[tail 2];
+
+// Bottom 2 rows after sorting by score descending.
+trades[order { score desc }, tail 2];
+
+// Last 2 rows per symbol in the current ordered result.
+trades[order { score desc }, tail 2, by symbol];

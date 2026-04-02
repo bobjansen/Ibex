@@ -61,6 +61,9 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto head(const runtime::Table& t, std::size_t count,
                         const std::vector<std::string>& group_by = {}) -> runtime::Table;
 
+[[nodiscard]] auto tail(const runtime::Table& t, std::size_t count,
+                        const std::vector<std::string>& group_by = {}) -> runtime::Table;
+
 [[nodiscard]] auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                              const std::vector<ir::AggSpec>& aggs) -> runtime::Table;
 

@@ -208,7 +208,7 @@ iris[order { `Species` asc, `Sepal.Length` desc }];
 iris[order];
 ```
 
-### Head
+### Head / Tail
 
 ```
 // First 10 rows in the current order
@@ -216,6 +216,12 @@ iris[head 10];
 
 // Top 3 rows per species after sorting
 iris[order { `Sepal.Length` desc }, head 3, by Species];
+
+// Last 10 rows in the current order
+iris[tail 10];
+
+// Bottom 3 rows per species after sorting
+iris[order { `Sepal.Length` desc }, tail 3, by Species];
 ```
 
 ### Scalar extraction

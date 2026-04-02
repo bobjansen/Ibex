@@ -1002,12 +1002,16 @@ class Lowerer {
             return std::unexpected(
                 LowerError{.message = "distinct is mutually exclusive with select/update"});
         }
+        if (state.head && state.tail) {
+            return std::unexpected(LowerError{.message = "head and tail are mutually exclusive"});
+        }
         if (state.distinct && state.by) {
             return std::unexpected(LowerError{.message = "distinct cannot be used with by"});
         }
-        if (state.by && !state.select && !state.update && !state.head && !state.resample &&
-            !state.dcast) {
-            return std::unexpected(LowerError{.message = "by requires select, update, or head"});
+        if (state.by && !state.select && !state.update && !state.head && !state.tail &&
+            !state.resample && !state.dcast) {
+            return std::unexpected(
+                LowerError{.message = "by requires select, update, head, or tail"});
         }
         if (state.resample && state.window) {
             return std::unexpected(
@@ -1259,6 +1263,21 @@ class Lowerer {
             node = std::move(head_node);
         }
 
+        if (state.tail) {
+            std::vector<ir::ColumnRef> tail_group_by;
+            if (state.by != nullptr) {
+                auto group_by_result = lower_group_by(*state.by);
+                if (!group_by_result.has_value()) {
+                    return std::unexpected(group_by_result.error());
+                }
+                tail_group_by = std::move(group_by_result.value());
+            }
+            auto tail_node = builder_.tail(static_cast<std::size_t>(state.tail->count),
+                                           std::move(tail_group_by));
+            tail_node->add_child(std::move(node));
+            node = std::move(tail_node);
+        }
+
         return node;
     }
 
@@ -1270,6 +1289,7 @@ class Lowerer {
         const RenameClause* rename = nullptr;
         const OrderClause* order = nullptr;
         const HeadClause* head = nullptr;
+        const TailClause* tail = nullptr;
         const ByClause* by = nullptr;
         const WindowClause* window = nullptr;
         const ResampleClause* resample = nullptr;
@@ -1336,6 +1356,14 @@ class Lowerer {
                     return false;
                 }
                 head = &std::get<HeadClause>(clause);
+                return true;
+            }
+            if (std::holds_alternative<TailClause>(clause)) {
+                if (tail != nullptr) {
+                    error = "duplicate tail clause";
+                    return false;
+                }
+                tail = &std::get<TailClause>(clause);
                 return true;
             }
             if (std::holds_alternative<ByClause>(clause)) {
@@ -2579,6 +2607,11 @@ class Lowerer {
             case ir::NodeKind::Head: {
                 const auto& head = static_cast<const ir::HeadNode&>(node);
                 clone = builder_.head(head.count(), head.group_by());
+                break;
+            }
+            case ir::NodeKind::Tail: {
+                const auto& tail = static_cast<const ir::TailNode&>(node);
+                clone = builder_.tail(tail.count(), tail.group_by());
                 break;
             }
             case ir::NodeKind::Aggregate: {

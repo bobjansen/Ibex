@@ -1146,6 +1146,19 @@ class Parser {
             }
             return HeadClause{.count = count};
         }
+        if (match(TokenKind::KeywordTail)) {
+            if (!consume(TokenKind::IntLiteral, "expected integer row count after 'tail'")) {
+                return std::nullopt;
+            }
+            std::int64_t count = 0;
+            auto text = previous().lexeme;
+            auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), count);
+            if (ec != std::errc{} || ptr != text.data() + text.size()) {
+                error_ = make_error(previous(), "invalid integer row count after 'tail'");
+                return std::nullopt;
+            }
+            return TailClause{.count = count};
+        }
         if (match(TokenKind::KeywordUpdate)) {
             // `update = expr`: merge all columns from a table-returning expression.
             if (match(TokenKind::Eq)) {

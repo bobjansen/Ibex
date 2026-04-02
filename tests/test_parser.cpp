@@ -540,6 +540,22 @@ TEST_CASE("Parse head clause") {
     REQUIRE(head.count == 10);
 }
 
+TEST_CASE("Parse tail clause") {
+    const char* source = "df[tail 10];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& tail = std::get<TailClause>(block.clauses[0]);
+    REQUIRE(tail.count == 10);
+}
+
 TEST_CASE("Parse select assignment without braces") {
     const char* source = "df[select total = price * 2];";
 

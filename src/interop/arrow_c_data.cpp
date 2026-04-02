@@ -163,6 +163,7 @@ auto finalize_schema(ArrowSchema* out, std::unique_ptr<SchemaExportState> state)
     out->private_data = state.release();
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto finalize_array(ArrowArray* out, std::unique_ptr<ArrayExportState> state, std::int64_t length,
                     std::int64_t null_count) -> void {
     out->length = length;
@@ -268,14 +269,16 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
             } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
-                auto state =
-                    primitive_buffers(entry, reinterpret_cast<const std::int32_t*>(col.data()));
+                auto state = primitive_buffers(
+                    entry, reinterpret_cast<const std::int32_t*>(
+                               col.data()));  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
             } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
-                auto state =
-                    primitive_buffers(entry, reinterpret_cast<const std::int64_t*>(col.data()));
+                auto state = primitive_buffers(
+                    entry, reinterpret_cast<const std::int64_t*>(
+                               col.data()));  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
@@ -416,7 +419,7 @@ auto release_arrow_schema(ArrowSchema* schema) noexcept -> void {
                 child->release(child.get());
             }
         }
-        delete state;
+        delete state;  // NOLINT(cppcoreguidelines-owning-memory)
     }
     clear_schema(schema);
 }
@@ -436,7 +439,7 @@ auto release_arrow_array(ArrowArray* array) noexcept -> void {
                 child->release(child.get());
             }
         }
-        delete state;
+        delete state;  // NOLINT(cppcoreguidelines-owning-memory)
     }
     clear_array(array);
 }

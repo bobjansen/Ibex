@@ -136,6 +136,39 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         right_out.push_back(RightOut{entry.column.get(), output.columns.size() - 1});
     }
 
+    const bool preserve_left_only =
+        preserve_left_rows && !preserve_right_rows && kind != ir::JoinKind::Asof;
+
+    auto materialize_left_identity = [&](const std::vector<std::size_t>& right_idx) {
+        for (std::size_t c = 0; c < left.columns.size(); ++c) {
+            *output.columns[c].column = *left.columns[c].column;
+            output.columns[c].validity = left.columns[c].validity;
+        }
+
+        if (!right_out.empty()) {
+            bool has_right_nulls = false;
+            for (std::size_t i = 0; i < right_idx.size() && !has_right_nulls; ++i) {
+                has_right_nulls = (right_idx[i] == kNull);
+            }
+
+            if (!has_right_nulls) {
+                for (const auto& item : right_out) {
+                    *output.columns[item.out_index].column =
+                        gather_column(*item.column, right_idx.data(), right_idx.size());
+                }
+            } else {
+                for (const auto& item : right_out) {
+                    auto [col_out, validity] = gather_column_with_nulls(
+                        *item.column, right_idx.data(), right_idx.size(), kNull);
+                    *output.columns[item.out_index].column = std::move(col_out);
+                    output.columns[item.out_index].validity = std::move(validity);
+                }
+            }
+        }
+
+        normalize_time_index(output);
+    };
+
     // ── Materialize output columns from index arrays ─────────────────────
     // left_idx[i]  = left  row for output row i, or kNull for default.
     // right_idx[i] = right row for output row i, or kNull for default.
@@ -566,13 +599,28 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         if (const auto* lc = std::get_if<Column<Categorical>>(left_keys[0])) {
             const auto& dict = *lc->dictionary_ptr();
             std::vector<const std::vector<std::size_t>*> code_to_right(dict.size(), nullptr);
+            bool unique_right = preserve_left_only;
             for (std::size_t code = 0; code < dict.size(); ++code) {
                 auto it = right_sv_index.find(std::string_view{dict[code]});
                 if (it != right_sv_index.end()) {
                     code_to_right[code] = &it->second;
+                    if (unique_right && it->second.size() != 1) {
+                        unique_right = false;
+                    }
                 }
             }
             const auto* codes = lc->codes_data();
+            if (unique_right) {
+                std::vector<std::size_t> ri(n_left, kNull);
+                for (std::size_t l = 0; l < n_left; ++l) {
+                    const auto* matches = code_to_right[static_cast<std::size_t>(codes[l])];
+                    if (matches != nullptr) {
+                        ri[l] = (*matches)[0];
+                    }
+                }
+                materialize_left_identity(ri);
+                return output;
+            }
             auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
                 return code_to_right[static_cast<std::size_t>(codes[l])];
             };
@@ -580,6 +628,27 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             materialize(li, ri, kri);
         } else {
             const auto& ls = std::get<Column<std::string>>(*left_keys[0]);
+            if (preserve_left_only) {
+                bool unique_right = true;
+                for (const auto& [key, rows] : right_sv_index) {
+                    (void)key;
+                    if (rows.size() != 1) {
+                        unique_right = false;
+                        break;
+                    }
+                }
+                if (unique_right) {
+                    std::vector<std::size_t> ri(n_left, kNull);
+                    for (std::size_t l = 0; l < n_left; ++l) {
+                        auto it = right_sv_index.find(ls[l]);
+                        if (it != right_sv_index.end()) {
+                            ri[l] = it->second[0];
+                        }
+                    }
+                    materialize_left_identity(ri);
+                    return output;
+                }
+            }
             auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
                 auto it = right_sv_index.find(ls[l]);
                 return it != right_sv_index.end() ? &it->second : nullptr;
@@ -620,8 +689,25 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         std::unordered_map<std::int64_t, std::vector<std::size_t>> right_int_index;
         right_int_index.reserve(n_right);
+        bool unique_right = preserve_left_only;
         for (std::size_t r = 0; r < n_right; ++r) {
-            right_int_index[right_ints[r]].push_back(r);
+            auto& rows = right_int_index[right_ints[r]];
+            rows.push_back(r);
+            if (unique_right && rows.size() != 1) {
+                unique_right = false;
+            }
+        }
+
+        if (unique_right) {
+            std::vector<std::size_t> ri(n_left, kNull);
+            for (std::size_t l = 0; l < n_left; ++l) {
+                auto it = right_int_index.find(left_ints[l]);
+                if (it != right_int_index.end()) {
+                    ri[l] = it->second[0];
+                }
+            }
+            materialize_left_identity(ri);
+            return output;
         }
 
         auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
@@ -776,13 +862,35 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
 
     right_index.reserve(n_right);
+    bool unique_right = preserve_left_only;
     for (std::size_t r = 0; r < n_right; ++r) {
         Key key;
         key.values.reserve(keys.size());
         for (const auto* col : right_keys) {
             key.values.push_back(scalar_from_column(*col, r));
         }
-        right_index[key].push_back(r);
+        auto& rows = right_index[key];
+        rows.push_back(r);
+        if (unique_right && rows.size() != 1) {
+            unique_right = false;
+        }
+    }
+
+    if (unique_right) {
+        std::vector<std::size_t> ri(n_left, kNull);
+        for (std::size_t l = 0; l < n_left; ++l) {
+            Key key;
+            key.values.reserve(keys.size());
+            for (const auto* col : left_keys) {
+                key.values.push_back(scalar_from_column(*col, l));
+            }
+            auto it = right_index.find(key);
+            if (it != right_index.end()) {
+                ri[l] = it->second[0];
+            }
+        }
+        materialize_left_identity(ri);
+        return output;
     }
 
     auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {

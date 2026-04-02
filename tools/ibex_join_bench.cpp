@@ -252,7 +252,8 @@ auto make_fact_table(std::size_t rows, std::size_t n_distinct_keys, const std::s
 //   key:    "K" + 0..n_keys-1
 //   label:  "label_" + key
 //   weight: 1.0 + (i % 100)
-auto make_dim_table(std::size_t n_keys, const std::string& key_prefix) -> ibex::runtime::Table {
+auto make_dim_table_with_offset(std::size_t first_key, std::size_t n_keys,
+                                const std::string& key_prefix) -> ibex::runtime::Table {
     ibex::runtime::Table t;
     ibex::Column<std::string> key_col;
     ibex::Column<std::string> label_col;
@@ -263,7 +264,7 @@ auto make_dim_table(std::size_t n_keys, const std::string& key_prefix) -> ibex::
     weight_col.reserve(n_keys);
 
     for (std::size_t i = 0; i < n_keys; ++i) {
-        auto k = fmt::format("{}{:06d}", key_prefix, i);
+        auto k = fmt::format("{}{:06d}", key_prefix, first_key + i);
         key_col.push_back(k);
         label_col.push_back("label_" + k);
         weight_col.push_back(1.0 + static_cast<double>(i % 100));
@@ -273,6 +274,10 @@ auto make_dim_table(std::size_t n_keys, const std::string& key_prefix) -> ibex::
     t.add_column("label", std::move(label_col));
     t.add_column("weight", std::move(weight_col));
     return t;
+}
+
+auto make_dim_table(std::size_t n_keys, const std::string& key_prefix) -> ibex::runtime::Table {
+    return make_dim_table_with_offset(0, n_keys, key_prefix);
 }
 
 // Build an Int64-key fact table with N rows:
@@ -452,16 +457,17 @@ int main(int argc, char** argv) {
     app.add_option("--suite", suites,
                    "Suite(s) to run (comma-separated). "
                    "Supported: all, hash_join, int_join, join_chain, filter_pushdown, "
-                   "projection_waste, asof_join, theta_join, semi_anti, join_defaults")
+                   "projection_waste, asof_join, theta_join, semi_anti, join_defaults, "
+                   "preserving_join")
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
 
     const std::unordered_set<std::string> allowed = {
-        "all",          "hash_join",       "int_join",
-        "join_chain",   "filter_pushdown", "projection_waste",
-        "asof_join",    "theta_join",      "semi_anti",
-        "join_defaults"};
+        "all",           "hash_join",       "int_join",
+        "join_chain",    "filter_pushdown", "projection_waste",
+        "asof_join",     "theta_join",      "semi_anti",
+        "join_defaults", "preserving_join"};
     std::unordered_set<std::string> selected;
     for (const auto& s : suites) {
         auto n = normalize_suite_name(s);
@@ -501,6 +507,8 @@ int main(int argc, char** argv) {
                 {
                     {"hj_inner_high_sel", "fact join dim on key"},
                     {"hj_left_high_sel", "fact left join dim on key"},
+                    {"hj_right_high_sel", "fact right join dim on key"},
+                    {"hj_outer_high_sel", "fact outer join dim on key"},
                 },
                 reg, warmup_iters, iters, verify);
         }
@@ -522,6 +530,8 @@ int main(int argc, char** argv) {
                 {
                     {"hj_inner_low_sel", "fact join dim on key"},
                     {"hj_left_low_sel", "fact left join dim on key"},
+                    {"hj_right_low_sel", "fact right join dim on key"},
+                    {"hj_outer_low_sel", "fact outer join dim on key"},
                 },
                 reg, warmup_iters, iters, verify);
         }
@@ -623,6 +633,8 @@ int main(int argc, char** argv) {
                 {
                     {"i64_inner_high_sel", "fact_i64 join dim_i64 on id"},
                     {"i64_left_high_sel", "fact_i64 left join dim_i64 on id"},
+                    {"i64_right_high_sel", "fact_i64 right join dim_i64 on id"},
+                    {"i64_outer_high_sel", "fact_i64 outer join dim_i64 on id"},
                 },
                 reg, warmup_iters, iters, verify);
         }
@@ -643,6 +655,8 @@ int main(int argc, char** argv) {
                 {
                     {"i64_inner_low_sel", "fact_i64 join dim_i64 on id"},
                     {"i64_left_low_sel", "fact_i64 left join dim_i64 on id"},
+                    {"i64_right_low_sel", "fact_i64 right join dim_i64 on id"},
+                    {"i64_outer_low_sel", "fact_i64 outer join dim_i64 on id"},
                     {"i64_semi_low_sel", "fact_i64 semi join dim_i64 on id"},
                     {"i64_anti_low_sel", "fact_i64 anti join dim_i64 on id"},
                 },
@@ -665,6 +679,8 @@ int main(int argc, char** argv) {
                 {
                     {"i64_inner_small_left", "fact_small_i64 join dim_large_i64 on id"},
                     {"i64_left_small_left", "fact_small_i64 left join dim_large_i64 on id"},
+                    {"i64_right_small_left", "fact_small_i64 right join dim_large_i64 on id"},
+                    {"i64_outer_small_left", "fact_small_i64 outer join dim_large_i64 on id"},
                     {"i64_semi_small_left", "fact_small_i64 semi join dim_large_i64 on id"},
                 },
                 reg, warmup_iters, iters, verify);
@@ -706,6 +722,162 @@ int main(int argc, char** argv) {
                 {
                     {"i64_right_extra_rhs", "fact_i64 right join dim_i64 on id"},
                     {"i64_outer_extra_rhs", "fact_i64 outer join dim_i64 on id"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Suite 2b: preserving_join — systematic left/right/outer coverage
+    // Dedicated baseline for the row-preserving join kinds that are most
+    // sensitive to materialization strategy and null/default emission.
+    // ═══════════════════════════════════════════════════════════════════════
+    if (status == 0 && want("preserving_join")) {
+        fmt::print("\n══ preserving_join suite ({} fact rows) ══\n", rows);
+
+        {
+            constexpr std::size_t kKeys = 100;
+            auto fact = make_fact_table(rows, kKeys, "K");
+            auto dim = make_dim_table(kKeys, "K");
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact", std::move(fact));
+            reg.emplace("dim", std::move(dim));
+
+            fmt::print("-- preserving_join: string-key full-match fact({}) x dim({}) --\n", rows,
+                       kKeys);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_str_left_full", "fact left join dim on key"},
+                    {"pj_str_right_full", "fact right join dim on key"},
+                    {"pj_str_outer_full", "fact outer join dim on key"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            constexpr std::size_t kFactKeys = 200;
+            constexpr std::size_t kDimKeys = 100;
+            auto fact = make_fact_table(rows, kFactKeys, "K");
+            auto dim = make_dim_table(kDimKeys, "K");
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact", std::move(fact));
+            reg.emplace("dim", std::move(dim));
+
+            fmt::print("-- preserving_join: string-key 50%%-match fact({}, {}) x dim({}) --\n",
+                       rows, kFactKeys, kDimKeys);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_str_left_half", "fact left join dim on key"},
+                    {"pj_str_right_half", "fact right join dim on key"},
+                    {"pj_str_outer_half", "fact outer join dim on key"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            auto fact = make_fact_table(rows, rows, "K");
+            auto dim = make_dim_table(rows + rows / 2, "K");
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact", std::move(fact));
+            reg.emplace("dim", std::move(dim));
+
+            fmt::print("-- preserving_join: string-key extra-right fact({}) x dim({}) --\n", rows,
+                       rows + rows / 2);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_str_right_extra_rhs", "fact right join dim on key"},
+                    {"pj_str_outer_extra_rhs", "fact outer join dim on key"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            auto fact = make_fact_table(rows, rows, "K");
+            auto dim = make_dim_table(rows, "Z");
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact", std::move(fact));
+            reg.emplace("dim", std::move(dim));
+
+            fmt::print("-- preserving_join: string-key all-miss fact({}) x dim({}) --\n", rows,
+                       rows);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_str_left_all_miss", "fact left join dim on key"},
+                    {"pj_str_right_all_miss", "fact right join dim on key"},
+                    {"pj_str_outer_all_miss", "fact outer join dim on key"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            const std::size_t dim_ids = rows;
+            auto fact = make_int_fact_table(rows, dim_ids);
+            auto dim = make_int_dim_table(dim_ids);
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_i64", std::move(fact));
+            reg.emplace("dim_i64", std::move(dim));
+
+            fmt::print("-- preserving_join: Int64 full-match fact_i64({}) x dim_i64({}) --\n", rows,
+                       dim_ids);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_i64_left_full", "fact_i64 left join dim_i64 on id"},
+                    {"pj_i64_right_full", "fact_i64 right join dim_i64 on id"},
+                    {"pj_i64_outer_full", "fact_i64 outer join dim_i64 on id"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            const std::size_t dim_ids = std::max<std::size_t>(1, rows / 2);
+            auto fact = make_int_fact_table(rows, rows);
+            auto dim = make_int_dim_table(dim_ids);
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_i64", std::move(fact));
+            reg.emplace("dim_i64", std::move(dim));
+
+            fmt::print("-- preserving_join: Int64 50%%-match fact_i64({}, {}) x dim_i64({}) --\n",
+                       rows, rows, dim_ids);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_i64_left_half", "fact_i64 left join dim_i64 on id"},
+                    {"pj_i64_right_half", "fact_i64 right join dim_i64 on id"},
+                    {"pj_i64_outer_half", "fact_i64 outer join dim_i64 on id"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            auto fact = make_int_fact_table(rows, rows);
+            auto dim = make_int_dim_table(rows + rows / 2);
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_i64", std::move(fact));
+            reg.emplace("dim_i64", std::move(dim));
+
+            fmt::print("-- preserving_join: Int64 extra-right fact_i64({}) x dim_i64({}) --\n",
+                       rows, rows + rows / 2);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_i64_right_extra_rhs", "fact_i64 right join dim_i64 on id"},
+                    {"pj_i64_outer_extra_rhs", "fact_i64 outer join dim_i64 on id"},
+                },
+                reg, warmup_iters, iters, verify);
+        }
+
+        if (status == 0) {
+            auto fact = make_int_fact_table(rows, rows);
+            auto dim = make_int_dim_table_with_offset(rows, rows);
+            ibex::runtime::TableRegistry reg;
+            reg.emplace("fact_i64", std::move(fact));
+            reg.emplace("dim_i64", std::move(dim));
+
+            fmt::print("-- preserving_join: Int64 all-miss fact_i64({}) x dim_i64({}) --\n", rows,
+                       rows);
+            status = run_suite_benchmarks(
+                {
+                    {"pj_i64_left_all_miss", "fact_i64 left join dim_i64 on id"},
+                    {"pj_i64_right_all_miss", "fact_i64 right join dim_i64 on id"},
+                    {"pj_i64_outer_all_miss", "fact_i64 outer join dim_i64 on id"},
                 },
                 reg, warmup_iters, iters, verify);
         }
@@ -1012,6 +1184,7 @@ int main(int argc, char** argv) {
                 {
                     {"jd_left_all_miss", "fact_miss left join dim_miss on key"},
                     {"jd_right_all_miss", "fact_miss right join dim_miss on key"},
+                    {"jd_outer_all_miss", "fact_miss outer join dim_miss on key"},
                 },
                 reg, warmup_iters, iters, verify);
         }
@@ -1028,6 +1201,7 @@ int main(int argc, char** argv) {
                 {
                     {"jd_i64_left_all_miss", "fact_miss_i64 left join dim_miss_i64 on id"},
                     {"jd_i64_right_all_miss", "fact_miss_i64 right join dim_miss_i64 on id"},
+                    {"jd_i64_outer_all_miss", "fact_miss_i64 outer join dim_miss_i64 on id"},
                 },
                 reg, warmup_iters, iters, verify);
         }

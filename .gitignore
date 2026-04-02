@@ -40,3 +40,5 @@ benchmarking/aws/.config
 # Python
 .venv/
 **/__pycache__/**
+
+.codex

@@ -16,12 +16,12 @@ auto is_simple_identifier(std::string_view name) -> bool {
     auto is_alnum = [](unsigned char ch) -> bool {
         return std::isalnum(ch) != 0;
     };
-    unsigned char first = static_cast<unsigned char>(name.front());
+    auto first = static_cast<unsigned char>(name.front());
     if (!is_alpha(first) && first != '_') {
         return false;
     }
     for (std::size_t i = 1; i < name.size(); ++i) {
-        unsigned char ch = static_cast<unsigned char>(name[i]);
+        auto ch = static_cast<unsigned char>(name[i]);
         if (!is_alnum(ch) && ch != '_') {
             return false;
         }

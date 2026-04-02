@@ -354,10 +354,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
 
             if (!left_had_match) {
-                if (anti_join) {
-                    left_idx.push_back(l);
-                    right_idx.push_back(kNull);
-                } else if (preserve_left_rows) {
+                if (anti_join || preserve_left_rows) {
                     left_idx.push_back(l);
                     right_idx.push_back(kNull);
                 }
@@ -441,7 +438,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // Preserving join.
         std::size_t out_rows = 0;
         for (std::size_t l = 0; l < n_left; ++l) {
-            out_rows += match_counts[l] == 0 ? (preserve_left_rows ? 1U : 0U) : match_counts[l];
+            auto preserve = preserve_left_rows ? 1U : 0U;
+            out_rows += match_counts[l] == 0 ? preserve : match_counts[l];
         }
         out_rows += unmatched_right;
 

@@ -169,6 +169,11 @@ struct ColumnEntry {
     return entry.validity.has_value() && !(*entry.validity)[row];
 }
 
+/// Returns the number of elements in a type-erased column.
+[[nodiscard]] inline auto column_size(const ColumnValue& column) noexcept -> std::size_t {
+    return std::visit([](const auto& col) { return col.size(); }, column);
+}
+
 struct Table {
     std::vector<ColumnEntry> columns;
     std::unordered_map<std::string, std::size_t> index;
@@ -181,7 +186,12 @@ struct Table {
     [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;
     [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;
     [[nodiscard]] auto find_entry(const std::string& name) const -> const ColumnEntry*;
-    [[nodiscard]] auto rows() const noexcept -> std::size_t;
+    [[nodiscard]] auto rows() const noexcept -> std::size_t {
+        if (columns.empty()) {
+            return 0;
+        }
+        return column_size(*columns.front().column);
+    }
 };
 
 using TableRegistry = std::unordered_map<std::string, Table>;

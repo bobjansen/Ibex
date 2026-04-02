@@ -75,10 +75,6 @@ auto format_tables(const TableRegistry& registry) -> std::string {
     return out;
 }
 
-auto column_size(const ColumnValue& column) -> std::size_t {
-    return std::visit([](const auto& col) { return col.size(); }, column);
-}
-
 [[noreturn]] void invariant_violation(std::string_view detail) {
     // This is triggered by a severe bug, everything in here is on a best effort basis
     (void)std::fputs("ibex internal invariant violated (runtime/interpreter): ", stderr);
@@ -6945,13 +6941,6 @@ auto Table::find(const std::string& name) const -> const ColumnValue* {
         return columns[it->second].column.get();
     }
     return nullptr;
-}
-
-auto Table::rows() const noexcept -> std::size_t {
-    if (columns.empty()) {
-        return 0;
-    }
-    return column_size(*columns.front().column);
 }
 
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,

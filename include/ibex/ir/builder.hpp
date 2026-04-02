@@ -119,10 +119,10 @@ class Builder {
 
    private:
     [[nodiscard]] auto next_id() -> NodeId {
-        return next_id_.fetch_add(1, std::memory_order_relaxed);
+        return NodeId{next_id_.fetch_add(1, std::memory_order_relaxed)};
     }
 
-    std::atomic<NodeId> next_id_{1};
+    std::atomic<std::uint64_t> next_id_{1};
 };
 
 }  // namespace ibex::ir

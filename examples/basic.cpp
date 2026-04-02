@@ -35,7 +35,7 @@ auto main() -> int {
     });
     project->add_child(std::move(filter));
 
-    fmt::print("plan root: node id={}, kind={}\n", project->id(),
+    fmt::print("plan root: node id={}, kind={}\n", project->id().value,
                static_cast<int>(project->kind()));
     fmt::print("plan has {} children\n", project->children().size());
 

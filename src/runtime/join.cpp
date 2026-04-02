@@ -432,7 +432,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             }
             ri.assign(li.size(), kNull);
-            return {std::move(li), std::move(ri), {}};
+            return std::make_tuple(std::move(li), std::move(ri), std::vector<std::size_t>{});
         }
 
         // Preserving join.
@@ -474,7 +474,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
 
-        return {std::move(li), std::move(ri), std::move(kri)};
+        return std::make_tuple(std::move(li), std::move(ri), std::move(kri));
     };
 
     // ── Helper: build index arrays from left-scan match ──────────────────
@@ -537,7 +537,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
 
-        return {std::move(li), std::move(ri), std::move(kri)};
+        return std::make_tuple(std::move(li), std::move(ri), std::move(kri));
     };
 
     // ── Single string/categorical key fast path ──────────────────────────

@@ -34,6 +34,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"distinct", TokenKind::KeywordDistinct},
         {"order", TokenKind::KeywordOrder},
         {"head", TokenKind::KeywordHead},
+        {"tail", TokenKind::KeywordTail},
         {"by", TokenKind::KeywordBy},
         {"window", TokenKind::KeywordWindow},
         {"resample", TokenKind::KeywordResample},

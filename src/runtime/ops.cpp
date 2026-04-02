@@ -208,6 +208,15 @@ auto head(const runtime::Table& t, std::size_t count, const std::vector<std::str
     return delegate(std::move(head_node), t);
 }
 
+auto tail(const runtime::Table& t, std::size_t count, const std::vector<std::string>& group_by)
+    -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto tail_node = b.tail(count, to_col_refs(group_by));
+    tail_node->add_child(std::move(scan_node));
+    return delegate(std::move(tail_node), t);
+}
+
 auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                const std::vector<ir::AggSpec>& aggs) -> runtime::Table {
     ir::Builder b;

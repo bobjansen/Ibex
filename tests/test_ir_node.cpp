@@ -88,6 +88,18 @@ TEST_CASE("HeadNode stores count and optional group-by", "[ir][head]") {
     REQUIRE(head->group_by()[0].name == "symbol");
 }
 
+TEST_CASE("TailNode stores count and optional group-by", "[ir][tail]") {
+    ibex::ir::Builder builder;
+    auto node = builder.tail(3, {ibex::ir::ColumnRef{.name = "symbol"}});
+
+    auto* tail = dynamic_cast<ibex::ir::TailNode*>(node.get());
+    REQUIRE(tail != nullptr);
+    REQUIRE(tail->kind() == ibex::ir::NodeKind::Tail);
+    REQUIRE(tail->count() == 3);
+    REQUIRE(tail->group_by().size() == 1);
+    REQUIRE(tail->group_by()[0].name == "symbol");
+}
+
 TEST_CASE("AggregateNode stores group-by and aggregations", "[ir][aggregate]") {
     ibex::ir::Builder builder;
 

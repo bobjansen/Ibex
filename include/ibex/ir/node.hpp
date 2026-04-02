@@ -206,6 +206,7 @@ enum class NodeKind : std::uint8_t {
     Distinct,
     Order,
     Head,
+    Tail,
     Aggregate,
     Update,
     Rename,
@@ -326,6 +327,22 @@ class HeadNode final : public Node {
    public:
     HeadNode(NodeId id, std::size_t count, std::vector<ColumnRef> group_by = {})
         : Node(NodeKind::Head, id), count_(count), group_by_(std::move(group_by)) {}
+
+    [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
+    [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
+        return group_by_;
+    }
+
+   private:
+    std::size_t count_;
+    std::vector<ColumnRef> group_by_;
+};
+
+/// Tail node: keep the last N rows, optionally per group.
+class TailNode final : public Node {
+   public:
+    TailNode(NodeId id, std::size_t count, std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Tail, id), count_(count), group_by_(std::move(group_by)) {}
 
     [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {

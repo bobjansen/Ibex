@@ -61,7 +61,7 @@ auto release_arrow_array(ArrowArray* array) noexcept -> void;
 
 /// Export a Table as an Arrow struct array plus schema, keeping the original
 /// table alive via shared ownership for true zero-copy export.
-[[nodiscard]] auto export_table_to_arrow(std::shared_ptr<const runtime::Table> table,
+[[nodiscard]] auto export_table_to_arrow(const std::shared_ptr<const runtime::Table>& table,
                                          ArrowArray* out_array, ArrowSchema* out_schema)
     -> std::expected<void, std::string>;
 

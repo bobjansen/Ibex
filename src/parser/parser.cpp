@@ -467,7 +467,7 @@ class Parser {
             return nullptr;
         }
         while (true) {
-            JoinKind kind;
+            JoinKind kind{};
             if (match(TokenKind::KeywordJoin)) {
                 kind = JoinKind::Inner;
             } else if (match(TokenKind::KeywordLeft)) {
@@ -865,8 +865,8 @@ class Parser {
                 std::vector<ExprPtr> cast_args;
                 cast_args.push_back(std::move(arg));
                 auto cast_expr = std::make_unique<Expr>();
-                cast_expr->node =
-                    CallExpr{.callee = std::move(type_name), .args = std::move(cast_args)};
+                cast_expr->node = CallExpr{
+                    .callee = std::move(type_name), .args = std::move(cast_args), .named_args = {}};
                 return cast_expr;
             }
             return fail_expr(previous(), "expected '(' after type name in cast expression");
@@ -1153,7 +1153,10 @@ class Parser {
                 if (!expr) {
                     return std::nullopt;
                 }
-                return UpdateClause{.merge_expr = std::move(expr)};
+                return UpdateClause{.fields = {},
+                                    .tuple_fields = {},
+                                    .map_fields = {},
+                                    .merge_expr = std::move(expr)};
             }
             auto result = parse_clause_field_list_or_single();
             if (!result.has_value()) {
@@ -1161,7 +1164,8 @@ class Parser {
             }
             return UpdateClause{.fields = std::move(result->fields),
                                 .tuple_fields = std::move(result->tuple_fields),
-                                .map_fields = std::move(result->map_fields)};
+                                .map_fields = std::move(result->map_fields),
+                                .merge_expr = {}};
         }
         if (match(TokenKind::KeywordRename)) {
             auto fields = parse_field_list_or_single();

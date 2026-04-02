@@ -1116,7 +1116,8 @@ class Parser {
                 return std::nullopt;
             }
             return SelectClause{.fields = std::move(result->fields),
-                                .tuple_fields = std::move(result->tuple_fields)};
+                                .tuple_fields = std::move(result->tuple_fields),
+                                .map_fields = std::move(result->map_fields)};
         }
         if (match(TokenKind::KeywordDistinct)) {
             auto fields = parse_field_list_or_single();
@@ -1146,7 +1147,8 @@ class Parser {
                 return std::nullopt;
             }
             return UpdateClause{.fields = std::move(result->fields),
-                                .tuple_fields = std::move(result->tuple_fields)};
+                                .tuple_fields = std::move(result->tuple_fields),
+                                .map_fields = std::move(result->map_fields)};
         }
         if (match(TokenKind::KeywordRename)) {
             auto fields = parse_field_list_or_single();
@@ -1491,14 +1493,103 @@ class Parser {
     struct ClauseFields {
         std::vector<Field> fields;
         std::vector<TupleField> tuple_fields;
+        std::vector<MapField> map_fields;
     };
+
+    auto parse_map_binding() -> std::optional<MapBinding> {
+        std::optional<std::string> index_name;
+        std::string value_name;
+        if (match(TokenKind::LParen)) {
+            auto idx = consume_identifier("expected loop index name in map binding");
+            if (!idx.has_value()) {
+                return std::nullopt;
+            }
+            if (!consume(TokenKind::Comma, "expected ',' after loop index name")) {
+                return std::nullopt;
+            }
+            auto val = consume_identifier("expected loop value name in map binding");
+            if (!val.has_value()) {
+                return std::nullopt;
+            }
+            if (!consume(TokenKind::RParen, "expected ')' after map binding")) {
+                return std::nullopt;
+            }
+            index_name = std::move(*idx);
+            value_name = std::move(*val);
+        } else {
+            auto val = consume_identifier("expected loop value name in map binding");
+            if (!val.has_value()) {
+                return std::nullopt;
+            }
+            value_name = std::move(*val);
+        }
+        if (!consume(TokenKind::KeywordIn, "expected 'in' in map binding")) {
+            return std::nullopt;
+        }
+        auto src = consume_identifier("expected compile-time list name after 'in'");
+        if (!src.has_value()) {
+            return std::nullopt;
+        }
+        return MapBinding{
+            .index_name = std::move(index_name),
+            .value_name = std::move(value_name),
+            .source_name = std::move(*src),
+        };
+    }
+
+    auto parse_map_field() -> std::optional<MapField> {
+        std::vector<MapBinding> bindings;
+        do {
+            auto binding = parse_map_binding();
+            if (!binding.has_value()) {
+                return std::nullopt;
+            }
+            bindings.push_back(std::move(*binding));
+        } while (match(TokenKind::Comma));
+
+        ExprPtr where_expr = nullptr;
+        if (match(TokenKind::KeywordWhere)) {
+            where_expr = parse_expression();
+            if (!where_expr) {
+                return std::nullopt;
+            }
+        }
+
+        if (!consume(TokenKind::FatArrow, "expected '=>' in map field")) {
+            return std::nullopt;
+        }
+        auto alias = consume_column_identifier("expected map field alias after '=>'");
+        if (!alias.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::Eq, "expected '=' after map field alias")) {
+            return std::nullopt;
+        }
+        auto value = parse_expression();
+        if (!value) {
+            return std::nullopt;
+        }
+        return MapField{
+            .bindings = std::move(bindings),
+            .where_expr = std::move(where_expr),
+            .alias_template = std::move(*alias),
+            .expr = std::move(value),
+        };
+    }
 
     auto parse_clause_field_list_after_open_brace() -> std::optional<ClauseFields> {
         std::vector<Field> fields;
         std::vector<TupleField> tuple_fields;
+        std::vector<MapField> map_fields;
         if (!check(TokenKind::RBrace)) {
             do {
-                if (match(TokenKind::LParen)) {
+                if (match(TokenKind::KeywordMap)) {
+                    auto map_field = parse_map_field();
+                    if (!map_field.has_value()) {
+                        return std::nullopt;
+                    }
+                    map_fields.push_back(std::move(*map_field));
+                } else if (match(TokenKind::LParen)) {
                     // Tuple LHS: (colA, colB, ...) = expr
                     std::vector<std::string> names;
                     do {
@@ -1540,7 +1631,9 @@ class Parser {
         if (!consume(TokenKind::RBrace, "expected '}' after field list")) {
             return std::nullopt;
         }
-        return ClauseFields{.fields = std::move(fields), .tuple_fields = std::move(tuple_fields)};
+        return ClauseFields{.fields = std::move(fields),
+                            .tuple_fields = std::move(tuple_fields),
+                            .map_fields = std::move(map_fields)};
     }
 
     auto parse_clause_field_list_or_single() -> std::optional<ClauseFields> {
@@ -1557,7 +1650,7 @@ class Parser {
         }
         std::vector<Field> fields;
         fields.push_back(std::move(*field));
-        return ClauseFields{.fields = std::move(fields), .tuple_fields = {}};
+        return ClauseFields{.fields = std::move(fields), .tuple_fields = {}, .map_fields = {}};
     }
 
     auto parse_type() -> std::optional<Type> {

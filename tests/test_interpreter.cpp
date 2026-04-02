@@ -136,6 +136,39 @@ TEST_CASE("Interpret update alias") {
     REQUIRE((*alias_ints)[1] == 7);
 }
 
+TEST_CASE("Interpret compile-time map expansion in aggregate select") {
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{"A", "A", "B"});
+    table.add_column("price", Column<double>{10.0, 14.0, 20.0});
+    table.add_column("fee", Column<double>{1.0, 3.0, 5.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir(R"(
+let measures = ["price", "fee"];
+trades[
+    select { symbol, map m in measures => `avg_${m}` = mean(get(m)) },
+    by symbol,
+    order symbol
+];
+)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& sym = std::get<Column<std::string>>(*result->find("symbol"));
+    const auto& avg_price = std::get<Column<double>>(*result->find("avg_price"));
+    const auto& avg_fee = std::get<Column<double>>(*result->find("avg_fee"));
+
+    REQUIRE(sym.size() == 2);
+    REQUIRE(sym[0] == "A");
+    REQUIRE(sym[1] == "B");
+    REQUIRE(avg_price[0] == Catch::Approx(12.0));
+    REQUIRE(avg_price[1] == Catch::Approx(20.0));
+    REQUIRE(avg_fee[0] == Catch::Approx(2.0));
+    REQUIRE(avg_fee[1] == Catch::Approx(5.0));
+}
+
 TEST_CASE("Interpret update with arithmetic") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{1, 2, 3});
@@ -3462,7 +3495,7 @@ TEST_CASE("update: abs and sqrt work in interpreted expressions", "[update][math
     CHECK(root[2] == Catch::Approx(4.0));
 }
 
-TEST_CASE("update: notebook-style rowwise max/min algebra works with sqrt", "[update][math]") {
+TEST_CASE("update: rowwise min/max work in interpreted expressions", "[update][math]") {
     runtime::Table table;
     table.add_column("a", Column<double>{10.0, 10.2});
     table.add_column("b", Column<double>{9.9, 10.1});
@@ -3472,22 +3505,21 @@ TEST_CASE("update: notebook-style rowwise max/min algebra works with sqrt", "[up
     registry.emplace("t", table);
 
     auto ir = require_ir(
-        "t[update { "
-        "max_ab = 0.5 * (a + b + sqrt((a - b) * (a - b))), "
-        "min_ab = 0.5 * (a + b - sqrt((a - b) * (a - b))), "
-        "max_abc = 0.5 * (max_ab + c + sqrt((max_ab - c) * (max_ab - c))), "
-        "min_abc = 0.5 * (min_ab + c - sqrt((min_ab - c) * (min_ab - c))) "
-        "}];");
+        "t[update { max_abc = pmax(a, b, c), min_abc = pmin(a, b, c), "
+        "mid_abc = a + b + c - pmax(a, b, c) - pmin(a, b, c) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
     const auto& max_abc = std::get<Column<double>>(*result->find("max_abc"));
     const auto& min_abc = std::get<Column<double>>(*result->find("min_abc"));
+    const auto& mid_abc = std::get<Column<double>>(*result->find("mid_abc"));
 
     CHECK(max_abc[0] == Catch::Approx(10.1));
     CHECK(min_abc[0] == Catch::Approx(9.9));
+    CHECK(mid_abc[0] == Catch::Approx(10.0));
     CHECK(max_abc[1] == Catch::Approx(10.3));
     CHECK(min_abc[1] == Catch::Approx(10.1));
+    CHECK(mid_abc[1] == Catch::Approx(10.2));
 }
 
 TEST_CASE("rep missing positional argument returns error") {

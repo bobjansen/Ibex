@@ -996,12 +996,12 @@ auto try_extract_numeric_cmp_spec(const ir::FilterExpr& expr, const Table& table
 
     NumericCmpSpec spec{};
     spec.op = op;
-    if (const auto* c = std::get_if<Column<std::int64_t>>(entry.column.get())) {
+    if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry.column.get())) {
         spec.kind = NumericSpecKind::Int64;
-        spec.i64 = c->data();
-    } else if (const auto* c = std::get_if<Column<double>>(entry.column.get())) {
+        spec.i64 = int_column->data();
+    } else if (const auto* double_column = std::get_if<Column<double>>(entry.column.get())) {
         spec.kind = NumericSpecKind::Double;
-        spec.dbl = c->data();
+        spec.dbl = double_column->data();
     } else {
         return std::nullopt;
     }
@@ -4547,28 +4547,28 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                 using ColType = std::decay_t<decltype(col)>;
                 using ValueType = typename ColType::value_type;
                 if constexpr (std::is_same_v<ValueType, std::int64_t>) {
-                    if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(*v);
-                    } else if (const auto* v = std::get_if<double>(&value.value())) {
-                        col.push_back(static_cast<std::int64_t>(*v));
+                    if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(*int_value);
+                    } else if (const auto* double_value = std::get_if<double>(&value.value())) {
+                        col.push_back(static_cast<std::int64_t>(*double_value));
                     } else {
                         invariant_violation(
                             "eval_expr_column: expected Int64-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, double>) {
-                    if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(static_cast<double>(*v));
-                    } else if (const auto* v = std::get_if<double>(&value.value())) {
-                        col.push_back(*v);
+                    if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(static_cast<double>(*int_value));
+                    } else if (const auto* double_value = std::get_if<double>(&value.value())) {
+                        col.push_back(*double_value);
                     } else {
                         invariant_violation(
                             "eval_expr_column: expected Float64-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, bool>) {
-                    if (const auto* v = std::get_if<bool>(&value.value())) {
-                        col.push_back(*v);
-                    } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(*v != 0);
+                    if (const auto* bool_value = std::get_if<bool>(&value.value())) {
+                        col.push_back(*bool_value);
+                    } else if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(*int_value != 0);
                     } else {
                         invariant_violation(
                             "eval_expr_column: expected Bool-compatible expression value");
@@ -4580,19 +4580,19 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
                         invariant_violation("eval_expr_column: expected String expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, Date>) {
-                    if (const auto* v = std::get_if<Date>(&value.value())) {
-                        col.push_back(*v);
-                    } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(int64_to_date_checked(*v));
+                    if (const auto* date_value = std::get_if<Date>(&value.value())) {
+                        col.push_back(*date_value);
+                    } else if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(int64_to_date_checked(*int_value));
                     } else {
                         invariant_violation(
                             "eval_expr_column: expected Date-compatible expression value");
                     }
                 } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
-                    if (const auto* v = std::get_if<Timestamp>(&value.value())) {
-                        col.push_back(*v);
-                    } else if (const auto* v = std::get_if<std::int64_t>(&value.value())) {
-                        col.push_back(Timestamp{*v});
+                    if (const auto* timestamp_value = std::get_if<Timestamp>(&value.value())) {
+                        col.push_back(*timestamp_value);
+                    } else if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                        col.push_back(Timestamp{*int_value});
                     } else {
                         invariant_violation(
                             "eval_expr_column: expected Timestamp-compatible expression value");
@@ -4769,15 +4769,15 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
             // Each branch is a constexpr-guarded check on a specific alternative.
             std::optional<T> maybe_fill;
             if constexpr (std::is_same_v<T, std::int64_t>) {
-                if (const auto* v = std::get_if<std::int64_t>(&fill_lit->value))
-                    maybe_fill = *v;
-                else if (const auto* v = std::get_if<double>(&fill_lit->value))
-                    maybe_fill = static_cast<std::int64_t>(*v);
+                if (const auto* int_value = std::get_if<std::int64_t>(&fill_lit->value))
+                    maybe_fill = *int_value;
+                else if (const auto* double_value = std::get_if<double>(&fill_lit->value))
+                    maybe_fill = static_cast<std::int64_t>(*double_value);
             } else if constexpr (std::is_same_v<T, double>) {
-                if (const auto* v = std::get_if<double>(&fill_lit->value))
-                    maybe_fill = *v;
-                else if (const auto* v = std::get_if<std::int64_t>(&fill_lit->value))
-                    maybe_fill = static_cast<double>(*v);
+                if (const auto* double_value = std::get_if<double>(&fill_lit->value))
+                    maybe_fill = *double_value;
+                else if (const auto* int_value = std::get_if<std::int64_t>(&fill_lit->value))
+                    maybe_fill = static_cast<double>(*int_value);
             } else if constexpr (std::is_same_v<T, bool>) {
                 if (const auto* v = std::get_if<bool>(&fill_lit->value))
                     maybe_fill = *v;

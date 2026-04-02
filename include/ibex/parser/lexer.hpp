@@ -28,6 +28,9 @@ enum class TokenKind : std::uint8_t {
     KeywordFn,
     KeywordFrom,
     KeywordImport,
+    KeywordMap,
+    KeywordIn,
+    KeywordWhere,
     KeywordFilter,
     KeywordSelect,
     KeywordUpdate,
@@ -102,7 +105,8 @@ enum class TokenKind : std::uint8_t {
     Dot,    // .
 
     // Assignment
-    Eq,  // =
+    Eq,        // =
+    FatArrow,  // =>
 
     // Delimiters
     LParen,     // (

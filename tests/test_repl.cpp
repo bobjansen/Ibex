@@ -81,6 +81,38 @@ filtered[select { price }];
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("REPL executes compile-time map expansion with string-list let binding") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let trades = Table { price = [10.0, 20.0], qty = [2.0, 4.0] };
+let measures = ["price", "qty"];
+trades[select {
+    map m in measures => `avg_${m}` = mean(get(m))
+}];
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL executes function-local compile-time map expansion") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn summarize(t: DataFrame) -> DataFrame {
+    let measures = ["price", "qty"];
+    t[select {
+        map m in measures => `avg_${m}` = mean(get(m))
+    }];
+}
+
+let trades = Table { price = [10.0, 20.0], qty = [2.0, 4.0] };
+summarize(trades);
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
 TEST_CASE("REPL supports model bindings with default ols and model accessors") {
     ibex::runtime::ExternRegistry registry;
 

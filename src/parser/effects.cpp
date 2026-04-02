@@ -193,6 +193,12 @@ class EffectAnalyzer {
                         collect_expr_effects(*f.expr, direct, deps);
                     }
                 };
+                const auto collect_map_field_expr = [&](const MapField& f) {
+                    if (f.where_expr) {
+                        collect_expr_effects(*f.where_expr, direct, deps);
+                    }
+                    collect_expr_effects(*f.expr, direct, deps);
+                };
                 if constexpr (std::is_same_v<T, FilterClause>) {
                     collect_expr_effects(*c.predicate, direct, deps);
                 } else if constexpr (std::is_same_v<T, SelectClause>) {
@@ -201,6 +207,9 @@ class EffectAnalyzer {
                     }
                     for (const auto& tf : c.tuple_fields) {
                         collect_expr_effects(*tf.expr, direct, deps);
+                    }
+                    for (const auto& mf : c.map_fields) {
+                        collect_map_field_expr(mf);
                     }
                 } else if constexpr (std::is_same_v<T, DistinctClause>) {
                     for (const auto& f : c.fields) {
@@ -212,6 +221,9 @@ class EffectAnalyzer {
                     }
                     for (const auto& tf : c.tuple_fields) {
                         collect_expr_effects(*tf.expr, direct, deps);
+                    }
+                    for (const auto& mf : c.map_fields) {
+                        collect_map_field_expr(mf);
                     }
                     if (c.merge_expr) {
                         collect_expr_effects(*c.merge_expr, direct, deps);

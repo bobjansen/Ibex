@@ -276,6 +276,40 @@ ggplot(summary, aes(Species, mean_sl)) +
   geom_col()</code></pre>
         </div>
       </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Compile-Time Map</span>
+          <h3>Generate feature families without leaving Ibex.</h3>
+          <p>
+            Braced <code>select</code> and <code>update</code> blocks support a
+            compile-time <code>map</code> form. It expands from earlier string-list
+            <code>let</code> bindings into ordinary named fields before lowering,
+            so runtime execution stays unchanged.
+          </p>
+          <p>
+            Use backtick aliases with <code>${name}</code> interpolation and
+            <code>get(name)</code> inside the map body to turn compile-time names
+            into column references.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">let</span> measures = [<span class="str">"price"</span>, <span class="str">"fee"</span>];
+
+trades[<span class="kw">select</span> {
+    symbol,
+    <span class="kw">map</span> m <span class="kw">in</span> measures =&gt; <span class="id">`avg_${m}`</span> = <span class="fn-name">mean</span>(<span class="fn-name">get</span>(m))
+}, <span class="kw">by</span> symbol];
+
+<span class="kw">let</span> price_cols = [<span class="str">"ask_price"</span>, <span class="str">"bid_price"</span>, <span class="str">"wap"</span>];
+
+book[<span class="kw">update</span> {
+    <span class="kw">map</span> (i, a) <span class="kw">in</span> price_cols, (j, b) <span class="kw">in</span> price_cols
+        <span class="kw">where</span> i &gt; j
+        =&gt; <span class="id">`${a}_${b}_imb`</span> = (<span class="fn-name">get</span>(a) - <span class="fn-name">get</span>(b)) / (<span class="fn-name">get</span>(a) + <span class="fn-name">get</span>(b))
+}];</code></pre>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -682,7 +716,8 @@ enriched[<span class="kw">select</span> { avg_sal = <span class="fn-name">mean</
           <p>
             Ibex ships a small set of built-in scalar functions that apply
             element-wise to a column. Math: <code>abs</code>, <code>log</code>,
-            <code>sqrt</code>. Date/time extraction: <code>year</code>,
+            <code>sqrt</code>, row-wise <code>pmin</code>, row-wise <code>pmax</code>.
+            Date/time extraction: <code>year</code>,
             <code>month</code>, <code>day</code>, <code>hour</code>,
             <code>minute</code>, <code>second</code>.
           </p>
@@ -698,7 +733,9 @@ enriched[<span class="kw">select</span> { avg_sal = <span class="fn-name">mean</
 trades[<span class="kw">update</span> {
     log_ret  = <span class="fn-name">log</span>(price <span class="op">/</span> <span class="fn-name">lag</span>(price, <span class="num">1</span>)),
     vol      = <span class="fn-name">sqrt</span>(variance),
-    notional = <span class="fn-name">abs</span>(pnl)
+    notional = <span class="fn-name">abs</span>(pnl),
+    hi       = <span class="fn-name">pmax</span>(bid, ask, wap),
+    lo       = <span class="fn-name">pmin</span>(bid, ask, wap)
 }];
 
 <span class="cm">// Date / time extraction</span>

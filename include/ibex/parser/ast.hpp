@@ -133,6 +133,19 @@ struct TupleField {
     ExprPtr expr;
 };
 
+struct MapBinding {
+    std::optional<std::string> index_name;
+    std::string value_name;
+    std::string source_name;
+};
+
+struct MapField {
+    std::vector<MapBinding> bindings;
+    ExprPtr where_expr;
+    std::string alias_template;
+    ExprPtr expr;
+};
+
 struct OrderKey {
     std::string name;
     bool ascending = true;
@@ -145,6 +158,7 @@ struct FilterClause {
 struct SelectClause {
     std::vector<Field> fields;
     std::vector<TupleField> tuple_fields;
+    std::vector<MapField> map_fields;
 };
 
 struct DistinctClause {
@@ -154,6 +168,7 @@ struct DistinctClause {
 struct UpdateClause {
     std::vector<Field> fields;
     std::vector<TupleField> tuple_fields;
+    std::vector<MapField> map_fields;
     /// Set for the `update = expr` form: all columns of the result are merged in.
     ExprPtr merge_expr;
 };
@@ -230,10 +245,9 @@ struct ModelClause {
     std::vector<ModelParam> params;
 };
 
-using Clause =
-    std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
-                 OrderClause, ByClause, WindowClause, ResampleClause, MeltClause, DcastClause,
-                 CovClause, CorrClause, TransposeClause, ModelClause>;
+using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
+                            OrderClause, ByClause, WindowClause, ResampleClause, MeltClause,
+                            DcastClause, CovClause, CorrClause, TransposeClause, ModelClause>;
 
 struct BlockExpr {
     ExprPtr base;

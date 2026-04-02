@@ -25,6 +25,9 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"fn", TokenKind::KeywordFn},
         {"from", TokenKind::KeywordFrom},
         {"import", TokenKind::KeywordImport},
+        {"map", TokenKind::KeywordMap},
+        {"in", TokenKind::KeywordIn},
+        {"where", TokenKind::KeywordWhere},
         {"filter", TokenKind::KeywordFilter},
         {"select", TokenKind::KeywordSelect},
         {"update", TokenKind::KeywordUpdate},
@@ -289,6 +292,8 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
             case '=':
                 if (match('=')) {
                     add_token(TokenKind::EqEq, token_start, 2, token_line, token_column);
+                } else if (match('>')) {
+                    add_token(TokenKind::FatArrow, token_start, 2, token_line, token_column);
                 } else {
                     add_token(TokenKind::Eq, token_start, 1, token_line, token_column);
                 }

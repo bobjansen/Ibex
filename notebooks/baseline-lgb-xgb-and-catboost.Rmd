@@ -152,26 +152,22 @@ let train = read_parquet(train_parquet);
 ```{r define-train-work}
 if (!is.null(params$max_date_id)) {
   session_eval(
-    get_knitr_session("optiver", plugin_paths),
+    ribex::knitr_session("optiver", plugin_paths),
     "
     let train_work = train[filter date_id <= max_date_id];
     ",
     scalars = list(max_date_id = as.integer(params$max_date_id))
   )
 } else {
-  session_eval(get_knitr_session("optiver", plugin_paths), "let train_work = train;")
+  session_eval(ribex::knitr_session("optiver", plugin_paths), "let train_work = train;")
 }
 ```
 
-```{ibex train-rows, session="optiver", assign="train_rows", quiet=TRUE}
+```{ibex train-rows, session="optiver", assign="train_rows"}
 train_work[select { rows = count() }];
 ```
 
-```{r train-rows-print}
-train_rows
-```
-
-## Generate the Ibex Feature Query
+## Define the Feature Families
 
 ```{r feature-query}
 price_cols <- c("reference_price", "far_price", "near_price", "ask_price", "bid_price", "wap")
@@ -193,92 +189,53 @@ base_features <- c(
   "imb_s2"
 )
 
-safe_div <- function(num, den) sprintf("((%s) / (%s))", num, den)
+pair_feature_names <- apply(
+  combn(price_cols, 2),
+  2,
+  \(cols) sprintf("%s_%s_imb", cols[[2]], cols[[1]])
+)
 
-row_max2 <- function(a, b) {
-  sprintf("(0.5 * ((%s) + (%s) + sqrt(((%s) - (%s)) * ((%s) - (%s)))))", a, b, a, b, a, b)
-}
-
-row_min2 <- function(a, b) {
-  sprintf("(0.5 * ((%s) + (%s) - sqrt(((%s) - (%s)) * ((%s) - (%s)))))", a, b, a, b, a, b)
-}
-
-row_max3 <- function(a, b, c) {
-  row_max2(row_max2(a, b), c)
-}
-
-row_min3 <- function(a, b, c) {
-  row_min2(row_min2(a, b), c)
-}
-
-pair_feature_specs <- list()
-for (i in seq_along(price_cols)) {
-  for (j in seq_along(price_cols)) {
-    if (i > j) {
-      a <- price_cols[[i]]
-      b <- price_cols[[j]]
-      name <- sprintf("%s_%s_imb", a, b)
-      expr <- safe_div(sprintf("(%s - %s)", a, b), sprintf("(%s + %s)", a, b))
-      pair_feature_specs[[length(pair_feature_specs) + 1L]] <- list(name = name, expr = expr)
-    }
-  }
-}
-
-triple_feature_specs <- list()
-for (i in seq_along(price_cols)) {
-  for (j in seq_along(price_cols)) {
-    for (k in seq_along(price_cols)) {
-      if (i > j && j > k) {
-        a <- price_cols[[i]]
-        b <- price_cols[[j]]
-        c <- price_cols[[k]]
-        max_expr <- row_max3(a, b, c)
-        min_expr <- row_min3(a, b, c)
-        mid_expr <- sprintf("((%s + %s + %s) - (%s) - (%s))", a, b, c, max_expr, min_expr)
-        name <- sprintf("%s_%s_%s_imb2", a, b, c)
-        expr <- safe_div(sprintf("((%s) - (%s))", max_expr, mid_expr),
-                         sprintf("((%s) - (%s))", mid_expr, min_expr))
-        triple_feature_specs[[length(triple_feature_specs) + 1L]] <- list(name = name, expr = expr)
-      }
-    }
-  }
-}
-
-derived_assignments <- c(
-  sprintf("imb_s1 = %s", safe_div("(bid_size - ask_size)", "(bid_size + ask_size)")),
-  sprintf("imb_s2 = %s", safe_div("(imbalance_size - matched_size)", "(matched_size + imbalance_size)")),
-  vapply(pair_feature_specs, function(spec) sprintf("%s = %s", spec$name, spec$expr), character(1)),
-  vapply(triple_feature_specs, function(spec) sprintf("%s = %s", spec$name, spec$expr), character(1))
+triple_feature_names <- apply(
+  combn(price_cols, 3),
+  2,
+  \(cols) sprintf("%s_%s_%s_imb2", cols[[3]], cols[[2]], cols[[1]])
 )
 
 feature_cols <- c(
   base_features,
-  vapply(pair_feature_specs, `[[`, character(1), "name"),
-  vapply(triple_feature_specs, `[[`, character(1), "name")
+  pair_feature_names,
+  triple_feature_names
 )
-
-build_feature_query <- function(table_name = "train_work") {
-  paste0(
-    table_name,
-    "[update {\n",
-    paste0("  ", derived_assignments, collapse = ",\n"),
-    "\n}];"
-  )
-}
-
-feature_query <- build_feature_query()
-cat(substr(feature_query, 1L, 1500L))
-if (nchar(feature_query) > 1500L) {
-  cat("\n...\n")
-}
 
 length(feature_cols)
 ```
 
 ## Materialize the Feature Table
 
-```{r features}
-train_features <- session_eval(ribex::knitr_session("optiver", plugin_paths), feature_query, format = "data.frame")
+```{ibex features, session="optiver", assign="train_features", quiet=TRUE}
+let price_cols = ["reference_price", "far_price", "near_price", "ask_price", "bid_price", "wap"];
+
+train_work[update {
+    imb_s1 = (bid_size - ask_size) / (bid_size + ask_size),
+    imb_s2 = (imbalance_size - matched_size) / (matched_size + imbalance_size),
+    map (i, a) in price_cols, (j, b) in price_cols
+        where i > j
+        => `${a}_${b}_imb` = (get(a) - get(b)) / (get(a) + get(b)),
+    map (i, a) in price_cols, (j, b) in price_cols, (k, c) in price_cols
+        where i > j && j > k
+        => `${a}_${b}_${c}_imb2` =
+            (
+                pmax(get(a), get(b), get(c)) -
+                (get(a) + get(b) + get(c) - pmin(get(a), get(b), get(c)) - pmax(get(a), get(b), get(c)))
+            ) /
+            (
+                (get(a) + get(b) + get(c) - pmin(get(a), get(b), get(c)) - pmax(get(a), get(b), get(c))) -
+                pmin(get(a), get(b), get(c))
+            )
+}];
+```
+
+```{r features-shape}
 
 dim(train_features)
 head(train_features[, c("stock_id", "date_id", "seconds_in_bucket", "target", feature_cols[1:8])])

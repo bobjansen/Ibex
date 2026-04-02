@@ -1,0 +1,32 @@
+// Compile-time field generation with map.
+
+let quotes = Table {
+    symbol = ["A", "A", "B"],
+    price  = [10.0, 14.0, 20.0],
+    fee    = [1.0, 3.0, 5.0]
+};
+
+let measures = ["price", "fee"];
+
+quotes[
+    select {
+        symbol,
+        map m in measures => `avg_${m}` = mean(get(m))
+    },
+    by symbol,
+    order symbol
+];
+
+let book = Table {
+    ask_price = [101.0, 103.0],
+    bid_price = [99.0, 100.0],
+    wap       = [100.0, 101.5]
+};
+
+let price_cols = ["ask_price", "bid_price", "wap"];
+
+book[update {
+    map (i, a) in price_cols, (j, b) in price_cols
+        where i > j
+        => `${a}_${b}_imb` = (get(a) - get(b)) / (get(a) + get(b))
+}];

@@ -153,6 +153,43 @@ TEST_CASE("Lower grouped aggregation with computed input to IR") {
     REQUIRE(right->name == "fee");
 }
 
+TEST_CASE("Lower grouped aggregation with compile-time map expansion to IR") {
+    auto program = require_parse(R"(
+let measures = ["price", "fee"];
+df[select { symbol, map m in measures => `avg_${m}` = mean(get(m)) }, by symbol];
+)");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* agg = as_node<ir::AggregateNode>(result->get());
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->group_by().size() == 1);
+    REQUIRE(agg->group_by()[0].name == "symbol");
+    REQUIRE(agg->aggregations().size() == 2);
+    REQUIRE(agg->aggregations()[0].alias == "avg_price");
+    REQUIRE(agg->aggregations()[0].column.name == "price");
+    REQUIRE(agg->aggregations()[1].alias == "avg_fee");
+    REQUIRE(agg->aggregations()[1].column.name == "fee");
+}
+
+TEST_CASE("Lower update with compile-time map expansion to IR") {
+    auto program = require_parse(R"(
+let cols = ["ask_price", "bid_price", "wap"];
+df[update {
+    map (i, a) in cols, (j, b) in cols where i > j => `${a}_${b}_imb` = (get(a) - get(b)) / (get(a) + get(b))
+}];
+)");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* update = as_node<ir::UpdateNode>(result->get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->fields().size() == 3);
+    REQUIRE(update->fields()[0].alias == "bid_price_ask_price_imb");
+    REQUIRE(update->fields()[1].alias == "wap_ask_price_imb");
+    REQUIRE(update->fields()[2].alias == "wap_bid_price_imb");
+}
+
 TEST_CASE("Lowering rejects nested aggregate input") {
     auto program = require_parse("df[select { symbol, bad = sum(mean(price)) }, by symbol];");
     auto result = parser::lower(program);

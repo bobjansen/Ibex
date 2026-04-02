@@ -21,6 +21,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -44,6 +45,7 @@ struct PluginLoadResult {
 
 struct SessionState {
     ibex::runtime::TableRegistry tables;
+    std::unordered_map<std::string, std::vector<std::string>> compile_time_lists;
     std::unordered_set<std::string> table_externs;
     std::unordered_set<std::string> sink_externs;
     ibex::runtime::ExternRegistry externs;
@@ -482,6 +484,29 @@ auto build_table_registry_from_r(SEXP tables_sexp)
     return registry;
 }
 
+auto extract_compile_time_string_list(const ibex::parser::Expr& expr)
+    -> std::optional<std::vector<std::string>> {
+    const auto* array = std::get_if<ibex::parser::ArrayLiteralExpr>(&expr.node);
+    if (array == nullptr) {
+        return std::nullopt;
+    }
+
+    std::vector<std::string> values;
+    values.reserve(array->elements.size());
+    for (const auto& elem : array->elements) {
+        const auto* lit = std::get_if<ibex::parser::LiteralExpr>(&elem->node);
+        if (lit == nullptr) {
+            return std::nullopt;
+        }
+        const auto* text = std::get_if<std::string>(&lit->value);
+        if (text == nullptr) {
+            return std::nullopt;
+        }
+        values.push_back(*text);
+    }
+    return values;
+}
+
 auto merge_registries(const ibex::runtime::TableRegistry& base,
                       const ibex::runtime::TableRegistry& extra) -> ibex::runtime::TableRegistry {
     ibex::runtime::TableRegistry merged = base;
@@ -590,12 +615,19 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         }
 
         ibex::parser::LowerContext context;
+        context.compile_time_lists = session.compile_time_lists;
         context.table_externs = session.table_externs;
         context.sink_externs = session.sink_externs;
         auto runtime_registry = merge_registries(session.tables, extra_tables);
         auto runtime_scalars = merge_scalars({}, extra_scalars);
 
         if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
+            if (auto string_list = extract_compile_time_string_list(*let_stmt->value);
+                string_list.has_value()) {
+                session.compile_time_lists.insert_or_assign(let_stmt->name,
+                                                            std::move(*string_list));
+                continue;
+            }
             auto lowered = ibex::parser::lower_expr(*let_stmt->value, context);
             if (!lowered.has_value()) {
                 return std::unexpected(
@@ -608,6 +640,7 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
             if (!evaluated.has_value()) {
                 return std::unexpected(make_error("runtime error", evaluated.error()));
             }
+            session.compile_time_lists.erase(let_stmt->name);
             session.tables.insert_or_assign(let_stmt->name, std::move(*evaluated));
             continue;
         }

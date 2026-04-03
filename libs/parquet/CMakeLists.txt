@@ -123,7 +123,8 @@ add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
 target_compile_options(ibex_parquet_plugin
     PRIVATE
-        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-missing-designated-field-initializers>
+        $<$<CXX_COMPILER_ID:Clang>:-Wno-missing-designated-field-initializers>
+        $<$<CXX_COMPILER_ID:AppleClang>:-Wno-missing-field-initializers>
 )
 
 set_target_properties(ibex_parquet_plugin PROPERTIES

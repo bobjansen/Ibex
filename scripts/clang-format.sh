@@ -3,6 +3,23 @@
 
 set -euo pipefail
 
+usage() {
+    cat <<'EOF'
+usage: scripts/clang-format.sh [clang-format args] <files...>
+
+Examples:
+  scripts/clang-format.sh -i src/core/foo.cpp
+  git ls-files '*.cpp' '*.hpp' | xargs scripts/clang-format.sh -i
+  echo 'int main(){return 0;}' | scripts/clang-format.sh
+EOF
+}
+
+if [[ "$#" -eq 0 && -t 0 ]]; then
+    echo "error: no input provided; refusing to wait on an interactive stdin" >&2
+    usage >&2
+    exit 64
+fi
+
 CLANG_FORMAT_BIN="${CLANG_FORMAT_BIN:-}"
 if [[ -z "$CLANG_FORMAT_BIN" ]]; then
     for candidate in clang-format-20 clang-format-19 clang-format-18 clang-format; do

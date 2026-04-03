@@ -3,7 +3,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "websocket.hpp"
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstdint>
@@ -12,6 +11,8 @@
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
+
+#include "websocket.hpp"
 
 namespace {
 

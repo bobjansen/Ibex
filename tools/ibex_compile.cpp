@@ -4,7 +4,6 @@
 
 #include <CLI/CLI.hpp>
 
-#include "import_resolver.hpp"
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -15,6 +14,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
+
+#include "import_resolver.hpp"
 
 namespace {
 

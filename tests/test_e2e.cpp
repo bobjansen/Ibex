@@ -321,8 +321,8 @@ TEST_CASE("E2E: mean aggregation", "[e2e]") {
     auto symbols = col_str(out, "symbol");
     auto avgs = col_dbl(out, "avg");
     if (symbols[0] == "AAPL") {
-        CHECK(avgs[0] == Catch::Approx(30.0));   // (10+30+50)/3
-        CHECK(avgs[1] == Catch::Approx(30.0));   // (20+40)/2
+        CHECK(avgs[0] == Catch::Approx(30.0));  // (10+30+50)/3
+        CHECK(avgs[1] == Catch::Approx(30.0));  // (20+40)/2
     } else {
         CHECK(avgs[0] == Catch::Approx(30.0));
         CHECK(avgs[1] == Catch::Approx(30.0));
@@ -331,8 +331,8 @@ TEST_CASE("E2E: mean aggregation", "[e2e]") {
 
 TEST_CASE("E2E: min and max aggregation", "[e2e]") {
     auto tables = make_trades();
-    auto out = run(
-        "trades[select { symbol, lo = min(price), hi = max(price) }, by symbol];", tables);
+    auto out =
+        run("trades[select { symbol, lo = min(price), hi = max(price) }, by symbol];", tables);
 
     REQUIRE(out.rows() == 2);
     auto symbols = col_str(out, "symbol");
@@ -353,8 +353,8 @@ TEST_CASE("E2E: min and max aggregation", "[e2e]") {
 
 TEST_CASE("E2E: first and last aggregation", "[e2e]") {
     auto tables = make_trades();
-    auto out = run(
-        "trades[select { symbol, f = first(price), l = last(price) }, by symbol];", tables);
+    auto out =
+        run("trades[select { symbol, f = first(price), l = last(price) }, by symbol];", tables);
 
     REQUIRE(out.rows() == 2);
     auto symbols = col_str(out, "symbol");
@@ -416,10 +416,10 @@ TEST_CASE("E2E: rename multiple columns", "[e2e]") {
 
 TEST_CASE("E2E: filter + aggregate + order pipeline", "[e2e]") {
     auto tables = make_trades();
-    auto out = run(
-        "trades[filter price > 15, select { symbol, total = sum(price) }, by symbol, "
-        "order { total desc }];",
-        tables);
+    auto out =
+        run("trades[filter price > 15, select { symbol, total = sum(price) }, by symbol, "
+            "order { total desc }];",
+            tables);
 
     REQUIRE(out.rows() == 2);
     auto symbols = col_str(out, "symbol");
@@ -439,11 +439,11 @@ TEST_CASE("E2E: update then filter via chained let", "[e2e]") {
     tables.emplace("trades", std::move(t));
 
     runtime::ExternRegistry registry;
-    registry.register_table("get_trades",
-                            [&tables](const runtime::ExternArgs&)
-                                -> std::expected<runtime::ExternValue, std::string> {
-                                return runtime::ExternValue{tables.at("trades")};
-                            });
+    registry.register_table(
+        "get_trades",
+        [&tables](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{tables.at("trades")};
+        });
 
     const char* src = R"(
 extern fn get_trades() -> DataFrame from "fake.hpp";
@@ -470,11 +470,11 @@ TEST_CASE("E2E: chained let bindings via execute_script", "[e2e]") {
     tables.emplace("data", std::move(t));
 
     runtime::ExternRegistry registry;
-    registry.register_table("get_data",
-                            [&tables](const runtime::ExternArgs&)
-                                -> std::expected<runtime::ExternValue, std::string> {
-                                return runtime::ExternValue{tables.at("data")};
-                            });
+    registry.register_table(
+        "get_data",
+        [&tables](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{tables.at("data")};
+        });
 
     const char* src = R"(
 extern fn get_data() -> DataFrame from "fake.hpp";
@@ -525,7 +525,6 @@ TEST_CASE("E2E: left join preserves all left rows", "[e2e]") {
     // Unmatched rows get default value 0 for int
     CHECK(col_i64(out, "score") == std::vector<std::int64_t>{0, 85, 0});
 }
-
 
 TEST_CASE("E2E: right join preserves all right rows", "[e2e]") {
     runtime::Table lhs, rhs;
@@ -753,8 +752,8 @@ TEST_CASE("E2E: handles 1000-row table", "[e2e]") {
     runtime::TableRegistry tables;
     tables.emplace("big", std::move(t));
 
-    auto out = run("big[filter price >= 500, select { symbol, total = sum(price) }, by symbol];",
-                   tables);
+    auto out =
+        run("big[filter price >= 500, select { symbol, total = sum(price) }, by symbol];", tables);
     REQUIRE(out.rows() == 2);
     // A: even numbers 500..998 → sum = 250*749 = 187250
     // B: odd numbers 501..999 → sum = 250*750 = 187500
@@ -1003,25 +1002,24 @@ TEST_CASE("make_buffered_source takes capacity from Ibex query argument", "[e2e]
 
     runtime::ExternRegistry registry;
 
-    registry.register_table(
-        "tick_src",
-        runtime::make_buffered_source([](runtime::StreamBuffered& buf) {
-            runtime::Table t1;
-            t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
-            t1.add_column("price", Column<double>{300.0});
-            t1.time_index = "ts";
-            buf.write(t1);
+    registry.register_table("tick_src",
+                            runtime::make_buffered_source([](runtime::StreamBuffered& buf) {
+                                runtime::Table t1;
+                                t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
+                                t1.add_column("price", Column<double>{300.0});
+                                t1.time_index = "ts";
+                                buf.write(t1);
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                                std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
-            runtime::Table t2;
-            t2.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
-            t2.add_column("price", Column<double>{310.0});
-            t2.time_index = "ts";
-            buf.write(t2);
+                                runtime::Table t2;
+                                t2.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
+                                t2.add_column("price", Column<double>{310.0});
+                                t2.time_index = "ts";
+                                buf.write(t2);
 
-            buf.close();
-        }));
+                                buf.close();
+                            }));
 
     registry.register_scalar_table_consumer(
         "tick_sink", runtime::ScalarKind::Int,
@@ -1253,13 +1251,13 @@ TEST_CASE("E2E: dcast with missing cells produces nulls", "[e2e][dcast]") {
     REQUIRE(math_entry != nullptr);
     REQUIRE(math_entry->validity.has_value());
     CHECK((*math_entry->validity)[0] == true);   // Alice has math
-    CHECK((*math_entry->validity)[1] == false);   // Bob missing math
+    CHECK((*math_entry->validity)[1] == false);  // Bob missing math
 
     const auto* sci_entry = out.find_entry("science");
     REQUIRE(sci_entry != nullptr);
     REQUIRE(sci_entry->validity.has_value());
-    CHECK((*sci_entry->validity)[0] == false);    // Alice missing science
-    CHECK((*sci_entry->validity)[1] == true);     // Bob has science
+    CHECK((*sci_entry->validity)[0] == false);  // Alice missing science
+    CHECK((*sci_entry->validity)[1] == true);   // Bob has science
 }
 
 TEST_CASE("E2E: dcast with multiple row keys", "[e2e][dcast]") {
@@ -1319,11 +1317,11 @@ TEST_CASE("E2E: tuple-LHS update unpacks two columns from extern fn", "[e2e]") {
                                 -> std::expected<runtime::ExternValue, std::string> {
                                 return runtime::ExternValue{base_tbl};
                             });
-    registry.register_table("compute_greeks",
-                            [&greeks](const runtime::ExternArgs&)
-                                -> std::expected<runtime::ExternValue, std::string> {
-                                return runtime::ExternValue{greeks};
-                            });
+    registry.register_table(
+        "compute_greeks",
+        [&greeks](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{greeks};
+        });
 
     const char* src = R"(
 extern fn get_base() -> DataFrame from "fake.hpp";
@@ -1346,16 +1344,16 @@ TEST_CASE("E2E: tuple-LHS update via execute_script verifies column count error"
     tables.emplace("base", std::move(base));
 
     runtime::ExternRegistry registry;
-    registry.register_table("get_base",
-                            [&tables](const runtime::ExternArgs&)
-                                -> std::expected<runtime::ExternValue, std::string> {
-                                return runtime::ExternValue{tables.at("base")};
-                            });
-    registry.register_table("one_col_fn",
-                            [&one_col](const runtime::ExternArgs&)
-                                -> std::expected<runtime::ExternValue, std::string> {
-                                return runtime::ExternValue{one_col};
-                            });
+    registry.register_table(
+        "get_base",
+        [&tables](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{tables.at("base")};
+        });
+    registry.register_table(
+        "one_col_fn",
+        [&one_col](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{one_col};
+        });
 
     const char* src = R"(
 extern fn get_base() -> DataFrame from "fake.hpp";
@@ -1381,11 +1379,11 @@ TEST_CASE("E2E: update = expr merges all columns from extern fn", "[e2e]") {
                                 -> std::expected<runtime::ExternValue, std::string> {
                                 return runtime::ExternValue{base_tbl};
                             });
-    registry.register_table("compute_extras",
-                            [&extra](const runtime::ExternArgs&)
-                                -> std::expected<runtime::ExternValue, std::string> {
-                                return runtime::ExternValue{extra};
-                            });
+    registry.register_table(
+        "compute_extras",
+        [&extra](const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+            return runtime::ExternValue{extra};
+        });
 
     const char* src = R"(
 extern fn get_base() -> DataFrame from "fake.hpp";
@@ -1424,7 +1422,8 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
     runtime::Table days_tbl;
     {
         Column<std::int64_t> idx;
-        for (int i = 1; i <= n_days; ++i) idx.push_back(i);
+        for (int i = 1; i <= n_days; ++i)
+            idx.push_back(i);
         days_tbl.add_column("day", std::move(idx));
     }
     runtime::TableRegistry tables;
@@ -1453,7 +1452,8 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
             {
                 std::stringstream ss(*sym_str);
                 std::string tok;
-                while (std::getline(ss, tok, ',')) syms.push_back(tok);
+                while (std::getline(ss, tok, ','))
+                    syms.push_back(tok);
             }
             if (syms.empty())
                 return std::unexpected("gen_correlated_returns: empty symbol list");
@@ -1461,9 +1461,8 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
             constexpr int n_days = 250;
             const int n = (int)syms.size();
             // Cholesky (hardcoded for 3-asset; clamp at 3 for safety)
-            const double L[3][3] = {{1.0000, 0.0000, 0.0000},
-                                    {0.7000, 0.7141, 0.0000},
-                                    {0.5000, 0.3499, 0.7929}};
+            const double L[3][3] = {
+                {1.0000, 0.0000, 0.0000}, {0.7000, 0.7141, 0.0000}, {0.5000, 0.3499, 0.7929}};
             constexpr double daily_vol = 0.01;
 
             std::mt19937 rng{42};
@@ -1503,7 +1502,7 @@ days[update = gen_correlated_returns(symbols)];
     // ── 5. Shape checks ───────────────────────────────────────────────────────
     REQUIRE(out.rows() == n_days);
     REQUIRE(out.columns.size() == 4);  // day + AAPL + MSFT + GOOG
-    REQUIRE(out.find("day")  != nullptr);
+    REQUIRE(out.find("day") != nullptr);
     REQUIRE(out.find("AAPL") != nullptr);
     REQUIRE(out.find("MSFT") != nullptr);
     REQUIRE(out.find("GOOG") != nullptr);
@@ -1514,12 +1513,18 @@ days[update = gen_correlated_returns(symbols)];
         const auto& ca = std::get<Column<double>>(*out.find(a));
         const auto& cb = std::get<Column<double>>(*out.find(b));
         double ma = 0, mb = 0;
-        for (int i = 0; i < n_days; ++i) { ma += ca[i]; mb += cb[i]; }
-        ma /= n_days; mb /= n_days;
+        for (int i = 0; i < n_days; ++i) {
+            ma += ca[i];
+            mb += cb[i];
+        }
+        ma /= n_days;
+        mb /= n_days;
         double cov = 0, va = 0, vb = 0;
         for (int i = 0; i < n_days; ++i) {
             double da = ca[i] - ma, db = cb[i] - mb;
-            cov += da * db; va += da * da; vb += db * db;
+            cov += da * db;
+            va += da * da;
+            vb += db * db;
         }
         return cov / std::sqrt(va * vb);
     };

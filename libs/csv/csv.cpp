@@ -38,12 +38,12 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
         });
 
     registry->register_scalar_table_consumer(
-        "write_csv",
-        ibex::runtime::ScalarKind::Int,
+        "write_csv", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.size() != 1) {
-                return std::unexpected("write_csv(df, path) expects exactly 1 scalar argument (path)");
+                return std::unexpected(
+                    "write_csv(df, path) expects exactly 1 scalar argument (path)");
             }
             const auto* path = std::get_if<std::string>(&args[0]);
             if (path == nullptr) {

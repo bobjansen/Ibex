@@ -38,7 +38,7 @@ target_link_libraries(ibex_bench
 # zorro.hpp (included via rng.hpp) uses compile-time SIMD dispatch.
 # Mirror the same AVX2 flag used by ibex_runtime so the benchmark
 # measures what actually runs in production.
-if(IBEX_HAS_AVX2)
+if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
     target_compile_options(ibex_bench PRIVATE -mavx2 -mfma)
 endif()
 
@@ -75,7 +75,7 @@ target_link_libraries(ibex_join_bench
         fmt::fmt
 )
 
-if(IBEX_HAS_AVX2)
+if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
     target_compile_options(ibex_join_bench PRIVATE -mavx2 -mfma)
 endif()
 

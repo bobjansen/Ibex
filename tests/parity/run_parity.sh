@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 CXX="${CXX:-clang++}"
+PARITY_CXXFLAGS="${PARITY_CXXFLAGS:-}"
+PARITY_LDFLAGS="${PARITY_LDFLAGS:-}"
 
 detect_cxx_std_flag() {
     local candidate
@@ -19,6 +21,18 @@ detect_cxx_std_flag() {
 }
 
 CXX_STD_FLAG="$(detect_cxx_std_flag)"
+
+EXTRA_CXXFLAGS=()
+if [[ -n "$PARITY_CXXFLAGS" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA_CXXFLAGS=($PARITY_CXXFLAGS)
+fi
+
+EXTRA_LDFLAGS=()
+if [[ -n "$PARITY_LDFLAGS" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA_LDFLAGS=($PARITY_LDFLAGS)
+fi
 
 IBEX_EVAL="$BUILD_DIR/tools/ibex_eval"
 IBEX_COMPILE="$BUILD_DIR/tools/ibex_compile"
@@ -75,7 +89,8 @@ for case_file in "$CASES_DIR"/*.ibex; do
 
     "$IBEX_EVAL" "$case_file" >"$interp_out"
     "$IBEX_COMPILE" "$case_file" -o "$cpp_file"
-    "$CXX" -std="$CXX_STD_FLAG" "${IBEX_INCS[@]}" "$cpp_file" "${IBEX_LIBS[@]}" -o "$bin_file"
+    "$CXX" "${EXTRA_CXXFLAGS[@]}" -std="$CXX_STD_FLAG" \
+        "${IBEX_INCS[@]}" "$cpp_file" "${IBEX_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
     "$bin_file" >"$transpiled_out"
 
     if ! diff -u "$interp_out" "$transpiled_out" >"$diff_out"; then

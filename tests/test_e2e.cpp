@@ -661,8 +661,8 @@ TEST_CASE("E2E: multiple aggregations in a single select", "[e2e]") {
     auto lows = col_i64(out, "lo");
 
     // Find AAPL index
-    int aapl = (symbols[0] == "AAPL") ? 0 : 1;
-    int goog = 1 - aapl;
+    const std::size_t aapl = (symbols[0] == "AAPL") ? 0U : 1U;
+    const std::size_t goog = 1U - aapl;
     CHECK(sums[aapl] == 90);
     CHECK(counts[aapl] == 3);
     CHECK(highs[aapl] == 50);
@@ -683,8 +683,8 @@ TEST_CASE("E2E: aggregate mean per group", "[e2e]") {
     auto symbols = col_str(out, "symbol");
     auto avgs = col_dbl(out, "avg");
     // AAPL mean: (10+30+50)/3 = 30, GOOG mean: (20+40)/2 = 30
-    int aapl = (symbols[0] == "AAPL") ? 0 : 1;
-    int goog = 1 - aapl;
+    const std::size_t aapl = (symbols[0] == "AAPL") ? 0U : 1U;
+    const std::size_t goog = 1U - aapl;
     CHECK(avgs[aapl] == Catch::Approx(30.0));
     CHECK(avgs[goog] == Catch::Approx(30.0));
 }
@@ -759,8 +759,8 @@ TEST_CASE("E2E: handles 1000-row table", "[e2e]") {
     // B: odd numbers 501..999 → sum = 250*750 = 187500
     auto symbols_out = col_str(out, "symbol");
     auto totals = col_i64(out, "total");
-    int a_idx = (symbols_out[0] == "A") ? 0 : 1;
-    int b_idx = 1 - a_idx;
+    const std::size_t a_idx = (symbols_out[0] == "A") ? 0U : 1U;
+    const std::size_t b_idx = 1U - a_idx;
     CHECK(totals[a_idx] == 187250);
     CHECK(totals[b_idx] == 187500);
 }
@@ -1458,8 +1458,8 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
             if (syms.empty())
                 return std::unexpected("gen_correlated_returns: empty symbol list");
 
-            constexpr int n_days = 250;
-            const int n = (int)syms.size();
+            constexpr std::size_t n_days = 250;
+            const std::size_t n = syms.size();
             // Cholesky (hardcoded for 3-asset; clamp at 3 for safety)
             const double L[3][3] = {
                 {1.0000, 0.0000, 0.0000}, {0.7000, 0.7141, 0.0000}, {0.5000, 0.3499, 0.7929}};
@@ -1476,12 +1476,12 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
 
             // Apply Cholesky and scale
             runtime::Table result;
-            for (int s = 0; s < n && s < 3; ++s) {
+            for (std::size_t s = 0; s < n && s < 3; ++s) {
                 Column<double> col;
                 col.reserve(n_days);
-                for (int d = 0; d < n_days; ++d) {
+                for (std::size_t d = 0; d < n_days; ++d) {
                     double r = 0.0;
-                    for (int k = 0; k <= s; ++k)
+                    for (std::size_t k = 0; k <= s; ++k)
                         r += L[s][k] * z[d][k];
                     col.push_back(r * daily_vol);
                 }
@@ -1513,14 +1513,14 @@ days[update = gen_correlated_returns(symbols)];
         const auto& ca = std::get<Column<double>>(*out.find(a));
         const auto& cb = std::get<Column<double>>(*out.find(b));
         double ma = 0, mb = 0;
-        for (int i = 0; i < n_days; ++i) {
+        for (std::size_t i = 0; i < n_days; ++i) {
             ma += ca[i];
             mb += cb[i];
         }
         ma /= n_days;
         mb /= n_days;
         double cov = 0, va = 0, vb = 0;
-        for (int i = 0; i < n_days; ++i) {
+        for (std::size_t i = 0; i < n_days; ++i) {
             double da = ca[i] - ma, db = cb[i] - mb;
             cov += da * db;
             va += da * da;

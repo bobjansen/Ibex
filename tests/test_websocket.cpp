@@ -142,7 +142,6 @@ TEST_CASE("ws_send: handshake and single-row broadcast") {
             ::close(sock);
             return;
         }
-        const auto b0 = static_cast<std::uint8_t>(buf[0]);
         const auto b1 = static_cast<std::uint8_t>(buf[1]);
         buf.erase(0, 2);
 
@@ -152,8 +151,8 @@ TEST_CASE("ws_send: handshake and single-row broadcast") {
                 ::close(sock);
                 return;
             }
-            payload_len =
-                (static_cast<std::uint8_t>(buf[0]) << 8) | static_cast<std::uint8_t>(buf[1]);
+            payload_len = (static_cast<std::size_t>(static_cast<std::uint8_t>(buf[0])) << 8) |
+                          static_cast<std::size_t>(static_cast<std::uint8_t>(buf[1]));
             buf.erase(0, 2);
         } else if (payload_len == 127) {
             if (!recv_exactly(sock, buf, 8)) {
@@ -161,7 +160,7 @@ TEST_CASE("ws_send: handshake and single-row broadcast") {
                 return;
             }
             payload_len = 0;
-            for (int i = 0; i < 8; ++i)
+            for (std::size_t i = 0; i < 8; ++i)
                 payload_len = (payload_len << 8) | static_cast<std::uint8_t>(buf[i]);
             buf.erase(0, 8);
         }

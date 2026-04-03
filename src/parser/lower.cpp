@@ -2426,7 +2426,8 @@ class Lowerer {
         auto number_part = text.substr(0, unit_pos);
         auto unit_part = text.substr(unit_pos);
         std::uint64_t value = 0;
-        auto result = std::from_chars(number_part.begin(), number_part.end(), value);
+        auto result =
+            std::from_chars(number_part.data(), number_part.data() + number_part.size(), value);
         if (result.ec != std::errc()) {
             return std::unexpected(LowerError{.message = "invalid duration literal"});
         }

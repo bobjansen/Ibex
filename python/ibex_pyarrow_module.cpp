@@ -1187,7 +1187,7 @@ PyObject* py_session_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwa
     return export_result_table_or_none(*evaluated);
 }
 
-#if defined(__clang__)
+#if defined(__clang__) && __has_warning("-Wcast-function-type-mismatch")
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wcast-function-type-mismatch"
 #endif
@@ -1211,7 +1211,7 @@ PyMethodDef kModuleMethods[] = {
          "Evaluate an Ibex file within a persistent session and return a pyarrow.Table or None.")},
     {nullptr, nullptr, 0, nullptr},
 };
-#if defined(__clang__)
+#if defined(__clang__) && __has_warning("-Wcast-function-type-mismatch")
 #pragma clang diagnostic pop
 #endif
 

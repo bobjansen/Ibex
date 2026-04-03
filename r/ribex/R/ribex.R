@@ -48,6 +48,32 @@ as_ribex_result <- function(payload, format) {
     as.data.frame(array)
 }
 
+normalize_table_binding <- function(value) {
+    if (is.null(value) || inherits(value, "data.frame") || inherits(value, "nanoarrow_array")) {
+        return(value)
+    }
+
+    if (requireNamespace("nanoarrow", quietly = TRUE)) {
+        converted <- tryCatch(nanoarrow::as_nanoarrow_array(value), error = function(e) NULL)
+        if (!is.null(converted)) {
+            return(converted)
+        }
+    }
+
+    value
+}
+
+normalize_table_bindings <- function(tables) {
+    if (is.null(tables)) {
+        return(NULL)
+    }
+    if (!is.list(tables)) {
+        return(tables)
+    }
+
+    lapply(tables, normalize_table_binding)
+}
+
 create_session <- function(plugin_paths = default_plugin_paths()) {
     .Call(ribex_c_create_session, plugin_paths)
 }
@@ -63,7 +89,7 @@ session_eval <- function(session,
                          format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(query), length(query) == 1L)
-    payload <- .Call(ribex_c_session_eval_ibex, session, query, tables, scalars)
+    payload <- .Call(ribex_c_session_eval_ibex, session, query, normalize_table_bindings(tables), scalars)
     as_ribex_result(payload, format)
 }
 
@@ -74,7 +100,7 @@ session_eval_file <- function(session,
                               format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(path), length(path) == 1L)
-    payload <- .Call(ribex_c_session_eval_file, session, path, tables, scalars)
+    payload <- .Call(ribex_c_session_eval_file, session, path, normalize_table_bindings(tables), scalars)
     as_ribex_result(payload, format)
 }
 
@@ -85,7 +111,7 @@ eval_ibex <- function(query,
                       format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(query), length(query) == 1L)
-    payload <- .Call(ribex_c_eval_ibex, query, plugin_paths, tables, scalars)
+    payload <- .Call(ribex_c_eval_ibex, query, plugin_paths, normalize_table_bindings(tables), scalars)
     as_ribex_result(payload, format)
 }
 
@@ -96,7 +122,7 @@ eval_file <- function(path,
                       format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(path), length(path) == 1L)
-    payload <- .Call(ribex_c_eval_file, path, plugin_paths, tables, scalars)
+    payload <- .Call(ribex_c_eval_file, path, plugin_paths, normalize_table_bindings(tables), scalars)
     as_ribex_result(payload, format)
 }
 

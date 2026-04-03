@@ -2074,12 +2074,7 @@ class Parser {
 
         constexpr std::int64_t kNanosPerSecond = 1'000'000'000;
         constexpr std::int64_t kNanosPerDay = 86'400 * kNanosPerSecond;
-        const auto day_count_raw = day_point.time_since_epoch().count();
-        if (day_count_raw < std::numeric_limits<std::int64_t>::min() ||
-            day_count_raw > std::numeric_limits<std::int64_t>::max()) {
-            return std::nullopt;
-        }
-        const auto day_count = static_cast<std::int64_t>(day_count_raw);
+        const auto day_count = static_cast<std::int64_t>(day_point.time_since_epoch().count());
         const auto time_of_day_nanos =
             ((static_cast<std::int64_t>(*hour) * 3600 + static_cast<std::int64_t>(*minute) * 60 +
               static_cast<std::int64_t>(*second)) *

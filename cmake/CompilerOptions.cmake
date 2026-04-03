@@ -5,9 +5,9 @@ add_library(Ibex::CompilerOptions ALIAS ibex_compiler_options)
 
 target_compile_features(ibex_compiler_options INTERFACE cxx_std_23)
 
-# Older Clang + libstdc++ combinations can report __cpp_concepts=201907L,
-# which makes libstdc++ reject <expected>. Probe the active toolchain first
-# and only enable the workaround when it is actually needed.
+# Older Clang + libstdc++ combinations can reject <expected> unless
+# __cpp_concepts is forced to 202002L. Probe actual std::expected usability
+# first and only enable the workaround when it is actually needed.
 include(CheckCXXSourceCompiles)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
@@ -16,10 +16,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
     check_cxx_source_compiles(
         "
         #include <expected>
-        #ifndef __cpp_concepts
-        #error __cpp_concepts missing
-        #endif
-        static_assert(__cpp_concepts >= 202002L);
         int main() {
             std::expected<int, int> x = 1;
             return *x;

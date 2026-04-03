@@ -2,7 +2,7 @@ include(Catch2Testing)
 
 add_library(ibex_test_warning_suppressions INTERFACE)
 
-add_executable(ibex_tests
+set(IBEX_TEST_SOURCES
     catch_string_view_apple.cpp
     test_arrow_c_data.cpp
     test_column.cpp
@@ -18,14 +18,22 @@ add_executable(ibex_tests
     test_interpreter.cpp
     test_codegen.cpp
     test_join.cpp
-    test_websocket.cpp
 )
+if(NOT WIN32)
+    list(APPEND IBEX_TEST_SOURCES test_websocket.cpp)
+endif()
+
+add_executable(ibex_tests ${IBEX_TEST_SOURCES})
 
 target_include_directories(ibex_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/libs/csv"
     "${PROJECT_SOURCE_DIR}/libs/json"
-    "${PROJECT_SOURCE_DIR}/libs/websocket"
 )
+if(NOT WIN32)
+    target_include_directories(ibex_tests PRIVATE
+        "${PROJECT_SOURCE_DIR}/libs/websocket"
+    )
+endif()
 
 target_link_libraries(ibex_tests
     PRIVATE
@@ -54,7 +62,7 @@ endif()
 
 # Match ibex_runtime's AVX2 flags so that zorro.hpp's SIMD dispatch agrees
 # between the test binary and the runtime library.
-if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
+if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2 AND NOT MSVC)
     target_compile_options(ibex_tests PRIVATE -mavx2 -mfma)
 endif()
 
@@ -65,6 +73,7 @@ target_compile_options(ibex_test_warning_suppressions
     INTERFACE
         $<$<CXX_COMPILER_ID:Clang>:-Wno-c2y-extensions>
         $<$<CXX_COMPILER_ID:AppleClang>:-Wno-c2x-extensions>
+        $<$<CXX_COMPILER_ID:MSVC>:/wd4459>
 )
 
 catch_discover_tests(ibex_tests)
@@ -73,7 +82,7 @@ if(IBEX_COVERAGE)
     ibex_add_coverage_target(ibex_tests)
 endif()
 
-if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin)
+if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin AND NOT WIN32)
     set(_parity_cxxflags "")
     set(_parity_ldflags "")
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")

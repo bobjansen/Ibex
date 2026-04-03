@@ -39,7 +39,11 @@ target_link_libraries(ibex_bench
 # Mirror the same AVX2 flag used by ibex_runtime so the benchmark
 # measures what actually runs in production.
 if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
-    target_compile_options(ibex_bench PRIVATE -mavx2 -mfma)
+    if(MSVC)
+        target_compile_options(ibex_bench PRIVATE /arch:AVX2)
+    else()
+        target_compile_options(ibex_bench PRIVATE -mavx2 -mfma)
+    endif()
 endif()
 
 # Link jemalloc when available.  jemalloc pools large freed allocations instead of
@@ -76,7 +80,11 @@ target_link_libraries(ibex_join_bench
 )
 
 if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
-    target_compile_options(ibex_join_bench PRIVATE -mavx2 -mfma)
+    if(MSVC)
+        target_compile_options(ibex_join_bench PRIVATE /arch:AVX2)
+    else()
+        target_compile_options(ibex_join_bench PRIVATE -mavx2 -mfma)
+    endif()
 endif()
 
 find_library(JEMALLOC_LIB_JOIN

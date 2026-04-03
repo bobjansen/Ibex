@@ -71,8 +71,10 @@ target_link_libraries(ibex_lib
 # Plugin libraries
 add_subdirectory(libs/csv)
 add_subdirectory(libs/json)
-add_subdirectory(libs/udp)
-add_subdirectory(libs/websocket)
+if(NOT WIN32)
+    add_subdirectory(libs/udp)
+    add_subdirectory(libs/websocket)
+endif()
 add_subdirectory(libs/lightbm)
 if(IBEX_BUILD_PARQUET)
     add_subdirectory(libs/parquet)

@@ -18,7 +18,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1806,11 +1810,34 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
     if (loaded_plugins.contains(stem)) {
         return {PluginLoadStatus::Loaded, ""};
     }
+#ifdef _WIN32
+    std::string filename = stem + ".dll";
+#else
     std::string filename = stem + ".so";
+#endif
     std::string last_error;
     std::string last_candidate;
     for (const auto& dir : search_paths) {
         auto full_path = std::filesystem::path(dir) / filename;
+#ifdef _WIN32
+        HMODULE handle = LoadLibraryA(full_path.string().c_str());
+        if (handle == nullptr) {
+            if (std::filesystem::exists(full_path)) {
+                last_error = fmt::format("error code {}", GetLastError());
+                last_candidate = full_path.string();
+            }
+            continue;
+        }
+        using RegisterFn = void (*)(runtime::ExternRegistry*);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        auto* fn = reinterpret_cast<RegisterFn>(
+            reinterpret_cast<void*>(GetProcAddress(handle, "ibex_register")));
+        if (fn == nullptr) {
+            FreeLibrary(handle);
+            fmt::print("warning: plugin '{}' has no ibex_register symbol\n", full_path.string());
+            continue;
+        }
+#else
         void* handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (handle == nullptr) {
             if (std::filesystem::exists(full_path)) {
@@ -1829,6 +1856,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
             fmt::print("warning: plugin '{}' has no ibex_register symbol\n", full_path.string());
             continue;
         }
+#endif
         fn(&externs);
         loaded_plugins.insert(stem);
         spdlog::debug("loaded plugin: {}", full_path.string());

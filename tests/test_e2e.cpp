@@ -1458,7 +1458,6 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
             if (syms.empty())
                 return std::unexpected("gen_correlated_returns: empty symbol list");
 
-            constexpr std::size_t n_days = 250;
             const std::size_t n = syms.size();
             // Cholesky (hardcoded for 3-asset; clamp at 3 for safety)
             const double L[3][3] = {

@@ -42,15 +42,15 @@ auto recv_exactly(int fd, std::string& buf, std::size_t n) -> bool {
 
 }  // namespace
 
-// ─── SHA-1 / accept-key ───────────────────────────────────────────────────────
+// --- SHA-1 / accept-key -------------------------------------------------------
 
-TEST_CASE("compute_accept_key matches RFC 6455 §1.3 test vector") {
-    // Known pair from the RFC: client key → expected server accept value.
+TEST_CASE("compute_accept_key matches RFC 6455 Section 1.3 test vector") {
+    // Known pair from the RFC: client key -> expected server accept value.
     const auto accept = ibex_ws::compute_accept_key("dGhlIHNhbXBsZSBub25jZQ==");
     CHECK(accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 }
 
-// ─── ws_send end-to-end ───────────────────────────────────────────────────────
+// --- ws_send end-to-end -------------------------------------------------------
 //
 // Sequence:
 //   1. ws_listen() binds the TCP port.

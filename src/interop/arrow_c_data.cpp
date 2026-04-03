@@ -3,11 +3,16 @@
 #include <ibex/interop/arrow_c_data.hpp>
 
 #include <bit>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -131,6 +136,300 @@ auto ordering_metadata(const std::optional<std::vector<ir::OrderKey>>& ordering)
         out.append((*ordering)[i].ascending ? "asc" : "desc");
     }
     return out;
+}
+
+auto read_i32_le(const char* p) -> std::int32_t {
+    return static_cast<std::int32_t>(static_cast<unsigned char>(p[0])) |
+           (static_cast<std::int32_t>(static_cast<unsigned char>(p[1])) << 8) |
+           (static_cast<std::int32_t>(static_cast<unsigned char>(p[2])) << 16) |
+           (static_cast<std::int32_t>(static_cast<unsigned char>(p[3])) << 24);
+}
+
+auto decode_metadata(const char* metadata)
+    -> std::expected<std::vector<std::pair<std::string, std::string>>, std::string> {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (metadata == nullptr) {
+        return out;
+    }
+
+    const char* p = metadata;
+    const auto pair_count = read_i32_le(p);
+    if (pair_count < 0) {
+        return std::unexpected("Arrow metadata has a negative pair count");
+    }
+    p += 4;
+    out.reserve(static_cast<std::size_t>(pair_count));
+    for (std::int32_t i = 0; i < pair_count; ++i) {
+        const auto key_len = read_i32_le(p);
+        p += 4;
+        if (key_len < 0) {
+            return std::unexpected("Arrow metadata has a negative key length");
+        }
+        std::string key(p, p + key_len);
+        p += key_len;
+
+        const auto value_len = read_i32_le(p);
+        p += 4;
+        if (value_len < 0) {
+            return std::unexpected("Arrow metadata has a negative value length");
+        }
+        std::string value(p, p + value_len);
+        p += value_len;
+        out.emplace_back(std::move(key), std::move(value));
+    }
+    return out;
+}
+
+auto find_metadata_value(const std::vector<std::pair<std::string, std::string>>& metadata,
+                         std::string_view key) -> std::optional<std::string> {
+    for (const auto& [k, v] : metadata) {
+        if (k == key) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
+auto parse_ordering(std::string_view text)
+    -> std::expected<std::optional<std::vector<ir::OrderKey>>, std::string> {
+    if (text.empty()) {
+        return std::nullopt;
+    }
+
+    std::vector<ir::OrderKey> ordering;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const std::size_t next = text.find(',', pos);
+        const std::string_view item =
+            next == std::string_view::npos ? text.substr(pos) : text.substr(pos, next - pos);
+        const std::size_t colon = item.rfind(':');
+        if (colon == std::string_view::npos || colon == 0 || colon + 1 >= item.size()) {
+            return std::unexpected("invalid ibex.ordering metadata");
+        }
+        const std::string_view direction = item.substr(colon + 1);
+        if (direction != "asc" && direction != "desc") {
+            return std::unexpected("invalid ibex.ordering direction");
+        }
+        ordering.push_back(
+            {.name = std::string(item.substr(0, colon)), .ascending = direction == "asc"});
+        if (next == std::string_view::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+    return ordering;
+}
+
+auto read_bitmap_bit(const std::uint8_t* bytes, std::int64_t index) -> bool {
+    const auto byte_index = static_cast<std::size_t>(index / 8);
+    const auto bit_index = static_cast<unsigned>(index % 8);
+    return ((bytes[byte_index] >> bit_index) & 0x01U) != 0U;
+}
+
+auto import_validity(const ArrowArray& array) -> std::optional<runtime::ValidityBitmap> {
+    if (array.null_count == 0 || array.buffers == nullptr || array.n_buffers < 1 ||
+        array.buffers[0] == nullptr) {
+        return std::nullopt;
+    }
+
+    runtime::ValidityBitmap validity(static_cast<std::size_t>(array.length), false);
+    const auto* bitmap = static_cast<const std::uint8_t*>(array.buffers[0]);
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        validity.set(static_cast<std::size_t>(i), read_bitmap_bit(bitmap, array.offset + i));
+    }
+    return validity;
+}
+
+auto validate_child(const ArrowArray& array, const ArrowSchema& schema, std::string_view where)
+    -> std::expected<void, std::string> {
+    if (schema.release == nullptr) {
+        return std::unexpected(std::string(where) + ": Arrow schema is released");
+    }
+    if (array.release == nullptr) {
+        return std::unexpected(std::string(where) + ": Arrow array is released");
+    }
+    if (array.length < 0 || array.offset < 0) {
+        return std::unexpected(std::string(where) + ": negative Arrow length or offset");
+    }
+    return {};
+}
+
+template <typename T>
+auto import_plain_column(const ArrowArray& array, std::size_t data_buffer_index)
+    -> std::expected<Column<T>, std::string> {
+    if (array.buffers == nullptr ||
+        array.n_buffers <= static_cast<std::int64_t>(data_buffer_index) ||
+        array.buffers[data_buffer_index] == nullptr) {
+        return std::unexpected("Arrow array is missing a primitive data buffer");
+    }
+
+    const auto* values = static_cast<const T*>(array.buffers[data_buffer_index]);
+    Column<T> column;
+    column.reserve(static_cast<std::size_t>(array.length));
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        column.push_back(values[array.offset + i]);
+    }
+    return column;
+}
+
+template <typename T>
+auto import_primitive_column(const ArrowArray& array, std::size_t data_buffer_index)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    auto column = import_plain_column<T>(array, data_buffer_index);
+    if (!column) {
+        return std::unexpected(column.error());
+    }
+    return runtime::ColumnValue{std::move(*column)};
+}
+
+auto import_bool_column(const ArrowArray& array)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    if (array.buffers == nullptr || array.n_buffers < 2 || array.buffers[1] == nullptr) {
+        return std::unexpected("Arrow bool array is missing a data buffer");
+    }
+
+    const auto* bitmap = static_cast<const std::uint8_t*>(array.buffers[1]);
+    Column<bool> column;
+    column.reserve(static_cast<std::size_t>(array.length));
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        column.push_back(read_bitmap_bit(bitmap, array.offset + i));
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
+auto import_string_column(const ArrowArray& array)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    if (array.buffers == nullptr || array.n_buffers < 3 || array.buffers[1] == nullptr ||
+        array.buffers[2] == nullptr) {
+        return std::unexpected("Arrow utf8 array is missing offsets or char buffers");
+    }
+
+    const auto* offsets = static_cast<const std::int32_t*>(array.buffers[1]);
+    const auto* chars = static_cast<const char*>(array.buffers[2]);
+    const auto start_base = offsets[array.offset];
+
+    Column<std::string> column;
+    std::size_t total_chars = 0;
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        const auto start = offsets[array.offset + i];
+        const auto end = offsets[array.offset + i + 1];
+        if (start < start_base || end < start) {
+            return std::unexpected("Arrow utf8 array has invalid offsets");
+        }
+        total_chars += static_cast<std::size_t>(end - start);
+    }
+    column.reserve(static_cast<std::size_t>(array.length), total_chars);
+
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        const auto start = offsets[array.offset + i];
+        const auto end = offsets[array.offset + i + 1];
+        column.push_back(std::string_view(chars + start, static_cast<std::size_t>(end - start)));
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
+auto import_dictionary_strings(const ArrowArray& dictionary)
+    -> std::expected<std::vector<std::string>, std::string> {
+    if (dictionary.buffers == nullptr || dictionary.n_buffers < 3 ||
+        dictionary.buffers[1] == nullptr || dictionary.buffers[2] == nullptr) {
+        return std::unexpected("Arrow dictionary array is missing utf8 buffers");
+    }
+
+    const auto* offsets = static_cast<const std::int32_t*>(dictionary.buffers[1]);
+    const auto* chars = static_cast<const char*>(dictionary.buffers[2]);
+    std::vector<std::string> values;
+    values.reserve(static_cast<std::size_t>(dictionary.length));
+    for (std::int64_t i = 0; i < dictionary.length; ++i) {
+        const auto start = offsets[dictionary.offset + i];
+        const auto end = offsets[dictionary.offset + i + 1];
+        if (end < start) {
+            return std::unexpected("Arrow dictionary utf8 array has invalid offsets");
+        }
+        values.emplace_back(chars + start, chars + end);
+    }
+    return values;
+}
+
+auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schema)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    if (schema.dictionary == nullptr || array.dictionary == nullptr) {
+        return std::unexpected("Arrow dictionary column is missing dictionary storage");
+    }
+    if (std::string_view(schema.dictionary->format != nullptr ? schema.dictionary->format : "") !=
+        "u") {
+        return std::unexpected("Arrow dictionary column currently requires utf8 dictionary values");
+    }
+    auto dict_values = import_dictionary_strings(*array.dictionary);
+    if (!dict_values.has_value()) {
+        return std::unexpected(dict_values.error());
+    }
+
+    if (array.buffers == nullptr || array.n_buffers < 2 || array.buffers[1] == nullptr) {
+        return std::unexpected("Arrow dictionary column is missing indices");
+    }
+    const auto* codes = static_cast<const std::int32_t*>(array.buffers[1]);
+    Column<Categorical> column(std::move(*dict_values));
+    column.reserve(static_cast<std::size_t>(array.length));
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        const auto code = codes[array.offset + i];
+        if (code < 0 || static_cast<std::size_t>(code) >= column.dictionary().size()) {
+            return std::unexpected("Arrow dictionary column has an out-of-range index");
+        }
+        column.push_code(code);
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
+auto import_column(const ArrowArray& array, const ArrowSchema& schema)
+    -> std::expected<std::pair<runtime::ColumnValue, std::optional<runtime::ValidityBitmap>>,
+                     std::string> {
+    auto ready = validate_child(array, schema, "Arrow column import");
+    if (!ready) {
+        return std::unexpected(ready.error());
+    }
+
+    const std::string_view format = schema.format != nullptr ? schema.format : "";
+    std::expected<runtime::ColumnValue, std::string> column =
+        std::unexpected("unsupported Arrow column format");
+
+    if (format == "l") {
+        column = import_primitive_column<std::int64_t>(array, 1);
+    } else if (format == "g") {
+        column = import_primitive_column<double>(array, 1);
+    } else if (format == "b") {
+        column = import_bool_column(array);
+    } else if (format == "tdD") {
+        auto raw = import_plain_column<std::int32_t>(array, 1);
+        if (!raw) {
+            return std::unexpected(raw.error());
+        }
+        Column<Date> dates;
+        dates.reserve(raw->size());
+        for (std::size_t i = 0; i < raw->size(); ++i) {
+            dates.push_back(Date{(*raw)[i]});
+        }
+        column = runtime::ColumnValue{std::move(dates)};
+    } else if (format == "tsn:") {
+        auto raw = import_plain_column<std::int64_t>(array, 1);
+        if (!raw) {
+            return std::unexpected(raw.error());
+        }
+        Column<Timestamp> ts;
+        ts.reserve(raw->size());
+        for (std::size_t i = 0; i < raw->size(); ++i) {
+            ts.push_back(Timestamp{(*raw)[i]});
+        }
+        column = runtime::ColumnValue{std::move(ts)};
+    } else if (format == "u") {
+        column = import_string_column(array);
+    } else if (format == "i") {
+        column = import_categorical_column(array, schema);
+    }
+
+    if (!column) {
+        return std::unexpected(column.error());
+    }
+    return std::pair{std::move(*column), import_validity(array)};
 }
 
 auto build_dictionary_strings(const Column<Categorical>& col)
@@ -456,6 +755,72 @@ auto export_table_to_arrow(const std::shared_ptr<const runtime::Table>& table,
         return std::unexpected("Arrow export requires a non-null table");
     }
     return export_table_impl(table, out_array, out_schema);
+}
+
+auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)
+    -> std::expected<runtime::Table, std::string> {
+    auto ready = validate_child(array, schema, "Arrow table import");
+    if (!ready) {
+        return std::unexpected(ready.error());
+    }
+
+    if (std::string_view(schema.format != nullptr ? schema.format : "") != "+s") {
+        return std::unexpected("Arrow table import currently requires a struct schema");
+    }
+    if (schema.n_children != array.n_children) {
+        return std::unexpected("Arrow table import requires matching child counts");
+    }
+    if (schema.children == nullptr || array.children == nullptr) {
+        if (schema.n_children != 0 || array.n_children != 0) {
+            return std::unexpected("Arrow table import is missing child arrays or schemas");
+        }
+    }
+
+    runtime::Table table;
+    for (std::int64_t i = 0; i < schema.n_children; ++i) {
+        const ArrowSchema* child_schema = schema.children[i];
+        const ArrowArray* child_array = array.children[i];
+        if (child_schema == nullptr || child_array == nullptr) {
+            return std::unexpected("Arrow table import encountered a null child");
+        }
+        if (child_array->length != array.length) {
+            return std::unexpected(
+                "Arrow table import requires every column to match table length");
+        }
+        auto imported = import_column(*child_array, *child_schema);
+        if (!imported) {
+            return std::unexpected(imported.error());
+        }
+        const std::string name = child_schema->name != nullptr ? child_schema->name : "";
+        if (name.empty()) {
+            return std::unexpected("Arrow table import requires named child columns");
+        }
+        auto& [column, validity] = *imported;
+        if (validity.has_value()) {
+            table.add_column(name, std::move(column), std::move(*validity));
+        } else {
+            table.add_column(name, std::move(column));
+        }
+    }
+
+    auto metadata = decode_metadata(schema.metadata);
+    if (!metadata) {
+        return std::unexpected(metadata.error());
+    }
+    if (auto time_index = find_metadata_value(*metadata, "ibex.time_index");
+        time_index.has_value()) {
+        table.time_index = *time_index;
+    }
+    if (auto ordering_text = find_metadata_value(*metadata, "ibex.ordering");
+        ordering_text.has_value()) {
+        auto ordering = parse_ordering(*ordering_text);
+        if (!ordering) {
+            return std::unexpected(ordering.error());
+        }
+        table.ordering = std::move(*ordering);
+    }
+
+    return table;
 }
 
 }  // namespace ibex::interop

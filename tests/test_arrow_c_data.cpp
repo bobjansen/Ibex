@@ -144,3 +144,102 @@ TEST_CASE("Arrow C Data export maps categoricals to dictionary arrays", "[intero
     schema.release(&schema);
     array.release(&array);
 }
+
+TEST_CASE("Arrow C Data import round-trips values, validity, and table metadata",
+          "[interop][arrow]") {
+    ibex::runtime::Table table;
+    table.add_column("id", ibex::Column<std::int64_t>{10, 20, 30});
+
+    ibex::Column<std::string> names{"alpha", "", "gamma"};
+    ibex::runtime::ValidityBitmap name_validity{true, false, true};
+    table.add_column("name", std::move(names), std::move(name_validity));
+
+    ibex::Column<bool> flags{true, false, true};
+    ibex::runtime::ValidityBitmap flag_validity{true, true, false};
+    table.add_column("flag", std::move(flags), std::move(flag_validity));
+
+    table.add_column("trade_date",
+                     ibex::Column<ibex::Date>{{ibex::Date{1}, ibex::Date{2}, ibex::Date{3}}});
+    table.add_column("ts", ibex::Column<ibex::Timestamp>{
+                               {ibex::Timestamp{100}, ibex::Timestamp{200}, ibex::Timestamp{300}}});
+    table.time_index = "ts";
+    table.ordering = std::vector<ibex::ir::OrderKey>{{"ts", true}, {"id", false}};
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(table, &array, &schema);
+    REQUIRE(exported.has_value());
+
+    auto imported = ibex::interop::import_table_from_arrow(array, schema);
+    REQUIRE(imported.has_value());
+
+    REQUIRE(imported->time_index == table.time_index);
+    REQUIRE(imported->ordering.has_value());
+    REQUIRE(table.ordering.has_value());
+    REQUIRE(imported->ordering->size() == table.ordering->size());
+    for (std::size_t i = 0; i < imported->ordering->size(); ++i) {
+        CHECK((*imported->ordering)[i].name == (*table.ordering)[i].name);
+        CHECK((*imported->ordering)[i].ascending == (*table.ordering)[i].ascending);
+    }
+
+    const auto* ids = std::get_if<ibex::Column<std::int64_t>>(imported->find("id"));
+    const auto* imported_names = std::get_if<ibex::Column<std::string>>(imported->find("name"));
+    const auto* imported_flags = std::get_if<ibex::Column<bool>>(imported->find("flag"));
+    REQUIRE(ids != nullptr);
+    REQUIRE(imported_names != nullptr);
+    REQUIRE(imported_flags != nullptr);
+
+    REQUIRE((*ids)[0] == 10);
+    REQUIRE((*ids)[1] == 20);
+    REQUIRE((*imported_names)[0] == "alpha");
+    REQUIRE((*imported_names)[1] == "");
+    REQUIRE((*imported_names)[2] == "gamma");
+    REQUIRE((*imported_flags)[0]);
+    REQUIRE(!(*imported_flags)[1]);
+    REQUIRE((*imported_flags)[2]);
+
+    const auto* imported_name_entry = imported->find_entry("name");
+    const auto* imported_flag_entry = imported->find_entry("flag");
+    REQUIRE(imported_name_entry != nullptr);
+    REQUIRE(imported_flag_entry != nullptr);
+    REQUIRE(imported_name_entry->validity.has_value());
+    REQUIRE(imported_flag_entry->validity.has_value());
+    CHECK((*imported_name_entry->validity)[0]);
+    CHECK(!(*imported_name_entry->validity)[1]);
+    CHECK((*imported_name_entry->validity)[2]);
+    CHECK((*imported_flag_entry->validity)[0]);
+    CHECK((*imported_flag_entry->validity)[1]);
+    CHECK(!(*imported_flag_entry->validity)[2]);
+
+    schema.release(&schema);
+    array.release(&array);
+}
+
+TEST_CASE("Arrow C Data import round-trips dictionary encoded categoricals", "[interop][arrow]") {
+    ibex::runtime::Table table;
+    ibex::Column<ibex::Categorical> cat;
+    cat.push_back("AAPL");
+    cat.push_back("MSFT");
+    cat.push_back("AAPL");
+    table.add_column("symbol", std::move(cat));
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(table, &array, &schema);
+    REQUIRE(exported.has_value());
+
+    auto imported = ibex::interop::import_table_from_arrow(array, schema);
+    REQUIRE(imported.has_value());
+
+    const auto* symbols = std::get_if<ibex::Column<ibex::Categorical>>(imported->find("symbol"));
+    REQUIRE(symbols != nullptr);
+    REQUIRE(symbols->dictionary().size() == 2);
+    REQUIRE(symbols->dictionary()[0] == "AAPL");
+    REQUIRE(symbols->dictionary()[1] == "MSFT");
+    REQUIRE((*symbols)[0] == "AAPL");
+    REQUIRE((*symbols)[1] == "MSFT");
+    REQUIRE((*symbols)[2] == "AAPL");
+
+    schema.release(&schema);
+    array.release(&array);
+}

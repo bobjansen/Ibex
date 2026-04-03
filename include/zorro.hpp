@@ -504,7 +504,7 @@ class alignas(64) Rng {
 
     // ── Uniform [low, high) ──────────────────────────────────────────────────
 
-    void fill_uniform(double* __restrict__ out, std::size_t count, double low = 0.0,
+    void fill_uniform(double* __restrict out, std::size_t count, double low = 0.0,
                       double high = 1.0) noexcept {
 #if defined(__AVX512F__)
         const double range = high - low;
@@ -586,7 +586,7 @@ class alignas(64) Rng {
 
     // ── Normal N(mean, stddev) — Marsaglia polar method ──────────────────────
 
-    void fill_normal(double* __restrict__ out, std::size_t count, double mean = 0.0,
+    void fill_normal(double* __restrict out, std::size_t count, double mean = 0.0,
                      double stddev = 1.0) noexcept {
 #if defined(__AVX512F__) && defined(ZORRO_USE_LIBMVEC)
         if (!detail::cpu_is_amd()) {
@@ -604,8 +604,7 @@ class alignas(64) Rng {
 
     // ── Exponential Exp(lambda) ──────────────────────────────────────────────
 
-    void fill_exponential(double* __restrict__ out, std::size_t count,
-                          double lambda = 1.0) noexcept {
+    void fill_exponential(double* __restrict out, std::size_t count, double lambda = 1.0) noexcept {
         const double inv_lambda = 1.0 / lambda;
 #if defined(__AVX512F__) && defined(ZORRO_USE_LIBMVEC)
         fill_exponential_avx512_veclog(out, count, inv_lambda);
@@ -618,7 +617,7 @@ class alignas(64) Rng {
 
     // ── Bernoulli(p) → double (0.0 / 1.0) ───────────────────────────────────
 
-    void fill_bernoulli(double* __restrict__ out, std::size_t count, double p) noexcept {
+    void fill_bernoulli(double* __restrict out, std::size_t count, double p) noexcept {
         const auto threshold = static_cast<std::uint64_t>(p * 0x1.0p64);
 #if defined(__AVX512F__)
         fill_bernoulli_avx512(out, count, threshold);
@@ -631,7 +630,7 @@ class alignas(64) Rng {
 
     // ── Gamma(alpha, 1) — Marsaglia & Tsang, alpha >= 1 ──────────────────────
 
-    void fill_gamma(double* __restrict__ out, std::size_t count, double alpha) noexcept {
+    void fill_gamma(double* __restrict out, std::size_t count, double alpha) noexcept {
 #ifdef __AVX2__
         fill_gamma_avx2(out, count, alpha);
 #else
@@ -641,7 +640,7 @@ class alignas(64) Rng {
 
     // ── Student's t(nu) = N(0,1) / sqrt(Gamma(nu/2, 1) / (nu/2)) ─────────────
 
-    void fill_student_t(double* __restrict__ out, std::size_t count, double nu) noexcept {
+    void fill_student_t(double* __restrict out, std::size_t count, double nu) noexcept {
 #ifdef __AVX2__
         fill_student_t_avx2(out, count, nu);
 #else
@@ -730,7 +729,7 @@ class alignas(64) Rng {
     // ── Portable (no SIMD intrinsics) ────────────────────────────────────────
 
 #ifndef __AVX2__
-    void fill_uniform_portable(double* __restrict__ out, std::size_t count, double low,
+    void fill_uniform_portable(double* __restrict out, std::size_t count, double low,
                                double high) noexcept {
         const double range = high - low;
         std::uint64_t result[4];
@@ -750,7 +749,7 @@ class alignas(64) Rng {
         }
     }
 
-    void fill_normal_portable(double* __restrict__ out, std::size_t count, double mean,
+    void fill_normal_portable(double* __restrict out, std::size_t count, double mean,
                               double stddev) noexcept {
         std::uint64_t result[4];
         std::size_t i = 0;
@@ -770,7 +769,7 @@ class alignas(64) Rng {
         }
     }
 
-    void fill_exponential_portable(double* __restrict__ out, std::size_t count,
+    void fill_exponential_portable(double* __restrict out, std::size_t count,
                                    double inv_lambda) noexcept {
         std::uint64_t result[4];
         std::size_t i = 0;
@@ -789,7 +788,7 @@ class alignas(64) Rng {
         }
     }
 
-    void fill_bernoulli_portable(double* __restrict__ out, std::size_t count,
+    void fill_bernoulli_portable(double* __restrict out, std::size_t count,
                                  std::uint64_t threshold) noexcept {
         std::uint64_t result[4];
         std::size_t i = 0;
@@ -808,7 +807,7 @@ class alignas(64) Rng {
         }
     }
 
-    void fill_gamma_portable(double* __restrict__ out, std::size_t count, double alpha) noexcept {
+    void fill_gamma_portable(double* __restrict out, std::size_t count, double alpha) noexcept {
         const double d = alpha - 1.0 / 3.0;
         const double c = 1.0 / std::sqrt(9.0 * d);
         std::uint64_t result[4];
@@ -837,7 +836,7 @@ class alignas(64) Rng {
         }
     }
 
-    void fill_student_t_portable(double* __restrict__ out, std::size_t count, double nu) noexcept {
+    void fill_student_t_portable(double* __restrict out, std::size_t count, double nu) noexcept {
         static constexpr std::size_t kChunk = 128;
         double z_buf[kChunk];
         double g_buf[kChunk];
@@ -878,7 +877,7 @@ class alignas(64) Rng {
     // ── AVX2 distribution kernels ────────────────────────────────────────────
 
 #ifdef __AVX2__
-    void fill_normal_avx2(double* __restrict__ out, std::size_t count, double mean,
+    void fill_normal_avx2(double* __restrict out, std::size_t count, double mean,
                           double stddev) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
 #if defined(ZORRO_USE_LIBMVEC) && \
@@ -993,7 +992,7 @@ class alignas(64) Rng {
         store_avx2(a0, a1, a2, a3, b0, b1, b2, b3);
     }
 
-    void fill_exponential_avx2(double* __restrict__ out, std::size_t count,
+    void fill_exponential_avx2(double* __restrict out, std::size_t count,
                                double inv_lambda) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
 #if defined(ZORRO_USE_LIBMVEC) && defined(ZORRO_EXACT_EXPONENTIAL_LOG)
@@ -1060,7 +1059,7 @@ class alignas(64) Rng {
         store_avx2(a0, a1, a2, a3, b0, b1, b2, b3);
     }
 
-    void fill_bernoulli_avx2(double* __restrict__ out, std::size_t count,
+    void fill_bernoulli_avx2(double* __restrict out, std::size_t count,
                              std::uint64_t threshold) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
         const __m256i sign_flip =
@@ -1105,7 +1104,7 @@ class alignas(64) Rng {
 
     // ── Gamma (two-phase: SIMD polar → N(0,1) buffer; MT acceptance) ──────────
 
-    void fill_gamma_avx2(double* __restrict__ out, std::size_t count, double alpha) noexcept {
+    void fill_gamma_avx2(double* __restrict out, std::size_t count, double alpha) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
         const double d = alpha - 1.0 / 3.0;
         const double c = 1.0 / std::sqrt(9.0 * d);
@@ -1316,7 +1315,7 @@ class alignas(64) Rng {
         store_avx2(a0, a1, a2, a3, b0, b1, b2, b3);
     }
 
-    void fill_student_t_avx2(double* __restrict__ out, std::size_t count, double nu) noexcept {
+    void fill_student_t_avx2(double* __restrict out, std::size_t count, double nu) noexcept {
         static constexpr std::size_t kChunk = 128;
         alignas(32) double z_buf[kChunk];
         alignas(32) double g_buf[kChunk];
@@ -1337,7 +1336,7 @@ class alignas(64) Rng {
     // ── AVX-512 distribution kernels ─────────────────────────────────────────
 
 #ifdef __AVX512F__
-    void fill_bernoulli_avx512(double* __restrict__ out, std::size_t count,
+    void fill_bernoulli_avx512(double* __restrict out, std::size_t count,
                                std::uint64_t threshold) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx512();
         const __m512i thresh_vec = _mm512_set1_epi64(static_cast<std::int64_t>(threshold));
@@ -1371,7 +1370,7 @@ class alignas(64) Rng {
     }
 
 #ifdef ZORRO_USE_LIBMVEC
-    void fill_normal_avx512_vecpolar(double* __restrict__ out, std::size_t count, double mean,
+    void fill_normal_avx512_vecpolar(double* __restrict out, std::size_t count, double mean,
                                      double stddev) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx512();
         const __m512d one = _mm512_set1_pd(1.0);
@@ -1445,7 +1444,7 @@ class alignas(64) Rng {
         store_avx512(a0, a1, a2, a3, b0, b1, b2, b3);
     }
 
-    void fill_exponential_avx512_veclog(double* __restrict__ out, std::size_t count,
+    void fill_exponential_avx512_veclog(double* __restrict out, std::size_t count,
                                         double inv_lambda) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx512();
         const __m512d neg_inv = _mm512_set1_pd(-inv_lambda);

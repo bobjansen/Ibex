@@ -28,7 +28,7 @@ target_link_libraries(ibex_repl
         Ibex::CompilerOptions
         fmt::fmt
         spdlog::spdlog
-        dl
+        $<$<NOT:$<PLATFORM_ID:Windows>>:dl>
 )
 
 if(TARGET Ibex::Sanitizers)

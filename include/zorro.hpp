@@ -39,11 +39,15 @@
 #include <limits>
 #include <random>
 
-#if defined(__AVX2__) || defined(__AVX512F__)
+#if defined(__AVX2__) || defined(__AVX512F__) || defined(_MSC_VER)
 #include <immintrin.h>
 #endif
-#if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__AVX512F__)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
+#endif
 #endif
 
 #ifdef ZORRO_USE_LIBMVEC

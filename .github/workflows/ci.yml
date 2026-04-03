@@ -52,6 +52,31 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --parallel 4
 
+  build-and-test-windows:
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+            -DIBEX_WARNINGS_AS_ERRORS=ON `
+            -DIBEX_BUILD_TESTS=ON `
+            -DIBEX_BUILD_TOOLS=ON `
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF `
+            -DIBEX_BUILD_PARQUET=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Test
+        run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure --parallel 4
+
   clang-tidy:
     runs-on: ubuntu-24.04
     steps:

@@ -53,7 +53,7 @@ endif()
 
 # Match ibex_runtime's AVX2 flags so that zorro.hpp's SIMD dispatch agrees
 # between the test binary and the runtime library.
-if(IBEX_HAS_AVX2)
+if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
     target_compile_options(ibex_tests PRIVATE -mavx2 -mfma)
 endif()
 

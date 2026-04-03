@@ -755,7 +755,7 @@ TEST_CASE("Interpret compound filter: AND") {
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
 
-    // price > 10 && qty < 5 → only row with price=25, qty=2 passes
+    // price > 10 && qty < 5 -> only row with price=25, qty=2 passes
     auto ir = require_ir("trades[filter price > 10 && qty < 5];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -793,7 +793,7 @@ TEST_CASE("Interpret compound filter: arithmetic in predicate") {
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
 
-    // price * 2 > 100 → only price=60 passes
+    // price * 2 > 100 -> only price=60 passes
     auto ir = require_ir("trades[filter price * 2 > 100];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -811,7 +811,7 @@ TEST_CASE("Interpret compound filter: NOT") {
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
 
-    // !(price > 15) → price=10 passes
+    // !(price > 15) -> price=10 passes
     auto ir = require_ir("trades[filter !(price > 15)];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -831,7 +831,7 @@ TEST_CASE("Interpret compound filter: three-way AND") {
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
 
-    // price > 10 && qty < 5 && flag == 1 → price=15 (qty=4,flag=1) and price=35 (qty=2,flag=1)
+    // price > 10 && qty < 5 && flag == 1 -> price=15 (qty=4,flag=1) and price=35 (qty=2,flag=1)
     auto ir = require_ir("trades[filter price > 10 && qty < 5 && flag == 1];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -843,7 +843,7 @@ TEST_CASE("Interpret compound filter: three-way AND") {
     REQUIRE((*prices)[1] == 35);
 }
 
-// ─── TimeFrame / as_timeframe tests ──────────────────────────────────────────
+// --- TimeFrame / as_timeframe tests ------------------------------------------
 
 TEST_CASE("as_timeframe on Timestamp column sets time_index and sorts ascending") {
     runtime::Table table;
@@ -1004,7 +1004,7 @@ TEST_CASE("Window on plain DataFrame returns TimeFrame error") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    // window + update on a plain DataFrame (no time_index) → error
+    // window + update on a plain DataFrame (no time_index) -> error
     auto ir = require_ir("data[window 5m, update { s = rolling_sum(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
@@ -1019,14 +1019,14 @@ TEST_CASE("Window with no update clause returns unsupported error") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    // window without any update node → "only 'update' is currently supported"
+    // window without any update node -> "only 'update' is currently supported"
     auto ir = require_ir("data[window 5m];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("only 'update'") != std::string::npos);
 }
 
-// ─── lag / lead tests ─────────────────────────────────────────────────────────
+// --- lag / lead tests ---------------------------------------------------------
 
 TEST_CASE("lag(val, 1) on TimeFrame shifts values and fills default at start") {
     runtime::Table table;
@@ -1120,7 +1120,7 @@ TEST_CASE("lag on non-TimeFrame returns error") {
     REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
 }
 
-// ─── cumsum / cumprod tests ───────────────────────────────────────────────────
+// --- cumsum / cumprod tests ---------------------------------------------------
 
 TEST_CASE("cumsum on Int column produces running sum") {
     runtime::Table table;
@@ -1244,12 +1244,12 @@ TEST_CASE("rolling_sum outside window clause returns error") {
     REQUIRE(result.error().find("requires a window clause") != std::string::npos);
 }
 
-// ─── rolling aggregate tests ──────────────────────────────────────────────────
+// --- rolling aggregate tests --------------------------------------------------
 // Timestamps: 0ns, 1ns, 2ns  Values: 10, 20, 30
 // Window 1ns: [t-1, t]
-//   row 0 (t=0): [0-1,0]=[-1,0] → only row 0
-//   row 1 (t=1): [0,1]          → rows 0,1
-//   row 2 (t=2): [1,2]          → rows 1,2
+//   row 0 (t=0): [0-1,0]=[-1,0] -> only row 0
+//   row 1 (t=1): [0,1]          -> rows 0,1
+//   row 2 (t=2): [1,2]          -> rows 1,2
 
 TEST_CASE("rolling_sum with 1ns window") {
     runtime::Table table;
@@ -1340,9 +1340,9 @@ TEST_CASE("rolling_min and rolling_max with 1ns window") {
     REQUIRE((*mx)[2] == 20);  // max(10,20)
 }
 
-// ─── resample tests ───────────────────────────────────────────────────────────
+// --- resample tests -----------------------------------------------------------
 
-TEST_CASE("resample basic OHLC — 3 two-minute buckets") {
+TEST_CASE("resample basic OHLC - 3 two-minute buckets") {
     // 6 ticks: t=0,1,2 in bucket 0; t=3,4,5 in bucket 1; t=6 in bucket 2
     // (using minute-scale nanos: 1 min = 60e9 ns)
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
@@ -1374,7 +1374,7 @@ TEST_CASE("resample basic OHLC — 3 two-minute buckets") {
     REQUIRE(high_col != nullptr);
     REQUIRE(low_col != nullptr);
 
-    // bucket 0: rows 0,1 → open=10, close=20, low=10, high=20
+    // bucket 0: rows 0,1 -> open=10, close=20, low=10, high=20
     const auto& opens = std::get<Column<double>>(*open_col);
     const auto& closes = std::get<Column<double>>(*close_col);
     const auto& highs = std::get<Column<double>>(*high_col);
@@ -1384,16 +1384,16 @@ TEST_CASE("resample basic OHLC — 3 two-minute buckets") {
     REQUIRE(highs[0] == 20.0);
     REQUIRE(lows[0] == 10.0);
 
-    // bucket 1: rows 2,3 → open=30, close=40
+    // bucket 1: rows 2,3 -> open=30, close=40
     REQUIRE(opens[1] == 30.0);
     REQUIRE(closes[1] == 40.0);
 
-    // bucket 2: rows 4,5 → open=50, close=60
+    // bucket 2: rows 4,5 -> open=50, close=60
     REQUIRE(opens[2] == 50.0);
     REQUIRE(closes[2] == 60.0);
 }
 
-TEST_CASE("resample with by — one bucket per (bucket, symbol)") {
+TEST_CASE("resample with by - one bucket per (bucket, symbol)") {
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1 * min_ns),
@@ -1408,7 +1408,7 @@ TEST_CASE("resample with by — one bucket per (bucket, symbol)") {
     auto ir = require_ir(R"(tf[resample 1m, select { close = last(price) }, by symbol];)");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    // 2 symbols × 2 buckets = 4 rows
+    // 2 symbols x 2 buckets = 4 rows
     REQUIRE(result->rows() == 4);
     REQUIRE(result->find("close") != nullptr);
     REQUIRE(result->find("symbol") != nullptr);
@@ -1450,13 +1450,13 @@ TEST_CASE("rolling_sum preserves other columns and time_index") {
     REQUIRE(result->find("s") != nullptr);
 }
 
-// ─── rolling_median / rolling_std / rolling_ewma ─────────────────────────────
+// --- rolling_median / rolling_std / rolling_ewma -----------------------------
 // Same 3-row, 1ns-window setup used by the other rolling tests:
 //   ts: 0ns, 1ns, 2ns   val: 10, 20, 30
-//   window 1ns → [t-1, t]
-//     row 0: only row 0      → {10}
-//     row 1: rows 0..1       → {10,20}
-//     row 2: rows 1..2       → {20,30}
+//   window 1ns -> [t-1, t]
+//     row 0: only row 0      -> {10}
+//     row 1: rows 0..1       -> {10,20}
+//     row 2: rows 1..2       -> {20,30}
 
 TEST_CASE("rolling_median with 1ns window") {
     runtime::Table table;
@@ -1475,14 +1475,14 @@ TEST_CASE("rolling_median with 1ns window") {
     REQUIRE(m != nullptr);
     // row 0: median({10}) = 10
     CHECK((*m)[0] == Catch::Approx(10.0));
-    // row 1: median({10,20}) = 15   (even count → average of two middle values)
+    // row 1: median({10,20}) = 15   (even count -> average of two middle values)
     CHECK((*m)[1] == Catch::Approx(15.0));
     // row 2: median({20,30}) = 25
     CHECK((*m)[2] == Catch::Approx(25.0));
 }
 
 TEST_CASE("rolling_median odd window size") {
-    // 5 timestamps, window 2ns → row 2 sees {10,20,30} (odd count)
+    // 5 timestamps, window 2ns -> row 2 sees {10,20,30} (odd count)
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3), ts_from_nanos(4)});
@@ -1498,16 +1498,16 @@ TEST_CASE("rolling_median odd window size") {
 
     const auto* m = std::get_if<Column<double>>(result->find("m"));
     REQUIRE(m != nullptr);
-    // row 2 (t=2): window [0,2] → {10,30,20} sorted {10,20,30} → median = 20
+    // row 2 (t=2): window [0,2] -> {10,30,20} sorted {10,20,30} -> median = 20
     CHECK((*m)[2] == Catch::Approx(20.0));
-    // row 3 (t=3): window [1,3] → {30,20,40} sorted {20,30,40} → median = 30
+    // row 3 (t=3): window [1,3] -> {30,20,40} sorted {20,30,40} -> median = 30
     CHECK((*m)[3] == Catch::Approx(30.0));
 }
 
 TEST_CASE("rolling_std with 1ns window") {
-    // row 0: {10}      → n<2, stddev = 0.0
-    // row 1: {10,20}   → mean=15, M2=50, sample std = sqrt(50/1)=sqrt(50)≈7.071
-    // row 2: {20,30}   → mean=25, M2=50, sample std = sqrt(50/1)=sqrt(50)≈7.071
+    // row 0: {10}      -> n<2, stddev = 0.0
+    // row 1: {10,20}   -> mean=15, M2=50, sample std = sqrt(50/1)=sqrt(50)~7.071
+    // row 2: {20,30}   -> mean=25, M2=50, sample std = sqrt(50/1)=sqrt(50)~7.071
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
@@ -1522,11 +1522,11 @@ TEST_CASE("rolling_std with 1ns window") {
 
     const auto* s = std::get_if<Column<double>>(result->find("s"));
     REQUIRE(s != nullptr);
-    // single-element window → 0.0 (undefined sample stddev)
+    // single-element window -> 0.0 (undefined sample stddev)
     CHECK((*s)[0] == Catch::Approx(0.0));
-    // {10,20}: sample std = sqrt(50) ≈ 7.0711
+    // {10,20}: sample std = sqrt(50) ~ 7.0711
     CHECK((*s)[1] == Catch::Approx(7.0711).epsilon(1e-3));
-    // {20,30}: sample std = sqrt(50) ≈ 7.0711
+    // {20,30}: sample std = sqrt(50) ~ 7.0711
     CHECK((*s)[2] == Catch::Approx(7.0711).epsilon(1e-3));
 }
 
@@ -1548,15 +1548,15 @@ TEST_CASE("rolling_std larger window") {
 
     const auto* s = std::get_if<Column<double>>(result->find("s"));
     REQUIRE(s != nullptr);
-    // row 2: {0,2,4} → sample std = 2.0
+    // row 2: {0,2,4} -> sample std = 2.0
     CHECK((*s)[2] == Catch::Approx(2.0));
 }
 
 TEST_CASE("rolling_ewma with 1ns window") {
     // alpha = 0.5
-    // row 0: window {10}     → ewma = 10
-    // row 1: window {10,20}  → ewma starts 10, then 0.5*20 + 0.5*10 = 15
-    // row 2: window {20,30}  → ewma starts 20, then 0.5*30 + 0.5*20 = 25
+    // row 0: window {10}     -> ewma = 10
+    // row 1: window {10,20}  -> ewma starts 10, then 0.5*20 + 0.5*10 = 15
+    // row 2: window {20,30}  -> ewma starts 20, then 0.5*30 + 0.5*20 = 25
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
@@ -1578,10 +1578,10 @@ TEST_CASE("rolling_ewma with 1ns window") {
 
 TEST_CASE("rolling_ewma larger window") {
     // window 2ns, alpha = 0.5
-    // row 0 (t=0): {10}            → ewma = 10
-    // row 1 (t=1): {10, 20}        → 10 → 0.5*20+0.5*10 = 15
-    // row 2 (t=2): {10, 20, 30}    → 10 → 15 → 0.5*30+0.5*15 = 22.5
-    // row 3 (t=3): {20, 30, 40}    → 20 → 0.5*30+0.5*20=25 → 0.5*40+0.5*25 = 32.5
+    // row 0 (t=0): {10}            -> ewma = 10
+    // row 1 (t=1): {10, 20}        -> 10 -> 0.5*20+0.5*10 = 15
+    // row 2 (t=2): {10, 20, 30}    -> 10 -> 15 -> 0.5*30+0.5*15 = 22.5
+    // row 3 (t=3): {20, 30, 40}    -> 20 -> 0.5*30+0.5*20=25 -> 0.5*40+0.5*25 = 32.5
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3)});
@@ -1603,7 +1603,7 @@ TEST_CASE("rolling_ewma larger window") {
     CHECK((*e)[3] == Catch::Approx(32.5));
 }
 
-// ─── Phase 1 null semantics ───────────────────────────────────────────────────
+// --- Phase 1 null semantics ---------------------------------------------------
 
 TEST_CASE("null: right join unmatched rows produce null left columns", "[null][join]") {
     runtime::Table left, right;
@@ -1633,9 +1633,9 @@ TEST_CASE("null: outer join unmatched rows produce nulls on both sides", "[null]
     //
     // Full outer join on id emits left rows in left-table order, then any
     // unmatched right rows:
-    //   row 0 → id=1, name="alice" (left-only)  →  score is NULL
-    //   row 1 → id=2, name="bob"  (matched)     →  score=20.0
-    //   row 2 → id=3              (right-only)  →  name is NULL, score=30.0
+    //   row 0 -> id=1, name="alice" (left-only)  ->  score is NULL
+    //   row 1 -> id=2, name="bob"  (matched)     ->  score=20.0
+    //   row 2 -> id=3              (right-only)  ->  name is NULL, score=30.0
     runtime::Table left, right;
     left.add_column("id", Column<std::int64_t>{1, 2});
     left.add_column("name", Column<std::string>{"alice", "bob"});
@@ -1651,15 +1651,15 @@ TEST_CASE("null: outer join unmatched rows produce nulls on both sides", "[null]
     const auto& name_entry = t.columns[t.index.at("name")];
     const auto& score_entry = t.columns[t.index.at("score")];
 
-    // row 0: id=1, left-only → name valid, score null
+    // row 0: id=1, left-only -> name valid, score null
     CHECK_FALSE(runtime::is_null(name_entry, 0));
     CHECK(runtime::is_null(score_entry, 0));
 
-    // row 1: id=2, matched  → both valid
+    // row 1: id=2, matched  -> both valid
     CHECK_FALSE(runtime::is_null(name_entry, 1));
     CHECK_FALSE(runtime::is_null(score_entry, 1));
 
-    // row 2: id=3, right-only → name null, score valid
+    // row 2: id=3, right-only -> name null, score valid
     CHECK(runtime::is_null(name_entry, 2));
     CHECK_FALSE(runtime::is_null(score_entry, 2));
 }
@@ -1687,7 +1687,7 @@ TEST_CASE("null: left join unmatched rows produce null right columns", "[null][j
 
     const auto& score_entry = t.columns[t.index.at("score")];
     CHECK_FALSE(runtime::is_null(score_entry, 0));  // id=1 matched
-    CHECK(runtime::is_null(score_entry, 1));        // id=2 unmatched → null
+    CHECK(runtime::is_null(score_entry, 1));        // id=2 unmatched -> null
     CHECK_FALSE(runtime::is_null(score_entry, 2));  // id=3 matched
 }
 
@@ -1699,7 +1699,7 @@ TEST_CASE("null: validity bitmap propagates through filter", "[null]") {
     runtime::TableRegistry registry;
     registry.emplace("t", t);
 
-    // Filter: keep id >= 1 (all rows) — bitmap must survive unchanged.
+    // Filter: keep id >= 1 (all rows) - bitmap must survive unchanged.
     auto ir = require_ir("t[filter id >= 1];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -1707,7 +1707,7 @@ TEST_CASE("null: validity bitmap propagates through filter", "[null]") {
 
     const auto& val_entry = result->columns[result->index.at("val")];
     CHECK_FALSE(runtime::is_null(val_entry, 0));  // row 0 was valid
-    CHECK(runtime::is_null(val_entry, 1));        // row 1 was null → still null
+    CHECK(runtime::is_null(val_entry, 1));        // row 1 was null -> still null
     CHECK_FALSE(runtime::is_null(val_entry, 2));  // row 2 was valid
 }
 
@@ -1845,8 +1845,8 @@ TEST_CASE("print: doubles use mixed precision formatting", "[print]") {
 
 TEST_CASE("null: left join fan-out (duplicate right keys)", "[null][join]") {
     // left: id = {1, 2, 3}
-    // right: id = {1, 1, 3}  — id=1 appears twice, id=2 missing
-    // expected output: 4 rows (id=1 ×2, id=2 ×1 null, id=3 ×1)
+    // right: id = {1, 1, 3}  - id=1 appears twice, id=2 missing
+    // expected output: 4 rows (id=1 x2, id=2 x1 null, id=3 x1)
     runtime::Table left, right;
     left.add_column("id", Column<std::int64_t>{1, 2, 3});
 
@@ -1876,7 +1876,7 @@ TEST_CASE("null: left join fan-out (duplicate right keys)", "[null][join]") {
     CHECK(val_col[3] == 30.0);
 }
 
-// ─── Phase 2: Nullable Expressions + 3VL Filter tests ────────────────────────
+// --- Phase 2: Nullable Expressions + 3VL Filter tests ------------------------
 
 TEST_CASE("null 3vl: arithmetic propagates null", "[null][3vl]") {
     // price column with a validity bitmap: rows 0,2 valid; row 1 null
@@ -1920,7 +1920,7 @@ TEST_CASE("null 3vl: comparison with null drops row", "[null][3vl]") {
     runtime::TableRegistry registry;
     registry.emplace("j", *joined);
 
-    // filter { sector == "Tech" } — null rows should be dropped
+    // filter { sector == "Tech" } - null rows should be dropped
     auto ir = require_ir("j[filter { sector == \"Tech\" }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -1943,7 +1943,7 @@ TEST_CASE("null 3vl: IS NULL predicate keeps null rows", "[null][3vl]") {
     runtime::TableRegistry registry;
     registry.emplace("j", *joined);
 
-    // filter { sector is null } — only id=2 (unmatched) should remain
+    // filter { sector is null } - only id=2 (unmatched) should remain
     auto ir = require_ir("j[filter { sector is null }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -1966,7 +1966,7 @@ TEST_CASE("null 3vl: IS NOT NULL predicate keeps valid rows", "[null][3vl]") {
     runtime::TableRegistry registry;
     registry.emplace("j", *joined);
 
-    // filter { sector is not null } — id=1 and id=3 should remain
+    // filter { sector is not null } - id=1 and id=3 should remain
     auto ir = require_ir("j[filter { sector is not null }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -1977,11 +1977,11 @@ TEST_CASE("null 3vl: IS NOT NULL predicate keeps valid rows", "[null][3vl]") {
     CHECK(id_col[1] == 3);
 }
 
-TEST_CASE("null 3vl: OR short-circuit with null — true OR null = true", "[null][3vl]") {
+TEST_CASE("null 3vl: OR short-circuit with null - true OR null = true", "[null][3vl]") {
     runtime::Table left, right;
     // id=1: price=10, sector="Tech"  (both known)
-    // id=2: price=50, sector=null    (price>0 is TRUE, sector is null → true OR null = true)
-    // id=3: price=-1, sector=null    (price>0 is FALSE, sector is null → false OR null = null →
+    // id=2: price=50, sector=null    (price>0 is TRUE, sector is null -> true OR null = true)
+    // id=3: price=-1, sector=null    (price>0 is FALSE, sector is null -> false OR null = null ->
     // drop)
     left.add_column("id", Column<std::int64_t>{1, 2, 3});
     left.add_column("price", Column<std::int64_t>{10, 50, -1});
@@ -2000,9 +2000,9 @@ TEST_CASE("null 3vl: OR short-circuit with null — true OR null = true", "[null
     auto ir = require_ir("j[filter { price > 0 || sector is not null }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    // id=1: price>0=true, is not null=true  → true OR true = true → keep
-    // id=2: price>0=true, is not null=false → true OR null(=false,invalid) = true (valid) → keep
-    // id=3: price>0=false, is not null=false → false OR null = null → drop
+    // id=1: price>0=true, is not null=true  -> true OR true = true -> keep
+    // id=2: price>0=true, is not null=false -> true OR null(=false,invalid) = true (valid) -> keep
+    // id=3: price>0=false, is not null=false -> false OR null = null -> drop
     CHECK(result->rows() == 2);
     const auto& id_col =
         std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
@@ -2095,7 +2095,7 @@ TEST_CASE("Interpret rename: error on missing column") {
     CHECK(result.error().find("nonexistent") != std::string::npos);
 }
 
-// ── Statistical aggregation functions ────────────────────────────────────────
+// -- Statistical aggregation functions ----------------------------------------
 
 TEST_CASE("Interpret median aggregation (odd count)") {
     runtime::Table table;
@@ -2154,9 +2154,9 @@ TEST_CASE("Interpret median aggregation grouped") {
     const auto* meds = std::get_if<Column<double>>(med_col);
     REQUIRE(meds != nullptr);
     REQUIRE(meds->size() == 2);
-    // Group A: {10, 20, 30} → median = 20
+    // Group A: {10, 20, 30} -> median = 20
     CHECK((*meds)[0] == Catch::Approx(20.0));
-    // Group B: {5, 15} → median = 10
+    // Group B: {5, 15} -> median = 10
     CHECK((*meds)[1] == Catch::Approx(10.0));
 }
 
@@ -2218,9 +2218,9 @@ TEST_CASE("Interpret sample stddev grouped") {
     const auto* sv = std::get_if<Column<double>>(s_col);
     REQUIRE(sv != nullptr);
     REQUIRE(sv->size() == 2);
-    // Group A: {2,4,6} → mean=4, M2=8, sample std = sqrt(8/2) = 2
+    // Group A: {2,4,6} -> mean=4, M2=8, sample std = sqrt(8/2) = 2
     CHECK((*sv)[0] == Catch::Approx(2.0));
-    // Group B: {1,3} → mean=2, M2=2, sample std = sqrt(2/1) = sqrt(2) ≈ 1.41421356
+    // Group B: {1,3} -> mean=2, M2=2, sample std = sqrt(2/1) = sqrt(2) ~ 1.41421356
     CHECK((*sv)[1] == Catch::Approx(1.41421356).epsilon(1e-5));
 }
 
@@ -2236,7 +2236,7 @@ TEST_CASE("Interpret stddev single element is null") {
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
-    // Single element → count < 2 → result should be null
+    // Single element -> count < 2 -> result should be null
     const auto* s_entry = result->find_entry("s");
     REQUIRE(s_entry != nullptr);
     REQUIRE(s_entry->validity.has_value());
@@ -2266,8 +2266,8 @@ TEST_CASE("Interpret EWMA aggregation") {
 
 TEST_CASE("Interpret EWMA grouped") {
     runtime::Table table;
-    // Group A: {1, 3}, alpha=0.5 → 1.0 then 0.5*3+0.5*1 = 2.0
-    // Group B: {2, 4}, alpha=0.5 → 2.0 then 0.5*4+0.5*2 = 3.0
+    // Group A: {1, 3}, alpha=0.5 -> 1.0 then 0.5*3+0.5*1 = 2.0
+    // Group B: {2, 4}, alpha=0.5 -> 2.0 then 0.5*4+0.5*2 = 3.0
     table.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0});
     table.add_column("grp", Column<std::string>{"A", "B", "A", "B"});
 
@@ -2287,11 +2287,11 @@ TEST_CASE("Interpret EWMA grouped") {
     CHECK((*ev)[1] == Catch::Approx(3.0));
 }
 
-// ─── quantile ─────────────────────────────────────────────────────────────────
+// --- quantile -----------------------------------------------------------------
 
 TEST_CASE("Interpret quantile aggregation (p=0.5 == median)") {
     runtime::Table table;
-    // {10, 20, 30} sorted → p=0.5 → idx=1.0 → 20.0
+    // {10, 20, 30} sorted -> p=0.5 -> idx=1.0 -> 20.0
     table.add_column("v", Column<double>{10.0, 30.0, 20.0});
     table.add_column("grp", Column<std::string>{"A", "A", "A"});
 
@@ -2313,8 +2313,8 @@ TEST_CASE("Interpret quantile aggregation (p=0.5 == median)") {
 TEST_CASE("Interpret quantile aggregation (p=0.25 and p=0.75)") {
     runtime::Table table;
     // {1, 2, 3, 4} sorted
-    // p=0.25 → idx=0.75 → 1 + 0.75*(2-1) = 1.75
-    // p=0.75 → idx=2.25 → 3 + 0.25*(4-3) = 3.25
+    // p=0.25 -> idx=0.75 -> 1 + 0.75*(2-1) = 1.75
+    // p=0.75 -> idx=2.25 -> 3 + 0.25*(4-3) = 3.25
     table.add_column("v", Column<double>{1.0, 3.0, 2.0, 4.0});
     table.add_column("grp", Column<std::string>{"A", "A", "A", "A"});
 
@@ -2361,8 +2361,8 @@ TEST_CASE("Interpret quantile aggregation (p=0 and p=1)") {
 
 TEST_CASE("Interpret quantile grouped") {
     runtime::Table table;
-    // Group A: {1,3,5} → p=0.5 → 3.0
-    // Group B: {2,4}   → p=0.5 → idx=0.5 → 2+0.5*(4-2)=3.0
+    // Group A: {1,3,5} -> p=0.5 -> 3.0
+    // Group B: {2,4}   -> p=0.5 -> idx=0.5 -> 2+0.5*(4-2)=3.0
     table.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
     table.add_column("grp", Column<std::string>{"A", "B", "A", "B", "A"});
 
@@ -2380,11 +2380,11 @@ TEST_CASE("Interpret quantile grouped") {
     CHECK((*qv)[1] == Catch::Approx(3.0));
 }
 
-// ─── skew ──────────────────────────────────────────────────────────────────────
+// --- skew ----------------------------------------------------------------------
 
-TEST_CASE("Interpret skew aggregation (symmetric → 0)") {
+TEST_CASE("Interpret skew aggregation (symmetric -> 0)") {
     runtime::Table table;
-    // {1, 2, 3} — symmetric around 2, skew = 0
+    // {1, 2, 3} - symmetric around 2, skew = 0
     table.add_column("v", Column<double>{1.0, 2.0, 3.0});
     table.add_column("grp", Column<std::string>{"A", "A", "A"});
 
@@ -2405,13 +2405,13 @@ TEST_CASE("Interpret skew aggregation (symmetric → 0)") {
 
 TEST_CASE("Interpret skew aggregation (right-skewed)") {
     runtime::Table table;
-    // {1, 1, 1, 4} — right skew
+    // {1, 1, 1, 4} - right skew
     // mean=1.75, deviations: -0.75,-0.75,-0.75,2.25
     // m2=0.75^2*3+2.25^2 = 1.6875+5.0625=6.75
     // m3=(-0.75)^3*3+(2.25)^3 = -1.265625+11.390625=10.125
     // n=4, skew = (4*sqrt(3)/2) * (10.125 / 6.75^1.5)
-    // 6.75^1.5 = sqrt(6.75^3) = sqrt(307.546875) ≈ 17.5371
-    // skew = (4*1.73205/2) * (10.125/17.5371) ≈ 3.4641 * 0.5773 ≈ 2.0
+    // 6.75^1.5 = sqrt(6.75^3) = sqrt(307.546875) ~ 17.5371
+    // skew = (4*1.73205/2) * (10.125/17.5371) ~ 3.4641 * 0.5773 ~ 2.0
     table.add_column("v", Column<double>{1.0, 1.0, 1.0, 4.0});
     table.add_column("grp", Column<std::string>{"A", "A", "A", "A"});
 
@@ -2425,13 +2425,13 @@ TEST_CASE("Interpret skew aggregation (right-skewed)") {
     const auto* sv = std::get_if<Column<double>>(result->find("s"));
     REQUIRE(sv != nullptr);
     REQUIRE(sv->size() == 1);
-    // Expected value matches pandas: pandas.Series([1,1,1,4]).skew() ≈ 2.0
+    // Expected value matches pandas: pandas.Series([1,1,1,4]).skew() ~ 2.0
     CHECK((*sv)[0] == Catch::Approx(2.0).epsilon(1e-5));
 }
 
 TEST_CASE("Interpret skew too few values is null") {
     runtime::Table table;
-    // n=2 → skew is undefined (n<3) → null
+    // n=2 -> skew is undefined (n<3) -> null
     table.add_column("v", Column<double>{1.0, 2.0});
     table.add_column("grp", Column<std::string>{"A", "A"});
 
@@ -2448,11 +2448,11 @@ TEST_CASE("Interpret skew too few values is null") {
     CHECK((*entry->validity)[0] == false);
 }
 
-// ─── kurtosis ──────────────────────────────────────────────────────────────────
+// --- kurtosis ------------------------------------------------------------------
 
-TEST_CASE("Interpret kurtosis aggregation (normal-like → ~0 excess)") {
+TEST_CASE("Interpret kurtosis aggregation (normal-like -> ~0 excess)") {
     runtime::Table table;
-    // {1,2,3,4,5} — excess kurtosis (pandas): ≈ -1.3
+    // {1,2,3,4,5} - excess kurtosis (pandas): ~ -1.3
     table.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
     table.add_column("grp", Column<std::string>{"A", "A", "A", "A", "A"});
 
@@ -2474,7 +2474,7 @@ TEST_CASE("Interpret kurtosis aggregation (normal-like → ~0 excess)") {
 
 TEST_CASE("Interpret kurtosis aggregation (leptokurtic)") {
     runtime::Table table;
-    // {0,0,0,0,10} — heavy tail, positive excess kurtosis
+    // {0,0,0,0,10} - heavy tail, positive excess kurtosis
     table.add_column("v", Column<double>{0.0, 0.0, 0.0, 0.0, 10.0});
     table.add_column("grp", Column<std::string>{"A", "A", "A", "A", "A"});
 
@@ -2487,13 +2487,13 @@ TEST_CASE("Interpret kurtosis aggregation (leptokurtic)") {
 
     const auto* kv = std::get_if<Column<double>>(result->find("k"));
     REQUIRE(kv != nullptr);
-    // pandas.Series([0,0,0,0,10]).kurtosis() ≈ 5.0
+    // pandas.Series([0,0,0,0,10]).kurtosis() ~ 5.0
     CHECK((*kv)[0] == Catch::Approx(5.0).epsilon(1e-4));
 }
 
 TEST_CASE("Interpret kurtosis too few values is null") {
     runtime::Table table;
-    // n=3 → kurtosis undefined (n<4) → null
+    // n=3 -> kurtosis undefined (n<4) -> null
     table.add_column("v", Column<double>{1.0, 2.0, 3.0});
     table.add_column("grp", Column<std::string>{"A", "A", "A"});
 
@@ -2510,11 +2510,11 @@ TEST_CASE("Interpret kurtosis too few values is null") {
     CHECK((*entry->validity)[0] == false);
 }
 
-// ─── rolling_quantile / rolling_skew / rolling_kurtosis ───────────────────────
+// --- rolling_quantile / rolling_skew / rolling_kurtosis -----------------------
 
 TEST_CASE("rolling_quantile with 1ns window") {
     runtime::Table table;
-    // {10, 20, 30} — 1ns window = each row sees only itself
+    // {10, 20, 30} - 1ns window = each row sees only itself
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
     table.time_index = "ts";
@@ -2523,7 +2523,7 @@ TEST_CASE("rolling_quantile with 1ns window") {
     registry.emplace("data", table);
 
     // 1ns window includes boundary: row 1 sees {10,20}, row 2 sees {20,30}
-    // p=0.5: row0→10, row1→15, row2→25
+    // p=0.5: row0->10, row1->15, row2->25
     auto ir = require_ir("data[window 1ns, update { q = rolling_quantile(val, 0.5) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -2541,10 +2541,10 @@ TEST_CASE("rolling_quantile with 1ns window") {
 TEST_CASE("rolling_quantile with 2ns window") {
     runtime::Table table;
     // {10, 20, 30, 40} with 2ns window (threshold = t - 2, lo advances when ts < threshold)
-    // row 0 (t=0): window {10}        → p=0.25 → 10.0
-    // row 1 (t=1): window {10,20}     → idx=0.25 → 12.5
-    // row 2 (t=2): window {10,20,30}  → idx=0.5  → 15.0
-    // row 3 (t=3): window {20,30,40}  → idx=0.5  → 25.0
+    // row 0 (t=0): window {10}        -> p=0.25 -> 10.0
+    // row 1 (t=1): window {10,20}     -> idx=0.25 -> 12.5
+    // row 2 (t=2): window {10,20,30}  -> idx=0.5  -> 15.0
+    // row 3 (t=3): window {20,30,40}  -> idx=0.5  -> 25.0
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0, 40.0});
@@ -2566,7 +2566,7 @@ TEST_CASE("rolling_quantile with 2ns window") {
     CHECK((*qv)[3] == Catch::Approx(25.0));
 }
 
-TEST_CASE("rolling_skew with 1ns window (single element → 0)") {
+TEST_CASE("rolling_skew with 1ns window (single element -> 0)") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0});
@@ -2582,15 +2582,15 @@ TEST_CASE("rolling_skew with 1ns window (single element → 0)") {
     const auto* sv = std::get_if<Column<double>>(result->find("s"));
     REQUIRE(sv != nullptr);
     REQUIRE(sv->size() == 3);
-    // n<3 → all zeros
+    // n<3 -> all zeros
     CHECK((*sv)[0] == Catch::Approx(0.0).margin(1e-10));
     CHECK((*sv)[1] == Catch::Approx(0.0).margin(1e-10));
     CHECK((*sv)[2] == Catch::Approx(0.0).margin(1e-10));
 }
 
-TEST_CASE("rolling_skew with wide window (symmetric → 0)") {
+TEST_CASE("rolling_skew with wide window (symmetric -> 0)") {
     runtime::Table table;
-    // {1,2,3} fully in window by row 2 — symmetric → skew=0
+    // {1,2,3} fully in window by row 2 - symmetric -> skew=0
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0});
     table.time_index = "ts";
@@ -2605,11 +2605,11 @@ TEST_CASE("rolling_skew with wide window (symmetric → 0)") {
     const auto* sv = std::get_if<Column<double>>(result->find("s"));
     REQUIRE(sv != nullptr);
     REQUIRE(sv->size() == 3);
-    // row 2: {1,2,3} symmetric → skew=0
+    // row 2: {1,2,3} symmetric -> skew=0
     CHECK((*sv)[2] == Catch::Approx(0.0).margin(1e-10));
 }
 
-TEST_CASE("rolling_kurtosis with 1ns window (n<4 → 0)") {
+TEST_CASE("rolling_kurtosis with 1ns window (n<4 -> 0)") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0});
@@ -2632,7 +2632,7 @@ TEST_CASE("rolling_kurtosis with 1ns window (n<4 → 0)") {
 
 TEST_CASE("rolling_kurtosis wide window") {
     runtime::Table table;
-    // {1,2,3,4,5}: excess kurtosis ≈ -1.3 (pandas)
+    // {1,2,3,4,5}: excess kurtosis ~ -1.3 (pandas)
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3), ts_from_nanos(4)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
@@ -2648,11 +2648,11 @@ TEST_CASE("rolling_kurtosis wide window") {
     const auto* kv = std::get_if<Column<double>>(result->find("k"));
     REQUIRE(kv != nullptr);
     REQUIRE(kv->size() == 5);
-    // row 4: {1,2,3,4,5} → excess kurtosis = -1.2
+    // row 4: {1,2,3,4,5} -> excess kurtosis = -1.2
     CHECK((*kv)[4] == Catch::Approx(-1.2).epsilon(1e-5));
 }
 
-// ─── Vectorized RNG ───────────────────────────────────────────────────────────
+// --- Vectorized RNG -----------------------------------------------------------
 
 TEST_CASE("rand_uniform generates correct number of rows in bounds") {
     runtime::Table table;
@@ -2967,7 +2967,7 @@ TEST_CASE("rand_bernoulli invalid p") {
     CHECK_FALSE(result.has_value());
 }
 
-// ─── seed_rng / reseed_rng ────────────────────────────────────────────────────
+// --- seed_rng / reseed_rng ----------------------------------------------------
 
 // rand_uniform uses zorro::Rng, so seeding requires reseed().
 TEST_CASE("reseed produces identical rand_uniform sequence") {
@@ -3048,7 +3048,7 @@ TEST_CASE("reseed produces identical rand_normal sequence") {
     }
 }
 
-// ─── rep ─────────────────────────────────────────────────────────────────────
+// --- rep ---------------------------------------------------------------------
 
 TEST_CASE("rep scalar int fills table rows") {
     runtime::Table table;
@@ -3136,7 +3136,7 @@ TEST_CASE("rep named arg times truncates to table rows") {
     runtime::TableRegistry registry;
     registry.emplace("t", table);
 
-    // rep(7, times=100) — scalar, so output is all 7s (length_out defaults to rows)
+    // rep(7, times=100) - scalar, so output is all 7s (length_out defaults to rows)
     auto ir = require_ir("t[update { c = rep(7, times=100) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -3157,7 +3157,7 @@ TEST_CASE("rep named arg length_out overrides row count") {
     runtime::TableRegistry registry;
     registry.emplace("t", table);
 
-    // length_out=3 produces only 3 elements — but update requires same row count,
+    // length_out=3 produces only 3 elements - but update requires same row count,
     // so length_out must equal rows; here we verify via select
     auto ir = require_ir("t[update { c = rep(9, length_out=5) }];");
     auto result = runtime::interpret(*ir, registry);
@@ -3179,7 +3179,7 @@ TEST_CASE("rep column reference with each repeats each element") {
     runtime::TableRegistry registry;
     registry.emplace("t", table);
 
-    // rep(x, each=2) — each element twice, cycling to 6 rows
+    // rep(x, each=2) - each element twice, cycling to 6 rows
     // pattern: 10,10,20,20,30,30 (exactly 6 rows)
     auto ir = require_ir("t[update { c = rep(x, each=2) }];");
     auto result = runtime::interpret(*ir, registry);
@@ -3209,7 +3209,7 @@ TEST_CASE("rep unknown named argument returns error") {
     CHECK_FALSE(result.has_value());
 }
 
-// ─── fill_null / fill_forward / fill_backward tests ──────────────────────────
+// --- fill_null / fill_forward / fill_backward tests --------------------------
 
 TEST_CASE("fill_null replaces null cells with constant (Int)", "[null][fill]") {
     runtime::Table t;
@@ -3225,7 +3225,7 @@ TEST_CASE("fill_null replaces null cells with constant (Int)", "[null][fill]") {
 
     const auto* entry = result->find_entry("v2");
     REQUIRE(entry != nullptr);
-    // No validity bitmap — all rows are now valid.
+    // No validity bitmap - all rows are now valid.
     CHECK_FALSE(entry->validity.has_value());
     const auto& v2 = std::get<Column<std::int64_t>>(*entry->column);
     CHECK(v2[0] == 10);
@@ -3259,7 +3259,7 @@ TEST_CASE("fill_null replaces null cells with constant (Float)", "[null][fill]")
 TEST_CASE("fill_null on column with no nulls is a no-op", "[null][fill]") {
     runtime::Table t;
     t.add_column("val", Column<std::int64_t>{1, 2, 3});
-    // No validity bitmap — no nulls.
+    // No validity bitmap - no nulls.
 
     runtime::TableRegistry registry;
     registry.emplace("t", t);
@@ -3293,7 +3293,7 @@ TEST_CASE("fill_forward carries last valid value forward (LOCF)", "[null][fill]"
 
     const auto* entry = result->find_entry("fwd");
     REQUIRE(entry != nullptr);
-    // No leading nulls — all rows should be valid after fill.
+    // No leading nulls - all rows should be valid after fill.
     CHECK_FALSE(entry->validity.has_value());
     const auto& fwd = std::get<Column<std::int64_t>>(*entry->column);
     CHECK(fwd[0] == 10);
@@ -3320,8 +3320,8 @@ TEST_CASE("fill_forward leaves leading nulls as null", "[null][fill]") {
     const auto* entry = result->find_entry("fwd");
     REQUIRE(entry != nullptr);
     REQUIRE(entry->validity.has_value());
-    CHECK(runtime::is_null(*entry, 0));  // leading null — unfillable
-    CHECK(runtime::is_null(*entry, 1));  // leading null — unfillable
+    CHECK(runtime::is_null(*entry, 0));  // leading null - unfillable
+    CHECK(runtime::is_null(*entry, 1));  // leading null - unfillable
     CHECK_FALSE(runtime::is_null(*entry, 2));
     CHECK_FALSE(runtime::is_null(*entry, 3));  // filled from row 2
     const auto& fwd = std::get<Column<std::int64_t>>(*entry->column);
@@ -3365,7 +3365,7 @@ TEST_CASE("fill_backward carries next valid value backward (NOCB)", "[null][fill
 
     const auto* entry = result->find_entry("bwd");
     REQUIRE(entry != nullptr);
-    // No trailing nulls — all rows should be valid after fill.
+    // No trailing nulls - all rows should be valid after fill.
     CHECK_FALSE(entry->validity.has_value());
     const auto& bwd = std::get<Column<std::int64_t>>(*entry->column);
     CHECK(bwd[0] == 10);
@@ -3394,8 +3394,8 @@ TEST_CASE("fill_backward leaves trailing nulls as null", "[null][fill]") {
     REQUIRE(entry->validity.has_value());
     CHECK_FALSE(runtime::is_null(*entry, 0));  // filled from row 1
     CHECK_FALSE(runtime::is_null(*entry, 1));
-    CHECK(runtime::is_null(*entry, 2));  // trailing null — unfillable
-    CHECK(runtime::is_null(*entry, 3));  // trailing null — unfillable
+    CHECK(runtime::is_null(*entry, 2));  // trailing null - unfillable
+    CHECK(runtime::is_null(*entry, 3));  // trailing null - unfillable
     const auto& bwd = std::get<Column<std::int64_t>>(*entry->column);
     CHECK(bwd[0] == 5);
     CHECK(bwd[1] == 5);
@@ -3678,7 +3678,7 @@ TEST_CASE("rep missing positional argument returns error") {
     CHECK_FALSE(result.has_value());
 }
 
-// ─── Table constructor from column vectors ────────────────────────────────────
+// --- Table constructor from column vectors ------------------------------------
 
 TEST_CASE("Table constructor creates table from integer columns") {
     runtime::TableRegistry registry;
@@ -3872,7 +3872,7 @@ TEST_CASE("Table constructor expression column length mismatch returns error") {
     src.add_column("x", col);
     registry["data"] = std::move(src);
 
-    // Literal has 3 elements; expression column produces 2 rows → length mismatch.
+    // Literal has 3 elements; expression column produces 2 rows -> length mismatch.
     auto ir = require_ir("Table { a = [1, 2, 3], b = data[select { x }] };");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
@@ -3887,7 +3887,7 @@ TEST_CASE("Table constructor expression column not found in multi-column result 
     registry["data"] = std::move(src);
 
     // "missing" does not exist in data (which has only "x"); multi-column, no name match.
-    // data has one column "x" but the def name is "missing" — single-col path renames it,
+    // data has one column "x" but the def name is "missing" - single-col path renames it,
     // so we test with two columns to exercise the error path.
     runtime::Table two_col;
     Column<std::int64_t> a_col, b_col;
@@ -3902,7 +3902,7 @@ TEST_CASE("Table constructor expression column not found in multi-column result 
     REQUIRE_FALSE(result.has_value());
 }
 
-// ─── Melt (wide → long) ───────────────────────────────────────────────────────
+// --- Melt (wide -> long) -------------------------------------------------------
 
 TEST_CASE("melt: basic wide-to-long unpivot", "[melt]") {
     // wide: symbol | open | close
@@ -3920,7 +3920,7 @@ TEST_CASE("melt: basic wide-to-long unpivot", "[melt]") {
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
-    // 2 rows × 2 measures = 4 output rows
+    // 2 rows x 2 measures = 4 output rows
     REQUIRE(result->rows() == 4);
 
     const auto* sym = result->find("symbol");
@@ -3966,7 +3966,7 @@ TEST_CASE("melt: select restricts measure columns", "[melt]") {
     auto ir = require_ir("wide[melt symbol, select { open, close }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->rows() == 4);  // 2 rows × 2 measures
+    REQUIRE(result->rows() == 4);  // 2 rows x 2 measures
 
     const auto* var = result->find("variable");
     REQUIRE(var != nullptr);
@@ -4064,7 +4064,7 @@ TEST_CASE("melt: measure type mismatch returns error", "[melt]") {
     REQUIRE(result.error().find("same type") != std::string::npos);
 }
 
-// ─── Dcast (long → wide) ─────────────────────────────────────────────────────
+// --- Dcast (long -> wide) -----------------------------------------------------
 
 TEST_CASE("dcast: basic long-to-wide pivot", "[dcast]") {
     // long: variable | value
@@ -4094,7 +4094,7 @@ TEST_CASE("dcast: basic long-to-wide pivot", "[dcast]") {
 }
 
 TEST_CASE("dcast: round-trips melt", "[dcast][melt]") {
-    // wide → melt → dcast should reproduce the original wide table structure.
+    // wide -> melt -> dcast should reproduce the original wide table structure.
     runtime::TableRegistry registry;
     runtime::Table wide;
     wide.add_column("symbol", Column<std::string>{"AAPL", "GOOG"});
@@ -4173,7 +4173,7 @@ TEST_CASE("dcast: value column not found returns error", "[dcast]") {
     REQUIRE(result.error().find("value column not found") != std::string::npos);
 }
 
-// ─── ExternCall node ─────────────────────────────────────────────────────────
+// --- ExternCall node ---------------------------------------------------------
 
 // Helper: extern fn declaration so the lowerer recognises the function.
 static constexpr const char* kMakePricesDecl =
@@ -4205,7 +4205,7 @@ TEST_CASE("ExternCall: table-returning extern is resolved and called", "[extern]
 TEST_CASE("ExternCall: no extern registry returns error", "[extern]") {
     runtime::TableRegistry registry;
 
-    // nullptr externs — should get "extern call with no registry" error.
+    // nullptr externs - should get "extern call with no registry" error.
     auto ir = require_ir(kMakePricesDecl);
     auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
     REQUIRE_FALSE(result.has_value());
@@ -4214,7 +4214,7 @@ TEST_CASE("ExternCall: no extern registry returns error", "[extern]") {
 
 TEST_CASE("ExternCall: unknown extern function returns error", "[extern]") {
     runtime::TableRegistry registry;
-    runtime::ExternRegistry externs;  // empty — make_prices not registered
+    runtime::ExternRegistry externs;  // empty - make_prices not registered
 
     auto ir = require_ir(kMakePricesDecl);
     auto result = runtime::interpret(*ir, registry, nullptr, &externs);
@@ -4222,7 +4222,7 @@ TEST_CASE("ExternCall: unknown extern function returns error", "[extern]") {
     REQUIRE(result.error().find("unknown extern function") != std::string::npos);
 }
 
-// ─── Grouped update error ────────────────────────────────────────────────────
+// --- Grouped update error ----------------------------------------------------
 
 TEST_CASE("grouped update returns unsupported error", "[update]") {
     runtime::TableRegistry registry;
@@ -4237,7 +4237,7 @@ TEST_CASE("grouped update returns unsupported error", "[update]") {
     REQUIRE(result.error().find("grouped update not supported") != std::string::npos);
 }
 
-// ─── Filter type coverage: double / string columns ───────────────────────────
+// --- Filter type coverage: double / string columns ---------------------------
 // These exercise template specialisations that the all-int64 tests miss.
 
 TEST_CASE("filter on double column vs float literal", "[filter][types]") {
@@ -4312,7 +4312,7 @@ TEST_CASE("filter on string column", "[filter][types]") {
 
 TEST_CASE("filter by bare column reference returns not-a-boolean-expression error",
           "[filter][types]") {
-    // Exercises compute_mask<FilterColumn> (the else branch — bare column reference
+    // Exercises compute_mask<FilterColumn> (the else branch - bare column reference
     // is not a boolean predicate; interpreter returns an error).
     runtime::Table table;
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
@@ -4327,7 +4327,7 @@ TEST_CASE("filter by bare column reference returns not-a-boolean-expression erro
     REQUIRE(result.error().find("not a boolean expression") != std::string::npos);
 }
 
-// ─── Mixed-type column arithmetic ─────────────────────────────────────────────
+// --- Mixed-type column arithmetic ---------------------------------------------
 // These exercise arith_into<int64,double>, arith_into<double,int64>,
 // and arith_into<double,double> template specialisations.
 
@@ -4407,7 +4407,7 @@ TEST_CASE("update: direct bool column copy preserves values", "[update][bool]") 
     REQUIRE((*copied)[3] == true);
 }
 
-// ─── Matrix Operations ────────────────────────────────────────────────────────
+// --- Matrix Operations --------------------------------------------------------
 
 TEST_CASE("cov: diagonal equals variance", "[cov][matrix]") {
     // x = [1, 2, 3, 4, 5], y = [2, 4, 6, 8, 10]  (y = 2x)
@@ -4510,8 +4510,8 @@ TEST_CASE("corr: off-diagonal in [-1, 1]", "[corr][matrix]") {
 }
 
 TEST_CASE("transpose: basic numeric float64", "[transpose][matrix]") {
-    // Input: 3 rows × 2 cols (a, b)
-    // After transpose: 2 rows × 3 cols (r0, r1, r2) + leading "column" label
+    // Input: 3 rows x 2 cols (a, b)
+    // After transpose: 2 rows x 3 cols (r0, r1, r2) + leading "column" label
     runtime::Table t;
     t.add_column("a", Column<double>{1.0, 2.0, 3.0});
     t.add_column("b", Column<double>{4.0, 5.0, 6.0});
@@ -4522,7 +4522,7 @@ TEST_CASE("transpose: basic numeric float64", "[transpose][matrix]") {
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
-    REQUIRE(result->rows() == 2);  // 2 original columns → 2 rows
+    REQUIRE(result->rows() == 2);  // 2 original columns -> 2 rows
     // Without a label column: output columns are "column", "r0", "r1", "r2"
     REQUIRE(result->find("column") != nullptr);
     REQUIRE(result->find("r0") != nullptr);
@@ -4577,8 +4577,8 @@ TEST_CASE("transpose: mixed-type columns returns error", "[transpose][matrix]") 
 }
 
 TEST_CASE("matmul: basic (2x2) * (2x2)", "[matmul][matrix]") {
-    // A = [[1, 2], [3, 4]]  →  columns: c0=[1,3], c1=[2,4]
-    // B = [[5, 6], [7, 8]]  →  columns: c0=[5,7], c1=[6,8]
+    // A = [[1, 2], [3, 4]]  ->  columns: c0=[1,3], c1=[2,4]
+    // B = [[5, 6], [7, 8]]  ->  columns: c0=[5,7], c1=[6,8]
     // C = A*B = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
     runtime::Table a, b;
     a.add_column("c0", Column<double>{1.0, 3.0});
@@ -4633,8 +4633,8 @@ TEST_CASE("matmul: identity matrix leaves operand unchanged", "[matmul][matrix]"
 TEST_CASE("matmul: inner dimension mismatch returns error", "[matmul][matrix]") {
     runtime::Table a, b;
     a.add_column("c0", Column<double>{1.0, 2.0});
-    a.add_column("c1", Column<double>{3.0, 4.0});         // A is 2 rows × 2 cols
-    b.add_column("only", Column<double>{5.0, 6.0, 7.0});  // B has 3 rows ≠ 2 cols of A
+    a.add_column("c1", Column<double>{3.0, 4.0});         // A is 2 rows x 2 cols
+    b.add_column("only", Column<double>{5.0, 6.0, 7.0});  // B has 3 rows != 2 cols of A
 
     runtime::TableRegistry registry;
     registry.emplace("a", a);
@@ -4646,7 +4646,7 @@ TEST_CASE("matmul: inner dimension mismatch returns error", "[matmul][matrix]") 
     REQUIRE(result.error().find("inner dimensions") != std::string::npos);
 }
 
-// ─── Model Specification Tests ───────────────────────────────────────────────
+// --- Model Specification Tests -----------------------------------------------
 
 TEST_CASE("model: OLS simple regression", "[model]") {
     // y = 2*x + 1 (perfect linear relationship)
@@ -4676,7 +4676,7 @@ TEST_CASE("model: OLS simple regression", "[model]") {
     REQUIRE(estimates[0] == Catch::Approx(1.0));
     REQUIRE(estimates[1] == Catch::Approx(2.0));
 
-    // ModelResult should have R² = 1.0 for perfect fit
+    // ModelResult should have R^2 = 1.0 for perfect fit
     REQUIRE(model_out.r_squared == Catch::Approx(1.0));
     REQUIRE(model_out.n_obs == 5);
     REQUIRE(model_out.n_params == 2);
@@ -4837,7 +4837,7 @@ TEST_CASE("model: ridge regression", "[model]") {
 
     // Ridge should shrink coefficients slightly toward zero compared to OLS
     const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
-    // With small lambda, should be close to OLS (intercept ≈ 1, slope ≈ 2)
+    // With small lambda, should be close to OLS (intercept ~ 1, slope ~ 2)
     REQUIRE(estimates[1] == Catch::Approx(2.0).margin(0.2));
 }
 
@@ -4977,7 +4977,7 @@ TEST_CASE("model: dummy encoding for string columns", "[model]") {
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
-    // With intercept: reference level (East) absorbed → intercept + region_West + region_North
+    // With intercept: reference level (East) absorbed -> intercept + region_West + region_North
     REQUIRE(result->rows() == 3);
 
     const auto& terms = std::get<Column<std::string>>(*result->find("term"));

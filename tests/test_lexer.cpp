@@ -20,7 +20,7 @@ auto first_of(const std::vector<Token>& tokens, TokenKind kind) -> const Token* 
 
 }  // namespace
 
-// ─── Empty and minimal input ─────────────────────────────────────────────────
+// --- Empty and minimal input -------------------------------------------------
 
 TEST_CASE("Lexer: empty input produces only Eof", "[lexer]") {
     auto tokens = tokenize("");
@@ -34,7 +34,7 @@ TEST_CASE("Lexer: whitespace-only input produces only Eof", "[lexer]") {
     REQUIRE(tokens[0].kind == TokenKind::Eof);
 }
 
-// ─── Integer literals ────────────────────────────────────────────────────────
+// --- Integer literals --------------------------------------------------------
 
 TEST_CASE("Lexer: single integer literal", "[lexer]") {
     auto tokens = tokenize("42");
@@ -55,7 +55,7 @@ TEST_CASE("Lexer: large integer", "[lexer]") {
     REQUIRE(tokens[0].lexeme == "9999999999");
 }
 
-// ─── Float literals ──────────────────────────────────────────────────────────
+// --- Float literals ----------------------------------------------------------
 
 TEST_CASE("Lexer: float literal", "[lexer]") {
     auto tokens = tokenize("3.14");
@@ -81,7 +81,7 @@ TEST_CASE("Lexer: float with positive exponent", "[lexer]") {
     REQUIRE(tokens[0].lexeme == "1.0e+3");
 }
 
-// ─── String literals ─────────────────────────────────────────────────────────
+// --- String literals ---------------------------------------------------------
 
 TEST_CASE("Lexer: simple string literal", "[lexer]") {
     auto tokens = tokenize("\"hello\"");
@@ -106,7 +106,7 @@ TEST_CASE("Lexer: unterminated string is an error", "[lexer]") {
     REQUIRE(tokens[0].kind == TokenKind::Error);
 }
 
-// ─── Bool literals ───────────────────────────────────────────────────────────
+// --- Bool literals -----------------------------------------------------------
 
 TEST_CASE("Lexer: true literal", "[lexer]") {
     auto tokens = tokenize("true");
@@ -120,7 +120,7 @@ TEST_CASE("Lexer: false literal", "[lexer]") {
     REQUIRE(tokens[0].lexeme == "false");
 }
 
-// ─── Duration literals ──────────────────────────────────────────────────────
+// --- Duration literals ------------------------------------------------------
 
 TEST_CASE("Lexer: duration literals for all units", "[lexer]") {
     auto check = [](const char* src, const char* expected) {
@@ -146,7 +146,7 @@ TEST_CASE("Lexer: invalid suffix after integer is an error", "[lexer]") {
     REQUIRE(tokens[0].lexeme == "42xyz");
 }
 
-// ─── Identifiers ─────────────────────────────────────────────────────────────
+// --- Identifiers -------------------------------------------------------------
 
 TEST_CASE("Lexer: simple identifier", "[lexer]") {
     auto tokens = tokenize("price");
@@ -166,7 +166,7 @@ TEST_CASE("Lexer: identifier with digits", "[lexer]") {
     REQUIRE(tokens[0].lexeme == "col1");
 }
 
-// ─── Quoted identifiers ─────────────────────────────────────────────────────
+// --- Quoted identifiers -----------------------------------------------------
 
 TEST_CASE("Lexer: quoted identifier with dot", "[lexer]") {
     auto tokens = tokenize("`Sepal.Length`");
@@ -179,7 +179,7 @@ TEST_CASE("Lexer: unterminated quoted identifier is an error", "[lexer]") {
     REQUIRE(tokens[0].kind == TokenKind::Error);
 }
 
-// ─── Keywords ────────────────────────────────────────────────────────────────
+// --- Keywords ----------------------------------------------------------------
 
 TEST_CASE("Lexer: all hard keywords", "[lexer]") {
     struct KW {
@@ -240,7 +240,7 @@ TEST_CASE("Lexer: all type keywords", "[lexer]") {
     }
 }
 
-// ─── Comparison operators ────────────────────────────────────────────────────
+// --- Comparison operators ----------------------------------------------------
 
 TEST_CASE("Lexer: comparison operators", "[lexer]") {
     auto tokens = tokenize("== != < <= > >=");
@@ -253,7 +253,7 @@ TEST_CASE("Lexer: comparison operators", "[lexer]") {
     REQUIRE(tokens[5].kind == TokenKind::Ge);
 }
 
-// ─── Arithmetic operators ────────────────────────────────────────────────────
+// --- Arithmetic operators ----------------------------------------------------
 
 TEST_CASE("Lexer: arithmetic operators", "[lexer]") {
     auto tokens = tokenize("+ - * / %");
@@ -265,7 +265,7 @@ TEST_CASE("Lexer: arithmetic operators", "[lexer]") {
     REQUIRE(tokens[4].kind == TokenKind::Percent);
 }
 
-// ─── Logical operators ──────────────────────────────────────────────────────
+// --- Logical operators ------------------------------------------------------
 
 TEST_CASE("Lexer: logical operators", "[lexer]") {
     auto tokens = tokenize("&& || !");
@@ -285,7 +285,7 @@ TEST_CASE("Lexer: single pipe is an error", "[lexer]") {
     REQUIRE(tokens[0].kind == TokenKind::Error);
 }
 
-// ─── Assignment and arrow ────────────────────────────────────────────────────
+// --- Assignment and arrow ----------------------------------------------------
 
 TEST_CASE("Lexer: assignment operator", "[lexer]") {
     auto tokens = tokenize("=");
@@ -298,7 +298,7 @@ TEST_CASE("Lexer: arrow operator", "[lexer]") {
     REQUIRE(tokens[0].lexeme == "->");
 }
 
-// ─── Delimiters ──────────────────────────────────────────────────────────────
+// --- Delimiters --------------------------------------------------------------
 
 TEST_CASE("Lexer: all delimiters", "[lexer]") {
     auto tokens = tokenize("( ) [ ] { } , ; :");
@@ -314,7 +314,7 @@ TEST_CASE("Lexer: all delimiters", "[lexer]") {
     REQUIRE(tokens[8].kind == TokenKind::Colon);
 }
 
-// ─── Scope escape ────────────────────────────────────────────────────────────
+// --- Scope escape ------------------------------------------------------------
 
 TEST_CASE("Lexer: caret (scope escape)", "[lexer]") {
     auto tokens = tokenize("^x");
@@ -322,7 +322,7 @@ TEST_CASE("Lexer: caret (scope escape)", "[lexer]") {
     REQUIRE(tokens[1].kind == TokenKind::Identifier);
 }
 
-// ─── Comments ────────────────────────────────────────────────────────────────
+// --- Comments ----------------------------------------------------------------
 
 TEST_CASE("Lexer: line comment is skipped", "[lexer]") {
     auto tokens = tokenize("// this is a comment\n42");
@@ -346,7 +346,7 @@ TEST_CASE("Lexer: inline block comment", "[lexer]") {
     REQUIRE(tokens[2].kind == TokenKind::IntLiteral);
 }
 
-// ─── Line and column tracking ────────────────────────────────────────────────
+// --- Line and column tracking ------------------------------------------------
 
 TEST_CASE("Lexer: line numbers track across newlines", "[lexer]") {
     auto tokens = tokenize("a\nb\nc");
@@ -370,7 +370,7 @@ TEST_CASE("Lexer: column resets after newline", "[lexer]") {
     REQUIRE(tokens[1].column == 1);
 }
 
-// ─── Complex expressions ────────────────────────────────────────────────────
+// --- Complex expressions ----------------------------------------------------
 
 TEST_CASE("Lexer: let binding statement", "[lexer]") {
     auto tokens = tokenize("let mut x: Int64 = 42;");

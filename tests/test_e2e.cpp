@@ -1,4 +1,4 @@
-/// Comprehensive end-to-end tests: source text → parse → lower → interpret.
+/// Comprehensive end-to-end tests: source text -> parse -> lower -> interpret.
 ///
 /// These tests exercise the full pipeline in a single step, ensuring that the
 /// parser, lowerer, and interpreter all agree on the semantics of each query.
@@ -26,7 +26,7 @@ namespace {
 
 using namespace ibex;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// --- Helpers -----------------------------------------------------------------
 
 auto col_i64(const runtime::Table& t, const std::string& name) -> std::vector<std::int64_t> {
     const auto* col = t.find(name);
@@ -96,7 +96,7 @@ auto make_trades() -> runtime::TableRegistry {
 
 }  // namespace
 
-// ─── Basic filter ────────────────────────────────────────────────────────────
+// --- Basic filter ------------------------------------------------------------
 
 TEST_CASE("E2E: filter with greater-than", "[e2e]") {
     auto tables = make_trades();
@@ -147,7 +147,7 @@ TEST_CASE("E2E: filter with OR predicate", "[e2e]") {
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{10, 50});
 }
 
-// ─── Select ──────────────────────────────────────────────────────────────────
+// --- Select ------------------------------------------------------------------
 
 TEST_CASE("E2E: select single column", "[e2e]") {
     auto tables = make_trades();
@@ -176,7 +176,7 @@ TEST_CASE("E2E: select with computed field", "[e2e]") {
     CHECK(col_i64(out, "total") == std::vector<std::int64_t>{50, 60, 240, 80, 50});
 }
 
-// ─── Filter + Select combined ────────────────────────────────────────────────
+// --- Filter + Select combined ------------------------------------------------
 
 TEST_CASE("E2E: filter then select", "[e2e]") {
     auto tables = make_trades();
@@ -187,7 +187,7 @@ TEST_CASE("E2E: filter then select", "[e2e]") {
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{20, 30, 40, 50});
 }
 
-// ─── Update ──────────────────────────────────────────────────────────────────
+// --- Update ------------------------------------------------------------------
 
 TEST_CASE("E2E: update adds new column", "[e2e]") {
     auto tables = make_trades();
@@ -226,7 +226,7 @@ TEST_CASE("E2E: update with modulo", "[e2e]") {
     CHECK(col_i64(out, "rem") == std::vector<std::int64_t>{10, 5, 0, 10, 5});
 }
 
-// ─── Distinct ────────────────────────────────────────────────────────────────
+// --- Distinct ----------------------------------------------------------------
 
 TEST_CASE("E2E: distinct on single column", "[e2e]") {
     auto tables = make_trades();
@@ -234,7 +234,7 @@ TEST_CASE("E2E: distinct on single column", "[e2e]") {
 
     CHECK(out.rows() == 2);
     auto symbols = col_str(out, "symbol");
-    // Order depends on first-seen — AAPL first, then GOOG.
+    // Order depends on first-seen - AAPL first, then GOOG.
     CHECK(symbols[0] == "AAPL");
     CHECK(symbols[1] == "GOOG");
 }
@@ -250,7 +250,7 @@ TEST_CASE("E2E: distinct on multiple columns", "[e2e]") {
     CHECK(out.rows() == 3);  // (1,X), (2,Y), (1,Y)
 }
 
-// ─── Order ───────────────────────────────────────────────────────────────────
+// --- Order -------------------------------------------------------------------
 
 TEST_CASE("E2E: order ascending", "[e2e]") {
     auto tables = make_trades();
@@ -278,7 +278,7 @@ TEST_CASE("E2E: order by string column", "[e2e]") {
     CHECK(symbols[4] == "GOOG");
 }
 
-// ─── Aggregation ─────────────────────────────────────────────────────────────
+// --- Aggregation -------------------------------------------------------------
 
 TEST_CASE("E2E: sum aggregation with group-by", "[e2e]") {
     auto tables = make_trades();
@@ -389,7 +389,7 @@ TEST_CASE("E2E: count without group-by", "[e2e]") {
     CHECK(col_i64(out, "n") == std::vector<std::int64_t>{5});
 }
 
-// ─── Rename ──────────────────────────────────────────────────────────────────
+// --- Rename ------------------------------------------------------------------
 
 TEST_CASE("E2E: rename column", "[e2e]") {
     auto tables = make_trades();
@@ -412,7 +412,7 @@ TEST_CASE("E2E: rename multiple columns", "[e2e]") {
     CHECK(col_i64(out, "amount") == std::vector<std::int64_t>{5, 3, 8, 2, 1});
 }
 
-// ─── Multi-step pipelines ────────────────────────────────────────────────────
+// --- Multi-step pipelines ----------------------------------------------------
 
 TEST_CASE("E2E: filter + aggregate + order pipeline", "[e2e]") {
     auto tables = make_trades();
@@ -424,7 +424,7 @@ TEST_CASE("E2E: filter + aggregate + order pipeline", "[e2e]") {
     REQUIRE(out.rows() == 2);
     auto symbols = col_str(out, "symbol");
     auto totals = col_i64(out, "total");
-    // AAPL: 30+50=80, GOOG: 20+40=60 → desc: AAPL, GOOG
+    // AAPL: 30+50=80, GOOG: 20+40=60 -> desc: AAPL, GOOG
     CHECK(symbols[0] == "AAPL");
     CHECK(totals[0] == 80);
     CHECK(symbols[1] == "GOOG");
@@ -461,7 +461,7 @@ TEST_CASE("E2E: filter then distinct", "[e2e]") {
     CHECK(out.rows() == 2);
 }
 
-// ─── Chained let bindings (via REPL) ─────────────────────────────────────────
+// --- Chained let bindings (via REPL) -----------------------------------------
 
 TEST_CASE("E2E: chained let bindings via execute_script", "[e2e]") {
     runtime::Table t;
@@ -485,7 +485,7 @@ big[select { val }];
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
-// ─── Joins ───────────────────────────────────────────────────────────────────
+// --- Joins -------------------------------------------------------------------
 
 TEST_CASE("E2E: inner join and select", "[e2e]") {
     runtime::Table lhs;
@@ -565,7 +565,7 @@ TEST_CASE("E2E: outer join preserves rows from both sides", "[e2e]") {
     CHECK(col_str(out, "name") == std::vector<std::string>{"alice", "bob", ""});
     CHECK(col_i64(out, "score") == std::vector<std::int64_t>{0, 85, 78});
 }
-// ─── Scalar predicate in filter ──────────────────────────────────────────────
+// --- Scalar predicate in filter ----------------------------------------------
 
 TEST_CASE("E2E: filter with scalar variable", "[e2e]") {
     auto tables = make_trades();
@@ -577,18 +577,18 @@ TEST_CASE("E2E: filter with scalar variable", "[e2e]") {
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{30, 40, 50});
 }
 
-// ─── Arithmetic in filter predicates ─────────────────────────────────────────
+// --- Arithmetic in filter predicates -----------------------------------------
 
 TEST_CASE("E2E: filter with arithmetic expression", "[e2e]") {
     auto tables = make_trades();
     auto out = run("trades[filter price * qty > 100];", tables);
 
-    // price*qty: 50, 60, 240, 80, 50 → only 240 > 100
+    // price*qty: 50, 60, 240, 80, 50 -> only 240 > 100
     REQUIRE(out.rows() == 1);
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{30});
 }
 
-// ─── Double columns ──────────────────────────────────────────────────────────
+// --- Double columns ----------------------------------------------------------
 
 TEST_CASE("E2E: filter and select with double column", "[e2e]") {
     runtime::Table t;
@@ -605,7 +605,7 @@ TEST_CASE("E2E: filter and select with double column", "[e2e]") {
     CHECK(prices[2] == Catch::Approx(4.5));
 }
 
-// ─── Empty results ───────────────────────────────────────────────────────────
+// --- Empty results -----------------------------------------------------------
 
 TEST_CASE("E2E: filter produces empty result", "[e2e]") {
     auto tables = make_trades();
@@ -614,7 +614,7 @@ TEST_CASE("E2E: filter produces empty result", "[e2e]") {
     CHECK(out.rows() == 0);
 }
 
-// ─── Error handling ──────────────────────────────────────────────────────────
+// --- Error handling ----------------------------------------------------------
 
 TEST_CASE("E2E: unknown table produces error", "[e2e]") {
     runtime::TableRegistry empty;
@@ -634,7 +634,7 @@ TEST_CASE("E2E: unknown column in select produces error", "[e2e]") {
     CHECK(!error.empty());
 }
 
-// ─── Parse errors ────────────────────────────────────────────────────────────
+// --- Parse errors ------------------------------------------------------------
 
 TEST_CASE("E2E: parse error for incomplete expression", "[e2e]") {
     auto result = parser::parse("trades[filter];");
@@ -646,7 +646,7 @@ TEST_CASE("E2E: parse error for missing closing bracket", "[e2e]") {
     REQUIRE_FALSE(result.has_value());
 }
 
-// ─── Multiple aggs in one query ──────────────────────────────────────────────
+// --- Multiple aggs in one query ----------------------------------------------
 
 TEST_CASE("E2E: multiple aggregations in a single select", "[e2e]") {
     auto tables = make_trades();
@@ -675,7 +675,7 @@ TEST_CASE("E2E: multiple aggregations in a single select", "[e2e]") {
     CHECK(lows[goog] == 20);
 }
 
-// ─── Update with group-by ────────────────────────────────────────────────────
+// --- Update with group-by ----------------------------------------------------
 
 TEST_CASE("E2E: aggregate mean per group", "[e2e]") {
     auto tables = make_trades();
@@ -691,7 +691,7 @@ TEST_CASE("E2E: aggregate mean per group", "[e2e]") {
     CHECK(avgs[goog] == Catch::Approx(30.0));
 }
 
-// ─── Date literals in filter ─────────────────────────────────────────────────
+// --- Date literals in filter -------------------------------------------------
 
 TEST_CASE("E2E: filter with date literal", "[e2e]") {
     using namespace std::chrono;
@@ -713,7 +713,7 @@ TEST_CASE("E2E: filter with date literal", "[e2e]") {
     CHECK(col_i64(out, "val") == std::vector<std::int64_t>{2, 3});
 }
 
-// ─── Extern function calls ──────────────────────────────────────────────────
+// --- Extern function calls --------------------------------------------------
 
 TEST_CASE("E2E: extern scalar function in select", "[e2e]") {
     runtime::Table t;
@@ -737,7 +737,7 @@ TEST_CASE("E2E: extern scalar function in select", "[e2e]") {
     CHECK(col_i64(out, "result") == std::vector<std::int64_t>{4, 6, 8});
 }
 
-// ─── Large dataset basic smoke ───────────────────────────────────────────────
+// --- Large dataset basic smoke -----------------------------------------------
 
 TEST_CASE("E2E: handles 1000-row table", "[e2e]") {
     runtime::Table t;
@@ -757,8 +757,8 @@ TEST_CASE("E2E: handles 1000-row table", "[e2e]") {
     auto out =
         run("big[filter price >= 500, select { symbol, total = sum(price) }, by symbol];", tables);
     REQUIRE(out.rows() == 2);
-    // A: even numbers 500..998 → sum = 250*749 = 187250
-    // B: odd numbers 501..999 → sum = 250*750 = 187500
+    // A: even numbers 500..998 -> sum = 250*749 = 187250
+    // B: odd numbers 501..999 -> sum = 250*750 = 187500
     auto symbols_out = col_str(out, "symbol");
     auto totals = col_i64(out, "total");
     const std::size_t a_idx = (symbols_out[0] == "A") ? 0U : 1U;
@@ -767,14 +767,14 @@ TEST_CASE("E2E: handles 1000-row table", "[e2e]") {
     CHECK(totals[b_idx] == 187500);
 }
 
-// ─── Stream wall-clock bucket flush ──────────────────────────────────────────
+// --- Stream wall-clock bucket flush ------------------------------------------
 
 // Verify that a TimeBucket stream emits a completed bucket at wall-clock bucket
 // end, not only when a message with a later data timestamp arrives.
 //
 // Scenario: both ticks have data timestamps in bucket 0 (by data time), but the
 // second tick arrives after the bucket duration has elapsed on the wall clock.
-// The expected behaviour is two separate sink calls — one for each tick — rather
+// The expected behaviour is two separate sink calls - one for each tick - rather
 // than a single call with both ticks merged into bucket 0.
 TEST_CASE("Stream TimeBucket flushes at wall-clock bucket end", "[e2e][stream]") {
     std::vector<runtime::Table> emitted;
@@ -800,7 +800,7 @@ TEST_CASE("Stream TimeBucket flushes at wall-clock bucket end", "[e2e][stream]")
                 // Sleep longer than the 20 ms bucket so the wall-clock check fires.
                 std::this_thread::sleep_for(std::chrono::milliseconds(30));
                 runtime::Table t;
-                // Data timestamp 5 ms — still inside bucket 0 by data time.
+                // Data timestamp 5 ms - still inside bucket 0 by data time.
                 t.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
                 t.add_column("price", Column<double>{110.0});
                 t.time_index = "ts";
@@ -857,7 +857,7 @@ Stream {
 // Scenario: one tick arrives in bucket 0, then the source returns StreamTimeout
 // repeatedly while 30 ms elapses (> 20 ms bucket), then signals EOF.
 // Expected: the bucket is flushed via the wall-clock check during the timeout
-// loop — not delayed until EOF.
+// loop - not delayed until EOF.
 TEST_CASE("Stream TimeBucket flushes via StreamTimeout during idle period", "[e2e][stream]") {
     std::vector<runtime::Table> emitted;
     int call_count = 0;
@@ -912,7 +912,7 @@ Stream {
     REQUIRE(result.has_value());
 
     // The bucket must have been flushed during the StreamTimeout loop, before EOF.
-    // Without StreamTimeout support the bucket would only flush at EOF — which
+    // Without StreamTimeout support the bucket would only flush at EOF - which
     // would still yield one emission, but from the wrong trigger.
     // Here we verify the flush happened AND carried the correct value.
     REQUIRE(emitted.size() == 1);
@@ -926,7 +926,7 @@ Stream {
 //
 // Scenario: a producer thread pushes two ticks into a StreamBuffered; the
 // second is delayed by 30 ms so the wall-clock flush fires between them.
-// Expected: two sink calls — one per bucket — without any double-buffering.
+// Expected: two sink calls - one per bucket - without any double-buffering.
 TEST_CASE("StreamBuffered feeds a TimeBucket stream from a producer thread", "[e2e][stream]") {
     std::vector<runtime::Table> emitted;
 
@@ -1031,7 +1031,7 @@ TEST_CASE("make_buffered_source takes capacity from Ibex query argument", "[e2e]
             return runtime::ExternValue{std::int64_t{0}};
         });
 
-    // Capacity 8 is passed from the query — the C++ plugin receives it on
+    // Capacity 8 is passed from the query - the C++ plugin receives it on
     // the first event-loop call and initialises the ring accordingly.
     const char* src = R"(
 extern fn tick_src(capacity: Int) -> TimeFrame from "fake.hpp";
@@ -1067,7 +1067,7 @@ Stream {
 // the producer into its backpressure yield loop.
 //
 // Each row carries a distinct 1 ms-spaced timestamp so the data-timestamp
-// trigger fires a bucket flush for every row — giving exactly N sink calls
+// trigger fires a bucket flush for every row - giving exactly N sink calls
 // with 1 row each.  The invariant is:
 //
 //   total rows received by sink == N
@@ -1108,7 +1108,7 @@ TEST_CASE("StreamBuffered: no packet loss under producer stress with jittery con
                          Column<Timestamp>{Timestamp{static_cast<std::int64_t>(i) * 1'000'000LL}});
             t.add_column("val", Column<double>{static_cast<double>(i)});
             t.time_index = "ts";
-            buf->write(t);  // yields on backpressure — never drops
+            buf->write(t);  // yields on backpressure - never drops
         }
         buf->close();
     });
@@ -1133,13 +1133,13 @@ Stream {
     producer.join();
     REQUIRE(result.has_value());
 
-    // N rows in → N rows out.  Any drop under backpressure would show here.
+    // N rows in -> N rows out.  Any drop under backpressure would show here.
     CHECK(rows_received.load() == N);
 }
 
-// ─── Melt ────────────────────────────────────────────────────────────────────
+// --- Melt --------------------------------------------------------------------
 
-TEST_CASE("E2E: melt basic — all non-id columns melted", "[e2e][melt]") {
+TEST_CASE("E2E: melt basic - all non-id columns melted", "[e2e][melt]") {
     runtime::Table t;
     t.add_column("name", Column<std::string>{"Alice", "Bob"});
     t.add_column("math", Column<std::int64_t>{90, 80});
@@ -1154,7 +1154,7 @@ TEST_CASE("E2E: melt basic — all non-id columns melted", "[e2e][melt]") {
     auto vars = col_str(out, "variable");
     auto vals = col_i64(out, "value");
 
-    // Row order: Alice×math, Alice×science, Bob×math, Bob×science
+    // Row order: Alicexmath, Alicexscience, Bobxmath, Bobxscience
     CHECK(names == std::vector<std::string>{"Alice", "Alice", "Bob", "Bob"});
     CHECK(vars == std::vector<std::string>{"math", "science", "math", "science"});
     CHECK(vals == std::vector<std::int64_t>{90, 85, 80, 95});
@@ -1214,9 +1214,9 @@ TEST_CASE("E2E: melt with double measure columns", "[e2e][melt]") {
     CHECK(col_dbl(out, "value") == std::vector<double>{1.5, 3.5, 2.5, 4.5});
 }
 
-// ─── Dcast ───────────────────────────────────────────────────────────────────
+// --- Dcast -------------------------------------------------------------------
 
-TEST_CASE("E2E: dcast basic — long to wide", "[e2e][dcast]") {
+TEST_CASE("E2E: dcast basic - long to wide", "[e2e][dcast]") {
     runtime::Table t;
     t.add_column("name", Column<std::string>{"Alice", "Alice", "Bob", "Bob"});
     t.add_column("subject", Column<std::string>{"math", "science", "math", "science"});
@@ -1302,7 +1302,7 @@ TEST_CASE("E2E: melt then dcast roundtrip", "[e2e][melt][dcast]") {
     CHECK(col_i64(out, "science") == std::vector<std::int64_t>{85, 95});
 }
 
-// ─── Tuple-LHS column assignment ─────────────────────────────────────────────
+// --- Tuple-LHS column assignment ---------------------------------------------
 
 TEST_CASE("E2E: tuple-LHS update unpacks two columns from extern fn", "[e2e]") {
     // The extern function returns a two-column DataFrame (delta, gamma).
@@ -1335,7 +1335,7 @@ df[update { (delta, gamma) = compute_greeks() }];
 }
 
 TEST_CASE("E2E: tuple-LHS update via execute_script verifies column count error", "[e2e]") {
-    // The extern function returns ONE column but we expect TWO — should fail.
+    // The extern function returns ONE column but we expect TWO - should fail.
     runtime::Table one_col;
     one_col.add_column("delta", Column<double>{0.1, 0.2});
 
@@ -1396,7 +1396,7 @@ df[update = compute_extras()];
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
-// ─── Proof: read symbols from a file, generate 250-day correlated returns ────
+// --- Proof: read symbols from a file, generate 250-day correlated returns ----
 //
 // Mirrors the real-world pattern:
 //   let data    = read_csv("symbols.csv");
@@ -1412,14 +1412,14 @@ df[update = compute_extras()];
 // `update = expr` then merges all those columns into the 250-day base frame.
 
 TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
-    // ── 1. "symbols.csv" content ─────────────────────────────────────────────
+    // -- 1. "symbols.csv" content ---------------------------------------------
     // In production: let data = read_csv("symbols.csv");
     //                let symbols = scalar(data, "symbol");
     // Here we put the scalar directly into the registry.
     runtime::ScalarRegistry scalars;
     scalars.emplace("symbols", std::string("AAPL,MSFT,GOOG"));
 
-    // ── 2. Base frame: 250 trading-day skeleton ───────────────────────────────
+    // -- 2. Base frame: 250 trading-day skeleton -------------------------------
     constexpr int n_days = 250;
     runtime::Table days_tbl;
     {
@@ -1431,7 +1431,7 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
     runtime::TableRegistry tables;
     tables.emplace("days", std::move(days_tbl));
 
-    // ── 3. Extern: gen_correlated_returns(syms: String) -> DataFrame ──────────
+    // -- 3. Extern: gen_correlated_returns(syms: String) -> DataFrame ----------
     // Cholesky factor L for 3-asset correlation matrix:
     //   rho(AAPL,MSFT) = 0.70,  rho(AAPL,GOOG) = 0.50,  rho(MSFT,GOOG) = 0.60
     //
@@ -1470,7 +1470,7 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
             std::mt19937 rng{42};
             std::normal_distribution<double> std_norm;
 
-            // n_days × n independent standard normals
+            // n_days x n independent standard normals
             std::vector<std::vector<double>> z(n_days, std::vector<double>(n));
             for (auto& row : z)
                 for (auto& v : row)
@@ -1492,7 +1492,7 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
             return runtime::ExternValue{std::move(result)};
         });
 
-    // ── 4. Ibex script ────────────────────────────────────────────────────────
+    // -- 4. Ibex script --------------------------------------------------------
     // `symbols` is resolved from the scalar registry at runtime.
     const char* src = R"(
 extern fn gen_correlated_returns(syms: String) -> DataFrame from "quant.so";
@@ -1501,7 +1501,7 @@ days[update = gen_correlated_returns(symbols)];
 
     auto out = run(src, tables, &scalars, &externs);
 
-    // ── 5. Shape checks ───────────────────────────────────────────────────────
+    // -- 5. Shape checks -------------------------------------------------------
     REQUIRE(out.rows() == n_days);
     REQUIRE(out.columns.size() == 4);  // day + AAPL + MSFT + GOOG
     REQUIRE(out.find("day") != nullptr);
@@ -1509,7 +1509,7 @@ days[update = gen_correlated_returns(symbols)];
     REQUIRE(out.find("MSFT") != nullptr);
     REQUIRE(out.find("GOOG") != nullptr);
 
-    // ── 6. Correlation checks ─────────────────────────────────────────────────
+    // -- 6. Correlation checks -------------------------------------------------
     // Verify that the Cholesky structure produced the intended correlations.
     auto pearson = [&](const std::string& a, const std::string& b) {
         const auto& ca = std::get<Column<double>>(*out.find(a));

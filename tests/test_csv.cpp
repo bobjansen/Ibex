@@ -94,7 +94,7 @@ TEST_CASE("Read CSV - single column") {
 
 TEST_CASE("Read CSV - mixed numeric/non-numeric falls back to string") {
     auto path = tmp("ibex_test_mixed.csv");
-    // "price" column has a non-numeric value → whole column must become string
+    // "price" column has a non-numeric value -> whole column must become string
     write_csv(path, "price\n10\n20\nN/A\n30\n");
 
     auto table = read_csv(path.string());
@@ -127,7 +127,7 @@ TEST_CASE("Read CSV - trailing comma produces empty last field") {
 
 TEST_CASE("Read CSV - RFC 4180 quoted fields with embedded commas") {
     auto path = tmp("ibex_test_quoted.csv");
-    // "name" column has commas inside quotes — old parser would split incorrectly
+    // "name" column has commas inside quotes - old parser would split incorrectly
     write_csv(path, "id,name,score\n1,\"Smith, John\",95\n2,\"Doe, Jane\",87\n");
 
     auto table = read_csv(path.string());

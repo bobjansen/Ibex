@@ -413,7 +413,7 @@ TEST_CASE("join: multi-key semi join preserves left row order when left side is 
 TEST_CASE("join: outer join row count and key values", "[join]") {
     // lhs: id {1, 2, 3},  lval {10, 20, 30}
     // rhs: id {2, 3, 4},  rval {200, 300, 400}
-    // outer join on id → 4 rows:
+    // outer join on id -> 4 rows:
     //   id=1 (left-only), id=2 (matched), id=3 (matched), id=4 (right-only)
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
@@ -467,13 +467,13 @@ TEST_CASE("join: outer join preserves left rows first when left side is smaller"
     CHECK_FALSE(runtime::is_null(rval_entry, 4));
 }
 
-TEST_CASE("join: outer join null semantics — left-only rows null right columns", "[join]") {
+TEST_CASE("join: outer join null semantics - left-only rows null right columns", "[join]") {
     // lhs: id {1, 2},  name {"alice", "bob"}
     // rhs: id {2, 3},  score {20.0, 30.0}
     // Row order: left rows first (left-table order), then unmatched right rows.
-    //   row 0 → id=1, left-only  → score NULL
-    //   row 1 → id=2, matched    → score 20.0
-    //   row 2 → id=3, right-only → name NULL
+    //   row 0 -> id=1, left-only  -> score NULL
+    //   row 1 -> id=2, matched    -> score 20.0
+    //   row 2 -> id=3, right-only -> name NULL
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2});
     lhs.add_column("name", Column<std::string>{"alice", "bob"});
@@ -492,21 +492,21 @@ TEST_CASE("join: outer join null semantics — left-only rows null right columns
     const auto& name_entry = t.columns[t.index.at("name")];
     const auto& score_entry = t.columns[t.index.at("score")];
 
-    // row 0: id=1, left-only → name valid, score null
+    // row 0: id=1, left-only -> name valid, score null
     CHECK_FALSE(runtime::is_null(name_entry, 0));
     CHECK(runtime::is_null(score_entry, 0));
 
-    // row 1: id=2, matched → both valid
+    // row 1: id=2, matched -> both valid
     CHECK_FALSE(runtime::is_null(name_entry, 1));
     CHECK_FALSE(runtime::is_null(score_entry, 1));
 
-    // row 2: id=3, right-only → name null, score valid
+    // row 2: id=3, right-only -> name null, score valid
     CHECK(runtime::is_null(name_entry, 2));
     CHECK_FALSE(runtime::is_null(score_entry, 2));
 }
 
-TEST_CASE("join: outer join disjoint tables — all rows unmatched", "[join]") {
-    // lhs: id {1}, rhs: id {2} — no matches at all
+TEST_CASE("join: outer join disjoint tables - all rows unmatched", "[join]") {
+    // lhs: id {1}, rhs: id {2} - no matches at all
     // 2 rows total; left row gets null rval, right row gets null lval
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1});
@@ -526,17 +526,17 @@ TEST_CASE("join: outer join disjoint tables — all rows unmatched", "[join]") {
     const auto& lval_entry = t.columns[t.index.at("lval")];
     const auto& rval_entry = t.columns[t.index.at("rval")];
 
-    // row 0: id=1, left-only → lval valid, rval null
+    // row 0: id=1, left-only -> lval valid, rval null
     CHECK_FALSE(runtime::is_null(lval_entry, 0));
     CHECK(runtime::is_null(rval_entry, 0));
 
-    // row 1: id=2, right-only → lval null, rval valid
+    // row 1: id=2, right-only -> lval null, rval valid
     CHECK(runtime::is_null(lval_entry, 1));
     CHECK_FALSE(runtime::is_null(rval_entry, 1));
 }
 
-TEST_CASE("join: outer join identical tables — all rows matched, no nulls", "[join]") {
-    // When both tables have the same keys, every row matches → no nulls
+TEST_CASE("join: outer join identical tables - all rows matched, no nulls", "[join]") {
+    // When both tables have the same keys, every row matches -> no nulls
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
     lhs.add_column("lval", Column<std::int64_t>{10, 20, 30});
@@ -566,8 +566,8 @@ TEST_CASE("join: outer join identical tables — all rows matched, no nulls", "[
 TEST_CASE("join: right join preserves right rows", "[join]") {
     // lhs: id {1, 2, 3},  lval {10, 20, 30}
     // rhs: id {2, 3, 4},  rval {200, 300, 400}
-    // right join on id → 3 rows: id=2, id=3, id=4
-    //   id=4 has no left match → lval null
+    // right join on id -> 3 rows: id=2, id=3, id=4
+    //   id=4 has no left match -> lval null
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
     lhs.add_column("lval", Column<std::int64_t>{10, 20, 30});
@@ -588,10 +588,10 @@ TEST_CASE("join: right join preserves right rows", "[join]") {
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 30, 0});
 
     const auto& lval_entry = out.columns[out.index.at("lval")];
-    // row 0 (id=2) and row 1 (id=3) matched → lval not null
+    // row 0 (id=2) and row 1 (id=3) matched -> lval not null
     CHECK_FALSE(runtime::is_null(lval_entry, 0));
     CHECK_FALSE(runtime::is_null(lval_entry, 1));
-    // row 2 (id=4) is right-only → lval null
+    // row 2 (id=4) is right-only -> lval null
     CHECK(runtime::is_null(lval_entry, 2));
 }
 
@@ -675,10 +675,10 @@ TEST_CASE("join: cross join returns cartesian product", "[join]") {
     CHECK(col_str(out, "group") == std::vector<std::string>{"A", "B", "C", "A", "B", "C"});
 }
 
-// ─── Non-equijoin / theta join tests ─────────────────────────────────────────
+// --- Non-equijoin / theta join tests -----------------------------------------
 
 TEST_CASE("non-equijoin: inner join on inequality predicate", "[join][non-equijoin]") {
-    // left.a < right.b  →  only pairs where a < b
+    // left.a < right.b  ->  only pairs where a < b
     runtime::Table lhs;
     lhs.add_column("a", Column<std::int64_t>{1, 3, 5});
 
@@ -689,7 +689,7 @@ TEST_CASE("non-equijoin: inner join on inequality predicate", "[join][non-equijo
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    // Pairs: (1,2)✓ (1,4)✓ (3,4)✓ (3,2)✗ (5,2)✗ (5,4)✗  → 3 rows
+    // Pairs: (1,2)OK (1,4)OK (3,4)OK (3,2)X (5,2)X (5,4)X  -> 3 rows
     auto out = interpret_expr("lhs join rhs on a < b;", tables);
 
     CHECK(out.rows() == 3);
@@ -710,10 +710,10 @@ TEST_CASE("non-equijoin: inner join compound predicate (range)", "[join][non-equ
     tables.emplace("ticks", std::move(ticks));
     tables.emplace("windows", std::move(windows));
 
-    // val=1:  [0,6)✓ [8,12)✗  → 1 row
-    // val=5:  [0,6)✓ [8,12)✗  → 1 row
-    // val=10: [0,6)✗ [8,12)✓  → 1 row
-    // val=15: [0,6)✗ [8,12)✗  → 0 rows
+    // val=1:  [0,6)OK [8,12)X  -> 1 row
+    // val=5:  [0,6)OK [8,12)X  -> 1 row
+    // val=10: [0,6)X [8,12)OK  -> 1 row
+    // val=15: [0,6)X [8,12)X  -> 0 rows
     auto out = interpret_expr("ticks join windows on lo <= val && val < hi;", tables);
 
     REQUIRE(out.rows() == 3);
@@ -749,7 +749,7 @@ TEST_CASE("non-equijoin: left join preserves unmatched left rows", "[join][non-e
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    // a=1: b=2✓ b=3✓ → 2 rows; a=10: no match → 1 null-padded row
+    // a=1: b=2OK b=3OK -> 2 rows; a=10: no match -> 1 null-padded row
     auto out = interpret_expr("lhs left join rhs on a < b;", tables);
 
     REQUIRE(out.rows() == 3);
@@ -762,7 +762,7 @@ TEST_CASE("non-equijoin: left join preserves unmatched left rows", "[join][non-e
     CHECK(b_entry->validity.has_value());
     CHECK((*b_entry->validity)[0] == true);
     CHECK((*b_entry->validity)[1] == true);
-    CHECK((*b_entry->validity)[2] == false);  // null — no match for a=10
+    CHECK((*b_entry->validity)[2] == false);  // null - no match for a=10
 }
 
 TEST_CASE("non-equijoin: semi join keeps left rows with at least one match",
@@ -777,7 +777,7 @@ TEST_CASE("non-equijoin: semi join keeps left rows with at least one match",
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    // a=1: 1<3✓ → keep (once); a=5: 5<6✓ → keep; a=10: 10<3✗ 10<6✗ → drop
+    // a=1: 1<3OK -> keep (once); a=5: 5<6OK -> keep; a=10: 10<3X 10<6X -> drop
     auto out = interpret_expr("lhs semi join rhs on a < b;", tables);
 
     REQUIRE(out.rows() == 2);
@@ -797,7 +797,7 @@ TEST_CASE("non-equijoin: anti join keeps left rows with no match", "[join][non-e
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    // a=1: 1<3✓ → drop; a=5: 5<6✓ → drop; a=10: no match → keep
+    // a=1: 1<3OK -> drop; a=5: 5<6OK -> drop; a=10: no match -> keep
     auto out = interpret_expr("lhs anti join rhs on a < b;", tables);
 
     REQUIRE(out.rows() == 1);
@@ -816,8 +816,8 @@ TEST_CASE("non-equijoin: right join preserves unmatched right rows", "[join][non
     tables.emplace("rhs", std::move(rhs));
 
     // Predicate: a < b
-    // a=1,b=5: 1<5✓; a=2,b=5: 2<5✓; a=1,b=0: 1<0✗; a=2,b=0: 2<0✗
-    // Matched right rows: b=5 (matched); b=0 (unmatched → null-padded left)
+    // a=1,b=5: 1<5OK; a=2,b=5: 2<5OK; a=1,b=0: 1<0X; a=2,b=0: 2<0X
+    // Matched right rows: b=5 (matched); b=0 (unmatched -> null-padded left)
     auto out = interpret_expr("lhs right join rhs on a < b;", tables);
 
     REQUIRE(out.rows() == 3);  // 2 matches for b=5, 1 null-padded row for b=0
@@ -845,7 +845,7 @@ TEST_CASE("non-equijoin: not-equal predicate", "[join][non-equijoin]") {
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    // x=1: y=2✓ y=3✓; x=2: y=1✓ y=3✓ → 4 rows
+    // x=1: y=2OK y=3OK; x=2: y=1OK y=3OK -> 4 rows
     auto out = interpret_expr("lhs join rhs on x != y;", tables);
     CHECK(out.rows() == 4);
 }

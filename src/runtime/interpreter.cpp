@@ -6773,12 +6773,12 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     ? static_cast<std::int64_t>(sn.bucket_duration().count())
                     : 0;
 
-            // Returns current CLOCK_REALTIME in nanoseconds.
+            // Returns current wall-clock time in nanoseconds.
             auto wall_now_ns = []() -> std::int64_t {
-                struct timespec ts{};
-                clock_gettime(CLOCK_REALTIME, &ts);
-                return static_cast<std::int64_t>(ts.tv_sec) * 1'000'000'000LL +
-                       static_cast<std::int64_t>(ts.tv_nsec);
+                auto now = std::chrono::system_clock::now();
+                auto ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
+                return static_cast<std::int64_t>(ns.count());
             };
 
             while (true) {

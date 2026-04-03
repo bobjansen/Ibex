@@ -3,6 +3,7 @@ include(Catch2Testing)
 add_library(ibex_test_warning_suppressions INTERFACE)
 
 add_executable(ibex_tests
+    catch_string_view_apple.cpp
     test_arrow_c_data.cpp
     test_column.cpp
     test_csv.cpp

@@ -19,6 +19,20 @@ IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
 BUILD_DIR="${BUILD_DIR:-$IBEX_ROOT/build}"
 CXX="${CXX:-clang++}"
 
+detect_cxx_std_flag() {
+    local candidate
+    for candidate in c++23 gnu++23 c++2b gnu++2b; do
+        if printf 'int main() { return 0; }\n' | "$CXX" -x c++ -std="$candidate" - -o /dev/null >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    echo "error: unable to find a supported C++23-or-newer standard flag for $CXX" >&2
+    return 1
+}
+
+CXX_STD_FLAG="$(detect_cxx_std_flag)"
+
 IBEX_COMPILE="$BUILD_DIR/tools/ibex_compile"
 
 # ── Arg parsing ──────────────────────────────────────────────────────────────
@@ -100,6 +114,6 @@ echo "▸ transpiling $IBEX_FILE → $CPP_FILE"
 "$IBEX_COMPILE" "$IBEX_FILE" -o "$CPP_FILE"
 
 echo "▸ compiling   → $OUTPUT"
-"$CXX" -std=c++23 "${IBEX_INCS[@]}" "$CPP_FILE" "${IBEX_LIBS[@]}" -o "$OUTPUT"
+"$CXX" -std="$CXX_STD_FLAG" "${IBEX_INCS[@]}" "$CPP_FILE" "${IBEX_LIBS[@]}" -o "$OUTPUT"
 
 echo "✓ built $OUTPUT"

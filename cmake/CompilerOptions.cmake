@@ -5,12 +5,14 @@ add_library(Ibex::CompilerOptions ALIAS ibex_compiler_options)
 
 target_compile_features(ibex_compiler_options INTERFACE cxx_std_23)
 
-# Older Clang + libstdc++ combinations can reject <expected> unless
-# __cpp_concepts is forced to 202002L. Probe actual std::expected usability
-# first and only enable the workaround when it is actually needed.
+# Older upstream Clang + libstdc++ combinations can reject <expected> unless
+# __cpp_concepts is forced to 202002L. AppleClang/libc++ should not use this
+# workaround because the builtin macro can remain at 201907L even when
+# std::expected is available, which turns the workaround into a hard
+# macro-redefinition error under -Werror.
 include(CheckCXXSourceCompiles)
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(_ibex_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
     string(APPEND CMAKE_REQUIRED_FLAGS " -std=c++23")
     check_cxx_source_compiles(

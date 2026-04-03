@@ -29,8 +29,13 @@ target_link_libraries(ibex_runtime
 # Enable when the compiler supports -mavx2.  zorro.hpp (included via rng.hpp)
 # uses compile-time SIMD dispatch: __AVX512F__ → __AVX2__ → portable.
 include(CheckCXXCompilerFlag)
+set(IBEX_TARGETS_X86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    set(IBEX_TARGETS_X86 ON)
+endif()
+
 check_cxx_compiler_flag(-mavx2 IBEX_HAS_AVX2)
-if(IBEX_HAS_AVX2)
+if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
     target_compile_options(ibex_runtime PRIVATE -mavx2 -mfma)
     # libmvec (glibc ≥ 2.22) provides vectorized transcendentals.
     # ZORRO_USE_LIBMVEC enables zorro's AVX2/512 log/cos/sin kernels.

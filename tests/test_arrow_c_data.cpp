@@ -37,12 +37,12 @@ auto decode_metadata(const char* metadata) -> std::unordered_map<std::string, st
     return out;
 }
 
-auto string_at(const ArrowArray& array, std::int64_t index) -> std::string_view {
+auto string_at(const ArrowArray& array, std::int64_t index) -> std::string {
     const auto* offsets = static_cast<const std::uint32_t*>(array.buffers[1]);
     const auto* chars = static_cast<const char*>(array.buffers[2]);
     const auto start = static_cast<std::size_t>(offsets[index]);
     const auto end = static_cast<std::size_t>(offsets[index + 1]);
-    return {chars + start, end - start};
+    return std::string(chars + start, chars + end);
 }
 
 }  // namespace
@@ -70,7 +70,7 @@ TEST_CASE("Arrow C Data export preserves zero-copy buffers and table metadata",
     auto exported = ibex::interop::export_table_to_arrow(table, &array, &schema);
     REQUIRE(exported.has_value());
 
-    REQUIRE(std::string_view(schema.format) == "+s");
+    REQUIRE(std::string(schema.format) == "+s");
     REQUIRE(array.length == 3);
     REQUIRE(schema.n_children == 5);
     REQUIRE(array.n_children == 5);
@@ -79,8 +79,8 @@ TEST_CASE("Arrow C Data export preserves zero-copy buffers and table metadata",
     REQUIRE(metadata.at("ibex.time_index") == "ts");
     REQUIRE(metadata.at("ibex.ordering") == "ts:asc,id:desc");
 
-    REQUIRE(std::string_view(schema.children[0]->name) == "id");
-    REQUIRE(std::string_view(schema.children[0]->format) == "l");
+    REQUIRE(std::string(schema.children[0]->name) == "id");
+    REQUIRE(std::string(schema.children[0]->format) == "l");
 
     const auto* id_col = std::get_if<ibex::Column<std::int64_t>>(table.find("id"));
     const auto* flag_col = std::get_if<ibex::Column<bool>>(table.find("flag"));
@@ -93,10 +93,10 @@ TEST_CASE("Arrow C Data export preserves zero-copy buffers and table metadata",
     REQUIRE(date_col != nullptr);
     REQUIRE(ts_col != nullptr);
 
-    REQUIRE(std::string_view(schema.children[1]->format) == "b");
-    REQUIRE(std::string_view(schema.children[2]->format) == "u");
-    REQUIRE(std::string_view(schema.children[3]->format) == "tdD");
-    REQUIRE(std::string_view(schema.children[4]->format) == "tsn:");
+    REQUIRE(std::string(schema.children[1]->format) == "b");
+    REQUIRE(std::string(schema.children[2]->format) == "u");
+    REQUIRE(std::string(schema.children[3]->format) == "tdD");
+    REQUIRE(std::string(schema.children[4]->format) == "tsn:");
 
     REQUIRE(array.children[0]->buffers[1] == static_cast<const void*>(id_col->data()));
     REQUIRE(array.children[1]->buffers[1] == static_cast<const void*>(flag_col->words_data()));
@@ -125,9 +125,9 @@ TEST_CASE("Arrow C Data export maps categoricals to dictionary arrays", "[intero
     REQUIRE(exported.has_value());
 
     REQUIRE(schema.n_children == 1);
-    REQUIRE(std::string_view(schema.children[0]->format) == "i");
+    REQUIRE(std::string(schema.children[0]->format) == "i");
     REQUIRE(schema.children[0]->dictionary != nullptr);
-    REQUIRE(std::string_view(schema.children[0]->dictionary->format) == "u");
+    REQUIRE(std::string(schema.children[0]->dictionary->format) == "u");
 
     const ArrowArray& child = *array.children[0];
     REQUIRE(child.dictionary != nullptr);

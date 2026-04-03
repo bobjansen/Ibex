@@ -29,6 +29,15 @@ function(ibex_silence_external_target target_name)
 
     get_target_property(_ibex_target_type "${target_name}" TYPE)
     if(_ibex_target_type AND NOT _ibex_target_type STREQUAL "INTERFACE_LIBRARY")
+        # On MSVC, strip any existing /W flags from the target to avoid D9025
+        # override warnings when we add /w below.
+        if(MSVC)
+            get_target_property(_ibex_opts "${target_name}" COMPILE_OPTIONS)
+            if(_ibex_opts)
+                list(FILTER _ibex_opts EXCLUDE REGEX "^/W[0-4]$")
+                set_target_properties("${target_name}" PROPERTIES COMPILE_OPTIONS "${_ibex_opts}")
+            endif()
+        endif()
         target_compile_options("${target_name}" PRIVATE
             $<$<AND:$<COMPILE_LANGUAGE:C>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-w>
             $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-w>

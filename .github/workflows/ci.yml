@@ -75,7 +75,9 @@ jobs:
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
 
       - name: Test
-        run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure --parallel 4
+        run: |
+          chcp 65001
+          ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure --parallel 4
 
   clang-tidy:
     runs-on: ubuntu-24.04

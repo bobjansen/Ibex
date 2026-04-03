@@ -527,7 +527,8 @@ TEST_CASE("E2E: left join preserves all left rows", "[e2e]") {
 }
 
 TEST_CASE("E2E: right join preserves all right rows", "[e2e]") {
-    runtime::Table lhs, rhs;
+    runtime::Table lhs;
+    runtime::Table rhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2});
     lhs.add_column("name", Column<std::string>{"alice", "bob"});
 
@@ -546,7 +547,8 @@ TEST_CASE("E2E: right join preserves all right rows", "[e2e]") {
 }
 
 TEST_CASE("E2E: outer join preserves rows from both sides", "[e2e]") {
-    runtime::Table lhs, rhs;
+    runtime::Table lhs;
+    runtime::Table rhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2});
     lhs.add_column("name", Column<std::string>{"alice", "bob"});
 
@@ -1464,6 +1466,7 @@ TEST_CASE("Proof: 250-day correlated returns via update = expr", "[e2e]") {
                 {1.0000, 0.0000, 0.0000}, {0.7000, 0.7141, 0.0000}, {0.5000, 0.3499, 0.7929}};
             constexpr double daily_vol = 0.01;
 
+            // NOLINTNEXTLINE(cert-msc51-cpp, cert-msc32-c)
             std::mt19937 rng{42};
             std::normal_distribution<double> std_norm;
 
@@ -1511,16 +1514,20 @@ days[update = gen_correlated_returns(symbols)];
     auto pearson = [&](const std::string& a, const std::string& b) {
         const auto& ca = std::get<Column<double>>(*out.find(a));
         const auto& cb = std::get<Column<double>>(*out.find(b));
-        double ma = 0, mb = 0;
+        double ma = 0;
+        double mb = 0;
         for (std::size_t i = 0; i < n_days; ++i) {
             ma += ca[i];
             mb += cb[i];
         }
         ma /= n_days;
         mb /= n_days;
-        double cov = 0, va = 0, vb = 0;
+        double cov = 0;
+        double va = 0;
+        double vb = 0;
         for (std::size_t i = 0; i < n_days; ++i) {
-            double da = ca[i] - ma, db = cb[i] - mb;
+            double da = ca[i] - ma;
+            double db = cb[i] - mb;
             cov += da * db;
             va += da * da;
             vb += db * db;

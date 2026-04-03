@@ -189,6 +189,8 @@ inline auto udp_recv(std::int64_t port) -> ibex::runtime::Table {
     static constexpr int kBatch = 256;
     static constexpr std::size_t kMsgBuf = 256;  // max tick JSON ≈ 70 bytes
 
+    int n = 0;
+#ifdef __linux__
     struct mmsghdr msgs[kBatch]{};
     struct iovec iovecs[kBatch]{};
     char bufs[kBatch][kMsgBuf];
@@ -204,7 +206,31 @@ inline auto udp_recv(std::int64_t port) -> ibex::runtime::Table {
         // MSG_WAITFORONE: block until ≥1 datagram is available, then
         // return however many are ready (up to kBatch) without further
         // blocking.  This avoids both busy-spinning and per-message wakeups.
-        const int n = ::recvmmsg(sock.fd, msgs, kBatch, MSG_WAITFORONE, nullptr);
+        n = ::recvmmsg(sock.fd, msgs, kBatch, MSG_WAITFORONE, nullptr);
+        if (n <= 0) {
+            return Table{};  // socket error / closed
+        }
+#else
+    char bufs[kBatch][kMsgBuf]{};
+    std::size_t lens[kBatch]{};
+
+    while (true) {
+        const auto first_len = ::recv(sock.fd, bufs[0], kMsgBuf - 1, 0);
+        if (first_len <= 0) {
+            return Table{};  // socket error / closed
+        }
+        lens[0] = static_cast<std::size_t>(first_len);
+        n = 1;
+
+        while (n < kBatch) {
+            const auto len = ::recv(sock.fd, bufs[n], kMsgBuf - 1, MSG_DONTWAIT);
+            if (len <= 0) {
+                break;
+            }
+            lens[n] = static_cast<std::size_t>(len);
+            ++n;
+        }
+#endif
         if (n <= 0) {
             return Table{};  // socket error / closed
         }
@@ -219,7 +245,11 @@ inline auto udp_recv(std::int64_t port) -> ibex::runtime::Table {
         vol_col.reserve(static_cast<std::size_t>(n));
 
         for (int i = 0; i < n; ++i) {
+#ifdef __linux__
             const std::size_t len = msgs[i].msg_len;
+#else
+            const std::size_t len = lens[i];
+#endif
             bufs[i][len] = '\0';
             const std::string_view json(bufs[i], len);
 

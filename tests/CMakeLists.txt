@@ -74,11 +74,19 @@ if(IBEX_COVERAGE)
 endif()
 
 if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin)
+    set(_parity_cxxflags "")
+    set(_parity_ldflags "")
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(_parity_cxxflags "-fsanitize=address,undefined -fno-omit-frame-pointer")
+        set(_parity_ldflags "-fsanitize=address,undefined")
+    endif()
     add_test(
         NAME ibex_parity_interpreter_vs_transpiled
         COMMAND "${CMAKE_COMMAND}" -E env
             "BUILD_DIR=${PROJECT_BINARY_DIR}"
             "CXX=${CMAKE_CXX_COMPILER}"
+            "PARITY_CXXFLAGS=${_parity_cxxflags}"
+            "PARITY_LDFLAGS=${_parity_ldflags}"
             "${PROJECT_SOURCE_DIR}/tests/parity/run_parity.sh"
     )
 endif()

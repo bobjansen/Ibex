@@ -6,6 +6,20 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 CXX="${CXX:-clang++}"
 
+detect_cxx_std_flag() {
+    local candidate
+    for candidate in c++23 gnu++23 c++2b gnu++2b; do
+        if printf 'int main() { return 0; }\n' | "$CXX" -x c++ -std="$candidate" - -o /dev/null >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    echo "error: unable to find a supported C++23-or-newer standard flag for $CXX" >&2
+    return 1
+}
+
+CXX_STD_FLAG="$(detect_cxx_std_flag)"
+
 IBEX_EVAL="$BUILD_DIR/tools/ibex_eval"
 IBEX_COMPILE="$BUILD_DIR/tools/ibex_compile"
 CASES_DIR="$SCRIPT_DIR/cases"
@@ -61,7 +75,7 @@ for case_file in "$CASES_DIR"/*.ibex; do
 
     "$IBEX_EVAL" "$case_file" >"$interp_out"
     "$IBEX_COMPILE" "$case_file" -o "$cpp_file"
-    "$CXX" -std=c++23 "${IBEX_INCS[@]}" "$cpp_file" "${IBEX_LIBS[@]}" -o "$bin_file"
+    "$CXX" -std="$CXX_STD_FLAG" "${IBEX_INCS[@]}" "$cpp_file" "${IBEX_LIBS[@]}" -o "$bin_file"
     "$bin_file" >"$transpiled_out"
 
     if ! diff -u "$interp_out" "$transpiled_out" >"$diff_out"; then

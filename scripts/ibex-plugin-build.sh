@@ -24,6 +24,20 @@ IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
 BUILD_DIR="${BUILD_DIR:-$IBEX_ROOT/build}"
 CXX="${CXX:-clang++}"
 
+detect_cxx_std_flag() {
+    local candidate
+    for candidate in c++23 gnu++23 c++2b gnu++2b; do
+        if printf 'int main() { return 0; }\n' | "$CXX" -x c++ -std="$candidate" - -o /dev/null >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    echo "error: unable to find a supported C++23-or-newer standard flag for $CXX" >&2
+    return 1
+}
+
+CXX_STD_FLAG="$(detect_cxx_std_flag)"
+
 # ── Arg parsing ──────────────────────────────────────────────────────────────
 if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
     echo "Usage: $(basename "$0") <plugin.cpp> [-o output.so]"
@@ -92,7 +106,7 @@ done
 
 # ── Compile ───────────────────────────────────────────────────────────────────
 echo "▸ compiling plugin $CPP_FILE → $OUTPUT"
-"$CXX" -std=c++23 -fPIC -shared \
+"$CXX" -std="$CXX_STD_FLAG" -fPIC -shared \
     "${IBEX_INCS[@]}" \
     "$CPP_FILE" \
     "${IBEX_LIBS[@]}" \

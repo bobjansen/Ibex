@@ -486,7 +486,7 @@ inline void seed_x16(std::uint64_t seed, std::uint64_t (&sa0)[8], std::uint64_t 
 // The SIMD tier is selected at compile time; the AMD Zen 4 workaround for
 // FP-heavy kernels is applied at runtime.
 
-class Rng {
+class alignas(64) Rng {
    public:
     explicit Rng(std::uint64_t seed) noexcept {
 #if defined(__AVX512F__)
@@ -531,7 +531,7 @@ class Rng {
         }
         if (i < count) {
             alignas(64) double tail[8];
-            _mm512_store_pd(
+            _mm512_storeu_pd(
                 tail, _mm512_add_pd(
                           vlo, _mm512_mul_pd(vrng, detail::u64_to_uniform01_avx512(
                                                        detail::next_x8_avx512(a0, a1, a2, a3)))));
@@ -566,7 +566,7 @@ class Rng {
         }
         if (i < count) {
             alignas(32) double tail[4];
-            _mm256_store_pd(
+            _mm256_storeu_pd(
                 tail,
                 _mm256_add_pd(vlo, _mm256_mul_pd(vrng, detail::u64_to_uniform01_avx2(
                                                            detail::next_x4_avx2(a0, a1, a2, a3)))));
@@ -673,27 +673,27 @@ class Rng {
 
     [[nodiscard]] auto load_avx2() const noexcept -> Avx2State {
         return {
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sa_[0])),
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sa_[1])),
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sa_[2])),
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sa_[3])),
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sb_[0])),
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sb_[1])),
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sb_[2])),
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(sb_[3])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sa_[0])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sa_[1])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sa_[2])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sa_[3])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sb_[0])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sb_[1])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sb_[2])),
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sb_[3])),
         };
     }
 
     void store_avx2(__m256i a0, __m256i a1, __m256i a2, __m256i a3, __m256i b0, __m256i b1,
                     __m256i b2, __m256i b3) noexcept {
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sa_[0]), a0);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sa_[1]), a1);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sa_[2]), a2);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sa_[3]), a3);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sb_[0]), b0);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sb_[1]), b1);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sb_[2]), b2);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(sb_[3]), b3);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sa_[0]), a0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sa_[1]), a1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sa_[2]), a2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sa_[3]), a3);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sb_[0]), b0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sb_[1]), b1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sb_[2]), b2);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(sb_[3]), b3);
     }
 #endif
 
@@ -704,22 +704,22 @@ class Rng {
 
     [[nodiscard]] auto load_avx512() const noexcept -> Avx512State {
         return {
-            _mm512_load_si512(sa_[0]), _mm512_load_si512(sa_[1]), _mm512_load_si512(sa_[2]),
-            _mm512_load_si512(sa_[3]), _mm512_load_si512(sb_[0]), _mm512_load_si512(sb_[1]),
-            _mm512_load_si512(sb_[2]), _mm512_load_si512(sb_[3]),
+            _mm512_loadu_si512(sa_[0]), _mm512_loadu_si512(sa_[1]), _mm512_loadu_si512(sa_[2]),
+            _mm512_loadu_si512(sa_[3]), _mm512_loadu_si512(sb_[0]), _mm512_loadu_si512(sb_[1]),
+            _mm512_loadu_si512(sb_[2]), _mm512_loadu_si512(sb_[3]),
         };
     }
 
     void store_avx512(__m512i a0, __m512i a1, __m512i a2, __m512i a3, __m512i b0, __m512i b1,
                       __m512i b2, __m512i b3) noexcept {
-        _mm512_store_si512(sa_[0], a0);
-        _mm512_store_si512(sa_[1], a1);
-        _mm512_store_si512(sa_[2], a2);
-        _mm512_store_si512(sa_[3], a3);
-        _mm512_store_si512(sb_[0], b0);
-        _mm512_store_si512(sb_[1], b1);
-        _mm512_store_si512(sb_[2], b2);
-        _mm512_store_si512(sb_[3], b3);
+        _mm512_storeu_si512(sa_[0], a0);
+        _mm512_storeu_si512(sa_[1], a1);
+        _mm512_storeu_si512(sa_[2], a2);
+        _mm512_storeu_si512(sa_[3], a3);
+        _mm512_storeu_si512(sb_[0], b0);
+        _mm512_storeu_si512(sb_[1], b1);
+        _mm512_storeu_si512(sb_[2], b2);
+        _mm512_storeu_si512(sb_[3], b3);
     }
 #endif
 
@@ -877,7 +877,8 @@ class Rng {
     void fill_normal_avx2(double* __restrict__ out, std::size_t count, double mean,
                           double stddev) noexcept {
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
-#ifdef ZORRO_USE_LIBMVEC
+#if defined(ZORRO_USE_LIBMVEC) && \
+    !(defined(__GNUC__) && !defined(__clang__) && defined(__SANITIZE_ADDRESS__))
         // Fully vectorized polar with libmvec log
         const __m256d one = _mm256_set1_pd(1.0);
         const __m256d zero = _mm256_setzero_pd();
@@ -905,8 +906,8 @@ class Rng {
                     const __m256d n2 =
                         _mm256_add_pd(vmean, _mm256_mul_pd(vstd, _mm256_mul_pd(u2, factor)));
                     alignas(32) double n1v[4], n2v[4];
-                    _mm256_store_pd(n1v, n1);
-                    _mm256_store_pd(n2v, n2);
+                    _mm256_storeu_pd(n1v, n1);
+                    _mm256_storeu_pd(n2v, n2);
                     for (int lane = 0; lane < 4 && i < count; ++lane) {
                         if (mask_bits & (1 << lane)) {
                             out[i++] = n1v[lane];
@@ -935,8 +936,8 @@ class Rng {
                     const __m256d n2 =
                         _mm256_add_pd(vmean, _mm256_mul_pd(vstd, _mm256_mul_pd(u2, factor)));
                     alignas(32) double n1v[4], n2v[4];
-                    _mm256_store_pd(n1v, n1);
-                    _mm256_store_pd(n2v, n2);
+                    _mm256_storeu_pd(n1v, n1);
+                    _mm256_storeu_pd(n2v, n2);
                     for (int lane = 0; lane < 4 && i < count; ++lane) {
                         if (mask_bits & (1 << lane)) {
                             out[i++] = n1v[lane];
@@ -953,10 +954,10 @@ class Rng {
         std::size_t i = 0;
         while (i < count) {
             // Group a: generate 4 pairs
-            _mm256_store_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
+            _mm256_storeu_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
             double u1a[4];
             std::memcpy(u1a, tmp, 32);
-            _mm256_store_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
+            _mm256_storeu_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
             for (int lane = 0; lane < 4 && i < count; ++lane) {
                 const double u1 = u1a[lane], u2 = tmp[lane];
                 const double sq = u1 * u1 + u2 * u2;
@@ -970,9 +971,9 @@ class Rng {
             if (i >= count)
                 break;
             // Group b: generate 4 pairs
-            _mm256_store_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
+            _mm256_storeu_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
             std::memcpy(u1a, tmp, 32);
-            _mm256_store_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
+            _mm256_storeu_pd(tmp, detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
             for (int lane = 0; lane < 4 && i < count; ++lane) {
                 const double u1 = u1a[lane], u2 = tmp[lane];
                 const double sq = u1 * u1 + u2 * u2;
@@ -984,7 +985,7 @@ class Rng {
                     out[i++] = mean + stddev * u2 * scale;
             }
         }
-#endif  // ZORRO_USE_LIBMVEC
+#endif  // ZORRO_USE_LIBMVEC && !(__GNUC__ && __SANITIZE_ADDRESS__)
         store_avx2(a0, a1, a2, a3, b0, b1, b2, b3);
     }
 
@@ -1011,9 +1012,9 @@ class Rng {
         }
         if (i < count) {
             alignas(32) double tail[4];
-            _mm256_store_pd(tail,
-                            _mm256_mul_pd(neg_inv, _ZGVdN4v_log(detail::u64_to_uniform01_avx2(
-                                                       detail::next_x4_avx2(a0, a1, a2, a3)))));
+            _mm256_storeu_pd(tail,
+                             _mm256_mul_pd(neg_inv, _ZGVdN4v_log(detail::u64_to_uniform01_avx2(
+                                                        detail::next_x4_avx2(a0, a1, a2, a3)))));
             for (std::size_t lane = 0; i < count; ++lane, ++i)
                 out[i] = tail[lane];
         }
@@ -1044,7 +1045,7 @@ class Rng {
         }
         if (i < count) {
             alignas(32) double tail[4];
-            _mm256_store_pd(
+            _mm256_storeu_pd(
                 tail, _mm256_mul_pd(inv, detail::fast_neglog01_avx2(_mm256_sub_pd(
                                              one, detail::u64_to_uniform01_avx2(
                                                       detail::next_x4_avx2(a0, a1, a2, a3))))));
@@ -1089,9 +1090,9 @@ class Rng {
         if (i < count) {
             alignas(32) double tail[4];
             const __m256i ra = detail::next_x4_avx2(a0, a1, a2, a3);
-            _mm256_store_pd(tail, _mm256_and_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(
-                                                    thresh_vec, _mm256_xor_si256(ra, sign_flip))),
-                                                one_d));
+            _mm256_storeu_pd(tail, _mm256_and_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(
+                                                     thresh_vec, _mm256_xor_si256(ra, sign_flip))),
+                                                 one_d));
             for (std::size_t lane = 0; i < count; ++lane, ++i)
                 out[i] = tail[lane];
         }
@@ -1138,8 +1139,8 @@ class Rng {
                         const __m256d fac = _mm256_sqrt_pd(
                             _mm256_div_pd(_mm256_mul_pd(neg2, _ZGVdN4v_log(sf)), sf));
                         alignas(32) double xa[4], xa2[4];
-                        _mm256_store_pd(xa, _mm256_mul_pd(u1, fac));
-                        _mm256_store_pd(xa2, _mm256_mul_pd(u2, fac));
+                        _mm256_storeu_pd(xa, _mm256_mul_pd(u1, fac));
+                        _mm256_storeu_pd(xa2, _mm256_mul_pd(u2, fac));
                         for (int lane = 0; lane < 4 && n < kBuf; ++lane) {
                             if (bits & (1 << lane)) {
                                 buf_x[n++] = xa[lane];
@@ -1164,8 +1165,8 @@ class Rng {
                         const __m256d fac = _mm256_sqrt_pd(
                             _mm256_div_pd(_mm256_mul_pd(neg2, _ZGVdN4v_log(sf)), sf));
                         alignas(32) double xb[4], xb2[4];
-                        _mm256_store_pd(xb, _mm256_mul_pd(u1, fac));
-                        _mm256_store_pd(xb2, _mm256_mul_pd(u2, fac));
+                        _mm256_storeu_pd(xb, _mm256_mul_pd(u1, fac));
+                        _mm256_storeu_pd(xb2, _mm256_mul_pd(u2, fac));
                         for (int lane = 0; lane < 4 && n < kBuf; ++lane) {
                             if (bits & (1 << lane)) {
                                 buf_x[n++] = xb[lane];
@@ -1200,7 +1201,7 @@ class Rng {
                 const int accept_bits = _mm256_movemask_pd(accept);
                 if (accept_bits) {
                     alignas(32) double gv[4];
-                    _mm256_store_pd(gv, _mm256_mul_pd(d_vec, v));
+                    _mm256_storeu_pd(gv, _mm256_mul_pd(d_vec, v));
                     for (int lane = 0; lane < 4 && i < count; ++lane) {
                         if (accept_bits & (1 << lane))
                             out[i++] = gv[lane];
@@ -1215,7 +1216,7 @@ class Rng {
                     continue;
                 const double v = vr * vr * vr;
                 alignas(32) double utail[4];
-                _mm256_store_pd(
+                _mm256_storeu_pd(
                     utail, detail::u64_to_uniform01_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
                 const double u = utail[0];
                 const double x2 = x * x;
@@ -1236,10 +1237,10 @@ class Rng {
             // Phase 1: fill buf_x with N(0,1) values
             int n = 0;
             while (n < kBuf) {
-                _mm256_store_pd(tmp_u1,
-                                detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
-                _mm256_store_pd(tmp_u2,
-                                detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
+                _mm256_storeu_pd(tmp_u1,
+                                 detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
+                _mm256_storeu_pd(tmp_u2,
+                                 detail::u64_to_pm1_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
                 for (int lane = 0; lane < 4 && n < kBuf; ++lane) {
                     const double u1 = tmp_u1[lane], u2 = tmp_u2[lane];
                     const double sq = u1 * u1 + u2 * u2;
@@ -1250,10 +1251,10 @@ class Rng {
                     if (n < kBuf)
                         buf_x[n++] = u2 * scale;
                 }
-                _mm256_store_pd(tmp_u1,
-                                detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
-                _mm256_store_pd(tmp_u2,
-                                detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
+                _mm256_storeu_pd(tmp_u1,
+                                 detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
+                _mm256_storeu_pd(tmp_u2,
+                                 detail::u64_to_pm1_avx2(detail::next_x4_avx2(b0, b1, b2, b3)));
                 for (int lane = 0; lane < 4 && n < kBuf; ++lane) {
                     const double u1 = tmp_u1[lane], u2 = tmp_u2[lane];
                     const double sq = u1 * u1 + u2 * u2;
@@ -1269,7 +1270,7 @@ class Rng {
             alignas(32) double u_batch[4];
             int k = 0;
             for (; k + 4 <= n && i < count; k += 4) {
-                _mm256_store_pd(
+                _mm256_storeu_pd(
                     u_batch, detail::u64_to_uniform01_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
                 for (int lane = 0; lane < 4 && i < count; ++lane) {
                     const double x = buf_x[k + lane];
@@ -1294,7 +1295,7 @@ class Rng {
                 if (vr <= 0.0)
                     continue;
                 const double v = vr * vr * vr;
-                _mm256_store_pd(
+                _mm256_storeu_pd(
                     u_batch, detail::u64_to_uniform01_avx2(detail::next_x4_avx2(a0, a1, a2, a3)));
                 const double u = u_batch[0];
                 const double x2 = x * x;
@@ -1358,7 +1359,7 @@ class Rng {
             alignas(64) double tail[8];
             const __mmask8 ma = _mm512_cmp_epu64_mask(detail::next_x8_avx512(a0, a1, a2, a3),
                                                       thresh_vec, _MM_CMPINT_LT);
-            _mm512_store_pd(tail, _mm512_maskz_mov_pd(ma, one_d));
+            _mm512_storeu_pd(tail, _mm512_maskz_mov_pd(ma, one_d));
             for (std::size_t lane = 0; i < count; ++lane, ++i)
                 out[i] = tail[lane];
         }
@@ -1462,9 +1463,9 @@ class Rng {
         }
         if (i < count) {
             alignas(64) double tail[8];
-            _mm512_store_pd(tail,
-                            _mm512_mul_pd(neg_inv, _ZGVeN8v_log(detail::u64_to_uniform01_avx512(
-                                                       detail::next_x8_avx512(a0, a1, a2, a3)))));
+            _mm512_storeu_pd(tail,
+                             _mm512_mul_pd(neg_inv, _ZGVeN8v_log(detail::u64_to_uniform01_avx512(
+                                                        detail::next_x8_avx512(a0, a1, a2, a3)))));
             for (std::size_t lane = 0; i < count; ++lane, ++i)
                 out[i] = tail[lane];
         }
@@ -1477,7 +1478,7 @@ class Rng {
 // ─── Convenience: thread-local singleton ─────────────────────────────────────
 
 inline auto get_rng() noexcept -> Rng& {
-    static thread_local Rng rng{std::random_device{}()};
+    alignas(64) static thread_local Rng rng{std::random_device{}()};
     return rng;
 }
 

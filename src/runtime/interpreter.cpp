@@ -10,8 +10,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <emmintrin.h>
-#include <immintrin.h>
 #include <limits>
 #include <numeric>
 #include <optional>

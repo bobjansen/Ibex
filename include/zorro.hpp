@@ -502,8 +502,8 @@ class Rng {
 
     void fill_uniform(double* __restrict__ out, std::size_t count, double low = 0.0,
                       double high = 1.0) noexcept {
-        const double range = high - low;
 #if defined(__AVX512F__)
+        const double range = high - low;
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx512();
         const __m512d vlo = _mm512_set1_pd(low);
         const __m512d vrng = _mm512_set1_pd(range);
@@ -541,6 +541,7 @@ class Rng {
         store_avx512(a0, a1, a2, a3, b0, b1, b2, b3);
 
 #elif defined(__AVX2__)
+        const double range = high - low;
         auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
         const __m256d vlo = _mm256_set1_pd(low);
         const __m256d vrng = _mm256_set1_pd(range);

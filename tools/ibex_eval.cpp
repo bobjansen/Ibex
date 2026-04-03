@@ -3,7 +3,6 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
 
-#include "import_resolver.hpp"
 #include <cstdint>
 #include <expected>
 #include <fstream>
@@ -12,6 +11,8 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+#include "import_resolver.hpp"
 
 namespace {
 

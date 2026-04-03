@@ -41,8 +41,7 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
     // Serialises each row of the DataFrame to a JSON UDP datagram.
     // Returns the number of rows sent.
     registry->register_scalar_table_consumer(
-        "udp_send",
-        ibex::runtime::ScalarKind::Int,
+        "udp_send", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
             if (args.size() != 2) {
@@ -59,8 +58,7 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
             }
             try {
                 std::int64_t sent = ibex_udp::udp_send(table, *host, *port);
-                return ibex::runtime::ExternValue{
-                    ibex::runtime::ScalarValue{sent}};
+                return ibex::runtime::ExternValue{ibex::runtime::ScalarValue{sent}};
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));
             }

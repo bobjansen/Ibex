@@ -129,7 +129,8 @@ class StreamBuffered : public std::enable_shared_from_this<StreamBuffered> {
     bool try_pop(Table& out) {
         const std::size_t h = head_.load(std::memory_order_relaxed);
         const std::size_t t = tail_.load(std::memory_order_acquire);
-        if (h == t) return false;
+        if (h == t)
+            return false;
         out = std::move(ring_[h % capacity_]);
         head_.store(h + 1, std::memory_order_release);
         return true;
@@ -140,7 +141,8 @@ class StreamBuffered : public std::enable_shared_from_this<StreamBuffered> {
     bool try_push(Table& t) {
         const std::size_t tail = tail_.load(std::memory_order_relaxed);
         const std::size_t h = head_.load(std::memory_order_acquire);
-        if (tail - h >= capacity_) return false;
+        if (tail - h >= capacity_)
+            return false;
         ring_[tail % capacity_] = std::move(t);
         tail_.store(tail + 1, std::memory_order_release);
         return true;
@@ -194,9 +196,7 @@ template <typename ProducerFn>
             }
             auto buf = std::make_shared<StreamBuffered>(cap);
             state->source_fn = buf->make_source_fn();
-            std::thread([buf, p = std::move(state->producer)]() mutable {
-                p(*buf);
-            }).detach();
+            std::thread([buf, p = std::move(state->producer)]() mutable { p(*buf); }).detach();
         }
         return (*state->source_fn)(args);
     };

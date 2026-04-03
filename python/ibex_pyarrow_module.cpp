@@ -1187,33 +1187,23 @@ PyObject* py_session_eval_file(PyObject* /*self*/, PyObject* args, PyObject* kwa
     return export_result_table_or_none(*evaluated);
 }
 
-#if defined(__clang__) && __has_warning("-Wcast-function-type-mismatch")
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wcast-function-type-mismatch"
-#endif
 PyMethodDef kModuleMethods[] = {
-    {"create_session", reinterpret_cast<PyCFunction>(py_create_session),
-     METH_VARARGS | METH_KEYWORDS,
+    {"create_session", _PyCFunction_CAST(py_create_session), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Create a persistent Ibex session for repeated evaluation.")},
-    {"reset_session", reinterpret_cast<PyCFunction>(py_reset_session), METH_VARARGS | METH_KEYWORDS,
+    {"reset_session", _PyCFunction_CAST(py_reset_session), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Reset a persistent Ibex session.")},
-    {"eval_table", reinterpret_cast<PyCFunction>(py_eval_table), METH_VARARGS | METH_KEYWORDS,
+    {"eval_table", _PyCFunction_CAST(py_eval_table), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Evaluate an Ibex source string and return a pyarrow.Table.")},
-    {"eval_file", reinterpret_cast<PyCFunction>(py_eval_file), METH_VARARGS | METH_KEYWORDS,
+    {"eval_file", _PyCFunction_CAST(py_eval_file), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Evaluate an Ibex file and return a pyarrow.Table.")},
-    {"session_eval_table", reinterpret_cast<PyCFunction>(py_session_eval_table),
-     METH_VARARGS | METH_KEYWORDS,
+    {"session_eval_table", _PyCFunction_CAST(py_session_eval_table), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Evaluate an Ibex source string within a persistent session and return a "
                "pyarrow.Table or None.")},
-    {"session_eval_file", reinterpret_cast<PyCFunction>(py_session_eval_file),
-     METH_VARARGS | METH_KEYWORDS,
+    {"session_eval_file", _PyCFunction_CAST(py_session_eval_file), METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR(
          "Evaluate an Ibex file within a persistent session and return a pyarrow.Table or None.")},
     {nullptr, nullptr, 0, nullptr},
 };
-#if defined(__clang__) && __has_warning("-Wcast-function-type-mismatch")
-#pragma clang diagnostic pop
-#endif
 
 PyModuleDef kModuleDef = {
     PyModuleDef_HEAD_INIT,

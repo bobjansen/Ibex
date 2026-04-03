@@ -9,51 +9,6 @@
     ]
   },
   "Packages": {
-    "Matrix": {
-      "Package": "Matrix",
-      "Version": "1.7-3",
-      "Source": "Repository",
-      "VersionNote": "do also bump src/version.h, inst/include/Matrix/version.h",
-      "Date": "2025-03-05",
-      "Priority": "recommended",
-      "Title": "Sparse and Dense Matrix Classes and Methods",
-      "Description": "A rich hierarchy of sparse and dense matrix classes, including general, symmetric, triangular, and diagonal matrices with numeric, logical, or pattern entries.  Efficient methods for operating on such matrices, often wrapping the 'BLAS', 'LAPACK', and 'SuiteSparse' libraries.",
-      "License": "GPL (>= 2) | file LICENCE",
-      "URL": "https://Matrix.R-forge.R-project.org",
-      "BugReports": "https://R-forge.R-project.org/tracker/?atid=294&group_id=61",
-      "Contact": "Matrix-authors@R-project.org",
-      "Authors@R": "c(person(\"Douglas\", \"Bates\", role = \"aut\", comment = c(ORCID = \"0000-0001-8316-9503\")), person(\"Martin\", \"Maechler\", role = c(\"aut\", \"cre\"), email = \"mmaechler+Matrix@gmail.com\", comment = c(ORCID = \"0000-0002-8685-9910\")), person(\"Mikael\", \"Jagan\", role = \"aut\", comment = c(ORCID = \"0000-0002-3542-2938\")), person(\"Timothy A.\", \"Davis\", role = \"ctb\", comment = c(ORCID = \"0000-0001-7614-6899\", \"SuiteSparse libraries\", \"collaborators listed in dir(system.file(\\\"doc\\\", \\\"SuiteSparse\\\", package=\\\"Matrix\\\"), pattern=\\\"License\\\", full.names=TRUE, recursive=TRUE)\")), person(\"George\", \"Karypis\", role = \"ctb\", comment = c(ORCID = \"0000-0003-2753-1437\", \"METIS library\", \"Copyright: Regents of the University of Minnesota\")), person(\"Jason\", \"Riedy\", role = \"ctb\", comment = c(ORCID = \"0000-0002-4345-4200\", \"GNU Octave's condest() and onenormest()\", \"Copyright: Regents of the University of California\")), person(\"Jens\", \"Oehlschlägel\", role = \"ctb\", comment = \"initial nearPD()\"), person(\"R Core Team\", role = \"ctb\", comment = c(ROR = \"02zz1nj61\", \"base R's matrix implementation\")))",
-      "Depends": [
-        "R (>= 4.4)",
-        "methods"
-      ],
-      "Imports": [
-        "grDevices",
-        "graphics",
-        "grid",
-        "lattice",
-        "stats",
-        "utils"
-      ],
-      "Suggests": [
-        "MASS",
-        "datasets",
-        "sfsmisc",
-        "tools"
-      ],
-      "Enhances": [
-        "SparseM",
-        "graph"
-      ],
-      "LazyData": "no",
-      "LazyDataNote": "not possible, since we use data/*.R and our S4 classes",
-      "BuildResaveData": "no",
-      "Encoding": "UTF-8",
-      "NeedsCompilation": "yes",
-      "Author": "Douglas Bates [aut] (<https://orcid.org/0000-0001-8316-9503>), Martin Maechler [aut, cre] (<https://orcid.org/0000-0002-8685-9910>), Mikael Jagan [aut] (<https://orcid.org/0000-0002-3542-2938>), Timothy A. Davis [ctb] (<https://orcid.org/0000-0001-7614-6899>, SuiteSparse libraries, collaborators listed in dir(system.file(\"doc\", \"SuiteSparse\", package=\"Matrix\"), pattern=\"License\", full.names=TRUE, recursive=TRUE)), George Karypis [ctb] (<https://orcid.org/0000-0003-2753-1437>, METIS library, Copyright: Regents of the University of Minnesota), Jason Riedy [ctb] (<https://orcid.org/0000-0002-4345-4200>, GNU Octave's condest() and onenormest(), Copyright: Regents of the University of California), Jens Oehlschlägel [ctb] (initial nearPD()), R Core Team [ctb] (02zz1nj61, base R's matrix implementation)",
-      "Maintainer": "Martin Maechler <mmaechler+Matrix@gmail.com>",
-      "Repository": "CRAN"
-    },
     "R6": {
       "Package": "R6",
       "Version": "2.6.1",
@@ -276,39 +231,6 @@
       "Author": "Winston Chang [aut, cre], Posit Software, PBC [cph, fnd]",
       "Maintainer": "Winston Chang <winston@posit.co>",
       "Repository": "CRAN"
-    },
-    "catboost": {
-      "Package": "catboost",
-      "Version": "1.2.10",
-      "Source": "GitHub",
-      "Title": "Gradient Boosting on Decision Trees",
-      "RoxygenNote": "7.3.2",
-      "Imports": [
-        "jsonlite"
-      ],
-      "License": "Apache License (== 2.0)",
-      "Description": "Open-source gradient boosting on decision trees with categorical features support out of the box.",
-      "Authors@R": "c( person(\"Nikita\", \"Dmitriev\", role = \"aut\"), person(\"Andrey\", \"Gulin\", role = \"aut\", comment = \"Chief researcher, author of the algorithm and of the first implementation\"), person(\"Anna Veronika\", \"Dorogush\", role = \"aut\"), person(\"Stanislav\", \"Kirillov\", role = \"cre\", email = \"staskirillov@gmail.com\"), person(\"Victor\", \"Omelyanenko\", role = \"aut\"), person(\"Evgueni\", \"Petrov\", role = \"aut\"), person(\"Andrey\", \"Mishenko\", role = \"aut\"), person(\"Pavel\", \"Kalinin\", role = \"aut\"), person(\"Vyacheslav\", \"Alipov\", role = \"aut\"), person(\"Egor\", \"Samosvat\", role = \"aut\"), person(\"Alexander\", \"Kobotov\", role = \"aut\"), person(\"Dmitry\", \"Schelchkov\", role = \"aut\"), person(\"Vasily\", \"Ershov\", role = \"aut\", comment = \"GPU implementation\"), person(\"Vyacheslav\", \"Murashkin\", role = \"aut\", comment = \"R Package\"), person(\"Roman\", \"Nefyodov\", role = \"aut\", comment = \"R Package\"), person(\"Anastasia\", \"Bezzubtseva\", role = \"aut\", comment = \"R Package\"), person(\"Alexey\", \"Gorchakov\", role = \"aut\", comment = \"R Package\"), person(\"Ivan\", \"Karev\", role = \"aut\", comment = \"Visualisation\"), person(\"Sergey\", \"Berezhnoy\", role = \"aut\", comment = \"Visualisation\"), person(\"Roman\", \"Rybalchenko\", role = \"aut\", comment = \"Visualisation\"), person(\"Valeriy\", \"Babushkin\", role = \"aut\", comment = \"Tutorials\"), person(\"Mikhail\", \"Pershin\", role = \"aut\", comment = \"Tutorials\"), person(\"Emil\", \"Kayumov\", role = \"aut\", comment = \"Tutorials\"), person(\"Evgeny\", \"Eltyshev\", role = \"aut\", comment = \"Tutorials\"), person(\"Alexander\", \"Baranov\", role = \"aut\", comment = \"CoreML support\"), person(\"Dmitry\", \"Oganesyan\", role = \"aut\", comment = \"R Package\"), person(\"CatBoost DevTeam\", role = c(\"aut\", \"cph\")), person(\"WLOG Solutions\", role = \"ctb\", comment = \"R package preparation for CRAN submission\"), person(\"Dmitry\", \"Baksheev\", role = \"aut\") )",
-      "Author": "CatBoost DevTeam [aut, cre]",
-      "Maintainer": "Andrei Khropov <5002794+andrey-khropov@users.noreply.github.com>",
-      "URL": "https://catboost.ai/, https://github.com/catboost/catboost",
-      "BugReports": "https://github.com/catboost/catboost/issues",
-      "Suggests": [
-        "caret",
-        "testthat",
-        "tibble",
-        "e1071"
-      ],
-      "Biarch": "FALSE",
-      "Encoding": "UTF-8",
-      "RemoteType": "github",
-      "RemoteHost": "api.github.com",
-      "RemoteRepo": "catboost",
-      "RemoteUsername": "catboost",
-      "RemoteRef": "HEAD",
-      "RemoteSha": "b943b44ecb7c26d3f1641772d7c1bda6590cbb0e",
-      "RemoteSubdir": "catboost/R-package",
-      "NeedsCompilation": "yes"
     },
     "cli": {
       "Package": "cli",
@@ -1227,45 +1149,6 @@
       "Maintainer": "Charlie Gao <charlie.gao@posit.co>",
       "Repository": "CRAN"
     },
-    "lattice": {
-      "Package": "lattice",
-      "Version": "0.22-6",
-      "Source": "Repository",
-      "Date": "2024-03-20",
-      "Priority": "recommended",
-      "Title": "Trellis Graphics for R",
-      "Authors@R": "c(person(\"Deepayan\", \"Sarkar\", role = c(\"aut\", \"cre\"), email = \"deepayan.sarkar@r-project.org\", comment = c(ORCID = \"0000-0003-4107-1553\")), person(\"Felix\", \"Andrews\", role = \"ctb\"), person(\"Kevin\", \"Wright\", role = \"ctb\", comment = \"documentation\"), person(\"Neil\", \"Klepeis\", role = \"ctb\"), person(\"Johan\", \"Larsson\", role = \"ctb\", comment = \"miscellaneous improvements\"), person(\"Zhijian (Jason)\", \"Wen\", role = \"cph\", comment = \"filled contour code\"), person(\"Paul\", \"Murrell\", role = \"ctb\", email = \"paul@stat.auckland.ac.nz\"), person(\"Stefan\", \"Eng\", role = \"ctb\", comment = \"violin plot improvements\"), person(\"Achim\", \"Zeileis\", role = \"ctb\", comment = \"modern colors\"), person(\"Alexandre\", \"Courtiol\", role = \"ctb\", comment = \"generics for larrows, lpolygon, lrect and lsegments\") )",
-      "Description": "A powerful and elegant high-level data visualization system inspired by Trellis graphics, with an emphasis on multivariate data. Lattice is sufficient for typical graphics needs, and is also flexible enough to handle most nonstandard requirements. See ?Lattice for an introduction.",
-      "Depends": [
-        "R (>= 4.0.0)"
-      ],
-      "Suggests": [
-        "KernSmooth",
-        "MASS",
-        "latticeExtra",
-        "colorspace"
-      ],
-      "Imports": [
-        "grid",
-        "grDevices",
-        "graphics",
-        "stats",
-        "utils"
-      ],
-      "Enhances": [
-        "chron",
-        "zoo"
-      ],
-      "LazyLoad": "yes",
-      "LazyData": "yes",
-      "License": "GPL (>= 2)",
-      "URL": "https://lattice.r-forge.r-project.org/",
-      "BugReports": "https://github.com/deepayan/lattice/issues",
-      "NeedsCompilation": "yes",
-      "Author": "Deepayan Sarkar [aut, cre] (<https://orcid.org/0000-0003-4107-1553>), Felix Andrews [ctb], Kevin Wright [ctb] (documentation), Neil Klepeis [ctb], Johan Larsson [ctb] (miscellaneous improvements), Zhijian (Jason) Wen [cph] (filled contour code), Paul Murrell [ctb], Stefan Eng [ctb] (violin plot improvements), Achim Zeileis [ctb] (modern colors), Alexandre Courtiol [ctb] (generics for larrows, lpolygon, lrect and lsegments)",
-      "Maintainer": "Deepayan Sarkar <deepayan.sarkar@r-project.org>",
-      "Repository": "CRAN"
-    },
     "lifecycle": {
       "Package": "lifecycle",
       "Version": "1.0.5",
@@ -1304,47 +1187,6 @@
       "NeedsCompilation": "no",
       "Author": "Lionel Henry [aut, cre], Hadley Wickham [aut] (ORCID: <https://orcid.org/0000-0003-4757-117X>), Posit Software, PBC [cph, fnd]",
       "Maintainer": "Lionel Henry <lionel@posit.co>",
-      "Repository": "CRAN"
-    },
-    "lightgbm": {
-      "Package": "lightgbm",
-      "Version": "4.6.0",
-      "Source": "Repository",
-      "Type": "Package",
-      "Title": "Light Gradient Boosting Machine",
-      "Date": "2025-02-13",
-      "Authors@R": "c( person(\"Yu\", \"Shi\", email = \"yushi2@microsoft.com\", role = c(\"aut\")), person(\"Guolin\", \"Ke\", email = \"guolin.ke@outlook.com\", role = c(\"aut\")), person(\"Damien\", \"Soukhavong\", email = \"damien.soukhavong@skema.edu\", role = c(\"aut\")), person(\"James\", \"Lamb\", email=\"jaylamb20@gmail.com\", role = c(\"aut\", \"cre\")), person(\"Qi\", \"Meng\", role = c(\"aut\")), person(\"Thomas\", \"Finley\", role = c(\"aut\")), person(\"Taifeng\", \"Wang\", role = c(\"aut\")), person(\"Wei\", \"Chen\", role = c(\"aut\")), person(\"Weidong\", \"Ma\", role = c(\"aut\")), person(\"Qiwei\", \"Ye\", role = c(\"aut\")), person(\"Tie-Yan\", \"Liu\", role = c(\"aut\")), person(\"Nikita\", \"Titov\", role = c(\"aut\")), person(\"Yachen\", \"Yan\", role = c(\"ctb\")), person(\"Microsoft Corporation\", role = c(\"cph\")), person(\"Dropbox, Inc.\", role = c(\"cph\")), person(\"Alberto\", \"Ferreira\", role = c(\"ctb\")), person(\"Daniel\", \"Lemire\", role = c(\"ctb\")), person(\"Victor\", \"Zverovich\", role = c(\"cph\")), person(\"IBM Corporation\", role = c(\"ctb\")), person(\"David\", \"Cortes\", role = c(\"aut\")), person(\"Michael\", \"Mayer\", role = c(\"ctb\")) )",
-      "Description": "Tree based algorithms can be improved by introducing boosting frameworks. 'LightGBM' is one such framework, based on Ke, Guolin et al. (2017) <https://papers.nips.cc/paper/6907-lightgbm-a-highly-efficient-gradient-boosting-decision>. This package offers an R interface to work with it. It is designed to be distributed and efficient with the following advantages: 1. Faster training speed and higher efficiency. 2. Lower memory usage. 3. Better accuracy. 4. Parallel learning supported. 5. Capable of handling large-scale data. In recognition of these advantages, 'LightGBM' has been widely-used in many winning solutions of machine learning competitions. Comparison experiments on public datasets suggest that 'LightGBM' can outperform existing boosting frameworks on both efficiency and accuracy, with significantly lower memory consumption. In addition, parallel experiments suggest that in certain circumstances, 'LightGBM' can achieve a linear speed-up in training time by using multiple machines.",
-      "Encoding": "UTF-8",
-      "License": "MIT + file LICENSE",
-      "URL": "https://github.com/Microsoft/LightGBM",
-      "BugReports": "https://github.com/Microsoft/LightGBM/issues",
-      "NeedsCompilation": "yes",
-      "Biarch": "true",
-      "VignetteBuilder": "knitr",
-      "Suggests": [
-        "knitr",
-        "markdown",
-        "RhpcBLASctl",
-        "testthat"
-      ],
-      "Depends": [
-        "R (>= 3.5)"
-      ],
-      "Imports": [
-        "R6 (>= 2.0)",
-        "data.table (>= 1.9.6)",
-        "graphics",
-        "jsonlite (>= 1.0)",
-        "Matrix (>= 1.1-0)",
-        "methods",
-        "parallel",
-        "utils"
-      ],
-      "SystemRequirements": "C++17",
-      "RoxygenNote": "7.3.2",
-      "Author": "Yu Shi [aut], Guolin Ke [aut], Damien Soukhavong [aut], James Lamb [aut, cre], Qi Meng [aut], Thomas Finley [aut], Taifeng Wang [aut], Wei Chen [aut], Weidong Ma [aut], Qiwei Ye [aut], Tie-Yan Liu [aut], Nikita Titov [aut], Yachen Yan [ctb], Microsoft Corporation [cph], Dropbox, Inc. [cph], Alberto Ferreira [ctb], Daniel Lemire [ctb], Victor Zverovich [cph], IBM Corporation [ctb], David Cortes [aut], Michael Mayer [ctb]",
-      "Maintainer": "James Lamb <jaylamb20@gmail.com>",
       "Repository": "CRAN"
     },
     "magrittr": {
@@ -1773,6 +1615,9 @@
       ],
       "Imports": [
         "nanoarrow"
+      ],
+      "Suggests": [
+        "knitr"
       ],
       "SystemRequirements": "C++23, an existing Ibex build tree",
       "License": "file LICENSE",
@@ -2514,53 +2359,6 @@
       "NeedsCompilation": "yes",
       "Author": "Yihui Xie [aut, cre, cph] (ORCID: <https://orcid.org/0000-0003-0645-5666>, URL: https://yihui.org), Wush Wu [ctb], Daijiang Li [ctb], Xianying Tan [ctb], Salim Brüggemann [ctb] (ORCID: <https://orcid.org/0000-0002-5329-5987>), Christophe Dervieux [ctb]",
       "Maintainer": "Yihui Xie <xie@yihui.name>",
-      "Repository": "CRAN"
-    },
-    "xgboost": {
-      "Package": "xgboost",
-      "Version": "3.2.1.1",
-      "Source": "Repository",
-      "Type": "Package",
-      "Title": "Extreme Gradient Boosting",
-      "Date": "2026-03-18",
-      "Authors@R": "c( person(\"Tianqi\", \"Chen\", role = c(\"aut\"), email = \"tianqi.tchen@gmail.com\"), person(\"Tong\", \"He\", role = c(\"aut\"), email = \"hetong007@gmail.com\"), person(\"Michael\", \"Benesty\", role = c(\"aut\"), email = \"michael@benesty.fr\"), person(\"Vadim\", \"Khotilovich\", role = c(\"aut\"), email = \"khotilovich@gmail.com\"), person(\"Yuan\", \"Tang\", role = c(\"aut\"), email = \"terrytangyuan@gmail.com\", comment = c(ORCID = \"0000-0001-5243-233X\")), person(\"Hyunsu\", \"Cho\", role = c(\"aut\"), email = \"chohyu01@cs.washington.edu\"), person(\"Kailong\", \"Chen\", role = c(\"aut\")), person(\"Rory\", \"Mitchell\", role = c(\"aut\")), person(\"Ignacio\", \"Cano\", role = c(\"aut\")), person(\"Tianyi\", \"Zhou\", role = c(\"aut\")), person(\"Mu\", \"Li\", role = c(\"aut\")), person(\"Junyuan\", \"Xie\", role = c(\"aut\")), person(\"Min\", \"Lin\", role = c(\"aut\")), person(\"Yifeng\", \"Geng\", role = c(\"aut\")), person(\"Yutian\", \"Li\", role = c(\"aut\")), person(\"Jiaming\", \"Yuan\", role = c(\"aut\", \"cre\"), email = \"jm.yuan@outlook.com\"), person(\"David\", \"Cortes\", role = c(\"aut\")), person(\"XGBoost contributors\", role = c(\"cph\"), comment = \"base XGBoost implementation\") )",
-      "Maintainer": "Jiaming Yuan <jm.yuan@outlook.com>",
-      "Description": "Extreme Gradient Boosting, which is an efficient implementation of the gradient boosting framework from Chen & Guestrin (2016) <doi:10.1145/2939672.2939785>. This package is its R interface. The package includes efficient linear model solver and tree learning algorithms. The package can automatically do parallel computation on a single machine which could be more than 10 times faster than existing gradient boosting packages. It supports various objective functions, including regression, classification and ranking. The package is made to be extensible, so that users are also allowed to define their own objectives easily.",
-      "License": "Apache License (== 2.0) | file LICENSE",
-      "URL": "https://github.com/dmlc/xgboost",
-      "BugReports": "https://github.com/dmlc/xgboost/issues",
-      "NeedsCompilation": "yes",
-      "VignetteBuilder": "knitr",
-      "Suggests": [
-        "knitr",
-        "rmarkdown",
-        "ggplot2 (>= 1.0.1)",
-        "DiagrammeR (>= 0.9.0)",
-        "DiagrammeRsvg",
-        "rsvg",
-        "htmlwidgets",
-        "Ckmeans.1d.dp (>= 3.3.1)",
-        "vcd (>= 1.3)",
-        "testthat",
-        "igraph (>= 1.0.1)",
-        "float",
-        "titanic",
-        "RhpcBLASctl",
-        "survival"
-      ],
-      "Depends": [
-        "R (>= 4.3.0)"
-      ],
-      "Imports": [
-        "Matrix (>= 1.1-0)",
-        "methods",
-        "data.table (>= 1.9.6)",
-        "jsonlite (>= 1.0)"
-      ],
-      "RoxygenNote": "7.3.3",
-      "Encoding": "UTF-8",
-      "SystemRequirements": "GNU make, C++17",
-      "Author": "Tianqi Chen [aut], Tong He [aut], Michael Benesty [aut], Vadim Khotilovich [aut], Yuan Tang [aut] (ORCID: <https://orcid.org/0000-0001-5243-233X>), Hyunsu Cho [aut], Kailong Chen [aut], Rory Mitchell [aut], Ignacio Cano [aut], Tianyi Zhou [aut], Mu Li [aut], Junyuan Xie [aut], Min Lin [aut], Yifeng Geng [aut], Yutian Li [aut], Jiaming Yuan [aut, cre], David Cortes [aut], XGBoost contributors [cph] (base XGBoost implementation)",
       "Repository": "CRAN"
     },
     "xtable": {

@@ -30,8 +30,10 @@ function(ibex_silence_external_target target_name)
     get_target_property(_ibex_target_type "${target_name}" TYPE)
     if(_ibex_target_type AND NOT _ibex_target_type STREQUAL "INTERFACE_LIBRARY")
         target_compile_options("${target_name}" PRIVATE
-            $<$<COMPILE_LANGUAGE:C>:-w>
-            $<$<COMPILE_LANGUAGE:CXX>:-w>
+            $<$<AND:$<COMPILE_LANGUAGE:C>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-w>
+            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-w>
+            $<$<AND:$<COMPILE_LANGUAGE:C>,$<CXX_COMPILER_ID:MSVC>>:/w>
+            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/w>
         )
     endif()
 endfunction()

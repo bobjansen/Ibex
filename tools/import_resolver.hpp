@@ -19,7 +19,12 @@ inline auto split_path_list(const std::string& raw) -> std::vector<std::filesyst
     std::vector<std::filesystem::path> out;
     std::size_t start = 0;
     while (start <= raw.size()) {
-        std::size_t end = raw.find(':', start);
+#ifdef _WIN32
+        constexpr char kPathSep = ';';
+#else
+        constexpr char kPathSep = ':';
+#endif
+        std::size_t end = raw.find(kPathSep, start);
         if (end == std::string::npos) {
             end = raw.size();
         }

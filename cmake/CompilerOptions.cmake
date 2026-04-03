@@ -54,27 +54,37 @@ target_compile_options(ibex_compiler_options
         >
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-deprecated-builtins>
         $<$<CXX_COMPILER_ID:GNU>:-Wno-null-dereference>
+        $<$<CXX_COMPILER_ID:MSVC>:
+            /W4
+            /permissive-
+            /utf-8
+            /Zc:__cplusplus
+            /EHsc
+        >
 )
 
 if(IBEX_WARNINGS_AS_ERRORS)
     target_compile_options(ibex_compiler_options
         INTERFACE
             $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-Werror>
+            $<$<CXX_COMPILER_ID:MSVC>:/WX>
     )
 endif()
 
 # Release optimizations
 target_compile_options(ibex_compiler_options
     INTERFACE
-        $<$<CONFIG:Release>:-O3 -DNDEBUG>
-        $<$<CONFIG:Debug>:-O0 -g>
+        $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-O3 -DNDEBUG>
+        $<$<AND:$<CONFIG:Debug>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-O0 -g>
+        $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:MSVC>>:/O2 /DNDEBUG>
+        $<$<AND:$<CONFIG:Debug>,$<CXX_COMPILER_ID:MSVC>>:/Od /Zi>
 )
 
 # Optional -march=native
 if(IBEX_ENABLE_MARCH_NATIVE)
     target_compile_options(ibex_compiler_options
         INTERFACE
-            $<$<CONFIG:Release>:-march=native>
+            $<$<AND:$<CONFIG:Release>,$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-march=native>
     )
 endif()
 

@@ -240,8 +240,8 @@ auto flip_cmp(ir::CompareOp op) -> ir::CompareOp {
 
 // Element-wise arithmetic: result type = common_type<L, R>.
 template <typename L, typename R>
-auto arith_into(ir::ArithmeticOp op, const L* __restrict__ lp, const R* __restrict__ rp,
-                std::common_type_t<L, R>* __restrict__ dp, std::size_t n) -> void {
+auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict rp,
+                std::common_type_t<L, R>* __restrict dp, std::size_t n) -> void {
     using Out = std::common_type_t<L, R>;
     switch (op) {
         case ir::ArithmeticOp::Add:
@@ -313,8 +313,8 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& r
 // Element-wise comparison between a column and a scalar literal.
 // The scalar is hoisted out of the loop — no broadcast allocation.
 template <typename ColT, typename LitT>
-auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict__ cp, LitT rv,
-                         uint8_t* __restrict__ mp, std::size_t n) -> void {
+auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict cp, LitT rv,
+                         uint8_t* __restrict mp, std::size_t n) -> void {
     using Common = std::common_type_t<ColT, LitT>;
     const Common crv = static_cast<Common>(rv);
     switch (op) {
@@ -346,8 +346,8 @@ auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict__ cp, LitT rv,
 }
 
 template <ir::CompareOp Op>
-auto cmp_col_scalar_into_double_op(const double* __restrict__ cp, double rv,
-                                   uint8_t* __restrict__ mp, std::size_t n) -> void {
+auto cmp_col_scalar_into_double_op(const double* __restrict cp, double rv, uint8_t* __restrict mp,
+                                   std::size_t n) -> void {
     if constexpr (Op == ir::CompareOp::Eq) {
         for (std::size_t i = 0; i < n; ++i)
             mp[i] = cp[i] == rv;
@@ -369,8 +369,8 @@ auto cmp_col_scalar_into_double_op(const double* __restrict__ cp, double rv,
     }
 }
 
-auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict__ cp, double rv,
-                                uint8_t* __restrict__ mp, std::size_t n) -> void {
+auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, double rv,
+                                uint8_t* __restrict mp, std::size_t n) -> void {
     switch (op) {
         case ir::CompareOp::Eq:
             cmp_col_scalar_into_double_op<ir::CompareOp::Eq>(cp, rv, mp, n);
@@ -711,8 +711,8 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
 
 // Element-wise comparison between two full columns.
 template <typename L, typename R>
-auto cmp_into(ir::CompareOp op, const L* __restrict__ lp, const R* __restrict__ rp,
-              uint8_t* __restrict__ mp, std::size_t n) -> void {
+auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restrict rp,
+              uint8_t* __restrict mp, std::size_t n) -> void {
     using Common = std::common_type_t<L, R>;
     switch (op) {
         case ir::CompareOp::Eq:
@@ -1040,8 +1040,8 @@ auto cmp_eval(L lhs, R rhs) -> uint8_t {
 
 template <ir::CompareOp LOp, ir::CompareOp ROp, bool UseAnd, typename L, typename LLit, typename R,
           typename RLit>
-auto cmp_pair_mask(const L* __restrict__ lhs_data, LLit lhs_lit, const R* __restrict__ rhs_data,
-                   RLit rhs_lit, uint8_t* __restrict__ out, std::size_t n) -> void {
+auto cmp_pair_mask(const L* __restrict lhs_data, LLit lhs_lit, const R* __restrict rhs_data,
+                   RLit rhs_lit, uint8_t* __restrict out, std::size_t n) -> void {
     for (std::size_t i = 0; i < n; ++i) {
         const uint8_t l = cmp_eval<LOp>(lhs_data[i], lhs_lit);
         const uint8_t r = cmp_eval<ROp>(rhs_data[i], rhs_lit);

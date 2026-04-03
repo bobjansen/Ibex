@@ -46,17 +46,17 @@ void reseed(std::uint64_t seed) noexcept;
 
 // ─── Bulk fills: double output (delegate to zorro::Rng) ──────────────────────
 
-void fill_uniform(double* __restrict__ out, std::size_t rows, double low, double high) noexcept;
+void fill_uniform(double* __restrict out, std::size_t rows, double low, double high) noexcept;
 
-void fill_normal(double* __restrict__ out, std::size_t rows, double mean, double stddev) noexcept;
+void fill_normal(double* __restrict out, std::size_t rows, double mean, double stddev) noexcept;
 
-void fill_exponential(double* __restrict__ out, std::size_t rows, double lambda) noexcept;
+void fill_exponential(double* __restrict out, std::size_t rows, double lambda) noexcept;
 
 // ─── Bulk fills: int64 output (zorro has no int64 bernoulli/int) ─────────────
 
-void fill_bernoulli(std::int64_t* __restrict__ out, std::size_t rows, double p) noexcept;
+void fill_bernoulli(std::int64_t* __restrict out, std::size_t rows, double p) noexcept;
 
-void fill_int(std::int64_t* __restrict__ out, std::size_t rows, std::int64_t lo,
+void fill_int(std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
               std::uint64_t span) noexcept;
 
 }  // namespace ibex::runtime

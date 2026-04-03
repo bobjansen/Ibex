@@ -18,17 +18,6 @@ auto first_of(const std::vector<Token>& tokens, TokenKind kind) -> const Token* 
     return nullptr;
 }
 
-// Helper: count tokens of a given kind (excluding Eof).
-auto count_kind(const std::vector<Token>& tokens, TokenKind kind) -> std::size_t {
-    std::size_t n = 0;
-    for (const auto& t : tokens) {
-        if (t.kind == kind) {
-            ++n;
-        }
-    }
-    return n;
-}
-
 }  // namespace
 
 // ─── Empty and minimal input ─────────────────────────────────────────────────

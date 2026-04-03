@@ -65,4 +65,12 @@ auto release_arrow_array(ArrowArray* array) noexcept -> void;
                                          ArrowArray* out_array, ArrowSchema* out_schema)
     -> std::expected<void, std::string>;
 
+/// Import an Arrow C Data struct array plus schema as an Ibex table.
+///
+/// The importer currently supports the Arrow layouts Ibex exports itself:
+/// int64, double, bool, utf8, dictionary-encoded utf8 categoricals, Date, and
+/// Timestamp, plus top-level table metadata for time index and ordering.
+[[nodiscard]] auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)
+    -> std::expected<runtime::Table, std::string>;
+
 }  // namespace ibex::interop

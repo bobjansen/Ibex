@@ -8,6 +8,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <cmath>
+#include <cstring>
 #include <dlfcn.h>
 #include <expected>
 #include <filesystem>
@@ -425,8 +426,58 @@ auto build_column_from_r_vector(const std::string& name, SEXP column_sexp) -> st
 
 auto build_runtime_table_from_r(SEXP table_obj)
     -> std::expected<ibex::runtime::Table, std::string> {
+    if (TYPEOF(table_obj) == EXTPTRSXP && Rf_inherits(table_obj, "nanoarrow_array")) {
+        SEXP schema_obj = Rf_getAttrib(table_obj, Rf_install("schema_xptr"));
+        if (schema_obj == R_NilValue) {
+            schema_obj = Rf_getAttrib(table_obj, Rf_install("schema"));
+        }
+        if (TYPEOF(schema_obj) != EXTPTRSXP) {
+            return std::unexpected(
+                "unsupported nanoarrow table binding; expected a schema_xptr attribute");
+        }
+
+        auto* array = static_cast<ArrowArray*>(R_ExternalPtrAddr(table_obj));
+        auto* schema = static_cast<ArrowSchema*>(R_ExternalPtrAddr(schema_obj));
+        if (array == nullptr || schema == nullptr) {
+            return std::unexpected("invalid nanoarrow table binding");
+        }
+
+        return ibex::interop::import_table_from_arrow(*array, *schema);
+    }
+
+    if (TYPEOF(table_obj) == VECSXP) {
+        SEXP names = Rf_getAttrib(table_obj, R_NamesSymbol);
+        if (TYPEOF(names) == STRSXP && XLENGTH(table_obj) == 2) {
+            int array_idx = -1;
+            int schema_idx = -1;
+            for (R_xlen_t i = 0; i < XLENGTH(table_obj); ++i) {
+                const auto* name = CHAR(STRING_ELT(names, i));
+                if (std::strcmp(name, "array") == 0) {
+                    array_idx = static_cast<int>(i);
+                } else if (std::strcmp(name, "schema") == 0) {
+                    schema_idx = static_cast<int>(i);
+                }
+            }
+            if (array_idx >= 0 && schema_idx >= 0) {
+                SEXP array_obj = VECTOR_ELT(table_obj, array_idx);
+                SEXP schema_obj = VECTOR_ELT(table_obj, schema_idx);
+                if (TYPEOF(array_obj) != EXTPTRSXP || TYPEOF(schema_obj) != EXTPTRSXP) {
+                    return std::unexpected(
+                        "Arrow payload table binding requires externalptr array and schema");
+                }
+                auto* array = static_cast<ArrowArray*>(R_ExternalPtrAddr(array_obj));
+                auto* schema = static_cast<ArrowSchema*>(R_ExternalPtrAddr(schema_obj));
+                if (array == nullptr || schema == nullptr) {
+                    return std::unexpected("invalid Arrow payload table binding");
+                }
+                return ibex::interop::import_table_from_arrow(*array, *schema);
+            }
+        }
+    }
+
     if (!Rf_inherits(table_obj, "data.frame")) {
-        return std::unexpected("unsupported table binding object; expected data.frame");
+        return std::unexpected(
+            "unsupported table binding object; expected data.frame or nanoarrow_array");
     }
 
     ibex::runtime::Table table;
@@ -466,7 +517,8 @@ auto build_table_registry_from_r(SEXP tables_sexp)
         return registry;
     }
     if (TYPEOF(tables_sexp) != VECSXP) {
-        return std::unexpected("'tables' must be a named list from name to data.frame");
+        return std::unexpected(
+            "'tables' must be a named list from name to data.frame or nanoarrow_array");
     }
 
     SEXP names = Rf_getAttrib(tables_sexp, R_NamesSymbol);

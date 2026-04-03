@@ -10,6 +10,9 @@ Current shape:
 - `register_knitr_engines()` adds a `{ibex}` knitr engine for R Markdown.
 - `knitr_session(name)` returns the named engine-backed session for mixed R / Ibex notebooks.
 - `tables = list(name = data.frame(...))` binds R tables into Ibex by copy.
+- `tables = list(name = nanoarrow_array)` binds Arrow-backed tables through the
+  Arrow C Data Interface, and other Arrow-ish R objects are normalized through
+  `nanoarrow` when possible.
 - `scalars = list(x = 1L, flag = TRUE, day = as.Date(...), ts = as.POSIXct(...))`
   binds R scalars into Ibex by copy.
 - results return as a `data.frame` by default for immediate `ggplot2` use

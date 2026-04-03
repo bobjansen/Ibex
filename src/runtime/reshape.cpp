@@ -997,7 +997,8 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 } else if constexpr (std::is_same_v<T, Column<Timestamp>>) {
                     return c[r].nanos;
                 } else {
-                    return kNullKey;
+                    // gcc doesn't like kNullKey here as it is not captured.
+                    return std::numeric_limits<std::int64_t>::min();
                 }
             },
             *input.columns[ki].column);

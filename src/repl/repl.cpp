@@ -885,7 +885,7 @@ std::size_t parse_optional_size(std::string_view text, std::size_t default_value
         return default_value;
     }
     std::size_t value = 0;
-    auto result = std::from_chars(text.begin(), text.end(), value);
+    auto result = std::from_chars(text.data(), text.data() + text.size(), value);
     if (result.ec != std::errc()) {
         return default_value;
     }

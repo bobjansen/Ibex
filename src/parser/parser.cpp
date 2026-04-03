@@ -1889,7 +1889,7 @@ class Parser {
 
     static auto parse_int(std::string_view text) -> std::optional<std::int64_t> {
         std::int64_t value = 0;
-        auto result = std::from_chars(text.begin(), text.end(), value);
+        auto result = std::from_chars(text.data(), text.data() + text.size(), value);
         if (result.ec != std::errc()) {
             return std::nullopt;
         }

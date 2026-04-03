@@ -61,6 +61,7 @@ target_compile_options(ibex_compiler_options
             /Zc:__cplusplus
             /EHsc
             /wd4189
+            /wd4324
             /wd4702
             /D_CRT_SECURE_NO_WARNINGS
         >

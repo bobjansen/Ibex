@@ -114,6 +114,11 @@ set(BOOST_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(arrow)
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
 
+# Bundled thrift uses deprecated std::iterator; suppress the warning on its target.
+if(TARGET thrift)
+    target_compile_options(thrift PRIVATE -Wno-deprecated-declarations)
+endif()
+
 add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
 target_compile_options(ibex_parquet_plugin

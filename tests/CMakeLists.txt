@@ -62,7 +62,8 @@ endif()
 # but suppress this one test-framework-specific diagnostic after those flags.
 target_compile_options(ibex_test_warning_suppressions
     INTERFACE
-        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-c2y-extensions>
+        $<$<CXX_COMPILER_ID:Clang>:-Wno-c2y-extensions>
+        $<$<CXX_COMPILER_ID:AppleClang>:-Wno-c2x-extensions>
 )
 
 catch_discover_tests(ibex_tests)

@@ -29,8 +29,9 @@
 // iterations can still reuse pages, but do not retain them indefinitely across
 // benchmark cases.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-extern "C" const char* malloc_conf =
-    "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000";
+extern "C" {
+const char* malloc_conf = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000";
+}
 
 #include <algorithm>
 #include <cctype>

@@ -14,7 +14,9 @@
 // subsequent iterations reuse physical pages at full DRAM bandwidth.
 // jemalloc reads this symbol during its C++ static-init phase, before main().
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-extern "C" const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
+extern "C" {
+const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
+}
 
 #include <algorithm>
 #include <cctype>

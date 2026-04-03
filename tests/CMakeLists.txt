@@ -76,7 +76,13 @@ target_compile_options(ibex_test_warning_suppressions
         $<$<CXX_COMPILER_ID:MSVC>:/wd4459>
 )
 
-catch_discover_tests(ibex_tests)
+if(WIN32)
+    # Use PRE_TEST discovery on Windows to avoid codepage issues with
+    # UTF-8 test names (em-dashes, arrows) during POST_BUILD discovery.
+    catch_discover_tests(ibex_tests DISCOVERY_MODE PRE_TEST)
+else()
+    catch_discover_tests(ibex_tests)
+endif()
 
 if(IBEX_COVERAGE)
     ibex_add_coverage_target(ibex_tests)

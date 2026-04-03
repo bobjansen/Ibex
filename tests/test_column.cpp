@@ -113,7 +113,7 @@ TEST_CASE("Column<bool> supports mutation and resize", "[core][column][bool]") {
     REQUIRE(col[69] == false);
 }
 
-// ─── Column<std::string> flat-buffer specialization ─────────────────────────
+// --- Column<std::string> flat-buffer specialization -------------------------
 
 TEST_CASE("Column<string> default-constructs empty", "[core][column][string]") {
     ibex::Column<std::string> col;
@@ -195,7 +195,7 @@ TEST_CASE("Column<string> resize fills with value", "[core][column][string]") {
     REQUIRE(col[2] == "x");
 }
 
-// ─── Column<Categorical> dictionary-encoded strings ─────────────────────────
+// --- Column<Categorical> dictionary-encoded strings -------------------------
 
 TEST_CASE("Categorical default-constructs empty", "[core][column][categorical]") {
     ibex::Column<ibex::Categorical> col;
@@ -267,7 +267,7 @@ TEST_CASE("Categorical dictionary stores unique values", "[core][column][categor
     REQUIRE(col.size() == 5);
 }
 
-// ─── Column<int> additional operations ──────────────────────────────────────
+// --- Column<int> additional operations --------------------------------------
 
 TEST_CASE("Column<int> front and back", "[core][column]") {
     ibex::Column<int> col{10, 20, 30};

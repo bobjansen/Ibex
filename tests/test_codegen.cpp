@@ -34,7 +34,7 @@ static auto make_source(ir::Builder& b, std::string_view path) -> ir::NodePtr {
     return b.extern_call("read_csv", {ir::Expr{ir::Literal{std::string(path)}}});
 }
 
-// ─── ExternCall ───────────────────────────────────────────────────────────────
+// --- ExternCall ---------------------------------------------------------------
 
 TEST_CASE("emitter: extern call node", "[codegen]") {
     ir::Builder b;
@@ -48,9 +48,9 @@ TEST_CASE("emitter: extern call node", "[codegen]") {
     CHECK(contains(out, "return 0;"));
 }
 
-// ─── Filter ──────────────────────────────────────────────────────────────────
+// --- Filter ------------------------------------------------------------------
 
-TEST_CASE("emitter: filter node — int64 predicate", "[codegen]") {
+TEST_CASE("emitter: filter node - int64 predicate", "[codegen]") {
     ir::Builder b;
     auto filter = b.filter(
         ops::filter_cmp(ir::CompareOp::Gt, ops::filter_col("price"), ops::filter_int(100)));
@@ -63,7 +63,7 @@ TEST_CASE("emitter: filter node — int64 predicate", "[codegen]") {
     CHECK(contains(out, "std::int64_t{100}"));
 }
 
-TEST_CASE("emitter: filter node — double predicate", "[codegen]") {
+TEST_CASE("emitter: filter node - double predicate", "[codegen]") {
     ir::Builder b;
     auto filter = b.filter(
         ops::filter_cmp(ir::CompareOp::Le, ops::filter_col("ratio"), ops::filter_dbl(0.5)));
@@ -74,7 +74,7 @@ TEST_CASE("emitter: filter node — double predicate", "[codegen]") {
     CHECK(contains(out, "0.5"));
 }
 
-TEST_CASE("emitter: filter node — string predicate", "[codegen]") {
+TEST_CASE("emitter: filter node - string predicate", "[codegen]") {
     ir::Builder b;
     auto filter = b.filter(
         ops::filter_cmp(ir::CompareOp::Eq, ops::filter_col("symbol"), ops::filter_str("AAPL")));
@@ -85,7 +85,7 @@ TEST_CASE("emitter: filter node — string predicate", "[codegen]") {
     CHECK(contains(out, "\"AAPL\""));
 }
 
-TEST_CASE("emitter: filter node — AND compound predicate", "[codegen]") {
+TEST_CASE("emitter: filter node - AND compound predicate", "[codegen]") {
     ir::Builder b;
     // price > 10 && qty < 5
     auto filter = b.filter(ops::filter_and(
@@ -99,7 +99,7 @@ TEST_CASE("emitter: filter node — AND compound predicate", "[codegen]") {
     CHECK(contains(out, "ibex::ir::CompareOp::Lt"));
 }
 
-TEST_CASE("emitter: filter node — arithmetic in predicate", "[codegen]") {
+TEST_CASE("emitter: filter node - arithmetic in predicate", "[codegen]") {
     ir::Builder b;
     // price * 2 > 100
     auto filter = b.filter(ops::filter_cmp(
@@ -114,7 +114,7 @@ TEST_CASE("emitter: filter node — arithmetic in predicate", "[codegen]") {
     CHECK(contains(out, "ibex::ir::CompareOp::Gt"));
 }
 
-TEST_CASE("emitter: filter node — is null predicate", "[codegen]") {
+TEST_CASE("emitter: filter node - is null predicate", "[codegen]") {
     ir::Builder b;
     auto filter = b.filter(ops::filter_is_null(ops::filter_col("dept_name")));
     filter->add_child(make_source(b, "data.csv"));
@@ -124,7 +124,7 @@ TEST_CASE("emitter: filter node — is null predicate", "[codegen]") {
     CHECK(contains(out, "ibex::ops::filter_col(\"dept_name\")"));
 }
 
-TEST_CASE("emitter: filter node — is not null predicate", "[codegen]") {
+TEST_CASE("emitter: filter node - is not null predicate", "[codegen]") {
     ir::Builder b;
     auto filter = b.filter(ops::filter_is_not_null(ops::filter_col("dept_name")));
     filter->add_child(make_source(b, "data.csv"));
@@ -134,7 +134,7 @@ TEST_CASE("emitter: filter node — is not null predicate", "[codegen]") {
     CHECK(contains(out, "ibex::ops::filter_col(\"dept_name\")"));
 }
 
-// ─── Project ─────────────────────────────────────────────────────────────────
+// --- Project -----------------------------------------------------------------
 
 TEST_CASE("emitter: project node", "[codegen]") {
     ir::Builder b;
@@ -167,7 +167,7 @@ TEST_CASE("emitter: order node", "[codegen]") {
     CHECK(contains(out, "OrderKey{\"symbol\", false}"));
 }
 
-// ─── Aggregate ───────────────────────────────────────────────────────────────
+// --- Aggregate ---------------------------------------------------------------
 
 TEST_CASE("emitter: aggregate node", "[codegen]") {
     ir::Builder b;
@@ -199,9 +199,9 @@ TEST_CASE("emitter: aggregate node with parameterized function", "[codegen]") {
     CHECK(contains(out, ", 0.5)"));
 }
 
-// ─── Resample ────────────────────────────────────────────────────────────────
+// --- Resample ----------------------------------------------------------------
 
-TEST_CASE("emitter: resample node — OHLC with group-by", "[codegen]") {
+TEST_CASE("emitter: resample node - OHLC with group-by", "[codegen]") {
     ir::Builder b;
     // 1-minute bucket (60 * 10^9 ns), group by symbol, 4 aggs
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
@@ -225,7 +225,7 @@ TEST_CASE("emitter: resample node — OHLC with group-by", "[codegen]") {
     CHECK(contains(out, "ibex::ops::make_agg("));
 }
 
-TEST_CASE("emitter: resample node — no group-by", "[codegen]") {
+TEST_CASE("emitter: resample node - no group-by", "[codegen]") {
     ir::Builder b;
     constexpr std::int64_t hour_ns = 3600LL * 1'000'000'000LL;
     auto rs = b.resample(ir::Duration(hour_ns), {},
@@ -239,7 +239,7 @@ TEST_CASE("emitter: resample node — no group-by", "[codegen]") {
     CHECK(contains(out, "\"avg\""));
 }
 
-// ─── AsTimeframe ─────────────────────────────────────────────────────────────
+// --- AsTimeframe -------------------------------------------------------------
 
 TEST_CASE("emitter: as_timeframe node", "[codegen]") {
     ir::Builder b;
@@ -251,9 +251,9 @@ TEST_CASE("emitter: as_timeframe node", "[codegen]") {
     CHECK(contains(out, "\"ts\""));
 }
 
-// ─── Window ──────────────────────────────────────────────────────────────────
+// --- Window ------------------------------------------------------------------
 
-TEST_CASE("emitter: window node — rolling sum", "[codegen]") {
+TEST_CASE("emitter: window node - rolling sum", "[codegen]") {
     ir::Builder b;
     // tf[window 1m, update { s = rolling_sum(price) }]
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
@@ -274,7 +274,7 @@ TEST_CASE("emitter: window node — rolling sum", "[codegen]") {
     CHECK(contains(out, "ibex::ops::make_field("));
 }
 
-TEST_CASE("emitter: window node — multiple rolling ops", "[codegen]") {
+TEST_CASE("emitter: window node - multiple rolling ops", "[codegen]") {
     ir::Builder b;
     constexpr std::int64_t min5_ns = 300LL * 1'000'000'000LL;
     auto price_arg = std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{.name = "price"}});
@@ -297,9 +297,9 @@ TEST_CASE("emitter: window node — multiple rolling ops", "[codegen]") {
     CHECK(contains(out, "rolling_mean"));
 }
 
-// ─── Update ──────────────────────────────────────────────────────────────────
+// --- Update ------------------------------------------------------------------
 
-TEST_CASE("emitter: update node — simple expression", "[codegen]") {
+TEST_CASE("emitter: update node - simple expression", "[codegen]") {
     ir::Builder b;
 
     // mid = (bid + ask) / 2.0
@@ -325,7 +325,7 @@ TEST_CASE("emitter: update node — simple expression", "[codegen]") {
     CHECK(contains(out, "ibex::ops::dbl_lit(2.0)"));
 }
 
-TEST_CASE("emitter: update node — literal types", "[codegen]") {
+TEST_CASE("emitter: update node - literal types", "[codegen]") {
     ir::Builder b;
 
     ir::FieldSpec f1{"label", ir::Expr{ir::Literal{std::string{"hello"}}}};
@@ -353,7 +353,7 @@ TEST_CASE("emitter: malformed update node does not crash", "[codegen]") {
     REQUIRE_THROWS(emit_to_string(*upd));
 }
 
-TEST_CASE("emitter: update node — tuple sources and by keys", "[codegen]") {
+TEST_CASE("emitter: update node - tuple sources and by keys", "[codegen]") {
     ir::Builder b;
     std::vector<ir::TupleFieldSpec> tuple_fields;
     tuple_fields.push_back(ir::TupleFieldSpec{
@@ -387,7 +387,7 @@ TEST_CASE("emitter: call expression preserves named args", "[codegen]") {
     CHECK(contains(out, "ibex::ops::NamedArgExpr{\"times\""));
 }
 
-// ─── Chained pipeline ────────────────────────────────────────────────────────
+// --- Chained pipeline --------------------------------------------------------
 
 TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     ir::Builder b;
@@ -407,9 +407,9 @@ TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     CHECK(pos_filter < pos_proj);
 }
 
-// ─── Join ────────────────────────────────────────────────────────────────────
+// --- Join --------------------------------------------------------------------
 
-TEST_CASE("emitter: join node — inner join", "[codegen]") {
+TEST_CASE("emitter: join node - inner join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -422,7 +422,7 @@ TEST_CASE("emitter: join node — inner join", "[codegen]") {
     CHECK(contains(out, "\"id\""));
 }
 
-TEST_CASE("emitter: join node — right join", "[codegen]") {
+TEST_CASE("emitter: join node - right join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -434,7 +434,7 @@ TEST_CASE("emitter: join node — right join", "[codegen]") {
     CHECK(contains(out, "ibex::ops::right_join("));
 }
 
-TEST_CASE("emitter: join node — outer join", "[codegen]") {
+TEST_CASE("emitter: join node - outer join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -445,7 +445,7 @@ TEST_CASE("emitter: join node — outer join", "[codegen]") {
     auto out = emit_to_string(*join);
     CHECK(contains(out, "ibex::ops::outer_join("));
 }
-TEST_CASE("emitter: join node — semi join", "[codegen]") {
+TEST_CASE("emitter: join node - semi join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -457,7 +457,7 @@ TEST_CASE("emitter: join node — semi join", "[codegen]") {
     CHECK(contains(out, "ibex::ops::semi_join("));
 }
 
-TEST_CASE("emitter: join node — anti join", "[codegen]") {
+TEST_CASE("emitter: join node - anti join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -469,7 +469,7 @@ TEST_CASE("emitter: join node — anti join", "[codegen]") {
     CHECK(contains(out, "ibex::ops::anti_join("));
 }
 
-TEST_CASE("emitter: join node — cross join", "[codegen]") {
+TEST_CASE("emitter: join node - cross join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -481,7 +481,7 @@ TEST_CASE("emitter: join node — cross join", "[codegen]") {
     CHECK(contains(out, "ibex::ops::cross_join("));
 }
 
-TEST_CASE("emitter: join node — asof join", "[codegen]") {
+TEST_CASE("emitter: join node - asof join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -495,7 +495,7 @@ TEST_CASE("emitter: join node — asof join", "[codegen]") {
     CHECK(contains(out, "\"symbol\""));
 }
 
-TEST_CASE("emitter: join node — non-equijoin predicate", "[codegen]") {
+TEST_CASE("emitter: join node - non-equijoin predicate", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");
     auto right = make_source(b, "right.csv");
@@ -509,7 +509,7 @@ TEST_CASE("emitter: join node — non-equijoin predicate", "[codegen]") {
     CHECK(contains(out, "ibex::ir::JoinKind::Inner"));
 }
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// --- Config ------------------------------------------------------------------
 
 TEST_CASE("emitter: extern headers in config", "[codegen]") {
     ir::Builder b;
@@ -525,7 +525,7 @@ TEST_CASE("emitter: extern headers in config", "[codegen]") {
     CHECK(contains(out, "#include \"math_utils.hpp\""));
 }
 
-// ─── String escaping ─────────────────────────────────────────────────────────
+// --- String escaping ---------------------------------------------------------
 
 TEST_CASE("emitter: escape quotes in extern call arg", "[codegen]") {
     ir::Builder b;

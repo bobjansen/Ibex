@@ -723,7 +723,7 @@ TEST_CASE("Lexer error includes invalid numeric literal lexeme") {
     REQUIRE(result.error().message.find("1dfsd1") != std::string::npos);
 }
 
-// ─── Unary expressions ──────────────────────────────────────────────────────
+// --- Unary expressions ------------------------------------------------------
 
 TEST_CASE("Parse unary negation") {
     const char* source = "let x = -42;";
@@ -754,7 +754,7 @@ TEST_CASE("Parse logical NOT") {
     REQUIRE(unary->op == UnaryOp::Not);
 }
 
-// ─── Boolean literals ────────────────────────────────────────────────────────
+// --- Boolean literals --------------------------------------------------------
 
 TEST_CASE("Parse boolean true literal") {
     const char* source = "let x = true;";
@@ -778,7 +778,7 @@ TEST_CASE("Parse boolean false literal") {
     REQUIRE(std::get<bool>(lit.value) == false);
 }
 
-// ─── Float literals ──────────────────────────────────────────────────────────
+// --- Float literals ----------------------------------------------------------
 
 TEST_CASE("Parse float literal in expression") {
     const char* source = "let x = 3.14;";
@@ -791,7 +791,7 @@ TEST_CASE("Parse float literal in expression") {
     REQUIRE(std::get<double>(lit.value) == Catch::Approx(3.14));
 }
 
-// ─── String literal ──────────────────────────────────────────────────────────
+// --- String literal ----------------------------------------------------------
 
 TEST_CASE("Parse string literal") {
     const char* source = R"(let x = "hello world";)";
@@ -804,7 +804,7 @@ TEST_CASE("Parse string literal") {
     REQUIRE(std::get<std::string>(lit.value) == "hello world");
 }
 
-// ─── Rename clause ───────────────────────────────────────────────────────────
+// --- Rename clause -----------------------------------------------------------
 
 TEST_CASE("Parse rename clause with braces") {
     const char* source = "df[rename { cost = price, amount = qty }];";
@@ -837,7 +837,7 @@ TEST_CASE("Parse rename clause without braces") {
     REQUIRE(rename.fields[0].name == "cost");
 }
 
-// ─── Resample clause ─────────────────────────────────────────────────────────
+// --- Resample clause ---------------------------------------------------------
 
 TEST_CASE("Parse resample clause") {
     const char* source = "tf[resample 1m, select { symbol, open = first(price) }, by symbol];";
@@ -853,7 +853,7 @@ TEST_CASE("Parse resample clause") {
     REQUIRE(resample.duration.text == "1m");
 }
 
-// ─── Import declaration ─────────────────────────────────────────────────────
+// --- Import declaration -----------------------------------------------------
 
 TEST_CASE("Parse import declaration with identifier") {
     const char* source = "import csv;";
@@ -875,7 +875,7 @@ TEST_CASE("Parse import declaration with string") {
     REQUIRE(import.name == "parquet");
 }
 
-// ─── Multiple statements ────────────────────────────────────────────────────
+// --- Multiple statements ----------------------------------------------------
 
 TEST_CASE("Parse multiple statements in sequence") {
     const char* source = R"(
@@ -891,7 +891,7 @@ foo(x, y);
     REQUIRE(std::holds_alternative<ExprStmt>(result->statements[2]));
 }
 
-// ─── Nested call expressions ─────────────────────────────────────────────────
+// --- Nested call expressions -------------------------------------------------
 
 TEST_CASE("Parse nested function calls") {
     const char* source = "foo(bar(1), baz(2, 3));";
@@ -909,7 +909,7 @@ TEST_CASE("Parse nested function calls") {
     REQUIRE(inner2.args.size() == 2);
 }
 
-// ─── Operator precedence ────────────────────────────────────────────────────
+// --- Operator precedence ----------------------------------------------------
 
 TEST_CASE("Parse comparison has lower precedence than arithmetic") {
     const char* source = "let x = a + b > c * d;";
@@ -957,7 +957,7 @@ TEST_CASE("Parse OR has lower precedence than AND") {
     require_binary(require_expr(or_expr.right), BinaryOp::And);
 }
 
-// ─── Parenthesized expressions ───────────────────────────────────────────────
+// --- Parenthesized expressions -----------------------------------------------
 
 TEST_CASE("Parse parenthesized expression overrides precedence") {
     const char* source = "let x = (1 + 2) * 3;";
@@ -971,7 +971,7 @@ TEST_CASE("Parse parenthesized expression overrides precedence") {
     REQUIRE(std::get<std::int64_t>(require_literal(require_expr(mul.right)).value) == 3);
 }
 
-// ─── Let binding without type annotation ─────────────────────────────────────
+// --- Let binding without type annotation -------------------------------------
 
 TEST_CASE("Parse let binding without type annotation") {
     const char* source = "let x = 42;";
@@ -984,7 +984,7 @@ TEST_CASE("Parse let binding without type annotation") {
     REQUIRE_FALSE(let_stmt.type.has_value());
 }
 
-// ─── More error cases ────────────────────────────────────────────────────────
+// --- More error cases --------------------------------------------------------
 
 TEST_CASE("Parse error for unmatched bracket") {
     auto result = parse("df[filter price > 10;");
@@ -1001,7 +1001,7 @@ TEST_CASE("Parse error for missing expression in let") {
     REQUIRE_FALSE(result.has_value());
 }
 
-// ─── Join expressions ────────────────────────────────────────────────────────
+// --- Join expressions --------------------------------------------------------
 
 TEST_CASE("Parse inner join") {
     const char* source = "a join b on id;";
@@ -1083,7 +1083,7 @@ TEST_CASE("Parse cross join") {
     REQUIRE(join.keys.empty());
 }
 
-// ─── All comparison operators parse correctly ────────────────────────────────
+// --- All comparison operators parse correctly --------------------------------
 
 TEST_CASE("Parse all comparison operators") {
     auto check = [](const char* source, BinaryOp expected) {
@@ -1102,7 +1102,7 @@ TEST_CASE("Parse all comparison operators") {
     check("let x = a >= b;", BinaryOp::Ge);
 }
 
-// ─── All arithmetic operators parse correctly ────────────────────────────────
+// --- All arithmetic operators parse correctly --------------------------------
 
 TEST_CASE("Parse all arithmetic operators") {
     auto check = [](const char* source, BinaryOp expected) {
@@ -1120,7 +1120,7 @@ TEST_CASE("Parse all arithmetic operators") {
     check("let x = a % b;", BinaryOp::Mod);
 }
 
-// ─── Tuple let (multi-column) assignment ─────────────────────────────────────
+// --- Tuple let (multi-column) assignment -------------------------------------
 
 TEST_CASE("Parse tuple let binding with two names") {
     const char* source = "let (a, b) = some_fn();";
@@ -1172,7 +1172,7 @@ TEST_CASE("Parse tuple let binding tracks source lines") {
     REQUIRE(tlet.end_line == 1);
 }
 
-// ─── Tuple-LHS in update/select clauses ──────────────────────────────────────
+// --- Tuple-LHS in update/select clauses --------------------------------------
 
 TEST_CASE("Parse tuple-LHS update with two names") {
     const char* source = "df[update { (colA, colB) = make_xy() }];";
@@ -1222,7 +1222,7 @@ TEST_CASE("Parse tuple-LHS select with three names") {
     REQUIRE(select.tuple_fields[0].names[2] == "r");
 }
 
-// ─── update = expr (merge-all) ───────────────────────────────────────────────
+// --- update = expr (merge-all) -----------------------------------------------
 
 TEST_CASE("Parse update = expr merge-all form") {
     const char* source = "df[update = gen_cols()];";

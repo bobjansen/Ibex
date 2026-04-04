@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux-x86_64
+            archive: ibex-linux-x86_64.tar.gz
+          - os: macos-14
+            name: macos-arm64
+            archive: ibex-macos-arm64.tar.gz
+          - os: windows-latest
+            name: windows-x86_64
+            archive: ibex-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 cmake ninja-build
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DCMAKE_INSTALL_PREFIX=dist \
+            -DIBEX_BUILD_TESTS=OFF \
+            -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_BUILD_EXAMPLES=OFF
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_INSTALL_PREFIX=dist \
+            -DIBEX_BUILD_TESTS=OFF \
+            -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_BUILD_EXAMPLES=OFF
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX=dist `
+            -DIBEX_BUILD_TESTS=OFF `
+            -DIBEX_BUILD_TOOLS=ON `
+            -DIBEX_BUILD_EXAMPLES=OFF `
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF `
+            -DIBEX_BUILD_PARQUET=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install
+        run: cmake --install build --config Release
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.archive }} -C dist/bin .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist\bin\* -DestinationPath ${{ matrix.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            linux-x86_64/ibex-linux-x86_64.tar.gz
+            macos-arm64/ibex-macos-arm64.tar.gz
+            windows-x86_64/ibex-windows-x86_64.zip

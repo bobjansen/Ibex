@@ -279,6 +279,24 @@ ggplot(summary, aes(Species, mean_sl)) +
 
       <div class="tour-item">
         <div class="tour-text">
+          <span class="tour-tag">CSV Options</span>
+          <h3>Read delimited files with or without headers.</h3>
+          <p>
+            The bundled CSV plugin supports custom delimiters and headerless
+            files. When <code>has_header</code> is <code>false</code>, Ibex
+            synthesizes column names <code>col1</code>, <code>col2</code>, and so on.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code>extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool) -&gt; DataFrame from "csv.hpp";
+
+let raw = read_csv("examples/measurements.txt", "", ";", false)
+    [select { station = col1, temp = col2 }];</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
           <span class="tour-tag">Compile-Time Map</span>
           <h3>Generate feature families without leaving Ibex.</h3>
           <p>

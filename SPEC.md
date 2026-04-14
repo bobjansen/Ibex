@@ -2262,7 +2262,7 @@ The bundled I/O plugins are:
 
 | Plugin | Reader | Writer | Format |
 |--------|--------|--------|--------|
-| `csv`  | `read_csv(path)` | `write_csv(df, path)` | RFC 4180 CSV |
+| `csv`  | `read_csv(path)` | `write_csv(df, path)` | RFC 4180 CSV, optional custom delimiter, optional no-header mode |
 | `json` | `read_json(path)` | `write_json(df, path)` | JSON array-of-objects / JSON-Lines |
 | `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet |
 
@@ -2275,6 +2275,18 @@ let iris = read_csv("iris.csv");
 
 `read_csv` infers column types from the input file (Int64, Float64, or String
 per column). The resulting schema is implementation-defined.
+
+The bundled CSV plugin also supports:
+
+```
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool)
+    -> DataFrame from "csv.hpp";
+```
+
+When `has_header` is `false`, the reader synthesizes numbered column names:
+`col1`, `col2`, `col3`, ...
 
 The JSON plugin supports three input formats:
 

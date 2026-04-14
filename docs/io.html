@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | CSV and Parquet I/O</title>
+  <meta name="description" content="CSV and Parquet input/output in Ibex: extern declarations, CSV options, schema hints, and round-trip examples." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Docs</a>
+      <a class="nav-link active" href="./io.html">I/O</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">I/O Guide</p>
+    <h1>CSV and Parquet I/O</h1>
+    <p class="lead">
+      Ibex keeps file I/O in plugins, not in core syntax. That means CSV and
+      Parquet read/write functions behave like normal <code>extern fn</code>
+      calls in scripts, the REPL, notebooks, and transpiled binaries.
+    </p>
+    <div class="cta-row">
+      <a class="button primary" href="./index.html">Back to docs</a>
+      <a class="button" href="./functions.html">Function reference</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Overview</p>
+    <h2>What ships today</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>CSV plugin</h3>
+        <p>
+          Read RFC 4180 CSV into a <code>DataFrame</code>, infer types, accept
+          custom null tokens, custom delimiters, headerless files, and optional
+          schema hints when you already know the column types.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Parquet plugin</h3>
+        <p>
+          Read and write Apache Parquet for typed batch storage. This is the
+          right default when you want a compact columnar format, better type
+          preservation, and faster reloads than CSV.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Import pattern</p>
+    <h2>Declare I/O with extern functions</h2>
+    <article class="card">
+      <p>
+        The common pattern is to declare the plugin entry points you use and
+        then treat them like any other function.
+      </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<span class="kw">extern fn</span> <span class="fn-name">write_csv</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="kw">extern fn</span> <span class="fn-name">read_parquet</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+<span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;</code></pre>
+    </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">CSV Input</p>
+    <h2>Read CSV with as much structure as you know</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Default CSV read</h3>
+        <p>
+          With just a path, Ibex reads the header row, infers
+          <code>Int64</code>, <code>Float64</code>, or string/categorical
+          columns, and returns a <code>DataFrame</code>.
+        </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);</code></pre>
+      </article>
+      <article class="card">
+        <h3>Null tokens</h3>
+        <p>
+          Pass a comma-separated null specification. <code>&lt;empty&gt;</code>
+          means empty fields should be treated as nulls too.
+        </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String, <span class="fn-name">nulls</span>: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="kw">let</span> train = <span class="fn-name">read_csv</span>(<span class="str">"train.csv"</span>, <span class="str">"&lt;empty&gt;,NA"</span>);</code></pre>
+      </article>
+    </div>
+
+    <div class="grid-2" style="margin-top:1rem;">
+      <article class="card">
+        <h3>Custom delimiter</h3>
+        <p>
+          This is useful for semicolon-separated files or other non-comma
+          dialects. Quoted commas are still preserved correctly.
+        </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
+    <span class="fn-name">path</span>: String,
+    <span class="fn-name">nulls</span>: String,
+    <span class="fn-name">delimiter</span>: String
+) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"quotes.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>);</code></pre>
+      </article>
+      <article class="card">
+        <h3>Headerless files</h3>
+        <p>
+          When <code>has_header</code> is <code>false</code>, Ibex synthesizes
+          <code>col1</code>, <code>col2</code>, and so on. This is what the
+          1BRC benchmark file uses.
+        </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
+    <span class="fn-name">path</span>: String,
+    <span class="fn-name">nulls</span>: String,
+    <span class="fn-name">delimiter</span>: String,
+    <span class="fn-name">has_header</span>: Bool
+) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>)
+    [<span class="kw">select</span> { station = col1, temp = col2 }];</code></pre>
+      </article>
+    </div>
+
+    <article class="card" style="margin-top:1rem;">
+      <h3>Schema hints</h3>
+      <p>
+        If you already know the CSV schema, pass it explicitly to skip most of
+        the inference work. For large repeated loads, this is the right shape.
+      </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
+    <span class="fn-name">path</span>: String,
+    <span class="fn-name">nulls</span>: String,
+    <span class="fn-name">delimiter</span>: String,
+    <span class="fn-name">has_header</span>: Bool,
+    <span class="fn-name">schema</span>: String
+) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="cm">// positional schema</span>
+<span class="kw">let</span> fast = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>);
+
+<span class="cm">// named schema</span>
+<span class="kw">let</span> typed = <span class="fn-name">read_csv</span>(<span class="str">"trades.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
+                          <span class="str">"symbol:cat,price:f64,size:i64"</span>);</code></pre>
+    </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">CSV Output</p>
+    <h2>Write CSV back out</h2>
+    <article class="card">
+      <p>
+        <code>write_csv</code> writes a header row plus all data rows and
+        returns the number of data rows written. Nulls become empty fields and
+        strings are quoted according to RFC 4180.
+      </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">write_csv</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+
+<span class="kw">let</span> summary = trades[
+    <span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(price), rows = <span class="fn-name">count</span>() },
+    <span class="kw">by</span> symbol,
+    <span class="kw">order</span> symbol
+];
+
+<span class="kw">let</span> n = <span class="fn-name">write_csv</span>(summary, <span class="str">"out/summary.csv"</span>);</code></pre>
+    </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Parquet</p>
+    <h2>Use Parquet for typed, columnar storage</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Read Parquet</h3>
+        <p>
+          Parquet is the cleaner choice when you control the data pipeline and
+          want strong type preservation, compact files, and faster reloads than
+          CSV.
+        </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_parquet</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+
+<span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);</code></pre>
+      </article>
+      <article class="card">
+        <h3>Write Parquet</h3>
+        <p>
+          <code>write_parquet</code> returns the number of rows written. String
+          and categorical columns are stored as UTF-8. Dates and timestamps are
+          preserved as typed Parquet columns.
+        </p>
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+
+<span class="kw">let</span> n = <span class="fn-name">write_parquet</span>(prices, <span class="str">"out/prices.parquet"</span>);</code></pre>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Round Trip</p>
+    <h2>Typical batch pipeline</h2>
+    <article class="card">
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
+    <span class="fn-name">path</span>: String,
+    <span class="fn-name">nulls</span>: String,
+    <span class="fn-name">delimiter</span>: String,
+    <span class="fn-name">has_header</span>: Bool,
+    <span class="fn-name">schema</span>: String
+) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
+    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+
+<span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>)
+    [<span class="kw">select</span> { station = col1, temp = col2 }];
+
+<span class="kw">let</span> summary = raw[<span class="kw">select</span> {
+    min_temp = <span class="fn-name">min</span>(temp),
+    avg_temp = <span class="fn-name">mean</span>(temp),
+    max_temp = <span class="fn-name">max</span>(temp)
+}, <span class="kw">by</span> station, <span class="kw">order</span> station];
+
+<span class="fn-name">write_parquet</span>(summary, <span class="str">"out/summary.parquet"</span>);</code></pre>
+    </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Practical Notes</p>
+    <h2>When to choose which format</h2>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Choose CSV when</h3>
+        <ul>
+          <li>You are ingesting raw files from outside systems.</li>
+          <li>You need human-readable interchange.</li>
+          <li>You need delimiter or headerless-file flexibility.</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3>Choose Parquet when</h3>
+        <ul>
+          <li>You control both ends of the pipeline.</li>
+          <li>You want better typed persistence and faster reloads.</li>
+          <li>You are caching a cleaned dataset for repeated analysis.</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span>Ibex - typed DataFrame pipelines</span>
+    <a href="./index.html">Back to docs</a>
+  </footer>
+
+</main>
+</body>
+</html>

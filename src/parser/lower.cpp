@@ -230,6 +230,128 @@ auto extract_string_list(const Expr& expr) -> std::optional<std::vector<std::str
     return values;
 }
 
+auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vector<std::string>> {
+    using ir::NodeKind;
+
+    switch (node.kind()) {
+        case NodeKind::Project: {
+            const auto& project = static_cast<const ir::ProjectNode&>(node);
+            std::vector<std::string> names;
+            names.reserve(project.columns().size());
+            for (const auto& col : project.columns()) {
+                names.push_back(col.name);
+            }
+            return names;
+        }
+        case NodeKind::Aggregate: {
+            const auto& agg = static_cast<const ir::AggregateNode&>(node);
+            std::vector<std::string> names;
+            names.reserve(agg.group_by().size() + agg.aggregations().size());
+            for (const auto& col : agg.group_by()) {
+                names.push_back(col.name);
+            }
+            for (const auto& spec : agg.aggregations()) {
+                names.push_back(spec.alias);
+            }
+            return names;
+        }
+        case NodeKind::Update: {
+            const auto& update = static_cast<const ir::UpdateNode&>(node);
+            if (update.children().empty()) {
+                return std::nullopt;
+            }
+            auto names = infer_output_column_names(*update.children().front());
+            if (!names.has_value()) {
+                return std::nullopt;
+            }
+            if (!update.tuple_fields().empty()) {
+                return std::nullopt;
+            }
+            for (const auto& field : update.fields()) {
+                auto it = std::find(names->begin(), names->end(), field.alias);
+                if (it == names->end()) {
+                    names->push_back(field.alias);
+                } else {
+                    *it = field.alias;
+                }
+            }
+            return names;
+        }
+        case NodeKind::Rename: {
+            const auto& rename = static_cast<const ir::RenameNode&>(node);
+            if (rename.children().empty()) {
+                return std::nullopt;
+            }
+            auto names = infer_output_column_names(*rename.children().front());
+            if (!names.has_value()) {
+                return std::nullopt;
+            }
+            for (const auto& spec : rename.renames()) {
+                auto it = std::find(names->begin(), names->end(), spec.old_name);
+                if (it == names->end()) {
+                    return std::nullopt;
+                }
+                *it = spec.new_name;
+            }
+            return names;
+        }
+        case NodeKind::Resample: {
+            const auto& rs = static_cast<const ir::ResampleNode&>(node);
+            std::vector<std::string> names;
+            names.reserve(rs.group_by().size() + rs.aggregations().size() + 1);
+            names.push_back("_bucket");
+            for (const auto& col : rs.group_by()) {
+                names.push_back(col.name);
+            }
+            for (const auto& spec : rs.aggregations()) {
+                names.push_back(spec.alias);
+            }
+            return names;
+        }
+        case NodeKind::AsTimeframe:
+        case NodeKind::Filter:
+        case NodeKind::Distinct:
+        case NodeKind::Order:
+        case NodeKind::Head:
+        case NodeKind::Tail:
+        case NodeKind::Window: {
+            if (node.children().empty()) {
+                return std::nullopt;
+            }
+            return infer_output_column_names(*node.children().front());
+        }
+        case NodeKind::Columns:
+            return std::vector<std::string>{"name"};
+        case NodeKind::Construct: {
+            const auto& cn = static_cast<const ir::ConstructNode&>(node);
+            std::vector<std::string> names;
+            names.reserve(cn.columns().size());
+            for (const auto& col : cn.columns()) {
+                names.push_back(col.name);
+            }
+            return names;
+        }
+        case NodeKind::Program: {
+            const auto& program = static_cast<const ir::ProgramNode&>(node);
+            return infer_output_column_names(program.main_node());
+        }
+        case NodeKind::Scan:
+        case NodeKind::ExternCall:
+        case NodeKind::Join:
+        case NodeKind::Melt:
+        case NodeKind::Dcast:
+        case NodeKind::Stream:
+        case NodeKind::Cov:
+        case NodeKind::Corr:
+        case NodeKind::Transpose:
+        case NodeKind::Matmul:
+        case NodeKind::Model:
+            return std::nullopt;
+    }
+
+    return std::nullopt;
+}
+
 auto compile_value_as_bool(const CompileTimeValue& value) -> std::optional<bool> {
     if (const auto* b = std::get_if<bool>(&value.value)) {
         return *b;
@@ -571,6 +693,22 @@ class Lowerer {
     auto lower_program(const Program& program) -> LowerResult {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
+        const auto infer_compile_time_list =
+            [this](const Expr& expr) -> std::optional<std::vector<std::string>> {
+            if (auto string_list = extract_string_list(expr); string_list.has_value()) {
+                return string_list;
+            }
+            const auto* call = std::get_if<CallExpr>(&expr.node);
+            if (call == nullptr || call->callee != "columns" || call->args.size() != 1 ||
+                !call->named_args.empty()) {
+                return std::nullopt;
+            }
+            auto lowered = lower_expr(*call->args.front());
+            if (!lowered.has_value()) {
+                return std::nullopt;
+            }
+            return infer_output_column_names(*lowered.value());
+        };
         for (const auto& stmt : program.statements) {
             if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
                 // Track externs that return a table so lower_table_call can
@@ -596,9 +734,9 @@ class Lowerer {
             }
             if (std::holds_alternative<LetStmt>(stmt)) {
                 const auto& let_stmt = std::get<LetStmt>(stmt);
-                if (auto string_list = extract_string_list(*let_stmt.value);
-                    string_list.has_value()) {
-                    compile_time_lists_[let_stmt.name] = std::move(*string_list);
+                if (auto compile_time_list = infer_compile_time_list(*let_stmt.value);
+                    compile_time_list.has_value()) {
+                    compile_time_lists_[let_stmt.name] = std::move(*compile_time_list);
                 } else {
                     compile_time_lists_.erase(let_stmt.name);
                 }
@@ -609,7 +747,7 @@ class Lowerer {
                     // expressions can still be lowered.
                     auto scalar = lower_expr_to_ir(*let_stmt.value);
                     if (!scalar.has_value()) {
-                        if (extract_string_list(*let_stmt.value).has_value()) {
+                        if (infer_compile_time_list(*let_stmt.value).has_value()) {
                             continue;
                         }
                         return std::unexpected(value.error());
@@ -807,6 +945,18 @@ class Lowerer {
                         "as_timeframe: second argument must be a string literal column name"});
             }
             auto node = builder_.as_timeframe(*col_name);
+            node->add_child(std::move(base.value()));
+            return node;
+        }
+        if (call.callee == "columns") {
+            if (call.args.size() != 1 || !call.named_args.empty()) {
+                return std::unexpected(LowerError{.message = "columns expects exactly 1 argument"});
+            }
+            auto base = lower_expr(*call.args[0]);
+            if (!base.has_value()) {
+                return base;
+            }
+            auto node = builder_.columns();
             node->add_child(std::move(base.value()));
             return node;
         }
@@ -2644,6 +2794,10 @@ class Lowerer {
             case ir::NodeKind::AsTimeframe: {
                 const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
                 clone = builder_.as_timeframe(atf.column());
+                break;
+            }
+            case ir::NodeKind::Columns: {
+                clone = builder_.columns();
                 break;
             }
             case ir::NodeKind::ExternCall: {

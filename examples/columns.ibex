@@ -1,0 +1,15 @@
+// Inspect output columns and reuse them in compile-time map expansion.
+
+let quotes = Table {
+    symbol = ["A", "B"],
+    price  = [10.0, 20.0],
+    qty    = [2.0, 4.0]
+};
+
+columns(quotes);
+
+let cols = columns(quotes);
+
+quotes[update {
+    map c in cols => `copy_${c}` = get(c)
+}];

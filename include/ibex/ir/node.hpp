@@ -213,6 +213,7 @@ enum class NodeKind : std::uint8_t {
     Window,
     Resample,
     AsTimeframe,
+    Columns,
     ExternCall,
     Join,
     Melt,
@@ -428,6 +429,12 @@ class AsTimeframeNode final : public Node {
 
    private:
     std::string column_;
+};
+
+/// Columns node: exposes the child table's column names as a one-column table.
+class ColumnsNode final : public Node {
+   public:
+    explicit ColumnsNode(NodeId id) : Node(NodeKind::Columns, id) {}
 };
 
 /// ExternCall node: calls a table-returning extern C++ function.

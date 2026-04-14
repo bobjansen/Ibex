@@ -290,6 +290,14 @@ auto as_timeframe(const runtime::Table& t, const std::string& column) -> runtime
     return delegate(std::move(atf_node), t);
 }
 
+auto columns(const runtime::Table& t) -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto columns_node = b.columns();
+    columns_node->add_child(std::move(scan_node));
+    return delegate(std::move(columns_node), t);
+}
+
 auto windowed_update(const runtime::Table& t, ir::Duration duration,
                      const std::vector<ir::FieldSpec>& fields) -> runtime::Table {
     ir::Builder b;

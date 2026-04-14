@@ -955,7 +955,9 @@ Rules:
 - Each `map` item expands to one or more named fields; the body must have the
   form ``alias_template = expr``.
 - The source after `in` must be an earlier `let` binding whose RHS is a string
-  array literal (for example `let cols = ["a", "b"];`).
+  array literal (for example `let cols = ["a", "b"];`) or a
+  `columns(table_expr)` call whose output names are statically known at lower
+  time.
 - Bindings may be unindexed (`c in cols`) or indexed (`(i, c) in cols`).
 - Multiple bindings form a Cartesian product.
 - An optional `where` clause filters expansions using compile-time binding
@@ -973,6 +975,35 @@ book[update {
     map (i, a) in price_cols, (j, b) in price_cols
         where i > j
         => `${a}_${b}_imb` = (get(a) - get(b)) / (get(a) + get(b))
+}];
+```
+
+**`columns(table_expr)`**
+
+`columns(table_expr)` returns a one-column `DataFrame` whose single column is
+named `name` and whose rows list the output column names of `table_expr` in
+schema order:
+
+```
+columns(trades)
+```
+
+For example, if `trades` has columns `symbol`, `price`, and `qty`, the result is
+equivalent to:
+
+```
+Table { name = ["symbol", "price", "qty"] }
+```
+
+`columns(...)` is a normal table expression, so it can be filtered, selected,
+and bound with `let`. When used in an earlier `let` binding whose output names
+are statically known, it can also feed compile-time `map` expansion:
+
+```
+let cols = columns(Table { ask = [1.0], bid = [2.0] });
+
+quotes[update {
+    map c in cols => `copy_${c}` = get(c)
 }];
 ```
 

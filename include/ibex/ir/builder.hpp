@@ -70,6 +70,8 @@ class Builder {
         return std::make_unique<AsTimeframeNode>(next_id(), std::move(column));
     }
 
+    [[nodiscard]] auto columns() -> NodePtr { return std::make_unique<ColumnsNode>(next_id()); }
+
     [[nodiscard]] auto extern_call(std::string callee, std::vector<Expr> args) -> NodePtr {
         return std::make_unique<ExternCallNode>(next_id(), std::move(callee), std::move(args));
     }

@@ -292,6 +292,11 @@ ggplot(summary, aes(Species, mean_sl)) +
             <code>get(name)</code> inside the map body to turn compile-time names
             into column references.
           </p>
+          <p>
+            <code>columns(table_expr)</code> returns a one-column metadata table
+            named <code>name</code>, so generated schemas can stay in Ibex
+            instead of being rebuilt in notebook host code.
+          </p>
         </div>
         <div class="tour-code">
 <pre><code><span class="kw">let</span> measures = [<span class="str">"price"</span>, <span class="str">"fee"</span>];
@@ -307,7 +312,10 @@ book[<span class="kw">update</span> {
     <span class="kw">map</span> (i, a) <span class="kw">in</span> price_cols, (j, b) <span class="kw">in</span> price_cols
         <span class="kw">where</span> i &gt; j
         =&gt; <span class="id">`${a}_${b}_imb`</span> = (<span class="fn-name">get</span>(a) - <span class="fn-name">get</span>(b)) / (<span class="fn-name">get</span>(a) + <span class="fn-name">get</span>(b))
-}];</code></pre>
+}];
+
+<span class="kw">let</span> generated = columns(book);
+generated[<span class="kw">filter</span> name != <span class="str">"row_id"</span>];</code></pre>
         </div>
       </div>
     </div>

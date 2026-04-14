@@ -48,6 +48,7 @@ target_link_libraries(ibex_tests
         Catch2::Catch2WithMain
         ibex_test_warning_suppressions
         nlohmann_json::nlohmann_json
+        fast_float
 )
 
 target_compile_definitions(ibex_tests

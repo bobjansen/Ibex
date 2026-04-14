@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fast_float/fast_float.h>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -360,7 +361,7 @@ inline auto csv_try_double(std::string_view sv, double& out) -> bool {
     }
     const char* begin = sv.data();
     const char* end = sv.data() + sv.size();
-    auto result = std::from_chars(begin, end, out);
+    auto result = fast_float::from_chars(begin, end, out);
     return result.ec == std::errc() && result.ptr == end;
 }
 

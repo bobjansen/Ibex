@@ -82,6 +82,18 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(robin_hood)
 ibex_mark_target_system_headers(robin_hood::robin_hood)
 
+# fast_float — drop-in std::from_chars replacement for floats (Apache 2.0).
+# Much faster than libstdc++'s from_chars<double> on hot CSV ingest paths.
+FetchContent_Declare(
+    fast_float
+    GIT_REPOSITORY https://github.com/fastfloat/fast_float.git
+    GIT_TAG        v6.1.6
+    GIT_SHALLOW    TRUE
+)
+set(FASTFLOAT_TEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(fast_float)
+ibex_mark_target_system_headers(fast_float)
+
 # nlohmann/json — header-only JSON library (MIT)
 FetchContent_Declare(
     nlohmann_json

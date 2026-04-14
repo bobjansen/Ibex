@@ -204,6 +204,21 @@ TEST_CASE("Read CSV - custom delimiter preserves quoted commas and numeric infer
     REQUIRE((*temp)[1] == Catch::Approx(-1.0));
 }
 
+TEST_CASE("Read CSV - no-header mode numbers columns and infers types") {
+    auto path = tmp("ibex_test_no_header_semicolon.csv");
+    write_csv(path, "\"Washington, D.C.\";12.5\nAmsterdam;-1.0\n");
+
+    auto table = read_csv(path.string(), "", ";", false);
+    REQUIRE(table.rows() == 2);
+    REQUIRE(get_string_at(table, "col1", 0) == "Washington, D.C.");
+    REQUIRE(get_string_at(table, "col1", 1) == "Amsterdam");
+
+    const auto* temp = std::get_if<ibex::Column<double>>(table.find("col2"));
+    REQUIRE(temp != nullptr);
+    REQUIRE((*temp)[0] == Catch::Approx(12.5));
+    REQUIRE((*temp)[1] == Catch::Approx(-1.0));
+}
+
 // ---------------------------------------------------------------------------
 // write_csv tests
 // ---------------------------------------------------------------------------

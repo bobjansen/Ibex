@@ -151,6 +151,15 @@ TEST_CASE("WindowNode stores duration", "[ir][window]") {
     REQUIRE(win->duration() == std::chrono::minutes{5});
 }
 
+TEST_CASE("ColumnsNode kind", "[ir][columns]") {
+    ibex::ir::Builder builder;
+    auto node = builder.columns();
+
+    auto* columns = dynamic_cast<ibex::ir::ColumnsNode*>(node.get());
+    REQUIRE(columns != nullptr);
+    REQUIRE(columns->kind() == ibex::ir::NodeKind::Columns);
+}
+
 TEST_CASE("Nodes can form a tree via add_child", "[ir][tree]") {
     ibex::ir::Builder builder;
 

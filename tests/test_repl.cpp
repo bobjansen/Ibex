@@ -95,6 +95,20 @@ trades[select {
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("REPL executes compile-time map expansion from columns metadata table") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let trades = Table { price = [10.0, 20.0], qty = [2.0, 4.0] };
+let cols = columns(trades);
+trades[update {
+    map c in cols => `copy_${c}` = get(c)
+}];
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
 TEST_CASE("REPL executes function-local compile-time map expansion") {
     ibex::runtime::ExternRegistry registry;
 

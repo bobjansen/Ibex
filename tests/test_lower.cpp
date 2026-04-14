@@ -190,6 +190,38 @@ df[update {
     REQUIRE(update->fields()[2].alias == "wap_bid_price_imb");
 }
 
+TEST_CASE("Lower columns table call to IR") {
+    auto program = require_parse("columns(df);");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* columns = as_node<ir::ColumnsNode>(result->get());
+    REQUIRE(columns != nullptr);
+    REQUIRE(columns->children().size() == 1);
+
+    const auto* scan = as_node<ir::ScanNode>(columns->children()[0].get());
+    REQUIRE(scan != nullptr);
+    REQUIRE(scan->source_name() == "df");
+}
+
+TEST_CASE("Lower compile-time map from columns metadata table") {
+    auto program = require_parse(R"(
+let cols = columns(Table { ask_price = [101.0], bid_price = [99.0], wap = [100.0] });
+df[update {
+    map c in cols => `copy_${c}` = get(c)
+}];
+)");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* update = as_node<ir::UpdateNode>(result->get());
+    REQUIRE(update != nullptr);
+    REQUIRE(update->fields().size() == 3);
+    REQUIRE(update->fields()[0].alias == "copy_ask_price");
+    REQUIRE(update->fields()[1].alias == "copy_bid_price");
+    REQUIRE(update->fields()[2].alias == "copy_wap");
+}
+
 TEST_CASE("Lower head to IR") {
     auto program = require_parse("df[order price desc, head 10];");
     auto result = parser::lower(program);

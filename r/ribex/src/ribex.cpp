@@ -559,6 +559,33 @@ auto extract_compile_time_string_list(const ibex::parser::Expr& expr)
     return values;
 }
 
+auto extract_compile_time_string_list(const ibex::runtime::Table& table)
+    -> std::optional<std::vector<std::string>> {
+    if (table.columns.size() != 1 || table.columns.front().name != "name") {
+        return std::nullopt;
+    }
+
+    const auto& entry = table.columns.front();
+    const auto* names = std::get_if<ibex::Column<std::string>>(entry.column.get());
+    if (names == nullptr) {
+        return std::nullopt;
+    }
+    if (entry.validity.has_value()) {
+        for (std::size_t row = 0; row < names->size(); ++row) {
+            if (!(*entry.validity)[row]) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    std::vector<std::string> values;
+    values.reserve(names->size());
+    for (const auto& value : *names) {
+        values.push_back(std::string(value));
+    }
+    return values;
+}
+
 auto merge_registries(const ibex::runtime::TableRegistry& base,
                       const ibex::runtime::TableRegistry& extra) -> ibex::runtime::TableRegistry {
     ibex::runtime::TableRegistry merged = base;
@@ -692,7 +719,13 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
             if (!evaluated.has_value()) {
                 return std::unexpected(make_error("runtime error", evaluated.error()));
             }
-            session.compile_time_lists.erase(let_stmt->name);
+            if (auto compile_time_list = extract_compile_time_string_list(*evaluated);
+                compile_time_list.has_value()) {
+                session.compile_time_lists.insert_or_assign(let_stmt->name,
+                                                            std::move(*compile_time_list));
+            } else {
+                session.compile_time_lists.erase(let_stmt->name);
+            }
             session.tables.insert_or_assign(let_stmt->name, std::move(*evaluated));
             continue;
         }

@@ -501,6 +501,13 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Columns: {
+            auto child = emit_node(require_single_child(node, "ColumnsNode"));
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::columns(" << child << ");\n";
+            return var;
+        }
+
         case ir::NodeKind::ExternCall: {
             // In bench mode ExternCall nodes were pre-emitted; reuse the var.
             if (auto it = cached_vars_.find(&node); it != cached_vars_.end())

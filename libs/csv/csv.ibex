@@ -7,7 +7,9 @@
 // explicit `extern fn` declaration in the script:
 //   read_csv(path: String) -> DataFrame
 //   read_csv(path: String, nulls: String) -> DataFrame
+//   read_csv(path: String, nulls: String, delimiter: String) -> DataFrame
 //   write_csv(df: DataFrame, path: String) -> Int
 
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";

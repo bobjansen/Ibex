@@ -189,6 +189,21 @@ TEST_CASE("Read CSV - nullable parsing via null spec") {
     REQUIRE(is_null_at(table, "note", 2));
 }
 
+TEST_CASE("Read CSV - custom delimiter preserves quoted commas and numeric inference") {
+    auto path = tmp("ibex_test_semicolon.csv");
+    write_csv(path, "station;temp\n\"Washington, D.C.\";12.5\nAmsterdam;-1.0\n");
+
+    auto table = read_csv(path.string(), "", ";");
+    REQUIRE(table.rows() == 2);
+    REQUIRE(get_string_at(table, "station", 0) == "Washington, D.C.");
+    REQUIRE(get_string_at(table, "station", 1) == "Amsterdam");
+
+    const auto* temp = std::get_if<ibex::Column<double>>(table.find("temp"));
+    REQUIRE(temp != nullptr);
+    REQUIRE((*temp)[0] == Catch::Approx(12.5));
+    REQUIRE((*temp)[1] == Catch::Approx(-1.0));
+}
+
 // ---------------------------------------------------------------------------
 // write_csv tests
 // ---------------------------------------------------------------------------

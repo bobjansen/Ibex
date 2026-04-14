@@ -82,16 +82,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(robin_hood)
 ibex_mark_target_system_headers(robin_hood::robin_hood)
 
-# rapidcsv — header-only RFC 4180 CSV parser (MIT)
-FetchContent_Declare(
-    rapidcsv
-    GIT_REPOSITORY https://github.com/d99kris/rapidcsv.git
-    GIT_TAG        v8.83
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(rapidcsv)
-ibex_mark_target_system_headers(rapidcsv)
-
 # nlohmann/json — header-only JSON library (MIT)
 FetchContent_Declare(
     nlohmann_json

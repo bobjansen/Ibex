@@ -103,6 +103,26 @@ install(TARGETS ibex_join_bench
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
 
+add_executable(ibex_bench_csv_read bench_read_csv.cpp)
+
+target_include_directories(ibex_bench_csv_read PRIVATE "${PROJECT_SOURCE_DIR}/libs/csv")
+
+target_link_libraries(ibex_bench_csv_read
+    PRIVATE
+        Ibex::runtime
+        Ibex::CompilerOptions
+        CLI11::CLI11
+        fast_float
+)
+
+if(TARGET Ibex::Sanitizers)
+    target_link_libraries(ibex_bench_csv_read PRIVATE Ibex::Sanitizers)
+endif()
+
+install(TARGETS ibex_bench_csv_read
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+
 add_library(ibex_gen_tf_data_plugin SHARED gen_tf_data.cpp)
 
 set_target_properties(ibex_gen_tf_data_plugin PROPERTIES

@@ -47,7 +47,6 @@ target_link_libraries(ibex_tests
         Ibex::CompilerOptions
         Catch2::Catch2WithMain
         ibex_test_warning_suppressions
-        rapidcsv
         nlohmann_json::nlohmann_json
 )
 

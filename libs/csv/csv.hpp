@@ -1,5 +1,5 @@
 #pragma once
-// Ibex CSV library — RFC 4180 compliant CSV reading and writing via rapidcsv.
+// Ibex CSV library — RFC 4180 compliant CSV reading and writing.
 //
 // Reading:
 //   extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
@@ -17,6 +17,12 @@
 // Writing:
 //   extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 //   let rows = write_csv(df, "data/out.csv");
+//
+// The reader streams the file via mmap (on POSIX) and parses it in a single
+// pass into views over the backing buffer; only fields that contain escaped
+// `""` sequences allocate a heap string.  Typed column construction then
+// performs at most one numeric-probe scan per column and fuses the final
+// parse into the build loop, so each value is parsed at most twice.
 
 #include <ibex/core/column.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -25,17 +31,28 @@
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
-#include <limits>
-#include <rapidcsv.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
+
+#if __has_include(<sys/mman.h>)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define IBEX_CSV_HAVE_MMAP 1
+#else
+#define IBEX_CSV_HAVE_MMAP 0
+#endif
 
 namespace {
 
@@ -86,17 +103,196 @@ inline auto csv_parse_delimiter(std::string_view spec) -> char {
     return spec.front();
 }
 
-inline auto csv_try_int(const std::string& text, std::int64_t& out) -> bool {
-    const char* begin = text.data();
-    const char* end = text.data() + text.size();
+/// Owns the source buffer for a CSV read.  Uses mmap on POSIX when the input
+/// is a regular file; otherwise reads the file into a heap-allocated buffer.
+class CsvSource {
+   public:
+    explicit CsvSource(const std::string& path) {
+#if IBEX_CSV_HAVE_MMAP
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            struct stat st{};
+            if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0) {
+                size_ = static_cast<std::size_t>(st.st_size);
+                if (size_ == 0) {
+                    ::close(fd);
+                    data_ = "";
+                    return;
+                }
+                void* addr = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (addr != MAP_FAILED) {
+                    ::madvise(addr, size_, MADV_SEQUENTIAL);
+                    fd_ = fd;
+                    mapped_ = addr;
+                    data_ = static_cast<const char*>(addr);
+                    return;
+                }
+            }
+            ::close(fd);
+        }
+#endif
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("read_csv: failed to open '" + path + "'");
+        }
+        in.seekg(0, std::ios::end);
+        const auto sz = in.tellg();
+        if (sz > 0) {
+            fallback_.resize(static_cast<std::size_t>(sz));
+            in.seekg(0, std::ios::beg);
+            in.read(fallback_.data(), static_cast<std::streamsize>(sz));
+            size_ = static_cast<std::size_t>(in.gcount());
+            data_ = fallback_.data();
+        } else {
+            data_ = "";
+            size_ = 0;
+        }
+    }
+
+    ~CsvSource() {
+#if IBEX_CSV_HAVE_MMAP
+        if (mapped_ != nullptr) {
+            ::munmap(mapped_, size_);
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+#endif
+    }
+
+    CsvSource(const CsvSource&) = delete;
+    auto operator=(const CsvSource&) -> CsvSource& = delete;
+    CsvSource(CsvSource&&) = delete;
+    auto operator=(CsvSource&&) -> CsvSource& = delete;
+
+    [[nodiscard]] auto data() const noexcept -> const char* { return data_; }
+    [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
+
+   private:
+    const char* data_ = nullptr;
+    std::size_t size_ = 0;
+#if IBEX_CSV_HAVE_MMAP
+    int fd_ = -1;
+    void* mapped_ = nullptr;
+#endif
+    std::vector<char> fallback_;
+};
+
+/// Parse one logical row out of [pos, end).  On return `pos` is advanced past
+/// the row's terminating newline (if any).  Views for ordinary fields point
+/// into the caller-owned source buffer; views for fields that contained a
+/// `""` escape point into strings held by `escape_storage`.  A std::deque is
+/// used so that subsequent push_backs do not invalidate earlier references.
+///
+/// Returns true iff a non-empty row was produced.  Empty lines are skipped
+/// (matching typical CSV reader behavior); a trailing newline does not
+/// synthesize an extra empty row.
+inline auto csv_parse_row(const char*& pos, const char* end, char delim,
+                          std::vector<std::string_view>& out_fields,
+                          std::deque<std::string>& escape_storage) -> bool {
+    while (pos < end && (*pos == '\n' || *pos == '\r')) {
+        if (*pos == '\r' && pos + 1 < end && *(pos + 1) == '\n') {
+            pos += 2;
+        } else {
+            ++pos;
+        }
+    }
+    if (pos >= end) {
+        return false;
+    }
+
+    out_fields.clear();
+    while (true) {
+        if (*pos == '"') {
+            ++pos;
+            const char* field_start = pos;
+            bool has_escape = false;
+            const char* content_end = nullptr;
+            while (pos < end) {
+                if (*pos == '"') {
+                    if (pos + 1 < end && *(pos + 1) == '"') {
+                        has_escape = true;
+                        pos += 2;
+                        continue;
+                    }
+                    content_end = pos;
+                    ++pos;
+                    break;
+                }
+                ++pos;
+            }
+            if (content_end == nullptr) {
+                content_end = pos;
+            }
+            if (!has_escape) {
+                out_fields.emplace_back(field_start,
+                                        static_cast<std::size_t>(content_end - field_start));
+            } else {
+                auto& buf = escape_storage.emplace_back();
+                buf.reserve(static_cast<std::size_t>(content_end - field_start));
+                for (const char* p = field_start; p < content_end;) {
+                    if (*p == '"' && p + 1 < content_end && *(p + 1) == '"') {
+                        buf.push_back('"');
+                        p += 2;
+                    } else {
+                        buf.push_back(*p);
+                        ++p;
+                    }
+                }
+                out_fields.emplace_back(buf);
+            }
+            if (pos < end && *pos != delim && *pos != '\n' && *pos != '\r') {
+                while (pos < end && *pos != delim && *pos != '\n' && *pos != '\r') {
+                    ++pos;
+                }
+            }
+        } else {
+            const char* field_start = pos;
+            while (pos < end && *pos != delim && *pos != '\n' && *pos != '\r') {
+                ++pos;
+            }
+            out_fields.emplace_back(field_start, static_cast<std::size_t>(pos - field_start));
+        }
+
+        if (pos >= end) {
+            return true;
+        }
+        if (*pos == delim) {
+            ++pos;
+            continue;
+        }
+        if (*pos == '\r') {
+            ++pos;
+            if (pos < end && *pos == '\n') {
+                ++pos;
+            }
+            return true;
+        }
+        if (*pos == '\n') {
+            ++pos;
+            return true;
+        }
+    }
+}
+
+inline auto csv_try_int(std::string_view sv, std::int64_t& out) -> bool {
+    if (sv.empty()) {
+        return false;
+    }
+    const char* begin = sv.data();
+    const char* end = sv.data() + sv.size();
     auto result = std::from_chars(begin, end, out);
     return result.ec == std::errc() && result.ptr == end;
 }
 
-inline auto csv_try_double(const std::string& text, double& out) -> bool {
-    char* end_ptr = nullptr;
-    out = std::strtod(text.c_str(), &end_ptr);
-    return end_ptr != text.c_str() && *end_ptr == '\0';
+inline auto csv_try_double(std::string_view sv, double& out) -> bool {
+    if (sv.empty()) {
+        return false;
+    }
+    const char* begin = sv.data();
+    const char* end = sv.data() + sv.size();
+    auto result = std::from_chars(begin, end, out);
+    return result.ec == std::errc() && result.ptr == end;
 }
 
 }  // namespace
@@ -113,129 +309,177 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     if (!exists) {
         throw std::runtime_error("read_csv: file not found: '" + path_string + "'");
     }
-    std::ifstream check(path_string);
-    if (!check.is_open()) {
-        throw std::runtime_error("read_csv: failed to open '" + path_string + "'");
-    }
 
-    const rapidcsv::LabelParams label_params =
-        options.has_header ? rapidcsv::LabelParams(0, -1) : rapidcsv::LabelParams(-1, -1);
-    rapidcsv::Document doc(path_string, label_params,
-                           rapidcsv::SeparatorParams(options.delimiter)  // handles RFC 4180 quoting
-    );
+    CsvSource source(path_string);
+    const char* pos = source.data();
+    const char* end = source.data() + source.size();
+
+    std::deque<std::string> escape_storage;
+    std::vector<std::string_view> row_buf;
+    row_buf.reserve(16);
 
     std::vector<std::string> col_names;
     if (options.has_header) {
-        col_names = doc.GetColumnNames();
-    } else {
-        const auto col_count = doc.GetColumnCount();
-        col_names.reserve(col_count);
-        for (std::size_t i = 0; i < col_count; ++i) {
-            col_names.push_back("col" + std::to_string(i + 1));
+        if (!csv_parse_row(pos, end, options.delimiter, row_buf, escape_storage)) {
+            return ibex::runtime::Table{};
+        }
+        col_names.reserve(row_buf.size());
+        for (auto sv : row_buf) {
+            col_names.emplace_back(sv);
         }
     }
-    ibex::runtime::Table table;
-    // Categorise string columns when cardinality is low enough that the dictionary is
-    // worthwhile.  Column<Categorical> carries an index_ (std::unordered_map) that costs
-    // ~80 bytes per unique entry.  Break-even vs the flat-buffer Column<std::string>
-    // (4B offset + L chars per row) is roughly r = L/80 ≈ 10% for typical 8-char strings.
-    // Beyond ~10% the categorical representation uses more memory and gives no benefit.
-    constexpr double kMaxCategoricalRatio = 0.10;
 
-    for (std::size_t col_idx = 0; col_idx < col_names.size(); ++col_idx) {
-        const auto& name = col_names[col_idx];
-        std::vector<std::string> vals = options.has_header ? doc.GetColumn<std::string>(name)
-                                                           : doc.GetColumn<std::string>(col_idx);
-        std::vector<bool> validity(vals.size(), true);
-        bool has_nulls = false;
-        for (std::size_t i = 0; i < vals.size(); ++i) {
-            const bool is_null =
-                (options.null_if_empty && vals[i].empty()) || options.null_tokens.contains(vals[i]);
-            validity[i] = !is_null;
-            has_nulls = has_nulls || is_null;
-        }
-
-        // Try int64
-        bool all_int = !vals.empty();
-        bool any_valid = false;
-        for (const auto& v : vals) {
-            if (options.null_if_empty && v.empty()) {
-                continue;
-            }
-            if (options.null_tokens.contains(v)) {
-                continue;
-            }
-            std::int64_t iv{};
-            if (!csv_try_int(v, iv)) {
-                all_int = false;
+    // Cheap newline count for row reservation.  Quoted newlines are rare
+    // enough that this is a fine upper bound.
+    std::size_t row_estimate = 0;
+    {
+        const char* scan = pos;
+        while (scan < end) {
+            const char* nl = static_cast<const char*>(
+                std::memchr(scan, '\n', static_cast<std::size_t>(end - scan)));
+            if (nl == nullptr) {
+                ++row_estimate;
                 break;
             }
-            any_valid = true;
+            ++row_estimate;
+            scan = nl + 1;
         }
-        if (all_int && any_valid) {
-            ibex::Column<std::int64_t> col;
-            col.reserve(vals.size());
-            for (std::size_t i = 0; i < vals.size(); ++i) {
-                if (!validity[i]) {
-                    col.push_back(0);
+    }
+
+    std::vector<std::vector<std::string_view>> columns;
+    std::size_t n_cols = col_names.size();
+    bool first_data_row = true;
+
+    while (csv_parse_row(pos, end, options.delimiter, row_buf, escape_storage)) {
+        if (first_data_row) {
+            if (!options.has_header) {
+                n_cols = row_buf.size();
+                col_names.reserve(n_cols);
+                for (std::size_t i = 0; i < n_cols; ++i) {
+                    col_names.push_back("col" + std::to_string(i + 1));
+                }
+            }
+            columns.resize(n_cols);
+            for (auto& c : columns) {
+                c.reserve(row_estimate);
+            }
+            first_data_row = false;
+        }
+        const std::size_t row_cols = row_buf.size();
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            if (c < row_cols) {
+                columns[c].push_back(row_buf[c]);
+            } else {
+                columns[c].emplace_back();
+            }
+        }
+    }
+
+    if (first_data_row) {
+        columns.resize(n_cols);
+    }
+
+    ibex::runtime::Table table;
+    constexpr double kMaxCategoricalRatio = 0.10;
+
+    for (std::size_t c = 0; c < columns.size(); ++c) {
+        const auto& vals = columns[c];
+        const auto& name = col_names[c];
+        const std::size_t n = vals.size();
+
+        ibex::runtime::ValidityBitmap validity;
+        bool has_nulls = false;
+        const bool need_null_check = options.null_if_empty || !options.null_tokens.empty();
+        if (need_null_check) {
+            validity.assign(n, true);
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto sv = vals[i];
+                bool row_is_null = false;
+                if (options.null_if_empty && sv.empty()) {
+                    row_is_null = true;
+                } else if (!options.null_tokens.empty() &&
+                           options.null_tokens.contains(std::string(sv))) {
+                    row_is_null = true;
+                }
+                if (row_is_null) {
+                    validity.set(i, false);
+                    has_nulls = true;
+                }
+            }
+        }
+
+        auto is_null = [&](std::size_t i) -> bool {
+            return need_null_check && !validity[i];
+        };
+
+        // Try int64 with a fused build pass: if every non-null value parses,
+        // we keep the built column directly.
+        if (n > 0) {
+            ibex::Column<std::int64_t> int_col;
+            int_col.reserve(n);
+            bool all_int = true;
+            bool any_valid = false;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (is_null(i)) {
+                    int_col.push_back(0);
                     continue;
                 }
                 std::int64_t iv{};
-                csv_try_int(vals[i], iv);
-                col.push_back(iv);
+                if (!csv_try_int(vals[i], iv)) {
+                    all_int = false;
+                    break;
+                }
+                int_col.push_back(iv);
+                any_valid = true;
             }
-            if (has_nulls) {
-                table.add_column(name, std::move(col), std::move(validity));
-            } else {
-                table.add_column(name, std::move(col));
+            if (all_int && any_valid) {
+                if (has_nulls) {
+                    table.add_column(name, std::move(int_col), std::move(validity));
+                } else {
+                    table.add_column(name, std::move(int_col));
+                }
+                continue;
             }
-            continue;
         }
 
-        // Try double
-        bool all_double = !vals.empty();
-        any_valid = false;
-        for (const auto& v : vals) {
-            if (options.null_if_empty && v.empty()) {
-                continue;
-            }
-            if (options.null_tokens.contains(v)) {
-                continue;
-            }
-            double dv{};
-            if (!csv_try_double(v, dv)) {
-                all_double = false;
-                break;
-            }
-            any_valid = true;
-        }
-        if (all_double && any_valid) {
-            ibex::Column<double> col;
-            col.reserve(vals.size());
-            for (std::size_t i = 0; i < vals.size(); ++i) {
-                if (!validity[i]) {
-                    col.push_back(0.0);
+        // Try double with a fused build pass.
+        if (n > 0) {
+            ibex::Column<double> dbl_col;
+            dbl_col.reserve(n);
+            bool all_double = true;
+            bool any_valid = false;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (is_null(i)) {
+                    dbl_col.push_back(0.0);
                     continue;
                 }
                 double dv{};
-                csv_try_double(vals[i], dv);
-                col.push_back(dv);
+                if (!csv_try_double(vals[i], dv)) {
+                    all_double = false;
+                    break;
+                }
+                dbl_col.push_back(dv);
+                any_valid = true;
             }
-            if (has_nulls) {
-                table.add_column(name, std::move(col), std::move(validity));
-            } else {
-                table.add_column(name, std::move(col));
+            if (all_double && any_valid) {
+                if (has_nulls) {
+                    table.add_column(name, std::move(dbl_col), std::move(validity));
+                } else {
+                    table.add_column(name, std::move(dbl_col));
+                }
+                continue;
             }
-            continue;
         }
 
-        // String fallback. When nulls are present, keep plain string + validity bitmap.
+        // String fallback.  When nulls are present, skip categorical detection
+        // and keep plain string + validity bitmap (matching historical
+        // behavior).
         if (has_nulls) {
             ibex::Column<std::string> col;
-            col.reserve(vals.size());
-            for (std::size_t i = 0; i < vals.size(); ++i) {
+            col.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
                 if (!validity[i]) {
-                    col.push_back("");
+                    col.push_back(std::string_view{});
                 } else {
                     col.push_back(vals[i]);
                 }
@@ -244,8 +488,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             continue;
         }
 
-        // String fallback (with categorical detection)
-        const std::size_t n = vals.size();
+        // Pure-string column: try categorical promotion.
         if (n > 0) {
             const std::size_t max_uniques = std::max<std::size_t>(
                 1, static_cast<std::size_t>(static_cast<double>(n) * kMaxCategoricalRatio));
@@ -254,9 +497,8 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             std::vector<std::string> dict;
             std::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type> index;
             bool ok = true;
-            for (const auto& v : vals) {
-                std::string_view key{v};
-                auto it = index.find(key);
+            for (auto sv : vals) {
+                auto it = index.find(sv);
                 if (it != index.end()) {
                     codes.push_back(it->second);
                     continue;
@@ -266,7 +508,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     break;
                 }
                 auto code = static_cast<ibex::Column<ibex::Categorical>::code_type>(dict.size());
-                dict.push_back(v);
+                dict.push_back(std::string(sv));
                 index.emplace(dict.back(), code);
                 codes.push_back(code);
             }
@@ -276,7 +518,13 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 continue;
             }
         }
-        table.add_column(name, ibex::Column<std::string>(std::move(vals)));
+
+        ibex::Column<std::string> col;
+        col.reserve(n);
+        for (auto sv : vals) {
+            col.push_back(sv);
+        }
+        table.add_column(name, std::move(col));
     }
 
     return table;

@@ -18,6 +18,7 @@ ITERS=5
 OUT="$IBEX_ROOT/benchmarking/results/onebrc.tsv"
 SKIP_INTERPRETED=0
 SKIP_COMPILED=1
+SKIP_POLARS=0
 INNER_RUNS=20
 
 while [[ $# -gt 0 ]]; do
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --with-compiled) SKIP_COMPILED=0; shift ;;
         --skip-interpreted) SKIP_INTERPRETED=1; shift ;;
         --skip-compiled) SKIP_COMPILED=1; shift ;;
+        --skip-polars) SKIP_POLARS=1; shift ;;
         *)
             echo "unknown option: $1" >&2
             exit 1
@@ -94,8 +96,12 @@ REPL_INPUT="$TMP_DIR/onebrc.repl"
 COMPILED_BIN="$TMP_DIR/onebrc"
 INTERPRETED_TIMES="$TMP_DIR/interpreted.txt"
 COMPILED_TIMES="$TMP_DIR/compiled.txt"
+POLARS_TIMES="$TMP_DIR/polars.txt"
 BENCH_QUERY="$TMP_DIR/onebrc_bench.ibex"
 COMPILED_RUNNER="$TMP_DIR/compiled_runner.sh"
+POLARS_SCRIPT="$TMP_DIR/onebrc_polars.py"
+POLARS_RUNNER="$TMP_DIR/polars_runner.sh"
+UV_CACHE_DIR_BENCH="${UV_CACHE_DIR:-$TMP_DIR/uv-cache}"
 
 cat > "$BENCH_QUERY" <<'EOF'
 extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool) -> DataFrame from "csv.hpp";
@@ -187,6 +193,56 @@ done
 EOF
 chmod +x "$COMPILED_RUNNER"
 
+cat > "$POLARS_SCRIPT" <<'EOF'
+from pathlib import Path
+import sys
+
+import polars as pl
+
+
+def run_once(path: Path) -> int:
+    df = pl.read_csv(
+        path,
+        separator=";",
+        has_header=False,
+        new_columns=["station", "temp"],
+        schema_overrides={"station": pl.String, "temp": pl.Float64},
+    )
+    summary = (
+        df.group_by("station")
+        .agg(
+            pl.col("temp").min().alias("min_temp"),
+            pl.col("temp").mean().alias("avg_temp"),
+            pl.col("temp").max().alias("max_temp"),
+        )
+        .sort("station")
+    )
+    return summary.height
+
+
+def main() -> int:
+    path = Path(sys.argv[1])
+    inner_runs = int(sys.argv[2])
+    rows = 0
+    for _ in range(inner_runs):
+        rows = run_once(path)
+    print(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+EOF
+
+cat > "$POLARS_RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$IBEX_ROOT"
+export UV_CACHE_DIR="$UV_CACHE_DIR_BENCH"
+uv run --project "$IBEX_ROOT" --frozen python3 "$POLARS_SCRIPT" "$INPUT" "$INNER_RUNS" >/dev/null
+EOF
+chmod +x "$POLARS_RUNNER"
+
 run_interpreted() {
     : > "$INTERPRETED_TIMES"
     for ((i = 0; i < WARMUP; ++i)); do
@@ -222,6 +278,26 @@ run_compiled() {
         fi
         cat "$tfile" >> "$COMPILED_TIMES"
         printf '\n' >> "$COMPILED_TIMES"
+    done
+}
+
+run_polars() {
+    : > "$POLARS_TIMES"
+    if ! command -v uv >/dev/null 2>&1; then
+        return 1
+    fi
+    for ((i = 0; i < WARMUP; ++i)); do
+        if ! "$POLARS_RUNNER" >/dev/null 2>/dev/null; then
+            return 1
+        fi
+    done
+    for ((i = 0; i < ITERS; ++i)); do
+        local tfile="$TMP_DIR/time.txt"
+        if ! /usr/bin/time -f '%e' -o "$tfile" "$POLARS_RUNNER" >/dev/null 2>/dev/null; then
+            return 1
+        fi
+        cat "$tfile" >> "$POLARS_TIMES"
+        printf '\n' >> "$POLARS_TIMES"
     done
 }
 
@@ -274,6 +350,14 @@ summarize_file() {
             summarize_file "ibex-compiled" "$COMPILED_TIMES"
         else
             echo "warning: skipping compiled 1BRC timing; current transpiled runtime aborts on this string-key aggregation query" >&2
+        fi
+    fi
+    if [[ "$SKIP_POLARS" -eq 0 ]]; then
+        echo "=== timing polars 1BRC query ===" >&2
+        if run_polars; then
+            summarize_file "polars" "$POLARS_TIMES"
+        else
+            echo "warning: skipping polars 1BRC timing; uv/polars benchmark run failed" >&2
         fi
     fi
 } | tee "$OUT"

@@ -7,6 +7,12 @@
 // Optional null controls:
 //   extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
 //   let df = read_csv("data/myfile.csv", "<empty>,NA");
+// Optional delimiter and header controls:
+//   extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
+//   let df = read_csv("data/myfile.csv", "", ";");
+//   extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool)
+//       -> DataFrame from "csv.hpp";
+//   let df = read_csv("data/myfile.csv", "", ";", false);
 //
 // Writing:
 //   extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
@@ -37,6 +43,7 @@ struct CsvReadOptions {
     bool null_if_empty = false;
     std::unordered_set<std::string> null_tokens;
     char delimiter = ',';
+    bool has_header = true;
 };
 
 inline auto csv_trim(std::string_view text) -> std::string_view {
@@ -111,12 +118,22 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
         throw std::runtime_error("read_csv: failed to open '" + path_string + "'");
     }
 
-    rapidcsv::Document doc(path_string,
-                           rapidcsv::LabelParams(0, -1),  // row 0 = header, no row-index column
+    const rapidcsv::LabelParams label_params =
+        options.has_header ? rapidcsv::LabelParams(0, -1) : rapidcsv::LabelParams(-1, -1);
+    rapidcsv::Document doc(path_string, label_params,
                            rapidcsv::SeparatorParams(options.delimiter)  // handles RFC 4180 quoting
     );
 
-    auto col_names = doc.GetColumnNames();
+    std::vector<std::string> col_names;
+    if (options.has_header) {
+        col_names = doc.GetColumnNames();
+    } else {
+        const auto col_count = doc.GetColumnCount();
+        col_names.reserve(col_count);
+        for (std::size_t i = 0; i < col_count; ++i) {
+            col_names.push_back("col" + std::to_string(i + 1));
+        }
+    }
     ibex::runtime::Table table;
     // Categorise string columns when cardinality is low enough that the dictionary is
     // worthwhile.  Column<Categorical> carries an index_ (std::unordered_map) that costs
@@ -125,8 +142,10 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     // Beyond ~10% the categorical representation uses more memory and gives no benefit.
     constexpr double kMaxCategoricalRatio = 0.10;
 
-    for (const auto& name : col_names) {
-        std::vector<std::string> vals = doc.GetColumn<std::string>(name);
+    for (std::size_t col_idx = 0; col_idx < col_names.size(); ++col_idx) {
+        const auto& name = col_names[col_idx];
+        std::vector<std::string> vals = options.has_header ? doc.GetColumn<std::string>(name)
+                                                           : doc.GetColumn<std::string>(col_idx);
         std::vector<bool> validity(vals.size(), true);
         bool has_nulls = false;
         for (std::size_t i = 0; i < vals.size(); ++i) {
@@ -275,6 +294,14 @@ inline auto read_csv(std::string_view path, std::string_view null_spec, std::str
     -> ibex::runtime::Table {
     auto options = csv_parse_null_spec(null_spec);
     options.delimiter = csv_parse_delimiter(delimiter);
+    return read_csv_with_options(path, options);
+}
+
+inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter,
+                     bool has_header) -> ibex::runtime::Table {
+    auto options = csv_parse_null_spec(null_spec);
+    options.delimiter = csv_parse_delimiter(delimiter);
+    options.has_header = has_header;
     return read_csv_with_options(path, options);
 }
 

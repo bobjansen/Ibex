@@ -12,7 +12,6 @@ else
 fi
 
 INPUT="$IBEX_ROOT/examples/measurements.txt"
-CACHE="$IBEX_ROOT/examples/.cache/measurements_1brc.csv"
 QUERY="$IBEX_ROOT/examples/onebrc.ibex"
 WARMUP=1
 ITERS=5
@@ -24,7 +23,6 @@ INNER_RUNS=20
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --input) INPUT="$2"; shift 2 ;;
-        --cache) CACHE="$2"; shift 2 ;;
         --warmup) WARMUP="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
@@ -69,7 +67,7 @@ if [[ -z "$CXXFLAGS" ]]; then
     fi
 fi
 
-mkdir -p "$(dirname "$CACHE")" "$(dirname "$OUT")"
+mkdir -p "$(dirname "$OUT")"
 
 echo "=== building ibex 1BRC prerequisites ===" >&2
 cmake --build "$BUILD_DIR" --parallel --target ibex_repl_bin ibex_compile_bin ibex_csv_plugin >&2
@@ -89,12 +87,6 @@ fi
 
 INPUT_ROWS="$(wc -l < "$INPUT" | tr -d '[:space:]')"
 
-echo "=== staging 1BRC input ===" >&2
-{
-    printf 'station;temp\n'
-    cat "$INPUT"
-} > "$CACHE"
-
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -106,9 +98,10 @@ BENCH_QUERY="$TMP_DIR/onebrc_bench.ibex"
 COMPILED_RUNNER="$TMP_DIR/compiled_runner.sh"
 
 cat > "$BENCH_QUERY" <<'EOF'
-extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool) -> DataFrame from "csv.hpp";
 
-let measurements = read_csv("__CACHE__", "", ";");
+let measurements = read_csv("__INPUT__", "", ";", false)
+    [select { station = col1, temp = col2 }];
 let summary = measurements[select {
     min_temp = min(temp),
     avg_temp = mean(temp),
@@ -117,12 +110,12 @@ let summary = measurements[select {
 summary;
 EOF
 
-python3 - <<'PY' "$BENCH_QUERY" "$CACHE"
+python3 - <<'PY' "$BENCH_QUERY" "$INPUT"
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
 input_path = sys.argv[2].replace("\\", "\\\\").replace('"', '\\"')
-path.write_text(path.read_text().replace("__CACHE__", input_path))
+path.write_text(path.read_text().replace("__INPUT__", input_path))
 PY
 
 printf ':load %s\n:q\n' "$BENCH_QUERY" > "$REPL_INPUT"

@@ -32,6 +32,7 @@ target_link_libraries(ibex_bench
         Ibex::CompilerOptions
         CLI11::CLI11
         fmt::fmt
+        fast_float
 )
 
 # zorro.hpp (included via rng.hpp) uses compile-time SIMD dispatch.

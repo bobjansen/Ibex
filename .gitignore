@@ -43,3 +43,5 @@ benchmarking/aws/.config
 
 .claude
 .codex
+
+examples/measurements*.txt

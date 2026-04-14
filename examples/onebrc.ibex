@@ -1,0 +1,13 @@
+// 1BRC-style aggregation over a staged headered semicolon-delimited file.
+//
+// scripts/bench-1brc.sh prepares examples/.cache/measurements_1brc.csv by
+// prepending the required `station;temp` header to the raw 1BRC data file.
+extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
+
+let measurements = read_csv("examples/.cache/measurements_1brc.csv", "", ";");
+
+measurements[select {
+    min_temp = min(temp),
+    avg_temp = mean(temp),
+    max_temp = max(temp)
+}, by station, order station];

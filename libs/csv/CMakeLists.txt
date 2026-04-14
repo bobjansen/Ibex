@@ -17,6 +17,7 @@ target_link_libraries(ibex_csv_plugin
     PRIVATE
         Ibex::runtime
         Ibex::CompilerOptions
+        fast_float
 )
 
 if(TARGET Ibex::Sanitizers)

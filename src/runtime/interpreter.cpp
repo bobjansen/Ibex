@@ -1575,6 +1575,17 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
     return output;
 }
 
+auto columns_table(const Table& input) -> std::expected<Table, std::string> {
+    Table output;
+    Column<std::string> names;
+    names.reserve(input.columns.size());
+    for (const auto& entry : input.columns) {
+        names.push_back(entry.name);
+    }
+    output.add_column("name", std::move(names));
+    return output;
+}
+
 struct Key {
     std::vector<ScalarValue> values;
 };
@@ -6514,6 +6525,16 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             sorted->time_index = atf.column();
             normalize_time_index(*sorted);
             return sorted;
+        }
+        case ir::NodeKind::Columns: {
+            if (node.children().empty()) {
+                return std::unexpected("columns node missing child");
+            }
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child.has_value()) {
+                return child;
+            }
+            return columns_table(child.value());
         }
         case ir::NodeKind::ExternCall: {
             const auto& ec = static_cast<const ir::ExternCallNode&>(node);

@@ -41,4 +41,5 @@ benchmarking/aws/.config
 .venv/
 **/__pycache__/**
 
+.claude
 .codex

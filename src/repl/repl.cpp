@@ -956,6 +956,31 @@ auto extract_compile_time_string_list(const parser::Expr& expr)
     return values;
 }
 
+auto extract_compile_time_string_list(const runtime::Table& table)
+    -> std::optional<std::vector<std::string>> {
+    if (table.columns.size() != 1 || table.columns.front().name != "name") {
+        return std::nullopt;
+    }
+    const auto& entry = table.columns.front();
+    const auto* names = std::get_if<ibex::Column<std::string>>(entry.column.get());
+    if (names == nullptr) {
+        return std::nullopt;
+    }
+    if (entry.validity.has_value()) {
+        for (std::size_t row = 0; row < names->size(); ++row) {
+            if (!(*entry.validity)[row]) {
+                return std::nullopt;
+            }
+        }
+    }
+    std::vector<std::string> values;
+    values.reserve(names->size());
+    for (const auto& value : *names) {
+        values.push_back(std::string(value));
+    }
+    return values;
+}
+
 auto lookup_model_binding(const parser::CallExpr& call, const ModelRegistry& models)
     -> std::expected<const runtime::ModelResult*, std::string> {
     if (call.args.size() != 1 || !call.named_args.empty()) {
@@ -1662,8 +1687,15 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 if (auto err = validate_table_type(value.value(), *let_stmt.type)) {
                     return std::unexpected("type error: '" + let_stmt.name + "': " + *err);
                 }
-                local_tables.insert_or_assign(let_stmt.name, std::move(value.value()));
-                local_compile_time_lists.erase(let_stmt.name);
+                auto table_value = std::move(value.value());
+                auto compile_time_list = extract_compile_time_string_list(table_value);
+                local_tables.insert_or_assign(let_stmt.name, std::move(table_value));
+                if (compile_time_list.has_value()) {
+                    local_compile_time_lists.insert_or_assign(let_stmt.name,
+                                                              std::move(*compile_time_list));
+                } else {
+                    local_compile_time_lists.erase(let_stmt.name);
+                }
                 if (has_model_result(model_value)) {
                     local_models.insert_or_assign(let_stmt.name, std::move(model_value));
                 } else {
@@ -1712,9 +1744,15 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     local_compile_time_lists.erase(let_stmt.name);
                     local_models.erase(let_stmt.name);
                 } else {
-                    local_tables.insert_or_assign(
-                        let_stmt.name, std::get<runtime::Table>(std::move(value.value())));
-                    local_compile_time_lists.erase(let_stmt.name);
+                    auto table_value = std::get<runtime::Table>(std::move(value.value()));
+                    auto compile_time_list = extract_compile_time_string_list(table_value);
+                    local_tables.insert_or_assign(let_stmt.name, std::move(table_value));
+                    if (compile_time_list.has_value()) {
+                        local_compile_time_lists.insert_or_assign(let_stmt.name,
+                                                                  std::move(*compile_time_list));
+                    } else {
+                        local_compile_time_lists.erase(let_stmt.name);
+                    }
                     if (has_model_result(model_value)) {
                         local_models.insert_or_assign(let_stmt.name, std::move(model_value));
                     } else {
@@ -1998,8 +2036,15 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         fmt::print("error: '{}': {}\n", let_stmt.name, *err);
                         return false;
                     }
-                    tables.insert_or_assign(let_stmt.name, std::move(value.value()));
-                    compile_time_lists.erase(let_stmt.name);
+                    auto table_value = std::move(value.value());
+                    auto compile_time_list = extract_compile_time_string_list(table_value);
+                    tables.insert_or_assign(let_stmt.name, std::move(table_value));
+                    if (compile_time_list.has_value()) {
+                        compile_time_lists.insert_or_assign(let_stmt.name,
+                                                            std::move(*compile_time_list));
+                    } else {
+                        compile_time_lists.erase(let_stmt.name);
+                    }
                     if (has_model_result(model_value)) {
                         models.insert_or_assign(let_stmt.name, std::move(model_value));
                     } else {
@@ -2059,9 +2104,15 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 compile_time_lists.erase(let_stmt.name);
                 models.erase(let_stmt.name);
             } else {
-                tables.insert_or_assign(let_stmt.name,
-                                        std::get<runtime::Table>(std::move(value.value())));
-                compile_time_lists.erase(let_stmt.name);
+                auto table_value = std::get<runtime::Table>(std::move(value.value()));
+                auto compile_time_list = extract_compile_time_string_list(table_value);
+                tables.insert_or_assign(let_stmt.name, std::move(table_value));
+                if (compile_time_list.has_value()) {
+                    compile_time_lists.insert_or_assign(let_stmt.name,
+                                                        std::move(*compile_time_list));
+                } else {
+                    compile_time_lists.erase(let_stmt.name);
+                }
                 if (has_model_result(model_value)) {
                     models.insert_or_assign(let_stmt.name, std::move(model_value));
                 } else {

@@ -169,53 +169,12 @@ train_work[select { rows = count() }];
 
 ## Define the Feature Families
 
-```{r feature-query}
-price_cols <- c("reference_price", "far_price", "near_price", "ask_price", "bid_price", "wap")
-
-base_features <- c(
-  "seconds_in_bucket",
-  "imbalance_buy_sell_flag",
-  "imbalance_size",
-  "matched_size",
-  "bid_size",
-  "ask_size",
-  "reference_price",
-  "far_price",
-  "near_price",
-  "ask_price",
-  "bid_price",
-  "wap",
-  "imb_s1",
-  "imb_s2"
-)
-
-pair_feature_names <- apply(
-  combn(price_cols, 2),
-  2,
-  \(cols) sprintf("%s_%s_imb", cols[[2]], cols[[1]])
-)
-
-triple_feature_names <- apply(
-  combn(price_cols, 3),
-  2,
-  \(cols) sprintf("%s_%s_%s_imb2", cols[[3]], cols[[2]], cols[[1]])
-)
-
-feature_cols <- c(
-  base_features,
-  pair_feature_names,
-  triple_feature_names
-)
-
-length(feature_cols)
-```
-
 ## Materialize the Feature Table
 
 ```{ibex features, session="optiver", assign="train_features", quiet=TRUE}
 let price_cols = ["reference_price", "far_price", "near_price", "ask_price", "bid_price", "wap"];
 
-train_work[update {
+let train_features = train_work[update {
     imb_s1 = (bid_size - ask_size) / (bid_size + ask_size),
     imb_s2 = (imbalance_size - matched_size) / (matched_size + imbalance_size),
     map (i, a) in price_cols, (j, b) in price_cols
@@ -233,6 +192,8 @@ train_work[update {
                 pmin(get(a), get(b), get(c))
             )
 }];
+
+train_features;
 ```
 
 ```{ibex features-rows, session="optiver"}
@@ -254,6 +215,21 @@ train_features[select {
     imb_s1,
     imb_s2
 }];
+```
+
+```{ibex feature-columns, session="optiver", assign="feature_cols_tbl", quiet=TRUE}
+columns(train_features)[filter
+    name != "row_id" &&
+    name != "stock_id" &&
+    name != "date_id" &&
+    name != "time_id" &&
+    name != "target"
+];
+```
+
+```{r feature-query}
+feature_cols <- feature_cols_tbl$name
+length(feature_cols)
 ```
 
 ## Prepare the Training Matrix

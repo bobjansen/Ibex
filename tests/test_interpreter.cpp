@@ -169,6 +169,28 @@ trades[
     REQUIRE(avg_fee[1] == Catch::Approx(5.0));
 }
 
+TEST_CASE("Interpret columns returns one-column metadata table") {
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{"A", "B"});
+    table.add_column("price", Column<double>{10.0, 20.0});
+    table.add_column("qty", Column<std::int64_t>{1, 2});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("columns(trades);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->columns.size() == 1);
+    REQUIRE(result->columns[0].name == "name");
+
+    const auto& names = std::get<Column<std::string>>(*result->find("name"));
+    REQUIRE(names.size() == 3);
+    REQUIRE(names[0] == "symbol");
+    REQUIRE(names[1] == "price");
+    REQUIRE(names[2] == "qty");
+}
+
 TEST_CASE("Interpret update with arithmetic") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{1, 2, 3});

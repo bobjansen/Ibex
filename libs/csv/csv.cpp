@@ -16,14 +16,27 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
         "read_csv",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
-            if (args.size() != 1 && args.size() != 2) {
-                return std::unexpected("read_csv() expects 1 or 2 arguments");
+            if (args.size() != 1 && args.size() != 2 && args.size() != 3) {
+                return std::unexpected("read_csv() expects 1, 2, or 3 arguments");
             }
             const auto* path = std::get_if<std::string>(&args[0]);
             if (path == nullptr) {
                 return std::unexpected("read_csv() expects a string path");
             }
             try {
+                if (args.size() == 3) {
+                    const auto* null_spec = std::get_if<std::string>(&args[1]);
+                    if (null_spec == nullptr) {
+                        return std::unexpected(
+                            "read_csv(path, nulls, delimiter) expects a string null spec");
+                    }
+                    const auto* delimiter = std::get_if<std::string>(&args[2]);
+                    if (delimiter == nullptr) {
+                        return std::unexpected(
+                            "read_csv(path, nulls, delimiter) expects a string delimiter");
+                    }
+                    return ibex::runtime::ExternValue{read_csv(*path, *null_spec, *delimiter)};
+                }
                 if (args.size() == 2) {
                     const auto* null_spec = std::get_if<std::string>(&args[1]);
                     if (null_spec == nullptr) {

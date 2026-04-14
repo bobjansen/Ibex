@@ -36,6 +36,7 @@ namespace {
 struct CsvReadOptions {
     bool null_if_empty = false;
     std::unordered_set<std::string> null_tokens;
+    char delimiter = ',';
 };
 
 inline auto csv_trim(std::string_view text) -> std::string_view {
@@ -71,6 +72,13 @@ inline auto csv_parse_null_spec(std::string_view spec) -> CsvReadOptions {
     return options;
 }
 
+inline auto csv_parse_delimiter(std::string_view spec) -> char {
+    if (spec.size() != 1) {
+        throw std::runtime_error("read_csv: delimiter must be a single character");
+    }
+    return spec.front();
+}
+
 inline auto csv_try_int(const std::string& text, std::int64_t& out) -> bool {
     const char* begin = text.data();
     const char* end = text.data() + text.size();
@@ -104,8 +112,8 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     }
 
     rapidcsv::Document doc(path_string,
-                           rapidcsv::LabelParams(0, -1),   // row 0 = header, no row-index column
-                           rapidcsv::SeparatorParams(',')  // handles RFC 4180 quoting
+                           rapidcsv::LabelParams(0, -1),  // row 0 = header, no row-index column
+                           rapidcsv::SeparatorParams(options.delimiter)  // handles RFC 4180 quoting
     );
 
     auto col_names = doc.GetColumnNames();
@@ -261,6 +269,13 @@ inline auto read_csv(std::string_view path) -> ibex::runtime::Table {
 
 inline auto read_csv(std::string_view path, std::string_view null_spec) -> ibex::runtime::Table {
     return read_csv_with_options(path, csv_parse_null_spec(null_spec));
+}
+
+inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter)
+    -> ibex::runtime::Table {
+    auto options = csv_parse_null_spec(null_spec);
+    options.delimiter = csv_parse_delimiter(delimiter);
+    return read_csv_with_options(path, options);
 }
 
 namespace {

@@ -1,6 +1,7 @@
 *_cache/**
 catboost_info/**
-*.pdf
+*.html
 *.json
+*.pdf
 *.tfevents
 *.tsv

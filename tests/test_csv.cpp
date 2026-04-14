@@ -219,6 +219,47 @@ TEST_CASE("Read CSV - no-header mode numbers columns and infers types") {
     REQUIRE((*temp)[1] == Catch::Approx(-1.0));
 }
 
+TEST_CASE("Read CSV - schema hint forces categorical and double types") {
+    auto path = tmp("ibex_test_schema_hint.csv");
+    write_csv(path, "Amsterdam;12.5\nBerlin;-1.0\nAmsterdam;3.25\n");
+
+    auto table = read_csv(path.string(), "", ";", false, "cat,f64");
+    REQUIRE(table.rows() == 3);
+    const auto* stations = std::get_if<ibex::Column<ibex::Categorical>>(table.find("col1"));
+    REQUIRE(stations != nullptr);
+    REQUIRE(stations->size() == 3);
+    REQUIRE(std::string((*stations)[0]) == "Amsterdam");
+    REQUIRE(std::string((*stations)[2]) == "Amsterdam");
+
+    const auto* temp = std::get_if<ibex::Column<double>>(table.find("col2"));
+    REQUIRE(temp != nullptr);
+    REQUIRE((*temp)[0] == Catch::Approx(12.5));
+    REQUIRE((*temp)[1] == Catch::Approx(-1.0));
+    REQUIRE((*temp)[2] == Catch::Approx(3.25));
+}
+
+TEST_CASE("Read CSV - schema hint named columns override inference") {
+    auto path = tmp("ibex_test_schema_hint_named.csv");
+    write_csv(path, "id,code\n1,100\n2,200\n3,300\n");
+
+    auto table = read_csv(path.string(), "", ",", true, "code:str");
+    const auto* codes = std::get_if<ibex::Column<std::string>>(table.find("code"));
+    REQUIRE(codes != nullptr);
+    REQUIRE((*codes)[0] == "100");
+    REQUIRE((*codes)[2] == "300");
+    // id has no hint — falls through to inference and becomes int64.
+    const auto* ids = std::get_if<ibex::Column<std::int64_t>>(table.find("id"));
+    REQUIRE(ids != nullptr);
+    REQUIRE((*ids)[1] == 2);
+}
+
+TEST_CASE("Read CSV - schema hint parse failure throws") {
+    auto path = tmp("ibex_test_schema_hint_fail.csv");
+    write_csv(path, "x\nnot_a_number\n");
+
+    REQUIRE_THROWS_AS(read_csv(path.string(), "", ",", true, "f64"), std::runtime_error);
+}
+
 // ---------------------------------------------------------------------------
 // write_csv tests
 // ---------------------------------------------------------------------------

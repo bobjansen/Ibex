@@ -16,14 +16,42 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
         "read_csv",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
-            if (args.size() != 1 && args.size() != 2 && args.size() != 3 && args.size() != 4) {
-                return std::unexpected("read_csv() expects 1, 2, 3, or 4 arguments");
+            if (args.size() < 1 || args.size() > 5) {
+                return std::unexpected("read_csv() expects 1 to 5 arguments");
             }
             const auto* path = std::get_if<std::string>(&args[0]);
             if (path == nullptr) {
                 return std::unexpected("read_csv() expects a string path");
             }
             try {
+                if (args.size() == 5) {
+                    const auto* null_spec = std::get_if<std::string>(&args[1]);
+                    if (null_spec == nullptr) {
+                        return std::unexpected(
+                            "read_csv(path, nulls, delimiter, has_header, schema) expects a "
+                            "string null spec");
+                    }
+                    const auto* delimiter = std::get_if<std::string>(&args[2]);
+                    if (delimiter == nullptr) {
+                        return std::unexpected(
+                            "read_csv(path, nulls, delimiter, has_header, schema) expects a "
+                            "string delimiter");
+                    }
+                    const auto* has_header = std::get_if<bool>(&args[3]);
+                    if (has_header == nullptr) {
+                        return std::unexpected(
+                            "read_csv(path, nulls, delimiter, has_header, schema) expects a bool "
+                            "has_header flag");
+                    }
+                    const auto* schema = std::get_if<std::string>(&args[4]);
+                    if (schema == nullptr) {
+                        return std::unexpected(
+                            "read_csv(path, nulls, delimiter, has_header, schema) expects a "
+                            "string schema");
+                    }
+                    return ibex::runtime::ExternValue{
+                        read_csv(*path, *null_spec, *delimiter, *has_header, *schema)};
+                }
                 if (args.size() == 4) {
                     const auto* null_spec = std::get_if<std::string>(&args[1]);
                     if (null_spec == nullptr) {

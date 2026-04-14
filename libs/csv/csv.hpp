@@ -35,6 +35,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -56,11 +57,30 @@
 
 namespace {
 
+enum class CsvColumnKind : std::uint8_t {
+    Infer,
+    Int,
+    Double,
+    String,
+    Categorical,
+};
+
+struct CsvSchemaEntry {
+    std::optional<std::string> name;  // set if the entry was written as `name:type`
+    CsvColumnKind kind = CsvColumnKind::Infer;
+};
+
+struct CsvSchemaHint {
+    std::vector<CsvSchemaEntry> entries;
+    [[nodiscard]] auto empty() const noexcept -> bool { return entries.empty(); }
+};
+
 struct CsvReadOptions {
     bool null_if_empty = false;
     std::unordered_set<std::string> null_tokens;
     char delimiter = ',';
     bool has_header = true;
+    CsvSchemaHint schema;
 };
 
 inline auto csv_trim(std::string_view text) -> std::string_view {
@@ -101,6 +121,55 @@ inline auto csv_parse_delimiter(std::string_view spec) -> char {
         throw std::runtime_error("read_csv: delimiter must be a single character");
     }
     return spec.front();
+}
+
+inline auto csv_parse_column_kind(std::string_view type_str) -> CsvColumnKind {
+    if (type_str == "i64" || type_str == "int") {
+        return CsvColumnKind::Int;
+    }
+    if (type_str == "f64" || type_str == "double" || type_str == "float") {
+        return CsvColumnKind::Double;
+    }
+    if (type_str == "str" || type_str == "string") {
+        return CsvColumnKind::String;
+    }
+    if (type_str == "cat" || type_str == "categorical") {
+        return CsvColumnKind::Categorical;
+    }
+    throw std::runtime_error("read_csv: unknown schema type '" + std::string(type_str) + "'");
+}
+
+inline auto csv_parse_schema(std::string_view spec) -> CsvSchemaHint {
+    CsvSchemaHint hint;
+    if (spec.empty()) {
+        return hint;
+    }
+    std::size_t pos = 0;
+    while (pos <= spec.size()) {
+        std::size_t comma = spec.find(',', pos);
+        if (comma == std::string_view::npos) {
+            comma = spec.size();
+        }
+        auto token = csv_trim(spec.substr(pos, comma - pos));
+        if (!token.empty()) {
+            CsvSchemaEntry entry;
+            const auto colon = token.find(':');
+            std::string_view type_str;
+            if (colon != std::string_view::npos) {
+                entry.name = std::string(csv_trim(token.substr(0, colon)));
+                type_str = csv_trim(token.substr(colon + 1));
+            } else {
+                type_str = token;
+            }
+            entry.kind = csv_parse_column_kind(type_str);
+            hint.entries.push_back(std::move(entry));
+        }
+        if (comma == spec.size()) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return hint;
 }
 
 /// Owns the source buffer for a CSV read.  Uses mmap on POSIX when the input
@@ -382,10 +451,28 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     ibex::runtime::Table table;
     constexpr double kMaxCategoricalRatio = 0.10;
 
+    // Resolve a schema hint for column `c`/`name`: match by name if any
+    // entries were written as `name:type`, otherwise by position.
+    auto resolve_hint = [&](std::size_t idx, const std::string& name) -> CsvColumnKind {
+        if (options.schema.empty()) {
+            return CsvColumnKind::Infer;
+        }
+        for (const auto& entry : options.schema.entries) {
+            if (entry.name && *entry.name == name) {
+                return entry.kind;
+            }
+        }
+        if (idx < options.schema.entries.size() && !options.schema.entries[idx].name) {
+            return options.schema.entries[idx].kind;
+        }
+        return CsvColumnKind::Infer;
+    };
+
     for (std::size_t c = 0; c < columns.size(); ++c) {
         const auto& vals = columns[c];
         const auto& name = col_names[c];
         const std::size_t n = vals.size();
+        const CsvColumnKind hint = resolve_hint(c, name);
 
         ibex::runtime::ValidityBitmap validity;
         bool has_nulls = false;
@@ -411,6 +498,103 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
         auto is_null = [&](std::size_t i) -> bool {
             return need_null_check && !validity[i];
         };
+
+        // Schema-hinted fast path: parse directly to the declared type, skip
+        // inference probes, and throw on parse failure.
+        if (hint != CsvColumnKind::Infer) {
+            if (hint == CsvColumnKind::Int) {
+                ibex::Column<std::int64_t> col;
+                col.reserve(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (is_null(i)) {
+                        col.push_back(0);
+                        continue;
+                    }
+                    std::int64_t iv{};
+                    if (!csv_try_int(vals[i], iv)) {
+                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                                                 std::to_string(i) + " failed to parse as i64");
+                    }
+                    col.push_back(iv);
+                }
+                if (has_nulls) {
+                    table.add_column(name, std::move(col), std::move(validity));
+                } else {
+                    table.add_column(name, std::move(col));
+                }
+                continue;
+            }
+            if (hint == CsvColumnKind::Double) {
+                ibex::Column<double> col;
+                col.reserve(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (is_null(i)) {
+                        col.push_back(0.0);
+                        continue;
+                    }
+                    double dv{};
+                    if (!csv_try_double(vals[i], dv)) {
+                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                                                 std::to_string(i) + " failed to parse as f64");
+                    }
+                    col.push_back(dv);
+                }
+                if (has_nulls) {
+                    table.add_column(name, std::move(col), std::move(validity));
+                } else {
+                    table.add_column(name, std::move(col));
+                }
+                continue;
+            }
+            if (hint == CsvColumnKind::Categorical) {
+                std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
+                codes.reserve(n);
+                std::vector<std::string> dict;
+                std::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type>
+                    index;
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (is_null(i)) {
+                        codes.push_back(0);
+                        continue;
+                    }
+                    const auto sv = vals[i];
+                    auto it = index.find(sv);
+                    if (it != index.end()) {
+                        codes.push_back(it->second);
+                        continue;
+                    }
+                    auto code =
+                        static_cast<ibex::Column<ibex::Categorical>::code_type>(dict.size());
+                    dict.emplace_back(sv);
+                    index.emplace(dict.back(), code);
+                    codes.push_back(code);
+                }
+                ibex::Column<ibex::Categorical> col(std::move(dict), std::move(codes));
+                if (has_nulls) {
+                    table.add_column(name, std::move(col), std::move(validity));
+                } else {
+                    table.add_column(name, std::move(col));
+                }
+                continue;
+            }
+            // CsvColumnKind::String — skip numeric probes and categorical
+            // promotion entirely.
+            ibex::Column<std::string> col;
+            col.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (is_null(i)) {
+                    col.push_back(std::string_view{});
+                } else {
+                    col.push_back(vals[i]);
+                }
+            }
+            if (has_nulls) {
+                table.add_column(name, std::move(col), std::move(validity));
+            } else {
+                table.add_column(name, std::move(col));
+            }
+            continue;
+        }
 
         // Try int64 with a fused build pass: if every non-null value parses,
         // we keep the built column directly.
@@ -550,6 +734,15 @@ inline auto read_csv(std::string_view path, std::string_view null_spec, std::str
     auto options = csv_parse_null_spec(null_spec);
     options.delimiter = csv_parse_delimiter(delimiter);
     options.has_header = has_header;
+    return read_csv_with_options(path, options);
+}
+
+inline auto read_csv(std::string_view path, std::string_view null_spec, std::string_view delimiter,
+                     bool has_header, std::string_view schema) -> ibex::runtime::Table {
+    auto options = csv_parse_null_spec(null_spec);
+    options.delimiter = csv_parse_delimiter(delimiter);
+    options.has_header = has_header;
+    options.schema = csv_parse_schema(schema);
     return read_csv_with_options(path, options);
 }
 

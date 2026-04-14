@@ -448,10 +448,88 @@ auto build_model_result(const std::vector<std::string>& col_names,
     };
 }
 
+auto promote_numeric_scalar(const ScalarValue& value) -> std::optional<double> {
+    if (const auto* dv = std::get_if<double>(&value)) {
+        return *dv;
+    }
+    if (const auto* iv = std::get_if<std::int64_t>(&value)) {
+        return static_cast<double>(*iv);
+    }
+    return std::nullopt;
+}
+
+auto eval_model_param_scalar(const ir::Expr& expr, const ScalarRegistry* scalars)
+    -> std::expected<ScalarValue, std::string> {
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        return std::visit([](const auto& value) -> ScalarValue { return ScalarValue{value}; },
+                          lit->value);
+    }
+
+    if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node)) {
+        if (scalars == nullptr) {
+            return std::unexpected("unknown scalar binding '" + ref->name + "'");
+        }
+        auto it = scalars->find(ref->name);
+        if (it == scalars->end()) {
+            return std::unexpected("unknown scalar binding '" + ref->name + "'");
+        }
+        return it->second;
+    }
+
+    if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        auto left = eval_model_param_scalar(*bin->left, scalars);
+        if (!left.has_value()) {
+            return std::unexpected(left.error());
+        }
+        auto right = eval_model_param_scalar(*bin->right, scalars);
+        if (!right.has_value()) {
+            return std::unexpected(right.error());
+        }
+        auto lhs = promote_numeric_scalar(*left);
+        auto rhs = promote_numeric_scalar(*right);
+        if (!lhs.has_value() || !rhs.has_value()) {
+            return std::unexpected("model parameter arithmetic expects numeric scalar values");
+        }
+
+        const bool both_int = std::holds_alternative<std::int64_t>(*left) &&
+                              std::holds_alternative<std::int64_t>(*right);
+        switch (bin->op) {
+            case ir::ArithmeticOp::Add:
+                if (both_int) {
+                    return ScalarValue{std::get<std::int64_t>(*left) +
+                                       std::get<std::int64_t>(*right)};
+                }
+                return ScalarValue{*lhs + *rhs};
+            case ir::ArithmeticOp::Sub:
+                if (both_int) {
+                    return ScalarValue{std::get<std::int64_t>(*left) -
+                                       std::get<std::int64_t>(*right)};
+                }
+                return ScalarValue{*lhs - *rhs};
+            case ir::ArithmeticOp::Mul:
+                if (both_int) {
+                    return ScalarValue{std::get<std::int64_t>(*left) *
+                                       std::get<std::int64_t>(*right)};
+                }
+                return ScalarValue{*lhs * *rhs};
+            case ir::ArithmeticOp::Div:
+                return ScalarValue{*lhs / *rhs};
+            case ir::ArithmeticOp::Mod:
+                if (!both_int) {
+                    return std::unexpected("model parameter modulo expects Int scalar values");
+                }
+                return ScalarValue{std::get<std::int64_t>(*left) % std::get<std::int64_t>(*right)};
+        }
+    }
+
+    return std::unexpected(
+        "model parameter must be a literal, scalar binding, or numeric scalar expression");
+}
+
 }  // namespace
 
 auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::string& method,
-               const std::vector<ir::ModelParamSpec>& params, const ScalarRegistry* /*scalars*/,
+               const std::vector<ir::ModelParamSpec>& params, const ScalarRegistry* scalars,
                const ExternRegistry* externs) -> std::expected<ModelResult, std::string> {
     auto matrix = build_model_matrix(input, formula);
     if (!matrix) {
@@ -485,12 +563,14 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
         double lambda = 1.0;
         for (const auto& param : params) {
             if (param.name == "lambda") {
-                if (const auto* lit = std::get_if<ir::Literal>(&param.value.node)) {
-                    if (const auto* dv = std::get_if<double>(&lit->value)) {
-                        lambda = *dv;
-                    } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
-                        lambda = static_cast<double>(*iv);
-                    }
+                auto scalar = eval_model_param_scalar(param.value, scalars);
+                if (!scalar.has_value()) {
+                    return std::unexpected("ridge: " + scalar.error());
+                }
+                if (const auto numeric = promote_numeric_scalar(*scalar); numeric.has_value()) {
+                    lambda = *numeric;
+                } else {
+                    return std::unexpected("ridge: lambda must be a numeric scalar");
                 }
             }
         }
@@ -569,26 +649,15 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
                     continue;
                 }
                 plugin_args.emplace_back(ScalarValue{param.name});
-                if (const auto* lit = std::get_if<ir::Literal>(&param.value.node)) {
-                    if (const auto* dv = std::get_if<double>(&lit->value)) {
-                        plugin_args.emplace_back(ScalarValue{*dv});
-                    } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
-                        plugin_args.emplace_back(ScalarValue{*iv});
-                    } else if (const auto* sv = std::get_if<std::string>(&lit->value)) {
-                        plugin_args.emplace_back(ScalarValue{*sv});
-                    } else if (const auto* date = std::get_if<Date>(&lit->value)) {
-                        plugin_args.emplace_back(ScalarValue{*date});
-                    } else if (const auto* ts = std::get_if<Timestamp>(&lit->value)) {
-                        plugin_args.emplace_back(ScalarValue{*ts});
-                    } else {
-                        return std::unexpected("model: unsupported literal parameter type for '" +
-                                               param.name + "'");
-                    }
+                auto scalar = eval_model_param_scalar(param.value, scalars);
+                if (scalar.has_value()) {
+                    plugin_args.emplace_back(std::move(*scalar));
                 } else if (const auto* ref = std::get_if<ir::ColumnRef>(&param.value.node)) {
                     plugin_args.emplace_back(ScalarValue{std::string("column:") + ref->name});
                 } else {
-                    return std::unexpected("model: plugin parameter '" + param.name +
-                                           "' must be a literal or column reference");
+                    return std::unexpected(
+                        "model: plugin parameter '" + param.name +
+                        "' must be a scalar, scalar binding, or column reference");
                 }
             }
 

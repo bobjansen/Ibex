@@ -214,7 +214,7 @@ train_features[select {
     wap,
     imb_s1,
     imb_s2
-}];
+}][head 10];
 ```
 
 ```{ibex feature-columns, session="optiver", assign="feature_cols_tbl", quiet=TRUE}

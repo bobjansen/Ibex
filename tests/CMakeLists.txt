@@ -18,6 +18,7 @@ set(IBEX_TEST_SOURCES
     test_interpreter.cpp
     test_codegen.cpp
     test_join.cpp
+    test_operator.cpp
 )
 if(NOT WIN32)
     list(APPEND IBEX_TEST_SOURCES test_websocket.cpp)

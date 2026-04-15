@@ -5071,7 +5071,21 @@ TEST_CASE("model: dummy encoding for string columns", "[model]") {
 
     const auto& terms = std::get<Column<std::string>>(*result->find("term"));
     REQUIRE(std::string(terms[0]) == "(intercept)");
-    // The dummy columns should be region_West and region_North (East is reference)
+    REQUIRE(std::string(terms[1]) == "region_West");
+    REQUIRE(std::string(terms[2]) == "region_North");
+}
+
+TEST_CASE("model: error on missing predictor column", "[model]") {
+    runtime::Table t;
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("column not found") != std::string::npos);
 }
 
 TEST_CASE("model: error on unknown method", "[model]") {
@@ -5099,4 +5113,93 @@ TEST_CASE("model: error on missing response column", "[model]") {
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("response column not found") != std::string::npos);
+}
+
+TEST_CASE("model: error on non-numeric response column", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<std::string>{"a", "b", "c", "d", "e"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("must be numeric") != std::string::npos);
+}
+
+TEST_CASE("model: interaction term rejects non-numeric columns", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("region", Column<std::string>{"East", "West", "North", "East", "West"});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x:region, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("interaction term requires numeric columns") != std::string::npos);
+}
+
+TEST_CASE("model: error when observations do not exceed parameters", "[model]") {
+    runtime::Table t;
+    t.add_column("x1", Column<double>{1.0, 2.0, 3.0});
+    t.add_column("x2", Column<double>{4.0, 5.0, 6.0});
+    t.add_column("x3", Column<double>{7.0, 8.0, 9.0});
+    t.add_column("y", Column<double>{1.0, 2.0, 3.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x1 + x2 + x3, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("need more observations") != std::string::npos);
+}
+
+TEST_CASE("model: error on rank-deficient design matrix", "[model]") {
+    runtime::Table t;
+    t.add_column("x1", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("x2", Column<double>{2.0, 4.0, 6.0, 8.0, 10.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x1 + x2, method = ols }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("rank-deficient") != std::string::npos);
+}
+
+TEST_CASE("model: WLS requires weights parameter", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = wls }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("requires weights parameter") != std::string::npos);
+}
+
+TEST_CASE("model: WLS errors on missing weights column", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = wls, weights = w }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("wls:") != std::string::npos);
+    REQUIRE(result.error().find("not found") != std::string::npos);
 }

@@ -30,8 +30,9 @@
     <h1>CSV and Parquet I/O</h1>
     <p class="lead">
       Ibex keeps file I/O in plugins, not in core syntax. That means CSV and
-      Parquet read/write functions behave like normal <code>extern fn</code>
-      calls in scripts, the REPL, notebooks, and transpiled binaries.
+      Parquet read/write functions are loaded with <code>import</code> and then
+      called like any other function in scripts, the REPL, notebooks, and
+      transpiled binaries.
     </p>
     <div class="cta-row">
       <a class="button primary" href="./index.html">Back to docs</a>
@@ -64,21 +65,17 @@
 
   <section class="section">
     <p class="section-label">Import pattern</p>
-    <h2>Declare I/O with extern functions</h2>
+    <h2>Import bundled I/O plugins</h2>
     <article class="card">
       <p>
-        The common pattern is to declare the plugin entry points you use and
-        then treat them like any other function.
+        The common pattern is to import the bundled plugin modules you need and
+        then call their functions directly.
       </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
-    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
-<span class="kw">extern fn</span> <span class="fn-name">write_csv</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="kw">extern fn</span> <span class="fn-name">read_parquet</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
-    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
-<span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;</code></pre>
+<span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
+<span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);</code></pre>
     </article>
   </section>
 
@@ -93,8 +90,7 @@
           <code>Int64</code>, <code>Float64</code>, or string/categorical
           columns, and returns a <code>DataFrame</code>.
         </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
-    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);</code></pre>
       </article>
@@ -104,8 +100,7 @@
           Pass a comma-separated null specification. <code>&lt;empty&gt;</code>
           means empty fields should be treated as nulls too.
         </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String, <span class="fn-name">nulls</span>: String) -&gt; DataFrame
-    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="kw">let</span> train = <span class="fn-name">read_csv</span>(<span class="str">"train.csv"</span>, <span class="str">"&lt;empty&gt;,NA"</span>);</code></pre>
       </article>
@@ -118,11 +113,7 @@
           This is useful for semicolon-separated files or other non-comma
           dialects. Quoted commas are still preserved correctly.
         </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
-    <span class="fn-name">path</span>: String,
-    <span class="fn-name">nulls</span>: String,
-    <span class="fn-name">delimiter</span>: String
-) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"quotes.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>);</code></pre>
       </article>
@@ -133,12 +124,7 @@
           <code>col1</code>, <code>col2</code>, and so on. This is what the
           1BRC benchmark file uses.
         </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
-    <span class="fn-name">path</span>: String,
-    <span class="fn-name">nulls</span>: String,
-    <span class="fn-name">delimiter</span>: String,
-    <span class="fn-name">has_header</span>: Bool
-) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>)
     [<span class="kw">select</span> { station = col1, temp = col2 }];</code></pre>
@@ -151,13 +137,7 @@
         If you already know the CSV schema, pass it explicitly to skip most of
         the inference work. For large repeated loads, this is the right shape.
       </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
-    <span class="fn-name">path</span>: String,
-    <span class="fn-name">nulls</span>: String,
-    <span class="fn-name">delimiter</span>: String,
-    <span class="fn-name">has_header</span>: Bool,
-    <span class="fn-name">schema</span>: String
-) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="cm">// positional schema</span>
 <span class="kw">let</span> fast = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>);
@@ -177,8 +157,7 @@
         returns the number of data rows written. Nulls become empty fields and
         strings are quoted according to RFC 4180.
       </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">write_csv</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
 <span class="kw">let</span> summary = trades[
     <span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(price), rows = <span class="fn-name">count</span>() },
@@ -201,8 +180,7 @@
           want strong type preservation, compact files, and faster reloads than
           CSV.
         </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_parquet</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
-    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 
 <span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);</code></pre>
       </article>
@@ -213,8 +191,7 @@
           and categorical columns are stored as UTF-8. Dates and timestamps are
           preserved as typed Parquet columns.
         </p>
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 
 <span class="kw">let</span> n = <span class="fn-name">write_parquet</span>(prices, <span class="str">"out/prices.parquet"</span>);</code></pre>
       </article>

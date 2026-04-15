@@ -1,6 +1,6 @@
 // Join examples (inner + left + right + outer + semi + anti + cross)
 
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let iris = read_csv("data/iris.csv");
 let species_meta = read_csv("data/iris.csv");

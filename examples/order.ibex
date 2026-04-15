@@ -1,4 +1,4 @@
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let iris = read_csv("data/iris.csv");
 

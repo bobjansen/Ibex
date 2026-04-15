@@ -122,3 +122,6 @@ jobs:
         run: |
           find src include tests tools -name '*.cpp' -o -name '*.hpp' | \
             xargs ./scripts/clang-format.sh --dry-run --Werror
+
+      - name: Check bundled I/O examples use imports
+        run: ./scripts/check-bundled-io-imports.sh

@@ -204,7 +204,7 @@ grouped.plot(kind=<span class="str">"bar"</span>, x=<span class="str">"symbol"</
         </div>
         <div class="tour-code">
 <pre><code>%%ibex --quiet
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+import "csv";
 let train = read_csv(<span class="str">"../../kaggle/data/train.csv"</span>, <span class="str">"&lt;empty&gt;"</span>);
 
 %%ibex --as pandas --out bucket_summary
@@ -257,7 +257,7 @@ sess &lt;- create_session(
 session_eval(
   sess,
   <span class="str">'
-  extern fn read_csv(path: String, nulls: String) -&gt; DataFrame from "csv.hpp";
+  import "csv";
   let iris = read_csv("data/iris.csv", "");
   '</span>
 )
@@ -289,7 +289,7 @@ ggplot(summary, aes(Species, mean_sl)) +
           </p>
         </div>
         <div class="tour-code">
-<pre><code>extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool) -&gt; DataFrame from "csv.hpp";
+<pre><code>import "csv";
 
 let raw = read_csv("examples/measurements.txt", "", ";", false)
     [select { station = col1, temp = col2 }];</code></pre>
@@ -393,12 +393,9 @@ prices[
 ];
 
 <span class="cm">// Write results back to disk</span>
-<span class="kw">extern fn</span> <span class="fn-name">write_csv</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
-<span class="kw">extern fn</span> <span class="fn-name">write_json</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"json.hpp"</span>;
-<span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+<span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"json"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
 
 <span class="kw">let</span> n = <span class="fn-name">write_csv</span>(active, <span class="str">"out/active.csv"</span>);
 <span class="fn-name">write_json</span>(active, <span class="str">"out/active.json"</span>);

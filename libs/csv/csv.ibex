@@ -9,9 +9,13 @@
 //   read_csv(path: String, nulls: String) -> DataFrame
 //   read_csv(path: String, nulls: String, delimiter: String) -> DataFrame
 //   read_csv(path: String, nulls: String, delimiter: String, has_header: Bool) -> DataFrame
+//   read_csv(path: String, nulls: String, delimiter: String, has_header: Bool, schema: String)
+//       -> DataFrame
 //   write_csv(df: DataFrame, path: String) -> Int
 
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
 extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
 extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool) -> DataFrame from "csv.hpp";
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool, schema: String) -> DataFrame from "csv.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";

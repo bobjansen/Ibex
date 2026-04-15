@@ -7,19 +7,31 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 PATTERN='extern fn .* from "(csv|json|parquet)\.hpp";'
-TARGETS=(
-    docs/index.html
-    docs/io.html
-    INSTALL.md
-    examples
-)
+matches=""
 
-if ! command -v rg >/dev/null 2>&1; then
-    echo "error: ripgrep (rg) is required for scripts/check-bundled-io-imports.sh" >&2
-    exit 2
-fi
+check_file() {
+    local path="$1"
+    local found
+    found="$(grep -nE "$PATTERN" "$path" || true)"
+    if [[ -n "$found" ]]; then
+        if [[ -n "$matches" ]]; then
+            matches+=$'\n'
+        fi
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            matches+="${path}:${line}"$'\n'
+        done <<< "$found"
+    fi
+}
 
-matches="$(rg -n "$PATTERN" "${TARGETS[@]}" || true)"
+check_file "docs/index.html"
+check_file "docs/io.html"
+check_file "INSTALL.md"
+while IFS= read -r path; do
+    check_file "$path"
+done < <(find examples -type f | sort)
+
+matches="${matches%$'\n'}"
 if [[ -n "$matches" ]]; then
     echo "error: bundled I/O examples must prefer import declarations in user-facing docs/examples" >&2
     echo >&2

@@ -98,9 +98,13 @@ INTERPRETED_TIMES="$TMP_DIR/interpreted.txt"
 COMPILED_TIMES="$TMP_DIR/compiled.txt"
 POLARS_TIMES="$TMP_DIR/polars.txt"
 BENCH_QUERY="$TMP_DIR/onebrc_bench.ibex"
+INTERPRETED_RUNNER="$TMP_DIR/interpreted_runner.sh"
+INTERPRETED_MEMORY_RUNNER="$TMP_DIR/interpreted_memory_runner.sh"
 COMPILED_RUNNER="$TMP_DIR/compiled_runner.sh"
+COMPILED_MEMORY_RUNNER="$TMP_DIR/compiled_memory_runner.sh"
 POLARS_SCRIPT="$TMP_DIR/onebrc_polars.py"
 POLARS_RUNNER="$TMP_DIR/polars_runner.sh"
+POLARS_MEMORY_RUNNER="$TMP_DIR/polars_memory_runner.sh"
 UV_CACHE_DIR_BENCH="${UV_CACHE_DIR:-$TMP_DIR/uv-cache}"
 
 cat > "$BENCH_QUERY" <<'EOF'
@@ -125,6 +129,22 @@ path.write_text(path.read_text().replace("__INPUT__", input_path))
 PY
 
 printf ':load %s\n:q\n' "$BENCH_QUERY" > "$REPL_INPUT"
+
+cat > "$INTERPRETED_RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+for ((j = 0; j < $INNER_RUNS; ++j)); do
+    "$IBEX_REPL" --plugin-path "$IBEX_PLUGIN_DIR" < "$REPL_INPUT" >/dev/null
+done
+EOF
+chmod +x "$INTERPRETED_RUNNER"
+
+cat > "$INTERPRETED_MEMORY_RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+"$IBEX_REPL" --plugin-path "$IBEX_PLUGIN_DIR" < "$REPL_INPUT" >/dev/null
+EOF
+chmod +x "$INTERPRETED_MEMORY_RUNNER"
 
 detect_cxx_std_flag() {
     local candidate
@@ -194,6 +214,14 @@ done
 EOF
 chmod +x "$COMPILED_RUNNER"
 
+cat > "$COMPILED_MEMORY_RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$IBEX_ROOT"
+"$COMPILED_BIN" >/dev/null 2>/dev/null
+EOF
+chmod +x "$COMPILED_MEMORY_RUNNER"
+
 cat > "$POLARS_SCRIPT" <<'EOF'
 from pathlib import Path
 import sys
@@ -244,62 +272,47 @@ uv run --project "$IBEX_ROOT" --frozen python3 "$POLARS_SCRIPT" "$INPUT" "$INNER
 EOF
 chmod +x "$POLARS_RUNNER"
 
-run_interpreted() {
-    : > "$INTERPRETED_TIMES"
+cat > "$POLARS_MEMORY_RUNNER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$IBEX_ROOT"
+export UV_CACHE_DIR="$UV_CACHE_DIR_BENCH"
+uv run --project "$IBEX_ROOT" --frozen python3 "$POLARS_SCRIPT" "$INPUT" 1 >/dev/null
+EOF
+chmod +x "$POLARS_MEMORY_RUNNER"
+
+measure_runner() {
+    local timed_runner="$1"
+    local memory_runner="$2"
+    local out_file="$3"
+
+    : > "$out_file"
     for ((i = 0; i < WARMUP; ++i)); do
-        for ((j = 0; j < INNER_RUNS; ++j)); do
-            "$IBEX_REPL" --plugin-path "$IBEX_PLUGIN_DIR" < "$REPL_INPUT" >/dev/null
-        done
+        "$timed_runner" >/dev/null 2>/dev/null
+        "$memory_runner" >/dev/null 2>/dev/null
     done
     for ((i = 0; i < ITERS; ++i)); do
-        local tfile="$TMP_DIR/time.txt"
-        /usr/bin/time -f '%e' -o "$tfile" bash -lc '
-            for ((j = 0; j < '"$INNER_RUNS"'; ++j)); do
-                "'"$IBEX_REPL"'" --plugin-path "'"$IBEX_PLUGIN_DIR"'" < "'"$REPL_INPUT"'" >/dev/null
-            done
-        '
-        cat "$tfile" >> "$INTERPRETED_TIMES"
-        printf '\n' >> "$INTERPRETED_TIMES"
+        local time_file="$TMP_DIR/time.txt"
+        local rss_file="$TMP_DIR/rss.txt"
+        /usr/bin/time -f '%e' -o "$time_file" "$timed_runner" >/dev/null 2>/dev/null
+        /usr/bin/time -f '%M' -o "$rss_file" "$memory_runner" >/dev/null 2>/dev/null
+        printf '%s\t%s\n' "$(cat "$time_file")" "$(cat "$rss_file")" >> "$out_file"
     done
+}
+
+run_interpreted() {
+    measure_runner "$INTERPRETED_RUNNER" "$INTERPRETED_MEMORY_RUNNER" "$INTERPRETED_TIMES"
 }
 
 run_compiled() {
-    : > "$COMPILED_TIMES"
-    for ((i = 0; i < WARMUP; ++i)); do
-        for ((j = 0; j < INNER_RUNS; ++j)); do
-            if ! (cd "$IBEX_ROOT" && "$COMPILED_BIN" >/dev/null 2>/dev/null); then
-                return 1
-            fi
-        done
-    done
-    for ((i = 0; i < ITERS; ++i)); do
-        local tfile="$TMP_DIR/time.txt"
-        if ! /usr/bin/time -f '%e' -o "$tfile" "$COMPILED_RUNNER" >/dev/null 2>/dev/null; then
-            return 1
-        fi
-        cat "$tfile" >> "$COMPILED_TIMES"
-        printf '\n' >> "$COMPILED_TIMES"
-    done
+    measure_runner "$COMPILED_RUNNER" "$COMPILED_MEMORY_RUNNER" "$COMPILED_TIMES"
 }
 
 run_polars() {
-    : > "$POLARS_TIMES"
     if ! command -v uv >/dev/null 2>&1; then
         return 1
     fi
-    for ((i = 0; i < WARMUP; ++i)); do
-        if ! "$POLARS_RUNNER" >/dev/null 2>/dev/null; then
-            return 1
-        fi
-    done
-    for ((i = 0; i < ITERS; ++i)); do
-        local tfile="$TMP_DIR/time.txt"
-        if ! /usr/bin/time -f '%e' -o "$tfile" "$POLARS_RUNNER" >/dev/null 2>/dev/null; then
-            return 1
-        fi
-        cat "$tfile" >> "$POLARS_TIMES"
-        printf '\n' >> "$POLARS_TIMES"
-    done
+    measure_runner "$POLARS_RUNNER" "$POLARS_MEMORY_RUNNER" "$POLARS_TIMES"
 }
 
 summarize_file() {
@@ -307,39 +320,49 @@ summarize_file() {
     local path="$2"
     awk -v fw="$framework" -v rows="$INPUT_ROWS" -v inner_runs="$INNER_RUNS" '
         BEGIN {
-            sum = 0.0;
+            sum_ms = 0.0;
             n = 0;
-            min = -1.0;
-            max = 0.0;
+            min_ms = -1.0;
+            max_ms = 0.0;
+            sum_rss = 0.0;
+            max_rss = 0.0;
         }
         NF {
-            v = $1 + 0.0;
-            sum += v;
+            ms = ($1 + 0.0) * 1000.0 / inner_runs;
+            rss = $2 + 0.0;
+            sum_ms += ms;
+            sum_rss += rss;
             ++n;
-            if (min < 0.0 || v < min) {
-                min = v;
+            if (min_ms < 0.0 || ms < min_ms) {
+                min_ms = ms;
             }
-            if (v > max) {
-                max = v;
+            if (ms > max_ms) {
+                max_ms = ms;
+            }
+            if (rss > max_rss) {
+                max_rss = rss;
             }
         }
         END {
             if (n == 0) {
                 exit 1;
             }
-            printf "%s\t%.3f\t%.3f\t%.3f\t%d\t%d\n",
+            printf "%s\t%.3f\t%.3f\t%.3f\t%.0f\t%.0f\t%d\t%d\n",
                    fw,
-                   sum * 1000.0 / (n * inner_runs),
-                   min * 1000.0 / inner_runs,
-                   max * 1000.0 / inner_runs,
+                   sum_ms / n,
+                   min_ms,
+                   max_ms,
+                   sum_rss / n,
+                   max_rss,
                    n,
                    rows;
         }
     ' "$path"
 }
 
+RESULTS="$(
 {
-    printf "framework\tavg_ms\tmin_ms\tmax_ms\titers\trows\n"
+    printf "framework\tavg_ms\tmin_ms\tmax_ms\tavg_maxrss_kb\tmax_maxrss_kb\titers\trows\n"
     if [[ "$SKIP_INTERPRETED" -eq 0 ]]; then
         echo "=== timing interpreted 1BRC query ===" >&2
         run_interpreted
@@ -361,6 +384,14 @@ summarize_file() {
             echo "warning: skipping polars 1BRC timing; uv/polars benchmark run failed" >&2
         fi
     fi
-} | tee "$OUT"
+}
+)"
+
+printf '%s\n' "$RESULTS" > "$OUT"
+if command -v column >/dev/null 2>&1; then
+    printf '%s\n' "$RESULTS" | column -t -s $'\t'
+else
+    printf '%s\n' "$RESULTS"
+fi
 
 echo "results written to $OUT" >&2

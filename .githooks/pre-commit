@@ -37,3 +37,5 @@ if [[ "$FAILED" -ne 0 ]]; then
     echo "error: clang-format check failed. Run clang-format on the files above." >&2
     exit 1
 fi
+
+"$(git rev-parse --show-toplevel)"/scripts/check-bundled-io-imports.sh

@@ -1,5 +1,5 @@
 // 1BRC-style aggregation over the raw headerless semicolon-delimited file.
-extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool) -> DataFrame from "csv.hpp";
+import "csv";
 
 let measurements = read_csv("examples/measurements.txt", "", ";", false)
     [select { station = col1, temp = col2 }];

@@ -7,7 +7,7 @@ See the [website](https://bobjansen.github.io/Ibex/#get-started) for more
 information.
 
 ```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let prices = read_csv("prices.csv");
 
@@ -94,7 +94,7 @@ and later cells can reuse it without rerunning the load:
 
 ```python
 %%ibex --quiet
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+import "csv";
 let train = read_csv("../../kaggle/data/train.csv", "<empty>");
 
 %%ibex --as pandas --out bucket_summary
@@ -163,7 +163,7 @@ table containing a column named after the definition.
 ### Load and filter
 
 ```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let iris = read_csv("data/iris.csv");
 
@@ -273,7 +273,7 @@ Arrow-style validity bitmap; null propagates through arithmetic and
 comparisons. Use `is null` / `is not null` to test for nulls explicitly:
 
 ```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let emp  = read_csv("employees.csv");
 let dept = read_csv("departments.csv");
@@ -299,7 +299,7 @@ sorted in ascending order. Rolling window operations are **time-based** (not
 row-count based) and use duration literals:
 
 ```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let prices = read_csv("prices.csv");
 let tf = as_timeframe(prices, timestamp);
@@ -443,9 +443,9 @@ df[update { rep2 = rep(price, each=2) }]
 ### Writing output
 
 ```
-extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
-extern fn write_json(df: DataFrame, path: String) -> Int from "json.hpp";
-extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+import "csv";
+import "json";
+import "parquet";
 
 let rows_written = write_csv(result, "output.csv");
 write_json(result, "output.json");
@@ -770,7 +770,15 @@ let df = read_json("data.json");
 write_json(df, "output.json");
 ```
 
-`csv.so` also supports an optional null-spec argument:
+`csv.so` also supports optional null-spec, delimiter, header, and schema
+arguments. Use `import "csv"` for the normal case:
+
+```ibex
+import "csv";
+let df = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
+```
+
+The equivalent explicit declaration is:
 
 ```ibex
 extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";

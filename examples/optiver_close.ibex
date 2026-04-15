@@ -7,7 +7,7 @@
 // does the more interesting part for Ibex: microstructure-style EDA on the
 // training table.
 
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let train = read_csv("../kaggle/data/train.csv", "<empty>");
 

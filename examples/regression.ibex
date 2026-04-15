@@ -10,7 +10,7 @@
 //  Ibex: 30 lines.
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 import "lightbm";
 
 let prices = read_csv("examples/data/ohlcv.csv");

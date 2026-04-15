@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset_suffix: linux-x86_64
+          - os: macos-14
+            asset_suffix: macos-arm64
+          - os: windows-latest
+            asset_suffix: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 cmake ninja-build
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cmake -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DIBEX_WARNINGS_AS_ERRORS=ON \
+            -DIBEX_ENABLE_MARCH_NATIVE=OFF \
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+            -DIBEX_BUILD_PARQUET=OFF
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cmake -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DIBEX_WARNINGS_AS_ERRORS=ON \
+            -DIBEX_ENABLE_MARCH_NATIVE=OFF \
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+            -DIBEX_BUILD_PARQUET=OFF
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake -B build-release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DIBEX_WARNINGS_AS_ERRORS=ON \
+            -DIBEX_ENABLE_MARCH_NATIVE=OFF \
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+            -DIBEX_BUILD_PARQUET=OFF
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake --build build-release --config Release --parallel
+          else
+            cmake --build build-release --parallel
+          fi
+
+      - name: Assemble release bundle
+        shell: bash
+        run: |
+          rm -rf stage
+          mkdir -p stage/bin stage/plugins
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake --install build-release --config Release --prefix "$PWD/stage"
+            find build-release/tools -maxdepth 1 \( -name '*.dll' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
+          else
+            cmake --install build-release --prefix "$PWD/stage"
+            find build-release/tools -maxdepth 1 \( -name '*.so' -o -name '*.dylib' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
+          fi
+
+          cat > stage/README.txt <<EOF
+          Ibex ${RELEASE_TAG}
+
+          Layout:
+          - bin/: executables
+          - plugins/: bundled plugin libraries and import stubs
+
+          Quick start:
+          - Run ./bin/ibex with IBEX_LIBRARY_PATH pointed at ./plugins
+          - Example (Linux/macOS): IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex
+          - Example (Windows PowerShell): \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe
+
+          Notes:
+          - These release bundles intentionally disable -march=native for portability.
+          - The Parquet plugin is not included in these archives yet.
+          EOF
+
+          asset_name="ibex-${RELEASE_TAG}-${{ matrix.asset_suffix }}.zip"
+          echo "ASSET_NAME=${asset_name}" >> "$GITHUB_ENV"
+          cmake -E tar cf "${asset_name}" --format=zip stage
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ env.ASSET_NAME }}
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes "Automated release for $RELEASE_TAG."
+          fi
+
+          find dist -type f -name '*.zip' -print0 | xargs -0 -n1 gh release upload "$RELEASE_TAG" --clobber

@@ -12,7 +12,7 @@ namespace ibex::runtime {
 namespace {
 
 /// Build a design matrix from a DataFrame using a model formula.
-/// Returns column names and a row-major matrix (vector of column vectors).
+/// Returns column names and a column-major matrix (vector of column vectors).
 /// Categorical/String columns are dummy-encoded (treatment coding: first level dropped when
 /// intercept is present).
 auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)

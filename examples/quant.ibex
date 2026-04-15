@@ -12,7 +12,7 @@
 //  Python/Pandas equivalent: ~150 lines.  Raw C++: ~600 lines.  Ibex: 90 lines.
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let ohlcv = read_csv("examples/data/ohlcv.csv");
 let fund   = read_csv("examples/data/fundamentals.csv");

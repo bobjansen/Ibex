@@ -2269,6 +2269,13 @@ The bundled I/O plugins are:
 A common example using the bundled CSV plugin:
 
 ```
+import "csv";
+let iris = read_csv("iris.csv");
+```
+
+The equivalent explicit form is:
+
+```
 extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 let iris = read_csv("iris.csv");
 ```
@@ -2283,6 +2290,8 @@ extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
 extern fn read_csv(path: String, nulls: String, delimiter: String) -> DataFrame from "csv.hpp";
 extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool)
     -> DataFrame from "csv.hpp";
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool,
+                   schema: String) -> DataFrame from "csv.hpp";
 ```
 
 When `has_header` is `false`, the reader synthesizes numbered column names:

@@ -225,15 +225,8 @@
     <p class="section-label">Round Trip</p>
     <h2>Typical batch pipeline</h2>
     <article class="card">
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
-    <span class="fn-name">path</span>: String,
-    <span class="fn-name">nulls</span>: String,
-    <span class="fn-name">delimiter</span>: String,
-    <span class="fn-name">has_header</span>: Bool,
-    <span class="fn-name">schema</span>: String
-) -&gt; DataFrame <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
-<span class="kw">extern fn</span> <span class="fn-name">write_parquet</span>(<span class="fn-name">df</span>: DataFrame, <span class="fn-name">path</span>: String) -&gt; Int
-    <span class="kw">from</span> <span class="str">"parquet.hpp"</span>;
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
 
 <span class="kw">let</span> raw = <span class="fn-name">read_csv</span>(<span class="str">"measurements.txt"</span>, <span class="str">""</span>, <span class="str">";"</span>, <span class="kw">false</span>, <span class="str">"cat,f64"</span>)
     [<span class="kw">select</span> { station = col1, temp = col2 }];

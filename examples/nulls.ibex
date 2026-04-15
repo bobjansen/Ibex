@@ -16,7 +16,7 @@
 //    · 3VL OR:  true  OR  null = true  (known true wins)
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+import "csv";
 
 let emp  = read_csv("examples/data/employees.csv");
 let dept = read_csv("examples/data/departments.csv");

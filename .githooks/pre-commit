@@ -15,23 +15,25 @@ fi
 
 if [[ -z "$CLANG_FORMAT_BIN" ]]; then
     echo "warning: clang-format not found; skipping format check" >&2
-    exit 0
 fi
 
 FILES=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.hpp' || true)
 if [[ -z "${FILES}" ]]; then
+    "$(git rev-parse --show-toplevel)"/scripts/check-bundled-io-imports.sh
     exit 0
 fi
 
 FAILED=0
-while IFS= read -r file; do
-    [[ -z "$file" ]] && continue
-    "$CLANG_FORMAT_BIN" -i "$file"
-    git add "$file"
-    if ! "$CLANG_FORMAT_BIN" --dry-run --Werror "$file"; then
-        FAILED=1
-    fi
-done <<< "$FILES"
+if [[ -n "$CLANG_FORMAT_BIN" ]]; then
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        "$CLANG_FORMAT_BIN" -i "$file"
+        git add "$file"
+        if ! "$CLANG_FORMAT_BIN" --dry-run --Werror "$file"; then
+            FAILED=1
+        fi
+    done <<< "$FILES"
+fi
 
 if [[ "$FAILED" -ne 0 ]]; then
     echo "error: clang-format check failed. Run clang-format on the files above." >&2

@@ -58,8 +58,8 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
     std::vector<std::vector<double>> columns;
 
     if (formula.has_intercept) {
-        col_names.push_back("(intercept)");
-        columns.push_back(std::vector<double>(n, 1.0));
+        col_names.emplace_back("(intercept)");
+        columns.emplace_back(n, 1.0);
     }
 
     for (const auto& term : formula.terms) {
@@ -121,7 +121,10 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                                         dummy[i] = 1.0;
                                     }
                                 }
-                                col_names.push_back(entry.name + "_" + levels[li]);
+                                std::string dummy_name = entry.name;
+                                dummy_name += "_";
+                                dummy_name += levels[li];
+                                col_names.push_back(std::move(dummy_name));
                                 columns.push_back(std::move(dummy));
                             }
                             return true;
@@ -131,8 +134,10 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                     },
                     *entry.column);
                 if (!ok) {
-                    return std::unexpected("model: column '" + entry.name +
-                                           "' has unsupported type for model matrix");
+                    std::string message = "model: column '";
+                    message += entry.name;
+                    message += "' has unsupported type for model matrix";
+                    return std::unexpected(std::move(message));
                 }
             }
             continue;
@@ -142,7 +147,9 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
             const auto& name = term.columns[0];
             const auto* entry = input.find_entry(name);
             if (entry == nullptr) {
-                return std::unexpected("model: column not found: " + name);
+                std::string message = "model: column not found: ";
+                message += name;
+                return std::unexpected(std::move(message));
             }
             auto ok = std::visit(
                 [&](const auto& c) -> bool {
@@ -185,7 +192,10 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                                     dummy[i] = 1.0;
                                 }
                             }
-                            col_names.push_back(name + "_" + levels[li]);
+                            std::string dummy_name = name;
+                            dummy_name += "_";
+                            dummy_name += levels[li];
+                            col_names.push_back(std::move(dummy_name));
                             columns.push_back(std::move(dummy));
                         }
                         return true;
@@ -195,8 +205,10 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                 },
                 *entry->column);
             if (!ok) {
-                return std::unexpected("model: column '" + name +
-                                       "' has unsupported type for model matrix");
+                std::string message = "model: column '";
+                message += name;
+                message += "' has unsupported type for model matrix";
+                return std::unexpected(std::move(message));
             }
         } else {
             std::vector<std::vector<double>> factors;
@@ -209,7 +221,9 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                 interaction_name += name;
                 const auto* entry = input.find_entry(name);
                 if (entry == nullptr) {
-                    return std::unexpected("model: column not found: " + name);
+                    std::string message = "model: column not found: ";
+                    message += name;
+                    return std::unexpected(std::move(message));
                 }
                 std::vector<double> v(n);
                 bool ok = std::visit(
@@ -231,8 +245,10 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                     },
                     *entry->column);
                 if (!ok) {
-                    return std::unexpected("model: interaction term requires numeric columns, '" +
-                                           name + "' is not numeric");
+                    std::string message = "model: interaction term requires numeric columns, '";
+                    message += name;
+                    message += "' is not numeric";
+                    return std::unexpected(std::move(message));
                 }
                 factors.push_back(std::move(v));
             }
@@ -257,7 +273,9 @@ auto extract_response(const Table& input, const std::string& name)
     -> std::expected<std::vector<double>, std::string> {
     const auto* entry = input.find_entry(name);
     if (entry == nullptr) {
-        return std::unexpected("model: response column not found: " + name);
+        std::string message = "model: response column not found: ";
+        message += name;
+        return std::unexpected(std::move(message));
     }
     const std::size_t n = input.rows();
     std::vector<double> y(n);
@@ -280,7 +298,10 @@ auto extract_response(const Table& input, const std::string& name)
         },
         *entry->column);
     if (!ok) {
-        return std::unexpected("model: response column '" + name + "' must be numeric");
+        std::string message = "model: response column '";
+        message += name;
+        message += "' must be numeric";
+        return std::unexpected(std::move(message));
     }
     return y;
 }
@@ -330,9 +351,10 @@ auto solve_spd(const std::vector<std::vector<double>>& a, const std::vector<doub
     return x;
 }
 
-auto compute_xtx_xty(const std::vector<std::vector<double>>& x, const std::vector<double>& y,
-                     std::size_t n, std::size_t p)
+auto compute_xtx_xty(const std::vector<std::vector<double>>& x, const std::vector<double>& y)
     -> std::pair<std::vector<std::vector<double>>, std::vector<double>> {
+    auto p = x.size();
+    auto n = y.size();
     std::vector<std::vector<double>> xtx(p, std::vector<double>(p, 0.0));
     std::vector<double> xty(p, 0.0);
     for (std::size_t a = 0; a < p; ++a) {
@@ -386,7 +408,7 @@ auto build_model_result(const std::vector<std::string>& col_names,
 
     const double sigma2 = (n > p) ? ss_res / static_cast<double>(n - p) : 0.0;
 
-    auto [xtx, unused_xty] = compute_xtx_xty(x, y, n, p);
+    auto [xtx, unused_xty] = compute_xtx_xty(x, y);
     static_cast<void>(unused_xty);
     std::vector<double> std_errors(p, 0.0);
     for (std::size_t j = 0; j < p; ++j) {
@@ -467,11 +489,17 @@ auto eval_model_param_scalar(const ir::Expr& expr, const ScalarRegistry* scalars
 
     if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node)) {
         if (scalars == nullptr) {
-            return std::unexpected("unknown scalar binding '" + ref->name + "'");
+            std::string message = "unknown scalar binding '";
+            message += ref->name;
+            message += "'";
+            return std::unexpected(std::move(message));
         }
         auto it = scalars->find(ref->name);
         if (it == scalars->end()) {
-            return std::unexpected("unknown scalar binding '" + ref->name + "'");
+            std::string message = "unknown scalar binding '";
+            message += ref->name;
+            message += "'";
+            return std::unexpected(std::move(message));
         }
         return it->second;
     }
@@ -545,11 +573,15 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
     }
 
     if (n <= p) {
-        return std::unexpected("model: need more observations (" + std::to_string(n) +
-                               ") than parameters (" + std::to_string(p) + ")");
+        std::string message = "model: need more observations (";
+        message += std::to_string(n);
+        message += ") than parameters (";
+        message += std::to_string(p);
+        message += ")";
+        return std::unexpected(std::move(message));
     }
 
-    auto [xtx, xty] = compute_xtx_xty(x, y.value(), n, p);
+    auto [xtx, xty] = compute_xtx_xty(x, y.value());
 
     if (method == "ols") {
         auto beta = solve_spd(xtx, xty);
@@ -565,7 +597,9 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
             if (param.name == "lambda") {
                 auto scalar = eval_model_param_scalar(param.value, scalars);
                 if (!scalar.has_value()) {
-                    return std::unexpected("ridge: " + scalar.error());
+                    std::string message = "ridge: ";
+                    message += scalar.error();
+                    return std::unexpected(std::move(message));
                 }
                 if (const auto numeric = promote_numeric_scalar(*scalar); numeric.has_value()) {
                     lambda = *numeric;
@@ -601,7 +635,9 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
         }
         auto w_result = extract_response(input, weights_col);
         if (!w_result) {
-            return std::unexpected("wls: " + w_result.error());
+            std::string message = "wls: ";
+            message += w_result.error();
+            return std::unexpected(std::move(message));
         }
         const auto& w = w_result.value();
 
@@ -628,12 +664,15 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
     }
 
     if (externs != nullptr) {
-        const std::string fn_name = "model_" + method;
+        std::string fn_name = "model_";
+        fn_name += method;
         const auto* fn = externs->find(fn_name);
         if (fn != nullptr) {
             if (!fn->first_arg_is_table || !fn->table_consumer_func) {
-                return std::unexpected("model: plugin method '" + fn_name +
-                                       "' must be registered as a table consumer");
+                std::string message = "model: plugin method '";
+                message += fn_name;
+                message += "' must be registered as a table consumer";
+                return std::unexpected(std::move(message));
             }
 
             Table design_table;
@@ -653,39 +692,54 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
                 if (scalar.has_value()) {
                     plugin_args.emplace_back(std::move(*scalar));
                 } else if (const auto* ref = std::get_if<ir::ColumnRef>(&param.value.node)) {
-                    plugin_args.emplace_back(ScalarValue{std::string("column:") + ref->name});
+                    std::string column_ref = "column:";
+                    column_ref += ref->name;
+                    plugin_args.emplace_back(ScalarValue{std::move(column_ref)});
                 } else {
-                    return std::unexpected(
-                        "model: plugin parameter '" + param.name +
-                        "' must be a scalar, scalar binding, or column reference");
+                    std::string message = "model: plugin parameter '";
+                    message += param.name;
+                    message += "' must be a scalar, scalar binding, or column reference";
+                    return std::unexpected(std::move(message));
                 }
             }
 
             auto plugin_result = fn->table_consumer_func(design_table, plugin_args);
             if (!plugin_result) {
-                return std::unexpected("model (" + method + "): " + plugin_result.error());
+                std::string message = "model (";
+                message += method;
+                message += "): ";
+                message += plugin_result.error();
+                return std::unexpected(std::move(message));
             }
 
             const auto* coef_table = std::get_if<Table>(&plugin_result.value());
             if (coef_table == nullptr) {
-                return std::unexpected("model (" + method +
-                                       "): plugin must return a coefficients table");
+                std::string message = "model (";
+                message += method;
+                message += "): plugin must return a coefficients table";
+                return std::unexpected(std::move(message));
             }
             const auto* term_any = coef_table->find("term");
             const auto* estimate_any = coef_table->find("estimate");
             if (term_any == nullptr || estimate_any == nullptr) {
-                return std::unexpected("model (" + method +
-                                       "): coefficients table must include 'term' and 'estimate'");
+                std::string message = "model (";
+                message += method;
+                message += "): coefficients table must include 'term' and 'estimate'";
+                return std::unexpected(std::move(message));
             }
             const auto* term_col = std::get_if<Column<std::string>>(term_any);
             const auto* estimate_col = std::get_if<Column<double>>(estimate_any);
             if (term_col == nullptr || estimate_col == nullptr) {
-                return std::unexpected(
-                    "model (" + method +
-                    "): coefficient columns must be term:String and estimate:Float64");
+                std::string message = "model (";
+                message += method;
+                message += "): coefficient columns must be term:String and estimate:Float64";
+                return std::unexpected(std::move(message));
             }
             if (term_col->size() != estimate_col->size()) {
-                return std::unexpected("model (" + method + "): coefficients length mismatch");
+                std::string message = "model (";
+                message += method;
+                message += "): coefficients length mismatch";
+                return std::unexpected(std::move(message));
             }
 
             std::unordered_map<std::string, double> beta_by_term;
@@ -699,8 +753,12 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
             for (const auto& name : col_names) {
                 auto it = beta_by_term.find(name);
                 if (it == beta_by_term.end()) {
-                    return std::unexpected("model (" + method +
-                                           "): missing coefficient for term '" + name + "'");
+                    std::string message = "model (";
+                    message += method;
+                    message += "): missing coefficient for term '";
+                    message += name;
+                    message += "'";
+                    return std::unexpected(std::move(message));
                 }
                 beta.push_back(it->second);
             }
@@ -708,8 +766,10 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
         }
     }
 
-    return std::unexpected("model: unknown method '" + method +
-                           "' (supported built-ins: ols, ridge, wls; plugins: model_<method>)");
+    std::string message = "model: unknown method '";
+    message += method;
+    message += "' (supported built-ins: ols, ridge, wls; plugins: model_<method>)";
+    return std::unexpected(std::move(message));
 }
 
 }  // namespace ibex::runtime

@@ -1,5 +1,6 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/rng.hpp>
 
 #include <algorithm>
@@ -6556,6 +6557,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     return std::unexpected(val.error());
                 args.push_back(std::move(val.value()));
             }
+            if (fn->chunked_table_func) {
+                auto source = fn->chunked_table_func(args);
+                if (!source)
+                    return std::unexpected(source.error());
+                MaterializeOperator sink{std::move(source.value())};
+                return sink.run();
+            }
             auto result = fn->func(args);
             if (!result)
                 return std::unexpected(result.error());
@@ -7040,7 +7048,13 @@ auto Table::find(const std::string& name) const -> const ColumnValue* {
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
                const ExternRegistry* externs, ModelResult* model_out)
     -> std::expected<Table, std::string> {
-    return interpret_node(node, registry, scalars, externs, model_out);
+    auto table = interpret_node(node, registry, scalars, externs, model_out);
+    if (!table.has_value()) {
+        return std::unexpected(std::move(table.error()));
+    }
+    auto source = std::make_unique<TableSourceOperator>(std::move(table.value()));
+    MaterializeOperator sink{std::move(source)};
+    return sink.run();
 }
 
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,

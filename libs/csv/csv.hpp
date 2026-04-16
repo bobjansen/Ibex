@@ -26,6 +26,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -364,6 +365,172 @@ inline auto csv_try_double(std::string_view sv, double& out) -> bool {
     auto result = fast_float::from_chars(begin, end, out);
     return result.ec == std::errc() && result.ptr == end;
 }
+
+/// Pull-based chunked CSV source. Requires a fully-specified schema with
+/// no Infer columns, no null handling, no header. Parses rows from the
+/// mmapped source into per-chunk builders; Categorical columns share a
+/// single dictionary + index across all chunks so codes are consistent
+/// when `MaterializeOperator` concatenates them.
+class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
+   public:
+    ChunkedCsvSourceOperator(const std::string& path, std::vector<std::string> col_names,
+                             std::vector<CsvColumnKind> col_kinds, char delimiter,
+                             std::size_t rows_per_chunk)
+        : source_(std::make_unique<CsvSource>(path)),
+          pos_(source_->data()),
+          end_(source_->data() + source_->size()),
+          col_names_(std::move(col_names)),
+          col_kinds_(std::move(col_kinds)),
+          delimiter_(delimiter),
+          rows_per_chunk_(rows_per_chunk) {
+        shared_dicts_.resize(col_kinds_.size());
+        shared_indices_.resize(col_kinds_.size());
+        for (std::size_t c = 0; c < col_kinds_.size(); ++c) {
+            if (col_kinds_[c] == CsvColumnKind::Categorical) {
+                shared_dicts_[c] = std::make_shared<std::vector<std::string>>();
+                shared_indices_[c] = std::make_shared<ibex::Column<ibex::Categorical>::index_map>();
+            }
+        }
+    }
+
+    auto next() -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> override {
+        if (pos_ >= end_) {
+            return std::optional<ibex::runtime::Chunk>{};
+        }
+
+        const std::size_t n_cols = col_names_.size();
+        std::vector<ibex::Column<std::int64_t>> int_cols(n_cols);
+        std::vector<ibex::Column<double>> double_cols(n_cols);
+        std::vector<ibex::Column<std::string>> string_cols(n_cols);
+        std::vector<std::vector<ibex::Column<ibex::Categorical>::code_type>> cat_codes(n_cols);
+
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            switch (col_kinds_[c]) {
+                case CsvColumnKind::Int:
+                    int_cols[c].reserve(rows_per_chunk_);
+                    break;
+                case CsvColumnKind::Double:
+                    double_cols[c].reserve(rows_per_chunk_);
+                    break;
+                case CsvColumnKind::String:
+                    string_cols[c].reserve(rows_per_chunk_);
+                    break;
+                case CsvColumnKind::Categorical:
+                    cat_codes[c].reserve(rows_per_chunk_);
+                    break;
+                case CsvColumnKind::Infer:
+                    return std::unexpected(
+                        "ChunkedCsvSourceOperator: schema must not contain Infer columns");
+            }
+        }
+
+        std::vector<std::string_view> row_buf;
+        row_buf.reserve(n_cols);
+        std::deque<std::string> escape_storage;
+        std::size_t rows_read = 0;
+
+        while (rows_read < rows_per_chunk_ &&
+               csv_parse_row(pos_, end_, delimiter_, row_buf, escape_storage)) {
+            const std::size_t row_cols = row_buf.size();
+            for (std::size_t c = 0; c < n_cols; ++c) {
+                const auto sv = c < row_cols ? row_buf[c] : std::string_view{};
+                switch (col_kinds_[c]) {
+                    case CsvColumnKind::Int: {
+                        std::int64_t iv{};
+                        if (!csv_try_int(sv, iv)) {
+                            return std::unexpected("read_csv: column '" + col_names_[c] + "' row " +
+                                                   std::to_string(total_rows_ + rows_read) +
+                                                   " failed to parse as i64");
+                        }
+                        int_cols[c].push_back(iv);
+                        break;
+                    }
+                    case CsvColumnKind::Double: {
+                        double dv{};
+                        if (!csv_try_double(sv, dv)) {
+                            return std::unexpected("read_csv: column '" + col_names_[c] + "' row " +
+                                                   std::to_string(total_rows_ + rows_read) +
+                                                   " failed to parse as f64");
+                        }
+                        double_cols[c].push_back(dv);
+                        break;
+                    }
+                    case CsvColumnKind::String:
+                        string_cols[c].push_back(sv);
+                        break;
+                    case CsvColumnKind::Categorical: {
+                        auto& idx = *shared_indices_[c];
+                        auto& dict = *shared_dicts_[c];
+                        using code_type = ibex::Column<ibex::Categorical>::code_type;
+                        code_type code{};
+                        auto it = idx.find(sv);
+                        if (it != idx.end()) {
+                            code = it->second;
+                        } else {
+                            code = static_cast<code_type>(dict.size());
+                            dict.emplace_back(sv);
+                            idx.emplace(dict.back(), code);
+                        }
+                        cat_codes[c].push_back(code);
+                        break;
+                    }
+                    case CsvColumnKind::Infer:
+                        break;
+                }
+            }
+            ++rows_read;
+            escape_storage.clear();
+        }
+
+        if (rows_read == 0) {
+            return std::optional<ibex::runtime::Chunk>{};
+        }
+
+        ibex::runtime::Chunk chunk;
+        chunk.columns.reserve(n_cols);
+        for (std::size_t c = 0; c < n_cols; ++c) {
+            ibex::runtime::ColumnEntry entry;
+            entry.name = col_names_[c];
+            switch (col_kinds_[c]) {
+                case CsvColumnKind::Int:
+                    entry.column =
+                        std::make_shared<ibex::runtime::ColumnValue>(std::move(int_cols[c]));
+                    break;
+                case CsvColumnKind::Double:
+                    entry.column =
+                        std::make_shared<ibex::runtime::ColumnValue>(std::move(double_cols[c]));
+                    break;
+                case CsvColumnKind::String:
+                    entry.column =
+                        std::make_shared<ibex::runtime::ColumnValue>(std::move(string_cols[c]));
+                    break;
+                case CsvColumnKind::Categorical: {
+                    ibex::Column<ibex::Categorical> col{shared_dicts_[c], shared_indices_[c],
+                                                        std::move(cat_codes[c])};
+                    entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(col));
+                    break;
+                }
+                case CsvColumnKind::Infer:
+                    break;
+            }
+            chunk.columns.push_back(std::move(entry));
+        }
+        total_rows_ += rows_read;
+        return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
+    }
+
+   private:
+    std::unique_ptr<CsvSource> source_;
+    const char* pos_ = nullptr;
+    const char* end_ = nullptr;
+    std::vector<std::string> col_names_;
+    std::vector<CsvColumnKind> col_kinds_;
+    char delimiter_;
+    std::size_t rows_per_chunk_;
+    std::size_t total_rows_ = 0;
+    std::vector<std::shared_ptr<std::vector<std::string>>> shared_dicts_;
+    std::vector<std::shared_ptr<ibex::Column<ibex::Categorical>::index_map>> shared_indices_;
+};
 
 }  // namespace
 

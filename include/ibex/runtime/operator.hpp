@@ -77,45 +77,95 @@ class TableSourceOperator final : public Operator {
     bool emitted_ = false;
 };
 
-/// Sink that drains a child operator into a `Table`. For the
-/// single-chunk case produced by `TableSourceOperator`, the chunk's
-/// columns move directly into the result, preserving `ordering` and
-/// `time_index`. Multi-chunk concatenation is deferred until a source
-/// that actually emits more than one chunk is introduced (step 3 of
-/// the chunked-execution migration).
+/// Sink that drains a child operator into a `Table`. Chunks are
+/// consumed one at a time: the first chunk's columns are moved into
+/// the result, and every subsequent chunk is appended and released
+/// before the next is pulled, so peak memory is bounded by
+/// `result + 1 chunk` rather than the full chunk list.
+///
+/// Concat assumes all chunks agree on schema (column count, names, and
+/// variant alternatives) and that any `Column<Categorical>` values across
+/// chunks share the same backing dictionary — which is the contract the
+/// chunked csv source provides. Validity bitmaps are not yet supported
+/// on multi-chunk streams; any non-null validity on any chunk is
+/// rejected until step 4+ wants to stream nulls.
 class MaterializeOperator {
    public:
     explicit MaterializeOperator(OperatorPtr child) : child_(std::move(child)) {}
 
     [[nodiscard]] auto run() -> std::expected<Table, std::string> {
         Table result;
-        std::optional<Chunk> first;
+
+        auto first_res = child_->next();
+        if (!first_res.has_value()) {
+            return std::unexpected(std::move(first_res.error()));
+        }
+        if (!first_res.value().has_value()) {
+            return result;
+        }
+
+        Chunk first = std::move(*first_res.value());
+        result.columns = std::move(first.columns);
+        for (std::size_t i = 0; i < result.columns.size(); ++i) {
+            result.index[result.columns[i].name] = i;
+        }
+        result.ordering = std::move(first.ordering);
+        result.time_index = std::move(first.time_index);
+
+        const std::size_t n_cols = result.columns.size();
 
         while (true) {
             auto chunk_res = child_->next();
             if (!chunk_res.has_value()) {
-                return std::unexpected(chunk_res.error());
+                return std::unexpected(std::move(chunk_res.error()));
             }
-            auto& maybe_chunk = chunk_res.value();
-            if (!maybe_chunk.has_value()) {
+            if (!chunk_res.value().has_value()) {
                 break;
             }
-            if (!first.has_value()) {
-                first = std::move(*maybe_chunk);
-                continue;
+            Chunk chunk = std::move(*chunk_res.value());
+
+            if (chunk.columns.size() != n_cols) {
+                return std::unexpected("MaterializeOperator: chunk schema mismatch (column count)");
             }
-            return std::unexpected(
-                "MaterializeOperator: multi-chunk concatenation not yet implemented");
+            for (std::size_t i = 0; i < n_cols; ++i) {
+                if (chunk.columns[i].name != result.columns[i].name) {
+                    return std::unexpected(
+                        "MaterializeOperator: chunk schema mismatch (column name)");
+                }
+                if (chunk.columns[i].column->index() != result.columns[i].column->index()) {
+                    return std::unexpected(
+                        "MaterializeOperator: chunk schema mismatch (column type)");
+                }
+                if (chunk.columns[i].validity.has_value() ||
+                    result.columns[i].validity.has_value()) {
+                    return std::unexpected(
+                        "MaterializeOperator: validity bitmaps not yet supported on multi-chunk "
+                        "streams");
+                }
+            }
+
+            for (std::size_t i = 0; i < n_cols; ++i) {
+                std::visit(
+                    [&](auto& dst) {
+                        using Col = std::decay_t<decltype(dst)>;
+                        auto& src = std::get<Col>(*chunk.columns[i].column);
+                        dst.reserve(dst.size() + src.size());
+                        if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                            for (std::size_t r = 0; r < src.size(); ++r) {
+                                dst.push_code(src.code_at(r));
+                            }
+                        } else {
+                            for (std::size_t r = 0; r < src.size(); ++r) {
+                                dst.push_back(src[r]);
+                            }
+                        }
+                    },
+                    *result.columns[i].column);
+            }
+            // `chunk` goes out of scope here, releasing its memory before
+            // the next `child_->next()` call.
         }
 
-        if (first.has_value()) {
-            result.columns = std::move(first->columns);
-            for (std::size_t i = 0; i < result.columns.size(); ++i) {
-                result.index[result.columns[i].name] = i;
-            }
-            result.ordering = std::move(first->ordering);
-            result.time_index = std::move(first->time_index);
-        }
         return result;
     }
 

@@ -7045,15 +7045,30 @@ auto Table::find(const std::string& name) const -> const ColumnValue* {
     return nullptr;
 }
 
-auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
-               const ExternRegistry* externs, ModelResult* model_out)
-    -> std::expected<Table, std::string> {
+/// Planner seam: returns a pull-based operator that, when drained,
+/// produces the logical result of `node`. Today this always falls back
+/// to the full-table `interpret_node` path and wraps its result in a
+/// `TableSourceOperator`. Subsequent commits will replace the fallback
+/// with native chunked operators for specific node kinds (Filter,
+/// Project, …); unmigrated kinds continue to flow through the fallback.
+auto build_operator(const ir::Node& node, const TableRegistry& registry,
+                    const ScalarRegistry* scalars, const ExternRegistry* externs,
+                    ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
     auto table = interpret_node(node, registry, scalars, externs, model_out);
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));
     }
-    auto source = std::make_unique<TableSourceOperator>(std::move(table.value()));
-    MaterializeOperator sink{std::move(source)};
+    return std::make_unique<TableSourceOperator>(std::move(table.value()));
+}
+
+auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
+               const ExternRegistry* externs, ModelResult* model_out)
+    -> std::expected<Table, std::string> {
+    auto op = build_operator(node, registry, scalars, externs, model_out);
+    if (!op.has_value()) {
+        return std::unexpected(std::move(op.error()));
+    }
+    MaterializeOperator sink{std::move(op.value())};
     return sink.run();
 }
 

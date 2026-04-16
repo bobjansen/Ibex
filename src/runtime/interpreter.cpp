@@ -7045,21 +7045,141 @@ auto Table::find(const std::string& name) const -> const ColumnValue* {
     return nullptr;
 }
 
+namespace {
+
+auto chunk_to_table(Chunk chunk) -> Table {
+    Table t;
+    t.columns = std::move(chunk.columns);
+    for (std::size_t i = 0; i < t.columns.size(); ++i) {
+        t.index[t.columns[i].name] = i;
+    }
+    t.ordering = std::move(chunk.ordering);
+    t.time_index = std::move(chunk.time_index);
+    return t;
+}
+
+auto table_to_chunk(Table table) -> Chunk {
+    Chunk c;
+    c.columns = std::move(table.columns);
+    c.ordering = std::move(table.ordering);
+    c.time_index = std::move(table.time_index);
+    return c;
+}
+
+/// Per-chunk filter: pulls a chunk from the child, wraps it as a `Table`,
+/// reuses the existing `filter_table` predicate evaluator, and emits the
+/// filtered columns as the next chunk. Chunks that filter to zero rows
+/// are skipped — the operator loops until it has a non-empty chunk or
+/// the child stream ends.
+class ChunkedFilterOperator final : public Operator {
+   public:
+    ChunkedFilterOperator(OperatorPtr child, const ir::FilterExpr* predicate,
+                          const ScalarRegistry* scalars)
+        : child_(std::move(child)), predicate_(predicate), scalars_(scalars) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                return std::optional<Chunk>{};
+            }
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            auto filtered = filter_table(t, *predicate_, scalars_);
+            if (!filtered.has_value()) {
+                return std::unexpected(std::move(filtered.error()));
+            }
+            if (!filtered->columns.empty() && filtered->rows() == 0) {
+                continue;
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(filtered.value()))};
+        }
+    }
+
+   private:
+    OperatorPtr child_;
+    const ir::FilterExpr* predicate_;
+    const ScalarRegistry* scalars_;
+};
+
+/// Per-chunk project: pulls a chunk, reuses `project_table` to select
+/// and rename columns, and forwards the result. Stateless and order
+/// preserving; no inter-chunk coordination is needed.
+class ChunkedProjectOperator final : public Operator {
+   public:
+    ChunkedProjectOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* columns)
+        : child_(std::move(child)), columns_(columns) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        auto chunk_res = child_->next();
+        if (!chunk_res.has_value()) {
+            return std::unexpected(std::move(chunk_res.error()));
+        }
+        if (!chunk_res.value().has_value()) {
+            return std::optional<Chunk>{};
+        }
+        Table t = chunk_to_table(std::move(*chunk_res.value()));
+        auto projected = project_table(t, *columns_);
+        if (!projected.has_value()) {
+            return std::unexpected(std::move(projected.error()));
+        }
+        return std::optional<Chunk>{table_to_chunk(std::move(projected.value()))};
+    }
+
+   private:
+    OperatorPtr child_;
+    const std::vector<ir::ColumnRef>* columns_;
+};
+
 /// Planner seam: returns a pull-based operator that, when drained,
-/// produces the logical result of `node`. Today this always falls back
-/// to the full-table `interpret_node` path and wraps its result in a
-/// `TableSourceOperator`. Subsequent commits will replace the fallback
-/// with native chunked operators for specific node kinds (Filter,
-/// Project, …); unmigrated kinds continue to flow through the fallback.
+/// produces the logical result of `node`. Chunked operators exist
+/// today for node kinds that are safe and useful to stream; any other
+/// node kind falls back to the full-table `interpret_node` path and
+/// is wrapped in a `TableSourceOperator` so downstream chunked
+/// operators see a uniform pull-based interface.
+// NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+    if (node.kind() == ir::NodeKind::Filter) {
+        const auto& filter = static_cast<const ir::FilterNode&>(node);
+        if (filter.children().empty()) {
+            return std::unexpected("filter node missing child");
+        }
+        auto child_op =
+            build_operator(*filter.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedFilterOperator>(std::move(child_op.value()),
+                                                       &filter.predicate(), scalars);
+    }
+
+    if (node.kind() == ir::NodeKind::Project) {
+        const auto& project = static_cast<const ir::ProjectNode&>(node);
+        if (project.children().empty()) {
+            return std::unexpected("project node missing child");
+        }
+        auto child_op =
+            build_operator(*project.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedProjectOperator>(std::move(child_op.value()),
+                                                        &project.columns());
+    }
+
     auto table = interpret_node(node, registry, scalars, externs, model_out);
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));
     }
     return std::make_unique<TableSourceOperator>(std::move(table.value()));
 }
+// NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
+
+}  // namespace
 
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
                const ExternRegistry* externs, ModelResult* model_out)

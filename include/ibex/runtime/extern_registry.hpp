@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 
 #include <expected>
 #include <functional>
@@ -54,6 +55,12 @@ using ExternFn = std::function<std::expected<ExternValue, std::string>(const Ext
 using ExternTableConsumerFn =
     std::function<std::expected<ExternValue, std::string>(const Table&, const ExternArgs&)>;
 
+/// Function signature for extern functions that produce a chunked table
+/// source. Used by streaming readers (e.g. read_csv on the chunked path)
+/// to return an operator that the interpreter can drain chunk by chunk.
+using ExternChunkedTableFn =
+    std::function<std::expected<OperatorPtr, std::string>(const ExternArgs&)>;
+
 enum class ExternReturnKind : std::uint8_t {
     Scalar,
     Table,
@@ -63,6 +70,11 @@ struct ExternFunction {
     ExternFn func;
     /// Set when the function's first argument is a DataFrame (e.g. write functions).
     ExternTableConsumerFn table_consumer_func;
+    /// Set when the function produces a chunked table source that the
+    /// interpreter can drain chunk by chunk. When both `func` and
+    /// `chunked_table_func` are set, the interpreter prefers the chunked
+    /// path.
+    ExternChunkedTableFn chunked_table_func;
     ExternReturnKind kind = ExternReturnKind::Scalar;
     std::optional<ScalarKind> scalar_kind;
     /// True when the first argument is a DataFrame rather than a scalar.
@@ -78,6 +90,7 @@ class ExternRegistry {
         registry_.insert_or_assign(std::move(name), ExternFunction{
                                                         .func = std::move(func),
                                                         .table_consumer_func = {},
+                                                        .chunked_table_func = {},
                                                         .kind = ExternReturnKind::Scalar,
                                                         .scalar_kind = kind,
                                                     });
@@ -87,8 +100,29 @@ class ExternRegistry {
     void register_table(std::string name, ExternFn func) {
         registry_.insert_or_assign(std::move(name), ExternFunction{.func = std::move(func),
                                                                    .table_consumer_func = {},
+                                                                   .chunked_table_func = {},
                                                                    .kind = ExternReturnKind::Table,
                                                                    .scalar_kind = std::nullopt});
+    }
+
+    /// Register a chunked table source. The callback produces an operator
+    /// that emits chunks on demand; the interpreter drains it into a
+    /// materialized table at bind time today (steps 4+ will stream chunks
+    /// further into downstream operators without materializing first).
+    ///
+    /// If a regular `register_table` entry already exists for this name,
+    /// both are stored; the interpreter prefers the chunked path.
+    void register_chunked_table(std::string name, ExternChunkedTableFn func) {
+        auto it = registry_.find(name);
+        if (it != registry_.end()) {
+            it->second.chunked_table_func = std::move(func);
+            it->second.kind = ExternReturnKind::Table;
+            return;
+        }
+        ExternFunction ef;
+        ef.chunked_table_func = std::move(func);
+        ef.kind = ExternReturnKind::Table;
+        registry_.insert_or_assign(std::move(name), std::move(ef));
     }
 
     /// Register a scalar-returning extern function whose first argument is a DataFrame.

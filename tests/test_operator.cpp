@@ -83,6 +83,71 @@ TEST_CASE("MaterializeOperator preserves Table ordering and time_index") {
     REQUIRE(*out.time_index == "ts");
 }
 
+namespace {
+
+auto make_int_chunk(const std::string& name, std::vector<std::int64_t> values) -> runtime::Chunk {
+    runtime::Chunk chunk;
+    runtime::ColumnEntry entry;
+    entry.name = name;
+    entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+    auto& col = std::get<Column<std::int64_t>>(*entry.column);
+    col.reserve(values.size());
+    for (auto v : values) {
+        col.push_back(v);
+    }
+    chunk.columns.push_back(std::move(entry));
+    return chunk;
+}
+
+class VectorSource final : public runtime::Operator {
+   public:
+    explicit VectorSource(std::vector<runtime::Chunk> chunks) : chunks_(std::move(chunks)) {}
+
+    auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+        if (pos_ >= chunks_.size()) {
+            return std::optional<runtime::Chunk>{};
+        }
+        return std::optional<runtime::Chunk>{std::move(chunks_[pos_++])};
+    }
+
+   private:
+    std::vector<runtime::Chunk> chunks_;
+    std::size_t pos_ = 0;
+};
+
+}  // namespace
+
+TEST_CASE("MaterializeOperator concatenates multi-chunk int streams") {
+    std::vector<runtime::Chunk> chunks;
+    chunks.push_back(make_int_chunk("x", {1, 2, 3}));
+    chunks.push_back(make_int_chunk("x", {4, 5}));
+    chunks.push_back(make_int_chunk("x", {6, 7, 8, 9}));
+
+    runtime::MaterializeOperator sink{std::make_unique<VectorSource>(std::move(chunks))};
+    auto result = sink.run();
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().rows() == 9);
+
+    const auto* col = std::get_if<Column<std::int64_t>>(result.value().find("x"));
+    REQUIRE(col != nullptr);
+    for (std::int64_t i = 1; i <= 9; ++i) {
+        REQUIRE((*col)[static_cast<std::size_t>(i - 1)] == i);
+    }
+}
+
+TEST_CASE("MaterializeOperator rejects chunk schema mismatches") {
+    std::vector<runtime::Chunk> chunks;
+    chunks.push_back(make_int_chunk("x", {1, 2}));
+
+    // Second chunk has a different column name.
+    chunks.push_back(make_int_chunk("y", {3, 4}));
+
+    runtime::MaterializeOperator sink{std::make_unique<VectorSource>(std::move(chunks))};
+    auto result = sink.run();
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("schema mismatch") != std::string::npos);
+}
+
 TEST_CASE("MaterializeOperator returns an empty Table when the source is empty") {
     class EmptySource final : public runtime::Operator {
        public:

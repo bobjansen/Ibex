@@ -110,14 +110,11 @@ UV_CACHE_DIR_BENCH="${UV_CACHE_DIR:-$TMP_DIR/uv-cache}"
 cat > "$BENCH_QUERY" <<'EOF'
 extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool, schema: String) -> DataFrame from "csv.hpp";
 
-let measurements = read_csv("__INPUT__", "", ";", false, "cat,f64")
-    [select { station = col1, temp = col2 }];
-let summary = measurements[select {
-    min_temp = min(temp),
-    avg_temp = mean(temp),
-    max_temp = max(temp)
-}, by station, order station];
-summary;
+read_csv("__INPUT__", "", ";", false, "cat,f64")[select {
+    min_temp = min(col2),
+    avg_temp = mean(col2),
+    max_temp = max(col2)
+}, by col1, order col1];
 EOF
 
 python3 - <<'PY' "$BENCH_QUERY" "$INPUT"

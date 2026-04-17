@@ -239,6 +239,27 @@ class CsvSource {
     [[nodiscard]] auto data() const noexcept -> const char* { return data_; }
     [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
 
+    void advise_dontneed(const char* from, const char* to) const noexcept {
+#if IBEX_CSV_HAVE_MMAP
+        if (mapped_ == nullptr || from >= to) {
+            return;
+        }
+        const auto page_size = static_cast<std::uintptr_t>(::sysconf(_SC_PAGESIZE));
+        auto start = reinterpret_cast<std::uintptr_t>(from);
+        auto aligned = start & ~(page_size - 1);
+        auto end_addr = reinterpret_cast<std::uintptr_t>(to);
+        auto aligned_end = end_addr & ~(page_size - 1);
+        if (aligned_end > aligned + page_size) {
+            // Keep the last page (may still be read by the next chunk).
+            ::madvise(reinterpret_cast<void*>(aligned), aligned_end - aligned - page_size,
+                      MADV_DONTNEED);
+        }
+#else
+        (void)from;
+        (void)to;
+#endif
+    }
+
    private:
     const char* data_ = nullptr;
     std::size_t size_ = 0;
@@ -428,6 +449,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
         row_buf.reserve(n_cols);
         std::deque<std::string> escape_storage;
         std::size_t rows_read = 0;
+        const char* chunk_start = pos_;
 
         while (rows_read < rows_per_chunk_ &&
                csv_parse_row(pos_, end_, delimiter_, row_buf, escape_storage)) {
@@ -481,6 +503,8 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
             ++rows_read;
             escape_storage.clear();
         }
+
+        source_->advise_dontneed(chunk_start, pos_);
 
         if (rows_read == 0) {
             return std::optional<ibex::runtime::Chunk>{};

@@ -1501,15 +1501,6 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                         std::get<runtime::Table>(std::move(value.value())));
                 block->base =
                     std::make_unique<parser::Expr>(parser::Expr{parser::IdentifierExpr{temp_name}});
-            } else if (call != nullptr && extern_decls.contains(call->callee)) {
-                auto table = eval_extern_table_call(*call);
-                if (!table) {
-                    return std::unexpected(table.error());
-                }
-                auto temp_name = make_temp_table_name();
-                tables.insert_or_assign(temp_name, std::move(table.value()));
-                block->base =
-                    std::make_unique<parser::Expr>(parser::Expr{parser::IdentifierExpr{temp_name}});
             }
         }
     }

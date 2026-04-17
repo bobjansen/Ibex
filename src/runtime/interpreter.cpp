@@ -7133,6 +7133,467 @@ class ChunkedProjectOperator final : public Operator {
     const std::vector<ir::ColumnRef>* columns_;
 };
 
+/// Streaming hash aggregate. Maintains a `robin_hood` group index and
+/// per-group `AggState` across chunks: each incoming chunk updates the
+/// state per row, the chunk is released, and the final result is
+/// emitted as a single output chunk on EOF.
+///
+/// Eligibility is gated at `build_operator` time to the common subset
+/// that streams cleanly: `Count`, `Sum`, `Min`, `Max`, `Mean` on
+/// numeric (int/double) inputs. Nullable agg inputs are handled — null
+/// rows skip the update, and an all-null group emits a null result.
+/// Nullable group-by columns are not supported yet; they fall back to
+/// `aggregate_table` via `interpret_node`. Complex aggs (Median, etc.)
+/// and string aggs also fall back.
+///
+/// The first chunk's group-by column types are snapshotted (including
+/// the Categorical dictionary pointer when applicable) and reused when
+/// building output; the chunked csv source shares dictionaries across
+/// chunks, matching MaterializeOperator's existing assumption.
+class ChunkedAggregateOperator final : public Operator {
+   public:
+    ChunkedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+                             const std::vector<ir::AggSpec>* aggregations)
+        : child_(std::move(child)), group_by_(group_by), aggregations_(aggregations) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (emitted_) {
+            return std::optional<Chunk>{};
+        }
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                break;
+            }
+            Chunk chunk = std::move(*chunk_res.value());
+            if (auto err = process_chunk(chunk)) {
+                return std::unexpected(*err);
+            }
+            // `chunk` goes out of scope here, releasing its memory
+            // before we pull the next one from the child.
+        }
+        emitted_ = true;
+        return build_output_chunk();
+    }
+
+   private:
+    auto process_chunk(const Chunk& chunk) -> std::optional<std::string> {
+        std::vector<const ColumnEntry*> group_entries;
+        group_entries.reserve(group_by_->size());
+        for (const auto& key : *group_by_) {
+            const ColumnEntry* entry = nullptr;
+            for (const auto& e : chunk.columns) {
+                if (e.name == key.name) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry == nullptr) {
+                return "group-by column not found: " + key.name;
+            }
+            if (entry->validity.has_value()) {
+                return "ChunkedAggregateOperator: null group-by values not supported";
+            }
+            group_entries.push_back(entry);
+        }
+
+        std::vector<const ColumnEntry*> agg_entries(aggregations_->size(), nullptr);
+        for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            const auto& agg = (*aggregations_)[i];
+            if (agg.func == ir::AggFunc::Count) {
+                continue;
+            }
+            const ColumnEntry* entry = nullptr;
+            for (const auto& e : chunk.columns) {
+                if (e.name == agg.column.name) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry == nullptr) {
+                return "aggregate column not found: " + agg.column.name;
+            }
+            ExprType kind = expr_type_for_column(*entry->column);
+            if (kind != ExprType::Int && kind != ExprType::Double) {
+                return "ChunkedAggregateOperator: non-numeric aggregation not supported";
+            }
+            agg_entries[i] = entry;
+        }
+
+        if (!initialized_) {
+            plan_.reserve(aggregations_->size());
+            for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+                SlotPlan p;
+                p.func = (*aggregations_)[i].func;
+                if (p.func == ir::AggFunc::Count) {
+                    p.kind = ExprType::Int;
+                } else {
+                    p.kind = expr_type_for_column(*agg_entries[i]->column);
+                }
+                plan_.push_back(p);
+            }
+            group_templates_.reserve(group_entries.size());
+            bool all_cat = true;
+            for (const auto* e : group_entries) {
+                group_templates_.push_back(make_empty_like(*e->column));
+                if (!std::holds_alternative<Column<Categorical>>(*e->column)) {
+                    all_cat = false;
+                }
+            }
+            cat_fast_path_ = all_cat && !group_entries.empty();
+            initialized_ = true;
+        } else {
+            for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+                if (plan_[i].func == ir::AggFunc::Count) {
+                    continue;
+                }
+                ExprType kind = expr_type_for_column(*agg_entries[i]->column);
+                if (kind != plan_[i].kind) {
+                    return "ChunkedAggregateOperator: aggregate column type changed across chunks";
+                }
+            }
+            for (std::size_t i = 0; i < group_entries.size(); ++i) {
+                if (group_entries[i]->column->index() != group_templates_[i].index()) {
+                    return "ChunkedAggregateOperator: group-by column type changed across chunks";
+                }
+            }
+        }
+
+        const std::size_t rows = chunk.rows();
+
+        if (cat_fast_path_) {
+            return process_rows_cat(group_entries, agg_entries, rows);
+        }
+        return process_rows_generic(group_entries, agg_entries, rows);
+    }
+
+    static void update_int_slot(AggSlot& slot, ir::AggFunc func, std::int64_t v) {
+        switch (func) {
+            case ir::AggFunc::Sum:
+                slot.int_value += v;
+                slot.has_value = true;
+                break;
+            case ir::AggFunc::Mean:
+                slot.sum += static_cast<double>(v);
+                slot.count += 1;
+                slot.has_value = true;
+                break;
+            case ir::AggFunc::Min:
+                slot.int_value = slot.has_value ? std::min(slot.int_value, v) : v;
+                slot.has_value = true;
+                break;
+            case ir::AggFunc::Max:
+                slot.int_value = slot.has_value ? std::max(slot.int_value, v) : v;
+                slot.has_value = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    static void update_double_slot(AggSlot& slot, ir::AggFunc func, double v) {
+        switch (func) {
+            case ir::AggFunc::Sum:
+                slot.double_value += v;
+                slot.has_value = true;
+                break;
+            case ir::AggFunc::Mean:
+                slot.sum += v;
+                slot.count += 1;
+                slot.has_value = true;
+                break;
+            case ir::AggFunc::Min:
+                slot.double_value = slot.has_value ? std::min(slot.double_value, v) : v;
+                slot.has_value = true;
+                break;
+            case ir::AggFunc::Max:
+                slot.double_value = slot.has_value ? std::max(slot.double_value, v) : v;
+                slot.has_value = true;
+                break;
+            default:
+                break;
+        }
+    }
+
+    auto process_rows_cat(const std::vector<const ColumnEntry*>& group_entries,
+                          const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
+        -> std::optional<std::string> {
+        std::vector<const Column<Categorical>*> cat_cols;
+        cat_cols.reserve(group_entries.size());
+        for (const auto* e : group_entries) {
+            cat_cols.push_back(&std::get<Column<Categorical>>(*e->column));
+        }
+        const bool single_key = cat_cols.size() == 1;
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::size_t state_idx;
+            if (single_key) {
+                const auto code = cat_cols[0]->code_at(row);
+                auto [it, inserted] = cat_index_.emplace(code, states_.size());
+                if (inserted) {
+                    cat_order_.push_back(code);
+                    states_.push_back(make_state());
+                }
+                state_idx = it->second;
+            } else {
+                CatKey ck;
+                ck.codes.resize(cat_cols.size());
+                for (std::size_t c = 0; c < cat_cols.size(); ++c) {
+                    ck.codes[c] = cat_cols[c]->code_at(row);
+                }
+                auto [it, inserted] = multi_cat_index_.emplace(std::move(ck), states_.size());
+                if (inserted) {
+                    multi_cat_order_.push_back(it->first);
+                    states_.push_back(make_state());
+                }
+                state_idx = it->second;
+            }
+            update_agg_slots(states_[state_idx].slots.data(), agg_entries, row);
+        }
+        return std::nullopt;
+    }
+
+    auto process_rows_generic(const std::vector<const ColumnEntry*>& group_entries,
+                              const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
+        -> std::optional<std::string> {
+        for (std::size_t row = 0; row < rows; ++row) {
+            Key key;
+            key.values.reserve(group_entries.size());
+            for (const auto* e : group_entries) {
+                key.values.push_back(scalar_from_column(*e->column, row));
+            }
+            auto [it, inserted] = index_.emplace(std::move(key), states_.size());
+            if (inserted) {
+                group_order_.push_back(it->first);
+                states_.push_back(make_state());
+            }
+            update_agg_slots(states_[it->second].slots.data(), agg_entries, row);
+        }
+        return std::nullopt;
+    }
+
+    void update_agg_slots(AggSlot* slots, const std::vector<const ColumnEntry*>& agg_entries,
+                          std::size_t row) {
+        for (std::size_t i = 0; i < plan_.size(); ++i) {
+            AggSlot& slot = slots[i];
+            if (plan_[i].func == ir::AggFunc::Count) {
+                slot.count += 1;
+                continue;
+            }
+            const auto& entry = *agg_entries[i];
+            if (entry.validity.has_value() && !(*entry.validity)[row]) {
+                continue;
+            }
+            const ColumnValue& col = *entry.column;
+            if (plan_[i].kind == ExprType::Int) {
+                update_int_slot(slot, plan_[i].func, std::get<Column<std::int64_t>>(col)[row]);
+            } else {
+                update_double_slot(slot, plan_[i].func, std::get<Column<double>>(col)[row]);
+            }
+        }
+    }
+
+    auto make_state() const -> AggState {
+        AggState state;
+        state.slots.reserve(plan_.size());
+        for (const auto& p : plan_) {
+            AggSlot slot;
+            slot.func = p.func;
+            slot.kind = p.kind;
+            state.slots.push_back(slot);
+        }
+        return state;
+    }
+
+    auto build_output_chunk() -> std::expected<std::optional<Chunk>, std::string> {
+        Chunk out;
+        out.columns.reserve(group_by_->size() + aggregations_->size());
+
+        if (!initialized_) {
+            // No input rows at all — emit a chunk with empty columns of
+            // the expected schema where possible. Without any chunk we
+            // have no types to build group columns; return an empty
+            // optional so the sink finalizes an empty table.
+            return std::optional<Chunk>{};
+        }
+
+        for (std::size_t i = 0; i < group_by_->size(); ++i) {
+            ColumnEntry entry;
+            entry.name = (*group_by_)[i].name;
+            entry.column = std::make_shared<ColumnValue>(make_empty_like(group_templates_[i]));
+            out.columns.push_back(std::move(entry));
+        }
+        for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            const auto& agg = (*aggregations_)[i];
+            ColumnValue column;
+            switch (agg.func) {
+                case ir::AggFunc::Count:
+                    column = Column<std::int64_t>{};
+                    break;
+                case ir::AggFunc::Mean:
+                    column = Column<double>{};
+                    break;
+                case ir::AggFunc::Sum:
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max:
+                    if (plan_[i].kind == ExprType::Double) {
+                        column = Column<double>{};
+                    } else {
+                        column = Column<std::int64_t>{};
+                    }
+                    break;
+                default:
+                    return std::unexpected(
+                        "ChunkedAggregateOperator: unsupported agg in build_output");
+            }
+            ColumnEntry entry;
+            entry.name = agg.alias;
+            entry.column = std::make_shared<ColumnValue>(std::move(column));
+            out.columns.push_back(std::move(entry));
+        }
+
+        const std::size_t n_groups = states_.size();
+        for (std::size_t i = 0; i < out.columns.size(); ++i) {
+            std::visit([&](auto& c) { c.reserve(n_groups); }, *out.columns[i].column);
+        }
+
+        // Track per-agg validity for funcs that can emit null when an
+        // entire group had no non-null input values.
+        std::vector<ValidityBitmap> agg_validity(aggregations_->size());
+        std::vector<std::uint8_t> track_validity(aggregations_->size(), 0U);
+        for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            switch (plan_[i].func) {
+                case ir::AggFunc::Sum:
+                case ir::AggFunc::Mean:
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max:
+                    track_validity[i] = 1U;
+                    agg_validity[i].reserve(n_groups);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        for (std::size_t g = 0; g < n_groups; ++g) {
+            if (cat_fast_path_) {
+                const bool single_key = group_by_->size() == 1;
+                if (single_key) {
+                    auto& cat_col = std::get<Column<Categorical>>(*out.columns[0].column);
+                    cat_col.push_code(cat_order_[g]);
+                } else {
+                    const auto& ck = multi_cat_order_[g];
+                    for (std::size_t ci = 0; ci < ck.codes.size(); ++ci) {
+                        auto& cat_col = std::get<Column<Categorical>>(*out.columns[ci].column);
+                        cat_col.push_code(ck.codes[ci]);
+                    }
+                }
+            } else {
+                const Key& key = group_order_[g];
+                for (std::size_t ci = 0; ci < key.values.size(); ++ci) {
+                    append_scalar(*out.columns[ci].column, key.values[ci]);
+                }
+            }
+            const AggSlot* slots = states_[g].slots.data();
+            for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+                auto& column = *out.columns[group_by_->size() + i].column;
+                const AggSlot& slot = slots[i];
+                if (track_validity[i] != 0U) {
+                    const bool valid =
+                        plan_[i].func == ir::AggFunc::Mean ? slot.count > 0 : slot.has_value;
+                    agg_validity[i].push_back(valid);
+                }
+                switch (plan_[i].func) {
+                    case ir::AggFunc::Count:
+                        append_scalar(column, slot.count);
+                        break;
+                    case ir::AggFunc::Mean:
+                        append_scalar(column, slot.count == 0
+                                                  ? 0.0
+                                                  : slot.sum / static_cast<double>(slot.count));
+                        break;
+                    case ir::AggFunc::Sum:
+                    case ir::AggFunc::Min:
+                    case ir::AggFunc::Max:
+                        if (plan_[i].kind == ExprType::Double) {
+                            append_scalar(column, slot.double_value);
+                        } else {
+                            append_scalar(column, slot.int_value);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            if (track_validity[i] == 0U || agg_validity[i].size() == 0) {
+                continue;
+            }
+            bool has_null = false;
+            for (std::size_t r = 0; r < agg_validity[i].size(); ++r) {
+                if (!agg_validity[i][r]) {
+                    has_null = true;
+                    break;
+                }
+            }
+            if (has_null) {
+                out.columns[group_by_->size() + i].validity = std::move(agg_validity[i]);
+            }
+        }
+
+        return std::optional<Chunk>{std::move(out)};
+    }
+
+    struct SlotPlan {
+        ir::AggFunc func = ir::AggFunc::Sum;
+        ExprType kind = ExprType::Int;
+    };
+
+    struct CatKey {
+        std::vector<Column<Categorical>::code_type> codes;
+        auto operator==(const CatKey& o) const noexcept -> bool { return codes == o.codes; }
+    };
+    struct CatKeyHash {
+        auto operator()(const CatKey& k) const noexcept -> std::size_t {
+            std::size_t h = 0;
+            for (auto c : k.codes) {
+                h ^= robin_hood::hash<Column<Categorical>::code_type>{}(c) + 0x9e3779b9 + (h << 6) +
+                     (h >> 2);
+            }
+            return h;
+        }
+    };
+
+    OperatorPtr child_;
+    const std::vector<ir::ColumnRef>* group_by_;
+    const std::vector<ir::AggSpec>* aggregations_;
+    bool emitted_ = false;
+
+    bool initialized_ = false;
+    bool cat_fast_path_ = false;
+    std::vector<SlotPlan> plan_;
+    std::vector<ColumnValue> group_templates_;
+
+    // Generic path (non-Categorical group keys).
+    robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> index_;
+    std::vector<Key> group_order_;
+
+    // Single-Categorical fast path.
+    using cat_code = Column<Categorical>::code_type;
+    robin_hood::unordered_flat_map<cat_code, std::size_t> cat_index_;
+    std::vector<cat_code> cat_order_;
+
+    // Multi-Categorical fast path.
+    robin_hood::unordered_flat_map<CatKey, std::size_t, CatKeyHash> multi_cat_index_;
+    std::vector<CatKey> multi_cat_order_;
+
+    std::vector<AggState> states_;
+};
+
 /// Planner seam: returns a pull-based operator that, when drained,
 /// produces the logical result of `node`. Chunked operators exist
 /// today for node kinds that are safe and useful to stream; any other
@@ -7169,6 +7630,78 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         return std::make_unique<ChunkedProjectOperator>(std::move(child_op.value()),
                                                         &project.columns());
+    }
+
+    if (node.kind() == ir::NodeKind::ExternCall && externs != nullptr) {
+        const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+        const auto* fn = externs->find(ec.callee());
+        if (fn != nullptr && fn->chunked_table_func) {
+            ExternArgs args;
+            args.reserve(ec.args().size());
+            for (const auto& arg : ec.args()) {
+                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+                if (!val.has_value()) {
+                    return std::unexpected(std::move(val.error()));
+                }
+                args.push_back(std::move(val.value()));
+            }
+            return fn->chunked_table_func(args);
+        }
+    }
+
+    if (node.kind() == ir::NodeKind::Order) {
+        const auto& order = static_cast<const ir::OrderNode&>(node);
+        if (order.children().empty()) {
+            return std::unexpected("order node missing child");
+        }
+        auto child_op =
+            build_operator(*order.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        MaterializeOperator sink{std::move(child_op.value())};
+        auto materialized = sink.run();
+        if (!materialized.has_value()) {
+            return std::unexpected(std::move(materialized.error()));
+        }
+        auto sorted = order_table(materialized.value(), order.keys());
+        if (!sorted.has_value()) {
+            return std::unexpected(std::move(sorted.error()));
+        }
+        return std::make_unique<TableSourceOperator>(std::move(sorted.value()));
+    }
+
+    if (node.kind() == ir::NodeKind::Aggregate) {
+        const auto& agg = static_cast<const ir::AggregateNode&>(node);
+        if (agg.children().empty()) {
+            return std::unexpected("aggregate node missing child");
+        }
+        bool streamable = true;
+        for (const auto& spec : agg.aggregations()) {
+            switch (spec.func) {
+                case ir::AggFunc::Count:
+                case ir::AggFunc::Sum:
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max:
+                case ir::AggFunc::Mean:
+                    break;
+                default:
+                    streamable = false;
+                    break;
+            }
+            if (!streamable) {
+                break;
+            }
+        }
+        if (streamable) {
+            auto child_op =
+                build_operator(*agg.children().front(), registry, scalars, externs, model_out);
+            if (!child_op.has_value()) {
+                return std::unexpected(std::move(child_op.error()));
+            }
+            return std::make_unique<ChunkedAggregateOperator>(std::move(child_op.value()),
+                                                              &agg.group_by(), &agg.aggregations());
+        }
     }
 
     auto table = interpret_node(node, registry, scalars, externs, model_out);

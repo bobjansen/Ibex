@@ -1,6 +1,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/rng.hpp>
 
 #include <algorithm>
@@ -7133,6 +7134,41 @@ class ChunkedProjectOperator final : public Operator {
     const std::vector<ir::ColumnRef>* columns_;
 };
 
+class ChunkedRenameOperator final : public Operator {
+   public:
+    ChunkedRenameOperator(OperatorPtr child, const std::vector<ir::RenameSpec>* renames)
+        : child_(std::move(child)), renames_(renames) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        auto chunk_res = child_->next();
+        if (!chunk_res.has_value()) {
+            return std::unexpected(std::move(chunk_res.error()));
+        }
+        if (!chunk_res.value().has_value()) {
+            return std::optional<Chunk>{};
+        }
+        Chunk chunk = std::move(*chunk_res.value());
+        for (const auto& spec : *renames_) {
+            bool found = false;
+            for (auto& col : chunk.columns) {
+                if (col.name == spec.old_name) {
+                    col.name = spec.new_name;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return std::unexpected("rename: column not found: " + spec.old_name);
+            }
+        }
+        return std::optional<Chunk>{std::move(chunk)};
+    }
+
+   private:
+    OperatorPtr child_;
+    const std::vector<ir::RenameSpec>* renames_;
+};
+
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and
 /// per-group `AggState` across chunks: each incoming chunk updates the
 /// state per row, the chunk is released, and the final result is
@@ -7682,6 +7718,20 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                                                         &project.columns());
     }
 
+    if (node.kind() == ir::NodeKind::Rename) {
+        const auto& rename = static_cast<const ir::RenameNode&>(node);
+        if (rename.children().empty()) {
+            return std::unexpected("rename node missing child");
+        }
+        auto child_op =
+            build_operator(*rename.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedRenameOperator>(std::move(child_op.value()),
+                                                       &rename.renames());
+    }
+
     if (node.kind() == ir::NodeKind::ExternCall && externs != nullptr) {
         const auto& ec = static_cast<const ir::ExternCallNode&>(node);
         const auto* fn = externs->find(ec.callee());
@@ -7704,6 +7754,27 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 }
             }
         }
+    }
+
+    if (node.kind() == ir::NodeKind::Distinct) {
+        if (node.children().empty()) {
+            return std::unexpected("distinct node missing child");
+        }
+        auto child_op =
+            build_operator(*node.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        MaterializeOperator sink{std::move(child_op.value())};
+        auto materialized = sink.run();
+        if (!materialized.has_value()) {
+            return std::unexpected(std::move(materialized.error()));
+        }
+        auto deduped = distinct_table(materialized.value());
+        if (!deduped.has_value()) {
+            return std::unexpected(std::move(deduped.error()));
+        }
+        return std::make_unique<TableSourceOperator>(std::move(deduped.value()));
     }
 
     if (node.kind() == ir::NodeKind::Order) {

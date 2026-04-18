@@ -4,6 +4,7 @@ add_library(ibex_runtime STATIC
     join.cpp
     model.cpp
     ops.cpp
+    pipeline.cpp
     reshape.cpp
     rng.cpp
     runtime_internal.cpp

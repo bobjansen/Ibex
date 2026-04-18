@@ -8173,6 +8173,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (!inserted) {
                     chain_next_[r] = it->second;
                     it->second = r;
+                    build_unique_ = false;
                 }
             }
         } else if (key_kind_ == ExprType::Date) {
@@ -8217,6 +8218,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (!inserted) {
                 chain_next_[r] = it->second;
                 it->second = r;
+                build_unique_ = false;
             }
         }
     }
@@ -8226,6 +8228,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (!inserted) {
             chain_next_[r] = it->second;
             it->second = r;
+            build_unique_ = false;
         }
     }
 
@@ -8241,9 +8244,45 @@ class ChunkedInnerJoinOperator final : public Operator {
 
     // Stream mode: walk the probe side (a left chunk), for each row look
     // up the right-keyed chain and append (li, ri) in probe-scan order.
+    // Returns true if every probe row matched exactly once (li == 0..n-1).
+    // Only possible when the build side was unique; otherwise falls back
+    // to the chained walk.
     template <typename Map, typename GetKey>
-    void probe_scalar(const Map& heads, std::size_t n, GetKey get, std::vector<std::size_t>& li,
-                      std::vector<std::size_t>& ri) {
+    auto probe_scalar(const Map& heads, std::size_t n, GetKey get, std::vector<std::size_t>& li,
+                      std::vector<std::size_t>& ri) -> bool {
+        if (build_unique_) {
+            ri.resize(n);
+            std::size_t* rp = ri.data();
+            std::size_t out = 0;
+            bool identity = true;
+            for (std::size_t l = 0; l < n; ++l) {
+                auto it = heads.find(get(l));
+                if (it == heads.end()) {
+                    identity = false;
+                    continue;
+                }
+                rp[out++] = it->second;
+                if (out != l + 1) {
+                    identity = false;
+                }
+            }
+            ri.resize(out);
+            if (identity) {
+                return true;
+            }
+            // Rebuild li for the sparse-match case.
+            li.resize(out);
+            std::size_t* lp = li.data();
+            std::size_t j = 0;
+            for (std::size_t l = 0; l < n && j < out; ++l) {
+                auto it = heads.find(get(l));
+                if (it == heads.end()) {
+                    continue;
+                }
+                lp[j++] = l;
+            }
+            return false;
+        }
         for (std::size_t l = 0; l < n; ++l) {
             auto it = heads.find(get(l));
             if (it == heads.end()) {
@@ -8256,6 +8295,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 cur = chain_next_[cur];
             }
         }
+        return false;
     }
 
     auto probe_chunk_against_right(Table left_chunk) -> std::expected<Table, std::string> {
@@ -8269,6 +8309,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         const std::size_t n = left_chunk.rows();
         li.reserve(n);
         ri.reserve(n);
+        bool li_identity = false;
 
         if (key_kind_ == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(key);
@@ -8276,58 +8317,58 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(i64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+            li_identity =
+                probe_scalar(i64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (key_kind_ == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(f64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+            li_identity =
+                probe_scalar(f64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (key_kind_ == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            probe_scalar(bool_heads_, n, [&](std::size_t i) { return (*col)[i]; }, li, ri);
+            li_identity =
+                probe_scalar(bool_heads_, n, [&](std::size_t i) { return (*col)[i]; }, li, ri);
         } else if (key_kind_ == ExprType::Date) {
             const auto* col = std::get_if<Column<Date>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(date_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+            li_identity =
+                probe_scalar(date_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (key_kind_ == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(ts_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+            li_identity =
+                probe_scalar(ts_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
         } else if (key_kind_ == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
                 const auto& dict = c_cat->dictionary();
-                for (std::size_t l = 0; l < n; ++l) {
-                    auto code = static_cast<std::size_t>(c_cat->code_at(l));
-                    auto it = string_heads_.find(std::string_view{dict[code]});
-                    if (it == string_heads_.end()) {
-                        continue;
-                    }
-                    std::size_t cur = it->second;
-                    while (cur != kNil) {
-                        li.push_back(l);
-                        ri.push_back(cur);
-                        cur = chain_next_[cur];
-                    }
-                }
+                li_identity = probe_scalar(
+                    string_heads_, n,
+                    [&](std::size_t i) {
+                        return std::string_view{dict[static_cast<std::size_t>(c_cat->code_at(i))]};
+                    },
+                    li, ri);
             } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
-                probe_scalar(string_heads_, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
+                li_identity = probe_scalar(
+                    string_heads_, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
             } else {
                 return std::unexpected("inner join: left key type mismatch");
             }
         }
 
-        return assemble_output(left_chunk, li.data(), ri.data(), li.size());
+        const std::size_t total = li_identity ? ri.size() : li.size();
+        return assemble_output(std::move(left_chunk), li.data(), ri.data(), total, li_identity);
     }
 
     // Swapped mode: the hash index is on the left table. For each right
@@ -8450,11 +8491,22 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         }
 
-        return assemble_output(*left_table_, li.data(), ri.data(), li.size());
+        Table left_copy;
+        left_copy.columns.reserve(left_table_->columns.size());
+        for (const auto& c : left_table_->columns) {
+            ColumnEntry e;
+            e.name = c.name;
+            e.column = std::make_shared<ColumnValue>(*c.column);
+            e.validity = c.validity;
+            left_copy.columns.push_back(std::move(e));
+            left_copy.index[left_copy.columns.back().name] = left_copy.columns.size() - 1;
+        }
+        return assemble_output(std::move(left_copy), li.data(), ri.data(), li.size());
     }
 
-    auto assemble_output(const Table& left_side, const std::size_t* li, const std::size_t* ri,
-                         std::size_t total) -> std::expected<Table, std::string> {
+    auto assemble_output(Table left_side, const std::size_t* li, const std::size_t* ri,
+                         std::size_t total, bool li_identity = false)
+        -> std::expected<Table, std::string> {
         Table output;
         if (total == 0) {
             return output;
@@ -8480,13 +8532,25 @@ class ChunkedInnerJoinOperator final : public Operator {
             return {std::move(gathered), std::move(val)};
         };
 
-        for (const auto& lc : left_side.columns) {
-            auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li);
-            out_names.insert(lc.name);
-            if (val.has_value()) {
-                output.add_column(lc.name, std::move(gathered), std::move(*val));
-            } else {
-                output.add_column(lc.name, std::move(gathered));
+        // li_identity: every probe row matched exactly once, so left columns
+        // can be passed through directly (shared_ptr share) instead of
+        // gathered. Do NOT move the underlying ColumnValue — the shared_ptr
+        // may be aliased by upstream state (e.g., re-runnable source).
+        if (li_identity && total == left_side.rows()) {
+            for (auto& lc : left_side.columns) {
+                out_names.insert(lc.name);
+                output.index[lc.name] = output.columns.size();
+                output.columns.push_back(std::move(lc));
+            }
+        } else {
+            for (const auto& lc : left_side.columns) {
+                auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li);
+                out_names.insert(lc.name);
+                if (val.has_value()) {
+                    output.add_column(lc.name, std::move(gathered), std::move(*val));
+                } else {
+                    output.add_column(lc.name, std::move(gathered));
+                }
             }
         }
 
@@ -8516,6 +8580,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     ExprType key_kind_ = ExprType::Int;
 
     // Hash index on the build side (right in Stream, left in Swapped).
+    bool build_unique_ = true;
     std::vector<std::size_t> chain_next_;
     robin_hood::unordered_flat_map<std::int64_t, std::size_t> i64_heads_;
     robin_hood::unordered_flat_map<double, std::size_t> f64_heads_;

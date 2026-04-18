@@ -143,6 +143,11 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
         return ibex::runtime::OperatorPtr(std::move(op));
     }
 
+    AdbcSourceOperator(const AdbcSourceOperator&) = delete;
+    AdbcSourceOperator& operator=(const AdbcSourceOperator&) = delete;
+    AdbcSourceOperator(AdbcSourceOperator&&) noexcept = delete;
+    AdbcSourceOperator& operator=(AdbcSourceOperator&&) noexcept = delete;
+
     ~AdbcSourceOperator() override {
         ibex::interop::release_arrow_stream(&stream_);
         ibex::interop::release_arrow_schema(&schema_);

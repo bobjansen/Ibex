@@ -404,6 +404,52 @@ auto verify_order_head_topk(const ibex::runtime::Table& table, const ibex::runti
     return true;
 }
 
+auto verify_order_head_topk_by_symbol(const ibex::runtime::Table& table,
+                                      const ibex::runtime::Table& result, std::size_t rows,
+                                      std::size_t k) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* symbol_col = table.find("symbol");
+    const auto* out_price = result.find("price");
+    const auto* out_symbol = result.find("symbol");
+    if (price_col == nullptr || symbol_col == nullptr || out_price == nullptr ||
+        out_symbol == nullptr) {
+        return false;
+    }
+
+    std::vector<std::size_t> idx(rows);
+    std::iota(idx.begin(), idx.end(), std::size_t{0});
+    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+        return double_at(*price_col, lhs) > double_at(*price_col, rhs);
+    });
+
+    std::unordered_map<std::string, std::size_t> seen;
+    std::vector<std::size_t> expected_idx;
+    expected_idx.reserve(std::min(rows, k * std::size_t{512}));
+    for (std::size_t row : idx) {
+        std::string symbol{string_view_at(*symbol_col, row)};
+        auto& count = seen[symbol];
+        if (count >= k) {
+            continue;
+        }
+        ++count;
+        expected_idx.push_back(row);
+    }
+
+    if (result.rows() != expected_idx.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < expected_idx.size(); ++i) {
+        const std::size_t row = expected_idx[i];
+        if (string_view_at(*out_symbol, i) != string_view_at(*symbol_col, row)) {
+            return false;
+        }
+        if (std::abs(double_at(*out_price, i) - double_at(*price_col, row)) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto verify_filter(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
                    std::size_t rows, const std::string_view mode) -> bool {
     const auto* price_col = table.find("price");
@@ -590,6 +636,14 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         std::size_t rows = sliced.at("prices").rows();
         if (!verify_order_head_topk(sliced.at("prices"), *result, rows, 100)) {
             return "order_head_topk verification failed";
+        }
+    } else if (query.name == "order_head_topk_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_order_head_topk_by_symbol(sliced.at("prices"), *result, rows, 3)) {
+            return "order_head_topk_by_symbol verification failed";
         }
     } else if (query.name == "count_by_symbol_day") {
         if (multi == nullptr) {
@@ -1060,6 +1114,10 @@ int main(int argc, char** argv) {
                 "order_head_topk",
                 "prices[order price desc, head 100]",
             },
+            {
+                "order_head_topk_by_symbol",
+                "prices[order price desc, head 3, by symbol]",
+            },
             // Parse + lower overhead: same queries timed with parsing included.
             // Run with --include-parse (default) to capture lexer/parser maps.
             {
@@ -1077,12 +1135,12 @@ int main(int argc, char** argv) {
             },
         };
 
-        // The first three queries benchmark pure execution (use --no-include-parse for isolation).
+        // The first four queries benchmark pure execution (use --no-include-parse for isolation).
         // The last three use default include_parse to measure parsing cost.
         if (run_suite("core")) {
             for (std::size_t qi = 0; qi < queries.size(); ++qi) {
                 // parse_* queries always include parsing in the timing
-                bool this_include_parse = (qi >= 3) ? true : saved_include_parse;
+                bool this_include_parse = (qi >= 4) ? true : saved_include_parse;
                 if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
                     if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
                         fmt::print("error: verify failed for {}: {}\n", queries[qi].name, *err);

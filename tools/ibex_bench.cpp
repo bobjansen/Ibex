@@ -375,6 +375,36 @@ auto verify_update_price_x2(const ibex::runtime::Table& table, const ibex::runti
     return true;
 }
 
+auto verify_distinct_symbol(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                            std::size_t rows) -> bool {
+    const auto* symbol_col = table.find("symbol");
+    const auto* out_symbol = result.find("symbol");
+    if (symbol_col == nullptr || out_symbol == nullptr) {
+        return false;
+    }
+
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> expected;
+    expected.reserve(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::string symbol{string_view_at(*symbol_col, row)};
+        if (!seen.insert(symbol).second) {
+            continue;
+        }
+        expected.push_back(std::move(symbol));
+    }
+
+    if (result.rows() != expected.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (string_view_at(*out_symbol, i) != expected[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto verify_order_head_topk(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
                             std::size_t rows, std::size_t k) -> bool {
     const auto* price_col = table.find("price");
@@ -712,6 +742,14 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         std::size_t rows = sliced.at("prices").rows();
         if (!verify_update_price_x2(sliced.at("prices"), *result, rows)) {
             return "update_price_x2 verification failed";
+        }
+    } else if (query.name == "distinct_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_distinct_symbol(sliced.at("prices"), *result, rows)) {
+            return "distinct_symbol verification failed";
         }
     } else if (query.name == "order_head_topk") {
         if (table == nullptr) {
@@ -1211,6 +1249,10 @@ int main(int argc, char** argv) {
                 "prices[update {price_x2 = price * 2}]",
             },
             {
+                "distinct_symbol",
+                "prices[distinct { symbol }]",
+            },
+            {
                 "order_head_topk",
                 "prices[order price desc, head 100]",
             },
@@ -1243,12 +1285,12 @@ int main(int argc, char** argv) {
             },
         };
 
-        // The first six queries benchmark pure execution (use --no-include-parse for isolation).
+        // The first seven queries benchmark pure execution (use --no-include-parse for isolation).
         // The last three use default include_parse to measure parsing cost.
         if (run_suite("core")) {
             for (std::size_t qi = 0; qi < queries.size(); ++qi) {
                 // parse_* queries always include parsing in the timing
-                bool this_include_parse = (qi >= 6) ? true : saved_include_parse;
+                bool this_include_parse = (qi >= 7) ? true : saved_include_parse;
                 if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
                     if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
                         fmt::print("error: verify failed for {}: {}\n", queries[qi].name, *err);

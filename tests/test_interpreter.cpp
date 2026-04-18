@@ -1,3 +1,4 @@
+#include <ibex/ir/builder.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/extern_registry.hpp>
@@ -61,6 +62,37 @@ TEST_CASE("Interpret filter + select") {
     REQUIRE(price_ints->size() == 2);
     REQUIRE((*price_ints)[0] == 20);
     REQUIRE((*price_ints)[1] == 30);
+}
+
+TEST_CASE("Interpret Program executes preamble extern calls before main node") {
+    ir::Builder builder;
+
+    runtime::Table df;
+    df.add_column("x", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("df", df);
+
+    int init_calls = 0;
+    runtime::ExternRegistry externs;
+    externs.register_scalar(
+        "init", runtime::ScalarKind::Int,
+        [&](const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            REQUIRE(args.size() == 1);
+            REQUIRE(std::get<std::int64_t>(args[0]) == 7);
+            ++init_calls;
+            return runtime::ExternValue{runtime::ScalarValue{std::int64_t{0}}};
+        });
+
+    std::vector<ir::NodePtr> preamble;
+    preamble.push_back(builder.extern_call("init", {ir::Expr{ir::Literal{std::int64_t{7}}}}));
+    auto program = builder.program(std::move(preamble), builder.scan("df"));
+
+    auto result = runtime::interpret(*program, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    REQUIRE(init_calls == 1);
+    REQUIRE(result->rows() == 3);
+    REQUIRE(result->find("x") != nullptr);
 }
 
 TEST_CASE("Interpret filter with scalar predicate") {

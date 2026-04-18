@@ -103,6 +103,25 @@ install(TARGETS ibex_join_bench
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
 
+add_executable(ibex_fusion_bench ibex_fusion_bench.cpp)
+
+target_link_libraries(ibex_fusion_bench
+    PRIVATE
+        Ibex::parser
+        Ibex::runtime
+        Ibex::CompilerOptions
+        CLI11::CLI11
+        fmt::fmt
+)
+
+if(TARGET Ibex::Sanitizers)
+    target_link_libraries(ibex_fusion_bench PRIVATE Ibex::Sanitizers)
+endif()
+
+install(TARGETS ibex_fusion_bench
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+
 add_executable(ibex_bench_csv_read bench_read_csv.cpp)
 
 target_include_directories(ibex_bench_csv_read PRIVATE "${PROJECT_SOURCE_DIR}/libs/csv")

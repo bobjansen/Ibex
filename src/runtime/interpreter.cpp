@@ -7153,6 +7153,115 @@ class ChunkedRenameOperator final : public Operator {
     const std::vector<ir::RenameSpec>* renames_;
 };
 
+class ChunkedHeadOperator final : public Operator {
+   public:
+    ChunkedHeadOperator(OperatorPtr child, std::size_t count,
+                        const std::vector<ir::ColumnRef>* group_by)
+        : child_(std::move(child)), count_(count), group_by_(group_by), remaining_(count) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (done_) {
+            return std::optional<Chunk>{};
+        }
+
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                done_ = true;
+                return std::optional<Chunk>{};
+            }
+
+            Chunk chunk = std::move(*chunk_res.value());
+            if (count_ == 0) {
+                done_ = true;
+                Table t = chunk_to_table(std::move(chunk));
+                std::vector<std::size_t> idx;
+                return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
+            }
+
+            if (group_by_->empty()) {
+                return take_global_rows(std::move(chunk));
+            }
+
+            auto filtered = take_grouped_rows(std::move(chunk));
+            if (!filtered.has_value()) {
+                return std::unexpected(std::move(filtered.error()));
+            }
+            if (!filtered->has_value()) {
+                continue;
+            }
+            return filtered;
+        }
+    }
+
+   private:
+    auto take_global_rows(Chunk chunk) -> std::expected<std::optional<Chunk>, std::string> {
+        const std::size_t rows = chunk.rows();
+        if (rows <= remaining_) {
+            remaining_ -= rows;
+            if (remaining_ == 0) {
+                done_ = true;
+            }
+            return std::optional<Chunk>{std::move(chunk)};
+        }
+
+        Table t = chunk_to_table(std::move(chunk));
+        std::vector<std::size_t> idx(remaining_);
+        std::iota(idx.begin(), idx.end(), std::size_t{0});
+        remaining_ = 0;
+        done_ = true;
+        return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
+    }
+
+    auto take_grouped_rows(Chunk chunk) -> std::expected<std::optional<Chunk>, std::string> {
+        const std::size_t rows = chunk.rows();
+        if (rows == 0) {
+            return std::optional<Chunk>{std::move(chunk)};
+        }
+
+        Table t = chunk_to_table(std::move(chunk));
+        std::vector<std::size_t> idx;
+        idx.reserve(std::min(rows, count_ * std::max<std::size_t>(1, group_by_->size())));
+
+        for (std::size_t row = 0; row < rows; ++row) {
+            Key key;
+            key.values.reserve(group_by_->size());
+            for (const auto& ref : *group_by_) {
+                const auto* column = t.find(ref.name);
+                if (column == nullptr) {
+                    return std::unexpected("head group-by column not found: " + ref.name +
+                                           " (available: " + format_columns(t) + ")");
+                }
+                key.values.push_back(scalar_from_column(*column, row));
+            }
+            auto& seen = seen_counts_[key];
+            if (seen >= count_) {
+                continue;
+            }
+            ++seen;
+            idx.push_back(row);
+        }
+
+        if (idx.empty()) {
+            return std::optional<Chunk>{};
+        }
+        if (idx.size() == rows) {
+            return std::optional<Chunk>{table_to_chunk(std::move(t))};
+        }
+        return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
+    }
+
+    OperatorPtr child_;
+    std::size_t count_;
+    const std::vector<ir::ColumnRef>* group_by_;
+    std::size_t remaining_;
+    bool done_ = false;
+    robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> seen_counts_;
+};
+
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and
 /// per-group `AggState` across chunks: each incoming chunk updates the
 /// state per row, the chunk is released, and the final result is
@@ -7918,9 +8027,13 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (head.children().empty()) {
             return std::unexpected("head node missing child");
         }
-        return build_unary_materializing_operator(
-            *head.children().front(), registry, scalars, externs, model_out,
-            [&](Table input) { return head_table(input, head.count(), head.group_by()); });
+        auto child_op =
+            build_operator(*head.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedHeadOperator>(std::move(child_op.value()), head.count(),
+                                                     &head.group_by());
     }
 
     if (node.kind() == ir::NodeKind::Tail) {

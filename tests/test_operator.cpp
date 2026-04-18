@@ -175,7 +175,7 @@ TEST_CASE("classify_node returns correct roles", "[pipeline]") {
     CHECK(runtime::classify_node(ir::NodeKind::Filter) == runtime::PipelineRole::Passthrough);
     CHECK(runtime::classify_node(ir::NodeKind::Project) == runtime::PipelineRole::Passthrough);
     CHECK(runtime::classify_node(ir::NodeKind::Rename) == runtime::PipelineRole::Passthrough);
-    CHECK(runtime::classify_node(ir::NodeKind::Update) == runtime::PipelineRole::Passthrough);
+    CHECK(runtime::classify_node(ir::NodeKind::Update) == runtime::PipelineRole::Breaker);
     CHECK(runtime::classify_node(ir::NodeKind::Aggregate) == runtime::PipelineRole::Breaker);
     CHECK(runtime::classify_node(ir::NodeKind::Order) == runtime::PipelineRole::Breaker);
     CHECK(runtime::classify_node(ir::NodeKind::Distinct) == runtime::PipelineRole::Breaker);

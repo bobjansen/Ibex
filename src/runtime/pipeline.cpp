@@ -12,12 +12,12 @@ auto classify_node(ir::NodeKind kind) noexcept -> PipelineRole {
         case ir::NodeKind::Filter:
         case ir::NodeKind::Project:
         case ir::NodeKind::Rename:
-        case ir::NodeKind::Update:
-        case ir::NodeKind::Columns:
-        case ir::NodeKind::Head:
-        case ir::NodeKind::Tail:
             return PipelineRole::Passthrough;
 
+        case ir::NodeKind::Columns:
+        case ir::NodeKind::Update:
+        case ir::NodeKind::Head:
+        case ir::NodeKind::Tail:
         case ir::NodeKind::Aggregate:
         case ir::NodeKind::Order:
         case ir::NodeKind::Distinct:

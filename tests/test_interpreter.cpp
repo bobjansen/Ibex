@@ -754,6 +754,44 @@ TEST_CASE("Interpret ordered grouped head returns top-k per group") {
     REQUIRE((*score)[3] == 1);
 }
 
+TEST_CASE("Interpret ordered grouped head over chunked extern source keeps top-k per group") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("stream_grouped_scores", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_str_int_chunk("symbol", {"A", "B", "A"}, "score", {5, 2, 9}));
+        chunks.push_back(make_str_int_chunk("symbol", {"B", "C", "A"}, "score", {8, 1, 7}));
+        chunks.push_back(make_str_int_chunk("symbol", {"C", "B", "C"}, "score", {6, 4, 3}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn stream_grouped_scores() -> DataFrame from \"x.hpp\"; "
+        "stream_grouped_scores()[order score desc, head 2, by symbol];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* score = std::get_if<Column<std::int64_t>>(result->find("score"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(score != nullptr);
+    REQUIRE(symbol->size() == 6);
+    REQUIRE((*symbol)[0] == "A");
+    REQUIRE((*score)[0] == 9);
+    REQUIRE((*symbol)[1] == "B");
+    REQUIRE((*score)[1] == 8);
+    REQUIRE((*symbol)[2] == "A");
+    REQUIRE((*score)[2] == 7);
+    REQUIRE((*symbol)[3] == "C");
+    REQUIRE((*score)[3] == 6);
+    REQUIRE((*symbol)[4] == "B");
+    REQUIRE((*score)[4] == 4);
+    REQUIRE((*symbol)[5] == "C");
+    REQUIRE((*score)[5] == 3);
+}
+
 TEST_CASE("Interpret global tail preserves current order of last rows") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{10, 20, 30, 40});

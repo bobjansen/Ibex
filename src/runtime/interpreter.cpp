@@ -7285,8 +7285,8 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
 class ChunkedTopKOrderHeadOperator final : public Operator {
    public:
     ChunkedTopKOrderHeadOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys,
-                                 std::size_t count)
-        : child_(std::move(child)), keys_(keys), count_(count) {}
+                                 std::size_t count, const std::vector<ir::ColumnRef>* group_by)
+        : child_(std::move(child)), keys_(keys), count_(count), group_by_(group_by) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (emitted_) {
@@ -7332,6 +7332,10 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         RowSnapshot row;
     };
 
+    struct GroupState {
+        std::vector<Entry> heap;
+    };
+
     auto snapshot_row(const Table& chunk, std::size_t row) const -> RowSnapshot {
         RowSnapshot snapshot;
         snapshot.values.reserve(chunk.columns.size());
@@ -7368,30 +7372,43 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         return ascending ? (lhs < *rhs_key) : (lhs > *rhs_key);
     }
 
-    auto push_entry(Entry entry) -> void {
-        if (heap_.size() < count_) {
-            heap_.push_back(std::move(entry));
-            std::push_heap(heap_.begin(), heap_.end(),
+    auto push_entry(Entry entry) -> void { push_entry(heap_, std::move(entry)); }
+
+    auto push_entry(std::vector<Entry>& heap, Entry entry) const -> void {
+        if (heap.size() < count_) {
+            heap.push_back(std::move(entry));
+            std::push_heap(heap.begin(), heap.end(),
                            [&](const Entry& a, const Entry& b) { return row_better(a, b); });
             return;
         }
 
-        std::pop_heap(heap_.begin(), heap_.end(),
+        std::pop_heap(heap.begin(), heap.end(),
                       [&](const Entry& a, const Entry& b) { return row_better(a, b); });
-        heap_.back() = std::move(entry);
-        std::push_heap(heap_.begin(), heap_.end(),
+        heap.back() = std::move(entry);
+        std::push_heap(heap.begin(), heap.end(),
                        [&](const Entry& a, const Entry& b) { return row_better(a, b); });
     }
 
     template <typename T>
-    auto process_single_key_chunk(const Table& chunk, const Column<T>& key_column, bool ascending)
+    auto process_single_key_chunk(const Table& chunk, const Column<T>& key_column, bool ascending,
+                                  const std::vector<const ColumnValue*>& group_columns)
         -> std::optional<std::string> {
         for (std::size_t row = 0; row < chunk.rows(); ++row) {
             const std::size_t sequence = next_sequence_++;
             const T& key = key_column[row];
 
-            if (heap_.size() == count_ &&
-                !single_key_better(key, sequence, heap_.front(), ascending)) {
+            std::vector<Entry>* heap = &heap_;
+            if (!group_by_->empty()) {
+                Key group_key;
+                group_key.values.reserve(group_columns.size());
+                for (const auto* column : group_columns) {
+                    group_key.values.push_back(scalar_from_column(*column, row));
+                }
+                heap = &group_heaps_[std::move(group_key)].heap;
+            }
+
+            if (heap->size() == count_ &&
+                !single_key_better(key, sequence, heap->front(), ascending)) {
                 continue;
             }
 
@@ -7400,7 +7417,7 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
             entry.key.values.emplace_back(key);
             entry.sequence = sequence;
             entry.row = snapshot_row(chunk, row);
-            push_entry(std::move(entry));
+            push_entry(*heap, std::move(entry));
         }
         return std::nullopt;
     }
@@ -7408,6 +7425,17 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
     auto process_chunk(const Table& chunk) -> std::optional<std::string> {
         if (count_ == 0 || chunk.rows() == 0) {
             return std::nullopt;
+        }
+
+        std::vector<const ColumnValue*> group_columns;
+        group_columns.reserve(group_by_->size());
+        for (const auto& ref : *group_by_) {
+            const auto* column = chunk.find(ref.name);
+            if (column == nullptr) {
+                return "head group-by column not found: " + ref.name +
+                       " (available: " + format_columns(chunk) + ")";
+            }
+            group_columns.push_back(column);
         }
 
         std::vector<const ColumnValue*> key_columns;
@@ -7425,48 +7453,69 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
             const bool ascending = keys_->front().ascending;
             const ColumnValue& key_column = *key_columns.front();
             if (const auto* col = std::get_if<Column<std::int64_t>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending);
+                return process_single_key_chunk(chunk, *col, ascending, group_columns);
             }
             if (const auto* col = std::get_if<Column<double>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending);
+                return process_single_key_chunk(chunk, *col, ascending, group_columns);
             }
             if (const auto* col = std::get_if<Column<bool>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending);
+                return process_single_key_chunk(chunk, *col, ascending, group_columns);
             }
             if (const auto* col = std::get_if<Column<Date>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending);
+                return process_single_key_chunk(chunk, *col, ascending, group_columns);
             }
             if (const auto* col = std::get_if<Column<Timestamp>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending);
+                return process_single_key_chunk(chunk, *col, ascending, group_columns);
             }
         }
 
         for (std::size_t row = 0; row < chunk.rows(); ++row) {
+            std::vector<Entry>* heap = &heap_;
+            if (!group_by_->empty()) {
+                Key group_key;
+                group_key.values.reserve(group_columns.size());
+                for (const auto* column : group_columns) {
+                    group_key.values.push_back(scalar_from_column(*column, row));
+                }
+                heap = &group_heaps_[std::move(group_key)].heap;
+            }
+
             Entry entry;
             entry.key.values.reserve(keys_->size());
             for (const auto* column : key_columns) {
                 entry.key.values.push_back(scalar_from_column(*column, row));
             }
             entry.sequence = next_sequence_++;
-            if (heap_.size() == count_ && !row_better(entry, heap_.front())) {
+            if (heap->size() == count_ && !row_better(entry, heap->front())) {
                 continue;
             }
             entry.row = snapshot_row(chunk, row);
-            push_entry(std::move(entry));
+            push_entry(*heap, std::move(entry));
         }
         return std::nullopt;
     }
 
     auto build_output() -> Table {
-        if (count_ == 0 || heap_.empty()) {
+        std::vector<Entry> winners;
+        if (group_by_->empty()) {
+            winners = heap_;
+        } else {
+            for (auto& [_, state] : group_heaps_) {
+                for (auto& entry : state.heap) {
+                    winners.push_back(std::move(entry));
+                }
+            }
+        }
+
+        if (count_ == 0 || winners.empty()) {
             return empty_template_.value_or(Table{});
         }
 
-        std::sort(heap_.begin(), heap_.end(),
+        std::sort(winners.begin(), winners.end(),
                   [&](const Entry& a, const Entry& b) { return row_better(a, b); });
 
         Table out = empty_template_.value_or(Table{});
-        for (const auto& entry : heap_) {
+        for (const auto& entry : winners) {
             for (std::size_t col = 0; col < out.columns.size(); ++col) {
                 append_scalar(*out.columns[col].column, entry.row.values[col]);
                 if (entry.row.valid[col] == 0U) {
@@ -7489,9 +7538,11 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
     OperatorPtr child_;
     const std::vector<ir::OrderKey>* keys_;
     std::size_t count_;
+    const std::vector<ir::ColumnRef>* group_by_;
     bool emitted_ = false;
     std::size_t next_sequence_ = 0;
     std::vector<Entry> heap_;
+    robin_hood::unordered_flat_map<Key, GroupState, KeyHash, KeyEq> group_heaps_;
     std::optional<Table> empty_template_;
 };
 
@@ -8260,7 +8311,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (head.children().empty()) {
             return std::unexpected("head node missing child");
         }
-        if (head.group_by().empty() && head.children().front()->kind() == ir::NodeKind::Order) {
+        if (head.children().front()->kind() == ir::NodeKind::Order) {
             const auto& order = static_cast<const ir::OrderNode&>(*head.children().front());
             if (order.children().empty()) {
                 return std::unexpected("order node missing child");
@@ -8270,8 +8321,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             if (!child_op.has_value()) {
                 return std::unexpected(std::move(child_op.error()));
             }
-            return std::make_unique<ChunkedTopKOrderHeadOperator>(std::move(child_op.value()),
-                                                                  &order.keys(), head.count());
+            return std::make_unique<ChunkedTopKOrderHeadOperator>(
+                std::move(child_op.value()), &order.keys(), head.count(), &head.group_by());
         }
         auto child_op =
             build_operator(*head.children().front(), registry, scalars, externs, model_out);

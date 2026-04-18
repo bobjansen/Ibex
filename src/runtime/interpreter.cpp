@@ -7757,6 +7757,532 @@ class ChunkedDistinctOperator final : public Operator {
     const void* cat_dictionary_id_ = nullptr;
 };
 
+class ChunkedSemiAntiJoinOperator final : public Operator {
+   public:
+    ChunkedSemiAntiJoinOperator(OperatorPtr left, Table right, ir::JoinKind kind,
+                                const std::vector<std::string>* keys)
+        : left_(std::move(left)), right_(std::move(right)), kind_(kind), keys_(keys) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (!initialized_) {
+            auto err = initialize();
+            if (err.has_value()) {
+                return std::unexpected(std::move(*err));
+            }
+            initialized_ = true;
+        }
+
+        while (true) {
+            auto chunk_res = left_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                return std::optional<Chunk>{};
+            }
+
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            auto filtered = filter_chunk(std::move(t));
+            if (!filtered.has_value()) {
+                continue;
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
+        }
+    }
+
+   private:
+    auto initialize() -> std::optional<std::string> {
+        if (keys_->size() != 1) {
+            return "ChunkedSemiAntiJoinOperator only supports single-key joins";
+        }
+        if (right_.columns.empty()) {
+            return std::nullopt;
+        }
+        const ColumnValue* key = right_.find(keys_->front());
+        if (key == nullptr) {
+            return "join key not found in right table: " + keys_->front();
+        }
+
+        if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
+            right_kind_ = ExprType::Int;
+            for (std::size_t row = 0; row < col->size(); ++row) {
+                right_i64_.insert((*col)[row]);
+            }
+            return std::nullopt;
+        }
+        if (const auto* col = std::get_if<Column<double>>(key)) {
+            right_kind_ = ExprType::Double;
+            for (std::size_t row = 0; row < col->size(); ++row) {
+                right_f64_.insert((*col)[row]);
+            }
+            return std::nullopt;
+        }
+        if (const auto* col = std::get_if<Column<bool>>(key)) {
+            right_kind_ = ExprType::Bool;
+            for (std::size_t row = 0; row < col->size(); ++row) {
+                right_bool_.insert((*col)[row]);
+            }
+            return std::nullopt;
+        }
+        if (const auto* col = std::get_if<Column<Date>>(key)) {
+            right_kind_ = ExprType::Date;
+            for (std::size_t row = 0; row < col->size(); ++row) {
+                right_date_.insert((*col)[row]);
+            }
+            return std::nullopt;
+        }
+        if (const auto* col = std::get_if<Column<Timestamp>>(key)) {
+            right_kind_ = ExprType::Timestamp;
+            for (std::size_t row = 0; row < col->size(); ++row) {
+                right_timestamp_.insert((*col)[row]);
+            }
+            return std::nullopt;
+        }
+        if (const auto* col = std::get_if<Column<Categorical>>(key)) {
+            right_kind_ = ExprType::String;
+            right_cat_dictionary_id_ = static_cast<const void*>(col->dictionary_ptr().get());
+            for (std::size_t row = 0; row < col->size(); ++row) {
+                right_cat_codes_.insert(col->code_at(row));
+            }
+            return std::nullopt;
+        }
+        if (const auto* col = std::get_if<Column<std::string>>(key)) {
+            right_kind_ = ExprType::String;
+            for (std::size_t row = 0; row < col->size(); ++row) {
+                owned_strings_.emplace_back((*col)[row]);
+                right_strings_.insert(std::string_view{owned_strings_.back()});
+            }
+            return std::nullopt;
+        }
+        return "ChunkedSemiAntiJoinOperator: unsupported key type";
+    }
+
+    template <typename Pred>
+    auto filter_rows(Table t, Pred pred) -> std::optional<Table> {
+        const std::size_t rows = t.rows();
+        std::vector<std::size_t> idx;
+        idx.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (pred(row)) {
+                idx.push_back(row);
+            }
+        }
+        if (idx.empty()) {
+            return std::nullopt;
+        }
+        if (idx.size() == rows) {
+            return t;
+        }
+        return gather_rows(t, idx);
+    }
+
+    auto filter_chunk(Table t) -> std::optional<Table> {
+        const ColumnValue* key = t.find(keys_->front());
+        if (key == nullptr) {
+            return std::nullopt;
+        }
+        const bool keep_matches = (kind_ == ir::JoinKind::Semi);
+
+        if (right_kind_ == ExprType::Int) {
+            const auto* col = std::get_if<Column<std::int64_t>>(key);
+            if (col == nullptr) {
+                return std::nullopt;
+            }
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = right_i64_.contains((*col)[row]);
+                return keep_matches ? match : !match;
+            });
+        }
+        if (right_kind_ == ExprType::Double) {
+            const auto* col = std::get_if<Column<double>>(key);
+            if (col == nullptr) {
+                return std::nullopt;
+            }
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = right_f64_.contains((*col)[row]);
+                return keep_matches ? match : !match;
+            });
+        }
+        if (right_kind_ == ExprType::Bool) {
+            const auto* col = std::get_if<Column<bool>>(key);
+            if (col == nullptr) {
+                return std::nullopt;
+            }
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = right_bool_.contains((*col)[row]);
+                return keep_matches ? match : !match;
+            });
+        }
+        if (right_kind_ == ExprType::Date) {
+            const auto* col = std::get_if<Column<Date>>(key);
+            if (col == nullptr) {
+                return std::nullopt;
+            }
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = right_date_.contains((*col)[row]);
+                return keep_matches ? match : !match;
+            });
+        }
+        if (right_kind_ == ExprType::Timestamp) {
+            const auto* col = std::get_if<Column<Timestamp>>(key);
+            if (col == nullptr) {
+                return std::nullopt;
+            }
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = right_timestamp_.contains((*col)[row]);
+                return keep_matches ? match : !match;
+            });
+        }
+
+        if (const auto* col = std::get_if<Column<Categorical>>(key);
+            col != nullptr &&
+            static_cast<const void*>(col->dictionary_ptr().get()) == right_cat_dictionary_id_) {
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = right_cat_codes_.contains(col->code_at(row));
+                return keep_matches ? match : !match;
+            });
+        }
+
+        if (const auto* col = std::get_if<Column<Categorical>>(key)) {
+            const void* left_dict_id = static_cast<const void*>(col->dictionary_ptr().get());
+            if (left_cat_dictionary_id_ != left_dict_id) {
+                left_cat_dictionary_id_ = left_dict_id;
+                left_cat_matches_.assign(col->dictionary().size(), uint8_t{0});
+                const auto& dict = col->dictionary();
+                for (std::size_t i = 0; i < dict.size(); ++i) {
+                    left_cat_matches_[i] =
+                        static_cast<uint8_t>(right_strings_.contains(std::string_view{dict[i]}));
+                }
+            }
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const auto code = static_cast<std::size_t>(col->code_at(row));
+                const bool match = left_cat_matches_[code] != 0U;
+                return keep_matches ? match : !match;
+            });
+        }
+        if (const auto* col = std::get_if<Column<std::string>>(key)) {
+            return filter_rows(std::move(t), [&](std::size_t row) {
+                const bool match = right_strings_.contains((*col)[row]);
+                return keep_matches ? match : !match;
+            });
+        }
+        return std::nullopt;
+    }
+
+    OperatorPtr left_;
+    Table right_;
+    ir::JoinKind kind_;
+    const std::vector<std::string>* keys_;
+    bool initialized_ = false;
+    ExprType right_kind_ = ExprType::Int;
+
+    robin_hood::unordered_flat_set<std::int64_t> right_i64_;
+    robin_hood::unordered_flat_set<double> right_f64_;
+    robin_hood::unordered_flat_set<bool> right_bool_;
+    robin_hood::unordered_flat_set<Date> right_date_;
+    robin_hood::unordered_flat_set<Timestamp> right_timestamp_;
+    robin_hood::unordered_flat_set<Column<Categorical>::code_type> right_cat_codes_;
+    robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> right_strings_;
+    std::deque<std::string> owned_strings_;
+    const void* right_cat_dictionary_id_ = nullptr;
+    const void* left_cat_dictionary_id_ = nullptr;
+    std::vector<uint8_t> left_cat_matches_;
+};
+
+/// Streaming inner join: materialize right once, build a chained hash index
+/// on a single key, then probe each left chunk and emit combined rows.
+/// Handles one-to-many matches via per-right-row chain links. Left columns
+/// stream from the child operator; right-side non-key columns are gathered
+/// from the materialized right table. Name conflicts are resolved with the
+/// same `_right` suffix rule as `join_table_impl`.
+class ChunkedInnerJoinOperator final : public Operator {
+   public:
+    ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<std::string>* keys)
+        : left_(std::move(left)), right_(std::move(right)), keys_(keys) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (!initialized_) {
+            auto err = initialize();
+            if (err.has_value()) {
+                return std::unexpected(std::move(*err));
+            }
+            initialized_ = true;
+        }
+
+        while (true) {
+            auto chunk_res = left_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                return std::optional<Chunk>{};
+            }
+
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            auto out = probe_chunk(std::move(t));
+            if (!out.has_value()) {
+                return std::unexpected(std::move(out.error()));
+            }
+            if (out->rows() == 0) {
+                continue;
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+        }
+    }
+
+   private:
+    static constexpr std::size_t kNil = std::numeric_limits<std::size_t>::max();
+
+    auto initialize() -> std::optional<std::string> {
+        if (keys_->size() != 1) {
+            return "ChunkedInnerJoinOperator only supports single-key joins";
+        }
+        const std::string& key_name = keys_->front();
+        const ColumnValue* key = right_.find(key_name);
+        if (key == nullptr) {
+            return "join key not found in right table: " + key_name;
+        }
+
+        const std::size_t n_right = right_.rows();
+        chain_next_.assign(n_right, kNil);
+
+        if (const auto* c_i64 = std::get_if<Column<std::int64_t>>(key)) {
+            right_kind_ = ExprType::Int;
+            build_chain_scalar(*c_i64, right_i64_heads_);
+        } else if (const auto* c_f64 = std::get_if<Column<double>>(key)) {
+            right_kind_ = ExprType::Double;
+            build_chain_scalar(*c_f64, right_f64_heads_);
+        } else if (const auto* c_bool = std::get_if<Column<bool>>(key)) {
+            right_kind_ = ExprType::Bool;
+            right_bool_heads_.reserve(n_right);
+            for (std::size_t r = n_right; r-- > 0;) {
+                const bool v = (*c_bool)[r];
+                auto [it, inserted] = right_bool_heads_.try_emplace(v, r);
+                if (!inserted) {
+                    chain_next_[r] = it->second;
+                    it->second = r;
+                }
+            }
+        } else if (const auto* c_date = std::get_if<Column<Date>>(key)) {
+            right_kind_ = ExprType::Date;
+            build_chain_scalar(*c_date, right_date_heads_);
+        } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(key)) {
+            right_kind_ = ExprType::Timestamp;
+            build_chain_scalar(*c_ts, right_ts_heads_);
+        } else if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
+            right_kind_ = ExprType::String;
+            right_cat_dictionary_id_ = static_cast<const void*>(c_cat->dictionary_ptr().get());
+            const auto& dict = c_cat->dictionary();
+            right_string_heads_.reserve(n_right);
+            for (std::size_t r = n_right; r-- > 0;) {
+                auto code = static_cast<std::size_t>(c_cat->code_at(r));
+                insert_chain_sv(std::string_view{dict[code]}, r);
+            }
+        } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
+            right_kind_ = ExprType::String;
+            right_string_heads_.reserve(n_right);
+            for (std::size_t r = n_right; r-- > 0;) {
+                insert_chain_sv((*c_str)[r], r);
+            }
+        } else {
+            return "ChunkedInnerJoinOperator: unsupported key type";
+        }
+
+        right_emit_idx_.reserve(right_.columns.size());
+        for (std::size_t i = 0; i < right_.columns.size(); ++i) {
+            if (right_.columns[i].name == key_name) {
+                continue;
+            }
+            right_emit_idx_.push_back(i);
+        }
+        return std::nullopt;
+    }
+
+    // Build a chained hash index keyed by scalar column values. Rows are
+    // visited in reverse so the final head is the lowest right-row index
+    // and chain_next_ walks rows in ascending (insertion) order — matching
+    // the nested-loop inner join's output ordering.
+    template <typename ColT, typename Map>
+    void build_chain_scalar(const ColT& col, Map& heads) {
+        const std::size_t n = col.size();
+        heads.reserve(n);
+        const auto* data = col.data();
+        for (std::size_t r = n; r-- > 0;) {
+            auto [it, inserted] = heads.try_emplace(data[r], r);
+            if (!inserted) {
+                chain_next_[r] = it->second;
+                it->second = r;
+            }
+        }
+    }
+
+    void insert_chain_sv(std::string_view sv, std::size_t r) {
+        auto [it, inserted] = right_string_heads_.try_emplace(sv, r);
+        if (!inserted) {
+            chain_next_[r] = it->second;
+            it->second = r;
+        }
+    }
+
+    template <typename Map, typename GetKey>
+    void probe_scalar(const Map& heads, std::size_t n, GetKey get, std::vector<std::size_t>& li,
+                      std::vector<std::size_t>& ri) {
+        for (std::size_t l = 0; l < n; ++l) {
+            auto it = heads.find(get(l));
+            if (it == heads.end()) {
+                continue;
+            }
+            std::size_t cur = it->second;
+            while (cur != kNil) {
+                li.push_back(l);
+                ri.push_back(cur);
+                cur = chain_next_[cur];
+            }
+        }
+    }
+
+    auto probe_chunk(Table left_chunk) -> std::expected<Table, std::string> {
+        const ColumnValue* key = left_chunk.find(keys_->front());
+        if (key == nullptr) {
+            return std::unexpected("join key not found in left chunk: " + keys_->front());
+        }
+
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+        const std::size_t n = left_chunk.rows();
+        li.reserve(n);
+        ri.reserve(n);
+
+        if (right_kind_ == ExprType::Int) {
+            const auto* col = std::get_if<Column<std::int64_t>>(key);
+            if (col == nullptr) {
+                return std::unexpected("inner join: left key type mismatch");
+            }
+            const auto* data = col->data();
+            probe_scalar(right_i64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (right_kind_ == ExprType::Double) {
+            const auto* col = std::get_if<Column<double>>(key);
+            if (col == nullptr) {
+                return std::unexpected("inner join: left key type mismatch");
+            }
+            const auto* data = col->data();
+            probe_scalar(right_f64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (right_kind_ == ExprType::Bool) {
+            const auto* col = std::get_if<Column<bool>>(key);
+            if (col == nullptr) {
+                return std::unexpected("inner join: left key type mismatch");
+            }
+            probe_scalar(right_bool_heads_, n, [&](std::size_t i) { return (*col)[i]; }, li, ri);
+        } else if (right_kind_ == ExprType::Date) {
+            const auto* col = std::get_if<Column<Date>>(key);
+            if (col == nullptr) {
+                return std::unexpected("inner join: left key type mismatch");
+            }
+            const auto* data = col->data();
+            probe_scalar(right_date_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (right_kind_ == ExprType::Timestamp) {
+            const auto* col = std::get_if<Column<Timestamp>>(key);
+            if (col == nullptr) {
+                return std::unexpected("inner join: left key type mismatch");
+            }
+            const auto* data = col->data();
+            probe_scalar(right_ts_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (right_kind_ == ExprType::String) {
+            if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
+                const auto& dict = c_cat->dictionary();
+                for (std::size_t l = 0; l < n; ++l) {
+                    auto code = static_cast<std::size_t>(c_cat->code_at(l));
+                    auto it = right_string_heads_.find(std::string_view{dict[code]});
+                    if (it == right_string_heads_.end()) {
+                        continue;
+                    }
+                    std::size_t cur = it->second;
+                    while (cur != kNil) {
+                        li.push_back(l);
+                        ri.push_back(cur);
+                        cur = chain_next_[cur];
+                    }
+                }
+            } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
+                probe_scalar(
+                    right_string_heads_, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
+            } else {
+                return std::unexpected("inner join: left key type mismatch");
+            }
+        }
+
+        Table output;
+        if (li.empty()) {
+            return output;
+        }
+        const std::size_t total = li.size();
+        output.columns.reserve(left_chunk.columns.size() + right_emit_idx_.size());
+
+        std::unordered_set<std::string> out_names;
+        out_names.reserve(left_chunk.columns.size() + right_emit_idx_.size());
+
+        auto gather_with_validity =
+            [&](const ColumnValue& src_col, const std::optional<ValidityBitmap>& src_val,
+                const std::size_t* idx) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
+            ColumnValue gathered = gather_column(src_col, idx, total);
+            std::optional<ValidityBitmap> val;
+            if (src_val.has_value()) {
+                const auto& src_bm = *src_val;
+                ValidityBitmap dst(total, false);
+                for (std::size_t i = 0; i < total; ++i) {
+                    dst.set(i, src_bm[idx[i]]);
+                }
+                val = std::move(dst);
+            }
+            return {std::move(gathered), std::move(val)};
+        };
+
+        for (const auto& lc : left_chunk.columns) {
+            auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li.data());
+            out_names.insert(lc.name);
+            if (val.has_value()) {
+                output.add_column(lc.name, std::move(gathered), std::move(*val));
+            } else {
+                output.add_column(lc.name, std::move(gathered));
+            }
+        }
+
+        for (std::size_t idx : right_emit_idx_) {
+            const auto& rc = right_.columns[idx];
+            std::string name = rc.name;
+            while (out_names.contains(name)) {
+                name += "_right";
+            }
+            out_names.insert(name);
+            auto [gathered, val] = gather_with_validity(*rc.column, rc.validity, ri.data());
+            if (val.has_value()) {
+                output.add_column(std::move(name), std::move(gathered), std::move(*val));
+            } else {
+                output.add_column(std::move(name), std::move(gathered));
+            }
+        }
+
+        return output;
+    }
+
+    OperatorPtr left_;
+    Table right_;
+    const std::vector<std::string>* keys_;
+    bool initialized_ = false;
+    ExprType right_kind_ = ExprType::Int;
+
+    std::vector<std::size_t> chain_next_;
+    robin_hood::unordered_flat_map<std::int64_t, std::size_t> right_i64_heads_;
+    robin_hood::unordered_flat_map<double, std::size_t> right_f64_heads_;
+    robin_hood::unordered_flat_map<bool, std::size_t> right_bool_heads_;
+    robin_hood::unordered_flat_map<Date, std::size_t> right_date_heads_;
+    robin_hood::unordered_flat_map<Timestamp, std::size_t> right_ts_heads_;
+    robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
+        right_string_heads_;
+    const void* right_cat_dictionary_id_ = nullptr;
+    std::vector<std::size_t> right_emit_idx_;
+};
+
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and
 /// per-group `AggState` across chunks: each incoming chunk updates the
 /// state per row, the chunk is released, and the final result is
@@ -8633,6 +9159,47 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& join = static_cast<const ir::JoinNode&>(node);
         if (join.children().size() != 2) {
             return std::unexpected("join node expects exactly two children");
+        }
+        const bool streamable_semi_anti =
+            (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
+            !join.predicate().has_value() && join.keys().size() == 1;
+        if (streamable_semi_anti) {
+            auto left_op =
+                build_operator(*join.children()[0], registry, scalars, externs, model_out);
+            if (!left_op.has_value()) {
+                return std::unexpected(std::move(left_op.error()));
+            }
+            auto right_op =
+                build_operator(*join.children()[1], registry, scalars, externs, model_out);
+            if (!right_op.has_value()) {
+                return std::unexpected(std::move(right_op.error()));
+            }
+            auto right = materialize_operator(std::move(right_op.value()));
+            if (!right.has_value()) {
+                return std::unexpected(std::move(right.error()));
+            }
+            return std::make_unique<ChunkedSemiAntiJoinOperator>(
+                std::move(left_op.value()), std::move(right.value()), join.kind(), &join.keys());
+        }
+        const bool streamable_inner = join.kind() == ir::JoinKind::Inner &&
+                                      !join.predicate().has_value() && join.keys().size() == 1;
+        if (streamable_inner) {
+            auto left_op =
+                build_operator(*join.children()[0], registry, scalars, externs, model_out);
+            if (!left_op.has_value()) {
+                return std::unexpected(std::move(left_op.error()));
+            }
+            auto right_op =
+                build_operator(*join.children()[1], registry, scalars, externs, model_out);
+            if (!right_op.has_value()) {
+                return std::unexpected(std::move(right_op.error()));
+            }
+            auto right = materialize_operator(std::move(right_op.value()));
+            if (!right.has_value()) {
+                return std::unexpected(std::move(right.error()));
+            }
+            return std::make_unique<ChunkedInnerJoinOperator>(
+                std::move(left_op.value()), std::move(right.value()), &join.keys());
         }
         const ir::FilterExpr* pred =
             join.predicate().has_value() ? join.predicate()->get() : nullptr;

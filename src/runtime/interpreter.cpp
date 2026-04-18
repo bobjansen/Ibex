@@ -32,6 +32,12 @@ namespace ibex::runtime {
 
 namespace {
 
+auto invoke_extern_call(const ir::ExternCallNode& ec, const ScalarRegistry* scalars,
+                        const ExternRegistry* externs) -> std::expected<ExternValue, std::string>;
+auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
+                              const ScalarRegistry* scalars, const ExternRegistry* externs)
+    -> std::expected<void, std::string>;
+
 auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
                            const std::unordered_map<std::string, std::size_t>& index) -> bool {
     for (const auto& key : keys) {
@@ -6540,36 +6546,19 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
         }
         case ir::NodeKind::ExternCall: {
             const auto& ec = static_cast<const ir::ExternCallNode&>(node);
-            if (externs == nullptr) {
-                return std::unexpected("extern call with no registry: " + ec.callee());
+            auto result = invoke_extern_call(ec, scalars, externs);
+            if (!result.has_value()) {
+                return std::unexpected(std::move(result.error()));
             }
-            const auto* fn = externs->find(ec.callee());
-            if (fn == nullptr) {
-                return std::unexpected("unknown extern function: " + ec.callee());
-            }
-            if (fn->kind != ExternReturnKind::Table) {
-                return std::unexpected("extern function does not return a table: " + ec.callee());
-            }
-            ExternArgs args;
-            args.reserve(ec.args().size());
-            for (const auto& arg : ec.args()) {
-                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val)
-                    return std::unexpected(val.error());
-                args.push_back(std::move(val.value()));
-            }
-            if (fn->chunked_table_func) {
-                auto source = fn->chunked_table_func(args);
-                if (source.has_value()) {
-                    MaterializeOperator sink{std::move(source.value())};
-                    return sink.run();
-                }
-            }
-            auto result = fn->func(args);
-            if (!result)
-                return std::unexpected(result.error());
             if (auto* table = std::get_if<Table>(&result.value())) {
                 return std::move(*table);
+            }
+            if (externs != nullptr) {
+                const auto* fn = externs->find(ec.callee());
+                if (fn != nullptr && fn->kind != ExternReturnKind::Table) {
+                    return std::unexpected("extern function does not return a table: " +
+                                           ec.callee());
+                }
             }
             return std::unexpected("extern function did not return a table: " + ec.callee());
         }
@@ -6830,10 +6819,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 }
 
                 if (sn.stream_kind() == ir::StreamKind::TimeBucket && bucket_ns > 0) {
-                    // Wall-clock end-of-bucket flush: emit the open bucket as soon as
-                    // bucket_ns wall-clock time has elapsed since it was opened.  This
-                    // fires on both normal data batches and StreamTimeout returns so
-                    // that idle periods do not delay delivery of the closed bucket.
                     if (open_bucket_ns >= 0 && buffer.rows() > 0 &&
                         wall_now_ns() - bucket_open_wall_ns >= bucket_ns) {
                         auto er = emit_buffer(buffer);
@@ -6846,9 +6831,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
                     if (!is_timeout) {
                         const auto& batch = std::get<Table>(src_result.value());
-                        // Process row-by-row so we can also detect bucket boundaries from
-                        // data timestamps (handles replayed/historical data where wall-clock
-                        // does not apply).
                         for (std::size_t r = 0; r < batch.rows(); ++r) {
                             Table row_tbl = slice_row(batch, r);
                             auto ts_opt = get_last_ts_ns(row_tbl);
@@ -6857,7 +6839,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 
                             if (open_bucket_ns >= 0 && row_bucket >= 0 &&
                                 row_bucket > open_bucket_ns) {
-                                // Bucket boundary crossed — flush the closed bucket.
                                 auto er = emit_buffer(buffer);
                                 if (!er)
                                     return std::unexpected(er.error());
@@ -6865,7 +6846,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                             }
                             if (row_bucket >= 0) {
                                 if (row_bucket != open_bucket_ns) {
-                                    // New bucket — record the wall-clock open time.
                                     bucket_open_wall_ns = wall_now_ns();
                                 }
                                 open_bucket_ns = row_bucket;
@@ -6876,7 +6856,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         }
                     }
                 } else if (!is_timeout) {
-                    // PerRow — append batch to rolling buffer, run transform, emit last rows.
                     const auto& batch = std::get<Table>(src_result.value());
                     auto app = append_table(buffer, batch);
                     if (!app)
@@ -6887,14 +6866,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 }
             }
 
-            // Flush any remaining buffered rows (TimeBucket only).
             if (sn.stream_kind() == ir::StreamKind::TimeBucket && buffer.rows() > 0) {
                 auto er = emit_buffer(buffer);
                 if (!er)
                     return std::unexpected(er.error());
             }
 
-            return Table{};  // stream execution produces no result table
+            return Table{};
         }
         case ir::NodeKind::Construct: {
             const auto& cn = static_cast<const ir::ConstructNode&>(node);
@@ -6984,8 +6962,14 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return coef;
         }
-        case ir::NodeKind::Program:
-            return std::unexpected("ProgramNode cannot be interpreted at runtime");
+        case ir::NodeKind::Program: {
+            const auto& program = static_cast<const ir::ProgramNode&>(node);
+            auto preamble = execute_program_preamble(program.preamble(), scalars, externs);
+            if (!preamble.has_value()) {
+                return std::unexpected(std::move(preamble.error()));
+            }
+            return interpret_node(program.main_node(), registry, scalars, externs, model_out);
+        }
     }
     return std::unexpected("unknown node kind");
 }
@@ -7680,6 +7664,127 @@ class ChunkedAggregateOperator final : public Operator {
     std::vector<CatKey> multi_cat_order_;
 };
 
+auto build_operator(const ir::Node& node, const TableRegistry& registry,
+                    const ScalarRegistry* scalars, const ExternRegistry* externs,
+                    ModelResult* model_out) -> std::expected<OperatorPtr, std::string>;
+
+auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
+    MaterializeOperator sink{std::move(op)};
+    return sink.run();
+}
+
+template <typename Fn>
+auto build_unary_materializing_operator(const ir::Node& child_node, const TableRegistry& registry,
+                                        const ScalarRegistry* scalars,
+                                        const ExternRegistry* externs, ModelResult* model_out,
+                                        Fn fn) -> std::expected<OperatorPtr, std::string> {
+    auto child_op = build_operator(child_node, registry, scalars, externs, model_out);
+    if (!child_op.has_value()) {
+        return std::unexpected(std::move(child_op.error()));
+    }
+    auto materialized = materialize_operator(std::move(child_op.value()));
+    if (!materialized.has_value()) {
+        return std::unexpected(std::move(materialized.error()));
+    }
+    auto result = fn(std::move(materialized.value()));
+    if (!result.has_value()) {
+        return std::unexpected(std::move(result.error()));
+    }
+    return std::make_unique<TableSourceOperator>(std::move(result.value()));
+}
+
+template <typename Fn>
+auto build_binary_materializing_operator(const ir::Node& left_node, const ir::Node& right_node,
+                                         const TableRegistry& registry,
+                                         const ScalarRegistry* scalars,
+                                         const ExternRegistry* externs, ModelResult* model_out,
+                                         Fn fn) -> std::expected<OperatorPtr, std::string> {
+    auto left_op = build_operator(left_node, registry, scalars, externs, model_out);
+    if (!left_op.has_value()) {
+        return std::unexpected(std::move(left_op.error()));
+    }
+    auto right_op = build_operator(right_node, registry, scalars, externs, model_out);
+    if (!right_op.has_value()) {
+        return std::unexpected(std::move(right_op.error()));
+    }
+    auto left = materialize_operator(std::move(left_op.value()));
+    if (!left.has_value()) {
+        return std::unexpected(std::move(left.error()));
+    }
+    auto right = materialize_operator(std::move(right_op.value()));
+    if (!right.has_value()) {
+        return std::unexpected(std::move(right.error()));
+    }
+    auto result = fn(std::move(left.value()), std::move(right.value()));
+    if (!result.has_value()) {
+        return std::unexpected(std::move(result.error()));
+    }
+    return std::make_unique<TableSourceOperator>(std::move(result.value()));
+}
+
+auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* scalars,
+                      const ExternRegistry* externs) -> std::expected<ExternArgs, std::string> {
+    ExternArgs args;
+    args.reserve(exprs.size());
+    for (const auto& arg : exprs) {
+        auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+        if (!val.has_value()) {
+            return std::unexpected(std::move(val.error()));
+        }
+        args.push_back(std::move(val.value()));
+    }
+    return args;
+}
+
+auto invoke_extern_call(const ir::ExternCallNode& ec, const ScalarRegistry* scalars,
+                        const ExternRegistry* externs) -> std::expected<ExternValue, std::string> {
+    if (externs == nullptr) {
+        return std::unexpected("extern call with no registry: " + ec.callee());
+    }
+    const auto* fn = externs->find(ec.callee());
+    if (fn == nullptr) {
+        return std::unexpected("unknown extern function: " + ec.callee());
+    }
+    if (fn->first_arg_is_table) {
+        return std::unexpected("extern function requires a table input: " + ec.callee());
+    }
+    auto args = eval_extern_args(ec.args(), scalars, externs);
+    if (!args.has_value()) {
+        return std::unexpected(std::move(args.error()));
+    }
+    if (fn->kind == ExternReturnKind::Table && fn->chunked_table_func) {
+        auto source = fn->chunked_table_func(args.value());
+        if (source.has_value()) {
+            auto materialized = materialize_operator(std::move(source.value()));
+            if (!materialized.has_value()) {
+                return std::unexpected(std::move(materialized.error()));
+            }
+            return ExternValue{std::move(materialized.value())};
+        }
+    }
+    auto result = fn->func(args.value());
+    if (!result.has_value()) {
+        return std::unexpected(std::move(result.error()));
+    }
+    return result;
+}
+
+auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
+                              const ScalarRegistry* scalars, const ExternRegistry* externs)
+    -> std::expected<void, std::string> {
+    for (const auto& node : preamble) {
+        if (node->kind() != ir::NodeKind::ExternCall) {
+            return std::unexpected("program preamble only supports extern calls");
+        }
+        const auto& ec = static_cast<const ir::ExternCallNode&>(*node);
+        auto result = invoke_extern_call(ec, scalars, externs);
+        if (!result.has_value()) {
+            return std::unexpected(std::move(result.error()));
+        }
+    }
+    return {};
+}
+
 /// Planner seam: returns a pull-based operator that, when drained,
 /// produces the logical result of `node`. Chunked operators exist
 /// today for node kinds that are safe and useful to stream; any other
@@ -7760,21 +7865,9 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (node.children().empty()) {
             return std::unexpected("distinct node missing child");
         }
-        auto child_op =
-            build_operator(*node.children().front(), registry, scalars, externs, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        MaterializeOperator sink{std::move(child_op.value())};
-        auto materialized = sink.run();
-        if (!materialized.has_value()) {
-            return std::unexpected(std::move(materialized.error()));
-        }
-        auto deduped = distinct_table(materialized.value());
-        if (!deduped.has_value()) {
-            return std::unexpected(std::move(deduped.error()));
-        }
-        return std::make_unique<TableSourceOperator>(std::move(deduped.value()));
+        return build_unary_materializing_operator(
+            *node.children().front(), registry, scalars, externs, model_out,
+            [](Table input) { return distinct_table(input); });
     }
 
     if (node.kind() == ir::NodeKind::Order) {
@@ -7782,21 +7875,9 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (order.children().empty()) {
             return std::unexpected("order node missing child");
         }
-        auto child_op =
-            build_operator(*order.children().front(), registry, scalars, externs, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        MaterializeOperator sink{std::move(child_op.value())};
-        auto materialized = sink.run();
-        if (!materialized.has_value()) {
-            return std::unexpected(std::move(materialized.error()));
-        }
-        auto sorted = order_table(materialized.value(), order.keys());
-        if (!sorted.has_value()) {
-            return std::unexpected(std::move(sorted.error()));
-        }
-        return std::make_unique<TableSourceOperator>(std::move(sorted.value()));
+        return build_unary_materializing_operator(
+            *order.children().front(), registry, scalars, externs, model_out,
+            [&](Table input) { return order_table(input, order.keys()); });
     }
 
     if (node.kind() == ir::NodeKind::Aggregate) {
@@ -7832,6 +7913,288 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
     }
 
+    if (node.kind() == ir::NodeKind::Head) {
+        const auto& head = static_cast<const ir::HeadNode&>(node);
+        if (head.children().empty()) {
+            return std::unexpected("head node missing child");
+        }
+        return build_unary_materializing_operator(
+            *head.children().front(), registry, scalars, externs, model_out,
+            [&](Table input) { return head_table(input, head.count(), head.group_by()); });
+    }
+
+    if (node.kind() == ir::NodeKind::Tail) {
+        const auto& tail = static_cast<const ir::TailNode&>(node);
+        if (tail.children().empty()) {
+            return std::unexpected("tail node missing child");
+        }
+        return build_unary_materializing_operator(
+            *tail.children().front(), registry, scalars, externs, model_out,
+            [&](Table input) { return tail_table(input, tail.count(), tail.group_by()); });
+    }
+
+    if (node.kind() == ir::NodeKind::Columns) {
+        if (node.children().empty()) {
+            return std::unexpected("columns node missing child");
+        }
+        return build_unary_materializing_operator(*node.children().front(), registry, scalars,
+                                                  externs, model_out,
+                                                  [](Table input) { return columns_table(input); });
+    }
+
+    if (node.kind() == ir::NodeKind::Melt) {
+        const auto& mn = static_cast<const ir::MeltNode&>(node);
+        if (mn.children().empty()) {
+            return std::unexpected("melt node missing child");
+        }
+        return build_unary_materializing_operator(
+            *mn.children().front(), registry, scalars, externs, model_out,
+            [&](Table input) { return melt_table(input, mn.id_columns(), mn.measure_columns()); });
+    }
+
+    if (node.kind() == ir::NodeKind::Dcast) {
+        const auto& dn = static_cast<const ir::DcastNode&>(node);
+        if (dn.children().empty()) {
+            return std::unexpected("dcast node missing child");
+        }
+        return build_unary_materializing_operator(
+            *dn.children().front(), registry, scalars, externs, model_out, [&](Table input) {
+                return dcast_table(input, dn.pivot_column(), dn.value_column(), dn.row_keys());
+            });
+    }
+
+    if (node.kind() == ir::NodeKind::Cov) {
+        if (node.children().empty()) {
+            return std::unexpected("cov node missing child");
+        }
+        return build_unary_materializing_operator(*node.children().front(), registry, scalars,
+                                                  externs, model_out,
+                                                  [](Table input) { return cov_table(input); });
+    }
+
+    if (node.kind() == ir::NodeKind::Corr) {
+        if (node.children().empty()) {
+            return std::unexpected("corr node missing child");
+        }
+        return build_unary_materializing_operator(*node.children().front(), registry, scalars,
+                                                  externs, model_out,
+                                                  [](Table input) { return corr_table(input); });
+    }
+
+    if (node.kind() == ir::NodeKind::Transpose) {
+        if (node.children().empty()) {
+            return std::unexpected("transpose node missing child");
+        }
+        return build_unary_materializing_operator(
+            *node.children().front(), registry, scalars, externs, model_out,
+            [](Table input) { return transpose_table(input); });
+    }
+
+    if (node.kind() == ir::NodeKind::Join) {
+        const auto& join = static_cast<const ir::JoinNode&>(node);
+        if (join.children().size() != 2) {
+            return std::unexpected("join node expects exactly two children");
+        }
+        const ir::FilterExpr* pred =
+            join.predicate().has_value() ? join.predicate()->get() : nullptr;
+        return build_binary_materializing_operator(
+            *join.children()[0], *join.children()[1], registry, scalars, externs, model_out,
+            [&](Table left, Table right) {
+                return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
+                                       compute_mask);
+            });
+    }
+
+    if (node.kind() == ir::NodeKind::Matmul) {
+        if (node.children().size() != 2) {
+            return std::unexpected("matmul node expects exactly two children");
+        }
+        return build_binary_materializing_operator(
+            *node.children()[0], *node.children()[1], registry, scalars, externs, model_out,
+            [](Table left, Table right) { return matmul_table(left, right); });
+    }
+
+    if (node.kind() == ir::NodeKind::Update) {
+        const auto& update = static_cast<const ir::UpdateNode&>(node);
+        if (update.children().empty()) {
+            return std::unexpected("update node missing child");
+        }
+        if (!update.group_by().empty()) {
+            return std::unexpected("grouped update not supported in interpreter");
+        }
+        auto child = build_unary_materializing_operator(
+            *update.children().front(), registry, scalars, externs, model_out, [&](Table input) {
+                return update_table(std::move(input), update.fields(), scalars, externs);
+            });
+        if (!child.has_value()) {
+            return std::unexpected(std::move(child.error()));
+        }
+        auto result = materialize_operator(std::move(child.value()));
+        if (!result.has_value()) {
+            return std::unexpected(std::move(result.error()));
+        }
+        for (const auto& tspec : update.tuple_fields()) {
+            auto src = interpret_node(*tspec.source, registry, scalars, externs);
+            if (!src.has_value()) {
+                return std::unexpected(std::move(src.error()));
+            }
+            if (tspec.aliases.empty()) {
+                for (const auto& entry : src->columns) {
+                    if (entry.validity) {
+                        result->add_column(entry.name, *entry.column, *entry.validity);
+                    } else {
+                        result->add_column(entry.name, *entry.column);
+                    }
+                }
+            } else {
+                if (src->columns.size() != tspec.aliases.size()) {
+                    return std::unexpected(
+                        "tuple assignment: expected " + std::to_string(tspec.aliases.size()) +
+                        " column(s), got " + std::to_string(src->columns.size()));
+                }
+                for (std::size_t i = 0; i < tspec.aliases.size(); ++i) {
+                    const auto& entry = src->columns[i];
+                    if (entry.validity) {
+                        result->add_column(tspec.aliases[i], *entry.column, *entry.validity);
+                    } else {
+                        result->add_column(tspec.aliases[i], *entry.column);
+                    }
+                }
+            }
+        }
+        return std::make_unique<TableSourceOperator>(std::move(result.value()));
+    }
+
+    if (node.kind() == ir::NodeKind::Resample) {
+        const auto& rs = static_cast<const ir::ResampleNode&>(node);
+        if (node.children().empty()) {
+            return std::unexpected("resample node missing child");
+        }
+        return build_unary_materializing_operator(
+            *node.children().front(), registry, scalars, externs, model_out, [&](Table input) {
+                return resample_table(input, rs.duration(), rs.group_by(), rs.aggregations());
+            });
+    }
+
+    if (node.kind() == ir::NodeKind::Window) {
+        const auto& win = static_cast<const ir::WindowNode&>(node);
+        if (node.children().empty()) {
+            return std::unexpected("window node missing child");
+        }
+        const ir::Node& child_node = *node.children().front();
+        if (child_node.kind() != ir::NodeKind::Update) {
+            return std::unexpected(
+                "window: only 'update' is currently supported inside a window block");
+        }
+        const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
+        if (child_node.children().empty()) {
+            return std::unexpected("window: update node missing child");
+        }
+        auto source_op =
+            build_operator(*child_node.children().front(), registry, scalars, externs, model_out);
+        if (!source_op.has_value()) {
+            return std::unexpected(std::move(source_op.error()));
+        }
+        auto source = materialize_operator(std::move(source_op.value()));
+        if (!source.has_value()) {
+            return std::unexpected(std::move(source.error()));
+        }
+        if (!source->time_index.has_value()) {
+            return std::unexpected(
+                "window requires a TimeFrame — use as_timeframe() to designate a timestamp column");
+        }
+        auto result = windowed_update_table(std::move(source.value()), update_node.fields(),
+                                            win.duration(), scalars, externs);
+        if (!result.has_value()) {
+            return std::unexpected(std::move(result.error()));
+        }
+        return std::make_unique<TableSourceOperator>(std::move(result.value()));
+    }
+
+    if (node.kind() == ir::NodeKind::AsTimeframe) {
+        const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
+        if (node.children().empty()) {
+            return std::unexpected("as_timeframe node missing child");
+        }
+        return build_unary_materializing_operator(
+            *node.children().front(), registry, scalars, externs, model_out,
+            [&](Table t) -> std::expected<Table, std::string> {
+                const auto* col = t.find(atf.column());
+                if (col == nullptr) {
+                    return std::unexpected("as_timeframe: column '" + atf.column() + "' not found");
+                }
+                if (const auto* int_col = std::get_if<Column<std::int64_t>>(col)) {
+                    Column<Timestamp> ts_col;
+                    ts_col.reserve(int_col->size());
+                    for (auto v : *int_col)
+                        ts_col.push_back(Timestamp{v});
+                    auto idx_it = t.index.find(atf.column());
+                    if (idx_it != t.index.end()) {
+                        t.columns[idx_it->second].column =
+                            std::make_shared<ColumnValue>(std::move(ts_col));
+                        col = t.find(atf.column());
+                    }
+                }
+                if (!std::holds_alternative<Column<Timestamp>>(*col) &&
+                    !std::holds_alternative<Column<Date>>(*col)) {
+                    return std::unexpected("as_timeframe: column '" + atf.column() +
+                                           "' must be Timestamp, Date, or Int");
+                }
+                auto sorted = order_table(t, {{.name = atf.column(), .ascending = true}});
+                if (!sorted.has_value()) {
+                    return std::unexpected(std::move(sorted.error()));
+                }
+                sorted->time_index = atf.column();
+                normalize_time_index(*sorted);
+                return sorted;
+            });
+    }
+
+    if (node.kind() == ir::NodeKind::Model) {
+        const auto& mn = static_cast<const ir::ModelNode&>(node);
+        if (mn.children().empty()) {
+            return std::unexpected("model node missing child");
+        }
+        auto child_op =
+            build_operator(*mn.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        auto input = materialize_operator(std::move(child_op.value()));
+        if (!input.has_value()) {
+            return std::unexpected(std::move(input.error()));
+        }
+        auto result =
+            fit_model(input.value(), mn.formula(), mn.method(), mn.params(), scalars, externs);
+        if (!result.has_value()) {
+            return std::unexpected(std::move(result.error()));
+        }
+        Table coef = result.value().coefficients;
+        if (model_out != nullptr) {
+            *model_out = std::move(result.value());
+        }
+        return std::make_unique<TableSourceOperator>(std::move(coef));
+    }
+
+    if (node.kind() == ir::NodeKind::Construct || node.kind() == ir::NodeKind::Stream) {
+        auto table = interpret_node(node, registry, scalars, externs, model_out);
+        if (!table.has_value()) {
+            return std::unexpected(std::move(table.error()));
+        }
+        return std::make_unique<TableSourceOperator>(std::move(table.value()));
+    }
+
+    if (node.kind() == ir::NodeKind::Program) {
+        const auto& program = static_cast<const ir::ProgramNode&>(node);
+        auto preamble = execute_program_preamble(program.preamble(), scalars, externs);
+        if (!preamble.has_value()) {
+            return std::unexpected(std::move(preamble.error()));
+        }
+        return build_operator(program.main_node(), registry, scalars, externs, model_out);
+    }
+
+    // Remaining node kinds fall through to interpret_node. Scan is already
+    // handled as a source by the caller.
     auto table = interpret_node(node, registry, scalars, externs, model_out);
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));

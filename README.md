@@ -573,6 +573,17 @@ To skip only specific frameworks:
 benchmarking/run_scale_suite.sh --skip-pandas --skip-dplyr
 ```
 
+To guard Ibex against regressions relative to the 4M-row README snapshot:
+
+```bash
+benchmarking/run_scale_regression.sh
+```
+
+This reruns the Ibex-only benchmark suite on 4,000,000 rows and fails if any
+query slows down by more than the configured tolerance versus the `ibex`
+column in `README.md`. Use `--allowed-regression-pct <X>` to relax or tighten
+the threshold.
+
 To analyze where ibex is faster/slower than polars and data.table:
 
 ```bash

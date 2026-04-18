@@ -83,6 +83,17 @@ auto clear_array(ArrowArray* array) noexcept -> void {
     array->private_data = nullptr;
 }
 
+auto clear_stream(ArrowArrayStream* stream) noexcept -> void {
+    if (stream == nullptr) {
+        return;
+    }
+    stream->get_schema = nullptr;
+    stream->get_next = nullptr;
+    stream->get_last_error = nullptr;
+    stream->release = nullptr;
+    stream->private_data = nullptr;
+}
+
 auto count_nulls(const runtime::ValidityBitmap& validity) noexcept -> std::int64_t {
     const std::size_t n = validity.size();
     const std::size_t word_bits = sizeof(runtime::ValidityBitmap::word_type) * 8;
@@ -707,6 +718,13 @@ auto release_arrow_schema(ArrowSchema* schema) noexcept -> void {
     if (schema == nullptr || schema->release == nullptr) {
         return;
     }
+    if (schema->release != &release_arrow_schema) {
+        auto* release = schema->release;
+        schema->release = nullptr;
+        release(schema);
+        clear_schema(schema);
+        return;
+    }
     auto* state = static_cast<SchemaExportState*>(schema->private_data);
     schema->release = nullptr;
     if (state != nullptr) {
@@ -727,6 +745,13 @@ auto release_arrow_array(ArrowArray* array) noexcept -> void {
     if (array == nullptr || array->release == nullptr) {
         return;
     }
+    if (array->release != &release_arrow_array) {
+        auto* release = array->release;
+        array->release = nullptr;
+        release(array);
+        clear_array(array);
+        return;
+    }
     auto* state = static_cast<ArrayExportState*>(array->private_data);
     array->release = nullptr;
     if (state != nullptr) {
@@ -741,6 +766,16 @@ auto release_arrow_array(ArrowArray* array) noexcept -> void {
         delete state;  // NOLINT(cppcoreguidelines-owning-memory)
     }
     clear_array(array);
+}
+
+auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void {
+    if (stream == nullptr || stream->release == nullptr) {
+        return;
+    }
+    auto* release = stream->release;
+    stream->release = nullptr;
+    release(stream);
+    clear_stream(stream);
 }
 
 auto export_table_to_arrow(const runtime::Table& table, ArrowArray* out_array,

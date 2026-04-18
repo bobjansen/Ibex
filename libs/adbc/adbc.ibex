@@ -1,0 +1,18 @@
+// ADBC plugin — standard extern fn declarations.
+//
+// Usage:
+//   import "adbc";
+//
+// After importing, the following functions are available without any
+// explicit `extern fn` declaration in the script:
+//   read_adbc(driver: String, uri: String, sql: String) -> DataFrame
+//   read_adbc(driver: String, uri: String, sql: String, options: String) -> DataFrame
+//
+// The optional `options` string is a `;` or newline separated list of
+// `key=value` entries. Prefix keys with `db.`, `conn.`, or `stmt.` to
+// target database, connection, or statement options; use `entrypoint=...`
+// to override the driver entrypoint symbol.
+
+extern fn read_adbc(driver: String, uri: String, sql: String) -> DataFrame from "adbc.hpp";
+extern fn read_adbc(driver: String, uri: String, sql: String, options: String)
+    -> DataFrame from "adbc.hpp";

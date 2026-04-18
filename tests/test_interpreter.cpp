@@ -858,6 +858,42 @@ TEST_CASE("Interpret ordered grouped tail over chunked extern source keeps botto
     REQUIRE((*score)[5] == 1);
 }
 
+TEST_CASE("Interpret distinct over chunked extern source keeps first occurrence order") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("stream_distinct_symbols", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_str_int_chunk("symbol", {"A", "B", "A"}, "score", {1, 2, 1}));
+        chunks.push_back(make_str_int_chunk("symbol", {"C", "B", "D"}, "score", {3, 2, 4}));
+        chunks.push_back(make_str_int_chunk("symbol", {"D", "E", "A"}, "score", {4, 5, 1}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn stream_distinct_symbols() -> DataFrame from \"x.hpp\"; "
+        "stream_distinct_symbols()[distinct { symbol, score }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* score = std::get_if<Column<std::int64_t>>(result->find("score"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(score != nullptr);
+    REQUIRE(symbol->size() == 5);
+    REQUIRE((*symbol)[0] == "A");
+    REQUIRE((*score)[0] == 1);
+    REQUIRE((*symbol)[1] == "B");
+    REQUIRE((*score)[1] == 2);
+    REQUIRE((*symbol)[2] == "C");
+    REQUIRE((*score)[2] == 3);
+    REQUIRE((*symbol)[3] == "D");
+    REQUIRE((*score)[3] == 4);
+    REQUIRE((*symbol)[4] == "E");
+    REQUIRE((*score)[4] == 5);
+}
+
 TEST_CASE("Interpret global tail preserves current order of last rows") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{10, 20, 30, 40});

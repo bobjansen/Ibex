@@ -91,6 +91,8 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     run("update_price_x2", lambda: df.assign(price_x2=df["price"] * 2))
 
+    run("distinct_symbol", lambda: df[["symbol"]].drop_duplicates(ignore_index=True))
+
     run(
         "order_head_topk",
         lambda: df.sort_values("price", ascending=False, kind="mergesort").head(100),
@@ -218,6 +220,8 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         "update_price_x2",
         lambda: df.with_columns((pl.col("price") * 2).alias("price_x2")),
     )
+
+    run("distinct_symbol", lambda: df.select("symbol").unique(maintain_order=True))
 
     run("order_head_topk", lambda: df.sort("price", descending=True).head(100))
 

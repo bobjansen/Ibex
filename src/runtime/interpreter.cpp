@@ -7561,6 +7561,60 @@ class ChunkedOrderedLimitOperator final : public Operator {
     std::optional<Table> empty_template_;
 };
 
+class ChunkedDistinctOperator final : public Operator {
+   public:
+    explicit ChunkedDistinctOperator(OperatorPtr child) : child_(std::move(child)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                return std::optional<Chunk>{};
+            }
+
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            if (t.columns.empty()) {
+                t.ordering.reset();
+                t.time_index.reset();
+                return std::optional<Chunk>{table_to_chunk(std::move(t))};
+            }
+
+            const std::size_t rows = t.rows();
+            std::vector<std::size_t> idx;
+            idx.reserve(rows);
+            for (std::size_t row = 0; row < rows; ++row) {
+                Key key;
+                key.values.reserve(t.columns.size());
+                for (const auto& entry : t.columns) {
+                    key.values.push_back(scalar_from_column(*entry.column, row));
+                }
+                if (!seen_.insert(std::move(key)).second) {
+                    continue;
+                }
+                idx.push_back(row);
+            }
+
+            if (idx.empty()) {
+                continue;
+            }
+
+            t.ordering.reset();
+            t.time_index.reset();
+            if (idx.size() == rows) {
+                return std::optional<Chunk>{table_to_chunk(std::move(t))};
+            }
+            return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
+        }
+    }
+
+   private:
+    OperatorPtr child_;
+    robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
+};
+
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and
 /// per-group `AggState` across chunks: each incoming chunk updates the
 /// state per row, the chunk is released, and the final result is
@@ -8273,9 +8327,12 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (node.children().empty()) {
             return std::unexpected("distinct node missing child");
         }
-        return build_unary_materializing_operator(
-            *node.children().front(), registry, scalars, externs, model_out,
-            [](Table input) { return distinct_table(input); });
+        auto child_op =
+            build_operator(*node.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()));
     }
 
     if (node.kind() == ir::NodeKind::Order) {

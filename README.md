@@ -550,6 +550,16 @@ For scalability runs across dataset sizes (1M, 2M, 4M, 8M, 16M, 32M, 64M rows):
 benchmarking/run_scale_suite.sh --warmup 1 --iters 3
 ```
 
+For the default Ibex-vs-Polars comparison path, use:
+
+```bash
+benchmarking/run_scale_ibex_vs_polars.sh --warmup 1 --iters 3
+```
+
+Use this as the primary scale comparison when checking for performance drift.
+Run the full `run_scale_suite.sh` matrix when you need the broader framework
+picture for release notes or README refreshes.
+
 Results are written per size under `benchmarking/results/scales/<rows>/` and
 combined into:
 - `benchmarking/results/scales.tsv`

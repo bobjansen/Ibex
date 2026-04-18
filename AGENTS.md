@@ -41,6 +41,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - For mutating benchmarks (e.g., `data.table` updates), exclude input-copy cost from timing by preparing copies outside the timed section.
 - Built-ins should remain minimal; prefer `extern fn` hooks for functionality implemented in C++
 - Workflow: when loading string columns (CSV/parquet), auto-detect categorical encoding where possible.
+- Workflow: for routine performance checks, use Polars as the primary comparison target. Prefer `benchmarking/run_scale_ibex_vs_polars.sh` before the full multi-framework suite, and treat `README.md` benchmark snapshots as the published baseline that should stay in sync with current results.
 
 ## Recent REPL Features
 - `:schema`, `:head`, `:describe`, `:scalars`, `:tables`, `:load <file>`

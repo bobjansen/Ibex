@@ -7989,12 +7989,19 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     std::vector<uint8_t> left_cat_matches_;
 };
 
-/// Streaming inner join: materialize right once, build a chained hash index
-/// on a single key, then probe each left chunk and emit combined rows.
-/// Handles one-to-many matches via per-right-row chain links. Left columns
-/// stream from the child operator; right-side non-key columns are gathered
-/// from the materialized right table. Name conflicts are resolved with the
-/// same `_right` suffix rule as `join_table_impl`.
+/// Inner hash join for single-key no-predicate joins.
+///
+/// Two execution modes:
+/// - Stream: right is small (<= kStreamRightThreshold). Build a chained
+///   hash index on the materialized right, then probe each left chunk
+///   streamed from the child. Matches the classic star-join shape.
+/// - Swapped: right is large and n_left < n_right. Materialize left,
+///   build the hash index on left, iterate right rows in two phases to
+///   emit output in left-row order (baseline's `build_indices_from_right_scan`
+///   equivalent). Much better cache behavior when the smaller side fits.
+///
+/// Name conflicts are resolved with the same `_right` suffix rule as
+/// `join_table_impl`.
 class ChunkedInnerJoinOperator final : public Operator {
    public:
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<std::string>* keys)
@@ -8009,17 +8016,41 @@ class ChunkedInnerJoinOperator final : public Operator {
             initialized_ = true;
         }
 
-        while (true) {
-            auto chunk_res = left_->next();
-            if (!chunk_res.has_value()) {
-                return std::unexpected(std::move(chunk_res.error()));
-            }
-            if (!chunk_res.value().has_value()) {
+        if (mode_ == Mode::Swapped) {
+            if (swapped_emitted_) {
                 return std::optional<Chunk>{};
             }
+            swapped_emitted_ = true;
+            auto out = emit_swapped();
+            if (!out.has_value()) {
+                return std::unexpected(std::move(out.error()));
+            }
+            if (out->rows() == 0) {
+                return std::optional<Chunk>{};
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+        }
 
-            Table t = chunk_to_table(std::move(*chunk_res.value()));
-            auto out = probe_chunk(std::move(t));
+        while (true) {
+            Table left_chunk;
+            if (use_materialized_left_) {
+                if (left_materialized_drained_) {
+                    return std::optional<Chunk>{};
+                }
+                left_materialized_drained_ = true;
+                left_chunk = std::move(*left_materialized_);
+                left_materialized_.reset();
+            } else {
+                auto chunk_res = left_->next();
+                if (!chunk_res.has_value()) {
+                    return std::unexpected(std::move(chunk_res.error()));
+                }
+                if (!chunk_res.value().has_value()) {
+                    return std::optional<Chunk>{};
+                }
+                left_chunk = chunk_to_table(std::move(*chunk_res.value()));
+            }
+            auto out = probe_chunk_against_right(std::move(left_chunk));
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
             }
@@ -8031,79 +8062,153 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
    private:
+    enum class Mode { Stream, Swapped };
+
     static constexpr std::size_t kNil = std::numeric_limits<std::size_t>::max();
+    // Build-on-right is preferred when right is small enough that probing
+    // it from streaming left chunks is cache-friendly. Above this, we
+    // materialize left to pick the smaller build side.
+    static constexpr std::size_t kStreamRightThreshold = 65536;
 
     auto initialize() -> std::optional<std::string> {
         if (keys_->size() != 1) {
             return "ChunkedInnerJoinOperator only supports single-key joins";
         }
         const std::string& key_name = keys_->front();
-        const ColumnValue* key = right_.find(key_name);
-        if (key == nullptr) {
+        const ColumnValue* rkey = right_.find(key_name);
+        if (rkey == nullptr) {
             return "join key not found in right table: " + key_name;
+        }
+        if (auto err = detect_key_kind(*rkey, key_kind_)) {
+            return err;
         }
 
         const std::size_t n_right = right_.rows();
-        chain_next_.assign(n_right, kNil);
 
-        if (const auto* c_i64 = std::get_if<Column<std::int64_t>>(key)) {
-            right_kind_ = ExprType::Int;
-            build_chain_scalar(*c_i64, right_i64_heads_);
-        } else if (const auto* c_f64 = std::get_if<Column<double>>(key)) {
-            right_kind_ = ExprType::Double;
-            build_chain_scalar(*c_f64, right_f64_heads_);
-        } else if (const auto* c_bool = std::get_if<Column<bool>>(key)) {
-            right_kind_ = ExprType::Bool;
-            right_bool_heads_.reserve(n_right);
-            for (std::size_t r = n_right; r-- > 0;) {
-                const bool v = (*c_bool)[r];
-                auto [it, inserted] = right_bool_heads_.try_emplace(v, r);
+        if (n_right <= kStreamRightThreshold) {
+            if (auto err = build_index(right_, key_name)) {
+                return err;
+            }
+            setup_right_emit_schema(key_name);
+            return std::nullopt;
+        }
+
+        auto left_res = MaterializeOperator(std::move(left_)).run();
+        if (!left_res.has_value()) {
+            return std::move(left_res.error());
+        }
+        Table left_table = std::move(*left_res);
+        const std::size_t n_left = left_table.rows();
+
+        if (n_left < n_right) {
+            left_table_ = std::move(left_table);
+            if (auto err = build_index(*left_table_, key_name)) {
+                return err;
+            }
+            setup_right_emit_schema(key_name);
+            mode_ = Mode::Swapped;
+            return std::nullopt;
+        }
+
+        left_materialized_ = std::move(left_table);
+        use_materialized_left_ = true;
+        if (auto err = build_index(right_, key_name)) {
+            return err;
+        }
+        setup_right_emit_schema(key_name);
+        return std::nullopt;
+    }
+
+    static auto detect_key_kind(const ColumnValue& col, ExprType& out)
+        -> std::optional<std::string> {
+        if (std::holds_alternative<Column<std::int64_t>>(col)) {
+            out = ExprType::Int;
+        } else if (std::holds_alternative<Column<double>>(col)) {
+            out = ExprType::Double;
+        } else if (std::holds_alternative<Column<bool>>(col)) {
+            out = ExprType::Bool;
+        } else if (std::holds_alternative<Column<Date>>(col)) {
+            out = ExprType::Date;
+        } else if (std::holds_alternative<Column<Timestamp>>(col)) {
+            out = ExprType::Timestamp;
+        } else if (std::holds_alternative<Column<Categorical>>(col) ||
+                   std::holds_alternative<Column<std::string>>(col)) {
+            out = ExprType::String;
+        } else {
+            return "ChunkedInnerJoinOperator: unsupported key type";
+        }
+        return std::nullopt;
+    }
+
+    // Build the chained hash index on `build_side` using column `key_name`.
+    // `build_idx_` maps each build-row index to the next row with the same
+    // key (kNil sentinel terminates the chain).
+    auto build_index(const Table& build_side, const std::string& key_name)
+        -> std::optional<std::string> {
+        const ColumnValue* key = build_side.find(key_name);
+        if (key == nullptr) {
+            return "join key not found in build side: " + key_name;
+        }
+        const std::size_t n = build_side.rows();
+        chain_next_.assign(n, kNil);
+
+        if (key_kind_ == ExprType::Int) {
+            const auto* col = std::get_if<Column<std::int64_t>>(key);
+            if (col == nullptr)
+                return "inner join: build-side key type mismatch";
+            build_scalar(*col, i64_heads_);
+        } else if (key_kind_ == ExprType::Double) {
+            const auto* col = std::get_if<Column<double>>(key);
+            if (col == nullptr)
+                return "inner join: build-side key type mismatch";
+            build_scalar(*col, f64_heads_);
+        } else if (key_kind_ == ExprType::Bool) {
+            const auto* col = std::get_if<Column<bool>>(key);
+            if (col == nullptr)
+                return "inner join: build-side key type mismatch";
+            bool_heads_.reserve(n);
+            for (std::size_t r = n; r-- > 0;) {
+                const bool v = (*col)[r];
+                auto [it, inserted] = bool_heads_.try_emplace(v, r);
                 if (!inserted) {
                     chain_next_[r] = it->second;
                     it->second = r;
                 }
             }
-        } else if (const auto* c_date = std::get_if<Column<Date>>(key)) {
-            right_kind_ = ExprType::Date;
-            build_chain_scalar(*c_date, right_date_heads_);
-        } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(key)) {
-            right_kind_ = ExprType::Timestamp;
-            build_chain_scalar(*c_ts, right_ts_heads_);
-        } else if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
-            right_kind_ = ExprType::String;
-            right_cat_dictionary_id_ = static_cast<const void*>(c_cat->dictionary_ptr().get());
-            const auto& dict = c_cat->dictionary();
-            right_string_heads_.reserve(n_right);
-            for (std::size_t r = n_right; r-- > 0;) {
-                auto code = static_cast<std::size_t>(c_cat->code_at(r));
-                insert_chain_sv(std::string_view{dict[code]}, r);
+        } else if (key_kind_ == ExprType::Date) {
+            const auto* col = std::get_if<Column<Date>>(key);
+            if (col == nullptr)
+                return "inner join: build-side key type mismatch";
+            build_scalar(*col, date_heads_);
+        } else if (key_kind_ == ExprType::Timestamp) {
+            const auto* col = std::get_if<Column<Timestamp>>(key);
+            if (col == nullptr)
+                return "inner join: build-side key type mismatch";
+            build_scalar(*col, ts_heads_);
+        } else if (key_kind_ == ExprType::String) {
+            if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
+                const auto& dict = c_cat->dictionary();
+                string_heads_.reserve(n);
+                for (std::size_t r = n; r-- > 0;) {
+                    auto code = static_cast<std::size_t>(c_cat->code_at(r));
+                    insert_chain_sv(std::string_view{dict[code]}, r);
+                }
+            } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
+                string_heads_.reserve(n);
+                for (std::size_t r = n; r-- > 0;) {
+                    insert_chain_sv((*c_str)[r], r);
+                }
+            } else {
+                return "inner join: build-side key type mismatch";
             }
-        } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
-            right_kind_ = ExprType::String;
-            right_string_heads_.reserve(n_right);
-            for (std::size_t r = n_right; r-- > 0;) {
-                insert_chain_sv((*c_str)[r], r);
-            }
-        } else {
-            return "ChunkedInnerJoinOperator: unsupported key type";
-        }
-
-        right_emit_idx_.reserve(right_.columns.size());
-        for (std::size_t i = 0; i < right_.columns.size(); ++i) {
-            if (right_.columns[i].name == key_name) {
-                continue;
-            }
-            right_emit_idx_.push_back(i);
         }
         return std::nullopt;
     }
 
-    // Build a chained hash index keyed by scalar column values. Rows are
-    // visited in reverse so the final head is the lowest right-row index
-    // and chain_next_ walks rows in ascending (insertion) order — matching
-    // the nested-loop inner join's output ordering.
+    // Iterate the build side in reverse so the chain walks forward during
+    // probe, matching the nested-loop inner join's output ordering.
     template <typename ColT, typename Map>
-    void build_chain_scalar(const ColT& col, Map& heads) {
+    void build_scalar(const ColT& col, Map& heads) {
         const std::size_t n = col.size();
         heads.reserve(n);
         const auto* data = col.data();
@@ -8117,13 +8222,25 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
     void insert_chain_sv(std::string_view sv, std::size_t r) {
-        auto [it, inserted] = right_string_heads_.try_emplace(sv, r);
+        auto [it, inserted] = string_heads_.try_emplace(sv, r);
         if (!inserted) {
             chain_next_[r] = it->second;
             it->second = r;
         }
     }
 
+    void setup_right_emit_schema(const std::string& key_name) {
+        right_emit_idx_.reserve(right_.columns.size());
+        for (std::size_t i = 0; i < right_.columns.size(); ++i) {
+            if (right_.columns[i].name == key_name) {
+                continue;
+            }
+            right_emit_idx_.push_back(i);
+        }
+    }
+
+    // Stream mode: walk the probe side (a left chunk), for each row look
+    // up the right-keyed chain and append (li, ri) in probe-scan order.
     template <typename Map, typename GetKey>
     void probe_scalar(const Map& heads, std::size_t n, GetKey get, std::vector<std::size_t>& li,
                       std::vector<std::size_t>& ri) {
@@ -8141,7 +8258,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
     }
 
-    auto probe_chunk(Table left_chunk) -> std::expected<Table, std::string> {
+    auto probe_chunk_against_right(Table left_chunk) -> std::expected<Table, std::string> {
         const ColumnValue* key = left_chunk.find(keys_->front());
         if (key == nullptr) {
             return std::unexpected("join key not found in left chunk: " + keys_->front());
@@ -8153,47 +8270,47 @@ class ChunkedInnerJoinOperator final : public Operator {
         li.reserve(n);
         ri.reserve(n);
 
-        if (right_kind_ == ExprType::Int) {
+        if (key_kind_ == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(right_i64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (right_kind_ == ExprType::Double) {
+            probe_scalar(i64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (key_kind_ == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(right_f64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (right_kind_ == ExprType::Bool) {
+            probe_scalar(f64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (key_kind_ == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            probe_scalar(right_bool_heads_, n, [&](std::size_t i) { return (*col)[i]; }, li, ri);
-        } else if (right_kind_ == ExprType::Date) {
+            probe_scalar(bool_heads_, n, [&](std::size_t i) { return (*col)[i]; }, li, ri);
+        } else if (key_kind_ == ExprType::Date) {
             const auto* col = std::get_if<Column<Date>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(right_date_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (right_kind_ == ExprType::Timestamp) {
+            probe_scalar(date_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (key_kind_ == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
-            probe_scalar(right_ts_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (right_kind_ == ExprType::String) {
+            probe_scalar(ts_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (key_kind_ == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
                 const auto& dict = c_cat->dictionary();
                 for (std::size_t l = 0; l < n; ++l) {
                     auto code = static_cast<std::size_t>(c_cat->code_at(l));
-                    auto it = right_string_heads_.find(std::string_view{dict[code]});
-                    if (it == right_string_heads_.end()) {
+                    auto it = string_heads_.find(std::string_view{dict[code]});
+                    if (it == string_heads_.end()) {
                         continue;
                     }
                     std::size_t cur = it->second;
@@ -8204,22 +8321,148 @@ class ChunkedInnerJoinOperator final : public Operator {
                     }
                 }
             } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
-                probe_scalar(
-                    right_string_heads_, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
+                probe_scalar(string_heads_, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
             } else {
                 return std::unexpected("inner join: left key type mismatch");
             }
         }
 
+        return assemble_output(left_chunk, li.data(), ri.data(), li.size());
+    }
+
+    // Swapped mode: the hash index is on the left table. For each right
+    // row walk the left chain twice — first to count matches per left
+    // row, then to fill (li, ri) in left-scan order.
+    auto emit_swapped() -> std::expected<Table, std::string> {
+        const ColumnValue* rkey = right_.find(keys_->front());
+        if (rkey == nullptr) {
+            return std::unexpected("join key not found in right table: " + keys_->front());
+        }
+        const std::size_t n_left = left_table_->rows();
+        const std::size_t n_right = right_.rows();
+
+        std::vector<std::size_t> match_counts(n_left, 0);
+        std::size_t total = 0;
+
+        // Phase 1: count.
+        auto walk_and_apply = [&](auto&& key_at, const auto& heads, auto&& apply) {
+            for (std::size_t r = 0; r < n_right; ++r) {
+                auto it = heads.find(key_at(r));
+                if (it == heads.end())
+                    continue;
+                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                    apply(cur, r);
+                }
+            }
+        };
+
+        auto do_phase1 = [&](auto&& key_at, const auto& heads) {
+            walk_and_apply(key_at, heads, [&](std::size_t lrow, std::size_t) {
+                ++match_counts[lrow];
+                ++total;
+            });
+        };
+
+        auto do_phase2 = [&](auto&& key_at, const auto& heads, std::vector<std::size_t>& li,
+                             std::vector<std::size_t>& ri) {
+            std::vector<std::size_t> offsets(n_left + 1, 0);
+            for (std::size_t l = 0; l < n_left; ++l) {
+                offsets[l + 1] = offsets[l] + match_counts[l];
+            }
+            li.assign(total, 0);
+            ri.assign(total, 0);
+            std::vector<std::size_t> next_off = offsets;
+            walk_and_apply(key_at, heads, [&](std::size_t lrow, std::size_t rrow) {
+                const std::size_t pos = next_off[lrow]++;
+                li[pos] = lrow;
+                ri[pos] = rrow;
+            });
+        };
+
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+
+        if (key_kind_ == ExprType::Int) {
+            const auto* col = std::get_if<Column<std::int64_t>>(rkey);
+            if (col == nullptr)
+                return std::unexpected("inner join: right key type mismatch");
+            const auto* data = col->data();
+            auto key_at = [&](std::size_t r) {
+                return data[r];
+            };
+            do_phase1(key_at, i64_heads_);
+            do_phase2(key_at, i64_heads_, li, ri);
+        } else if (key_kind_ == ExprType::Double) {
+            const auto* col = std::get_if<Column<double>>(rkey);
+            if (col == nullptr)
+                return std::unexpected("inner join: right key type mismatch");
+            const auto* data = col->data();
+            auto key_at = [&](std::size_t r) {
+                return data[r];
+            };
+            do_phase1(key_at, f64_heads_);
+            do_phase2(key_at, f64_heads_, li, ri);
+        } else if (key_kind_ == ExprType::Bool) {
+            const auto* col = std::get_if<Column<bool>>(rkey);
+            if (col == nullptr)
+                return std::unexpected("inner join: right key type mismatch");
+            auto key_at = [&](std::size_t r) {
+                return (*col)[r];
+            };
+            do_phase1(key_at, bool_heads_);
+            do_phase2(key_at, bool_heads_, li, ri);
+        } else if (key_kind_ == ExprType::Date) {
+            const auto* col = std::get_if<Column<Date>>(rkey);
+            if (col == nullptr)
+                return std::unexpected("inner join: right key type mismatch");
+            const auto* data = col->data();
+            auto key_at = [&](std::size_t r) {
+                return data[r];
+            };
+            do_phase1(key_at, date_heads_);
+            do_phase2(key_at, date_heads_, li, ri);
+        } else if (key_kind_ == ExprType::Timestamp) {
+            const auto* col = std::get_if<Column<Timestamp>>(rkey);
+            if (col == nullptr)
+                return std::unexpected("inner join: right key type mismatch");
+            const auto* data = col->data();
+            auto key_at = [&](std::size_t r) {
+                return data[r];
+            };
+            do_phase1(key_at, ts_heads_);
+            do_phase2(key_at, ts_heads_, li, ri);
+        } else if (key_kind_ == ExprType::String) {
+            if (const auto* c_cat = std::get_if<Column<Categorical>>(rkey)) {
+                const auto& dict = c_cat->dictionary();
+                auto key_at = [&](std::size_t r) {
+                    return std::string_view{dict[static_cast<std::size_t>(c_cat->code_at(r))]};
+                };
+                do_phase1(key_at, string_heads_);
+                do_phase2(key_at, string_heads_, li, ri);
+            } else if (const auto* c_str = std::get_if<Column<std::string>>(rkey)) {
+                auto key_at = [&](std::size_t r) {
+                    return (*c_str)[r];
+                };
+                do_phase1(key_at, string_heads_);
+                do_phase2(key_at, string_heads_, li, ri);
+            } else {
+                return std::unexpected("inner join: right key type mismatch");
+            }
+        }
+
+        return assemble_output(*left_table_, li.data(), ri.data(), li.size());
+    }
+
+    auto assemble_output(const Table& left_side, const std::size_t* li, const std::size_t* ri,
+                         std::size_t total) -> std::expected<Table, std::string> {
         Table output;
-        if (li.empty()) {
+        if (total == 0) {
             return output;
         }
-        const std::size_t total = li.size();
-        output.columns.reserve(left_chunk.columns.size() + right_emit_idx_.size());
+        output.columns.reserve(left_side.columns.size() + right_emit_idx_.size());
 
         std::unordered_set<std::string> out_names;
-        out_names.reserve(left_chunk.columns.size() + right_emit_idx_.size());
+        out_names.reserve(left_side.columns.size() + right_emit_idx_.size());
 
         auto gather_with_validity =
             [&](const ColumnValue& src_col, const std::optional<ValidityBitmap>& src_val,
@@ -8237,8 +8480,8 @@ class ChunkedInnerJoinOperator final : public Operator {
             return {std::move(gathered), std::move(val)};
         };
 
-        for (const auto& lc : left_chunk.columns) {
-            auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li.data());
+        for (const auto& lc : left_side.columns) {
+            auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li);
             out_names.insert(lc.name);
             if (val.has_value()) {
                 output.add_column(lc.name, std::move(gathered), std::move(*val));
@@ -8254,33 +8497,44 @@ class ChunkedInnerJoinOperator final : public Operator {
                 name += "_right";
             }
             out_names.insert(name);
-            auto [gathered, val] = gather_with_validity(*rc.column, rc.validity, ri.data());
+            auto [gathered, val] = gather_with_validity(*rc.column, rc.validity, ri);
             if (val.has_value()) {
                 output.add_column(std::move(name), std::move(gathered), std::move(*val));
             } else {
                 output.add_column(std::move(name), std::move(gathered));
             }
         }
-
         return output;
     }
 
     OperatorPtr left_;
     Table right_;
     const std::vector<std::string>* keys_;
-    bool initialized_ = false;
-    ExprType right_kind_ = ExprType::Int;
 
+    bool initialized_ = false;
+    Mode mode_ = Mode::Stream;
+    ExprType key_kind_ = ExprType::Int;
+
+    // Hash index on the build side (right in Stream, left in Swapped).
     std::vector<std::size_t> chain_next_;
-    robin_hood::unordered_flat_map<std::int64_t, std::size_t> right_i64_heads_;
-    robin_hood::unordered_flat_map<double, std::size_t> right_f64_heads_;
-    robin_hood::unordered_flat_map<bool, std::size_t> right_bool_heads_;
-    robin_hood::unordered_flat_map<Date, std::size_t> right_date_heads_;
-    robin_hood::unordered_flat_map<Timestamp, std::size_t> right_ts_heads_;
+    robin_hood::unordered_flat_map<std::int64_t, std::size_t> i64_heads_;
+    robin_hood::unordered_flat_map<double, std::size_t> f64_heads_;
+    robin_hood::unordered_flat_map<bool, std::size_t> bool_heads_;
+    robin_hood::unordered_flat_map<Date, std::size_t> date_heads_;
+    robin_hood::unordered_flat_map<Timestamp, std::size_t> ts_heads_;
     robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
-        right_string_heads_;
-    const void* right_cat_dictionary_id_ = nullptr;
+        string_heads_;
     std::vector<std::size_t> right_emit_idx_;
+
+    // Stream mode: when right > threshold and left >= right, left was
+    // materialized to measure but not swapped; replay as a single chunk.
+    std::optional<Table> left_materialized_;
+    bool left_materialized_drained_ = false;
+    bool use_materialized_left_ = false;
+
+    // Swapped mode: materialized left held for later gather.
+    std::optional<Table> left_table_;
+    bool swapped_emitted_ = false;
 };
 
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and

@@ -7262,6 +7262,162 @@ class ChunkedHeadOperator final : public Operator {
     robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> seen_counts_;
 };
 
+auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) -> int {
+    return std::visit(
+        [](const auto& l, const auto& r) -> int {
+            using L = std::decay_t<decltype(l)>;
+            using R = std::decay_t<decltype(r)>;
+            if constexpr (std::is_same_v<L, R>) {
+                if (l < r) {
+                    return -1;
+                }
+                if (r < l) {
+                    return 1;
+                }
+                return 0;
+            } else {
+                invariant_violation("compare_scalar_for_order: mismatched scalar types");
+            }
+        },
+        lhs, rhs);
+}
+
+class ChunkedTopKOrderHeadOperator final : public Operator {
+   public:
+    ChunkedTopKOrderHeadOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys,
+                                 std::size_t count)
+        : child_(std::move(child)), keys_(keys), count_(count) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (emitted_) {
+            return std::optional<Chunk>{};
+        }
+
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                break;
+            }
+
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            if (!empty_template_.has_value()) {
+                std::vector<std::size_t> idx;
+                empty_template_ = gather_rows(t, idx);
+            }
+            auto err = process_chunk(t);
+            if (err.has_value()) {
+                return std::unexpected(std::move(*err));
+            }
+        }
+
+        emitted_ = true;
+        if (!empty_template_.has_value()) {
+            return std::optional<Chunk>{};
+        }
+        return std::optional<Chunk>{table_to_chunk(build_output())};
+    }
+
+   private:
+    struct Entry {
+        Key key;
+        std::size_t sequence = 0;
+        Table row;
+    };
+
+    auto row_better(const Entry& lhs, const Entry& rhs) const -> bool {
+        for (std::size_t i = 0; i < lhs.key.values.size(); ++i) {
+            int cmp = compare_scalar_for_order(lhs.key.values[i], rhs.key.values[i]);
+            if (cmp == 0) {
+                continue;
+            }
+            return (*keys_)[i].ascending ? (cmp < 0) : (cmp > 0);
+        }
+        return lhs.sequence < rhs.sequence;
+    }
+
+    auto process_chunk(const Table& chunk) -> std::optional<std::string> {
+        if (count_ == 0 || chunk.rows() == 0) {
+            return std::nullopt;
+        }
+
+        for (const auto& key : *keys_) {
+            if (chunk.find(key.name) == nullptr) {
+                return "order column not found: " + key.name +
+                       " (available: " + format_columns(chunk) + ")";
+            }
+        }
+
+        for (std::size_t row = 0; row < chunk.rows(); ++row) {
+            Entry entry;
+            entry.key.values.reserve(keys_->size());
+            for (const auto& key : *keys_) {
+                entry.key.values.push_back(scalar_from_column(*chunk.find(key.name), row));
+            }
+            entry.sequence = next_sequence_++;
+            std::vector<std::size_t> idx{row};
+            entry.row = gather_rows(chunk, idx);
+
+            if (heap_.size() < count_) {
+                heap_.push_back(std::move(entry));
+                std::push_heap(heap_.begin(), heap_.end(),
+                               [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+                continue;
+            }
+
+            if (!row_better(entry, heap_.front())) {
+                continue;
+            }
+
+            std::pop_heap(heap_.begin(), heap_.end(),
+                          [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+            heap_.back() = std::move(entry);
+            std::push_heap(heap_.begin(), heap_.end(),
+                           [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+        }
+        return std::nullopt;
+    }
+
+    auto build_output() -> Table {
+        if (count_ == 0 || heap_.empty()) {
+            return empty_template_.value_or(Table{});
+        }
+
+        std::sort(heap_.begin(), heap_.end(),
+                  [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+
+        Table out = empty_template_.value_or(Table{});
+        for (const auto& entry : heap_) {
+            for (std::size_t col = 0; col < out.columns.size(); ++col) {
+                append_value(*out.columns[col].column, *entry.row.columns[col].column, 0);
+                if (entry.row.columns[col].validity.has_value()) {
+                    if (!out.columns[col].validity.has_value()) {
+                        out.columns[col].validity =
+                            ValidityBitmap(column_size(*out.columns[col].column) - 1, true);
+                    }
+                    out.columns[col].validity->push_back((*entry.row.columns[col].validity)[0]);
+                } else if (out.columns[col].validity.has_value()) {
+                    out.columns[col].validity->push_back(true);
+                }
+            }
+        }
+
+        out.ordering = *keys_;
+        normalize_time_index(out);
+        return out;
+    }
+
+    OperatorPtr child_;
+    const std::vector<ir::OrderKey>* keys_;
+    std::size_t count_;
+    bool emitted_ = false;
+    std::size_t next_sequence_ = 0;
+    std::vector<Entry> heap_;
+    std::optional<Table> empty_template_;
+};
+
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and
 /// per-group `AggState` across chunks: each incoming chunk updates the
 /// state per row, the chunk is released, and the final result is
@@ -8026,6 +8182,19 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& head = static_cast<const ir::HeadNode&>(node);
         if (head.children().empty()) {
             return std::unexpected("head node missing child");
+        }
+        if (head.group_by().empty() && head.children().front()->kind() == ir::NodeKind::Order) {
+            const auto& order = static_cast<const ir::OrderNode&>(*head.children().front());
+            if (order.children().empty()) {
+                return std::unexpected("order node missing child");
+            }
+            auto child_op =
+                build_operator(*order.children().front(), registry, scalars, externs, model_out);
+            if (!child_op.has_value()) {
+                return std::unexpected(std::move(child_op.error()));
+            }
+            return std::make_unique<ChunkedTopKOrderHeadOperator>(std::move(child_op.value()),
+                                                                  &order.keys(), head.count());
         }
         auto child_op =
             build_operator(*head.children().front(), registry, scalars, externs, model_out);

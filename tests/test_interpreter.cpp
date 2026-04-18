@@ -699,6 +699,34 @@ TEST_CASE("Interpret grouped head over chunked extern source tracks groups acros
     REQUIRE((*x)[4] == 60);
 }
 
+TEST_CASE("Interpret ordered head over chunked extern source keeps top-k without full sort") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("stream_unsorted", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_int_chunk("x", {5, 1, 7}));
+        chunks.push_back(make_int_chunk("x", {3, 9, 2}));
+        chunks.push_back(make_int_chunk("x", {8, 4, 6}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn stream_unsorted() -> DataFrame from \"x.hpp\"; "
+        "stream_unsorted()[order x desc, head 4];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == 4);
+    REQUIRE((*x)[0] == 9);
+    REQUIRE((*x)[1] == 8);
+    REQUIRE((*x)[2] == 7);
+    REQUIRE((*x)[3] == 6);
+}
+
 TEST_CASE("Interpret ordered grouped head returns top-k per group") {
     runtime::Table table;
     table.add_column("symbol", Column<std::string>{"A", "A", "B", "A", "B"});

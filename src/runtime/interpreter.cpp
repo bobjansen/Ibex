@@ -6559,10 +6559,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             if (fn->chunked_table_func) {
                 auto source = fn->chunked_table_func(args);
-                if (!source)
-                    return std::unexpected(source.error());
-                MaterializeOperator sink{std::move(source.value())};
-                return sink.run();
+                if (source.has_value()) {
+                    MaterializeOperator sink{std::move(source.value())};
+                    return sink.run();
+                }
             }
             auto result = fn->func(args);
             if (!result)
@@ -7194,9 +7194,6 @@ class ChunkedAggregateOperator final : public Operator {
             if (entry == nullptr) {
                 return "group-by column not found: " + key.name;
             }
-            if (entry->validity.has_value()) {
-                return "ChunkedAggregateOperator: null group-by values not supported";
-            }
             group_entries.push_back(entry);
         }
 
@@ -7240,7 +7237,8 @@ class ChunkedAggregateOperator final : public Operator {
             bool all_cat = true;
             for (const auto* e : group_entries) {
                 group_templates_.push_back(make_empty_like(*e->column));
-                if (!std::holds_alternative<Column<Categorical>>(*e->column)) {
+                if (!std::holds_alternative<Column<Categorical>>(*e->column) ||
+                    e->validity.has_value()) {
                     all_cat = false;
                 }
             }
@@ -7690,14 +7688,21 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (fn != nullptr && fn->chunked_table_func) {
             ExternArgs args;
             args.reserve(ec.args().size());
+            bool args_ok = true;
             for (const auto& arg : ec.args()) {
                 auto val = eval_expr(arg, Table{}, 0, scalars, externs);
                 if (!val.has_value()) {
-                    return std::unexpected(std::move(val.error()));
+                    args_ok = false;
+                    break;
                 }
                 args.push_back(std::move(val.value()));
             }
-            return fn->chunked_table_func(args);
+            if (args_ok) {
+                auto op = fn->chunked_table_func(args);
+                if (op.has_value()) {
+                    return std::move(op.value());
+                }
+            }
         }
     }
 

@@ -287,6 +287,11 @@ ggplot(summary, aes(Species, mean_sl)) +
             files. When <code>has_header</code> is <code>false</code>, Ibex
             synthesizes column names <code>col1</code>, <code>col2</code>, and so on.
           </p>
+          <p>
+            SQLite is also available through the optional ADBC plugin, so the
+            same pipeline can start from a SQL query instead of a flat file
+            when you want database-side staging first.
+          </p>
         </div>
         <div class="tour-code">
 <pre><code>import "csv";
@@ -370,8 +375,9 @@ generated[<span class="kw">filter</span> name != <span class="str">"row_id"</spa
           </p>
           <p>
             The dedicated <a href="./io.html">I/O guide</a> covers CSV and
-            Parquet usage in more detail, including headerless files, custom
-            delimiters, and schema hints.
+            Parquet usage in more detail, plus SQLite reads through ADBC,
+            including headerless files, custom delimiters, schema hints, and
+            a first-1M-rows measurements showcase.
           </p>
         </div>
         <div class="tour-code">

@@ -32,6 +32,7 @@ option(IBEX_BUILD_TOOLS "Build REPL and other tools" ON)
 option(IBEX_BUILD_EXAMPLES "Build examples" ON)
 option(IBEX_BUILD_PYTHON_BRIDGE "Build the experimental pyarrow-backed Python bridge" ON)
 option(IBEX_BUILD_PARQUET "Build the bundled Parquet plugin" ON)
+option(IBEX_BUILD_ADBC "Build the bundled ADBC plugin" OFF)
 set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
     "Directory for bundled Ibex plugins (csv/gen_tf_data)")
 
@@ -78,6 +79,9 @@ endif()
 add_subdirectory(libs/lightbm)
 if(IBEX_BUILD_PARQUET)
     add_subdirectory(libs/parquet)
+endif()
+if(IBEX_BUILD_ADBC)
+    add_subdirectory(libs/adbc)
 endif()
 
 # Tools

@@ -45,6 +45,42 @@ auto string_at(const ArrowArray& array, std::int64_t index) -> std::string {
     return std::string(chars + start, chars + end);
 }
 
+struct FakeArrowStreamState {
+    bool released = false;
+};
+
+struct FakeArrowArrayState {
+    bool released = false;
+};
+
+struct FakeArrowSchemaState {
+    bool released = false;
+};
+
+auto release_fake_array(ArrowArray* array) -> void {
+    auto* state = static_cast<FakeArrowArrayState*>(array->private_data);
+    if (state != nullptr) {
+        state->released = true;
+    }
+    array->release = nullptr;
+}
+
+auto release_fake_schema(ArrowSchema* schema) -> void {
+    auto* state = static_cast<FakeArrowSchemaState*>(schema->private_data);
+    if (state != nullptr) {
+        state->released = true;
+    }
+    schema->release = nullptr;
+}
+
+auto release_fake_stream(ArrowArrayStream* stream) -> void {
+    auto* state = static_cast<FakeArrowStreamState*>(stream->private_data);
+    if (state != nullptr) {
+        state->released = true;
+    }
+    stream->release = nullptr;
+}
+
 }  // namespace
 
 TEST_CASE("Arrow C Data export preserves zero-copy buffers and table metadata",
@@ -242,4 +278,43 @@ TEST_CASE("Arrow C Data import round-trips dictionary encoded categoricals", "[i
 
     schema.release(&schema);
     array.release(&array);
+}
+
+TEST_CASE("Arrow C stream release clears callbacks and calls producer release",
+          "[interop][arrow]") {
+    FakeArrowStreamState state{};
+    ArrowArrayStream stream{};
+    stream.release = release_fake_stream;
+    stream.private_data = &state;
+
+    ibex::interop::release_arrow_stream(&stream);
+
+    REQUIRE(state.released);
+    REQUIRE(stream.release == nullptr);
+    REQUIRE(stream.get_schema == nullptr);
+    REQUIRE(stream.get_next == nullptr);
+    REQUIRE(stream.get_last_error == nullptr);
+    REQUIRE(stream.private_data == nullptr);
+}
+
+TEST_CASE("Arrow C release wrappers handle foreign arrays and schemas", "[interop][arrow]") {
+    FakeArrowArrayState array_state{};
+    ArrowArray array{};
+    array.release = release_fake_array;
+    array.private_data = &array_state;
+
+    FakeArrowSchemaState schema_state{};
+    ArrowSchema schema{};
+    schema.release = release_fake_schema;
+    schema.private_data = &schema_state;
+
+    ibex::interop::release_arrow_array(&array);
+    ibex::interop::release_arrow_schema(&schema);
+
+    REQUIRE(array_state.released);
+    REQUIRE(schema_state.released);
+    REQUIRE(array.release == nullptr);
+    REQUIRE(schema.release == nullptr);
+    REQUIRE(array.private_data == nullptr);
+    REQUIRE(schema.private_data == nullptr);
 }

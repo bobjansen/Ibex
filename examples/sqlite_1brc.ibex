@@ -1,0 +1,19 @@
+// 1BRC-style aggregation over the first 1M rows loaded into SQLite.
+//
+// Setup:
+//   python3 scripts/import_measurements_sqlite.py --limit 1000000 --output /tmp/measurements_1m.sqlite
+//
+// Run the REPL with the ADBC plugin available, then paste this script:
+//   LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
+//   ./build-release/tools/ibex --plugin-path ./build-release/tools
+import "adbc";
+
+read_adbc(
+    "/home/brj/miniforge3/envs/ibex/lib/libadbc_driver_sqlite.so",
+    "/tmp/measurements_1m.sqlite",
+    "select station, temp from measurements"
+)[select {
+    min_temp = min(temp),
+    avg_temp = mean(temp),
+    max_temp = max(temp)
+}, by station, order station];

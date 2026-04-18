@@ -7671,6 +7671,30 @@ class ChunkedDistinctOperator final : public Operator {
 
     auto gather_distinct_categorical_rows(Table t, const Column<Categorical>& col)
         -> std::optional<Table> {
+        const void* dict_id = static_cast<const void*>(col.dictionary_ptr().get());
+        if (cat_dictionary_id_ == nullptr || cat_dictionary_id_ == dict_id) {
+            cat_dictionary_id_ = dict_id;
+            const std::size_t rows = t.rows();
+            std::vector<std::size_t> idx;
+            idx.reserve(rows);
+            const auto* codes = col.codes_data();
+            for (std::size_t row = 0; row < rows; ++row) {
+                if (!seen_cat_codes_.insert(codes[row]).second) {
+                    continue;
+                }
+                idx.push_back(row);
+            }
+            if (idx.empty()) {
+                return std::nullopt;
+            }
+            t.ordering.reset();
+            t.time_index.reset();
+            if (idx.size() == rows) {
+                return t;
+            }
+            return gather_rows(t, idx);
+        }
+
         const std::size_t rows = t.rows();
         std::vector<std::size_t> idx;
         idx.reserve(rows);
@@ -7727,8 +7751,10 @@ class ChunkedDistinctOperator final : public Operator {
     robin_hood::unordered_flat_set<bool> seen_bool_;
     robin_hood::unordered_flat_set<Date> seen_date_;
     robin_hood::unordered_flat_set<Timestamp> seen_timestamp_;
-    std::unordered_set<std::string_view, StringViewHash, StringViewEq> seen_strings_;
+    robin_hood::unordered_flat_set<Column<Categorical>::code_type> seen_cat_codes_;
+    robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> seen_strings_;
     std::deque<std::string> owned_strings_;
+    const void* cat_dictionary_id_ = nullptr;
 };
 
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and

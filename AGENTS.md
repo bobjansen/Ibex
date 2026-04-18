@@ -42,6 +42,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - Built-ins should remain minimal; prefer `extern fn` hooks for functionality implemented in C++
 - Workflow: when loading string columns (CSV/parquet), auto-detect categorical encoding where possible.
 - Workflow: for routine performance checks, use Polars as the primary comparison target. Prefer `benchmarking/run_scale_ibex_vs_polars.sh` before the full multi-framework suite, and treat `README.md` benchmark snapshots as the published baseline that should stay in sync with current results.
+- Workflow: when comparing against Polars, run **both** single-threaded (`POLARS_MAX_THREADS=1`) and default multi-threaded. Ibex's execution is currently single-threaded, so the ST number is the apples-to-apples comparison; the MT number shows the headroom left by not parallelizing yet. Report both.
 
 ## Recent REPL Features
 - `:schema`, `:head`, `:describe`, `:scalars`, `:tables`, `:load <file>`

@@ -91,6 +91,11 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     run("update_price_x2", lambda: df.assign(price_x2=df["price"] * 2))
 
+    run(
+        "order_head_topk",
+        lambda: df.sort_values("price", ascending=False, kind="mergesort").head(100),
+    )
+
     run("cumsum_price", lambda: df.assign(cs=df["price"].cumsum()))
 
     run("cumprod_price", lambda: df.assign(cp=df["price"].cumprod()))
@@ -194,6 +199,8 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         "update_price_x2",
         lambda: df.with_columns((pl.col("price") * 2).alias("price_x2")),
     )
+
+    run("order_head_topk", lambda: df.sort("price", descending=True).head(100))
 
     run("cumsum_price", lambda: df.with_columns(pl.col("price").cum_sum().alias("cs")))
 

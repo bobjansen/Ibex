@@ -375,6 +375,35 @@ auto verify_update_price_x2(const ibex::runtime::Table& table, const ibex::runti
     return true;
 }
 
+auto verify_order_head_topk(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                            std::size_t rows, std::size_t k) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* out_price = result.find("price");
+    if (price_col == nullptr || out_price == nullptr) {
+        return false;
+    }
+
+    std::vector<double> expected;
+    expected.reserve(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+        expected.push_back(double_at(*price_col, row));
+    }
+    std::stable_sort(expected.begin(), expected.end(), std::greater<double>{});
+    if (expected.size() > k) {
+        expected.resize(k);
+    }
+
+    if (result.rows() != expected.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (std::abs(double_at(*out_price, i) - expected[i]) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto verify_filter(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
                    std::size_t rows, const std::string_view mode) -> bool {
     const auto* price_col = table.find("price");
@@ -553,6 +582,14 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         std::size_t rows = sliced.at("prices").rows();
         if (!verify_update_price_x2(sliced.at("prices"), *result, rows)) {
             return "update_price_x2 verification failed";
+        }
+    } else if (query.name == "order_head_topk") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_order_head_topk(sliced.at("prices"), *result, rows, 100)) {
+            return "order_head_topk verification failed";
         }
     } else if (query.name == "count_by_symbol_day") {
         if (multi == nullptr) {
@@ -1018,6 +1055,10 @@ int main(int argc, char** argv) {
             {
                 "update_price_x2",
                 "prices[update {price_x2 = price * 2}]",
+            },
+            {
+                "order_head_topk",
+                "prices[order price desc, head 100]",
             },
             // Parse + lower overhead: same queries timed with parsing included.
             // Run with --include-parse (default) to capture lexer/parser maps.

@@ -40,6 +40,64 @@ auto ts_from_nanos(std::int64_t nanos) -> Timestamp {
     return Timestamp{nanos};
 }
 
+auto make_int_chunk(const std::string& name, std::vector<std::int64_t> values) -> runtime::Chunk {
+    runtime::Chunk chunk;
+    runtime::ColumnEntry entry;
+    entry.name = name;
+    entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+    auto& col = std::get<Column<std::int64_t>>(*entry.column);
+    col.reserve(values.size());
+    for (auto v : values) {
+        col.push_back(v);
+    }
+    chunk.columns.push_back(std::move(entry));
+    return chunk;
+}
+
+auto make_str_int_chunk(const std::string& key_name, std::vector<std::string> keys,
+                        const std::string& value_name, std::vector<std::int64_t> values)
+    -> runtime::Chunk {
+    runtime::Chunk chunk;
+
+    runtime::ColumnEntry key_entry;
+    key_entry.name = key_name;
+    key_entry.column = std::make_shared<runtime::ColumnValue>(Column<std::string>{});
+    auto& key_col = std::get<Column<std::string>>(*key_entry.column);
+    key_col.reserve(keys.size());
+    for (const auto& v : keys) {
+        key_col.push_back(v);
+    }
+    chunk.columns.push_back(std::move(key_entry));
+
+    runtime::ColumnEntry value_entry;
+    value_entry.name = value_name;
+    value_entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+    auto& value_col = std::get<Column<std::int64_t>>(*value_entry.column);
+    value_col.reserve(values.size());
+    for (auto v : values) {
+        value_col.push_back(v);
+    }
+    chunk.columns.push_back(std::move(value_entry));
+
+    return chunk;
+}
+
+class VectorSource final : public runtime::Operator {
+   public:
+    explicit VectorSource(std::vector<runtime::Chunk> chunks) : chunks_(std::move(chunks)) {}
+
+    auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+        if (pos_ >= chunks_.size()) {
+            return std::optional<runtime::Chunk>{};
+        }
+        return std::optional<runtime::Chunk>{std::move(chunks_[pos_++])};
+    }
+
+   private:
+    std::vector<runtime::Chunk> chunks_;
+    std::size_t pos_ = 0;
+};
+
 }  // namespace
 
 TEST_CASE("Interpret filter + select") {
@@ -550,6 +608,35 @@ TEST_CASE("Interpret global head preserves current order") {
     REQUIRE((*x)[1] == 20);
 }
 
+TEST_CASE("Interpret global head over chunked extern source stops after requested rows") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    int source_calls = 0;
+    externs.register_chunked_table("stream_nums", [&](const runtime::ExternArgs&) {
+        ++source_calls;
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_int_chunk("x", {10, 20, 30}));
+        chunks.push_back(make_int_chunk("x", {40, 50, 60}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir =
+        require_ir("extern fn stream_nums() -> DataFrame from \"x.hpp\"; stream_nums()[head 4];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    REQUIRE(source_calls == 1);
+
+    const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == 4);
+    REQUIRE((*x)[0] == 10);
+    REQUIRE((*x)[1] == 20);
+    REQUIRE((*x)[2] == 30);
+    REQUIRE((*x)[3] == 40);
+}
+
 TEST_CASE("Interpret grouped head keeps first rows per group in encounter order") {
     runtime::Table table;
     table.add_column("symbol", Column<std::string>{"A", "B", "A", "A", "B"});
@@ -575,6 +662,41 @@ TEST_CASE("Interpret grouped head keeps first rows per group in encounter order"
     REQUIRE((*x)[2] == 30);
     REQUIRE((*symbol)[3] == "B");
     REQUIRE((*x)[3] == 50);
+}
+
+TEST_CASE("Interpret grouped head over chunked extern source tracks groups across chunks") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("stream_grouped", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_str_int_chunk("symbol", {"A", "B", "A"}, "x", {10, 20, 30}));
+        chunks.push_back(make_str_int_chunk("symbol", {"A", "B", "C"}, "x", {40, 50, 60}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn stream_grouped() -> DataFrame from \"x.hpp\"; "
+        "stream_grouped()[head 2, by symbol];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(x != nullptr);
+    REQUIRE(symbol->size() == 5);
+    REQUIRE((*symbol)[0] == "A");
+    REQUIRE((*x)[0] == 10);
+    REQUIRE((*symbol)[1] == "B");
+    REQUIRE((*x)[1] == 20);
+    REQUIRE((*symbol)[2] == "A");
+    REQUIRE((*x)[2] == 30);
+    REQUIRE((*symbol)[3] == "B");
+    REQUIRE((*x)[3] == 50);
+    REQUIRE((*symbol)[4] == "C");
+    REQUIRE((*x)[4] == 60);
 }
 
 TEST_CASE("Interpret ordered grouped head returns top-k per group") {

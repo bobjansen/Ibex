@@ -7282,11 +7282,18 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
         lhs, rhs);
 }
 
-class ChunkedTopKOrderHeadOperator final : public Operator {
+class ChunkedOrderedLimitOperator final : public Operator {
    public:
-    ChunkedTopKOrderHeadOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys,
-                                 std::size_t count, const std::vector<ir::ColumnRef>* group_by)
-        : child_(std::move(child)), keys_(keys), count_(count), group_by_(group_by) {}
+    enum class KeepMode { First, Last };
+
+    ChunkedOrderedLimitOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys,
+                                std::size_t count, const std::vector<ir::ColumnRef>* group_by,
+                                KeepMode keep_mode)
+        : child_(std::move(child)),
+          keys_(keys),
+          count_(count),
+          group_by_(group_by),
+          keep_mode_(keep_mode) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (emitted_) {
@@ -7348,7 +7355,7 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         return snapshot;
     }
 
-    auto row_better(const Entry& lhs, const Entry& rhs) const -> bool {
+    auto row_comes_first(const Entry& lhs, const Entry& rhs) const -> bool {
         for (std::size_t i = 0; i < lhs.key.values.size(); ++i) {
             int cmp = compare_scalar_for_order(lhs.key.values[i], rhs.key.values[i]);
             if (cmp == 0) {
@@ -7359,17 +7366,24 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         return lhs.sequence < rhs.sequence;
     }
 
+    auto entry_preferred(const Entry& lhs, const Entry& rhs) const -> bool {
+        return keep_mode_ == KeepMode::First ? row_comes_first(lhs, rhs)
+                                             : row_comes_first(rhs, lhs);
+    }
+
     template <typename T>
     auto single_key_better(const T& lhs, std::size_t lhs_sequence, const Entry& rhs,
                            bool ascending) const -> bool {
         const auto* rhs_key = std::get_if<T>(&rhs.key.values.front());
         if (rhs_key == nullptr) {
-            invariant_violation("ChunkedTopKOrderHeadOperator: single-key type mismatch");
+            invariant_violation("ChunkedOrderedLimitOperator: single-key type mismatch");
         }
         if (lhs == *rhs_key) {
-            return lhs_sequence < rhs.sequence;
+            return keep_mode_ == KeepMode::First ? (lhs_sequence < rhs.sequence)
+                                                 : (rhs.sequence < lhs_sequence);
         }
-        return ascending ? (lhs < *rhs_key) : (lhs > *rhs_key);
+        const bool lhs_first = ascending ? (lhs < *rhs_key) : (lhs > *rhs_key);
+        return keep_mode_ == KeepMode::First ? lhs_first : !lhs_first;
     }
 
     auto push_entry(Entry entry) -> void { push_entry(heap_, std::move(entry)); }
@@ -7378,15 +7392,15 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         if (heap.size() < count_) {
             heap.push_back(std::move(entry));
             std::push_heap(heap.begin(), heap.end(),
-                           [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+                           [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
             return;
         }
 
         std::pop_heap(heap.begin(), heap.end(),
-                      [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+                      [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
         heap.back() = std::move(entry);
         std::push_heap(heap.begin(), heap.end(),
-                       [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+                       [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
     }
 
     template <typename T>
@@ -7486,7 +7500,7 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
                 entry.key.values.push_back(scalar_from_column(*column, row));
             }
             entry.sequence = next_sequence_++;
-            if (heap->size() == count_ && !row_better(entry, heap->front())) {
+            if (heap->size() == count_ && !entry_preferred(entry, heap->front())) {
                 continue;
             }
             entry.row = snapshot_row(chunk, row);
@@ -7512,7 +7526,7 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         }
 
         std::sort(winners.begin(), winners.end(),
-                  [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+                  [&](const Entry& a, const Entry& b) { return row_comes_first(a, b); });
 
         Table out = empty_template_.value_or(Table{});
         for (const auto& entry : winners) {
@@ -7539,6 +7553,7 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
     const std::vector<ir::OrderKey>* keys_;
     std::size_t count_;
     const std::vector<ir::ColumnRef>* group_by_;
+    KeepMode keep_mode_;
     bool emitted_ = false;
     std::size_t next_sequence_ = 0;
     std::vector<Entry> heap_;
@@ -8321,8 +8336,9 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             if (!child_op.has_value()) {
                 return std::unexpected(std::move(child_op.error()));
             }
-            return std::make_unique<ChunkedTopKOrderHeadOperator>(
-                std::move(child_op.value()), &order.keys(), head.count(), &head.group_by());
+            return std::make_unique<ChunkedOrderedLimitOperator>(
+                std::move(child_op.value()), &order.keys(), head.count(), &head.group_by(),
+                ChunkedOrderedLimitOperator::KeepMode::First);
         }
         auto child_op =
             build_operator(*head.children().front(), registry, scalars, externs, model_out);
@@ -8337,6 +8353,20 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& tail = static_cast<const ir::TailNode&>(node);
         if (tail.children().empty()) {
             return std::unexpected("tail node missing child");
+        }
+        if (tail.children().front()->kind() == ir::NodeKind::Order) {
+            const auto& order = static_cast<const ir::OrderNode&>(*tail.children().front());
+            if (order.children().empty()) {
+                return std::unexpected("order node missing child");
+            }
+            auto child_op =
+                build_operator(*order.children().front(), registry, scalars, externs, model_out);
+            if (!child_op.has_value()) {
+                return std::unexpected(std::move(child_op.error()));
+            }
+            return std::make_unique<ChunkedOrderedLimitOperator>(
+                std::move(child_op.value()), &order.keys(), tail.count(), &tail.group_by(),
+                ChunkedOrderedLimitOperator::KeepMode::Last);
         }
         return build_unary_materializing_operator(
             *tail.children().front(), registry, scalars, externs, model_out,

@@ -792,6 +792,72 @@ TEST_CASE("Interpret ordered grouped head over chunked extern source keeps top-k
     REQUIRE((*score)[5] == 3);
 }
 
+TEST_CASE("Interpret ordered tail over chunked extern source keeps bottom-k without full sort") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("stream_unsorted", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_int_chunk("x", {5, 1, 7}));
+        chunks.push_back(make_int_chunk("x", {3, 9, 2}));
+        chunks.push_back(make_int_chunk("x", {8, 4, 6}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn stream_unsorted() -> DataFrame from \"x.hpp\"; "
+        "stream_unsorted()[order x desc, tail 4];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == 4);
+    REQUIRE((*x)[0] == 4);
+    REQUIRE((*x)[1] == 3);
+    REQUIRE((*x)[2] == 2);
+    REQUIRE((*x)[3] == 1);
+}
+
+TEST_CASE("Interpret ordered grouped tail over chunked extern source keeps bottom-k per group") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("stream_grouped_scores", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_str_int_chunk("symbol", {"A", "B", "A"}, "score", {5, 2, 9}));
+        chunks.push_back(make_str_int_chunk("symbol", {"B", "C", "A"}, "score", {8, 1, 7}));
+        chunks.push_back(make_str_int_chunk("symbol", {"C", "B", "C"}, "score", {6, 4, 3}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn stream_grouped_scores() -> DataFrame from \"x.hpp\"; "
+        "stream_grouped_scores()[order score desc, tail 2, by symbol];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* score = std::get_if<Column<std::int64_t>>(result->find("score"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(score != nullptr);
+    REQUIRE(symbol->size() == 6);
+    REQUIRE((*symbol)[0] == "A");
+    REQUIRE((*score)[0] == 7);
+    REQUIRE((*symbol)[1] == "A");
+    REQUIRE((*score)[1] == 5);
+    REQUIRE((*symbol)[2] == "B");
+    REQUIRE((*score)[2] == 4);
+    REQUIRE((*symbol)[3] == "C");
+    REQUIRE((*score)[3] == 3);
+    REQUIRE((*symbol)[4] == "B");
+    REQUIRE((*score)[4] == 2);
+    REQUIRE((*symbol)[5] == "C");
+    REQUIRE((*score)[5] == 1);
+}
+
 TEST_CASE("Interpret global tail preserves current order of last rows") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{10, 20, 30, 40});

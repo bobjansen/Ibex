@@ -7321,11 +7321,28 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
     }
 
    private:
+    struct RowSnapshot {
+        std::vector<ScalarValue> values;
+        std::vector<uint8_t> valid;
+    };
+
     struct Entry {
         Key key;
         std::size_t sequence = 0;
-        Table row;
+        RowSnapshot row;
     };
+
+    auto snapshot_row(const Table& chunk, std::size_t row) const -> RowSnapshot {
+        RowSnapshot snapshot;
+        snapshot.values.reserve(chunk.columns.size());
+        snapshot.valid.reserve(chunk.columns.size());
+        for (const auto& column : chunk.columns) {
+            snapshot.values.push_back(scalar_from_column(*column.column, row));
+            snapshot.valid.push_back(
+                column.validity.has_value() ? static_cast<uint8_t>((*column.validity)[row]) : 1U);
+        }
+        return snapshot;
+    }
 
     auto row_better(const Entry& lhs, const Entry& rhs) const -> bool {
         for (std::size_t i = 0; i < lhs.key.values.size(); ++i) {
@@ -7338,44 +7355,104 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         return lhs.sequence < rhs.sequence;
     }
 
+    template <typename T>
+    auto single_key_better(const T& lhs, std::size_t lhs_sequence, const Entry& rhs,
+                           bool ascending) const -> bool {
+        const auto* rhs_key = std::get_if<T>(&rhs.key.values.front());
+        if (rhs_key == nullptr) {
+            invariant_violation("ChunkedTopKOrderHeadOperator: single-key type mismatch");
+        }
+        if (lhs == *rhs_key) {
+            return lhs_sequence < rhs.sequence;
+        }
+        return ascending ? (lhs < *rhs_key) : (lhs > *rhs_key);
+    }
+
+    auto push_entry(Entry entry) -> void {
+        if (heap_.size() < count_) {
+            heap_.push_back(std::move(entry));
+            std::push_heap(heap_.begin(), heap_.end(),
+                           [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+            return;
+        }
+
+        std::pop_heap(heap_.begin(), heap_.end(),
+                      [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+        heap_.back() = std::move(entry);
+        std::push_heap(heap_.begin(), heap_.end(),
+                       [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+    }
+
+    template <typename T>
+    auto process_single_key_chunk(const Table& chunk, const Column<T>& key_column, bool ascending)
+        -> std::optional<std::string> {
+        for (std::size_t row = 0; row < chunk.rows(); ++row) {
+            const std::size_t sequence = next_sequence_++;
+            const T& key = key_column[row];
+
+            if (heap_.size() == count_ &&
+                !single_key_better(key, sequence, heap_.front(), ascending)) {
+                continue;
+            }
+
+            Entry entry;
+            entry.key.values.reserve(1);
+            entry.key.values.emplace_back(key);
+            entry.sequence = sequence;
+            entry.row = snapshot_row(chunk, row);
+            push_entry(std::move(entry));
+        }
+        return std::nullopt;
+    }
+
     auto process_chunk(const Table& chunk) -> std::optional<std::string> {
         if (count_ == 0 || chunk.rows() == 0) {
             return std::nullopt;
         }
 
+        std::vector<const ColumnValue*> key_columns;
+        key_columns.reserve(keys_->size());
         for (const auto& key : *keys_) {
-            if (chunk.find(key.name) == nullptr) {
+            const auto* column = chunk.find(key.name);
+            if (column == nullptr) {
                 return "order column not found: " + key.name +
                        " (available: " + format_columns(chunk) + ")";
+            }
+            key_columns.push_back(column);
+        }
+
+        if (keys_->size() == 1) {
+            const bool ascending = keys_->front().ascending;
+            const ColumnValue& key_column = *key_columns.front();
+            if (const auto* col = std::get_if<Column<std::int64_t>>(&key_column)) {
+                return process_single_key_chunk(chunk, *col, ascending);
+            }
+            if (const auto* col = std::get_if<Column<double>>(&key_column)) {
+                return process_single_key_chunk(chunk, *col, ascending);
+            }
+            if (const auto* col = std::get_if<Column<bool>>(&key_column)) {
+                return process_single_key_chunk(chunk, *col, ascending);
+            }
+            if (const auto* col = std::get_if<Column<Date>>(&key_column)) {
+                return process_single_key_chunk(chunk, *col, ascending);
+            }
+            if (const auto* col = std::get_if<Column<Timestamp>>(&key_column)) {
+                return process_single_key_chunk(chunk, *col, ascending);
             }
         }
 
         for (std::size_t row = 0; row < chunk.rows(); ++row) {
             Entry entry;
             entry.key.values.reserve(keys_->size());
-            for (const auto& key : *keys_) {
-                entry.key.values.push_back(scalar_from_column(*chunk.find(key.name), row));
+            for (const auto* column : key_columns) {
+                entry.key.values.push_back(scalar_from_column(*column, row));
             }
             entry.sequence = next_sequence_++;
-            std::vector<std::size_t> idx{row};
-            entry.row = gather_rows(chunk, idx);
-
-            if (heap_.size() < count_) {
-                heap_.push_back(std::move(entry));
-                std::push_heap(heap_.begin(), heap_.end(),
-                               [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+            if (heap_.size() == count_ && !row_better(entry, heap_.front())) {
                 continue;
             }
-
-            if (!row_better(entry, heap_.front())) {
-                continue;
-            }
-
-            std::pop_heap(heap_.begin(), heap_.end(),
-                          [&](const Entry& a, const Entry& b) { return row_better(a, b); });
-            heap_.back() = std::move(entry);
-            std::push_heap(heap_.begin(), heap_.end(),
-                           [&](const Entry& a, const Entry& b) { return row_better(a, b); });
+            entry.row = snapshot_row(chunk, row);
+            push_entry(std::move(entry));
         }
         return std::nullopt;
     }
@@ -7391,13 +7468,13 @@ class ChunkedTopKOrderHeadOperator final : public Operator {
         Table out = empty_template_.value_or(Table{});
         for (const auto& entry : heap_) {
             for (std::size_t col = 0; col < out.columns.size(); ++col) {
-                append_value(*out.columns[col].column, *entry.row.columns[col].column, 0);
-                if (entry.row.columns[col].validity.has_value()) {
+                append_scalar(*out.columns[col].column, entry.row.values[col]);
+                if (entry.row.valid[col] == 0U) {
                     if (!out.columns[col].validity.has_value()) {
                         out.columns[col].validity =
                             ValidityBitmap(column_size(*out.columns[col].column) - 1, true);
                     }
-                    out.columns[col].validity->push_back((*entry.row.columns[col].validity)[0]);
+                    out.columns[col].validity->push_back(false);
                 } else if (out.columns[col].validity.has_value()) {
                     out.columns[col].validity->push_back(true);
                 }

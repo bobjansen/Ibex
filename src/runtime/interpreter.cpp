@@ -8251,37 +8251,23 @@ class ChunkedInnerJoinOperator final : public Operator {
     auto probe_scalar(const Map& heads, std::size_t n, GetKey get, std::vector<std::size_t>& li,
                       std::vector<std::size_t>& ri) -> bool {
         if (build_unique_) {
+            li.resize(n);
             ri.resize(n);
+            std::size_t* lp = li.data();
             std::size_t* rp = ri.data();
             std::size_t out = 0;
-            bool identity = true;
             for (std::size_t l = 0; l < n; ++l) {
                 auto it = heads.find(get(l));
                 if (it == heads.end()) {
-                    identity = false;
                     continue;
                 }
-                rp[out++] = it->second;
-                if (out != l + 1) {
-                    identity = false;
-                }
+                lp[out] = l;
+                rp[out] = it->second;
+                ++out;
             }
-            ri.resize(out);
-            if (identity) {
-                return true;
-            }
-            // Rebuild li for the sparse-match case.
             li.resize(out);
-            std::size_t* lp = li.data();
-            std::size_t j = 0;
-            for (std::size_t l = 0; l < n && j < out; ++l) {
-                auto it = heads.find(get(l));
-                if (it == heads.end()) {
-                    continue;
-                }
-                lp[j++] = l;
-            }
-            return false;
+            ri.resize(out);
+            return out == n;
         }
         for (std::size_t l = 0; l < n; ++l) {
             auto it = heads.find(get(l));

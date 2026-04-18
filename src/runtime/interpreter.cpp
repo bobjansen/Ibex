@@ -7224,8 +7224,9 @@ class ChunkedAggregateOperator final : public Operator {
         }
 
         if (!initialized_) {
-            plan_.reserve(aggregations_->size());
-            for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            n_aggs_ = aggregations_->size();
+            plan_.reserve(n_aggs_);
+            for (std::size_t i = 0; i < n_aggs_; ++i) {
                 SlotPlan p;
                 p.func = (*aggregations_)[i].func;
                 if (p.func == ir::AggFunc::Count) {
@@ -7246,7 +7247,7 @@ class ChunkedAggregateOperator final : public Operator {
             cat_fast_path_ = all_cat && !group_entries.empty();
             initialized_ = true;
         } else {
-            for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            for (std::size_t i = 0; i < n_aggs_; ++i) {
                 if (plan_[i].func == ir::AggFunc::Count) {
                     continue;
                 }
@@ -7270,52 +7271,11 @@ class ChunkedAggregateOperator final : public Operator {
         return process_rows_generic(group_entries, agg_entries, rows);
     }
 
-    static void update_int_slot(AggSlot& slot, ir::AggFunc func, std::int64_t v) {
-        switch (func) {
-            case ir::AggFunc::Sum:
-                slot.int_value += v;
-                slot.has_value = true;
-                break;
-            case ir::AggFunc::Mean:
-                slot.sum += static_cast<double>(v);
-                slot.count += 1;
-                slot.has_value = true;
-                break;
-            case ir::AggFunc::Min:
-                slot.int_value = slot.has_value ? std::min(slot.int_value, v) : v;
-                slot.has_value = true;
-                break;
-            case ir::AggFunc::Max:
-                slot.int_value = slot.has_value ? std::max(slot.int_value, v) : v;
-                slot.has_value = true;
-                break;
-            default:
-                break;
-        }
-    }
-
-    static void update_double_slot(AggSlot& slot, ir::AggFunc func, double v) {
-        switch (func) {
-            case ir::AggFunc::Sum:
-                slot.double_value += v;
-                slot.has_value = true;
-                break;
-            case ir::AggFunc::Mean:
-                slot.sum += v;
-                slot.count += 1;
-                slot.has_value = true;
-                break;
-            case ir::AggFunc::Min:
-                slot.double_value = slot.has_value ? std::min(slot.double_value, v) : v;
-                slot.has_value = true;
-                break;
-            case ir::AggFunc::Max:
-                slot.double_value = slot.has_value ? std::max(slot.double_value, v) : v;
-                slot.has_value = true;
-                break;
-            default:
-                break;
-        }
+    auto alloc_group() -> std::uint32_t {
+        auto gid = static_cast<std::uint32_t>(n_groups_);
+        ++n_groups_;
+        flat_slots_.resize(n_groups_ * n_aggs_);
+        return gid;
     }
 
     auto process_rows_cat(const std::vector<const ColumnEntry*>& group_entries,
@@ -7327,84 +7287,173 @@ class ChunkedAggregateOperator final : public Operator {
             cat_cols.push_back(&std::get<Column<Categorical>>(*e->column));
         }
         const bool single_key = cat_cols.size() == 1;
+
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
         for (std::size_t row = 0; row < rows; ++row) {
-            std::size_t state_idx;
             if (single_key) {
                 const auto code = cat_cols[0]->code_at(row);
-                auto [it, inserted] = cat_index_.emplace(code, states_.size());
+                auto [it, inserted] = cat_index_.emplace(code, n_groups_);
                 if (inserted) {
                     cat_order_.push_back(code);
-                    states_.push_back(make_state());
+                    gids[row] = alloc_group();
+                } else {
+                    gids[row] = static_cast<std::uint32_t>(it->second);
                 }
-                state_idx = it->second;
             } else {
                 CatKey ck;
                 ck.codes.resize(cat_cols.size());
                 for (std::size_t c = 0; c < cat_cols.size(); ++c) {
                     ck.codes[c] = cat_cols[c]->code_at(row);
                 }
-                auto [it, inserted] = multi_cat_index_.emplace(std::move(ck), states_.size());
+                auto [it, inserted] = multi_cat_index_.emplace(std::move(ck), n_groups_);
                 if (inserted) {
                     multi_cat_order_.push_back(it->first);
-                    states_.push_back(make_state());
+                    gids[row] = alloc_group();
+                } else {
+                    gids[row] = static_cast<std::uint32_t>(it->second);
                 }
-                state_idx = it->second;
             }
-            update_agg_slots(states_[state_idx].slots.data(), agg_entries, row);
         }
+
+        accumulate_columns(gids, agg_entries, rows);
         return std::nullopt;
     }
 
     auto process_rows_generic(const std::vector<const ColumnEntry*>& group_entries,
                               const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
         for (std::size_t row = 0; row < rows; ++row) {
             Key key;
             key.values.reserve(group_entries.size());
             for (const auto* e : group_entries) {
                 key.values.push_back(scalar_from_column(*e->column, row));
             }
-            auto [it, inserted] = index_.emplace(std::move(key), states_.size());
+            auto [it, inserted] = index_.emplace(std::move(key), n_groups_);
             if (inserted) {
                 group_order_.push_back(it->first);
-                states_.push_back(make_state());
+                gids[row] = alloc_group();
+            } else {
+                gids[row] = static_cast<std::uint32_t>(it->second);
             }
-            update_agg_slots(states_[it->second].slots.data(), agg_entries, row);
         }
+
+        accumulate_columns(gids, agg_entries, rows);
         return std::nullopt;
     }
 
-    void update_agg_slots(AggSlot* slots, const std::vector<const ColumnEntry*>& agg_entries,
-                          std::size_t row) {
-        for (std::size_t i = 0; i < plan_.size(); ++i) {
-            AggSlot& slot = slots[i];
-            if (plan_[i].func == ir::AggFunc::Count) {
-                slot.count += 1;
-                continue;
-            }
-            const auto& entry = *agg_entries[i];
-            if (entry.validity.has_value() && !(*entry.validity)[row]) {
-                continue;
-            }
-            const ColumnValue& col = *entry.column;
-            if (plan_[i].kind == ExprType::Int) {
-                update_int_slot(slot, plan_[i].func, std::get<Column<std::int64_t>>(col)[row]);
-            } else {
-                update_double_slot(slot, plan_[i].func, std::get<Column<double>>(col)[row]);
-            }
-        }
-    }
+    void accumulate_columns(const std::uint32_t* gids,
+                            const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows) {
+        AggSlot* fs = flat_slots_.data();
+        for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
+            const auto slot_for = [&](std::uint32_t g) -> AggSlot& {
+                return fs[static_cast<std::size_t>(g) * n_aggs_ + agg_i];
+            };
 
-    auto make_state() const -> AggState {
-        AggState state;
-        state.slots.reserve(plan_.size());
-        for (const auto& p : plan_) {
-            AggSlot slot;
-            slot.func = p.func;
-            slot.kind = p.kind;
-            state.slots.push_back(slot);
+            if (plan_[agg_i].func == ir::AggFunc::Count) {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    slot_for(gids[row]).count++;
+                }
+                continue;
+            }
+
+            const auto& entry = *agg_entries[agg_i];
+            const bool has_nulls = entry.validity.has_value();
+
+            if (plan_[agg_i].kind == ExprType::Double) {
+                const double* data = std::get<Column<double>>(*entry.column).data();
+                switch (plan_[agg_i].func) {
+                    case ir::AggFunc::Sum:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            slot.double_value += data[row];
+                            slot.has_value = true;
+                        }
+                        break;
+                    case ir::AggFunc::Mean:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            slot.sum += data[row];
+                            slot.count++;
+                            slot.has_value = true;
+                        }
+                        break;
+                    case ir::AggFunc::Min:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            double v = data[row];
+                            slot.double_value = slot.has_value ? std::min(slot.double_value, v) : v;
+                            slot.has_value = true;
+                        }
+                        break;
+                    case ir::AggFunc::Max:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            double v = data[row];
+                            slot.double_value = slot.has_value ? std::max(slot.double_value, v) : v;
+                            slot.has_value = true;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            } else {
+                const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
+                switch (plan_[agg_i].func) {
+                    case ir::AggFunc::Sum:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            slot.int_value += data[row];
+                            slot.has_value = true;
+                        }
+                        break;
+                    case ir::AggFunc::Mean:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            slot.sum += static_cast<double>(data[row]);
+                            slot.count++;
+                            slot.has_value = true;
+                        }
+                        break;
+                    case ir::AggFunc::Min:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            std::int64_t v = data[row];
+                            slot.int_value = slot.has_value ? std::min(slot.int_value, v) : v;
+                            slot.has_value = true;
+                        }
+                        break;
+                    case ir::AggFunc::Max:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            std::int64_t v = data[row];
+                            slot.int_value = slot.has_value ? std::max(slot.int_value, v) : v;
+                            slot.has_value = true;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
         }
-        return state;
     }
 
     auto build_output_chunk() -> std::expected<std::optional<Chunk>, std::string> {
@@ -7454,13 +7503,10 @@ class ChunkedAggregateOperator final : public Operator {
             out.columns.push_back(std::move(entry));
         }
 
-        const std::size_t n_groups = states_.size();
         for (std::size_t i = 0; i < out.columns.size(); ++i) {
-            std::visit([&](auto& c) { c.reserve(n_groups); }, *out.columns[i].column);
+            std::visit([&](auto& c) { c.reserve(n_groups_); }, *out.columns[i].column);
         }
 
-        // Track per-agg validity for funcs that can emit null when an
-        // entire group had no non-null input values.
         std::vector<ValidityBitmap> agg_validity(aggregations_->size());
         std::vector<std::uint8_t> track_validity(aggregations_->size(), 0U);
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
@@ -7470,14 +7516,15 @@ class ChunkedAggregateOperator final : public Operator {
                 case ir::AggFunc::Min:
                 case ir::AggFunc::Max:
                     track_validity[i] = 1U;
-                    agg_validity[i].reserve(n_groups);
+                    agg_validity[i].reserve(n_groups_);
                     break;
                 default:
                     break;
             }
         }
 
-        for (std::size_t g = 0; g < n_groups; ++g) {
+        const AggSlot* fs = flat_slots_.data();
+        for (std::size_t g = 0; g < n_groups_; ++g) {
             if (cat_fast_path_) {
                 const bool single_key = group_by_->size() == 1;
                 if (single_key) {
@@ -7496,10 +7543,9 @@ class ChunkedAggregateOperator final : public Operator {
                     append_scalar(*out.columns[ci].column, key.values[ci]);
                 }
             }
-            const AggSlot* slots = states_[g].slots.data();
             for (std::size_t i = 0; i < aggregations_->size(); ++i) {
                 auto& column = *out.columns[group_by_->size() + i].column;
-                const AggSlot& slot = slots[i];
+                const AggSlot& slot = fs[g * n_aggs_ + i];
                 if (track_validity[i] != 0U) {
                     const bool valid =
                         plan_[i].func == ir::AggFunc::Mean ? slot.count > 0 : slot.has_value;
@@ -7575,8 +7621,16 @@ class ChunkedAggregateOperator final : public Operator {
 
     bool initialized_ = false;
     bool cat_fast_path_ = false;
+    std::size_t n_aggs_ = 0;
+    std::size_t n_groups_ = 0;
     std::vector<SlotPlan> plan_;
     std::vector<ColumnValue> group_templates_;
+
+    // Flat accumulator storage: n_groups_ × n_aggs_ contiguous AggSlots.
+    std::vector<AggSlot> flat_slots_;
+
+    // Reusable per-chunk gids buffer to avoid repeated heap allocations.
+    std::vector<std::uint32_t> gids_buf_;
 
     // Generic path (non-Categorical group keys).
     robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> index_;
@@ -7590,8 +7644,6 @@ class ChunkedAggregateOperator final : public Operator {
     // Multi-Categorical fast path.
     robin_hood::unordered_flat_map<CatKey, std::size_t, CatKeyHash> multi_cat_index_;
     std::vector<CatKey> multi_cat_order_;
-
-    std::vector<AggState> states_;
 };
 
 /// Planner seam: returns a pull-based operator that, when drained,

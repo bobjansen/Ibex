@@ -781,6 +781,7 @@ it looks for `csv.so` in the plugin search path and calls its
 | `csv`  | `read_csv`, `write_csv` | RFC 4180 CSV with type inference |
 | `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |
 | `parquet` | `read_parquet`, `write_parquet` | Apache Parquet via Arrow |
+| `adbc` | `read_adbc` | Optional ADBC/Arrow driver-manager source plugin |
 | `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
 
 Use `import` to load a plugin without explicit `extern fn` declarations:
@@ -813,6 +814,19 @@ also treated as null.
 single JSON object. Type inference follows the same priority as CSV: Int64,
 Float64, Bool, String. Missing keys and JSON `null` values produce null
 bitmaps.
+
+`adbc.so` is optional and built with `-DIBEX_BUILD_ADBC=ON` when an installed
+ADBC driver manager is available. It exposes:
+
+```ibex
+import "adbc";
+let df = read_adbc("adbc_driver_sqlite", "", "select 1 as x");
+```
+
+The 4th optional argument is a `;` or newline-separated `key=value` string.
+Prefix keys with `db.`, `conn.`, or `stmt.` to target database, connection, or
+statement options, and use `entrypoint=...` to override the driver entrypoint
+symbol.
 
 ### Writing your own plugin
 

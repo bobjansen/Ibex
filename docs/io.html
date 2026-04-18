@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ibex | CSV and Parquet I/O</title>
-  <meta name="description" content="CSV and Parquet input/output in Ibex: extern declarations, CSV options, schema hints, and round-trip examples." />
+  <title>Ibex | CSV, Parquet, and SQLite I/O</title>
+  <meta name="description" content="CSV, Parquet, and SQLite/ADBC input in Ibex: plugin imports, CSV options, schema hints, and practical examples." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -27,12 +27,12 @@
   <section class="hero">
     <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
     <p class="eyebrow">I/O Guide</p>
-    <h1>CSV and Parquet I/O</h1>
+    <h1>CSV, Parquet, and SQLite I/O</h1>
     <p class="lead">
       Ibex keeps file I/O in plugins, not in core syntax. That means CSV and
-      Parquet read/write functions are loaded with <code>import</code> and then
-      called like any other function in scripts, the REPL, notebooks, and
-      transpiled binaries.
+      Parquet read/write functions, plus SQLite reads through ADBC, are loaded
+      with <code>import</code> and then called like any other function in
+      scripts, the REPL, notebooks, and transpiled binaries.
     </p>
     <div class="cta-row">
       <a class="button primary" href="./index.html">Back to docs</a>
@@ -60,6 +60,14 @@
           preservation, and faster reloads than CSV.
         </p>
       </article>
+      <article class="card">
+        <h3>ADBC plugin</h3>
+        <p>
+          Read from SQLite and other ADBC-backed systems as Arrow streams.
+          This is the bridge from database result sets into Ibex chunked
+          execution without writing a bespoke reader per backend.
+        </p>
+      </article>
     </div>
   </section>
 
@@ -73,9 +81,14 @@
       </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
+<span class="kw">import</span> <span class="str">"adbc"</span>;
+<span class="kw">import</span> <span class="str">"adbc"</span>;
 
 <span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
-<span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);</code></pre>
+<span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
+<span class="kw">let</span> db_prices = <span class="fn-name">read_adbc</span>(<span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+                               <span class="str">"data/prices.sqlite"</span>,
+                               <span class="str">"select * from prices"</span>);</code></pre>
     </article>
   </section>
 
@@ -199,6 +212,80 @@
   </section>
 
   <section class="section">
+    <p class="section-label">SQLite via ADBC</p>
+    <h2>Read database tables and query results through the chunked path</h2>
+    <div>
+      <article class="card">
+        <h3>Minimal SQLite query</h3>
+        <p>
+          <code>read_adbc</code> takes a driver, a database URI or path, and a
+          SQL query. Passing the SQLite driver shared library path is the most
+          portable shape when you are using a conda environment.
+        </p>
+        <p>
+          When using <code>import "adbc"</code> in the REPL, start Ibex with
+          <code>--plugin-path ./build-release/tools</code> so it can find both
+          <code>adbc.ibex</code> and <code>adbc.so</code>.
+        </p>
+<pre><code><span class="kw">import</span> <span class="str">"adbc"</span>;
+
+<span class="kw">let</span> trades = <span class="fn-name">read_adbc</span>(
+    <span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"/tmp/trades.sqlite"</span>,
+    <span class="str">"select symbol, qty, px from trades order by qty desc"</span>
+);</code></pre>
+      </article>
+      <article class="card" style="margin-top:1rem;">
+        <h3>1M-row measurements showcase</h3>
+        <p>
+          The helper script below loads the first 1,000,000 rows of the 1BRC
+          benchmark file into SQLite. After that, the Ibex query shape is the
+          same aggregation you would run directly over CSV.
+        </p>
+<pre><code><span class="cm"># shell</span>
+python3 scripts/import_measurements_sqlite.py \
+    --input examples/measurements.txt \
+    --limit 1000000 \
+    --output /tmp/measurements_1m.sqlite
+
+LD_LIBRARY_PATH=~/envs/ibex/lib:$LD_LIBRARY_PATH \
+./build-release/tools/ibex --plugin-path ./build-release/tools
+
+<span class="cm"># ibex</span>
+<span class="kw">import</span> <span class="str">"adbc"</span>;
+
+<span class="kw">let</span> measurements = <span class="fn-name">read_adbc</span>(
+    <span class="str">"~/envs/ibex/lib/libadbc_driver_sqlite.so"</span>,
+    <span class="str">"/tmp/measurements_1m.sqlite"</span>,
+    <span class="str">"select station, temp from measurements"</span>
+);
+
+measurements[<span class="kw">select</span> {
+    min_temp = <span class="fn-name">min</span>(temp),
+    avg_temp = <span class="fn-name">mean</span>(temp),
+    max_temp = <span class="fn-name">max</span>(temp)
+}, <span class="kw">by</span> station, <span class="kw">order</span> station];</code></pre>
+      </article>
+    </div>
+
+    <article class="card" style="margin-top:1rem;">
+      <h3>Optional ADBC options string</h3>
+      <p>
+        The 4th argument is an optional <code>key=value</code> string separated
+        by semicolons or newlines. Prefix keys with <code>db.</code>,
+        <code>conn.</code>, or <code>stmt.</code> to target database,
+        connection, or statement options.
+      </p>
+<pre><code><span class="kw">let</span> remote = <span class="fn-name">read_adbc</span>(
+    <span class="str">"adbc_driver_postgresql"</span>,
+    <span class="str">"postgresql://user:pass@host/db"</span>,
+    <span class="str">"select * from trades where qty &gt; 0"</span>,
+    <span class="str">"conn.autocommit=true;stmt.query_timeout_ms=5000"</span>
+);</code></pre>
+    </article>
+  </section>
+
+  <section class="section">
     <p class="section-label">Round Trip</p>
     <h2>Typical batch pipeline</h2>
     <article class="card">
@@ -236,6 +323,14 @@
           <li>You control both ends of the pipeline.</li>
           <li>You want better typed persistence and faster reloads.</li>
           <li>You are caching a cleaned dataset for repeated analysis.</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3>Choose SQLite via ADBC when</h3>
+        <ul>
+          <li>You want to stage a database table or query result into Ibex.</li>
+          <li>You want SQL pushdown for filtering, joins, or pre-aggregation.</li>
+          <li>You want to bridge into other ADBC-backed systems later.</li>
         </ul>
       </article>
     </div>

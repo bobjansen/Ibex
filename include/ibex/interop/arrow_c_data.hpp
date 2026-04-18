@@ -10,6 +10,8 @@
 extern "C" {
 
 /// Arrow C Data Interface schema descriptor.
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
 struct ArrowSchema {
     const char* format;
     const char* name;
@@ -35,6 +37,19 @@ struct ArrowArray {
     void (*release)(ArrowArray*);
     void* private_data;
 };
+#endif
+
+/// Arrow C Stream Interface descriptor.
+#ifndef ARROW_C_STREAM_INTERFACE
+#define ARROW_C_STREAM_INTERFACE
+struct ArrowArrayStream {
+    int (*get_schema)(ArrowArrayStream*, ArrowSchema*);
+    int (*get_next)(ArrowArrayStream*, ArrowArray*);
+    const char* (*get_last_error)(ArrowArrayStream*);
+    void (*release)(ArrowArrayStream*);
+    void* private_data;
+};
+#endif
 
 }  // extern "C"
 
@@ -49,6 +64,9 @@ auto release_arrow_schema(ArrowSchema* schema) noexcept -> void;
 
 /// Release an Arrow array previously exported by Ibex.
 auto release_arrow_array(ArrowArray* array) noexcept -> void;
+
+/// Release an Arrow stream produced by an external system.
+auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void;
 
 /// Export a Table as an Arrow struct array plus schema.
 ///

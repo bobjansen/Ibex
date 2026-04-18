@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -21,6 +22,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "join_internal.hpp"
@@ -7582,6 +7584,14 @@ class ChunkedDistinctOperator final : public Operator {
                 return std::optional<Chunk>{table_to_chunk(std::move(t))};
             }
 
+            if (t.columns.size() == 1) {
+                auto out = process_single_column(std::move(t));
+                if (!out.has_value()) {
+                    continue;
+                }
+                return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+            }
+
             const std::size_t rows = t.rows();
             std::vector<std::size_t> idx;
             idx.reserve(rows);
@@ -7611,8 +7621,114 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
    private:
+    template <typename T>
+    auto gather_distinct_rows(Table t, robin_hood::unordered_flat_set<T>& seen,
+                              const Column<T>& col) -> std::optional<Table> {
+        const std::size_t rows = t.rows();
+        std::vector<std::size_t> idx;
+        idx.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (!seen.insert(col[row]).second) {
+                continue;
+            }
+            idx.push_back(row);
+        }
+        if (idx.empty()) {
+            return std::nullopt;
+        }
+        t.ordering.reset();
+        t.time_index.reset();
+        if (idx.size() == rows) {
+            return t;
+        }
+        return gather_rows(t, idx);
+    }
+
+    auto gather_distinct_string_rows(Table t, const Column<std::string>& col)
+        -> std::optional<Table> {
+        const std::size_t rows = t.rows();
+        std::vector<std::size_t> idx;
+        idx.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::string_view value = col[row];
+            if (seen_strings_.contains(value)) {
+                continue;
+            }
+            owned_strings_.emplace_back(value);
+            seen_strings_.insert(std::string_view{owned_strings_.back()});
+            idx.push_back(row);
+        }
+        if (idx.empty()) {
+            return std::nullopt;
+        }
+        t.ordering.reset();
+        t.time_index.reset();
+        if (idx.size() == rows) {
+            return t;
+        }
+        return gather_rows(t, idx);
+    }
+
+    auto gather_distinct_categorical_rows(Table t, const Column<Categorical>& col)
+        -> std::optional<Table> {
+        const std::size_t rows = t.rows();
+        std::vector<std::size_t> idx;
+        idx.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::string_view value = col[row];
+            if (seen_strings_.contains(value)) {
+                continue;
+            }
+            owned_strings_.emplace_back(value);
+            seen_strings_.insert(std::string_view{owned_strings_.back()});
+            idx.push_back(row);
+        }
+        if (idx.empty()) {
+            return std::nullopt;
+        }
+        t.ordering.reset();
+        t.time_index.reset();
+        if (idx.size() == rows) {
+            return t;
+        }
+        return gather_rows(t, idx);
+    }
+
+    auto process_single_column(Table t) -> std::optional<Table> {
+        const ColumnValue& column = *t.columns.front().column;
+        if (const auto* col = std::get_if<Column<std::int64_t>>(&column)) {
+            return gather_distinct_rows(std::move(t), seen_i64_, *col);
+        }
+        if (const auto* col = std::get_if<Column<double>>(&column)) {
+            return gather_distinct_rows(std::move(t), seen_f64_, *col);
+        }
+        if (const auto* col = std::get_if<Column<bool>>(&column)) {
+            return gather_distinct_rows(std::move(t), seen_bool_, *col);
+        }
+        if (const auto* col = std::get_if<Column<Date>>(&column)) {
+            return gather_distinct_rows(std::move(t), seen_date_, *col);
+        }
+        if (const auto* col = std::get_if<Column<Timestamp>>(&column)) {
+            return gather_distinct_rows(std::move(t), seen_timestamp_, *col);
+        }
+        if (const auto* col = std::get_if<Column<std::string>>(&column)) {
+            return gather_distinct_string_rows(std::move(t), *col);
+        }
+        if (const auto* col = std::get_if<Column<Categorical>>(&column)) {
+            return gather_distinct_categorical_rows(std::move(t), *col);
+        }
+        return std::nullopt;
+    }
+
     OperatorPtr child_;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
+    robin_hood::unordered_flat_set<std::int64_t> seen_i64_;
+    robin_hood::unordered_flat_set<double> seen_f64_;
+    robin_hood::unordered_flat_set<bool> seen_bool_;
+    robin_hood::unordered_flat_set<Date> seen_date_;
+    robin_hood::unordered_flat_set<Timestamp> seen_timestamp_;
+    std::unordered_set<std::string_view, StringViewHash, StringViewEq> seen_strings_;
+    std::deque<std::string> owned_strings_;
 };
 
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and

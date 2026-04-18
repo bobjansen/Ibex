@@ -1,5 +1,8 @@
+#include <ibex/ir/builder.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/pipeline.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -161,4 +164,96 @@ TEST_CASE("MaterializeOperator returns an empty Table when the source is empty")
     REQUIRE(result.has_value());
     REQUIRE(result.value().columns.empty());
     REQUIRE(result.value().rows() == 0);
+}
+
+// ── Pipeline planner tests ──────────────────────────────────────────────────
+
+TEST_CASE("classify_node returns correct roles", "[pipeline]") {
+    CHECK(runtime::classify_node(ir::NodeKind::Scan) == runtime::PipelineRole::Source);
+    CHECK(runtime::classify_node(ir::NodeKind::ExternCall) == runtime::PipelineRole::Source);
+    CHECK(runtime::classify_node(ir::NodeKind::Construct) == runtime::PipelineRole::Source);
+    CHECK(runtime::classify_node(ir::NodeKind::Filter) == runtime::PipelineRole::Passthrough);
+    CHECK(runtime::classify_node(ir::NodeKind::Project) == runtime::PipelineRole::Passthrough);
+    CHECK(runtime::classify_node(ir::NodeKind::Rename) == runtime::PipelineRole::Passthrough);
+    CHECK(runtime::classify_node(ir::NodeKind::Update) == runtime::PipelineRole::Passthrough);
+    CHECK(runtime::classify_node(ir::NodeKind::Aggregate) == runtime::PipelineRole::Breaker);
+    CHECK(runtime::classify_node(ir::NodeKind::Order) == runtime::PipelineRole::Breaker);
+    CHECK(runtime::classify_node(ir::NodeKind::Distinct) == runtime::PipelineRole::Breaker);
+    CHECK(runtime::classify_node(ir::NodeKind::Join) == runtime::PipelineRole::Breaker);
+}
+
+TEST_CASE("plan_pipelines: scan-only produces one segment", "[pipeline]") {
+    ir::Builder b;
+    auto scan = b.scan("prices");
+
+    auto plan = runtime::plan_pipelines(*scan);
+    REQUIRE(plan.segments.size() == 1);
+    REQUIRE(plan.segments[0].size() == 1);
+    REQUIRE(plan.segments[0].source()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("plan_pipelines: scan → filter → project is one segment", "[pipeline]") {
+    ir::Builder b;
+    auto scan = b.scan("prices");
+    auto filter = b.filter(ibex::ops::filter_cmp(ir::CompareOp::Gt, ibex::ops::filter_col("price"),
+                                                 ibex::ops::filter_dbl(100.0)));
+    filter->add_child(std::move(scan));
+    auto project = b.project({ir::ColumnRef{.name = "price"}});
+    project->add_child(std::move(filter));
+
+    auto plan = runtime::plan_pipelines(*project);
+    REQUIRE(plan.segments.size() == 1);
+    REQUIRE(plan.segments[0].size() == 3);
+    REQUIRE(plan.segments[0].source()->kind() == ir::NodeKind::Scan);
+    REQUIRE(plan.segments[0].nodes[1]->kind() == ir::NodeKind::Filter);
+    REQUIRE(plan.segments[0].sink()->kind() == ir::NodeKind::Project);
+}
+
+TEST_CASE("plan_pipelines: scan → filter → aggregate splits into two segments", "[pipeline]") {
+    ir::Builder b;
+    auto scan = b.scan("prices");
+    auto filter = b.filter(ibex::ops::filter_cmp(ir::CompareOp::Gt, ibex::ops::filter_col("price"),
+                                                 ibex::ops::filter_dbl(0.0)));
+    filter->add_child(std::move(scan));
+    auto agg = b.aggregate(
+        {ir::ColumnRef{.name = "symbol"}},
+        {ir::AggSpec{
+            .func = ir::AggFunc::Sum, .column = ir::ColumnRef{.name = "price"}, .alias = "total"}});
+    agg->add_child(std::move(filter));
+
+    auto plan = runtime::plan_pipelines(*agg);
+    REQUIRE(plan.segments.size() == 2);
+
+    // Segment 0: scan → filter (the upstream pipeline)
+    REQUIRE(plan.segments[0].size() == 2);
+    REQUIRE(plan.segments[0].source()->kind() == ir::NodeKind::Scan);
+    REQUIRE(plan.segments[0].sink()->kind() == ir::NodeKind::Filter);
+
+    // Segment 1: aggregate (the breaker)
+    REQUIRE(plan.segments[1].size() == 1);
+    REQUIRE(plan.segments[1].source()->kind() == ir::NodeKind::Aggregate);
+}
+
+TEST_CASE("plan_pipelines: scan → agg → order produces three segments", "[pipeline]") {
+    ir::Builder b;
+    auto scan = b.scan("prices");
+    auto agg = b.aggregate(
+        {ir::ColumnRef{.name = "symbol"}},
+        {ir::AggSpec{
+            .func = ir::AggFunc::Count, .column = ir::ColumnRef{.name = "symbol"}, .alias = "n"}});
+    agg->add_child(std::move(scan));
+    auto order = b.order({ir::OrderKey{.name = "symbol", .ascending = true}});
+    order->add_child(std::move(agg));
+
+    auto plan = runtime::plan_pipelines(*order);
+    REQUIRE(plan.segments.size() == 3);
+
+    REQUIRE(plan.segments[0].size() == 1);
+    REQUIRE(plan.segments[0].source()->kind() == ir::NodeKind::Scan);
+
+    REQUIRE(plan.segments[1].size() == 1);
+    REQUIRE(plan.segments[1].source()->kind() == ir::NodeKind::Aggregate);
+
+    REQUIRE(plan.segments[2].size() == 1);
+    REQUIRE(plan.segments[2].source()->kind() == ir::NodeKind::Order);
 }

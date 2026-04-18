@@ -1382,8 +1382,11 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
         expr.node);
 }
 
-auto filter_table(const Table& input, const ir::FilterExpr& predicate,
-                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+namespace {
+
+auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
+                       const std::vector<ir::ColumnRef>* project, const ScalarRegistry* scalars)
+    -> std::expected<Table, std::string> {
     const std::size_t n = input.rows();
 
     auto mask_result = compute_mask(predicate, input, scalars, n);
@@ -1411,11 +1414,31 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
         out_n += static_cast<std::size_t>(std::popcount(bits));
     }
 
-    // Gather: for each column, copy only the matching rows.
+    // Build output skeleton: either all input columns (no projection) or
+    // just the projected subset. `src_of_dst[d]` maps an output column index
+    // to its source index in `input.columns`.
     Table output;
-    output.columns.reserve(input.columns.size());
-    for (const auto& entry : input.columns) {
-        output.add_column(entry.name, make_empty_like(*entry.column));
+    std::vector<std::size_t> src_of_dst;
+    if (project == nullptr) {
+        output.columns.reserve(input.columns.size());
+        src_of_dst.reserve(input.columns.size());
+        for (std::size_t i = 0; i < input.columns.size(); ++i) {
+            const auto& entry = input.columns[i];
+            output.add_column(entry.name, make_empty_like(*entry.column));
+            src_of_dst.push_back(i);
+        }
+    } else {
+        output.columns.reserve(project->size());
+        src_of_dst.reserve(project->size());
+        for (const auto& col : *project) {
+            auto it = input.index.find(col.name);
+            if (it == input.index.end()) {
+                return std::unexpected("select column not found: " + col.name);
+            }
+            const auto& entry = input.columns[it->second];
+            output.add_column(entry.name, make_empty_like(*entry.column));
+            src_of_dst.push_back(it->second);
+        }
     }
 
     auto for_each_selected = [&](auto&& fn) {
@@ -1430,9 +1453,10 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
         }
     };
 
-    auto copy_column = [&](std::size_t col_idx) {
-        const auto& src_entry = input.columns[col_idx];
-        auto& dst_entry = output.columns[col_idx];
+    auto copy_column = [&](std::size_t dst_idx) {
+        const std::size_t src_idx = src_of_dst[dst_idx];
+        const auto& src_entry = input.columns[src_idx];
+        auto& dst_entry = output.columns[dst_idx];
         std::visit(
             [&](const auto& src) {
                 using ColT = std::decay_t<decltype(src)>;
@@ -1493,14 +1517,15 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
             *src_entry.column);
     };
 
-    for (std::size_t c = 0; c < input.columns.size(); ++c) {
+    for (std::size_t c = 0; c < output.columns.size(); ++c) {
         copy_column(c);
     }
 
     // Propagate validity bitmaps using the same selected row set.
-    for (std::size_t c = 0; c < input.columns.size(); ++c) {
-        if (input.columns[c].validity.has_value()) {
-            const auto& src_bm = *input.columns[c].validity;
+    for (std::size_t c = 0; c < output.columns.size(); ++c) {
+        const std::size_t src_idx = src_of_dst[c];
+        if (input.columns[src_idx].validity.has_value()) {
+            const auto& src_bm = *input.columns[src_idx].validity;
             ValidityBitmap dst_bm(out_n, false);
             std::size_t j = 0;
             for_each_selected([&](std::size_t si) { dst_bm.set(j++, src_bm[si]); });
@@ -1508,10 +1533,29 @@ auto filter_table(const Table& input, const ir::FilterExpr& predicate,
         }
     }
 
-    output.ordering = input.ordering;
-    output.time_index = input.time_index;
+    if (input.ordering.has_value() &&
+        (project == nullptr || ordering_keys_present(*input.ordering, output.index))) {
+        output.ordering = input.ordering;
+    }
+    if (input.time_index.has_value() &&
+        (project == nullptr || output.index.contains(*input.time_index))) {
+        output.time_index = input.time_index;
+    }
     normalize_time_index(output);
     return output;
+}
+
+}  // namespace
+
+auto filter_table(const Table& input, const ir::FilterExpr& predicate,
+                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+    return filter_table_impl(input, predicate, nullptr, scalars);
+}
+
+auto filter_project_table(const Table& input, const ir::FilterExpr& predicate,
+                          const std::vector<ir::ColumnRef>& columns, const ScalarRegistry* scalars)
+    -> std::expected<Table, std::string> {
+    return filter_table_impl(input, predicate, &columns, scalars);
 }
 
 auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns)
@@ -7120,6 +7164,45 @@ class ChunkedProjectOperator final : public Operator {
     const std::vector<ir::ColumnRef>* columns_;
 };
 
+/// Fused filter→project: computes the filter mask once per chunk and gathers
+/// only the projected columns. Skips materializing columns that the surrounding
+/// `select` would discard, which is the main win over running `Filter` then
+/// `Project` as independent chunked operators.
+class ChunkedFilterProjectOperator final : public Operator {
+   public:
+    ChunkedFilterProjectOperator(OperatorPtr child, const ir::FilterExpr* predicate,
+                                 const std::vector<ir::ColumnRef>* columns,
+                                 const ScalarRegistry* scalars)
+        : child_(std::move(child)), predicate_(predicate), columns_(columns), scalars_(scalars) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                return std::optional<Chunk>{};
+            }
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            auto out = filter_project_table(t, *predicate_, *columns_, scalars_);
+            if (!out.has_value()) {
+                return std::unexpected(std::move(out.error()));
+            }
+            if (!out->columns.empty() && out->rows() == 0) {
+                continue;
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
+        }
+    }
+
+   private:
+    OperatorPtr child_;
+    const ir::FilterExpr* predicate_;
+    const std::vector<ir::ColumnRef>* columns_;
+    const ScalarRegistry* scalars_;
+};
+
 class ChunkedRenameOperator final : public Operator {
    public:
     ChunkedRenameOperator(OperatorPtr child, const std::vector<ir::RenameSpec>* renames)
@@ -9248,6 +9331,22 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& project = static_cast<const ir::ProjectNode&>(node);
         if (project.children().empty()) {
             return std::unexpected("project node missing child");
+        }
+        const ir::Node& pchild = *project.children().front();
+        // Fuse Project(Filter(x)) into a single operator so we only gather the
+        // projected columns. `plan_pipelines()` classifies both as Passthrough.
+        if (pchild.kind() == ir::NodeKind::Filter) {
+            const auto& filter = static_cast<const ir::FilterNode&>(pchild);
+            if (filter.children().empty()) {
+                return std::unexpected("filter node missing child");
+            }
+            auto grandchild_op =
+                build_operator(*filter.children().front(), registry, scalars, externs, model_out);
+            if (!grandchild_op.has_value()) {
+                return std::unexpected(std::move(grandchild_op.error()));
+            }
+            return std::make_unique<ChunkedFilterProjectOperator>(
+                std::move(grandchild_op.value()), &filter.predicate(), &project.columns(), scalars);
         }
         auto child_op =
             build_operator(*project.children().front(), registry, scalars, externs, model_out);

@@ -10,7 +10,7 @@ namespace ibex::runtime {
 /// How a node participates in a chunk pipeline.
 enum class PipelineRole : std::uint8_t {
     Source,       ///< Produces chunks (Scan, ExternCall, Construct).
-    Passthrough,  ///< Processes chunks 1:1 without materializing (Filter, Project, Rename, Update).
+    Passthrough,  ///< Processes chunks 1:1 without materializing (Filter, Project, Rename).
     Breaker,      ///< Must materialize input before producing output (Aggregate, Order, Join, …).
 };
 

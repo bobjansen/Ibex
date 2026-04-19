@@ -33,6 +33,7 @@ option(IBEX_BUILD_EXAMPLES "Build examples" ON)
 option(IBEX_BUILD_PYTHON_BRIDGE "Build the experimental pyarrow-backed Python bridge" ON)
 option(IBEX_BUILD_PARQUET "Build the bundled Parquet plugin" ON)
 option(IBEX_BUILD_ADBC "Build the bundled ADBC plugin" OFF)
+option(IBEX_BUILD_KAFKA "Build the bundled Kafka plugin" OFF)
 set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
     "Directory for bundled Ibex plugins (csv/gen_tf_data)")
 
@@ -82,6 +83,9 @@ if(IBEX_BUILD_PARQUET)
 endif()
 if(IBEX_BUILD_ADBC)
     add_subdirectory(libs/adbc)
+endif()
+if(IBEX_BUILD_KAFKA)
+    add_subdirectory(libs/kafka)
 endif()
 
 # Tools

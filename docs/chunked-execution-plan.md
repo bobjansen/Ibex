@@ -24,6 +24,8 @@ finding fusion opportunities that actually move the benchmark.
 | `Project`   | `ChunkedProjectOperator` — per-chunk column selection |
 | `Rename`    | `ChunkedRenameOperator` — per-chunk metadata edit |
 | `Distinct`  | `ChunkedDistinctOperator` — streaming hash set; numeric fast path (robin_hood), string fast path, single-column fast path, multi-column key fallback |
+| `Order`     | `ChunkedOrderOperator` — buffer + validate sortedness; re-emit chunks if sorted, fall back to `order_table` on concat otherwise |
+| `AsTimeframe` | `ChunkedAsTimeframeOperator` — buffer + validate; re-emit chunks with `time_index` stamped if sorted, fall back to concat + `order_table` (SPEC §9.1) |
 | `Update`    | `ChunkedUpdateOperator` — row-local field expressions, no tuple_fields, no group_by |
 | `Aggregate` | `ChunkedAggregateOperator` — streaming for the supported subset (Count, Sum, Min, Max, Mean on numeric) |
 | `Head`      | `ChunkedHeadOperator` — global and grouped, short-circuits child on reach; `count == 0` early-exit |
@@ -52,7 +54,8 @@ full `Table` before processing.
 
 | Node Kind | Reason still materializing |
 |-----------|----------------------------|
-| `Order` | Full sort requires all rows |
+| `Order` (unsorted input) | Buffer all chunks, fall back to `order_table` on concat |
+| `AsTimeframe` (unsorted input) | Buffer all chunks, fall back to concat + `order_table` (SPEC §9.1 requires sorting if unsorted) |
 | `Tail` (non-`Order` child) | Needs last n rows; no streaming ring-buffer operator yet |
 | `Update` (non-row-local, or with tuple_fields or group_by) | Cross-row expressions (lag, rolling, cum, rng, fill, rep) or whole-table tuple sources |
 | `Columns` | Produces a one-row schema table; trivial but not streamed |
@@ -61,33 +64,25 @@ full `Table` before processing.
 | `Transpose` | Shape transform on full table |
 | `Matmul` | Binary whole-table operation |
 | `Resample`, `Window` | Time-window operations materialize to sort + bucket |
-| `AsTimeframe` | Currently always sorts by timestamp, even when input is already sorted |
 | `Model` | Fit consumes full input |
 
 ## Immediate Priorities
-
-### Streaming `AsTimeframe` on pre-sorted input
-
-`AsTimeframe` today always sorts by the timestamp column and marks the result
-as a TimeFrame. When the source is already sorted (extremely common for
-ingested time-series), the sort is wasted work and the operator can be a
-metadata-only passthrough that stamps `time_index` on each chunk.
-
-Mechanism mirrors the pre-sort early-exit already used by `order_table`.
-This unblocks streaming for any TimeFrame query (currently every TF query
-materializes).
 
 ### `Tail(Filter(x))` pushdown
 
 Analogue of `Head(Filter(x))`: keep a ring buffer of the last n matches per
 chunk so we don't materialize all matches only to discard all but the last n.
 
-### Streaming `Order` for bounded cases
+### Order pushed later in the pipeline
 
-Full ordering remains materializing, but two important shapes already stream
-via `ChunkedOrderedLimitOperator` (`Head(Order)` and `Tail(Order)`). The
-remaining win here is when the input is already sorted on the order keys —
-detect and passthrough.
+`Order` and the unsorted path of `AsTimeframe` still materialize (the spec
+forces it for `AsTimeframe` and global ordering inherently requires all
+rows). The remaining win is structural: move `Order` nodes as late as
+possible in the plan so the materialization operates on a smaller,
+already-projected, already-filtered table. A planner pass that sinks `Order`
+below `Head`/`Tail` is already in place via `ChunkedOrderedLimitOperator`;
+extending that to sink `Order` past `Project`/`Filter` when safe is the
+natural follow-on.
 
 ## Later Phases
 
@@ -145,4 +140,4 @@ Benchmark gates compare against `build-release/` only, since debug runs
 - materialization points are intentional, named, and measurable — **done**
 - external readers can stream chunks into native operators — partial
   (`read_csv` streams; source contract not yet documented)
-- passthrough pipelines can execute without intermediate chunk wrappers — **done** for the shapes above; ongoing for AsTimeframe and Tail(Filter)
+- passthrough pipelines can execute without intermediate chunk wrappers — **done** for the shapes above (including Order and AsTimeframe on sorted input); ongoing for Tail(Filter)

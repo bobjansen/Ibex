@@ -7918,6 +7918,248 @@ class ChunkedOrderOperator final : public Operator {
     bool still_sorted_ = true;
 };
 
+/// Chunk-preserving `as_timeframe`: buffers incoming chunks, promotes an
+/// `Int` time column to `Timestamp` per chunk, validates ascending sortedness
+/// on the fly, and either re-emits the buffered chunks with `time_index`
+/// stamped (fast path: no sort) or falls back to concat + `order_table`
+/// (slow path: SPEC §9.1 says as_timeframe must sort if unsorted, so the
+/// full table materialization is unavoidable for that branch).
+///
+/// The win is real only when the input is already sorted on the time column,
+/// which is the overwhelmingly common TimeFrame shape (CSV/parquet ingest,
+/// streaming sources). For those we skip the sort entirely and let downstream
+/// operators see a chunked TimeFrame.
+class ChunkedAsTimeframeOperator final : public Operator {
+   public:
+    ChunkedAsTimeframeOperator(OperatorPtr child, std::string column)
+        : child_(std::move(child)), column_(std::move(column)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (mode_ == Mode::Ingest) {
+            auto drained = drain();
+            if (!drained.has_value()) {
+                return std::unexpected(std::move(drained.error()));
+            }
+        }
+        if (mode_ == Mode::EmitBuffered) {
+            if (emit_idx_ >= buffered_.size()) {
+                mode_ = Mode::Done;
+                return std::optional<Chunk>{};
+            }
+            Chunk out = std::move(buffered_[emit_idx_++]);
+            out.time_index = column_;
+            out.ordering = std::vector<ir::OrderKey>{{.name = column_, .ascending = true}};
+            return std::optional<Chunk>{std::move(out)};
+        }
+        if (mode_ == Mode::EmitSorted) {
+            mode_ = Mode::Done;
+            if (!sorted_result_.has_value()) {
+                return std::optional<Chunk>{};
+            }
+            Chunk out = table_to_chunk(std::move(*sorted_result_));
+            sorted_result_.reset();
+            return std::optional<Chunk>{std::move(out)};
+        }
+        return std::optional<Chunk>{};
+    }
+
+   private:
+    enum class Mode : std::uint8_t { Ingest, EmitBuffered, EmitSorted, Done };
+
+    auto drain() -> std::expected<void, std::string> {
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                break;
+            }
+            Chunk chunk = std::move(*chunk_res.value());
+            if (chunk.rows() == 0) {
+                continue;
+            }
+
+            // Locate the time column in this chunk.
+            std::size_t col_idx = chunk.columns.size();
+            for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
+                if (chunk.columns[i].name == column_) {
+                    col_idx = i;
+                    break;
+                }
+            }
+            if (col_idx == chunk.columns.size()) {
+                return std::unexpected("as_timeframe: column '" + column_ + "' not found");
+            }
+
+            // On the first chunk, decide whether Int promotion is needed and
+            // reject invalid types.
+            if (!type_checked_) {
+                const auto& col = *chunk.columns[col_idx].column;
+                if (std::holds_alternative<Column<std::int64_t>>(col)) {
+                    needs_promotion_ = true;
+                } else if (!std::holds_alternative<Column<Timestamp>>(col) &&
+                           !std::holds_alternative<Column<Date>>(col)) {
+                    return std::unexpected("as_timeframe: column '" + column_ +
+                                           "' must be Timestamp, Date, or Int");
+                }
+                type_checked_ = true;
+            }
+
+            // Promote Int → Timestamp per chunk (cheap — same row count, same
+            // layout — and keeps downstream operators seeing Timestamp).
+            if (needs_promotion_) {
+                const auto& ints = std::get<Column<std::int64_t>>(*chunk.columns[col_idx].column);
+                Column<Timestamp> ts_col;
+                ts_col.reserve(ints.size());
+                for (auto v : ints) {
+                    ts_col.push_back(Timestamp{v});
+                }
+                chunk.columns[col_idx].column = std::make_shared<ColumnValue>(std::move(ts_col));
+            }
+
+            if (still_sorted_) {
+                auto ok = validate_chunk(chunk, col_idx);
+                if (!ok.has_value()) {
+                    return std::unexpected(std::move(ok.error()));
+                }
+                if (!*ok) {
+                    still_sorted_ = false;
+                }
+            }
+
+            buffered_.push_back(std::move(chunk));
+        }
+
+        if (buffered_.empty()) {
+            mode_ = Mode::Done;
+            return {};
+        }
+        if (still_sorted_) {
+            mode_ = Mode::EmitBuffered;
+            return {};
+        }
+
+        // Fallback: concat all buffered chunks and run the full sort. SPEC
+        // §9.1 requires as_timeframe to sort its input when unsorted, so this
+        // materialization is intentional.
+        Table concat;
+        Chunk first = std::move(buffered_.front());
+        concat.columns = std::move(first.columns);
+        for (std::size_t i = 0; i < concat.columns.size(); ++i) {
+            concat.index[concat.columns[i].name] = i;
+        }
+        const std::size_t n_cols = concat.columns.size();
+        for (std::size_t bi = 1; bi < buffered_.size(); ++bi) {
+            Chunk& chunk = buffered_[bi];
+            if (chunk.columns.size() != n_cols) {
+                return std::unexpected("as_timeframe: chunk schema mismatch (column count)");
+            }
+            for (std::size_t i = 0; i < n_cols; ++i) {
+                if (chunk.columns[i].name != concat.columns[i].name) {
+                    return std::unexpected("as_timeframe: chunk schema mismatch (column name)");
+                }
+                if (chunk.columns[i].column->index() != concat.columns[i].column->index()) {
+                    return std::unexpected("as_timeframe: chunk schema mismatch (column type)");
+                }
+                std::visit(
+                    [&](auto& dst) {
+                        using Col = std::decay_t<decltype(dst)>;
+                        auto& src = std::get<Col>(*chunk.columns[i].column);
+                        dst.reserve(dst.size() + src.size());
+                        if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                            for (std::size_t r = 0; r < src.size(); ++r) {
+                                dst.push_code(src.code_at(r));
+                            }
+                        } else {
+                            for (std::size_t r = 0; r < src.size(); ++r) {
+                                dst.push_back(src[r]);
+                            }
+                        }
+                    },
+                    *concat.columns[i].column);
+            }
+        }
+        buffered_.clear();
+
+        auto sorted = order_table(concat, {{.name = column_, .ascending = true}});
+        if (!sorted.has_value()) {
+            return std::unexpected(std::move(sorted.error()));
+        }
+        sorted->time_index = column_;
+        normalize_time_index(*sorted);
+        sorted_result_ = std::move(*sorted);
+        mode_ = Mode::EmitSorted;
+        return {};
+    }
+
+    // Returns true if the chunk's time column is ascending internally and its
+    // first row is ≥ the last row of the previously buffered chunk. Typed
+    // dispatch mirrors ChunkedOrderOperator's single-key fast path — the whole
+    // point of this operator is to avoid a big sort, so the validation must
+    // itself not be expensive.
+    auto validate_chunk(const Chunk& chunk, std::size_t col_idx)
+        -> std::expected<bool, std::string> {
+        const std::size_t rows = chunk.rows();
+        if (rows == 0) {
+            return true;
+        }
+        const auto& col_var = *chunk.columns[col_idx].column;
+        bool sorted = true;
+        bool handled = false;
+        std::visit(
+            [&](const auto& col) {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+                    handled = true;
+                    if (prev_last_nanos_.has_value() && col[0].nanos < *prev_last_nanos_) {
+                        sorted = false;
+                        return;
+                    }
+                    for (std::size_t i = 1; i < rows; ++i) {
+                        if (col[i].nanos < col[i - 1].nanos) {
+                            sorted = false;
+                            return;
+                        }
+                    }
+                    prev_last_nanos_ = col[rows - 1].nanos;
+                } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
+                    handled = true;
+                    if (prev_last_days_.has_value() && col[0].days < *prev_last_days_) {
+                        sorted = false;
+                        return;
+                    }
+                    for (std::size_t i = 1; i < rows; ++i) {
+                        if (col[i].days < col[i - 1].days) {
+                            sorted = false;
+                            return;
+                        }
+                    }
+                    prev_last_days_ = col[rows - 1].days;
+                }
+            },
+            col_var);
+        if (!handled) {
+            // Type already validated on first chunk; downstream schema
+            // guarantees stability. Reaching here means inconsistent schema.
+            return std::unexpected("as_timeframe: unexpected time column type");
+        }
+        return sorted;
+    }
+
+    OperatorPtr child_;
+    std::string column_;
+    Mode mode_ = Mode::Ingest;
+    std::vector<Chunk> buffered_;
+    std::optional<std::int64_t> prev_last_nanos_;
+    std::optional<std::int32_t> prev_last_days_;
+    std::size_t emit_idx_ = 0;
+    std::optional<Table> sorted_result_;
+    bool type_checked_ = false;
+    bool needs_promotion_ = false;
+    bool still_sorted_ = true;
+};
+
 class ChunkedOrderedLimitOperator final : public Operator {
    public:
     enum class KeepMode { First, Last };
@@ -10352,38 +10594,13 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (node.children().empty()) {
             return std::unexpected("as_timeframe node missing child");
         }
-        return build_unary_materializing_operator(
-            *node.children().front(), registry, scalars, externs, model_out,
-            [&](Table t) -> std::expected<Table, std::string> {
-                const auto* col = t.find(atf.column());
-                if (col == nullptr) {
-                    return std::unexpected("as_timeframe: column '" + atf.column() + "' not found");
-                }
-                if (const auto* int_col = std::get_if<Column<std::int64_t>>(col)) {
-                    Column<Timestamp> ts_col;
-                    ts_col.reserve(int_col->size());
-                    for (auto v : *int_col)
-                        ts_col.push_back(Timestamp{v});
-                    auto idx_it = t.index.find(atf.column());
-                    if (idx_it != t.index.end()) {
-                        t.columns[idx_it->second].column =
-                            std::make_shared<ColumnValue>(std::move(ts_col));
-                        col = t.find(atf.column());
-                    }
-                }
-                if (!std::holds_alternative<Column<Timestamp>>(*col) &&
-                    !std::holds_alternative<Column<Date>>(*col)) {
-                    return std::unexpected("as_timeframe: column '" + atf.column() +
-                                           "' must be Timestamp, Date, or Int");
-                }
-                auto sorted = order_table(t, {{.name = atf.column(), .ascending = true}});
-                if (!sorted.has_value()) {
-                    return std::unexpected(std::move(sorted.error()));
-                }
-                sorted->time_index = atf.column();
-                normalize_time_index(*sorted);
-                return sorted;
-            });
+        auto child_op =
+            build_operator(*node.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedAsTimeframeOperator>(std::move(child_op.value()),
+                                                            atf.column());
     }
 
     if (node.kind() == ir::NodeKind::Model) {

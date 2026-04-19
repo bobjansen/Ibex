@@ -2,293 +2,147 @@
 
 ## Current Status
 
-Ibex now has a real pull-based chunk pipeline, not just scaffolding:
+Ibex runs every table query through a pull-based chunk pipeline. `build_operator()`
+has an explicit branch for every `ir::NodeKind` that can appear at a table
+position; the final fall-through to `interpret_node()` is defensive and only
+reachable for node kinds that are not yet classified.
 
-- `Operator`, `TableSourceOperator`, and `MaterializeOperator` exist as the
-  execution substrate.
-- `build_operator()` can execute a query through that substrate and only falls
-  back to `interpret_node()` where the chunked path is missing or not yet worth
-  specializing.
-- Native chunk-preserving operators exist for:
-  - `Scan` via `TableSourceOperator`
-  - `ExternCall` via `chunked_table_func`
-  - `Filter`
-  - `Project`
-  - `Rename`
-  - `Aggregate` for the current streamable subset (`Count`, `Sum`, `Min`,
-    `Max`, `Mean` on numeric inputs)
-- `plan_pipelines()` exists and already classifies nodes into `Source`,
-  `Passthrough`, and `Breaker` segments.
-
-That means the first milestone is no longer “make chunked execution exist”.
-The next milestones are about removing avoidable materialization points,
-hardening semantics, and exploiting the pipeline plan for fusion.
+The substrate (`Operator`, `TableSourceOperator`, `MaterializeOperator`,
+`chunk_to_table` / `table_to_chunk`, `plan_pipelines()`) is stable. What the
+roadmap tracks now is removing the remaining materialization boundaries and
+finding fusion opportunities that actually move the benchmark.
 
 ## Coverage Today
 
-### Native chunked path
+### Native chunked path (no whole-table materialization)
 
-| Node Kind   | Current handling |
-|-------------|------------------|
-| `Scan`      | Source |
-| `ExternCall`| Source when `chunked_table_func` is registered |
-| `Filter`    | Per-chunk passthrough |
-| `Project`   | Per-chunk passthrough |
-| `Rename`    | Per-chunk passthrough |
-| `Aggregate` | Streaming implementation for the supported subset |
+| Node Kind   | Handling |
+|-------------|----------|
+| `Scan`      | `TableSourceOperator` |
+| `ExternCall`| `TableSourceOperator` from `chunked_table_func` when registered |
+| `Filter`    | `ChunkedFilterOperator` — per-chunk mask + gather |
+| `Project`   | `ChunkedProjectOperator` — per-chunk column selection |
+| `Rename`    | `ChunkedRenameOperator` — per-chunk metadata edit |
+| `Distinct`  | `ChunkedDistinctOperator` — streaming hash set; numeric fast path (robin_hood), string fast path, single-column fast path, multi-column key fallback |
+| `Update`    | `ChunkedUpdateOperator` — row-local field expressions, no tuple_fields, no group_by |
+| `Aggregate` | `ChunkedAggregateOperator` — streaming for the supported subset (Count, Sum, Min, Max, Mean on numeric) |
+| `Head`      | `ChunkedHeadOperator` — global and grouped, short-circuits child on reach; `count == 0` early-exit |
+| `Tail`      | Streaming only when paired with `Order` (`ChunkedOrderedLimitOperator`); otherwise materializing |
+| `Join`      | `ChunkedInnerJoinOperator`, `ChunkedSemiAntiJoinOperator` for the supported shapes |
+| `Construct` | Materialize once via `interpret_node`, wrap as source |
+| `Stream`    | Materialize once via `interpret_node`, wrap as source |
+| `Program`   | Evaluate preamble, then delegate to child's operator |
+
+### Fused chunked operators
+
+These replace a multi-node subtree with a single operator so intermediate
+chunks aren't materialized.
+
+| Pattern | Operator | Payoff |
+|---------|----------|--------|
+| `Project(Filter(x))` | `ChunkedFilterProjectOperator` | Per-chunk gather touches only projected columns |
+| `Project(Update(Filter(x)))` (row-local update, empty tuple_fields/group_by) | `ChunkedFilterUpdateProjectOperator` | Gather set = columns read by update ∪ projected originals not produced by update; skips columns the select drops |
+| `Head(Filter(x))` (empty group_by) | `ChunkedFilterHeadOperator` | Pushes `row_limit` into the filter gather so the per-chunk compaction stops at n surviving rows; child's `next()` stops once n reached |
+| `Head(Order(x))`, `Tail(Order(x))` | `ChunkedOrderedLimitOperator` | Partial sort / bounded heap instead of full sort + slice |
 
 ### Chunk-aware but materializing
 
-These nodes already run inside `build_operator()`, but they still drain their
-child operator into a full `Table` before continuing:
+These run inside the operator pipeline but still drain their child into a
+full `Table` before processing.
 
-| Node Kind | Current handling |
-|-----------|------------------|
-| `Distinct` | materialize child -> `distinct_table` |
-| `Order` | materialize child -> `order_table` |
-| `Head` | materialize child -> `head_table` |
-| `Tail` | materialize child -> `tail_table` |
-| `Columns` | materialize child -> `columns_table` |
-| `Melt` | materialize child -> `melt_table` |
-| `Dcast` | materialize child -> `dcast_table` |
-| `Cov` | materialize child -> `cov_table` |
-| `Corr` | materialize child -> `corr_table` |
-| `Transpose` | materialize child -> `transpose_table` |
-| `Update` | materialize child -> `update_table` |
-| `Resample` | materialize child -> `resample_table` |
-| `Window` | materialize child -> `windowed_update_table` |
-| `AsTimeframe` | materialize child -> sort + mark time index |
-| `Join` | materialize both children -> `join_table_impl` |
-| `Matmul` | materialize both children -> `matmul_table` |
-| `Model` | materialize child -> `fit_model` |
+| Node Kind | Reason still materializing |
+|-----------|----------------------------|
+| `Order` | Full sort requires all rows |
+| `Tail` (non-`Order` child) | Needs last n rows; no streaming ring-buffer operator yet |
+| `Update` (non-row-local, or with tuple_fields or group_by) | Cross-row expressions (lag, rolling, cum, rng, fill, rep) or whole-table tuple sources |
+| `Columns` | Produces a one-row schema table; trivial but not streamed |
+| `Melt`, `Dcast` | Reshape requires full input |
+| `Cov`, `Corr` | Whole-table statistics |
+| `Transpose` | Shape transform on full table |
+| `Matmul` | Binary whole-table operation |
+| `Resample`, `Window` | Time-window operations materialize to sort + bucket |
+| `AsTimeframe` | Currently always sorts by timestamp, even when input is already sorted |
+| `Model` | Fit consumes full input |
 
-### Full-table fallback
+## Immediate Priorities
 
-These still fall through to `interpret_node()` and are wrapped back into a
-`TableSourceOperator`:
+### Streaming `AsTimeframe` on pre-sorted input
 
-| Node Kind | Current handling |
-|-----------|------------------|
-| `Construct` | full-table fallback |
-| `Stream` | full-table fallback |
-| `Program` | full-table fallback |
+`AsTimeframe` today always sorts by the timestamp column and marks the result
+as a TimeFrame. When the source is already sorted (extremely common for
+ingested time-series), the sort is wasted work and the operator can be a
+metadata-only passthrough that stamps `time_index` on each chunk.
 
-## Immediate Goal
+Mechanism mirrors the pre-sort early-exit already used by `order_table`.
+This unblocks streaming for any TimeFrame query (currently every TF query
+materializes).
 
-Keep the chunked path as the default execution substrate, even when an operator
-must temporarily materialize. That gives us one place to add instrumentation,
-fusion, chunk sizing, and external streaming sources.
+### `Tail(Filter(x))` pushdown
 
-Concretely, this means:
+Analogue of `Head(Filter(x))`: keep a ring buffer of the last n matches per
+chunk so we don't materialize all matches only to discard all but the last n.
 
-1. Finish coverage in `build_operator()` for every node kind.
-2. Centralize the “materialize child, run table function, re-wrap as source”
-   pattern so breaker implementations stay small and consistent.
-3. Narrow the set of nodes that still need `interpret_node()` fallback.
+### Streaming `Order` for bounded cases
 
-## Phase 1: Finish `build_operator()` Coverage
+Full ordering remains materializing, but two important shapes already stream
+via `ChunkedOrderedLimitOperator` (`Head(Order)` and `Tail(Order)`). The
+remaining win here is when the input is already sorted on the order keys —
+detect and passthrough.
 
-### 1.1 Eliminate the remaining fall-through nodes
+## Later Phases
 
-Add explicit `build_operator()` branches for:
+### External streaming sources
 
-- `Construct`
-- `Stream`
-- `Program`
+`ExternRegistry::register_chunked_table(...)` is the runtime entrypoint. The
+source contract is not yet documented as a first-class API. Before we chase
+ADBC or similar adapters, write down:
 
-These can still use full-table logic initially. The important part is that
-coverage becomes explicit rather than hiding in the final fallback branch.
+- stable schema across chunks
+- ownership and lifetime rules
+- categorical dictionary expectations
+- EOF and error signaling
 
-That gives three benefits:
+and add tests that drive a multi-chunk extern source through native operators.
 
-- clearer error handling per node kind
-- a single audit point for chunked-execution coverage
-- easier profiling later, because every materialization boundary is named
+Once stable, an `adbc` plugin reads Arrow `RecordBatch` objects as Ibex
+chunks with zero-copy where layouts match — path to PostgreSQL, DuckDB,
+Snowflake, BigQuery.
 
-### 1.2 Factor the materialize-wrapper helper
+### Remaining fusion opportunities
 
-`build_operator()` currently repeats the same pattern for many breaker nodes:
+These are tentative; only pursue once a benchmark identifies them as
+actually slow.
 
-- recursively build the child operator
-- materialize it with `MaterializeOperator`
-- call a table-level implementation
-- re-wrap the result in `TableSourceOperator`
+- `Scan → Filter → Rename → Project` (listed in the original plan; cheap
+  to implement once we see it shows up)
+- Row-limit pushdown through `Project` into `Filter` when `Head` sits on
+  top of a fused `Filter→Project`
 
-Extract helpers along these lines:
+### Materialization hardening
 
-- `run_unary_breaker(child, fn)`
-- `run_binary_breaker(left, right, fn)`
-
-The helpers should own the common error plumbing and make it obvious which
-nodes are:
-
-- native streaming
-- chunk-aware but materializing
-- still on full-table fallback
-
-### 1.3 Tighten node-role invariants
-
-`classify_node()` and `build_operator()` should stay aligned.
-
-Add a small invariant test layer so when a new `ir::NodeKind` is introduced,
-we fail fast unless:
-
-- it is classified in `classify_node()`
-- it has an explicit `build_operator()` strategy
-
-## Phase 2: Harden the Existing Native Operators
-
-Before adding more native operators, the current ones need stronger semantics
-and tests.
-
-### 2.1 Filter / project / rename correctness
-
-Add tests for:
-
-- zero-row chunks being skipped correctly by `Filter`
-- metadata preservation across passthrough operators
-- rename failures surfacing deterministically
-- mixed multi-chunk inputs, not just single-chunk tables
-
-### 2.2 Aggregate correctness envelope
-
-The streaming aggregate is the most important native breaker today. Expand
-coverage around:
-
-- nullable aggregate inputs
-- empty input
-- grouped and ungrouped aggregations
-- categorical group keys across many chunks
-- rejection paths for unsupported aggregate shapes
-
-This is also the point to document the exact supported subset in code comments
-and user-facing docs once the behavior is stable.
-
-### 2.3 Materialization constraints
-
-`MaterializeOperator` currently assumes:
-
-- identical schema across chunks
-- shared categorical dictionaries across chunks
-- no multi-chunk validity bitmap support
-
-Those assumptions are acceptable for now, but they should be explicit
-engineering constraints, not accidental behavior. The roadmap should treat
-them as tracked limitations to remove deliberately.
-
-## Phase 3: Native Streaming Breakers With Clear Payoff
-
-Not every breaker deserves a chunk-native implementation. Prioritize the ones
-that either unlock major memory wins or enable obvious pipeline continuation.
-
-### Good candidates
-
-- `Head`
-  - global `head(n)` can stop upstream early
-  - grouped `head` is more complex but still bounded
-- `Distinct`
-  - streaming hash-set implementation is conceptually close to aggregate
-- `Update`
-  - only for the subset of row-local expressions that do not require whole-table
-    context
-- `AsTimeframe`
-  - only if we can separate “mark time index” from “sort to enforce ordering”
-
-### Poor near-term candidates
-
-- `Order`
-- `Join`
-- `Window`
-- `Resample`
-- `Matmul`
-- `Model`
-
-These are real breakers and can remain materializing until the rest of the
-pipeline is mature.
-
-## Phase 4: External Streaming Sources
-
-The existing `chunked_table_func` hook is the right seam for streaming readers.
-The next step is to treat it as a first-class source API rather than an
-implementation detail used by `read_csv`.
-
-### Source API direction
-
-- keep `ExternRegistry::register_chunked_table(...)` as the runtime entrypoint
-- document the chunk contract:
-  - stable schema across chunks
-  - ownership and lifetime rules
-  - categorical dictionary expectations
-  - EOF and error signaling
-- add tests that drive a multi-chunk extern source through native operators
-
-### ADBC plugin
-
-Once the source contract is stable, an `adbc` plugin becomes straightforward:
-
-- open a driver / connection from plugin config
-- execute SQL
-- stream Arrow `RecordBatch` objects as Ibex chunks
-- preserve zero-copy conversions where the column layout already matches
-
-This is the cleanest path to PostgreSQL, DuckDB, Snowflake, BigQuery, and
-other ADBC-backed systems without building bespoke readers per backend.
-
-## Phase 5: Pipeline-Driven Fusion
-
-`plan_pipelines()` already identifies source / passthrough / breaker segments.
-That should become the planning input for fused execution.
-
-### First fusion target
-
-Fuse:
-
-- `Scan -> Filter`
-- `Scan -> Project`
-- `Scan -> Filter -> Project`
-- `Scan -> Filter -> Rename -> Project`
-
-### Non-goals for the first fusion pass
-
-- crossing breaker boundaries
-- fusing joins or windows
-- general-purpose JIT
-
-### Implementation sketch
-
-1. Use `plan_pipelines()` to identify a segment whose sink is a passthrough.
-2. Lower that segment into a single row loop over the source chunk.
-3. Apply predicates and projected expressions without constructing intermediate
-   `Chunk` objects.
-4. Materialize once at the segment output.
-
-The point is not just speed. Fusion also reduces allocator churn and creates a
-single place to add SIMD-friendly expression lowering later.
+`MaterializeOperator` assumes identical schema and shared categorical
+dictionaries across chunks, and has no multi-chunk validity bitmap support.
+These remain tracked limitations to remove deliberately as real workloads
+expose them.
 
 ## Validation Plan
 
-Every phase above should leave behind tests, not just code.
-
-Minimum regression coverage:
+Every change leaves behind tests:
 
 - operator unit tests for chunk boundaries and EOF behavior
-- interpreter tests that run the same query through single-chunk and multi-chunk
-  sources and compare results
+- interpreter tests running the same query through single-chunk and
+  multi-chunk sources and comparing results
 - pipeline-planner tests for representative IR shapes
-- extern-source tests for chunked plugin readers
+- `tools/ibex_fusion_bench` for perf regression gates on fused shapes
 
-Benchmark gates should focus on `build-release/` only and compare:
-
-- full-table interpreter path
-- chunked unfused path
-- fused passthrough path once it exists
+Benchmark gates compare against `build-release/` only, since debug runs
+~4× slower.
 
 ## Success Criteria
 
-The roadmap is complete when:
-
-- every `ir::NodeKind` has an explicit `build_operator()` strategy
-- the chunked path is the normal execution substrate for table queries
-- materialization points are intentional, named, and measurable
-- external readers can stream chunks into native operators
-- passthrough pipelines can execute without intermediate chunk wrappers
+- every `ir::NodeKind` has an explicit `build_operator()` strategy — **done**
+- the chunked path is the normal execution substrate for table queries — **done**
+- materialization points are intentional, named, and measurable — **done**
+- external readers can stream chunks into native operators — partial
+  (`read_csv` streams; source contract not yet documented)
+- passthrough pipelines can execute without intermediate chunk wrappers — **done** for the shapes above; ongoing for AsTimeframe and Tail(Filter)

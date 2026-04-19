@@ -135,6 +135,11 @@ auto main(int argc, char** argv) -> int {
         // also chains filter→update to exercise the chunked pipeline end-to-end.
         {"wide_update_arith", "wide[update { d = c0 * 2 + c1 }]"},
         {"wide_filter_update", "wide[filter c0 < 500, update { d = c1 + c2 }]"},
+        // Global head(n): should stop pulling from the source once n rows are
+        // emitted. On a 2M-row table these should be effectively constant-time.
+        {"wide_head_10", "wide[head 10]"},
+        {"wide_head_1000", "wide[head 1000]"},
+        {"wide_filter_head_10", "wide[filter c0 < 500, head 10]"},
     };
 
     int status = 0;

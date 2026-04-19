@@ -119,6 +119,26 @@ auto main(int argc, char** argv) -> int {
     tables["narrow"] = make_wide_table(rows, 4, 42);
     tables["wide"] = make_wide_table(rows, 16, 42);
 
+    // A table pre-sorted ascending on `k`, so `order k asc` exercises the
+    // ChunkedOrderOperator's validated-passthrough path rather than the sort.
+    {
+        ibex::runtime::Table t;
+        ibex::Column<std::int64_t> k;
+        k.resize(rows);
+        for (std::size_t i = 0; i < rows; ++i) {
+            k.data()[i] = static_cast<std::int64_t>(i);
+        }
+        t.add_column("k", std::move(k));
+        ibex::Column<std::int64_t> v;
+        v.resize(rows);
+        std::mt19937_64 rng(43);
+        for (std::size_t i = 0; i < rows; ++i) {
+            v.data()[i] = static_cast<std::int64_t>(rng() % 1000);
+        }
+        t.add_column("v", std::move(v));
+        tables["sorted"] = std::move(t);
+    }
+
     struct Q {
         std::string name;
         std::string src;
@@ -151,6 +171,11 @@ auto main(int argc, char** argv) -> int {
          "wide[filter c0 < 500, "
          "select { c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, "
          "d = c0 + c1 }]"},
+        // Order: chunked operator buffers + validates sortedness, falls back
+        // to order_table on violation. The `sorted` table is already sorted
+        // ascending on `k`, so the streaming path skips the sort entirely.
+        {"wide_order_unsorted", "wide[order c0 asc]"},
+        {"sorted_order_presorted", "sorted[order k asc]"},
     };
 
     int status = 0;

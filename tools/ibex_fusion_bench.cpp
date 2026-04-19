@@ -139,6 +139,26 @@ auto main(int argc, char** argv) -> int {
         tables["sorted"] = std::move(t);
     }
 
+    // A table with a pre-sorted nanosecond-timestamp column `ts`, used by the
+    // as_timeframe passthrough benchmark. Int column → promoted per-chunk.
+    {
+        ibex::runtime::Table t;
+        ibex::Column<std::int64_t> ts;
+        ts.resize(rows);
+        for (std::size_t i = 0; i < rows; ++i) {
+            ts.data()[i] = static_cast<std::int64_t>(i) * 1'000'000;  // 1ms steps
+        }
+        t.add_column("ts", std::move(ts));
+        ibex::Column<std::int64_t> v;
+        v.resize(rows);
+        std::mt19937_64 rng(44);
+        for (std::size_t i = 0; i < rows; ++i) {
+            v.data()[i] = static_cast<std::int64_t>(rng() % 1000);
+        }
+        t.add_column("v", std::move(v));
+        tables["tf_sorted"] = std::move(t);
+    }
+
     struct Q {
         std::string name;
         std::string src;
@@ -176,6 +196,11 @@ auto main(int argc, char** argv) -> int {
         // ascending on `k`, so the streaming path skips the sort entirely.
         {"wide_order_unsorted", "wide[order c0 asc]"},
         {"sorted_order_presorted", "sorted[order k asc]"},
+        // as_timeframe on a pre-sorted nanosecond column streams chunks
+        // through ChunkedAsTimeframeOperator without a sort; unsorted input
+        // falls back to concat + order_table (spec §9.1).
+        {"tf_sorted_as_timeframe", "as_timeframe(tf_sorted, \"ts\")"},
+        {"wide_as_timeframe_unsorted", "as_timeframe(wide, \"c0\")"},
     };
 
     int status = 0;

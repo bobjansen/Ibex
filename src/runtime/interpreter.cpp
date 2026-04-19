@@ -1385,8 +1385,8 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
 namespace {
 
 auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
-                       const std::vector<ir::ColumnRef>* project, const ScalarRegistry* scalars)
-    -> std::expected<Table, std::string> {
+                       const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
+                       const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     const std::size_t n = input.rows();
 
     auto mask_result = compute_mask(predicate, input, scalars, n);
@@ -1398,6 +1398,8 @@ auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
     const uint8_t* vp = mask_result->valid ? mask_result->valid->data() : nullptr;
 
     // Block-wise compaction: keep bits per 64-row chunk + popcount for out size.
+    // When `row_limit` is non-zero, stop scanning after we've accumulated that
+    // many kept rows — any suffix words stay zero and gather skips them.
     const std::size_t n_words = (n + 63) / 64;
     std::vector<std::uint64_t> keep_words(n_words, 0);
     std::size_t out_n = 0;
@@ -1410,8 +1412,24 @@ auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
             const bool keep = vp ? ((mp[row] & vp[row]) != 0) : (mp[row] != 0);
             bits |= static_cast<std::uint64_t>(keep) << i;
         }
+        const std::size_t block_kept = static_cast<std::size_t>(std::popcount(bits));
+        if (row_limit != 0 && out_n + block_kept >= row_limit) {
+            // Trim this block's high-order keep bits so we emit exactly
+            // `row_limit - out_n` more rows and then stop.
+            std::size_t remaining = row_limit - out_n;
+            std::uint64_t trimmed = 0;
+            std::uint64_t b = bits;
+            while (remaining > 0 && b != 0) {
+                trimmed |= b & (~b + 1);  // lowest set bit
+                b &= b - 1;
+                --remaining;
+            }
+            keep_words[w] = trimmed;
+            out_n = row_limit;
+            break;
+        }
         keep_words[w] = bits;
-        out_n += static_cast<std::size_t>(std::popcount(bits));
+        out_n += block_kept;
     }
 
     // Build output skeleton: either all input columns (no projection) or
@@ -1549,13 +1567,18 @@ auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
 
 auto filter_table(const Table& input, const ir::FilterExpr& predicate,
                   const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
-    return filter_table_impl(input, predicate, nullptr, scalars);
+    return filter_table_impl(input, predicate, nullptr, 0, scalars);
 }
 
 auto filter_project_table(const Table& input, const ir::FilterExpr& predicate,
                           const std::vector<ir::ColumnRef>& columns, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
-    return filter_table_impl(input, predicate, &columns, scalars);
+    return filter_table_impl(input, predicate, &columns, 0, scalars);
+}
+
+auto filter_table_limit(const Table& input, const ir::FilterExpr& predicate, std::size_t row_limit,
+                        const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+    return filter_table_impl(input, predicate, nullptr, row_limit, scalars);
 }
 
 auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns)
@@ -7203,6 +7226,64 @@ class ChunkedFilterProjectOperator final : public Operator {
     const ScalarRegistry* scalars_;
 };
 
+/// Fused filter→head(n): pushes the row limit into the per-chunk filter so
+/// gather stops as soon as `n` surviving rows are produced, and short-circuits
+/// pulling from the child once the limit is reached. Only used for global
+/// `head` (no group_by); grouped head still uses ChunkedHeadOperator.
+class ChunkedFilterHeadOperator final : public Operator {
+   public:
+    ChunkedFilterHeadOperator(OperatorPtr child, const ir::FilterExpr* predicate, std::size_t count,
+                              const ScalarRegistry* scalars)
+        : child_(std::move(child)),
+          predicate_(predicate),
+          count_(count),
+          remaining_(count),
+          scalars_(scalars) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (done_) {
+            return std::optional<Chunk>{};
+        }
+        while (true) {
+            if (remaining_ == 0) {
+                done_ = true;
+                return std::optional<Chunk>{};
+            }
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                done_ = true;
+                return std::optional<Chunk>{};
+            }
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            auto out = filter_table_limit(t, *predicate_, remaining_, scalars_);
+            if (!out.has_value()) {
+                return std::unexpected(std::move(out.error()));
+            }
+            const std::size_t produced = out->rows();
+            if (!out->columns.empty() && produced == 0) {
+                continue;
+            }
+            remaining_ -= produced;
+            if (remaining_ == 0) {
+                done_ = true;
+            }
+            (void)count_;
+            return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
+        }
+    }
+
+   private:
+    OperatorPtr child_;
+    const ir::FilterExpr* predicate_;
+    std::size_t count_;
+    std::size_t remaining_;
+    const ScalarRegistry* scalars_;
+    bool done_ = false;
+};
+
 class ChunkedRenameOperator final : public Operator {
    public:
     ChunkedRenameOperator(OperatorPtr child, const std::vector<ir::RenameSpec>* renames)
@@ -7319,6 +7400,10 @@ class ChunkedHeadOperator final : public Operator {
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (done_) {
+            return std::optional<Chunk>{};
+        }
+        if (count_ == 0 && group_by_->empty()) {
+            done_ = true;
             return std::optional<Chunk>{};
         }
 
@@ -9541,6 +9626,18 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::make_unique<ChunkedOrderedLimitOperator>(
                 std::move(child_op.value()), &order.keys(), head.count(), &head.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::First);
+        }
+        if (head.group_by().empty() && head.children().front()->kind() == ir::NodeKind::Filter) {
+            const auto& filter = static_cast<const ir::FilterNode&>(*head.children().front());
+            if (!filter.children().empty()) {
+                auto child_op = build_operator(*filter.children().front(), registry, scalars,
+                                               externs, model_out);
+                if (!child_op.has_value()) {
+                    return std::unexpected(std::move(child_op.error()));
+                }
+                return std::make_unique<ChunkedFilterHeadOperator>(
+                    std::move(child_op.value()), &filter.predicate(), head.count(), scalars);
+            }
         }
         auto child_op =
             build_operator(*head.children().front(), registry, scalars, externs, model_out);

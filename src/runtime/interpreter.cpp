@@ -7284,6 +7284,66 @@ class ChunkedFilterHeadOperator final : public Operator {
     bool done_ = false;
 };
 
+/// Fused filter→update→project: evaluates the predicate per chunk, gathers
+/// only the columns needed (referenced by any update expression, or in the
+/// final projection but not produced by the update), then runs the row-local
+/// update and final projection. Skips materializing columns the surrounding
+/// select would discard — the same win as ChunkedFilterProjectOperator, but
+/// allowing computed fields in the select.
+class ChunkedFilterUpdateProjectOperator final : public Operator {
+   public:
+    ChunkedFilterUpdateProjectOperator(OperatorPtr child, const ir::FilterExpr* predicate,
+                                       const std::vector<ir::FieldSpec>* fields,
+                                       const std::vector<ir::ColumnRef>* project_columns,
+                                       std::vector<ir::ColumnRef> gather_columns,
+                                       const ScalarRegistry* scalars, const ExternRegistry* externs)
+        : child_(std::move(child)),
+          predicate_(predicate),
+          fields_(fields),
+          project_columns_(project_columns),
+          gather_columns_(std::move(gather_columns)),
+          scalars_(scalars),
+          externs_(externs) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                return std::optional<Chunk>{};
+            }
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            auto filtered = filter_project_table(t, *predicate_, gather_columns_, scalars_);
+            if (!filtered.has_value()) {
+                return std::unexpected(std::move(filtered.error()));
+            }
+            if (!filtered->columns.empty() && filtered->rows() == 0) {
+                continue;
+            }
+            auto updated = update_table(std::move(filtered.value()), *fields_, scalars_, externs_);
+            if (!updated.has_value()) {
+                return std::unexpected(std::move(updated.error()));
+            }
+            auto projected = project_table(updated.value(), *project_columns_);
+            if (!projected.has_value()) {
+                return std::unexpected(std::move(projected.error()));
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(projected.value()))};
+        }
+    }
+
+   private:
+    OperatorPtr child_;
+    const ir::FilterExpr* predicate_;
+    const std::vector<ir::FieldSpec>* fields_;
+    const std::vector<ir::ColumnRef>* project_columns_;
+    std::vector<ir::ColumnRef> gather_columns_;
+    const ScalarRegistry* scalars_;
+    const ExternRegistry* externs_;
+};
+
 class ChunkedRenameOperator final : public Operator {
    public:
     ChunkedRenameOperator(OperatorPtr child, const std::vector<ir::RenameSpec>* renames)
@@ -7353,6 +7413,31 @@ auto is_row_local_update_expr(const ir::Expr& expr) -> bool {
                 return true;
             } else {
                 return false;
+            }
+        },
+        expr.node);
+}
+
+/// Collects the set of column names referenced by an Expr tree. Used to
+/// compute the minimal gather set for Filter→Update→Project fusion.
+void collect_expr_column_refs(const ir::Expr& expr, std::unordered_set<std::string>& out) {
+    std::visit(
+        [&](const auto& n) {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                out.insert(n.name);
+            } else if constexpr (std::is_same_v<T, ir::Literal>) {
+                // nothing
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
+                collect_expr_column_refs(*n.left, out);
+                collect_expr_column_refs(*n.right, out);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                for (const auto& arg : n.args) {
+                    collect_expr_column_refs(*arg, out);
+                }
+                for (const auto& na : n.named_args) {
+                    collect_expr_column_refs(*na.value, out);
+                }
             }
         },
         expr.node);
@@ -9505,6 +9590,52 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             }
             return std::make_unique<ChunkedFilterProjectOperator>(
                 std::move(grandchild_op.value()), &filter.predicate(), &project.columns(), scalars);
+        }
+        // Fuse Project(Update(Filter(x))) — the canonical lowering of
+        // `filter P, select { cols, computed = expr }`. Gather only the
+        // columns the update reads plus projected columns not produced by
+        // the update, then run update and final projection.
+        if (pchild.kind() == ir::NodeKind::Update) {
+            const auto& update = static_cast<const ir::UpdateNode&>(pchild);
+            const bool update_eligible = !update.children().empty() && update.group_by().empty() &&
+                                         update.tuple_fields().empty() &&
+                                         std::all_of(update.fields().begin(), update.fields().end(),
+                                                     [](const ir::FieldSpec& f) {
+                                                         return is_row_local_update_expr(f.expr);
+                                                     });
+            if (update_eligible && update.children().front()->kind() == ir::NodeKind::Filter) {
+                const auto& filter = static_cast<const ir::FilterNode&>(*update.children().front());
+                if (!filter.children().empty()) {
+                    std::unordered_set<std::string> update_outputs;
+                    std::unordered_set<std::string> needed;
+                    for (const auto& f : update.fields()) {
+                        update_outputs.insert(f.alias);
+                        collect_expr_column_refs(f.expr, needed);
+                    }
+                    // Projected columns that aren't produced by the update
+                    // must come from the filtered input. Outputs of the
+                    // update are already part of the updated table, so we
+                    // don't need to gather originals with those names.
+                    for (const auto& col : project.columns()) {
+                        if (update_outputs.find(col.name) == update_outputs.end()) {
+                            needed.insert(col.name);
+                        }
+                    }
+                    std::vector<ir::ColumnRef> gather_cols;
+                    gather_cols.reserve(needed.size());
+                    for (const auto& name : needed) {
+                        gather_cols.push_back(ir::ColumnRef{.name = name});
+                    }
+                    auto grand = build_operator(*filter.children().front(), registry, scalars,
+                                                externs, model_out);
+                    if (!grand.has_value()) {
+                        return std::unexpected(std::move(grand.error()));
+                    }
+                    return std::make_unique<ChunkedFilterUpdateProjectOperator>(
+                        std::move(grand.value()), &filter.predicate(), &update.fields(),
+                        &project.columns(), std::move(gather_cols), scalars, externs);
+                }
+            }
         }
         auto child_op =
             build_operator(*project.children().front(), registry, scalars, externs, model_out);

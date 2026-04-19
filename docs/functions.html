@@ -294,7 +294,7 @@
     <p class="section-label">I/O Libraries</p>
     <h2>File and stream functions shipped with Ibex</h2>
     <article class="card">
-      <p>For a focused CSV / Parquet guide with examples and usage notes, see <a href="./io.html">the I/O page</a>.</p>
+      <p>For a focused CSV / Parquet / SQLite / Kafka guide with examples and usage notes, see <a href="./io.html">the I/O page</a>.</p>
     </article>
     <div class="grid-2">
       <article class="card">
@@ -311,11 +311,13 @@
       </article>
       <article class="card">
         <h3>Parquet and stream I/O</h3>
-        <p>Use parquet for batch files; UDP/WebSocket functions are commonly used in <code>Stream { ... }</code> pipelines.</p>
+        <p>Use parquet for batch files; UDP, WebSocket, and Kafka functions are commonly used in <code>Stream { ... }</code> pipelines.</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>read_parquet(path)</code></td><td>Load Apache Parquet into a DataFrame.</td></tr>
             <tr><td><code>write_parquet(df, path)</code></td><td>Write a DataFrame to Parquet and return row count.</td></tr>
+            <tr><td><code>kafka_recv(brokers, topic, group, schema[, options])</code></td><td>Poll one JSON Kafka message, decode it with an explicit schema, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
+            <tr><td><code>kafka_send(df, brokers, topic[, options])</code></td><td>Serialize each DataFrame row to one JSON Kafka message and return sent-row count.</td></tr>
             <tr><td><code>udp_recv(port)</code></td><td>Read rows from UDP into a DataFrame batch.</td></tr>
             <tr><td><code>udp_send(df, host, port)</code></td><td>Send a DataFrame batch via UDP and return sent-row count.</td></tr>
             <tr><td><code>ws_listen(port)</code></td><td>Start a WebSocket listener.</td></tr>

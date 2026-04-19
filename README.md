@@ -782,6 +782,7 @@ it looks for `csv.so` in the plugin search path and calls its
 | `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |
 | `parquet` | `read_parquet`, `write_parquet` | Apache Parquet via Arrow |
 | `adbc` | `read_adbc` | Optional ADBC/Arrow driver-manager source plugin |
+| `kafka` | `kafka_recv`, `kafka_send` | Optional JSON-over-Kafka streaming plugin |
 | `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
 
 Use `import` to load a plugin without explicit `extern fn` declarations:
@@ -827,6 +828,80 @@ The 4th optional argument is a `;` or newline-separated `key=value` string.
 Prefix keys with `db.`, `conn.`, or `stmt.` to target database, connection, or
 statement options, and use `entrypoint=...` to override the driver entrypoint
 symbol.
+
+`kafka.so` is optional and built with `-DIBEX_BUILD_KAFKA=ON` when
+`librdkafka` development files are available. It exposes a live JSON streaming
+source and sink:
+
+```ibex
+import "kafka";
+
+let tick = kafka_recv(
+    "localhost:9092",
+    "ticks",
+    "ibex-demo",
+    "ts:timestamp,symbol:str,price:f64,size:i64",
+    "poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"
+);
+```
+
+The receive schema is explicit and required. Use `name:type` entries separated
+by commas, with types from `int`, `f64`, `bool`, `str`, `cat`, `date`, and
+`timestamp`. Consumer options use `poll_timeout_ms=...` plus any
+`consumer.<key>=<value>` Kafka config. Producer options use
+`flush_timeout_ms=...` plus `producer.<key>=<value>`.
+
+For a streaming pipeline, wrap `kafka_recv(...)` inside `Stream { ... }`. Each
+Kafka JSON message becomes a one-row table. Idle polls return `StreamTimeout`,
+so the stream stays live rather than terminating on temporary inactivity.
+`poll_timeout_ms` is only the consumer wait interval between polls; it is not
+an overall runtime limit for the stream.
+
+### Kafka demo with Redpanda
+
+The repo includes a small Docker Compose demo under
+[`demo/kafka/`](./demo/kafka/) that starts a single-node Redpanda broker and a
+synthetic tick producer. The producer emits JSON messages of the form:
+
+```json
+{"ts":1713474000000000000,"symbol":"AAPL","venue":"XNAS","price":172.53,"size":900}
+```
+
+Start the demo stack with:
+
+```bash
+scripts/demo-kafka.sh
+```
+
+Then, in another terminal, start both Ibex websocket streams:
+
+```bash
+scripts/run-kafka-dashboard.sh
+```
+
+The dashboard consumes two live websocket feeds:
+- `ws://127.0.0.1:8765` for grouped trade summaries
+- `ws://127.0.0.1:8766` for 5-second OHLC bars
+
+Open the dashboard at
+[`demo/kafka/ws_dashboard.html`](./demo/kafka/ws_dashboard.html), or watch the
+same feeds in the terminal with:
+
+```bash
+python3 demo/kafka/ws_client.py
+python3 demo/kafka/ohlc_ws_client.py
+```
+
+The demo uses `consumer.auto.offset.reset=latest` so it behaves like a live
+feed instead of replaying historical ticks, and `consumer.session.timeout.ms=6000`
+so restarting the Ibex process does not leave the next run waiting through a
+long consumer-group rebalance.
+
+To tail producer activity directly, use:
+
+```bash
+docker compose -f demo/kafka/docker-compose.yml logs -f tick-producer
+```
 
 ### Writing your own plugin
 

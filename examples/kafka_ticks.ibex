@@ -1,0 +1,24 @@
+import "kafka";
+import "websocket";
+
+ws_listen(8765);
+
+let ticks = Stream {
+    source = kafka_recv(
+        "localhost:19092",
+        "ticks",
+        "ibex-demo-summary",
+        "ts:timestamp,symbol:str,venue:str,price:f64,size:i64",
+        "poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"
+    ),
+
+    transform = [by { symbol, venue }, select {
+        trades = count(),
+        last_px = last(price),
+        total_size = sum(size)
+    }],
+
+    sink = ws_send(8765)
+};
+
+ticks;

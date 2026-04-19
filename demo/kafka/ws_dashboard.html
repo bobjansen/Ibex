@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ibex Kafka Dashboard</title>
+  <style>
+    :root {
+      --bg: #07111a;
+      --panel: rgba(10, 25, 38, 0.84);
+      --panel-2: rgba(10, 25, 38, 0.66);
+      --border: rgba(138, 177, 204, 0.16);
+      --text: #edf6ff;
+      --muted: #8ca6bd;
+      --good: #39d98a;
+      --warn: #ffd166;
+      --bad: #ff6b6b;
+      --accent: #4cc9f0;
+      --accent-2: #90f1ef;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 28px;
+      font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(76, 201, 240, 0.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(57, 217, 138, 0.14), transparent 24%),
+        linear-gradient(160deg, #051019 0%, #091723 45%, #040a10 100%);
+    }
+
+    .shell {
+      max-width: 1220px;
+      margin: 0 auto;
+      display: grid;
+      gap: 20px;
+    }
+
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+    }
+
+    .hero {
+      padding: 28px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .eyebrow {
+      color: var(--accent-2);
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      font-size: 0.73rem;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 0.95;
+    }
+
+    .sub {
+      margin: 0;
+      max-width: 74ch;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.5;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .status-connecting { color: var(--warn); }
+    .status-connected { color: var(--good); }
+    .status-error { color: var(--bad); }
+
+    .tabs {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .tab {
+      cursor: pointer;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: var(--panel-2);
+      color: var(--muted);
+      padding: 12px 16px;
+      border-radius: 16px;
+      font: inherit;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      transition: 120ms ease;
+    }
+
+    .tab.active {
+      color: var(--text);
+      border-color: rgba(76, 201, 240, 0.35);
+      box-shadow: inset 0 0 0 1px rgba(76, 201, 240, 0.18);
+    }
+
+    .panel {
+      padding: 22px;
+    }
+
+    .view {
+      display: none;
+      gap: 20px;
+    }
+
+    .view.active {
+      display: grid;
+    }
+
+    .summary-grid {
+      grid-template-columns: 1.05fr 1.95fr;
+    }
+
+    .ohlc-grid {
+      grid-template-columns: 1fr;
+    }
+
+    .panel h2 {
+      margin: 0 0 14px;
+      font-size: 1rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .leaders {
+      display: grid;
+      gap: 10px;
+    }
+
+    .leader {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .leader .name {
+      font-weight: 700;
+      font-size: 1rem;
+    }
+
+    .leader .venue {
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-top: 3px;
+    }
+
+    .leader .value {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .leader .value strong {
+      display: block;
+      font-size: 1.08rem;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+    }
+
+    thead th {
+      text-align: left;
+      font-size: 0.76rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 0 0 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    thead th.num, tbody td.num {
+      text-align: right;
+    }
+
+    tbody td {
+      padding: 12px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    tbody tr.flash {
+      animation: flash 1.1s ease-out;
+    }
+
+    @keyframes flash {
+      from { background: rgba(76, 201, 240, 0.18); }
+      to { background: transparent; }
+    }
+
+    .symbol {
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    .venue-badge {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 3px 7px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      color: var(--accent-2);
+      background: rgba(144, 241, 239, 0.08);
+      border: 1px solid rgba(144, 241, 239, 0.14);
+    }
+
+    .price {
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .up { color: var(--good); }
+    .down { color: var(--bad); }
+    .flat { color: var(--text); }
+
+    .empty {
+      color: var(--muted);
+      padding: 22px 0 8px;
+      text-align: center;
+    }
+
+    @media (max-width: 900px) {
+      body { padding: 18px; }
+      .summary-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">Ibex + Kafka + WebSocket</div>
+      <h1>Live Tick Dashboard</h1>
+      <p class="sub">
+        Redpanda publishes random ticks, one Ibex stream turns them into grouped
+        activity summaries, and a second Ibex stream resamples them into 5-second
+        OHLC bars. Both feeds are broadcast over WebSocket and shown here.
+      </p>
+      <div class="meta">
+        <div id="summary-status" class="pill status-connecting">
+          <span class="status-dot"></span>
+          <span id="summary-status-text">Summary feed connecting to ws://127.0.0.1:8765</span>
+        </div>
+        <div id="ohlc-status" class="pill status-connecting">
+          <span class="status-dot"></span>
+          <span id="ohlc-status-text">OHLC feed connecting to ws://127.0.0.1:8766</span>
+        </div>
+      </div>
+      <div class="tabs">
+        <button class="tab active" data-view="summary-view">Trade Summary</button>
+        <button class="tab" data-view="ohlc-view">OHLC Bars</button>
+      </div>
+    </section>
+
+    <section id="summary-view" class="view summary-grid active">
+      <section class="panel">
+        <h2>Most Active</h2>
+        <div id="leaders" class="leaders">
+          <div class="empty">Waiting for summary feed…</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Latest Groups</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th class="num">Trades</th>
+              <th class="num">Last Px</th>
+              <th class="num">Total Size</th>
+            </tr>
+          </thead>
+          <tbody id="summary-body">
+            <tr><td class="empty" colspan="4">Waiting for summary feed…</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </section>
+
+    <section id="ohlc-view" class="view ohlc-grid">
+      <section class="panel">
+        <h2>Latest 5-Second Bars</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Bucket (UTC)</th>
+              <th>Symbol</th>
+              <th class="num">Open</th>
+              <th class="num">High</th>
+              <th class="num">Low</th>
+              <th class="num">Close</th>
+              <th class="num">Change</th>
+            </tr>
+          </thead>
+          <tbody id="ohlc-body">
+            <tr><td class="empty" colspan="7">Waiting for OHLC feed…</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const summaryRows = new Map();
+    const ohlcRows = [];
+    const MAX_LEADERS = 8;
+    const MAX_OHLC_ROWS = 40;
+
+    const summaryStatus = {
+      root: document.getElementById("summary-status"),
+      text: document.getElementById("summary-status-text"),
+    };
+    const ohlcStatus = {
+      root: document.getElementById("ohlc-status"),
+      text: document.getElementById("ohlc-status-text"),
+    };
+    const leadersEl = document.getElementById("leaders");
+    const summaryBodyEl = document.getElementById("summary-body");
+    const ohlcBodyEl = document.getElementById("ohlc-body");
+
+    function setStatus(target, cls, text) {
+      target.root.className = `pill ${cls}`;
+      target.text.textContent = text;
+    }
+
+    function fmtPrice(v) {
+      return Number.isFinite(v) ? v.toFixed(2) : "?";
+    }
+
+    function fmtNs(ns) {
+      const d = new Date(ns / 1e6);
+      return d.toISOString().replace("T", " ").slice(0, 19);
+    }
+
+    function summaryKeyOf(row) {
+      return `${row.symbol}__${row.venue}`;
+    }
+
+    function renderLeaders() {
+      const items = Array.from(summaryRows.values())
+        .sort((a, b) => b.trades - a.trades || b.total_size - a.total_size)
+        .slice(0, MAX_LEADERS);
+
+      if (items.length === 0) {
+        leadersEl.innerHTML = '<div class="empty">Waiting for summary feed…</div>';
+        return;
+      }
+
+      leadersEl.innerHTML = items.map((row) => `
+        <div class="leader">
+          <div>
+            <div class="name">${row.symbol}</div>
+            <div class="venue">${row.venue}</div>
+          </div>
+          <div class="value">
+            <strong>${row.trades} trades</strong>
+            <span>${row.total_size} total size</span>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function renderSummaryTable(updatedKey = "") {
+      const items = Array.from(summaryRows.values())
+        .sort((a, b) => b.trades - a.trades || a.symbol.localeCompare(b.symbol) || a.venue.localeCompare(b.venue));
+
+      if (items.length === 0) {
+        summaryBodyEl.innerHTML = '<tr><td class="empty" colspan="4">Waiting for summary feed…</td></tr>';
+        return;
+      }
+
+      summaryBodyEl.innerHTML = items.map((row) => {
+        const key = summaryKeyOf(row);
+        const flash = key === updatedKey ? "flash" : "";
+        return `
+          <tr class="${flash}">
+            <td>
+              <span class="symbol">${row.symbol}</span>
+              <span class="venue-badge">${row.venue}</span>
+            </td>
+            <td class="num">${row.trades}</td>
+            <td class="num price">${fmtPrice(row.last_px)}</td>
+            <td class="num">${row.total_size}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function renderOhlcTable(updatedIndex = -1) {
+      if (ohlcRows.length === 0) {
+        ohlcBodyEl.innerHTML = '<tr><td class="empty" colspan="7">Waiting for OHLC feed…</td></tr>';
+        return;
+      }
+
+      ohlcBodyEl.innerHTML = ohlcRows.map((row, idx) => {
+        const change = row.close - row.open;
+        const dir = change > 0 ? "up" : change < 0 ? "down" : "flat";
+        const sign = change > 0 ? "+" : "";
+        const flash = idx === updatedIndex ? "flash" : "";
+        return `
+          <tr class="${flash}">
+            <td>${fmtNs(row.ts)}</td>
+            <td><span class="symbol">${row.symbol ?? "?"}</span></td>
+            <td class="num">${fmtPrice(row.open)}</td>
+            <td class="num">${fmtPrice(row.high)}</td>
+            <td class="num">${fmtPrice(row.low)}</td>
+            <td class="num price ${dir}">${fmtPrice(row.close)}</td>
+            <td class="num ${dir}">${sign}${fmtPrice(change)}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function applySummary(msg) {
+      if (!msg || typeof msg.symbol !== "string" || typeof msg.venue !== "string") {
+        return;
+      }
+      const normalized = {
+        symbol: msg.symbol,
+        venue: msg.venue,
+        trades: Number(msg.trades ?? 0),
+        last_px: Number(msg.last_px ?? NaN),
+        total_size: Number(msg.total_size ?? 0),
+      };
+      const key = summaryKeyOf(normalized);
+      summaryRows.set(key, normalized);
+      renderLeaders();
+      renderSummaryTable(key);
+    }
+
+    function applyOhlc(msg) {
+      if (!msg || typeof msg.symbol !== "string") {
+        return;
+      }
+      const normalized = {
+        ts: Number(msg.ts ?? 0),
+        symbol: msg.symbol,
+        open: Number(msg.open ?? NaN),
+        high: Number(msg.high ?? NaN),
+        low: Number(msg.low ?? NaN),
+        close: Number(msg.close ?? NaN),
+      };
+      ohlcRows.unshift(normalized);
+      if (ohlcRows.length > MAX_OHLC_ROWS) {
+        ohlcRows.length = MAX_OHLC_ROWS;
+      }
+      renderOhlcTable(0);
+    }
+
+    function connectSocket(port, statusTarget, onMessage) {
+      const url = `ws://127.0.0.1:${port}`;
+
+      function connect() {
+        setStatus(statusTarget, "status-connecting", `Connecting to ${url}`);
+        const ws = new WebSocket(url);
+
+        ws.addEventListener("open", () => {
+          setStatus(statusTarget, "status-connected", `Connected to ${url}`);
+        });
+
+        ws.addEventListener("message", (event) => {
+          try {
+            onMessage(JSON.parse(event.data));
+          } catch (err) {
+            console.warn("Bad websocket message", event.data, err);
+          }
+        });
+
+        ws.addEventListener("close", () => {
+          setStatus(statusTarget, "status-error", `Disconnected from ${url}, retrying in 2s`);
+          setTimeout(connect, 2000);
+        });
+
+        ws.addEventListener("error", () => {
+          setStatus(statusTarget, "status-error", `Connection error on ${url}, retrying in 2s`);
+        });
+      }
+
+      connect();
+    }
+
+    document.querySelectorAll(".tab").forEach((button) => {
+      button.addEventListener("click", () => {
+        const viewId = button.dataset.view;
+        document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab === button));
+        document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === viewId));
+      });
+    });
+
+    connectSocket(8765, summaryStatus, applySummary);
+    connectSocket(8766, ohlcStatus, applyOhlc);
+  </script>
+</body>
+</html>

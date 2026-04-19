@@ -11,6 +11,7 @@ set(IBEX_TEST_SOURCES
     test_e2e.cpp
     test_ir_node.cpp
     test_ir_optimizer.cpp
+    test_kafka_common.cpp
     test_lexer.cpp
     test_parser.cpp
     test_repl.cpp
@@ -28,6 +29,7 @@ add_executable(ibex_tests ${IBEX_TEST_SOURCES})
 
 target_include_directories(ibex_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/libs/csv"
+    "${PROJECT_SOURCE_DIR}/libs/kafka"
     "${PROJECT_SOURCE_DIR}/libs/json"
 )
 if(NOT WIN32)

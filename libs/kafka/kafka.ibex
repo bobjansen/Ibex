@@ -1,0 +1,33 @@
+// Kafka plugin — streaming JSON source and sink declarations.
+//
+// Usage:
+//   import "kafka";
+//
+// After importing, the following functions are available:
+//
+//   kafka_recv(brokers: String, topic: String, group: String, schema: String) -> DataFrame
+//   kafka_recv(brokers: String, topic: String, group: String, schema: String,
+//              options: String) -> DataFrame
+//     Polls Kafka for one JSON message, converts it to a one-row DataFrame
+//     using the explicit schema string, and returns StreamTimeout when no
+//     message arrives before the poll timeout.
+//
+//   kafka_send(df: DataFrame, brokers: String, topic: String) -> Int
+//   kafka_send(df: DataFrame, brokers: String, topic: String, options: String) -> Int
+//     Serializes each DataFrame row to one JSON Kafka message.
+//
+// Schema format:
+//   "ts:ts,symbol:str,price:f64,volume:i64"
+//
+// Options format:
+//   "poll_timeout_ms=200;consumer.auto.offset.reset=earliest"
+//   "flush_timeout_ms=5000;producer.compression.type=snappy"
+
+extern fn kafka_recv(brokers: String, topic: String, group: String, schema: String)
+    -> DataFrame from "kafka";
+extern fn kafka_recv(brokers: String, topic: String, group: String, schema: String,
+                     options: String) -> DataFrame from "kafka";
+
+extern fn kafka_send(df: DataFrame, brokers: String, topic: String) -> Int from "kafka";
+extern fn kafka_send(df: DataFrame, brokers: String, topic: String, options: String)
+    -> Int from "kafka";

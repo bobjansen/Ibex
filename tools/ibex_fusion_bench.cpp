@@ -131,6 +131,10 @@ auto main(int argc, char** argv) -> int {
         {"wide_keep_all_16",
          "wide[filter c0 < 500, select { c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, "
          "c13, c14, c15 }]"},
+        // Row-local update: `update` runs per chunk now. The wide_update case
+        // also chains filter→update to exercise the chunked pipeline end-to-end.
+        {"wide_update_arith", "wide[update { d = c0 * 2 + c1 }]"},
+        {"wide_filter_update", "wide[filter c0 < 500, update { d = c1 + c2 }]"},
     };
 
     int status = 0;

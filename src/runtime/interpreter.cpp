@@ -7238,6 +7238,79 @@ class ChunkedRenameOperator final : public Operator {
     const std::vector<ir::RenameSpec>* renames_;
 };
 
+/// Returns true if an expression is safe to evaluate per-chunk — its output
+/// at row i depends only on its inputs at row i, so concatenating per-chunk
+/// results matches running the expression over the full table. Calls that
+/// reach across rows (lag/lead, rolling_*, cumsum/cumprod, fill_forward/
+/// fill_backward, rep) or that sample a global sequence (rng_*) are not
+/// row-local.
+auto is_row_local_update_expr(const ir::Expr& expr) -> bool {
+    return std::visit(
+        [](const auto& n) -> bool {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, ir::ColumnRef> || std::is_same_v<T, ir::Literal>) {
+                return true;
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
+                return is_row_local_update_expr(*n.left) && is_row_local_update_expr(*n.right);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                const auto& name = n.callee;
+                if (name == "lag" || name == "lead" || name == "rep" || is_rolling_func(name) ||
+                    is_cum_func(name) || is_rng_func(name) || name == "fill_forward" ||
+                    name == "fill_backward") {
+                    return false;
+                }
+                for (const auto& arg : n.args) {
+                    if (!is_row_local_update_expr(*arg)) {
+                        return false;
+                    }
+                }
+                for (const auto& na : n.named_args) {
+                    if (!is_row_local_update_expr(*na.value)) {
+                        return false;
+                    }
+                }
+                return true;
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
+
+/// Per-chunk update for row-local field expressions. `build_operator()` only
+/// routes here when all of the UpdateNode's field expressions are row-local
+/// (per `is_row_local_update_expr`) and there are no tuple_fields or
+/// group_by clauses — the subset where running `update_table` per chunk is
+/// equivalent to running it on the materialized table.
+class ChunkedUpdateOperator final : public Operator {
+   public:
+    ChunkedUpdateOperator(OperatorPtr child, const std::vector<ir::FieldSpec>* fields,
+                          const ScalarRegistry* scalars, const ExternRegistry* externs)
+        : child_(std::move(child)), fields_(fields), scalars_(scalars), externs_(externs) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        auto chunk_res = child_->next();
+        if (!chunk_res.has_value()) {
+            return std::unexpected(std::move(chunk_res.error()));
+        }
+        if (!chunk_res.value().has_value()) {
+            return std::optional<Chunk>{};
+        }
+        Table t = chunk_to_table(std::move(*chunk_res.value()));
+        auto out = update_table(std::move(t), *fields_, scalars_, externs_);
+        if (!out.has_value()) {
+            return std::unexpected(std::move(out.error()));
+        }
+        return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
+    }
+
+   private:
+    OperatorPtr child_;
+    const std::vector<ir::FieldSpec>* fields_;
+    const ScalarRegistry* scalars_;
+    const ExternRegistry* externs_;
+};
+
 class ChunkedHeadOperator final : public Operator {
    public:
     ChunkedHeadOperator(OperatorPtr child, std::size_t count,
@@ -9631,6 +9704,20 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         if (!update.group_by().empty()) {
             return std::unexpected("grouped update not supported in interpreter");
+        }
+        // Route to a streaming ChunkedUpdateOperator when every field is
+        // row-local and there are no table-valued tuple assignments.
+        const bool all_row_local =
+            std::all_of(update.fields().begin(), update.fields().end(),
+                        [](const ir::FieldSpec& f) { return is_row_local_update_expr(f.expr); });
+        if (all_row_local && update.tuple_fields().empty()) {
+            auto child_op =
+                build_operator(*update.children().front(), registry, scalars, externs, model_out);
+            if (!child_op.has_value()) {
+                return std::unexpected(std::move(child_op.error()));
+            }
+            return std::make_unique<ChunkedUpdateOperator>(std::move(child_op.value()),
+                                                           &update.fields(), scalars, externs);
         }
         auto child = build_unary_materializing_operator(
             *update.children().front(), registry, scalars, externs, model_out, [&](Table input) {

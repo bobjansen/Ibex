@@ -192,7 +192,7 @@ TEST_CASE("plan_pipelines: scan-only produces one segment", "[pipeline]") {
     REQUIRE(plan.segments[0].source()->kind() == ir::NodeKind::Scan);
 }
 
-TEST_CASE("plan_pipelines: scan → filter → project is one segment", "[pipeline]") {
+TEST_CASE("plan_pipelines: scan -> filter -> project is one segment", "[pipeline]") {
     ir::Builder b;
     auto scan = b.scan("prices");
     auto filter = b.filter(ibex::ops::filter_cmp(ir::CompareOp::Gt, ibex::ops::filter_col("price"),
@@ -209,7 +209,7 @@ TEST_CASE("plan_pipelines: scan → filter → project is one segment", "[pipeli
     REQUIRE(plan.segments[0].sink()->kind() == ir::NodeKind::Project);
 }
 
-TEST_CASE("plan_pipelines: scan → filter → aggregate splits into two segments", "[pipeline]") {
+TEST_CASE("plan_pipelines: scan -> filter -> aggregate splits into two segments", "[pipeline]") {
     ir::Builder b;
     auto scan = b.scan("prices");
     auto filter = b.filter(ibex::ops::filter_cmp(ir::CompareOp::Gt, ibex::ops::filter_col("price"),
@@ -234,7 +234,7 @@ TEST_CASE("plan_pipelines: scan → filter → aggregate splits into two segment
     REQUIRE(plan.segments[1].source()->kind() == ir::NodeKind::Aggregate);
 }
 
-TEST_CASE("plan_pipelines: scan → agg → order produces three segments", "[pipeline]") {
+TEST_CASE("plan_pipelines: scan -> agg -> order produces three segments", "[pipeline]") {
     ir::Builder b;
     auto scan = b.scan("prices");
     auto agg = b.aggregate(

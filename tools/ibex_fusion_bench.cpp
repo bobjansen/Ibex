@@ -140,6 +140,17 @@ auto main(int argc, char** argv) -> int {
         {"wide_head_10", "wide[head 10]"},
         {"wide_head_1000", "wide[head 1000]"},
         {"wide_filter_head_10", "wide[filter c0 < 500, head 10]"},
+        // Filter → Update → Project: `select { cols, computed = expr }` lowers
+        // to Project(Update(Filter(Scan))). The fused operator gathers only
+        // the columns the update reads plus projected originals, skipping
+        // the rest of the wide input.
+        {"wide_filter_computed_select_keep2", "wide[filter c0 < 500, select { c1, d = c1 + c2 }]"},
+        {"wide_filter_computed_select_keep4",
+         "wide[filter c0 < 500, select { c1, c2, c3, d = c4 + c5 }]"},
+        {"wide_filter_computed_select_keep_all_like",
+         "wide[filter c0 < 500, "
+         "select { c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, "
+         "d = c0 + c1 }]"},
     };
 
     int status = 0;

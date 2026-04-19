@@ -3,14 +3,11 @@
 #include <ibex/interop/arrow_c_data.hpp>
 
 #include <bit>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -580,15 +577,15 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                                null_count);
             } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
                 auto state = primitive_buffers(
-                    entry, reinterpret_cast<const std::int32_t*>(
-                               col.data()));  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+                    entry, reinterpret_cast<const std::int32_t*>(col.data()));
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
             } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
                 auto state = primitive_buffers(
-                    entry, reinterpret_cast<const std::int64_t*>(
-                               col.data()));  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+                    entry, reinterpret_cast<const std::int64_t*>(col.data()));
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);

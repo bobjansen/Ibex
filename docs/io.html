@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ibex | CSV, Parquet, and SQLite I/O</title>
-  <meta name="description" content="CSV, Parquet, and SQLite/ADBC input in Ibex: plugin imports, CSV options, schema hints, and practical examples." />
+  <title>Ibex | CSV, Parquet, SQLite, and Kafka I/O</title>
+  <meta name="description" content="CSV, Parquet, SQLite/ADBC, and Kafka/Redpanda I/O in Ibex: plugin imports, schema hints, and practical batch and streaming examples." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -27,11 +27,12 @@
   <section class="hero">
     <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
     <p class="eyebrow">I/O Guide</p>
-    <h1>CSV, Parquet, and SQLite I/O</h1>
+    <h1>CSV, Parquet, SQLite, and Kafka I/O</h1>
     <p class="lead">
       Ibex keeps file I/O in plugins, not in core syntax. That means CSV and
-      Parquet read/write functions, plus SQLite reads through ADBC, are loaded
-      with <code>import</code> and then called like any other function in
+      Parquet read/write functions, plus SQLite reads through ADBC and Kafka
+      streams through the Kafka plugin, are loaded with <code>import</code>
+      and then called like any other function in
       scripts, the REPL, notebooks, and transpiled binaries.
     </p>
     <div class="cta-row">
@@ -68,6 +69,14 @@
           execution without writing a bespoke reader per backend.
         </p>
       </article>
+      <article class="card">
+        <h3>Kafka plugin</h3>
+        <p>
+          Consume JSON messages from Kafka-compatible brokers such as Redpanda,
+          turn them into one-row typed tables, and plug them directly into
+          <code>Stream { ... }</code> pipelines or WebSocket dashboards.
+        </p>
+      </article>
     </div>
   </section>
 
@@ -82,13 +91,16 @@
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
 <span class="kw">import</span> <span class="str">"adbc"</span>;
-<span class="kw">import</span> <span class="str">"adbc"</span>;
+<span class="kw">import</span> <span class="str">"kafka"</span>;
 
 <span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
 <span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
 <span class="kw">let</span> db_prices = <span class="fn-name">read_adbc</span>(<span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
                                <span class="str">"data/prices.sqlite"</span>,
-                               <span class="str">"select * from prices"</span>);</code></pre>
+                               <span class="str">"select * from prices"</span>);
+<span class="kw">let</span> tick = <span class="fn-name">kafka_recv</span>(<span class="str">"localhost:19092"</span>, <span class="str">"ticks"</span>,
+                          <span class="str">"ibex-demo"</span>,
+                          <span class="str">"ts:timestamp,symbol:str,price:f64,size:i64"</span>);</code></pre>
     </article>
   </section>
 
@@ -159,6 +171,86 @@
 <span class="kw">let</span> typed = <span class="fn-name">read_csv</span>(<span class="str">"trades.csv"</span>, <span class="str">""</span>, <span class="str">","</span>, <span class="kw">true</span>,
                           <span class="str">"symbol:cat,price:f64,size:i64"</span>);</code></pre>
     </article>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Kafka via Redpanda</p>
+    <h2>Run a visible live-stream demo with Kafka input and WebSocket output</h2>
+    <div>
+      <article class="card">
+        <h3>What the demo does</h3>
+        <p>
+          The bundled Kafka demo uses Redpanda as a local Kafka-compatible
+          broker. A synthetic tick producer writes JSON ticks into the
+          <code>ticks</code> topic, and two Ibex stream jobs consume that same
+          topic:
+        </p>
+        <ul>
+          <li>one job groups by <code>symbol</code> and <code>venue</code> and sends live summaries to <code>ws://127.0.0.1:8765</code></li>
+          <li>one job resamples ticks into 5-second OHLC bars and sends them to <code>ws://127.0.0.1:8766</code></li>
+        </ul>
+        <p>
+          The dashboard at <code>demo/kafka/ws_dashboard.html</code> opens both
+          WebSocket feeds and shows them as two tabs.
+        </p>
+      </article>
+
+      <article class="card" style="margin-top:1rem;">
+        <h3>Start the demo</h3>
+<pre><code><span class="cm"># shell</span>
+scripts/demo-kafka.sh
+scripts/run-kafka-dashboard.sh
+
+<span class="cm"># optional terminal viewers</span>
+python3 demo/kafka/ws_client.py
+python3 demo/kafka/ohlc_ws_client.py</code></pre>
+        <p>
+          The Docker stack starts Redpanda plus the random tick producer. The
+          launcher script starts two Ibex REPL processes in the background and
+          keeps them running until you stop it.
+        </p>
+      </article>
+
+      <article class="card" style="margin-top:1rem;">
+        <h3>The Ibex side</h3>
+<pre><code><span class="kw">import</span> <span class="str">"kafka"</span>;
+<span class="kw">import</span> <span class="str">"websocket"</span>;
+
+<span class="fn-name">ws_listen</span>(<span class="num">8765</span>);
+
+<span class="kw">let</span> summary = Stream {
+    source = <span class="fn-name">kafka_recv</span>(
+        <span class="str">"localhost:19092"</span>,
+        <span class="str">"ticks"</span>,
+        <span class="str">"ibex-demo-summary"</span>,
+        <span class="str">"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</span>,
+        <span class="str">"poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"</span>
+    ),
+    transform = [<span class="kw">by</span> { symbol, venue }, <span class="kw">select</span> {
+        trades = <span class="fn-name">count</span>(),
+        last_px = <span class="fn-name">last</span>(price),
+        total_size = <span class="fn-name">sum</span>(size)
+    }],
+    sink = <span class="fn-name">ws_send</span>(<span class="num">8765</span>)
+};</code></pre>
+        <p>
+          The OHLC job in <code>examples/kafka_ohlc.ibex</code> uses the same
+          source but switches the transform to
+          <code>[resample 5s, by { symbol }, select { ... }]</code> and writes
+          to <code>ws://127.0.0.1:8766</code>.
+        </p>
+      </article>
+
+      <article class="card" style="margin-top:1rem;">
+        <h3>Kafka-specific notes</h3>
+        <ul>
+          <li>The schema string is explicit and required: use <code>name:type</code> entries like <code>"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</code>.</li>
+          <li>For live dashboards, prefer <code>consumer.auto.offset.reset=latest</code> so the stream starts at current traffic instead of replaying old messages.</li>
+          <li><code>poll_timeout_ms</code> is only the wait between polls. It is not a lifetime timeout for the stream.</li>
+          <li>For per-message live streams, <code>str</code> is a better demo key type than <code>cat</code>; it avoids per-message categorical dictionary churn.</li>
+        </ul>
+      </article>
+    </div>
   </section>
 
   <section class="section">
@@ -331,6 +423,14 @@ measurements[<span class="kw">select</span> {
           <li>You want to stage a database table or query result into Ibex.</li>
           <li>You want SQL pushdown for filtering, joins, or pre-aggregation.</li>
           <li>You want to bridge into other ADBC-backed systems later.</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3>Choose Kafka when</h3>
+        <ul>
+          <li>You want live event ingestion instead of batch file loads.</li>
+          <li>You want to feed <code>Stream { ... }</code> pipelines from a broker rather than UDP or WebSocket input.</li>
+          <li>You want a local Redpanda-backed demo that ends in a browser dashboard.</li>
         </ul>
       </article>
     </div>

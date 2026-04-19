@@ -1,0 +1,25 @@
+import "kafka";
+import "websocket";
+
+ws_listen(8766);
+
+let ohlc = Stream {
+    source = kafka_recv(
+        "localhost:19092",
+        "ticks",
+        "ibex-demo-ohlc",
+        "ts:timestamp,symbol:str,venue:str,price:f64,size:i64",
+        "poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"
+    ),
+
+    transform = [resample 5s, by { symbol }, select {
+        open = first(price),
+        high = max(price),
+        low = min(price),
+        close = last(price)
+    }],
+
+    sink = ws_send(8766)
+};
+
+ohlc;

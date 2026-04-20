@@ -7284,6 +7284,132 @@ class ChunkedFilterHeadOperator final : public Operator {
     bool done_ = false;
 };
 
+/// Fused `Tail(Filter(x))`: filters each incoming chunk, then keeps only the
+/// last `n` matching rows in a rolling buffer so we never hold the full
+/// filtered result in memory (the prior materializing path built the entire
+/// filter output and sliced the last `n`). We must still drain the child —
+/// `tail` is inherently a read-all operator — but peak memory is O(n) rather
+/// than O(matches). Only wired for global `tail` (empty group_by); grouped
+/// tail still goes through the materializing path.
+class ChunkedFilterTailOperator final : public Operator {
+   public:
+    ChunkedFilterTailOperator(OperatorPtr child, const ir::FilterExpr* predicate, std::size_t count,
+                              const ScalarRegistry* scalars)
+        : child_(std::move(child)), predicate_(predicate), count_(count), scalars_(scalars) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (done_) {
+            return std::optional<Chunk>{};
+        }
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                break;
+            }
+            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            auto filtered = filter_table(t, *predicate_, scalars_);
+            if (!filtered.has_value()) {
+                return std::unexpected(std::move(filtered.error()));
+            }
+            if (filtered->columns.empty()) {
+                continue;
+            }
+            if (filtered->rows() == 0) {
+                continue;
+            }
+            buffered_rows_ += filtered->rows();
+            buffered_.push_back(std::move(filtered.value()));
+            trim_to_limit();
+        }
+        done_ = true;
+        if (buffered_.empty()) {
+            return std::optional<Chunk>{};
+        }
+        if (buffered_.size() == 1) {
+            return std::optional<Chunk>{table_to_chunk(std::move(buffered_.front()))};
+        }
+        auto concat = concat_buffered();
+        if (!concat.has_value()) {
+            return std::unexpected(std::move(concat.error()));
+        }
+        return std::optional<Chunk>{table_to_chunk(std::move(concat.value()))};
+    }
+
+   private:
+    // Drop or slice from the front of `buffered_` until its combined row count
+    // is ≤ count_. Full-chunk drops are cheap (pointer-level pop); only one
+    // partial slice (gather_rows on the front) is ever needed per trim.
+    auto trim_to_limit() -> void {
+        while (buffered_rows_ > count_ && !buffered_.empty()) {
+            const std::size_t front_rows = buffered_.front().rows();
+            if (buffered_rows_ - front_rows >= count_) {
+                buffered_rows_ -= front_rows;
+                buffered_.pop_front();
+                continue;
+            }
+            const std::size_t excess = buffered_rows_ - count_;
+            const std::size_t keep = front_rows - excess;
+            std::vector<std::size_t> idx;
+            idx.reserve(keep);
+            for (std::size_t i = excess; i < front_rows; ++i) {
+                idx.push_back(i);
+            }
+            buffered_.front() = gather_rows(buffered_.front(), idx);
+            buffered_rows_ = count_;
+            break;
+        }
+    }
+
+    auto concat_buffered() -> std::expected<Table, std::string> {
+        Table out = std::move(buffered_.front());
+        buffered_.pop_front();
+        const std::size_t n_cols = out.columns.size();
+        while (!buffered_.empty()) {
+            Table& src_t = buffered_.front();
+            if (src_t.columns.size() != n_cols) {
+                return std::unexpected("tail: chunk schema mismatch (column count)");
+            }
+            for (std::size_t i = 0; i < n_cols; ++i) {
+                if (src_t.columns[i].name != out.columns[i].name) {
+                    return std::unexpected("tail: chunk schema mismatch (column name)");
+                }
+                if (src_t.columns[i].column->index() != out.columns[i].column->index()) {
+                    return std::unexpected("tail: chunk schema mismatch (column type)");
+                }
+                std::visit(
+                    [&](auto& dst) {
+                        using Col = std::decay_t<decltype(dst)>;
+                        auto& src = std::get<Col>(*src_t.columns[i].column);
+                        dst.reserve(dst.size() + src.size());
+                        if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                            for (std::size_t r = 0; r < src.size(); ++r) {
+                                dst.push_code(src.code_at(r));
+                            }
+                        } else {
+                            for (std::size_t r = 0; r < src.size(); ++r) {
+                                dst.push_back(src[r]);
+                            }
+                        }
+                    },
+                    *out.columns[i].column);
+            }
+            buffered_.pop_front();
+        }
+        return out;
+    }
+
+    OperatorPtr child_;
+    const ir::FilterExpr* predicate_;
+    std::size_t count_;
+    const ScalarRegistry* scalars_;
+    std::deque<Table> buffered_;
+    std::size_t buffered_rows_ = 0;
+    bool done_ = false;
+};
+
 /// Fused filter→update→project: evaluates the predicate per chunk, gathers
 /// only the columns needed (referenced by any update expression, or in the
 /// final projection but not produced by the update), then runs the row-local
@@ -10350,6 +10476,18 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::make_unique<ChunkedOrderedLimitOperator>(
                 std::move(child_op.value()), &order.keys(), tail.count(), &tail.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::Last);
+        }
+        if (tail.group_by().empty() && tail.children().front()->kind() == ir::NodeKind::Filter) {
+            const auto& filter = static_cast<const ir::FilterNode&>(*tail.children().front());
+            if (!filter.children().empty()) {
+                auto child_op = build_operator(*filter.children().front(), registry, scalars,
+                                               externs, model_out);
+                if (!child_op.has_value()) {
+                    return std::unexpected(std::move(child_op.error()));
+                }
+                return std::make_unique<ChunkedFilterTailOperator>(
+                    std::move(child_op.value()), &filter.predicate(), tail.count(), scalars);
+            }
         }
         return build_unary_materializing_operator(
             *tail.children().front(), registry, scalars, externs, model_out,

@@ -200,6 +200,16 @@ auto main(int argc, char** argv) -> int {
         // ascending on `k`, so the streaming path skips the sort entirely.
         {"wide_order_unsorted", "wide[order c0 asc]"},
         {"sorted_order_presorted", "sorted[order k asc]"},
+        // Order-delay: Filter(Order(x)) → Order(Filter(x)). Without the
+        // rewrite the sort runs on all 2M rows; with it, only surviving rows
+        // (~998k at c1<500) pay the sort cost.
+        {"order_then_filter", "wide[order c0 asc][filter c1 < 500]"},
+        // Order-delay: Project(Order(x)) → Order(Project(x)). Without the
+        // rewrite the sort carries all 16 columns; with it, only the 2
+        // projected columns flow through the sort.
+        {"order_then_project", "wide[order c0 asc][select { c0, c1 }]"},
+        // Composite: Project(Filter(Order(x))) → Order(FilterProject(x)).
+        {"order_then_filter_project", "wide[order c0 asc][filter c2 < 500, select { c0, c1 }]"},
         // as_timeframe on a pre-sorted nanosecond column streams chunks
         // through ChunkedAsTimeframeOperator without a sort; unsorted input
         // falls back to concat + order_table (spec §9.1).

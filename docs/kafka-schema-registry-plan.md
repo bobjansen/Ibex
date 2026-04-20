@@ -27,18 +27,19 @@ But replace JSON payloads with Schema Registry-backed Avro and Protobuf.
 ### Phase 1: shared registry/wire scaffolding
 
 - [x] Add schema-registry project plan to the repo.
-- [ ] Parse Schema Registry wire envelopes (`magic byte` + `schema id` + payload).
-- [ ] Parse Redpanda Schema Registry schema responses.
-- [ ] Add tests for envelope parsing and response parsing.
+- [x] Parse Schema Registry wire envelopes (`magic byte` + `schema id` + payload).
+- [x] Parse Redpanda Schema Registry schema responses.
+- [x] Add tests for envelope parsing and response parsing.
 
 ### Phase 2: registry client
 
-- [ ] Add a small HTTP client layer for Schema Registry lookups.
-- [ ] Cache schema lookups by schema id.
+- [x] Add a small HTTP client layer for Schema Registry lookups.
+- [x] Cache schema lookups by schema id.
 - [ ] Handle transient registry errors without killing long-lived stream jobs.
 
 ### Phase 3: Avro v1
 
+- [x] Vendor Avro C++ in the Kafka plugin build so Avro support does not depend on `avro-c`.
 - [ ] Add `kafka_recv_avro(...)`.
 - [ ] Decode flat Avro records from Schema Registry-backed Kafka messages.
 - [ ] Map Avro scalars/logical timestamps/dates into Ibex columns.
@@ -65,4 +66,3 @@ But replace JSON payloads with Schema Registry-backed Avro and Protobuf.
 1. Finish the shared registry/wire scaffolding.
 2. Build Avro end-to-end first.
 3. Reuse the same transport/registry path for Protobuf.
-

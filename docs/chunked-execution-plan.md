@@ -45,6 +45,7 @@ chunks aren't materialized.
 | `Project(Filter(x))` | `ChunkedFilterProjectOperator` | Per-chunk gather touches only projected columns |
 | `Project(Update(Filter(x)))` (row-local update, empty tuple_fields/group_by) | `ChunkedFilterUpdateProjectOperator` | Gather set = columns read by update ∪ projected originals not produced by update; skips columns the select drops |
 | `Head(Filter(x))` (empty group_by) | `ChunkedFilterHeadOperator` | Pushes `row_limit` into the filter gather so the per-chunk compaction stops at n surviving rows; child's `next()` stops once n reached |
+| `Tail(Filter(x))` (empty group_by) | `ChunkedFilterTailOperator` | Rolling buffer of the last n matches as chunks arrive — peak memory O(n) instead of O(all matches) |
 | `Head(Order(x))`, `Tail(Order(x))` | `ChunkedOrderedLimitOperator` | Partial sort / bounded heap instead of full sort + slice |
 
 ### Chunk-aware but materializing
@@ -56,7 +57,7 @@ full `Table` before processing.
 |-----------|----------------------------|
 | `Order` (unsorted input) | Buffer all chunks, fall back to `order_table` on concat |
 | `AsTimeframe` (unsorted input) | Buffer all chunks, fall back to concat + `order_table` (SPEC §9.1 requires sorting if unsorted) |
-| `Tail` (non-`Order` child) | Needs last n rows; no streaming ring-buffer operator yet |
+| `Tail` (non-`Order`, non-`Filter` child) | Needs last n rows; falls back to full materialization |
 | `Update` (non-row-local, or with tuple_fields or group_by) | Cross-row expressions (lag, rolling, cum, rng, fill, rep) or whole-table tuple sources |
 | `Columns` | Produces a one-row schema table; trivial but not streamed |
 | `Melt`, `Dcast` | Reshape requires full input |
@@ -67,11 +68,6 @@ full `Table` before processing.
 | `Model` | Fit consumes full input |
 
 ## Immediate Priorities
-
-### `Tail(Filter(x))` pushdown
-
-Analogue of `Head(Filter(x))`: keep a ring buffer of the last n matches per
-chunk so we don't materialize all matches only to discard all but the last n.
 
 ### Order pushed later in the pipeline
 
@@ -140,4 +136,4 @@ Benchmark gates compare against `build-release/` only, since debug runs
 - materialization points are intentional, named, and measurable — **done**
 - external readers can stream chunks into native operators — partial
   (`read_csv` streams; source contract not yet documented)
-- passthrough pipelines can execute without intermediate chunk wrappers — **done** for the shapes above (including Order and AsTimeframe on sorted input); ongoing for Tail(Filter)
+- passthrough pipelines can execute without intermediate chunk wrappers — **done** for the shapes above (including Order and AsTimeframe on sorted input, and Tail(Filter))

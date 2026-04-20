@@ -180,6 +180,10 @@ auto main(int argc, char** argv) -> int {
         {"wide_head_10", "wide[head 10]"},
         {"wide_head_1000", "wide[head 1000]"},
         {"wide_filter_head_10", "wide[filter c0 < 500, head 10]"},
+        // Tail pushdown through Filter: buffer only the last n matches as
+        // chunks arrive, never hold the full filtered result in memory.
+        {"wide_filter_tail_10", "wide[filter c0 < 500, tail 10]"},
+        {"wide_filter_tail_1000", "wide[filter c0 < 500, tail 1000]"},
         // Filter → Update → Project: `select { cols, computed = expr }` lowers
         // to Project(Update(Filter(Scan))). The fused operator gathers only
         // the columns the update reads plus projected originals, skipping

@@ -46,6 +46,9 @@ chunks aren't materialized.
 | `Project(Update(Filter(x)))` (row-local update, empty tuple_fields/group_by) | `ChunkedFilterUpdateProjectOperator` | Gather set = columns read by update ∪ projected originals not produced by update; skips columns the select drops |
 | `Head(Filter(x))` (empty group_by) | `ChunkedFilterHeadOperator` | Pushes `row_limit` into the filter gather so the per-chunk compaction stops at n surviving rows; child's `next()` stops once n reached |
 | `Tail(Filter(x))` (empty group_by) | `ChunkedFilterTailOperator` | Rolling buffer of the last n matches as chunks arrive — peak memory O(n) instead of O(all matches) |
+| `Filter(Order(x))` | Rewritten to `Order(Filter(x))` at operator build time | Sort runs on the filtered (smaller) row set. SPEC §9: filter preserves ordering, so observably identical |
+| `Project(Order(x))` (keys preserved) | Rewritten to `Order(Project(x))` | Sort carries only projected columns through the comparator and gather |
+| `Project(Filter(Order(x)))` (keys preserved) | Rewritten to `Order(FilterProject(x))` | Combined Order-delay: both row and column reductions applied before the sort |
 | `Head(Order(x))`, `Tail(Order(x))` | `ChunkedOrderedLimitOperator` | Partial sort / bounded heap instead of full sort + slice |
 
 ### Chunk-aware but materializing
@@ -73,12 +76,16 @@ full `Table` before processing.
 
 `Order` and the unsorted path of `AsTimeframe` still materialize (the spec
 forces it for `AsTimeframe` and global ordering inherently requires all
-rows). The remaining win is structural: move `Order` nodes as late as
-possible in the plan so the materialization operates on a smaller,
-already-projected, already-filtered table. A planner pass that sinks `Order`
-below `Head`/`Tail` is already in place via `ChunkedOrderedLimitOperator`;
-extending that to sink `Order` past `Project`/`Filter` when safe is the
-natural follow-on.
+rows). The structural win — sinking `Order` past `Filter` and `Project` so
+the sort runs on the smallest table we can produce — is now implemented as
+operator-level pattern rewrites in `build_operator`. Measured wins on a 2M
+× 16 table: `Filter(Order)` 28%, `Project(Order)` 73%, `Project(Filter(Order))`
+85% (see `tools/ibex_fusion_bench`).
+
+The remaining Order-delay opportunity is pulling `Order` past `Rename`
+(renamed order keys) and past chains that cross `Aggregate`/`Distinct`
+boundaries (which drop ordering, so the rewrite would need to re-establish
+it via the aggregate's own sort when present).
 
 ## Later Phases
 

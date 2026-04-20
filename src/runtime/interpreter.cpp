@@ -10229,6 +10229,27 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 /// is wrapped in a `TableSourceOperator` so downstream chunked
 /// operators see a uniform pull-based interface.
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
+// True iff every OrderKey appears (by name) in `columns`. Used by the
+// Order-delay rewrites: pushing Project inside Order is only safe when the
+// projection preserves every key the sort depends on.
+[[nodiscard]] auto order_keys_kept_in_projection(const std::vector<ir::OrderKey>& keys,
+                                                 const std::vector<ir::ColumnRef>& columns)
+    -> bool {
+    for (const auto& key : keys) {
+        bool found = false;
+        for (const auto& col : columns) {
+            if (col.name == key.name) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
@@ -10236,6 +10257,22 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& filter = static_cast<const ir::FilterNode&>(node);
         if (filter.children().empty()) {
             return std::unexpected("filter node missing child");
+        }
+        // Order-delay rewrite: Filter(Order(x)) → Order(Filter(x)).
+        // SPEC §9: filter preserves ordering, so this is observably identical
+        // and the sort now operates on the filtered (smaller) table.
+        if (filter.children().front()->kind() == ir::NodeKind::Order) {
+            const auto& order = static_cast<const ir::OrderNode&>(*filter.children().front());
+            if (!order.children().empty()) {
+                auto grandchild_op = build_operator(*order.children().front(), registry, scalars,
+                                                    externs, model_out);
+                if (!grandchild_op.has_value()) {
+                    return std::unexpected(std::move(grandchild_op.error()));
+                }
+                auto filter_op = std::make_unique<ChunkedFilterOperator>(
+                    std::move(grandchild_op.value()), &filter.predicate(), scalars);
+                return std::make_unique<ChunkedOrderOperator>(std::move(filter_op), &order.keys());
+            }
         }
         auto child_op =
             build_operator(*filter.children().front(), registry, scalars, externs, model_out);
@@ -10252,12 +10289,51 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("project node missing child");
         }
         const ir::Node& pchild = *project.children().front();
+        // Order-delay rewrite: Project(Order(x)) → Order(Project(x)) when the
+        // projection keeps every order key. SPEC §9 guarantees pure projection
+        // (no computed replacements) preserves ordering, so the sort can run
+        // after the column reduction — sorts fewer columns per row.
+        if (pchild.kind() == ir::NodeKind::Order) {
+            const auto& order = static_cast<const ir::OrderNode&>(pchild);
+            if (!order.children().empty() &&
+                order_keys_kept_in_projection(order.keys(), project.columns())) {
+                auto grandchild_op = build_operator(*order.children().front(), registry, scalars,
+                                                    externs, model_out);
+                if (!grandchild_op.has_value()) {
+                    return std::unexpected(std::move(grandchild_op.error()));
+                }
+                auto project_op = std::make_unique<ChunkedProjectOperator>(
+                    std::move(grandchild_op.value()), &project.columns());
+                return std::make_unique<ChunkedOrderOperator>(std::move(project_op), &order.keys());
+            }
+        }
         // Fuse Project(Filter(x)) into a single operator so we only gather the
         // projected columns. `plan_pipelines()` classifies both as Passthrough.
         if (pchild.kind() == ir::NodeKind::Filter) {
             const auto& filter = static_cast<const ir::FilterNode&>(pchild);
             if (filter.children().empty()) {
                 return std::unexpected("filter node missing child");
+            }
+            // Composite Order-delay rewrite:
+            //   Project(Filter(Order(x))) → Order(FilterProject(x))
+            // when the projection keeps every order key. Pulls Order all the
+            // way outside the fused filter+project so the sort runs on the
+            // smallest table we can produce (filtered rows × projected cols).
+            if (!filter.children().empty() &&
+                filter.children().front()->kind() == ir::NodeKind::Order) {
+                const auto& order = static_cast<const ir::OrderNode&>(*filter.children().front());
+                if (!order.children().empty() &&
+                    order_keys_kept_in_projection(order.keys(), project.columns())) {
+                    auto grandchild_op = build_operator(*order.children().front(), registry,
+                                                        scalars, externs, model_out);
+                    if (!grandchild_op.has_value()) {
+                        return std::unexpected(std::move(grandchild_op.error()));
+                    }
+                    auto fp_op = std::make_unique<ChunkedFilterProjectOperator>(
+                        std::move(grandchild_op.value()), &filter.predicate(), &project.columns(),
+                        scalars);
+                    return std::make_unique<ChunkedOrderOperator>(std::move(fp_op), &order.keys());
+                }
             }
             auto grandchild_op =
                 build_operator(*filter.children().front(), registry, scalars, externs, model_out);

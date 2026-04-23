@@ -27,7 +27,7 @@ finding fusion opportunities that actually move the benchmark.
 | `Order`     | `ChunkedOrderOperator` — buffer + validate sortedness; re-emit chunks if sorted, fall back to `order_table` on concat otherwise |
 | `AsTimeframe` | `ChunkedAsTimeframeOperator` — buffer + validate; re-emit chunks with `time_index` stamped if sorted, fall back to concat + `order_table` (SPEC §9.1) |
 | `Update`    | `ChunkedUpdateOperator` — row-local field expressions, no tuple_fields, no group_by |
-| `Aggregate` | `ChunkedAggregateOperator` — streaming for the supported subset (Count, Sum, Min, Max, Mean on numeric) |
+| `Aggregate` | `ChunkedAggregateOperator` — streaming for the supported subset (Count, Sum, Min, Max, Mean on numeric); fast paths for single categorical key and single string key (transparent `string_view` lookup, SSO-friendly) bypass the generic `ScalarValue` variant key |
 | `Head`      | `ChunkedHeadOperator` — global and grouped, short-circuits child on reach; `count == 0` early-exit |
 | `Tail`      | Streaming only when paired with `Order` (`ChunkedOrderedLimitOperator`); otherwise materializing |
 | `Join`      | `ChunkedInnerJoinOperator`, `ChunkedSemiAntiJoinOperator` for the supported shapes |

@@ -26,6 +26,9 @@ set(IBEX_TEST_SOURCES
 if(NOT WIN32)
     list(APPEND IBEX_TEST_SOURCES test_websocket.cpp)
 endif()
+if(TARGET avrocpp_s OR TARGET avrocpp)
+    list(APPEND IBEX_TEST_SOURCES test_kafka_avro.cpp)
+endif()
 
 add_executable(ibex_tests ${IBEX_TEST_SOURCES})
 
@@ -55,6 +58,11 @@ target_link_libraries(ibex_tests
         nlohmann_json::nlohmann_json
         fast_float
 )
+if(TARGET avrocpp_s)
+    target_link_libraries(ibex_tests PRIVATE avrocpp_s)
+elseif(TARGET avrocpp)
+    target_link_libraries(ibex_tests PRIVATE avrocpp)
+endif()
 
 target_compile_definitions(ibex_tests
     PRIVATE

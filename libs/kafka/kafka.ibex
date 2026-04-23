@@ -12,6 +12,14 @@
 //     using the explicit schema string, and returns StreamTimeout when no
 //     message arrives before the poll timeout.
 //
+//   kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
+//                   registry_url: String) -> DataFrame
+//   kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
+//                   registry_url: String, options: String) -> DataFrame
+//     Polls Kafka for one Schema-Registry-framed Avro message, fetches the
+//     writer schema from Redpanda Schema Registry, decodes one flat record,
+//     and returns StreamTimeout when no message arrives before the poll timeout.
+//
 //   kafka_send(df: DataFrame, brokers: String, topic: String) -> Int
 //   kafka_send(df: DataFrame, brokers: String, topic: String, options: String) -> Int
 //     Serializes each DataFrame row to one JSON Kafka message.
@@ -27,6 +35,10 @@ extern fn kafka_recv(brokers: String, topic: String, group: String, schema: Stri
     -> DataFrame from "kafka";
 extern fn kafka_recv(brokers: String, topic: String, group: String, schema: String,
                      options: String) -> DataFrame from "kafka";
+extern fn kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
+                          registry_url: String) -> DataFrame from "kafka";
+extern fn kafka_recv_avro(brokers: String, topic: String, group: String, schema: String,
+                          registry_url: String, options: String) -> DataFrame from "kafka";
 
 extern fn kafka_send(df: DataFrame, brokers: String, topic: String) -> Int from "kafka";
 extern fn kafka_send(df: DataFrame, brokers: String, topic: String, options: String)

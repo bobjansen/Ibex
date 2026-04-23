@@ -41,6 +41,40 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
             return ibex_kafka::kafka_recv(*brokers, *topic, *group, *schema, options);
         });
 
+    registry->register_table(
+        "kafka_recv_avro",
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            if (args.size() != 5 && args.size() != 6) {
+                return std::unexpected(
+                    "kafka_recv_avro(brokers, topic, group, schema, registry_url[, options]) "
+                    "expects 5 or 6 string arguments");
+            }
+            const auto* brokers = std::get_if<std::string>(&args[0]);
+            const auto* topic = std::get_if<std::string>(&args[1]);
+            const auto* group = std::get_if<std::string>(&args[2]);
+            const auto* schema = std::get_if<std::string>(&args[3]);
+            const auto* registry_url = std::get_if<std::string>(&args[4]);
+            if (brokers == nullptr || topic == nullptr || group == nullptr || schema == nullptr ||
+                registry_url == nullptr) {
+                return std::unexpected(
+                    "kafka_recv_avro(brokers, topic, group, schema, registry_url[, options]) "
+                    "expects string arguments");
+            }
+            std::string options;
+            if (args.size() == 6) {
+                const auto* option_text = std::get_if<std::string>(&args[5]);
+                if (option_text == nullptr) {
+                    return std::unexpected(
+                        "kafka_recv_avro(..., options) expects the options argument to be a "
+                        "string");
+                }
+                options = *option_text;
+            }
+            return ibex_kafka::kafka_recv_avro(*brokers, *topic, *group, *schema, *registry_url,
+                                               options);
+        });
+
     registry->register_scalar_table_consumer(
         "kafka_send", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)

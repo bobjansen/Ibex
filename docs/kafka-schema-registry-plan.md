@@ -40,9 +40,9 @@ But replace JSON payloads with Schema Registry-backed Avro and Protobuf.
 ### Phase 3: Avro v1
 
 - [x] Vendor Avro C++ in the Kafka plugin build so Avro support does not depend on `avro-c`.
-- [ ] Add `kafka_recv_avro(...)`.
-- [ ] Decode flat Avro records from Schema Registry-backed Kafka messages.
-- [ ] Map Avro scalars/logical timestamps/dates into Ibex columns.
+- [x] Add `kafka_recv_avro(...)`.
+- [x] Decode flat Avro records from Schema Registry-backed Kafka messages.
+- [x] Map Avro scalars/logical timestamps/dates into Ibex columns.
 - [ ] Reject unsupported Avro features with clear runtime errors.
 - [ ] Add Avro-focused tests and one live demo producer path.
 

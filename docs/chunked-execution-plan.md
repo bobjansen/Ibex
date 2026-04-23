@@ -51,6 +51,7 @@ chunks aren't materialized.
 | `Project(Filter(Order(x)))` (keys preserved) | Rewritten to `Order(FilterProject(x))` | Combined Order-delay: both row and column reductions applied before the sort |
 | `Order(Rename(x))` | Rewritten to `Rename(Order(x))` with keys remapped `new→old` | Rename is a metadata bijection; pushing Order under it exposes the sort to anything beneath (source passthrough on the pre-rename name, further Order-delay across Filter/Project under the rename) |
 | `Head(Order(x))`, `Tail(Order(x))` | `ChunkedOrderedLimitOperator` | Partial sort / bounded heap instead of full sort + slice |
+| `Head(Project/Rename…(x))`, `Tail(Project/Rename…(x))` (empty group_by) | Rewritten to `Project/Rename…(Head/Tail(x))` | Row-limit reaches the fused `FilterHead`/`FilterTail` beneath any Project/Rename chain; only n rows flow through the projection/rename instead of the full filtered set |
 
 ### Chunk-aware but materializing
 
@@ -116,8 +117,9 @@ actually slow.
 
 - `Scan → Filter → Rename → Project` (listed in the original plan; cheap
   to implement once we see it shows up)
-- Row-limit pushdown through `Project` into `Filter` when `Head` sits on
-  top of a fused `Filter→Project`
+- Row-limit pushdown through `Project`/`Rename` chains — **done**; Head/Tail
+  descend past metadata-only wrappers at build time so `ChunkedFilterHeadOperator`/
+  `ChunkedFilterTailOperator` still fires underneath
 
 ### Materialization hardening
 

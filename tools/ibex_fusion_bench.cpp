@@ -184,6 +184,12 @@ auto main(int argc, char** argv) -> int {
         // chunks arrive, never hold the full filtered result in memory.
         {"wide_filter_tail_10", "wide[filter c0 < 500, tail 10]"},
         {"wide_filter_tail_1000", "wide[filter c0 < 500, tail 1000]"},
+        // Head/Tail pushdown past Project: Head(Project(Filter(x))) rewrites to
+        // Project(FilterHead(x)) so the row-limit reaches the fused FilterHead
+        // and only n surviving rows flow through the projection.
+        {"wide_filter_project_head_10", "wide[filter c0 < 500, select { c1, c2 }, head 10]"},
+        {"wide_filter_project_tail_10", "wide[filter c0 < 500, select { c1, c2 }, tail 10]"},
+        {"wide_filter_rename_head_10", "wide[filter c0 < 500, rename k = c1, head 10]"},
         // Filter → Update → Project: `select { cols, computed = expr }` lowers
         // to Project(Update(Filter(Scan))). The fused operator gathers only
         // the columns the update reads plus projected originals, skipping

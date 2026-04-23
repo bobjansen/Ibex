@@ -10665,6 +10665,57 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 std::move(child_op.value()), &order.keys(), head.count(), &head.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::First);
         }
+        // Push Head past Project/Rename chains (both preserve row count + order
+        // per SPEC §9), so the row-limit reaches any Filter beneath and composes
+        // with ChunkedFilterHeadOperator. We'll build the innermost head op and
+        // then wrap it with Project/Rename operators from inner to outer.
+        if (head.group_by().empty()) {
+            const ir::Node* inner = head.children().front().get();
+            std::vector<const ir::Node*> wrappers;
+            while (inner != nullptr && (inner->kind() == ir::NodeKind::Project ||
+                                        inner->kind() == ir::NodeKind::Rename)) {
+                if (inner->children().empty()) {
+                    break;
+                }
+                wrappers.push_back(inner);
+                inner = inner->children().front().get();
+            }
+            if (!wrappers.empty() && inner != nullptr) {
+                OperatorPtr op;
+                if (inner->kind() == ir::NodeKind::Filter) {
+                    const auto& filter = static_cast<const ir::FilterNode&>(*inner);
+                    if (!filter.children().empty()) {
+                        auto child_op = build_operator(*filter.children().front(), registry,
+                                                       scalars, externs, model_out);
+                        if (!child_op.has_value()) {
+                            return std::unexpected(std::move(child_op.error()));
+                        }
+                        op = std::make_unique<ChunkedFilterHeadOperator>(
+                            std::move(child_op.value()), &filter.predicate(), head.count(),
+                            scalars);
+                    }
+                }
+                if (!op) {
+                    auto child_op = build_operator(*inner, registry, scalars, externs, model_out);
+                    if (!child_op.has_value()) {
+                        return std::unexpected(std::move(child_op.error()));
+                    }
+                    op = std::make_unique<ChunkedHeadOperator>(std::move(child_op.value()),
+                                                               head.count(), &head.group_by());
+                }
+                for (auto it = wrappers.rbegin(); it != wrappers.rend(); ++it) {
+                    if ((*it)->kind() == ir::NodeKind::Project) {
+                        const auto& proj = static_cast<const ir::ProjectNode&>(**it);
+                        op = std::make_unique<ChunkedProjectOperator>(std::move(op),
+                                                                      &proj.columns());
+                    } else {
+                        const auto& ren = static_cast<const ir::RenameNode&>(**it);
+                        op = std::make_unique<ChunkedRenameOperator>(std::move(op), &ren.renames());
+                    }
+                }
+                return op;
+            }
+        }
         if (head.group_by().empty() && head.children().front()->kind() == ir::NodeKind::Filter) {
             const auto& filter = static_cast<const ir::FilterNode&>(*head.children().front());
             if (!filter.children().empty()) {
@@ -10704,6 +10755,46 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::make_unique<ChunkedOrderedLimitOperator>(
                 std::move(child_op.value()), &order.keys(), tail.count(), &tail.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::Last);
+        }
+        // Push Tail past Project/Rename: symmetric to Head. Tail(Filter(x))
+        // already fuses into ChunkedFilterTailOperator; wrapping Project/Rename
+        // around it keeps peak memory at O(n) instead of materializing the
+        // whole filtered set before slicing.
+        if (tail.group_by().empty()) {
+            const ir::Node* inner = tail.children().front().get();
+            std::vector<const ir::Node*> wrappers;
+            while (inner != nullptr && (inner->kind() == ir::NodeKind::Project ||
+                                        inner->kind() == ir::NodeKind::Rename)) {
+                if (inner->children().empty()) {
+                    break;
+                }
+                wrappers.push_back(inner);
+                inner = inner->children().front().get();
+            }
+            if (!wrappers.empty() && inner != nullptr && inner->kind() == ir::NodeKind::Filter) {
+                const auto& filter = static_cast<const ir::FilterNode&>(*inner);
+                if (!filter.children().empty()) {
+                    auto child_op = build_operator(*filter.children().front(), registry, scalars,
+                                                   externs, model_out);
+                    if (!child_op.has_value()) {
+                        return std::unexpected(std::move(child_op.error()));
+                    }
+                    OperatorPtr op = std::make_unique<ChunkedFilterTailOperator>(
+                        std::move(child_op.value()), &filter.predicate(), tail.count(), scalars);
+                    for (auto it = wrappers.rbegin(); it != wrappers.rend(); ++it) {
+                        if ((*it)->kind() == ir::NodeKind::Project) {
+                            const auto& proj = static_cast<const ir::ProjectNode&>(**it);
+                            op = std::make_unique<ChunkedProjectOperator>(std::move(op),
+                                                                          &proj.columns());
+                        } else {
+                            const auto& ren = static_cast<const ir::RenameNode&>(**it);
+                            op = std::make_unique<ChunkedRenameOperator>(std::move(op),
+                                                                         &ren.renames());
+                        }
+                    }
+                    return op;
+                }
+            }
         }
         if (tail.group_by().empty() && tail.children().front()->kind() == ir::NodeKind::Filter) {
             const auto& filter = static_cast<const ir::FilterNode&>(*tail.children().front());

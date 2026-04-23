@@ -3772,22 +3772,32 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
             // Pass 1: code assignment + flat output dictionary (no heap-allocated std::string
             // per distinct key; string_views in the map point into the original column buffer).
+            //
+            // Reserve based on rows (capped at 64K). High-cardinality string group-bys
+            // like `sum by user_id` (~100K distinct in 2M rows) previously started at 1024
+            // and paid ~7 rehashes of growing cost; starting larger cuts that to ~1.
             robin_hood::unordered_flat_map<std::string_view, std::uint32_t> key_to_gid;
-            key_to_gid.reserve(1024);
+            const std::size_t reserve_hint =
+                std::min<std::size_t>(rows, static_cast<std::size_t>(65536));
+            key_to_gid.reserve(reserve_hint);
             std::vector<std::uint32_t> dict_offsets;
-            dict_offsets.reserve(1025);
+            dict_offsets.reserve(reserve_hint + 1);
             dict_offsets.push_back(0);
             std::vector<char> dict_chars;
-            dict_chars.reserve(8192);
+            dict_chars.reserve(reserve_hint * 16);
             // Flat AggSlot array: one contiguous allocation replaces n_groups heap allocations.
             // Layout: flat_slots[g * n_aggs + agg_i] is the slot for group g, aggregation agg_i.
             const std::size_t n_aggs = plan.size();
             AggState tmpl = make_state();
             std::vector<AggSlot> flat_slots;
-            flat_slots.reserve(1024 * (n_aggs == 0 ? 1 : n_aggs));
+            flat_slots.reserve(reserve_hint * (n_aggs == 0 ? 1 : n_aggs));
             std::uint32_t n_groups = 0;
             std::vector<std::uint32_t> group_ids(rows);
             {
+                // Single-probe emplace: `find`+`emplace` re-hashes the key on
+                // insertion. At 100K distinct keys that's ~100K extra probes.
+                // robin_hood::emplace returns (iterator, inserted) so we can
+                // do the full find-or-insert in one call.
                 std::string_view prev_key;
                 std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
                 for (std::size_t row = 0; row < rows; ++row) {
@@ -3796,16 +3806,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     if (key == prev_key) {
                         gid = prev_gid;
                     } else {
-                        auto it = key_to_gid.find(key);
-                        if (it == key_to_gid.end()) {
+                        auto result = key_to_gid.emplace(key, n_groups);
+                        if (result.second) {
                             gid = n_groups++;
-                            key_to_gid.emplace(key, gid);
                             dict_chars.insert(dict_chars.end(), key.begin(), key.end());
                             dict_offsets.push_back(static_cast<std::uint32_t>(dict_chars.size()));
                             flat_slots.insert(flat_slots.end(), tmpl.slots.begin(),
                                               tmpl.slots.end());
                         } else {
-                            gid = it->second;
+                            gid = result.first->second;
                         }
                         prev_key = key;
                         prev_gid = gid;
@@ -9709,6 +9718,16 @@ class ChunkedAggregateOperator final : public Operator {
                 }
             }
             cat_fast_path_ = all_cat && !group_entries.empty();
+            // Single-string-key fast path: avoids the generic `Key`/ScalarValue
+            // variant path used by `process_rows_generic`. High-cardinality
+            // `sum by user_id` (~100K distinct strings in 2M rows) was spending
+            // most of its time constructing per-row ScalarValue variants and
+            // hashing them; the string path uses a string_view map keyed against
+            // an owned char/offset dictionary instead.
+            str_fast_path_ =
+                group_entries.size() == 1 &&
+                std::holds_alternative<Column<std::string>>(*group_entries[0]->column) &&
+                !group_entries[0]->validity.has_value();
             initialized_ = true;
         } else {
             for (std::size_t i = 0; i < n_aggs_; ++i) {
@@ -9732,7 +9751,54 @@ class ChunkedAggregateOperator final : public Operator {
         if (cat_fast_path_) {
             return process_rows_cat(group_entries, agg_entries, rows);
         }
+        if (str_fast_path_) {
+            return process_rows_str(group_entries, agg_entries, rows);
+        }
         return process_rows_generic(group_entries, agg_entries, rows);
+    }
+
+    auto process_rows_str(const std::vector<const ColumnEntry*>& group_entries,
+                          const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
+        -> std::optional<std::string> {
+        const auto& col = std::get<Column<std::string>>(*group_entries[0]->column);
+        const char* src_chars = col.chars_data();
+        const std::uint32_t* src_off = col.offsets_data();
+
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
+
+        // Run-length shortcut: sorted or chunked CSV often has adjacent
+        // repeats; skip the hash lookup when the key matches the previous row.
+        std::string_view prev_key;
+        std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::string_view key{src_chars + src_off[row], src_off[row + 1] - src_off[row]};
+            std::uint32_t gid{};
+            if (key == prev_key) {
+                gid = prev_gid;
+            } else {
+                // Transparent lookup on string_view avoids constructing a
+                // std::string per probe. Insertions pay one std::string
+                // construction per novel key — with libstdc++'s 15-char SSO,
+                // 11-char user_id strings stay inline (no heap alloc).
+                auto it = str_index_.find(key);
+                if (it == str_index_.end()) {
+                    gid = static_cast<std::uint32_t>(n_groups_);
+                    str_index_.emplace(std::string(key), gid);
+                    str_order_.emplace_back(key);
+                    ++n_groups_;
+                    flat_slots_.resize(n_groups_ * n_aggs_);
+                } else {
+                    gid = static_cast<std::uint32_t>(it->second);
+                }
+                prev_key = key;
+                prev_gid = gid;
+            }
+            gids[row] = gid;
+        }
+
+        accumulate_columns(gids, agg_entries, rows);
+        return std::nullopt;
     }
 
     auto alloc_group() -> std::uint32_t {
@@ -10001,6 +10067,9 @@ class ChunkedAggregateOperator final : public Operator {
                         cat_col.push_code(ck.codes[ci]);
                     }
                 }
+            } else if (str_fast_path_) {
+                auto& str_col = std::get<Column<std::string>>(*out.columns[0].column);
+                str_col.push_back(str_order_[g]);
             } else {
                 const Key& key = group_order_[g];
                 for (std::size_t ci = 0; ci < key.values.size(); ++ci) {
@@ -10067,6 +10136,30 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<Column<Categorical>::code_type> codes;
         auto operator==(const CatKey& o) const noexcept -> bool { return codes == o.codes; }
     };
+
+    // Transparent hash/eq: lets `str_index_.find(string_view)` skip the
+    // allocation of a temporary std::string on every probe.
+    struct StrViewHash {
+        using is_transparent = void;
+        auto operator()(std::string_view s) const noexcept -> std::size_t {
+            return robin_hood::hash_bytes(s.data(), s.size());
+        }
+        auto operator()(const std::string& s) const noexcept -> std::size_t {
+            return robin_hood::hash_bytes(s.data(), s.size());
+        }
+    };
+    struct StrViewEq {
+        using is_transparent = void;
+        auto operator()(const std::string& a, const std::string& b) const noexcept -> bool {
+            return a == b;
+        }
+        auto operator()(const std::string& a, std::string_view b) const noexcept -> bool {
+            return std::string_view(a) == b;
+        }
+        auto operator()(std::string_view a, const std::string& b) const noexcept -> bool {
+            return a == std::string_view(b);
+        }
+    };
     struct CatKeyHash {
         auto operator()(const CatKey& k) const noexcept -> std::size_t {
             std::size_t h = 0;
@@ -10085,6 +10178,7 @@ class ChunkedAggregateOperator final : public Operator {
 
     bool initialized_ = false;
     bool cat_fast_path_ = false;
+    bool str_fast_path_ = false;
     std::size_t n_aggs_ = 0;
     std::size_t n_groups_ = 0;
     std::vector<SlotPlan> plan_;
@@ -10108,6 +10202,10 @@ class ChunkedAggregateOperator final : public Operator {
     // Multi-Categorical fast path.
     robin_hood::unordered_flat_map<CatKey, std::size_t, CatKeyHash> multi_cat_index_;
     std::vector<CatKey> multi_cat_order_;
+
+    // Single-string-key fast path.
+    robin_hood::unordered_flat_map<std::string, std::size_t, StrViewHash, StrViewEq> str_index_;
+    std::vector<std::string> str_order_;
 };
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,

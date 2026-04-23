@@ -7748,6 +7748,14 @@ class ChunkedOrderOperator final : public Operator {
     ChunkedOrderOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys)
         : child_(std::move(child)), keys_(keys) {}
 
+    // Owning overload used by operator-level rewrites that need to construct
+    // a new key list (e.g. pushing Order past Rename, which requires remapping
+    // renamed-key names back to the child's original names).
+    ChunkedOrderOperator(OperatorPtr child, std::vector<ir::OrderKey> owned_keys)
+        : child_(std::move(child)),
+          owned_keys_(std::move(owned_keys)),
+          keys_(&owned_keys_.value()) {}
+
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (mode_ == Mode::Ingest) {
             auto drained = drain_and_check();
@@ -8034,6 +8042,7 @@ class ChunkedOrderOperator final : public Operator {
     }
 
     OperatorPtr child_;
+    std::optional<std::vector<ir::OrderKey>> owned_keys_;
     const std::vector<ir::OrderKey>* keys_;
     Mode mode_ = Mode::Ingest;
     std::vector<Chunk> buffered_;
@@ -10452,6 +10461,51 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& order = static_cast<const ir::OrderNode&>(node);
         if (order.children().empty()) {
             return std::unexpected("order node missing child");
+        }
+        // Order-delay rewrite: Order(Rename(x)) → Rename(Order(x)) with keys
+        // remapped from new_name → old_name. Rename is a pure metadata edit
+        // (bijection), so this is observably identical but exposes the Order
+        // to further rewrites against whatever sits under the rename (Filter,
+        // Project, source passthrough on the pre-rename column names).
+        if (order.children().front()->kind() == ir::NodeKind::Rename) {
+            const auto& rename = static_cast<const ir::RenameNode&>(*order.children().front());
+            if (!rename.children().empty()) {
+                std::vector<ir::OrderKey> remapped;
+                remapped.reserve(order.keys().size());
+                bool all_mappable = true;
+                for (const auto& key : order.keys()) {
+                    std::string resolved = key.name;
+                    for (const auto& r : rename.renames()) {
+                        if (r.new_name == key.name) {
+                            resolved = r.old_name;
+                            break;
+                        }
+                        // A key that names a pre-rename column that the
+                        // rename is about to shadow would collide post-push;
+                        // bail out of the rewrite in that rare case.
+                        if (r.old_name == key.name && r.new_name != key.name) {
+                            all_mappable = false;
+                            break;
+                        }
+                    }
+                    if (!all_mappable) {
+                        break;
+                    }
+                    remapped.push_back(
+                        ir::OrderKey{.name = std::move(resolved), .ascending = key.ascending});
+                }
+                if (all_mappable) {
+                    auto grandchild_op = build_operator(*rename.children().front(), registry,
+                                                        scalars, externs, model_out);
+                    if (!grandchild_op.has_value()) {
+                        return std::unexpected(std::move(grandchild_op.error()));
+                    }
+                    auto order_op = std::make_unique<ChunkedOrderOperator>(
+                        std::move(grandchild_op.value()), std::move(remapped));
+                    return std::make_unique<ChunkedRenameOperator>(std::move(order_op),
+                                                                   &rename.renames());
+                }
+            }
         }
         auto child_op =
             build_operator(*order.children().front(), registry, scalars, externs, model_out);

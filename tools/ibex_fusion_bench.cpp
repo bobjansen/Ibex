@@ -210,6 +210,10 @@ auto main(int argc, char** argv) -> int {
         {"order_then_project", "wide[order c0 asc][select { c0, c1 }]"},
         // Composite: Project(Filter(Order(x))) → Order(FilterProject(x)).
         {"order_then_filter_project", "wide[order c0 asc][filter c2 < 500, select { c0, c1 }]"},
+        // Order-delay past Rename: Order(Rename(x)) → Rename(Order(x)) with
+        // keys remapped. Exposes the sort to the source's pre-rename column
+        // name, so the `sorted` passthrough path still fires after the push.
+        {"sorted_rename_then_order", "sorted[rename key = k][order key asc]"},
         // as_timeframe on a pre-sorted nanosecond column streams chunks
         // through ChunkedAsTimeframeOperator without a sort; unsorted input
         // falls back to concat + order_table (spec §9.1).

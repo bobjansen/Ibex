@@ -49,6 +49,7 @@ chunks aren't materialized.
 | `Filter(Order(x))` | Rewritten to `Order(Filter(x))` at operator build time | Sort runs on the filtered (smaller) row set. SPEC §9: filter preserves ordering, so observably identical |
 | `Project(Order(x))` (keys preserved) | Rewritten to `Order(Project(x))` | Sort carries only projected columns through the comparator and gather |
 | `Project(Filter(Order(x)))` (keys preserved) | Rewritten to `Order(FilterProject(x))` | Combined Order-delay: both row and column reductions applied before the sort |
+| `Order(Rename(x))` | Rewritten to `Rename(Order(x))` with keys remapped `new→old` | Rename is a metadata bijection; pushing Order under it exposes the sort to anything beneath (source passthrough on the pre-rename name, further Order-delay across Filter/Project under the rename) |
 | `Head(Order(x))`, `Tail(Order(x))` | `ChunkedOrderedLimitOperator` | Partial sort / bounded heap instead of full sort + slice |
 
 ### Chunk-aware but materializing
@@ -82,10 +83,12 @@ operator-level pattern rewrites in `build_operator`. Measured wins on a 2M
 × 16 table: `Filter(Order)` 28%, `Project(Order)` 73%, `Project(Filter(Order))`
 85% (see `tools/ibex_fusion_bench`).
 
-The remaining Order-delay opportunity is pulling `Order` past `Rename`
-(renamed order keys) and past chains that cross `Aggregate`/`Distinct`
-boundaries (which drop ordering, so the rewrite would need to re-establish
-it via the aggregate's own sort when present).
+Order-delay past `Rename` now rewrites `Order(Rename(x))` to
+`Rename(Order(x))` with keys remapped `new→old`, so the sort runs against
+the pre-rename schema and composes with the Filter/Project Order-delay
+rewrites beneath it. Remaining opportunity: pulling `Order` past
+`Aggregate`/`Distinct` boundaries (which drop ordering, so the rewrite
+would need to re-establish it via the aggregate's own sort when present).
 
 ## Later Phases
 

@@ -20,6 +20,7 @@ target_include_directories(ibex_runtime
 target_link_libraries(ibex_runtime
     PUBLIC
         Ibex::core
+        Ibex::ir
     PRIVATE
         Ibex::CompilerOptions
         fmt::fmt

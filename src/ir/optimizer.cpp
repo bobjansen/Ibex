@@ -1,3 +1,4 @@
+#include <ibex/ir/canonicalize.hpp>
 #include <ibex/ir/optimizer.hpp>
 
 #include <algorithm>
@@ -151,6 +152,7 @@ auto PassManager::run(NodePtr root, const OptimizationContext& context,
 auto make_default_pass_manager() -> PassManager {
     PassManager manager;
     manager.add_pass(std::make_unique<DeadPurePreamblePass>());
+    manager.add_pass(std::make_unique<CanonicalizePass>());
     return manager;
 }
 

@@ -25,23 +25,21 @@ TEST_CASE("Lower filter and select to IR") {
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    const auto* project = as_node<ir::ProjectNode>(result->get());
-    REQUIRE(project != nullptr);
-    REQUIRE(project->columns().size() == 1);
-    REQUIRE(project->columns()[0].name == "price");
+    // Canonicalize R5 fuses Project(Filter(x)) into FilterProject(x).
+    const auto* fp = as_node<ir::FilterProjectNode>(result->get());
+    REQUIRE(fp != nullptr);
+    REQUIRE(fp->columns().size() == 1);
+    REQUIRE(fp->columns()[0].name == "price");
 
-    REQUIRE(project->children().size() == 1);
-    const auto* filter = as_node<ir::FilterNode>(project->children()[0].get());
-    REQUIRE(filter != nullptr);
     // Predicate is a FilterCmp with a FilterColumn on the left referencing "price".
-    const auto* cmp = std::get_if<ibex::ir::FilterCmp>(&filter->predicate().node);
+    const auto* cmp = std::get_if<ibex::ir::FilterCmp>(&fp->predicate().node);
     REQUIRE(cmp != nullptr);
     const auto* col = std::get_if<ibex::ir::FilterColumn>(&cmp->left->node);
     REQUIRE(col != nullptr);
     REQUIRE(col->name == "price");
 
-    REQUIRE(filter->children().size() == 1);
-    const auto* scan = as_node<ir::ScanNode>(filter->children()[0].get());
+    REQUIRE(fp->children().size() == 1);
+    const auto* scan = as_node<ir::ScanNode>(fp->children()[0].get());
     REQUIRE(scan != nullptr);
     REQUIRE(scan->source_name() == "df");
 }
@@ -548,15 +546,13 @@ enriched[filter x > 10, select { x }];
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    const auto* project = as_node<ir::ProjectNode>(result->get());
-    REQUIRE(project != nullptr);
-    REQUIRE(project->children().size() == 1);
+    // Canonicalize R5 fuses Project(Filter(x)) into FilterProject(x); here x
+    // is the Update subtree, so the shape is FilterProject(Update(Scan)).
+    const auto* fp = as_node<ir::FilterProjectNode>(result->get());
+    REQUIRE(fp != nullptr);
+    REQUIRE(fp->children().size() == 1);
 
-    const auto* filter = as_node<ir::FilterNode>(project->children()[0].get());
-    REQUIRE(filter != nullptr);
-    REQUIRE(filter->children().size() == 1);
-
-    const auto* update = as_node<ir::UpdateNode>(filter->children()[0].get());
+    const auto* update = as_node<ir::UpdateNode>(fp->children()[0].get());
     REQUIRE(update != nullptr);
     REQUIRE(update->children().size() == 1);
     REQUIRE(update->children()[0] != nullptr);

@@ -35,6 +35,24 @@ finding fusion opportunities that actually move the benchmark.
 | `Stream`    | Materialize once via `interpret_node`, wrap as source |
 | `Program`   | Evaluate preamble, then delegate to child's operator |
 
+### IR canonicalization pass
+
+`src/ir/canonicalize.cpp` runs as part of the default `PassManager` before
+the interpreter walks the tree. Algebraic identities are applied bottom-up
+to fixpoint so `build_operator` only sees canonical shapes — no pattern
+walkers or peek-ahead for node permutations. Current rules:
+
+| Rule | Direction | Notes |
+|------|-----------|-------|
+| R1 | `Filter(Order(x))` → `Order(Filter(x))` | Filter preserves order (SPEC §9) |
+| R2 | `Project(Order(x))` → `Order(Project(x))` | Only when all Order keys are preserved by the projection |
+| R3 | `Order(Rename(x))` → `Rename(Order(x))` | Order keys remapped new→old |
+| R4 | `Head/Tail(Project\|Rename(x))` → `Project\|Rename(Head/Tail(x))` | group_by (if any) remapped through Rename |
+| R5 | `Project(Filter(x))` → `FilterProject(x)` | Fused IR node; `build_operator` dispatches on `NodeKind::FilterProject` instead of pattern-matching the Project→Filter shape |
+| R6 | `Project(Update(Filter(x)))` → `FilterUpdateProject(x)` | Only when Update is row-local (no tuple_fields, no group_by, no cross-row callees); carries filter predicate + update fields + projection |
+
+New identities go here as data, not as branches in `build_operator`.
+
 ### Fused chunked operators
 
 These replace a multi-node subtree with a single operator so intermediate
@@ -42,16 +60,16 @@ chunks aren't materialized.
 
 | Pattern | Operator | Payoff |
 |---------|----------|--------|
-| `Project(Filter(x))` | `ChunkedFilterProjectOperator` | Per-chunk gather touches only projected columns |
-| `Project(Update(Filter(x)))` (row-local update, empty tuple_fields/group_by) | `ChunkedFilterUpdateProjectOperator` | Gather set = columns read by update ∪ projected originals not produced by update; skips columns the select drops |
+| `Project(Filter(x))` → `FilterProject` (canonicalize R5) | `ChunkedFilterProjectOperator` | Per-chunk gather touches only projected columns; dispatched by NodeKind, not by pattern-matching |
+| `Project(Update(Filter(x)))` (row-local) → `FilterUpdateProject` (canonicalize R6) | `ChunkedFilterUpdateProjectOperator` | Gather set = columns read by update ∪ projected originals not produced by update; skips columns the select drops |
 | `Head(Filter(x))` (empty group_by) | `ChunkedFilterHeadOperator` | Pushes `row_limit` into the filter gather so the per-chunk compaction stops at n surviving rows; child's `next()` stops once n reached |
 | `Tail(Filter(x))` (empty group_by) | `ChunkedFilterTailOperator` | Rolling buffer of the last n matches as chunks arrive — peak memory O(n) instead of O(all matches) |
-| `Filter(Order(x))` | Rewritten to `Order(Filter(x))` at operator build time | Sort runs on the filtered (smaller) row set. SPEC §9: filter preserves ordering, so observably identical |
-| `Project(Order(x))` (keys preserved) | Rewritten to `Order(Project(x))` | Sort carries only projected columns through the comparator and gather |
+| `Filter(Order(x))` | Canonicalize R1: `Order(Filter(x))` | Sort runs on the filtered (smaller) row set. SPEC §9: filter preserves ordering, so observably identical |
+| `Project(Order(x))` (keys preserved) | Canonicalize R2: `Order(Project(x))` | Sort carries only projected columns through the comparator and gather |
 | `Project(Filter(Order(x)))` (keys preserved) | Rewritten to `Order(FilterProject(x))` | Combined Order-delay: both row and column reductions applied before the sort |
-| `Order(Rename(x))` | Rewritten to `Rename(Order(x))` with keys remapped `new→old` | Rename is a metadata bijection; pushing Order under it exposes the sort to anything beneath (source passthrough on the pre-rename name, further Order-delay across Filter/Project under the rename) |
+| `Order(Rename(x))` | Canonicalize R3: `Rename(Order(x))` with keys remapped `new→old` | Rename is a metadata bijection; pushing Order under it exposes the sort to anything beneath |
 | `Head(Order(x))`, `Tail(Order(x))` | `ChunkedOrderedLimitOperator` | Partial sort / bounded heap instead of full sort + slice |
-| `Head(Project/Rename…(x))`, `Tail(Project/Rename…(x))` (empty group_by) | Rewritten to `Project/Rename…(Head/Tail(x))` | Row-limit reaches the fused `FilterHead`/`FilterTail` beneath any Project/Rename chain; only n rows flow through the projection/rename instead of the full filtered set |
+| `Head(Project/Rename…(x))`, `Tail(Project/Rename…(x))` | Canonicalize R4: `Project/Rename…(Head/Tail(x))` | Row-limit reaches the fused `FilterHead`/`FilterTail` beneath any Project/Rename chain; only n rows flow through the projection/rename instead of the full filtered set |
 
 ### Chunk-aware but materializing
 

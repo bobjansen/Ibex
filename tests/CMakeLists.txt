@@ -9,6 +9,7 @@ set(IBEX_TEST_SOURCES
     test_csv.cpp
     test_json.cpp
     test_e2e.cpp
+    test_ir_canonicalize.cpp
     test_ir_node.cpp
     test_ir_optimizer.cpp
     test_kafka_common.cpp

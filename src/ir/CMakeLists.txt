@@ -1,5 +1,7 @@
 add_library(ibex_ir STATIC
     builder.cpp
+    canonicalize.cpp
+    expr_predicates.cpp
     node.cpp
     optimizer.cpp
 )

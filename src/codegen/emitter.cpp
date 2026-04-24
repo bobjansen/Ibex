@@ -915,6 +915,57 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "    ibex::runtime::Table " << var << ";\n";
             return var;
         }
+        case ir::NodeKind::FilterProject: {
+            // Fused shape produced by canonicalize R5. Emit as filter + project
+            // — the ops layer has no fused primitive.
+            const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+            auto child = emit_node(require_single_child(fp, "FilterProjectNode"));
+            auto fvar = fresh_var();
+            *out_ << "    auto " << fvar << " = ibex::ops::filter(" << child << ", "
+                  << emit_filter_expr(fp.predicate()) << ");\n";
+            auto pvar = fresh_var();
+            *out_ << "    auto " << pvar << " = ibex::ops::project(" << fvar << ", {";
+            bool first = true;
+            for (const auto& col : fp.columns()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(col.name) << '"';
+            }
+            *out_ << "});\n";
+            return pvar;
+        }
+        case ir::NodeKind::FilterUpdateProject: {
+            // Fused shape produced by canonicalize R6. Emit as filter + update
+            // + project — the ops layer has no fused primitive.
+            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+            auto child = emit_node(require_single_child(fup, "FilterUpdateProjectNode"));
+            auto fvar = fresh_var();
+            *out_ << "    auto " << fvar << " = ibex::ops::filter(" << child << ", "
+                  << emit_filter_expr(fup.predicate()) << ");\n";
+            auto uvar = fresh_var();
+            *out_ << "    auto " << uvar << " = ibex::ops::update(" << fvar << ", {\n";
+            bool first_field = true;
+            for (const auto& f : fup.fields()) {
+                if (!first_field)
+                    *out_ << ",\n";
+                first_field = false;
+                *out_ << "        ibex::ops::make_field(\"" << escape_string(f.alias) << "\", "
+                      << emit_expr(f.expr) << ")";
+            }
+            *out_ << "\n    }, {}, {});\n";
+            auto pvar = fresh_var();
+            *out_ << "    auto " << pvar << " = ibex::ops::project(" << uvar << ", {";
+            bool first_col = true;
+            for (const auto& col : fup.project_columns()) {
+                if (!first_col)
+                    *out_ << ", ";
+                first_col = false;
+                *out_ << '"' << escape_string(col.name) << '"';
+            }
+            *out_ << "});\n";
+            return pvar;
+        }
         case ir::NodeKind::Program: {
             // NOLINTNEXTLINE cppcoreguidelines-pro-type-static-cast-downcast
             const auto& prog = static_cast<const ir::ProgramNode&>(node);

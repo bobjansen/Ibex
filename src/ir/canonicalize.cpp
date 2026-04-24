@@ -80,6 +80,25 @@ auto remap_group_by_through_rename(std::vector<ColumnRef> group_by,
     return group_by;
 }
 
+// Collect the set of column names referenced by a FilterExpr tree.
+void collect_filter_column_refs(const FilterExpr& expr, std::unordered_set<std::string>& out) {
+    std::visit(
+        [&](const auto& n) {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, FilterColumn>) {
+                out.insert(n.name);
+            } else if constexpr (std::is_same_v<T, FilterArith> || std::is_same_v<T, FilterCmp> ||
+                                 std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
+                collect_filter_column_refs(*n.left, out);
+                collect_filter_column_refs(*n.right, out);
+            } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
+                                 std::is_same_v<T, FilterIsNotNull>) {
+                collect_filter_column_refs(*n.operand, out);
+            }
+        },
+        expr.node);
+}
+
 // Remap FilterColumn references inside a FilterExpr tree new→old.
 void remap_filter_expr_through_rename(FilterExpr& expr,
                                       const std::unordered_map<std::string, std::string>& n2o) {
@@ -265,6 +284,40 @@ auto rewrite_root(NodePtr node) -> NodePtr {
             node = rewrite_root(std::move(rename_owned));
             changed = true;
             continue;
+        }
+
+        // R12: Filter(Update(x)) → Update(Filter(x)) when the Update is
+        // row-local and the predicate reads no column the Update produces.
+        // Exposes Project(Update(Filter(x))) shapes to R6 for fusion.
+        if (kind == NodeKind::Filter && !node->children().empty() &&
+            node->children().front()->kind() == NodeKind::Update) {
+            auto& filter = static_cast<FilterNode&>(*node);
+            const auto& upd = static_cast<const UpdateNode&>(*node->children().front());
+            const bool update_eligible =
+                !upd.children().empty() && upd.group_by().empty() && upd.tuple_fields().empty() &&
+                std::all_of(upd.fields().begin(), upd.fields().end(),
+                            [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
+            if (update_eligible) {
+                std::unordered_set<std::string> pred_cols;
+                collect_filter_column_refs(filter.predicate(), pred_cols);
+                const bool predicate_independent =
+                    std::none_of(upd.fields().begin(), upd.fields().end(),
+                                 [&](const FieldSpec& f) { return pred_cols.contains(f.alias); });
+                if (predicate_independent) {
+                    FilterExprPtr pred = filter.take_predicate();
+                    const auto filter_id = node->id();
+                    NodePtr filter_owned = std::move(node);
+                    NodePtr update_owned = take_unique_child(*filter_owned);
+                    NodePtr x = take_unique_child(*update_owned);
+                    auto new_filter = std::make_unique<FilterNode>(filter_id, std::move(pred));
+                    new_filter->add_child(std::move(x));
+                    NodePtr bubbled = rewrite_root(std::move(new_filter));
+                    update_owned->add_child(std::move(bubbled));
+                    node = std::move(update_owned);
+                    changed = true;
+                    continue;
+                }
+            }
         }
 
         // R5: Project(Filter(x)) → FilterProject(x) — move the filter+project

@@ -272,6 +272,42 @@ TEST_CASE("canonicalize R11: Filter(Rename(x)) bubbles Rename up with remapped p
     REQUIRE(col.name == "k");
 }
 
+TEST_CASE("canonicalize R12: Filter(Update(x)) sinks when predicate is independent",
+          "[ir][canonicalize]") {
+    // Predicate references "a" (not produced by update, which adds "b"),
+    // so Filter can move under Update.
+    auto tree =
+        with_child(make_filter_cmp_col({1}, "a", 500),
+                   with_child(make_update_row_local({2}, "b", "raw_b"), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Update);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R12: Filter(Update(x)) preserved when predicate reads update output",
+          "[ir][canonicalize]") {
+    // Predicate references "b", which the update produces — swapping would
+    // change the predicate's value.
+    auto tree =
+        with_child(make_filter_cmp_col({1}, "b", 500),
+                   with_child(make_update_row_local({2}, "b", "raw_b"), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Update);
+}
+
+TEST_CASE("canonicalize R12 then R6: Project(Filter(Update(x))) fuses end-to-end",
+          "[ir][canonicalize]") {
+    auto tree = with_child(
+        make_project({1}, {"a", "b"}),
+        with_child(make_filter_cmp_col({2}, "a", 500),
+                   with_child(make_update_row_local({3}, "b", "raw_b"), make_scan({4}, "t"))));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::FilterUpdateProject);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+}
+
 TEST_CASE("canonicalize composes R3, R11, R1: Filter(Order(Rename(x)))", "[ir][canonicalize]") {
     auto tree =
         with_child(make_filter({1}),

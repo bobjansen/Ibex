@@ -23,8 +23,14 @@ Redpanda demo is starting.
 Broker:
   localhost:19092
 
+Schema Registry:
+  http://localhost:18081
+
 Topic:
   ticks
+
+Avro topic:
+  ticks_avro
 
 Dashboard websocket:
   ws://127.0.0.1:8765
@@ -32,11 +38,23 @@ Dashboard websocket:
 OHLC websocket:
   ws://127.0.0.1:8766
 
+Avro dashboard websocket:
+  ws://127.0.0.1:8775
+
+Avro OHLC websocket:
+  ws://127.0.0.1:8776
+
 Start both Ibex websocket streams:
   scripts/run-kafka-dashboard.sh
 
+Start both Ibex Avro websocket streams:
+  scripts/run-kafka-avro-dashboard.sh
+
 Open dashboard:
   demo/kafka/ws_dashboard.html
+
+Open Avro dashboard:
+  demo/kafka/ws_dashboard_avro.html
 
 Or watch the summary feed in the terminal:
   python3 demo/kafka/ws_client.py

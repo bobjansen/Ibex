@@ -43,6 +43,10 @@ namespace ibex::ir {
 ///                                                                   row-local AND the predicate
 ///                                                                   references no column the
 ///                                                                   Update produces. Feeds R6.
+///  R13. `Head(m, Head(n, x))`        → `Head(min(m,n), x)`         — both group_by empty.
+///  R14. `Tail(m, Tail(n, x))`        → `Tail(min(m,n), x)`         — both group_by empty.
+///  R15. `Order(Filter(... AND col==K AND ..., x))` drops `col` from Order keys (pinned by
+///       equality). If all keys drop, the Order is removed entirely.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

@@ -1,3 +1,4 @@
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
@@ -4061,9 +4062,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     return output;
 }
 
-constexpr auto is_rng_func(std::string_view name) -> bool;
+using ir::is_cum_func;
+using ir::is_rng_func;
+using ir::is_rolling_func;
 constexpr auto rng_func_returns_int(std::string_view name) -> bool;
-constexpr auto is_cum_func(std::string_view name) -> bool;
 constexpr auto is_fill_func(std::string_view name) -> bool;
 constexpr auto is_float_clean_func(std::string_view name) -> bool;
 
@@ -5636,24 +5638,7 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
     return out;
 }
 
-constexpr auto is_rolling_func(std::string_view name) -> bool {
-    return name == "rolling_sum" || name == "rolling_mean" || name == "rolling_min" ||
-           name == "rolling_max" || name == "rolling_count" || name == "rolling_median" ||
-           name == "rolling_std" || name == "rolling_ewma" || name == "rolling_quantile" ||
-           name == "rolling_skew" || name == "rolling_kurtosis";
-}
-
-constexpr auto is_cum_func(std::string_view name) -> bool {
-    return name == "cumsum" || name == "cumprod";
-}
-
 // ─── Vectorized RNG ───────────────────────────────────────────────────────────
-
-constexpr auto is_rng_func(std::string_view name) -> bool {
-    return name == "rand_uniform" || name == "rand_normal" || name == "rand_student_t" ||
-           name == "rand_gamma" || name == "rand_exponential" || name == "rand_bernoulli" ||
-           name == "rand_poisson" || name == "rand_int";
-}
 
 constexpr auto rng_func_returns_int(std::string_view name) -> bool {
     return name == "rand_bernoulli" || name == "rand_poisson" || name == "rand_int";
@@ -7048,6 +7033,45 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return interpret_node(program.main_node(), registry, scalars, externs, model_out);
         }
+        case ir::NodeKind::FilterProject: {
+            // Fused shape produced by canonicalize R5. Materializing fallback
+            // for contexts where chunked build_operator is bypassed: evaluate
+            // filter then project sequentially.
+            const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+            if (fp.children().empty()) {
+                return std::unexpected("filter_project node missing child");
+            }
+            auto child = interpret_node(*fp.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            auto filtered = filter_table(child.value(), fp.predicate(), scalars);
+            if (!filtered) {
+                return std::unexpected(filtered.error());
+            }
+            return project_table(filtered.value(), fp.columns());
+        }
+        case ir::NodeKind::FilterUpdateProject: {
+            // Fused shape produced by canonicalize R6. Materializing fallback.
+            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+            if (fup.children().empty()) {
+                return std::unexpected("filter_update_project node missing child");
+            }
+            auto child = interpret_node(*fup.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            auto filtered = filter_table(child.value(), fup.predicate(), scalars);
+            if (!filtered) {
+                return std::unexpected(filtered.error());
+            }
+            auto updated =
+                update_table(std::move(filtered.value()), fup.fields(), scalars, externs);
+            if (!updated) {
+                return std::unexpected(updated.error());
+            }
+            return project_table(updated.value(), fup.project_columns());
+        }
     }
     return std::unexpected("unknown node kind");
 }
@@ -7514,69 +7538,8 @@ class ChunkedRenameOperator final : public Operator {
     const std::vector<ir::RenameSpec>* renames_;
 };
 
-/// Returns true if an expression is safe to evaluate per-chunk — its output
-/// at row i depends only on its inputs at row i, so concatenating per-chunk
-/// results matches running the expression over the full table. Calls that
-/// reach across rows (lag/lead, rolling_*, cumsum/cumprod, fill_forward/
-/// fill_backward, rep) or that sample a global sequence (rng_*) are not
-/// row-local.
-auto is_row_local_update_expr(const ir::Expr& expr) -> bool {
-    return std::visit(
-        [](const auto& n) -> bool {
-            using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, ir::ColumnRef> || std::is_same_v<T, ir::Literal>) {
-                return true;
-            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                return is_row_local_update_expr(*n.left) && is_row_local_update_expr(*n.right);
-            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                const auto& name = n.callee;
-                if (name == "lag" || name == "lead" || name == "rep" || is_rolling_func(name) ||
-                    is_cum_func(name) || is_rng_func(name) || name == "fill_forward" ||
-                    name == "fill_backward") {
-                    return false;
-                }
-                for (const auto& arg : n.args) {
-                    if (!is_row_local_update_expr(*arg)) {
-                        return false;
-                    }
-                }
-                for (const auto& na : n.named_args) {
-                    if (!is_row_local_update_expr(*na.value)) {
-                        return false;
-                    }
-                }
-                return true;
-            } else {
-                return false;
-            }
-        },
-        expr.node);
-}
-
-/// Collects the set of column names referenced by an Expr tree. Used to
-/// compute the minimal gather set for Filter→Update→Project fusion.
-void collect_expr_column_refs(const ir::Expr& expr, std::unordered_set<std::string>& out) {
-    std::visit(
-        [&](const auto& n) {
-            using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, ir::ColumnRef>) {
-                out.insert(n.name);
-            } else if constexpr (std::is_same_v<T, ir::Literal>) {
-                // nothing
-            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                collect_expr_column_refs(*n.left, out);
-                collect_expr_column_refs(*n.right, out);
-            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                for (const auto& arg : n.args) {
-                    collect_expr_column_refs(*arg, out);
-                }
-                for (const auto& na : n.named_args) {
-                    collect_expr_column_refs(*na.value, out);
-                }
-            }
-        },
-        expr.node);
-}
+using ir::collect_expr_column_refs;
+using ir::is_row_local_update_expr;
 
 /// Per-chunk update for row-local field expressions. `build_operator()` only
 /// routes here when all of the UpdateNode's field expressions are row-local
@@ -7756,14 +7719,6 @@ class ChunkedOrderOperator final : public Operator {
    public:
     ChunkedOrderOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys)
         : child_(std::move(child)), keys_(keys) {}
-
-    // Owning overload used by operator-level rewrites that need to construct
-    // a new key list (e.g. pushing Order past Rename, which requires remapping
-    // renamed-key names back to the child's original names).
-    ChunkedOrderOperator(OperatorPtr child, std::vector<ir::OrderKey> owned_keys)
-        : child_(std::move(child)),
-          owned_keys_(std::move(owned_keys)),
-          keys_(&owned_keys_.value()) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (mode_ == Mode::Ingest) {
@@ -8051,7 +8006,6 @@ class ChunkedOrderOperator final : public Operator {
     }
 
     OperatorPtr child_;
-    std::optional<std::vector<ir::OrderKey>> owned_keys_;
     const std::vector<ir::OrderKey>* keys_;
     Mode mode_ = Mode::Ingest;
     std::vector<Chunk> buffered_;
@@ -10336,26 +10290,12 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 /// is wrapped in a `TableSourceOperator` so downstream chunked
 /// operators see a uniform pull-based interface.
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
-// True iff every OrderKey appears (by name) in `columns`. Used by the
-// Order-delay rewrites: pushing Project inside Order is only safe when the
-// projection preserves every key the sort depends on.
-[[nodiscard]] auto order_keys_kept_in_projection(const std::vector<ir::OrderKey>& keys,
-                                                 const std::vector<ir::ColumnRef>& columns)
-    -> bool {
-    for (const auto& key : keys) {
-        bool found = false;
-        for (const auto& col : columns) {
-            if (col.name == key.name) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            return false;
-        }
-    }
-    return true;
-}
+// Order-delay past Filter/Project/Rename, and Head/Tail pushdown past
+// Project/Rename, are handled by the IR canonicalize pass
+// (src/ir/canonicalize.cpp). IR arrives here in canonical form, so
+// build_operator only needs one branch per NodeKind and the shapes it
+// matches are the post-canonicalization shapes (e.g. Project(Filter(x))
+// for the fused operator, not Project(Filter(Order(x)))).
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
@@ -10364,22 +10304,6 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& filter = static_cast<const ir::FilterNode&>(node);
         if (filter.children().empty()) {
             return std::unexpected("filter node missing child");
-        }
-        // Order-delay rewrite: Filter(Order(x)) → Order(Filter(x)).
-        // SPEC §9: filter preserves ordering, so this is observably identical
-        // and the sort now operates on the filtered (smaller) table.
-        if (filter.children().front()->kind() == ir::NodeKind::Order) {
-            const auto& order = static_cast<const ir::OrderNode&>(*filter.children().front());
-            if (!order.children().empty()) {
-                auto grandchild_op = build_operator(*order.children().front(), registry, scalars,
-                                                    externs, model_out);
-                if (!grandchild_op.has_value()) {
-                    return std::unexpected(std::move(grandchild_op.error()));
-                }
-                auto filter_op = std::make_unique<ChunkedFilterOperator>(
-                    std::move(grandchild_op.value()), &filter.predicate(), scalars);
-                return std::make_unique<ChunkedOrderOperator>(std::move(filter_op), &order.keys());
-            }
         }
         auto child_op =
             build_operator(*filter.children().front(), registry, scalars, externs, model_out);
@@ -10395,107 +10319,6 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (project.children().empty()) {
             return std::unexpected("project node missing child");
         }
-        const ir::Node& pchild = *project.children().front();
-        // Order-delay rewrite: Project(Order(x)) → Order(Project(x)) when the
-        // projection keeps every order key. SPEC §9 guarantees pure projection
-        // (no computed replacements) preserves ordering, so the sort can run
-        // after the column reduction — sorts fewer columns per row.
-        if (pchild.kind() == ir::NodeKind::Order) {
-            const auto& order = static_cast<const ir::OrderNode&>(pchild);
-            if (!order.children().empty() &&
-                order_keys_kept_in_projection(order.keys(), project.columns())) {
-                auto grandchild_op = build_operator(*order.children().front(), registry, scalars,
-                                                    externs, model_out);
-                if (!grandchild_op.has_value()) {
-                    return std::unexpected(std::move(grandchild_op.error()));
-                }
-                auto project_op = std::make_unique<ChunkedProjectOperator>(
-                    std::move(grandchild_op.value()), &project.columns());
-                return std::make_unique<ChunkedOrderOperator>(std::move(project_op), &order.keys());
-            }
-        }
-        // Fuse Project(Filter(x)) into a single operator so we only gather the
-        // projected columns. `plan_pipelines()` classifies both as Passthrough.
-        if (pchild.kind() == ir::NodeKind::Filter) {
-            const auto& filter = static_cast<const ir::FilterNode&>(pchild);
-            if (filter.children().empty()) {
-                return std::unexpected("filter node missing child");
-            }
-            // Composite Order-delay rewrite:
-            //   Project(Filter(Order(x))) → Order(FilterProject(x))
-            // when the projection keeps every order key. Pulls Order all the
-            // way outside the fused filter+project so the sort runs on the
-            // smallest table we can produce (filtered rows × projected cols).
-            if (!filter.children().empty() &&
-                filter.children().front()->kind() == ir::NodeKind::Order) {
-                const auto& order = static_cast<const ir::OrderNode&>(*filter.children().front());
-                if (!order.children().empty() &&
-                    order_keys_kept_in_projection(order.keys(), project.columns())) {
-                    auto grandchild_op = build_operator(*order.children().front(), registry,
-                                                        scalars, externs, model_out);
-                    if (!grandchild_op.has_value()) {
-                        return std::unexpected(std::move(grandchild_op.error()));
-                    }
-                    auto fp_op = std::make_unique<ChunkedFilterProjectOperator>(
-                        std::move(grandchild_op.value()), &filter.predicate(), &project.columns(),
-                        scalars);
-                    return std::make_unique<ChunkedOrderOperator>(std::move(fp_op), &order.keys());
-                }
-            }
-            auto grandchild_op =
-                build_operator(*filter.children().front(), registry, scalars, externs, model_out);
-            if (!grandchild_op.has_value()) {
-                return std::unexpected(std::move(grandchild_op.error()));
-            }
-            return std::make_unique<ChunkedFilterProjectOperator>(
-                std::move(grandchild_op.value()), &filter.predicate(), &project.columns(), scalars);
-        }
-        // Fuse Project(Update(Filter(x))) — the canonical lowering of
-        // `filter P, select { cols, computed = expr }`. Gather only the
-        // columns the update reads plus projected columns not produced by
-        // the update, then run update and final projection.
-        if (pchild.kind() == ir::NodeKind::Update) {
-            const auto& update = static_cast<const ir::UpdateNode&>(pchild);
-            const bool update_eligible = !update.children().empty() && update.group_by().empty() &&
-                                         update.tuple_fields().empty() &&
-                                         std::all_of(update.fields().begin(), update.fields().end(),
-                                                     [](const ir::FieldSpec& f) {
-                                                         return is_row_local_update_expr(f.expr);
-                                                     });
-            if (update_eligible && update.children().front()->kind() == ir::NodeKind::Filter) {
-                const auto& filter = static_cast<const ir::FilterNode&>(*update.children().front());
-                if (!filter.children().empty()) {
-                    std::unordered_set<std::string> update_outputs;
-                    std::unordered_set<std::string> needed;
-                    for (const auto& f : update.fields()) {
-                        update_outputs.insert(f.alias);
-                        collect_expr_column_refs(f.expr, needed);
-                    }
-                    // Projected columns that aren't produced by the update
-                    // must come from the filtered input. Outputs of the
-                    // update are already part of the updated table, so we
-                    // don't need to gather originals with those names.
-                    for (const auto& col : project.columns()) {
-                        if (update_outputs.find(col.name) == update_outputs.end()) {
-                            needed.insert(col.name);
-                        }
-                    }
-                    std::vector<ir::ColumnRef> gather_cols;
-                    gather_cols.reserve(needed.size());
-                    for (const auto& name : needed) {
-                        gather_cols.push_back(ir::ColumnRef{.name = name});
-                    }
-                    auto grand = build_operator(*filter.children().front(), registry, scalars,
-                                                externs, model_out);
-                    if (!grand.has_value()) {
-                        return std::unexpected(std::move(grand.error()));
-                    }
-                    return std::make_unique<ChunkedFilterUpdateProjectOperator>(
-                        std::move(grand.value()), &filter.predicate(), &update.fields(),
-                        &project.columns(), std::move(gather_cols), scalars, externs);
-                }
-            }
-        }
         auto child_op =
             build_operator(*project.children().front(), registry, scalars, externs, model_out);
         if (!child_op.has_value()) {
@@ -10503,6 +10326,55 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         return std::make_unique<ChunkedProjectOperator>(std::move(child_op.value()),
                                                         &project.columns());
+    }
+
+    // Fused Project(Filter(x)) produced by canonicalize R5.
+    if (node.kind() == ir::NodeKind::FilterProject) {
+        const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+        if (fp.children().empty()) {
+            return std::unexpected("filter_project node missing child");
+        }
+        auto child_op =
+            build_operator(*fp.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedFilterProjectOperator>(
+            std::move(child_op.value()), &fp.predicate(), &fp.columns(), scalars);
+    }
+
+    // Fused Project(Update(Filter(x))) produced by canonicalize R6. The
+    // gather set (columns the update reads ∪ projected columns not produced
+    // by the update) is recomputed here from the node payload.
+    if (node.kind() == ir::NodeKind::FilterUpdateProject) {
+        const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+        if (fup.children().empty()) {
+            return std::unexpected("filter_update_project node missing child");
+        }
+        std::unordered_set<std::string> update_outputs;
+        std::unordered_set<std::string> needed;
+        for (const auto& f : fup.fields()) {
+            update_outputs.insert(f.alias);
+            collect_expr_column_refs(f.expr, needed);
+        }
+        for (const auto& col : fup.project_columns()) {
+            if (update_outputs.find(col.name) == update_outputs.end()) {
+                needed.insert(col.name);
+            }
+        }
+        std::vector<ir::ColumnRef> gather_cols;
+        gather_cols.reserve(needed.size());
+        for (const auto& name : needed) {
+            gather_cols.push_back(ir::ColumnRef{.name = name});
+        }
+        auto child_op =
+            build_operator(*fup.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedFilterUpdateProjectOperator>(
+            std::move(child_op.value()), &fup.predicate(), &fup.fields(), &fup.project_columns(),
+            std::move(gather_cols), scalars, externs);
     }
 
     if (node.kind() == ir::NodeKind::Rename) {
@@ -10559,51 +10431,6 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& order = static_cast<const ir::OrderNode&>(node);
         if (order.children().empty()) {
             return std::unexpected("order node missing child");
-        }
-        // Order-delay rewrite: Order(Rename(x)) → Rename(Order(x)) with keys
-        // remapped from new_name → old_name. Rename is a pure metadata edit
-        // (bijection), so this is observably identical but exposes the Order
-        // to further rewrites against whatever sits under the rename (Filter,
-        // Project, source passthrough on the pre-rename column names).
-        if (order.children().front()->kind() == ir::NodeKind::Rename) {
-            const auto& rename = static_cast<const ir::RenameNode&>(*order.children().front());
-            if (!rename.children().empty()) {
-                std::vector<ir::OrderKey> remapped;
-                remapped.reserve(order.keys().size());
-                bool all_mappable = true;
-                for (const auto& key : order.keys()) {
-                    std::string resolved = key.name;
-                    for (const auto& r : rename.renames()) {
-                        if (r.new_name == key.name) {
-                            resolved = r.old_name;
-                            break;
-                        }
-                        // A key that names a pre-rename column that the
-                        // rename is about to shadow would collide post-push;
-                        // bail out of the rewrite in that rare case.
-                        if (r.old_name == key.name && r.new_name != key.name) {
-                            all_mappable = false;
-                            break;
-                        }
-                    }
-                    if (!all_mappable) {
-                        break;
-                    }
-                    remapped.push_back(
-                        ir::OrderKey{.name = std::move(resolved), .ascending = key.ascending});
-                }
-                if (all_mappable) {
-                    auto grandchild_op = build_operator(*rename.children().front(), registry,
-                                                        scalars, externs, model_out);
-                    if (!grandchild_op.has_value()) {
-                        return std::unexpected(std::move(grandchild_op.error()));
-                    }
-                    auto order_op = std::make_unique<ChunkedOrderOperator>(
-                        std::move(grandchild_op.value()), std::move(remapped));
-                    return std::make_unique<ChunkedRenameOperator>(std::move(order_op),
-                                                                   &rename.renames());
-                }
-            }
         }
         auto child_op =
             build_operator(*order.children().front(), registry, scalars, externs, model_out);
@@ -10665,57 +10492,9 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 std::move(child_op.value()), &order.keys(), head.count(), &head.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::First);
         }
-        // Push Head past Project/Rename chains (both preserve row count + order
-        // per SPEC §9), so the row-limit reaches any Filter beneath and composes
-        // with ChunkedFilterHeadOperator. We'll build the innermost head op and
-        // then wrap it with Project/Rename operators from inner to outer.
-        if (head.group_by().empty()) {
-            const ir::Node* inner = head.children().front().get();
-            std::vector<const ir::Node*> wrappers;
-            while (inner != nullptr && (inner->kind() == ir::NodeKind::Project ||
-                                        inner->kind() == ir::NodeKind::Rename)) {
-                if (inner->children().empty()) {
-                    break;
-                }
-                wrappers.push_back(inner);
-                inner = inner->children().front().get();
-            }
-            if (!wrappers.empty() && inner != nullptr) {
-                OperatorPtr op;
-                if (inner->kind() == ir::NodeKind::Filter) {
-                    const auto& filter = static_cast<const ir::FilterNode&>(*inner);
-                    if (!filter.children().empty()) {
-                        auto child_op = build_operator(*filter.children().front(), registry,
-                                                       scalars, externs, model_out);
-                        if (!child_op.has_value()) {
-                            return std::unexpected(std::move(child_op.error()));
-                        }
-                        op = std::make_unique<ChunkedFilterHeadOperator>(
-                            std::move(child_op.value()), &filter.predicate(), head.count(),
-                            scalars);
-                    }
-                }
-                if (!op) {
-                    auto child_op = build_operator(*inner, registry, scalars, externs, model_out);
-                    if (!child_op.has_value()) {
-                        return std::unexpected(std::move(child_op.error()));
-                    }
-                    op = std::make_unique<ChunkedHeadOperator>(std::move(child_op.value()),
-                                                               head.count(), &head.group_by());
-                }
-                for (auto it = wrappers.rbegin(); it != wrappers.rend(); ++it) {
-                    if ((*it)->kind() == ir::NodeKind::Project) {
-                        const auto& proj = static_cast<const ir::ProjectNode&>(**it);
-                        op = std::make_unique<ChunkedProjectOperator>(std::move(op),
-                                                                      &proj.columns());
-                    } else {
-                        const auto& ren = static_cast<const ir::RenameNode&>(**it);
-                        op = std::make_unique<ChunkedRenameOperator>(std::move(op), &ren.renames());
-                    }
-                }
-                return op;
-            }
-        }
+        // Head past Project/Rename chains is handled by the IR canonicalize
+        // pass (see src/ir/canonicalize.cpp rule R4), so Head arrives here
+        // sitting directly on Filter or the scan when group_by is empty.
         if (head.group_by().empty() && head.children().front()->kind() == ir::NodeKind::Filter) {
             const auto& filter = static_cast<const ir::FilterNode&>(*head.children().front());
             if (!filter.children().empty()) {
@@ -10756,46 +10535,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 std::move(child_op.value()), &order.keys(), tail.count(), &tail.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::Last);
         }
-        // Push Tail past Project/Rename: symmetric to Head. Tail(Filter(x))
-        // already fuses into ChunkedFilterTailOperator; wrapping Project/Rename
-        // around it keeps peak memory at O(n) instead of materializing the
-        // whole filtered set before slicing.
-        if (tail.group_by().empty()) {
-            const ir::Node* inner = tail.children().front().get();
-            std::vector<const ir::Node*> wrappers;
-            while (inner != nullptr && (inner->kind() == ir::NodeKind::Project ||
-                                        inner->kind() == ir::NodeKind::Rename)) {
-                if (inner->children().empty()) {
-                    break;
-                }
-                wrappers.push_back(inner);
-                inner = inner->children().front().get();
-            }
-            if (!wrappers.empty() && inner != nullptr && inner->kind() == ir::NodeKind::Filter) {
-                const auto& filter = static_cast<const ir::FilterNode&>(*inner);
-                if (!filter.children().empty()) {
-                    auto child_op = build_operator(*filter.children().front(), registry, scalars,
-                                                   externs, model_out);
-                    if (!child_op.has_value()) {
-                        return std::unexpected(std::move(child_op.error()));
-                    }
-                    OperatorPtr op = std::make_unique<ChunkedFilterTailOperator>(
-                        std::move(child_op.value()), &filter.predicate(), tail.count(), scalars);
-                    for (auto it = wrappers.rbegin(); it != wrappers.rend(); ++it) {
-                        if ((*it)->kind() == ir::NodeKind::Project) {
-                            const auto& proj = static_cast<const ir::ProjectNode&>(**it);
-                            op = std::make_unique<ChunkedProjectOperator>(std::move(op),
-                                                                          &proj.columns());
-                        } else {
-                            const auto& ren = static_cast<const ir::RenameNode&>(**it);
-                            op = std::make_unique<ChunkedRenameOperator>(std::move(op),
-                                                                         &ren.renames());
-                        }
-                    }
-                    return op;
-                }
-            }
-        }
+        // Tail past Project/Rename chains is handled by canonicalize rule R4;
+        // Tail arrives here directly above Filter or the scan.
         if (tail.group_by().empty() && tail.children().front()->kind() == ir::NodeKind::Filter) {
             const auto& filter = static_cast<const ir::FilterNode&>(*tail.children().front());
             if (!filter.children().empty()) {

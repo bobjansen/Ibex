@@ -219,13 +219,15 @@ enum class NodeKind : std::uint8_t {
     Melt,
     Dcast,
     Stream,
-    Construct,  ///< Build a Table from inline literal column vectors.
-    Program,    ///< Top-level program: zero or more preamble side-effect calls + one main node.
-    Cov,        ///< Covariance matrix of all numeric columns.
-    Corr,       ///< Pearson correlation matrix of all numeric columns.
-    Transpose,  ///< Transpose: swap rows and columns (homogeneous-type DataFrames).
-    Matmul,     ///< Matrix multiply: (m×k) × (k×n) → (m×n).
-    Model,      ///< Model fitting: formula → ModelResult.
+    Construct,      ///< Build a Table from inline literal column vectors.
+    Program,        ///< Top-level program: zero or more preamble side-effect calls + one main node.
+    Cov,            ///< Covariance matrix of all numeric columns.
+    Corr,           ///< Pearson correlation matrix of all numeric columns.
+    Transpose,      ///< Transpose: swap rows and columns (homogeneous-type DataFrames).
+    Matmul,         ///< Matrix multiply: (m×k) × (k×n) → (m×n).
+    Model,          ///< Model fitting: formula → ModelResult.
+    FilterProject,  ///< Fused Project(Filter(x)) — produced by canonicalize R5.
+    FilterUpdateProject,  ///< Fused Project(Update(Filter(x))) — produced by canonicalize R6.
 };
 
 /// How a StreamNode triggers output emission.
@@ -256,6 +258,7 @@ class Node {
     [[nodiscard]] auto children() const noexcept -> const std::vector<NodePtr>& {
         return children_;
     }
+    [[nodiscard]] auto mutable_children() noexcept -> std::vector<NodePtr>& { return children_; }
 
     void add_child(NodePtr child) { children_.push_back(std::move(child)); }
 
@@ -285,6 +288,10 @@ class FilterNode final : public Node {
         : Node(NodeKind::Filter, id), predicate_(std::move(predicate)) {}
 
     [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    /// Move the predicate out of this node. Leaves the node without a predicate;
+    /// only call when you are about to discard the FilterNode (e.g. during an IR
+    /// rewrite that replaces it with a fused node).
+    [[nodiscard]] auto take_predicate() noexcept -> FilterExprPtr { return std::move(predicate_); }
 
    private:
     FilterExprPtr predicate_;
@@ -749,6 +756,52 @@ class ModelNode final : public Node {
     ModelFormula formula_;
     std::string method_;
     std::vector<ModelParamSpec> params_;
+};
+
+/// Fused Project(Filter(x)) — produced by the canonicalize pass (rule R5).
+/// The single child is the pre-filter input `x`; the filter predicate and
+/// the final projection list are carried by this node.
+class FilterProjectNode final : public Node {
+   public:
+    FilterProjectNode(NodeId id, FilterExprPtr predicate, std::vector<ColumnRef> columns)
+        : Node(NodeKind::FilterProject, id),
+          predicate_(std::move(predicate)),
+          columns_(std::move(columns)) {}
+
+    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto columns() const noexcept -> const std::vector<ColumnRef>& {
+        return columns_;
+    }
+
+   private:
+    FilterExprPtr predicate_;
+    std::vector<ColumnRef> columns_;
+};
+
+/// Fused Project(Update(Filter(x))) — produced by the canonicalize pass (rule R6).
+/// The single child is the pre-filter input `x`. The node carries the filter
+/// predicate, the row-local update field list, and the final projection list.
+/// Only emitted when the underlying Update is row-local (no tuple_fields or
+/// group_by and no cross-row callees in any field expression).
+class FilterUpdateProjectNode final : public Node {
+   public:
+    FilterUpdateProjectNode(NodeId id, FilterExprPtr predicate, std::vector<FieldSpec> fields,
+                            std::vector<ColumnRef> project_columns)
+        : Node(NodeKind::FilterUpdateProject, id),
+          predicate_(std::move(predicate)),
+          fields_(std::move(fields)),
+          project_columns_(std::move(project_columns)) {}
+
+    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& { return fields_; }
+    [[nodiscard]] auto project_columns() const noexcept -> const std::vector<ColumnRef>& {
+        return project_columns_;
+    }
+
+   private:
+    FilterExprPtr predicate_;
+    std::vector<FieldSpec> fields_;
+    std::vector<ColumnRef> project_columns_;
 };
 
 }  // namespace ibex::ir

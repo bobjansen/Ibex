@@ -12,6 +12,8 @@ auto classify_node(ir::NodeKind kind) noexcept -> PipelineRole {
         case ir::NodeKind::Filter:
         case ir::NodeKind::Project:
         case ir::NodeKind::Rename:
+        case ir::NodeKind::FilterProject:
+        case ir::NodeKind::FilterUpdateProject:
             return PipelineRole::Passthrough;
 
         case ir::NodeKind::Columns:

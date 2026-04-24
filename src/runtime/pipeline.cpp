@@ -20,6 +20,8 @@ auto classify_node(ir::NodeKind kind) noexcept -> PipelineRole {
         case ir::NodeKind::Update:
         case ir::NodeKind::Head:
         case ir::NodeKind::Tail:
+        case ir::NodeKind::FilterHead:
+        case ir::NodeKind::FilterTail:
         case ir::NodeKind::Aggregate:
         case ir::NodeKind::Order:
         case ir::NodeKind::Distinct:

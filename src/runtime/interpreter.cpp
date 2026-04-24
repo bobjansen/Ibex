@@ -7072,6 +7072,36 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return project_table(updated.value(), fup.project_columns());
         }
+        case ir::NodeKind::FilterHead: {
+            const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+            if (fh.children().empty()) {
+                return std::unexpected("filter_head node missing child");
+            }
+            auto child = interpret_node(*fh.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            auto filtered = filter_table(child.value(), fh.predicate(), scalars);
+            if (!filtered) {
+                return std::unexpected(filtered.error());
+            }
+            return head_table(filtered.value(), fh.count(), {});
+        }
+        case ir::NodeKind::FilterTail: {
+            const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+            if (ft.children().empty()) {
+                return std::unexpected("filter_tail node missing child");
+            }
+            auto child = interpret_node(*ft.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            auto filtered = filter_table(child.value(), ft.predicate(), scalars);
+            if (!filtered) {
+                return std::unexpected(filtered.error());
+            }
+            return tail_table(filtered.value(), ft.count(), {});
+        }
     }
     return std::unexpected("unknown node kind");
 }
@@ -10343,6 +10373,34 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             std::move(child_op.value()), &fp.predicate(), &fp.columns(), scalars);
     }
 
+    // Fused Head(Filter(x)) / Tail(Filter(x)) produced by canonicalize R7/R8.
+    if (node.kind() == ir::NodeKind::FilterHead) {
+        const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+        if (fh.children().empty()) {
+            return std::unexpected("filter_head node missing child");
+        }
+        auto child_op =
+            build_operator(*fh.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedFilterHeadOperator>(std::move(child_op.value()),
+                                                           &fh.predicate(), fh.count(), scalars);
+    }
+    if (node.kind() == ir::NodeKind::FilterTail) {
+        const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+        if (ft.children().empty()) {
+            return std::unexpected("filter_tail node missing child");
+        }
+        auto child_op =
+            build_operator(*ft.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        return std::make_unique<ChunkedFilterTailOperator>(std::move(child_op.value()),
+                                                           &ft.predicate(), ft.count(), scalars);
+    }
+
     // Fused Project(Update(Filter(x))) produced by canonicalize R6. The
     // gather set (columns the update reads ∪ projected columns not produced
     // by the update) is recomputed here from the node payload.
@@ -10492,21 +10550,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 std::move(child_op.value()), &order.keys(), head.count(), &head.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::First);
         }
-        // Head past Project/Rename chains is handled by the IR canonicalize
-        // pass (see src/ir/canonicalize.cpp rule R4), so Head arrives here
-        // sitting directly on Filter or the scan when group_by is empty.
-        if (head.group_by().empty() && head.children().front()->kind() == ir::NodeKind::Filter) {
-            const auto& filter = static_cast<const ir::FilterNode&>(*head.children().front());
-            if (!filter.children().empty()) {
-                auto child_op = build_operator(*filter.children().front(), registry, scalars,
-                                               externs, model_out);
-                if (!child_op.has_value()) {
-                    return std::unexpected(std::move(child_op.error()));
-                }
-                return std::make_unique<ChunkedFilterHeadOperator>(
-                    std::move(child_op.value()), &filter.predicate(), head.count(), scalars);
-            }
-        }
+        // Head(Filter(x)) with no group_by is rewritten by canonicalize R7
+        // into FilterHead(x); Head past Project/Rename is handled by R4.
         auto child_op =
             build_operator(*head.children().front(), registry, scalars, externs, model_out);
         if (!child_op.has_value()) {
@@ -10535,20 +10580,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 std::move(child_op.value()), &order.keys(), tail.count(), &tail.group_by(),
                 ChunkedOrderedLimitOperator::KeepMode::Last);
         }
-        // Tail past Project/Rename chains is handled by canonicalize rule R4;
-        // Tail arrives here directly above Filter or the scan.
-        if (tail.group_by().empty() && tail.children().front()->kind() == ir::NodeKind::Filter) {
-            const auto& filter = static_cast<const ir::FilterNode&>(*tail.children().front());
-            if (!filter.children().empty()) {
-                auto child_op = build_operator(*filter.children().front(), registry, scalars,
-                                               externs, model_out);
-                if (!child_op.has_value()) {
-                    return std::unexpected(std::move(child_op.error()));
-                }
-                return std::make_unique<ChunkedFilterTailOperator>(
-                    std::move(child_op.value()), &filter.predicate(), tail.count(), scalars);
-            }
-        }
+        // Tail(Filter(x)) with no group_by is rewritten by canonicalize R8
+        // into FilterTail(x); Tail past Project/Rename is handled by R4.
         return build_unary_materializing_operator(
             *tail.children().front(), registry, scalars, externs, model_out,
             [&](Table input) { return tail_table(input, tail.count(), tail.group_by()); });

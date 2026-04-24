@@ -211,6 +211,43 @@ auto rewrite_root(NodePtr node) -> NodePtr {
             }
         }
 
+        // R7/R8: Head(Filter(x)) → FilterHead(x), Tail(Filter(x)) → FilterTail(x)
+        // when the Head/Tail has no group_by. The fused operator stops pulling
+        // from the source as soon as n surviving rows are found (Head) or
+        // maintains only a rolling tail buffer (Tail).
+        if ((kind == NodeKind::Head || kind == NodeKind::Tail) && !node->children().empty() &&
+            node->children().front()->kind() == NodeKind::Filter) {
+            const auto& group_by = (kind == NodeKind::Head)
+                                       ? static_cast<const HeadNode&>(*node).group_by()
+                                       : static_cast<const TailNode&>(*node).group_by();
+            if (group_by.empty()) {
+                const auto count = (kind == NodeKind::Head)
+                                       ? static_cast<const HeadNode&>(*node).count()
+                                       : static_cast<const TailNode&>(*node).count();
+                const auto fused_id = node->id();
+                NodePtr limit_owned = std::move(node);
+                NodePtr filter_owned = take_unique_child(*limit_owned);
+                auto& filter = static_cast<FilterNode&>(*filter_owned);
+                if (!filter.children().empty()) {
+                    NodePtr x = take_unique_child(filter);
+                    FilterExprPtr pred = filter.take_predicate();
+                    NodePtr fused;
+                    if (kind == NodeKind::Head) {
+                        fused = std::make_unique<FilterHeadNode>(fused_id, std::move(pred), count);
+                    } else {
+                        fused = std::make_unique<FilterTailNode>(fused_id, std::move(pred), count);
+                    }
+                    fused->add_child(std::move(x));
+                    node = std::move(fused);
+                    changed = true;
+                    continue;
+                }
+                // Malformed: put it back.
+                limit_owned->add_child(std::move(filter_owned));
+                node = std::move(limit_owned);
+            }
+        }
+
         // R4: Head/Tail past Project and Rename.
         if (kind == NodeKind::Head || kind == NodeKind::Tail) {
             if (node->children().empty()) {

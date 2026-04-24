@@ -39,6 +39,10 @@ namespace ibex::ir {
 ///                                                                   remapped new→old; bubbles
 ///                                                                   Rename toward the root so
 ///                                                                   it composes via R9.
+///  R12. `Filter(Update(x))`          → `Update(Filter(x))`        — only when the Update is
+///                                                                   row-local AND the predicate
+///                                                                   references no column the
+///                                                                   Update produces. Feeds R6.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

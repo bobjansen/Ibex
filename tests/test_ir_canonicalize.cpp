@@ -211,17 +211,80 @@ TEST_CASE("canonicalize R8: Tail(Filter(x)) fuses to FilterTail(x)", "[ir][canon
     REQUIRE(ft.count() == 5);
 }
 
-TEST_CASE("canonicalize composes R3 then R1: Filter(Order(Rename(x)))", "[ir][canonicalize]") {
+namespace {
+
+auto make_filter_cmp_col(ir::NodeId id, std::string col_name, std::int64_t threshold)
+    -> ir::NodePtr {
+    auto left = std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{.node = ir::FilterColumn{.name = std::move(col_name)}});
+    auto right = std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{.node = ir::FilterLiteral{.value = threshold}});
+    auto cmp = std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+        .node = ir::FilterCmp{
+            .op = ir::CompareOp::Lt, .left = std::move(left), .right = std::move(right)}});
+    return std::make_unique<ir::FilterNode>(id, std::move(cmp));
+}
+
+}  // namespace
+
+TEST_CASE("canonicalize R9: Rename(Rename(x)) composes to single Rename", "[ir][canonicalize]") {
+    // Outer: a→final; inner: raw→a.  Composed: raw→final.
+    auto tree = with_child(
+        make_rename({1}, {{.new_name = "final", .old_name = "a"}}),
+        with_child(make_rename({2}, {{.new_name = "a", .old_name = "raw"}}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Rename);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+    const auto& rn = static_cast<const ir::RenameNode&>(*out);
+    REQUIRE(rn.renames().size() == 1);
+    REQUIRE(rn.renames().front().new_name == "final");
+    REQUIRE(rn.renames().front().old_name == "raw");
+}
+
+TEST_CASE("canonicalize R9: opposing renames cancel", "[ir][canonicalize]") {
+    // k→key then key→k should cancel to nothing.
+    auto tree = with_child(
+        make_rename({1}, {{.new_name = "k", .old_name = "key"}}),
+        with_child(make_rename({2}, {{.new_name = "key", .old_name = "k"}}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R10: drops identity Rename", "[ir][canonicalize]") {
+    auto tree =
+        with_child(make_rename({1}, {{.new_name = "a", .old_name = "a"}}), make_scan({2}, "t"));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R11: Filter(Rename(x)) bubbles Rename up with remapped predicate",
+          "[ir][canonicalize]") {
+    auto tree = with_child(
+        make_filter_cmp_col({1}, "key", 500),
+        with_child(make_rename({2}, {{.new_name = "key", .old_name = "k"}}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Rename);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
+    // The predicate's column ref should now reference the pre-rename name "k".
+    const auto& filter = static_cast<const ir::FilterNode&>(*out->children().front());
+    const auto& cmp = std::get<ir::FilterCmp>(filter.predicate().node);
+    const auto& col = std::get<ir::FilterColumn>(cmp.left->node);
+    REQUIRE(col.name == "k");
+}
+
+TEST_CASE("canonicalize composes R3, R11, R1: Filter(Order(Rename(x)))", "[ir][canonicalize]") {
     auto tree =
         with_child(make_filter({1}),
                    with_child(make_order({2}, {{.name = "key", .ascending = true}}),
                               with_child(make_rename({3}, {{.new_name = "key", .old_name = "k"}}),
                                          make_scan({4}, "t"))));
     auto out = ir::canonicalize(std::move(tree));
-    // R3 first rewrites Order(Rename) to Rename(Order); then Filter sits above
-    // Rename. No further rules apply to Filter(Rename), so the final shape is
-    // Filter(Rename(Order(Scan))). The sort still runs on the pre-rename schema.
-    REQUIRE(out->kind() == ir::NodeKind::Filter);
-    REQUIRE(out->children().front()->kind() == ir::NodeKind::Rename);
-    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Order);
+    // R3 rewrites Order(Rename) → Rename(Order); R11 then lifts Rename above
+    // Filter; R1 sinks Filter below Order. Final shape: Rename(Order(Filter(Scan)))
+    // — the sort runs on already-filtered rows with the pre-rename schema.
+    REQUIRE(out->kind() == ir::NodeKind::Rename);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Order);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->children().front()->children().front()->kind() ==
+            ir::NodeKind::Scan);
 }

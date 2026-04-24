@@ -33,6 +33,12 @@ namespace ibex::ir {
 ///                                                                   no group_by.
 ///   R8. `Tail(Filter(x))`            → `FilterTail(x)`            — only when the Tail has
 ///                                                                   no group_by.
+///   R9. `Rename(Rename(x))`          → single `Rename(x)` composed; identity pairs dropped.
+///  R10. Rename with no entries (or all identity) is dropped.
+///  R11. `Filter(Rename(x))`          → `Rename(Filter'(x))`       — predicate column refs
+///                                                                   remapped new→old; bubbles
+///                                                                   Rename toward the root so
+///                                                                   it composes via R9.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

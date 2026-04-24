@@ -29,6 +29,10 @@ namespace ibex::ir {
 ///                                                                   (no tuple_fields, no
 ///                                                                   group_by, no cross-row
 ///                                                                   callees).
+///   R7. `Head(Filter(x))`            → `FilterHead(x)`            — only when the Head has
+///                                                                   no group_by.
+///   R8. `Tail(Filter(x))`            → `FilterTail(x)`            — only when the Tail has
+///                                                                   no group_by.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

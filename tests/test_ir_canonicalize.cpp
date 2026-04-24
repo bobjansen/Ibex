@@ -182,6 +182,35 @@ TEST_CASE("canonicalize R6: Project(Update(Filter(x))) preserved when update is 
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Update);
 }
 
+TEST_CASE("canonicalize R7: Head(Filter(x)) fuses to FilterHead(x)", "[ir][canonicalize]") {
+    auto tree = with_child(make_head({1}, 10), with_child(make_filter({2}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::FilterHead);
+    REQUIRE(out->children().size() == 1);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+    const auto& fh = static_cast<const ir::FilterHeadNode&>(*out);
+    REQUIRE(fh.count() == 10);
+}
+
+TEST_CASE("canonicalize R7: Head(Filter(x)) preserved when Head has group_by",
+          "[ir][canonicalize]") {
+    std::vector<ir::ColumnRef> gb{{.name = "g", .source = {0}}};
+    auto tree = with_child(make_head({1}, 10, std::move(gb)),
+                           with_child(make_filter({2}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Head);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
+}
+
+TEST_CASE("canonicalize R8: Tail(Filter(x)) fuses to FilterTail(x)", "[ir][canonicalize]") {
+    auto tree = with_child(make_tail({1}, 5), with_child(make_filter({2}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::FilterTail);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+    const auto& ft = static_cast<const ir::FilterTailNode&>(*out);
+    REQUIRE(ft.count() == 5);
+}
+
 TEST_CASE("canonicalize composes R3 then R1: Filter(Order(Rename(x)))", "[ir][canonicalize]") {
     auto tree =
         with_child(make_filter({1}),

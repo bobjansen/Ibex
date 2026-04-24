@@ -966,6 +966,31 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             *out_ << "});\n";
             return pvar;
         }
+        case ir::NodeKind::FilterHead: {
+            // Fused shape produced by canonicalize R7. Emit as filter + head —
+            // the ops layer has no fused primitive.
+            const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+            auto child = emit_node(require_single_child(fh, "FilterHeadNode"));
+            auto fvar = fresh_var();
+            *out_ << "    auto " << fvar << " = ibex::ops::filter(" << child << ", "
+                  << emit_filter_expr(fh.predicate()) << ");\n";
+            auto hvar = fresh_var();
+            *out_ << "    auto " << hvar << " = ibex::ops::head(" << fvar << ", " << fh.count()
+                  << ", {});\n";
+            return hvar;
+        }
+        case ir::NodeKind::FilterTail: {
+            // Fused shape produced by canonicalize R8. Emit as filter + tail.
+            const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+            auto child = emit_node(require_single_child(ft, "FilterTailNode"));
+            auto fvar = fresh_var();
+            *out_ << "    auto " << fvar << " = ibex::ops::filter(" << child << ", "
+                  << emit_filter_expr(ft.predicate()) << ");\n";
+            auto tvar = fresh_var();
+            *out_ << "    auto " << tvar << " = ibex::ops::tail(" << fvar << ", " << ft.count()
+                  << ", {});\n";
+            return tvar;
+        }
         case ir::NodeKind::Program: {
             // NOLINTNEXTLINE cppcoreguidelines-pro-type-static-cast-downcast
             const auto& prog = static_cast<const ir::ProgramNode&>(node);

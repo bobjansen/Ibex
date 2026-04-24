@@ -228,6 +228,8 @@ enum class NodeKind : std::uint8_t {
     Model,          ///< Model fitting: formula → ModelResult.
     FilterProject,  ///< Fused Project(Filter(x)) — produced by canonicalize R5.
     FilterUpdateProject,  ///< Fused Project(Update(Filter(x))) — produced by canonicalize R6.
+    FilterHead,           ///< Fused Head(Filter(x)) — produced by canonicalize R7.
+    FilterTail,           ///< Fused Tail(Filter(x)) — produced by canonicalize R8.
 };
 
 /// How a StreamNode triggers output emission.
@@ -802,6 +804,36 @@ class FilterUpdateProjectNode final : public Node {
     FilterExprPtr predicate_;
     std::vector<FieldSpec> fields_;
     std::vector<ColumnRef> project_columns_;
+};
+
+/// Fused Head(Filter(x)) — produced by canonicalize R7 when the Head has
+/// no group_by. The single child is the pre-filter input `x`.
+class FilterHeadNode final : public Node {
+   public:
+    FilterHeadNode(NodeId id, FilterExprPtr predicate, std::size_t count)
+        : Node(NodeKind::FilterHead, id), predicate_(std::move(predicate)), count_(count) {}
+
+    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
+
+   private:
+    FilterExprPtr predicate_;
+    std::size_t count_;
+};
+
+/// Fused Tail(Filter(x)) — produced by canonicalize R8 when the Tail has
+/// no group_by. The single child is the pre-filter input `x`.
+class FilterTailNode final : public Node {
+   public:
+    FilterTailNode(NodeId id, FilterExprPtr predicate, std::size_t count)
+        : Node(NodeKind::FilterTail, id), predicate_(std::move(predicate)), count_(count) {}
+
+    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
+
+   private:
+    FilterExprPtr predicate_;
+    std::size_t count_;
 };
 
 }  // namespace ibex::ir

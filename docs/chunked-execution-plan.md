@@ -105,9 +105,17 @@ operator-level pattern rewrites in `build_operator`. Measured wins on a 2M
 Order-delay past `Rename` now rewrites `Order(Rename(x))` to
 `Rename(Order(x))` with keys remapped `new→old`, so the sort runs against
 the pre-rename schema and composes with the Filter/Project Order-delay
-rewrites beneath it. Remaining opportunity: pulling `Order` past
-`Aggregate`/`Distinct` boundaries (which drop ordering, so the rewrite
-would need to re-establish it via the aggregate's own sort when present).
+rewrites beneath it.
+
+Pulling `Order` past `Aggregate`/`Distinct` was measured and skipped:
+hash-based `Aggregate` emits groups in first-seen order (not sorted), so
+an outer `Order` on the K aggregated rows is the only way to get sorted
+output, and sorting K rows is negligible. `tools/ibex_fusion_bench` shows
+`agg_then_order_1k_groups` ≈ 54ms and `agg_then_order_100_groups` ≈ 66ms
+on 2M rows, dominated by the aggregate itself. Pulling `Order` under
+`Aggregate` would sort N rows to save sorting K≪N — a regression. The
+real win here is a streaming sort-based `Aggregate` operator, not an IR
+rewrite.
 
 ## Later Phases
 

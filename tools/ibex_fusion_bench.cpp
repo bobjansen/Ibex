@@ -225,6 +225,13 @@ auto main(int argc, char** argv) -> int {
         // falls back to concat + order_table (spec §9.1).
         {"tf_sorted_as_timeframe", "as_timeframe(tf_sorted, \"ts\")"},
         {"wide_as_timeframe_unsorted", "as_timeframe(wide, \"c0\")"},
+        // Order-after-Aggregate measurement: aggregate reduces 2M rows to K groups;
+        // sorting K rows afterwards is cheap. Confirms pulling Order under Aggregate
+        // has no payoff at current scales.
+        {"agg_then_order_1k_groups",
+         "wide[update { g = c0 % 1000 }][by g, select { g, s = sum(c1) }][order s desc]"},
+        {"agg_then_order_100_groups",
+         "wide[update { g = c0 % 100 }][by g, select { g, s = sum(c1) }][order s desc]"},
     };
 
     int status = 0;

@@ -80,6 +80,62 @@ auto remap_group_by_through_rename(std::vector<ColumnRef> group_by,
     return group_by;
 }
 
+// Remap FilterColumn references inside a FilterExpr tree new→old.
+void remap_filter_expr_through_rename(FilterExpr& expr,
+                                      const std::unordered_map<std::string, std::string>& n2o) {
+    std::visit(
+        [&](auto& n) {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, FilterColumn>) {
+                auto it = n2o.find(n.name);
+                if (it != n2o.end()) {
+                    n.name = it->second;
+                }
+            } else if constexpr (std::is_same_v<T, FilterArith> || std::is_same_v<T, FilterCmp> ||
+                                 std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
+                remap_filter_expr_through_rename(*n.left, n2o);
+                remap_filter_expr_through_rename(*n.right, n2o);
+            } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
+                                 std::is_same_v<T, FilterIsNotNull>) {
+                remap_filter_expr_through_rename(*n.operand, n2o);
+            }
+        },
+        expr.node);
+}
+
+// Compose outer(inner): the outer rename's old_name that matches an inner
+// new_name should reach through to the inner old_name. Identity pairs
+// (new == old) are dropped in the result.
+auto compose_renames(const std::vector<RenameSpec>& outer, const std::vector<RenameSpec>& inner)
+    -> std::vector<RenameSpec> {
+    std::unordered_map<std::string, std::string> inner_new_to_old;
+    inner_new_to_old.reserve(inner.size());
+    for (const auto& rs : inner) {
+        inner_new_to_old.emplace(rs.new_name, rs.old_name);
+    }
+    std::unordered_set<std::string> used_inner;
+    used_inner.reserve(inner.size());
+    std::vector<RenameSpec> out;
+    out.reserve(outer.size() + inner.size());
+    for (const auto& rs : outer) {
+        std::string old = rs.old_name;
+        auto it = inner_new_to_old.find(old);
+        if (it != inner_new_to_old.end()) {
+            used_inner.insert(it->first);
+            old = it->second;
+        }
+        if (rs.new_name != old) {
+            out.push_back(RenameSpec{.new_name = rs.new_name, .old_name = old});
+        }
+    }
+    for (const auto& rs : inner) {
+        if (!used_inner.contains(rs.new_name) && rs.new_name != rs.old_name) {
+            out.push_back(rs);
+        }
+    }
+    return out;
+}
+
 auto canon(NodePtr node) -> NodePtr;
 
 // Apply the rewrite rules at this node's root, looping until a fixpoint is
@@ -142,6 +198,71 @@ auto rewrite_root(NodePtr node) -> NodePtr {
             new_order = rewrite_root(std::move(new_order));
             rename_owned->add_child(std::move(new_order));
             node = std::move(rename_owned);
+            changed = true;
+            continue;
+        }
+
+        // R9: Rename(Rename(x)) → Rename(x) with composed mappings. Identity
+        // pairs (new == old) drop out of the result.
+        if (kind == NodeKind::Rename && !node->children().empty() &&
+            node->children().front()->kind() == NodeKind::Rename) {
+            const auto& outer = static_cast<const RenameNode&>(*node);
+            const auto& inner = static_cast<const RenameNode&>(*node->children().front());
+            auto composed = compose_renames(outer.renames(), inner.renames());
+            const auto merged_id = node->id();
+            NodePtr outer_owned = std::move(node);
+            NodePtr inner_owned = take_unique_child(*outer_owned);
+            NodePtr x = take_unique_child(*inner_owned);
+            if (composed.empty()) {
+                node = std::move(x);
+            } else {
+                auto merged = std::make_unique<RenameNode>(merged_id, std::move(composed));
+                merged->add_child(std::move(x));
+                node = std::move(merged);
+            }
+            changed = true;
+            continue;
+        }
+
+        // R10: Drop a Rename whose entries are all identity (new == old) or
+        // empty. Safe: produces the same schema as its input.
+        if (kind == NodeKind::Rename && !node->children().empty()) {
+            const auto& rn = static_cast<const RenameNode&>(*node);
+            const bool all_identity =
+                std::all_of(rn.renames().begin(), rn.renames().end(),
+                            [](const RenameSpec& rs) { return rs.new_name == rs.old_name; });
+            if (rn.renames().empty() || all_identity) {
+                NodePtr rename_owned = std::move(node);
+                node = take_unique_child(*rename_owned);
+                changed = true;
+                continue;
+            }
+        }
+
+        // R11: Filter(Rename(x)) → Rename(Filter'(x)) with the predicate's
+        // column references remapped new→old. Symmetric to R3 for Order;
+        // bubbles Rename toward the root so it can compose via R9 and stop
+        // blocking Project/Filter fusions beneath it.
+        if (kind == NodeKind::Filter && !node->children().empty() &&
+            node->children().front()->kind() == NodeKind::Rename) {
+            auto& filter = static_cast<FilterNode&>(*node);
+            const auto& rename = static_cast<const RenameNode&>(*node->children().front());
+            std::unordered_map<std::string, std::string> n2o;
+            n2o.reserve(rename.renames().size());
+            for (const auto& rs : rename.renames()) {
+                n2o.emplace(rs.new_name, rs.old_name);
+            }
+            FilterExprPtr pred = filter.take_predicate();
+            remap_filter_expr_through_rename(*pred, n2o);
+            const auto filter_id = node->id();
+            NodePtr filter_owned = std::move(node);
+            NodePtr rename_owned = take_unique_child(*filter_owned);
+            NodePtr x = take_unique_child(*rename_owned);
+            auto new_filter = std::make_unique<FilterNode>(filter_id, std::move(pred));
+            new_filter->add_child(std::move(x));
+            NodePtr bubbled = rewrite_root(std::move(new_filter));
+            rename_owned->add_child(std::move(bubbled));
+            node = rewrite_root(std::move(rename_owned));
             changed = true;
             continue;
         }

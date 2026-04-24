@@ -308,6 +308,62 @@ TEST_CASE("canonicalize R12 then R6: Project(Filter(Update(x))) fuses end-to-end
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
 }
 
+TEST_CASE("canonicalize R13: Head(Head(x)) collapses to tighter bound", "[ir][canonicalize]") {
+    auto tree =
+        with_child(make_head({1}, 10), with_child(make_head({2}, 100), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Head);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+    const auto& h = static_cast<const ir::HeadNode&>(*out);
+    REQUIRE(h.count() == 10);
+}
+
+TEST_CASE("canonicalize R14: Tail(Tail(x)) collapses to tighter bound", "[ir][canonicalize]") {
+    auto tree =
+        with_child(make_tail({1}, 1000), with_child(make_tail({2}, 50), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Tail);
+    const auto& t = static_cast<const ir::TailNode&>(*out);
+    REQUIRE(t.count() == 50);
+}
+
+namespace {
+
+auto make_filter_eq_const(ir::NodeId id, std::string col_name, std::int64_t value) -> ir::NodePtr {
+    auto left = std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{.node = ir::FilterColumn{.name = std::move(col_name)}});
+    auto right =
+        std::make_unique<ir::FilterExpr>(ir::FilterExpr{.node = ir::FilterLiteral{.value = value}});
+    auto eq = std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+        .node = ir::FilterCmp{
+            .op = ir::CompareOp::Eq, .left = std::move(left), .right = std::move(right)}});
+    return std::make_unique<ir::FilterNode>(id, std::move(eq));
+}
+
+}  // namespace
+
+TEST_CASE("canonicalize R15: Order key pinned by equality Filter is dropped",
+          "[ir][canonicalize]") {
+    // filter a == 5, order a asc, b desc  — `a` is constant so Order on `a`
+    // is redundant; `b` remains.
+    auto tree = with_child(
+        make_order({1}, {{.name = "a", .ascending = true}, {.name = "b", .ascending = false}}),
+        with_child(make_filter_eq_const({2}, "a", 5), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Order);
+    const auto& order = static_cast<const ir::OrderNode&>(*out);
+    REQUIRE(order.keys().size() == 1);
+    REQUIRE(order.keys().front().name == "b");
+}
+
+TEST_CASE("canonicalize R15: Order dissolves when all keys are pinned", "[ir][canonicalize]") {
+    auto tree = with_child(make_order({1}, {{.name = "a", .ascending = true}}),
+                           with_child(make_filter_eq_const({2}, "a", 5), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+}
+
 TEST_CASE("canonicalize composes R3, R11, R1: Filter(Order(Rename(x)))", "[ir][canonicalize]") {
     auto tree =
         with_child(make_filter({1}),

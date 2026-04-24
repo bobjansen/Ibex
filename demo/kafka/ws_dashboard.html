@@ -271,8 +271,8 @@
 <body>
   <main class="shell">
     <section class="hero">
-      <div class="eyebrow">Ibex + Kafka + WebSocket</div>
-      <h1>Live Tick Dashboard</h1>
+      <div id="hero-eyebrow" class="eyebrow">Ibex + Kafka + WebSocket</div>
+      <h1 id="hero-title">Live Tick Dashboard</h1>
       <p class="sub">
         Redpanda publishes random ticks, one Ibex stream turns them into grouped
         activity summaries, and a second Ibex stream resamples them into 5-second
@@ -281,11 +281,11 @@
       <div class="meta">
         <div id="summary-status" class="pill status-connecting">
           <span class="status-dot"></span>
-          <span id="summary-status-text">Summary feed connecting to ws://127.0.0.1:8765</span>
+          <span id="summary-status-text">Summary feed connecting…</span>
         </div>
         <div id="ohlc-status" class="pill status-connecting">
           <span class="status-dot"></span>
-          <span id="ohlc-status-text">OHLC feed connecting to ws://127.0.0.1:8766</span>
+          <span id="ohlc-status-text">OHLC feed connecting…</span>
         </div>
       </div>
       <div class="tabs">
@@ -348,6 +348,19 @@
     const ohlcRows = [];
     const MAX_LEADERS = 8;
     const MAX_OHLC_ROWS = 40;
+    const query = new URLSearchParams(window.location.search);
+    const summaryPort = Number.parseInt(query.get("summary") ?? "8765", 10);
+    const ohlcPort = Number.parseInt(query.get("ohlc") ?? "8766", 10);
+    const eyebrowText = query.get("eyebrow");
+    const titleText = query.get("title");
+
+    if (eyebrowText) {
+      document.getElementById("hero-eyebrow").textContent = eyebrowText;
+    }
+    if (titleText) {
+      document.getElementById("hero-title").textContent = titleText;
+      document.title = titleText;
+    }
 
     const summaryStatus = {
       root: document.getElementById("summary-status"),
@@ -530,8 +543,8 @@
       });
     });
 
-    connectSocket(8765, summaryStatus, applySummary);
-    connectSocket(8766, ohlcStatus, applyOhlc);
+    connectSocket(Number.isFinite(summaryPort) ? summaryPort : 8765, summaryStatus, applySummary);
+    connectSocket(Number.isFinite(ohlcPort) ? ohlcPort : 8766, ohlcStatus, applyOhlc);
   </script>
 </body>
 </html>

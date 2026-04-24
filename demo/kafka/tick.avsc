@@ -1,0 +1,30 @@
+{
+  "type": "record",
+  "name": "tick",
+  "namespace": "ibex.demo",
+  "fields": [
+    {
+      "name": "ts",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-nanos"
+      }
+    },
+    {
+      "name": "symbol",
+      "type": "string"
+    },
+    {
+      "name": "venue",
+      "type": "string"
+    },
+    {
+      "name": "price",
+      "type": "double"
+    },
+    {
+      "name": "size",
+      "type": "long"
+    }
+  ]
+}

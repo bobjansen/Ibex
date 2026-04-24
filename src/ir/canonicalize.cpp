@@ -155,6 +155,34 @@ auto compose_renames(const std::vector<RenameSpec>& outer, const std::vector<Ren
     return out;
 }
 
+// Collect columns pinned to a literal constant by a conjunctive predicate.
+// Walks through FilterAnd nodes; any `col == literal` (or `literal == col`)
+// contributes `col`. Other shapes (OR, NOT, arithmetic, non-Eq comparisons)
+// are skipped — the column is not provably constant under those.
+void collect_equality_pinned_cols(const FilterExpr& expr, std::unordered_set<std::string>& out) {
+    std::visit(
+        [&](const auto& n) {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, FilterAnd>) {
+                collect_equality_pinned_cols(*n.left, out);
+                collect_equality_pinned_cols(*n.right, out);
+            } else if constexpr (std::is_same_v<T, FilterCmp>) {
+                if (n.op == CompareOp::Eq) {
+                    const auto* lcol = std::get_if<FilterColumn>(&n.left->node);
+                    const auto* llit = std::get_if<FilterLiteral>(&n.left->node);
+                    const auto* rcol = std::get_if<FilterColumn>(&n.right->node);
+                    const auto* rlit = std::get_if<FilterLiteral>(&n.right->node);
+                    if ((lcol != nullptr) && (rlit != nullptr)) {
+                        out.insert(lcol->name);
+                    } else if ((rcol != nullptr) && (llit != nullptr)) {
+                        out.insert(rcol->name);
+                    }
+                }
+            }
+        },
+        expr.node);
+}
+
 auto canon(NodePtr node) -> NodePtr;
 
 // Apply the rewrite rules at this node's root, looping until a fixpoint is
@@ -284,6 +312,78 @@ auto rewrite_root(NodePtr node) -> NodePtr {
             node = rewrite_root(std::move(rename_owned));
             changed = true;
             continue;
+        }
+
+        // R13/R14: Collapse Head(Head(x)) / Tail(Tail(x)) to a single node
+        // with the tighter bound. Only when both have empty group_by.
+        if ((kind == NodeKind::Head || kind == NodeKind::Tail) && !node->children().empty() &&
+            node->children().front()->kind() == kind) {
+            const auto outer_count = (kind == NodeKind::Head)
+                                         ? static_cast<const HeadNode&>(*node).count()
+                                         : static_cast<const TailNode&>(*node).count();
+            const auto& outer_gb = (kind == NodeKind::Head)
+                                       ? static_cast<const HeadNode&>(*node).group_by()
+                                       : static_cast<const TailNode&>(*node).group_by();
+            const auto& inner = *node->children().front();
+            const auto inner_count = (kind == NodeKind::Head)
+                                         ? static_cast<const HeadNode&>(inner).count()
+                                         : static_cast<const TailNode&>(inner).count();
+            const auto& inner_gb = (kind == NodeKind::Head)
+                                       ? static_cast<const HeadNode&>(inner).group_by()
+                                       : static_cast<const TailNode&>(inner).group_by();
+            if (outer_gb.empty() && inner_gb.empty()) {
+                const auto merged_count = std::min(outer_count, inner_count);
+                const auto merged_id = node->id();
+                NodePtr outer_owned = std::move(node);
+                NodePtr inner_owned = take_unique_child(*outer_owned);
+                NodePtr x = take_unique_child(*inner_owned);
+                NodePtr merged;
+                if (kind == NodeKind::Head) {
+                    merged = std::make_unique<HeadNode>(merged_id, merged_count,
+                                                        std::vector<ColumnRef>{});
+                } else {
+                    merged = std::make_unique<TailNode>(merged_id, merged_count,
+                                                        std::vector<ColumnRef>{});
+                }
+                merged->add_child(std::move(x));
+                node = std::move(merged);
+                changed = true;
+                continue;
+            }
+        }
+
+        // R15: Drop Order keys pinned to constants by an immediate Filter
+        // child. If every key drops, the Order node itself is redundant.
+        if (kind == NodeKind::Order && !node->children().empty() &&
+            node->children().front()->kind() == NodeKind::Filter) {
+            const auto& order_n = static_cast<const OrderNode&>(*node);
+            const auto& filter = static_cast<const FilterNode&>(*node->children().front());
+            std::unordered_set<std::string> pinned;
+            collect_equality_pinned_cols(filter.predicate(), pinned);
+            if (!pinned.empty()) {
+                std::vector<OrderKey> surviving;
+                surviving.reserve(order_n.keys().size());
+                for (const auto& k : order_n.keys()) {
+                    if (!pinned.contains(k.name)) {
+                        surviving.push_back(k);
+                    }
+                }
+                if (surviving.size() != order_n.keys().size()) {
+                    const auto order_id = node->id();
+                    NodePtr order_owned = std::move(node);
+                    NodePtr filter_owned = take_unique_child(*order_owned);
+                    if (surviving.empty()) {
+                        node = std::move(filter_owned);
+                    } else {
+                        auto new_order =
+                            std::make_unique<OrderNode>(order_id, std::move(surviving));
+                        new_order->add_child(std::move(filter_owned));
+                        node = std::move(new_order);
+                    }
+                    changed = true;
+                    continue;
+                }
+            }
         }
 
         // R12: Filter(Update(x)) → Update(Filter(x)) when the Update is

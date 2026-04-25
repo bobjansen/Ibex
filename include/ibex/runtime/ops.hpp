@@ -64,6 +64,13 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto tail(const runtime::Table& t, std::size_t count,
                         const std::vector<std::string>& group_by = {}) -> runtime::Table;
 
+/// Fused order + head/tail. `keep_first=true` keeps the first `count` rows
+/// after sorting (Head(Order)); `keep_first=false` keeps the last (Tail(Order)).
+/// Runs a partial heap-select internally — O(n log count) vs. O(n log n).
+[[nodiscard]] auto top_k(const runtime::Table& t, const std::vector<ir::OrderKey>& keys,
+                         std::size_t count, const std::vector<std::string>& group_by = {},
+                         bool keep_first = true) -> runtime::Table;
+
 [[nodiscard]] auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                              const std::vector<ir::AggSpec>& aggs) -> runtime::Table;
 

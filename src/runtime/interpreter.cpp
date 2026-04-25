@@ -7072,6 +7072,24 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return project_table(updated.value(), fup.project_columns());
         }
+        case ir::NodeKind::TopK: {
+            const auto& topk = static_cast<const ir::TopKNode&>(node);
+            if (topk.children().empty()) {
+                return std::unexpected("topk node missing child");
+            }
+            auto child = interpret_node(*topk.children().front(), registry, scalars, externs);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            auto sorted = order_table(child.value(), topk.keys());
+            if (!sorted) {
+                return std::unexpected(sorted.error());
+            }
+            if (topk.keep_mode() == ir::TopKNode::KeepMode::First) {
+                return head_table(sorted.value(), topk.count(), topk.group_by());
+            }
+            return tail_table(sorted.value(), topk.count(), topk.group_by());
+        }
         case ir::NodeKind::FilterHead: {
             const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
             if (fh.children().empty()) {
@@ -10531,27 +10549,33 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
     }
 
+    if (node.kind() == ir::NodeKind::TopK) {
+        // Fused Head(Order(x)) / Tail(Order(x)) — canonicalize R16. The
+        // chunked implementation uses a partial heap-select (O(n log k)).
+        const auto& topk = static_cast<const ir::TopKNode&>(node);
+        if (topk.children().empty()) {
+            return std::unexpected("topk node missing child");
+        }
+        auto child_op =
+            build_operator(*topk.children().front(), registry, scalars, externs, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        const auto keep = (topk.keep_mode() == ir::TopKNode::KeepMode::First)
+                              ? ChunkedOrderedLimitOperator::KeepMode::First
+                              : ChunkedOrderedLimitOperator::KeepMode::Last;
+        return std::make_unique<ChunkedOrderedLimitOperator>(
+            std::move(child_op.value()), &topk.keys(), topk.count(), &topk.group_by(), keep);
+    }
+
     if (node.kind() == ir::NodeKind::Head) {
         const auto& head = static_cast<const ir::HeadNode&>(node);
         if (head.children().empty()) {
             return std::unexpected("head node missing child");
         }
-        if (head.children().front()->kind() == ir::NodeKind::Order) {
-            const auto& order = static_cast<const ir::OrderNode&>(*head.children().front());
-            if (order.children().empty()) {
-                return std::unexpected("order node missing child");
-            }
-            auto child_op =
-                build_operator(*order.children().front(), registry, scalars, externs, model_out);
-            if (!child_op.has_value()) {
-                return std::unexpected(std::move(child_op.error()));
-            }
-            return std::make_unique<ChunkedOrderedLimitOperator>(
-                std::move(child_op.value()), &order.keys(), head.count(), &head.group_by(),
-                ChunkedOrderedLimitOperator::KeepMode::First);
-        }
-        // Head(Filter(x)) with no group_by is rewritten by canonicalize R7
-        // into FilterHead(x); Head past Project/Rename is handled by R4.
+        // Head(Order(x)) is rewritten by canonicalize R16 into TopK(x);
+        // Head(Filter(x)) with no group_by is rewritten by R7 into FilterHead(x);
+        // Head past Project/Rename is handled by R4.
         auto child_op =
             build_operator(*head.children().front(), registry, scalars, externs, model_out);
         if (!child_op.has_value()) {
@@ -10566,22 +10590,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (tail.children().empty()) {
             return std::unexpected("tail node missing child");
         }
-        if (tail.children().front()->kind() == ir::NodeKind::Order) {
-            const auto& order = static_cast<const ir::OrderNode&>(*tail.children().front());
-            if (order.children().empty()) {
-                return std::unexpected("order node missing child");
-            }
-            auto child_op =
-                build_operator(*order.children().front(), registry, scalars, externs, model_out);
-            if (!child_op.has_value()) {
-                return std::unexpected(std::move(child_op.error()));
-            }
-            return std::make_unique<ChunkedOrderedLimitOperator>(
-                std::move(child_op.value()), &order.keys(), tail.count(), &tail.group_by(),
-                ChunkedOrderedLimitOperator::KeepMode::Last);
-        }
-        // Tail(Filter(x)) with no group_by is rewritten by canonicalize R8
-        // into FilterTail(x); Tail past Project/Rename is handled by R4.
+        // Tail(Order(x)) → TopK via R16; Tail(Filter(x)) no-group_by → FilterTail via R8;
+        // Tail past Project/Rename via R4.
         return build_unary_materializing_operator(
             *tail.children().front(), registry, scalars, externs, model_out,
             [&](Table input) { return tail_table(input, tail.count(), tail.group_by()); });

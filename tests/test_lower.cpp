@@ -225,17 +225,15 @@ TEST_CASE("Lower head to IR") {
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    const auto* head = as_node<ir::HeadNode>(result->get());
-    REQUIRE(head != nullptr);
-    REQUIRE(head->count() == 10);
-    REQUIRE(head->group_by().empty());
-
-    REQUIRE(head->children().size() == 1);
-    const auto* order = as_node<ir::OrderNode>(head->children()[0].get());
-    REQUIRE(order != nullptr);
-    REQUIRE(order->keys().size() == 1);
-    REQUIRE(order->keys()[0].name == "price");
-    REQUIRE(order->keys()[0].ascending == false);
+    // Canonicalize R16 fuses Head(Order(x)) into TopK(..., First).
+    const auto* topk = as_node<ir::TopKNode>(result->get());
+    REQUIRE(topk != nullptr);
+    REQUIRE(topk->count() == 10);
+    REQUIRE(topk->group_by().empty());
+    REQUIRE(topk->keep_mode() == ir::TopKNode::KeepMode::First);
+    REQUIRE(topk->keys().size() == 1);
+    REQUIRE(topk->keys()[0].name == "price");
+    REQUIRE(topk->keys()[0].ascending == false);
 }
 
 TEST_CASE("Lower grouped head to IR") {
@@ -243,11 +241,12 @@ TEST_CASE("Lower grouped head to IR") {
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    const auto* head = as_node<ir::HeadNode>(result->get());
-    REQUIRE(head != nullptr);
-    REQUIRE(head->count() == 3);
-    REQUIRE(head->group_by().size() == 1);
-    REQUIRE(head->group_by()[0].name == "symbol");
+    const auto* topk = as_node<ir::TopKNode>(result->get());
+    REQUIRE(topk != nullptr);
+    REQUIRE(topk->count() == 3);
+    REQUIRE(topk->group_by().size() == 1);
+    REQUIRE(topk->group_by()[0].name == "symbol");
+    REQUIRE(topk->keep_mode() == ir::TopKNode::KeepMode::First);
 }
 
 TEST_CASE("Lower tail to IR") {
@@ -255,17 +254,14 @@ TEST_CASE("Lower tail to IR") {
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    const auto* tail = as_node<ir::TailNode>(result->get());
-    REQUIRE(tail != nullptr);
-    REQUIRE(tail->count() == 10);
-    REQUIRE(tail->group_by().empty());
-
-    REQUIRE(tail->children().size() == 1);
-    const auto* order = as_node<ir::OrderNode>(tail->children()[0].get());
-    REQUIRE(order != nullptr);
-    REQUIRE(order->keys().size() == 1);
-    REQUIRE(order->keys()[0].name == "price");
-    REQUIRE(order->keys()[0].ascending == false);
+    const auto* topk = as_node<ir::TopKNode>(result->get());
+    REQUIRE(topk != nullptr);
+    REQUIRE(topk->count() == 10);
+    REQUIRE(topk->group_by().empty());
+    REQUIRE(topk->keep_mode() == ir::TopKNode::KeepMode::Last);
+    REQUIRE(topk->keys().size() == 1);
+    REQUIRE(topk->keys()[0].name == "price");
+    REQUIRE(topk->keys()[0].ascending == false);
 }
 
 TEST_CASE("Lower grouped tail to IR") {
@@ -273,11 +269,12 @@ TEST_CASE("Lower grouped tail to IR") {
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    const auto* tail = as_node<ir::TailNode>(result->get());
-    REQUIRE(tail != nullptr);
-    REQUIRE(tail->count() == 3);
-    REQUIRE(tail->group_by().size() == 1);
-    REQUIRE(tail->group_by()[0].name == "symbol");
+    const auto* topk = as_node<ir::TopKNode>(result->get());
+    REQUIRE(topk != nullptr);
+    REQUIRE(topk->count() == 3);
+    REQUIRE(topk->group_by().size() == 1);
+    REQUIRE(topk->group_by()[0].name == "symbol");
+    REQUIRE(topk->keep_mode() == ir::TopKNode::KeepMode::Last);
 }
 
 TEST_CASE("Lowering rejects nested aggregate input") {

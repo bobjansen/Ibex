@@ -1055,10 +1055,13 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
                      runtime::ModelResult* model_out = nullptr)
     -> std::expected<EvalValue, std::string> {
+    if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
+        return eval_expr_value(*group->expr, tables, scalars, columns, models, functions,
+                               compile_time_lists, extern_decls, externs, model_out);
+    }
     if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
-        std::holds_alternative<parser::UnaryExpr>(expr.node) ||
-        std::holds_alternative<parser::GroupExpr>(expr.node)) {
+        std::holds_alternative<parser::UnaryExpr>(expr.node)) {
         auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
                                        compile_time_lists, extern_decls, externs);
         if (!scalar) {

@@ -824,6 +824,9 @@ class Lowerer {
         if (const auto* tbl = std::get_if<TableExpr>(&expr.node)) {
             return lower_table_expr(*tbl);
         }
+        if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+            return lower_expr(*group->expr);
+        }
         return std::unexpected(LowerError{.message = "expected DataFrame expression"});
     }
 
@@ -1248,7 +1251,7 @@ class Lowerer {
         }
 
         if (!state.resample && !state.melt && !state.dcast && state.select &&
-            (state.by || select_has_aggregate(expanded_select_fields))) {
+            select_has_aggregate(expanded_select_fields)) {
             auto aggregate = lower_aggregate(state.by, expanded_select_fields, std::move(node));
             if (!aggregate.has_value()) {
                 return std::unexpected(aggregate.error());

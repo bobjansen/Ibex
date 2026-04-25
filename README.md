@@ -124,41 +124,51 @@ separate plotting system or a full standalone kernel.
 
 ### Inline table construction
 
-Build a `DataFrame` directly from column vectors. Each column may be an inline
-array literal **or** any expression that produces a table:
+Use `Table { ... }` when a small lookup table, test fixture, or derived table is
+clearer inline than in a separate file. Each field defines one output column.
+The value can be either an array literal or a table expression to extract a
+column from:
 
 ```
-// Columns from array literals
-let t = Table {
+// Small in-memory data, useful for examples and joins
+let prices = Table {
     symbol = ["AAPL", "GOOG", "MSFT"],
     price  = [150.0, 140.0, 300.0],
-    volume = [1000, 2000, 1500],
+    volume = [1000, 2000, 1500]
 };
 
-// Columns from existing table expressions
-let summary = Table {
+// Build a new table from columns produced by existing pipelines
+let quote_view = Table {
+    symbol   = prices[select { symbol }],       // single-column result
+    price    = prices[select { price }],
+    notional = prices[select { notional = price * volume }]
+};
+
+// A multi-column expression is matched by the field name
+let copied = Table {
+    symbol = prices,
+    price  = prices
+};
+
+// Mix literals and expression-backed columns freely
+let enriched = Table {
     symbol = prices[select { symbol }],
-    high   = prices[select { high = max(price) }, by symbol],
-    low    = prices[select { low  = min(price) }, by symbol],
+    tier   = ["mega", "search", "software"],
+    price  = prices[select { price }]
 };
 
-// Mix literals and expressions freely
-let ref = Table {
-    label = ["a", "b", "c"],
-    value = some_df[select { value }],
-};
-
-// Promote to TimeFrame via as_timeframe
+// Inline tables are ordinary DataFrames
 let tf = as_timeframe(
     Table { ts = [1000, 2000, 3000], price = [10, 20, 30] },
     "ts"
 );
 ```
 
-All columns must have the same row count. For array literals, all elements must
-share the same type (`Int64`, `Float64`, `Bool`, `String`, `Date`, `Timestamp`).
-For expression columns, the expression must produce a single-column table or a
-table containing a column named after the definition.
+Array values infer `Int64`, `Float64`, `Bool`, `String`, `Date`, or
+`Timestamp`, and every element in one array must have the same type. Every
+column in the constructor must have the same row count. For expression-backed
+columns, a single-column result is used directly; a multi-column result must
+contain a column with the same name as the field being defined.
 
 ### Load and filter
 

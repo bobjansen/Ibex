@@ -3988,19 +3988,69 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                                                std::numeric_limits<std::uint32_t>::max());
         flat_slots.reserve(256 * (n_aggs == 0 ? 1 : n_aggs));
         group_col_codes_flat.reserve(256 * n_keys);
-        for (std::size_t row = 0; row < rows; ++row) {
-            std::uint32_t cell = 0;
-            for (std::size_t ci = 0; ci < n_keys; ++ci)
-                cell += per_col[ci].code_at(row) * static_cast<std::uint32_t>(strides[ci]);
-            std::uint32_t gid = cell_to_gid[cell];
-            if (gid == std::numeric_limits<std::uint32_t>::max()) {
-                gid = n_groups_m++;
-                cell_to_gid[cell] = gid;
-                flat_slots.insert(flat_slots.end(), tmpl.slots.begin(), tmpl.slots.end());
-                for (std::size_t ci = 0; ci < n_keys; ++ci)
-                    group_col_codes_flat.push_back(per_col[ci].code_at(row));
+
+        // Hoist per-key data out of the row loop so the compiler can see plain
+        // pointer/scalar arithmetic instead of struct access through per_col[ci].
+        // For all-categorical multi-key (the common case after CSV/Categorical
+        // inference) this collapses the inner key loop into a couple of array
+        // loads and a multiply.
+        struct KeyAccess {
+            const Column<Categorical>::code_type* cat_raw;
+            const std::uint32_t* nonsparse_codes;
+            std::uint32_t stride;
+        };
+        std::vector<KeyAccess> kacc(n_keys);
+        bool all_cat = true;
+        for (std::size_t ci = 0; ci < n_keys; ++ci) {
+            kacc[ci].cat_raw = per_col[ci].cat_raw;
+            kacc[ci].nonsparse_codes =
+                per_col[ci].cat_raw == nullptr ? per_col[ci].codes.data() : nullptr;
+            kacc[ci].stride = static_cast<std::uint32_t>(strides[ci]);
+            if (per_col[ci].cat_raw == nullptr)
+                all_cat = false;
+        }
+
+        auto code_at_fast = [&](std::size_t ci, std::size_t row) -> std::uint32_t {
+            return kacc[ci].cat_raw != nullptr ? static_cast<std::uint32_t>(kacc[ci].cat_raw[row])
+                                               : kacc[ci].nonsparse_codes[row];
+        };
+
+        if (all_cat && n_keys == 2) {
+            // Two-key all-categorical specialization: by far the dominant
+            // shape (e.g. `by {symbol, day}` over CSV-inferred columns).
+            const auto* k0 = kacc[0].cat_raw;
+            const auto* k1 = kacc[1].cat_raw;
+            const std::uint32_t s0 = kacc[0].stride;
+            const std::uint32_t s1 = kacc[1].stride;
+            std::uint32_t* const cell_to_gid_data = cell_to_gid.data();
+            for (std::size_t row = 0; row < rows; ++row) {
+                const std::uint32_t cell = static_cast<std::uint32_t>(k0[row]) * s0 +
+                                           static_cast<std::uint32_t>(k1[row]) * s1;
+                std::uint32_t gid = cell_to_gid_data[cell];
+                if (gid == std::numeric_limits<std::uint32_t>::max()) {
+                    gid = n_groups_m++;
+                    cell_to_gid_data[cell] = gid;
+                    flat_slots.insert(flat_slots.end(), tmpl.slots.begin(), tmpl.slots.end());
+                    group_col_codes_flat.push_back(static_cast<std::uint32_t>(k0[row]));
+                    group_col_codes_flat.push_back(static_cast<std::uint32_t>(k1[row]));
+                }
+                compound_gids[row] = gid;
             }
-            compound_gids[row] = gid;
+        } else {
+            for (std::size_t row = 0; row < rows; ++row) {
+                std::uint32_t cell = 0;
+                for (std::size_t ci = 0; ci < n_keys; ++ci)
+                    cell += code_at_fast(ci, row) * kacc[ci].stride;
+                std::uint32_t gid = cell_to_gid[cell];
+                if (gid == std::numeric_limits<std::uint32_t>::max()) {
+                    gid = n_groups_m++;
+                    cell_to_gid[cell] = gid;
+                    flat_slots.insert(flat_slots.end(), tmpl.slots.begin(), tmpl.slots.end());
+                    for (std::size_t ci = 0; ci < n_keys; ++ci)
+                        group_col_codes_flat.push_back(code_at_fast(ci, row));
+                }
+                compound_gids[row] = gid;
+            }
         }
     } else {
         // Fallback: hash map on the uint64_t Cartesian cell key.
@@ -9818,13 +9868,15 @@ class ChunkedAggregateOperator final : public Operator {
         for (const auto* e : group_entries) {
             cat_cols.push_back(&std::get<Column<Categorical>>(*e->column));
         }
-        const bool single_key = cat_cols.size() == 1;
+        const std::size_t n_keys = cat_cols.size();
+        const bool single_key = n_keys == 1;
 
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
-        for (std::size_t row = 0; row < rows; ++row) {
-            if (single_key) {
-                const auto code = cat_cols[0]->code_at(row);
+        if (single_key) {
+            const auto* codes = cat_cols[0]->codes_data();
+            for (std::size_t row = 0; row < rows; ++row) {
+                const auto code = codes[row];
                 auto [it, inserted] = cat_index_.emplace(code, n_groups_);
                 if (inserted) {
                     cat_order_.push_back(code);
@@ -9832,18 +9884,84 @@ class ChunkedAggregateOperator final : public Operator {
                 } else {
                     gids[row] = static_cast<std::uint32_t>(it->second);
                 }
-            } else {
-                CatKey ck;
-                ck.codes.resize(cat_cols.size());
-                for (std::size_t c = 0; c < cat_cols.size(); ++c) {
-                    ck.codes[c] = cat_cols[c]->code_at(row);
+            }
+        } else {
+            // Multi-key: encode each row as a uint64_t Cartesian cell so we
+            // avoid heap-allocating a CatKey (with its inner vector) per row.
+            // Strides may grow across chunks if a chunk introduces new dict
+            // entries; we recompute per chunk and rebuild the index when that
+            // happens (rare — Categorical dicts are usually stable).
+            std::vector<std::uint64_t> dict_sizes(n_keys);
+            for (std::size_t c = 0; c < n_keys; ++c) {
+                dict_sizes[c] = static_cast<std::uint64_t>(cat_cols[c]->dictionary().size());
+                if (dict_sizes[c] == 0)
+                    dict_sizes[c] = 1;  // avoid stride collapse
+            }
+            // Strides: cell = c0*s0 + c1*s1 + … with s_{n-1} = 1.
+            std::vector<std::uint64_t> strides(n_keys);
+            {
+                std::uint64_t s = 1;
+                for (int ci = static_cast<int>(n_keys) - 1; ci >= 0; --ci) {
+                    strides[static_cast<std::size_t>(ci)] = s;
+                    s *= dict_sizes[static_cast<std::size_t>(ci)];
                 }
-                auto [it, inserted] = multi_cat_index_.emplace(std::move(ck), n_groups_);
-                if (inserted) {
-                    multi_cat_order_.push_back(it->first);
-                    gids[row] = alloc_group();
-                } else {
-                    gids[row] = static_cast<std::uint32_t>(it->second);
+            }
+
+            // If strides changed since last chunk (new dict entries), rebuild
+            // multi_cat_cell_index_ from multi_cat_codes_flat_ using new strides.
+            if (multi_cat_strides_ != strides) {
+                multi_cat_cell_index_.clear();
+                multi_cat_cell_index_.reserve(n_groups_);
+                for (std::size_t g = 0; g < n_groups_; ++g) {
+                    std::uint64_t cell = 0;
+                    for (std::size_t c = 0; c < n_keys; ++c) {
+                        cell += static_cast<std::uint64_t>(multi_cat_codes_flat_[g * n_keys + c]) *
+                                strides[c];
+                    }
+                    multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(g));
+                }
+                multi_cat_strides_ = strides;
+            }
+
+            // Hoist raw code pointers out of the row loop.
+            std::vector<const Column<Categorical>::code_type*> raws(n_keys);
+            for (std::size_t c = 0; c < n_keys; ++c)
+                raws[c] = cat_cols[c]->codes_data();
+
+            if (n_keys == 2) {
+                const auto* k0 = raws[0];
+                const auto* k1 = raws[1];
+                const std::uint64_t s0 = strides[0];
+                const std::uint64_t s1 = strides[1];
+                for (std::size_t row = 0; row < rows; ++row) {
+                    const std::uint64_t cell = static_cast<std::uint64_t>(k0[row]) * s0 +
+                                               static_cast<std::uint64_t>(k1[row]) * s1;
+                    auto [it, inserted] =
+                        multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(n_groups_));
+                    if (inserted) {
+                        multi_cat_codes_flat_.push_back(k0[row]);
+                        multi_cat_codes_flat_.push_back(k1[row]);
+                        gids[row] = alloc_group();
+                    } else {
+                        gids[row] = it->second;
+                    }
+                }
+            } else {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    std::uint64_t cell = 0;
+                    for (std::size_t c = 0; c < n_keys; ++c) {
+                        cell += static_cast<std::uint64_t>(raws[c][row]) * strides[c];
+                    }
+                    auto [it, inserted] =
+                        multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(n_groups_));
+                    if (inserted) {
+                        for (std::size_t c = 0; c < n_keys; ++c) {
+                            multi_cat_codes_flat_.push_back(raws[c][row]);
+                        }
+                        gids[row] = alloc_group();
+                    } else {
+                        gids[row] = it->second;
+                    }
                 }
             }
         }
@@ -10063,10 +10181,10 @@ class ChunkedAggregateOperator final : public Operator {
                     auto& cat_col = std::get<Column<Categorical>>(*out.columns[0].column);
                     cat_col.push_code(cat_order_[g]);
                 } else {
-                    const auto& ck = multi_cat_order_[g];
-                    for (std::size_t ci = 0; ci < ck.codes.size(); ++ci) {
+                    const std::size_t n_keys = group_by_->size();
+                    for (std::size_t ci = 0; ci < n_keys; ++ci) {
                         auto& cat_col = std::get<Column<Categorical>>(*out.columns[ci].column);
-                        cat_col.push_code(ck.codes[ci]);
+                        cat_col.push_code(multi_cat_codes_flat_[g * n_keys + ci]);
                     }
                 }
             } else if (str_fast_path_) {
@@ -10201,9 +10319,10 @@ class ChunkedAggregateOperator final : public Operator {
     robin_hood::unordered_flat_map<cat_code, std::size_t> cat_index_;
     std::vector<cat_code> cat_order_;
 
-    // Multi-Categorical fast path.
-    robin_hood::unordered_flat_map<CatKey, std::size_t, CatKeyHash> multi_cat_index_;
-    std::vector<CatKey> multi_cat_order_;
+    // Multi-Categorical fast path: cell-encoded.
+    robin_hood::unordered_flat_map<std::uint64_t, std::uint32_t> multi_cat_cell_index_;
+    std::vector<Column<Categorical>::code_type> multi_cat_codes_flat_;  // n_groups_ × n_keys
+    std::vector<std::uint64_t> multi_cat_strides_;  // last-seen strides for rebuild detection
 
     // Single-string-key fast path.
     robin_hood::unordered_flat_map<std::string, std::size_t, StrViewHash, StrViewEq> str_index_;

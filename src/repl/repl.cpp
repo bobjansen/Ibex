@@ -664,6 +664,20 @@ auto column_type_matches(const runtime::ColumnValue& col, parser::ScalarType exp
     return false;
 }
 
+/// Validates that `column` satisfies the scalar element type declared in `type`.
+/// Returns nullopt on success, or an error message on failure.
+auto validate_column_type(const runtime::ColumnValue& column, const parser::Type& type)
+    -> std::optional<std::string> {
+    const auto* scalar = std::get_if<parser::ScalarType>(&type.arg);
+    if (scalar == nullptr) {
+        return std::nullopt;
+    }
+    if (!column_type_matches(column, *scalar)) {
+        return "column has wrong type (expected " + std::string(scalar_type_name(*scalar)) + ")";
+    }
+    return std::nullopt;
+}
+
 /// Validates that `table` satisfies the schema declared in `type`.
 /// All declared fields must be present with the correct type; extra columns are allowed.
 /// Returns nullopt on success, or an error message on failure.
@@ -1628,12 +1642,21 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 if (auto value = eval_expr_value(arg, tables, scalars, columns, models, functions,
                                                  compile_time_lists, extern_decls, externs)) {
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                        if (auto err = validate_column_type(*col, param.type)) {
+                            return std::unexpected("type mismatch for parameter '" + param.name +
+                                                   "': " + *err);
+                        }
                         local_columns.insert_or_assign(param.name, std::move(*col));
                         break;
                     }
                     if (auto* table = std::get_if<runtime::Table>(&value.value())) {
                         if (table->columns.size() != 1) {
                             return std::unexpected("Column argument must have exactly one column");
+                        }
+                        if (auto err =
+                                validate_column_type(*table->columns.front().column, param.type)) {
+                            return std::unexpected("type mismatch for parameter '" + param.name +
+                                                   "': " + *err);
                         }
                         local_columns.insert_or_assign(param.name, *table->columns.front().column);
                         break;
@@ -1803,16 +1826,26 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         if (!std::holds_alternative<runtime::Table>(*last_value)) {
             return std::unexpected("function return type mismatch (expected table)");
         }
-        return EvalValue{std::get<runtime::Table>(std::move(*last_value))};
+        auto table = std::get<runtime::Table>(std::move(*last_value));
+        if (auto err = validate_table_type(table, fn.return_type)) {
+            return std::unexpected("function return type mismatch: " + *err);
+        }
+        return EvalValue{std::move(table)};
     }
 
     if (fn.return_type.kind == parser::Type::Kind::Series) {
         if (auto* col = std::get_if<runtime::ColumnValue>(&last_value.value())) {
+            if (auto err = validate_column_type(*col, fn.return_type)) {
+                return std::unexpected("function return type mismatch: " + *err);
+            }
             return EvalValue{std::move(*col)};
         }
         if (auto* table = std::get_if<runtime::Table>(&last_value.value())) {
             if (table->columns.size() != 1) {
                 return std::unexpected("Column return must have exactly one column");
+            }
+            if (auto err = validate_column_type(*table->columns.front().column, fn.return_type)) {
+                return std::unexpected("function return type mismatch: " + *err);
             }
             return EvalValue{*table->columns.front().column};
         }

@@ -568,21 +568,24 @@ auto try_limit_collapse(NodePtr node) -> TryResult {
         node->children().front()->kind() != kind) {
         return {false, std::move(node)};
     }
-    const auto outer_count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
-                                                      : static_cast<const TailNode&>(*node).count();
+    const auto outer_count = (kind == NodeKind::Head)
+                                 ? static_cast<const HeadNode&>(*node).count_literal()
+                                 : static_cast<const TailNode&>(*node).count_literal();
     const auto& outer_gb = (kind == NodeKind::Head)
                                ? static_cast<const HeadNode&>(*node).group_by()
                                : static_cast<const TailNode&>(*node).group_by();
     const auto& inner = *node->children().front();
-    const auto inner_count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(inner).count()
-                                                      : static_cast<const TailNode&>(inner).count();
+    const auto inner_count = (kind == NodeKind::Head)
+                                 ? static_cast<const HeadNode&>(inner).count_literal()
+                                 : static_cast<const TailNode&>(inner).count_literal();
     const auto& inner_gb = (kind == NodeKind::Head)
                                ? static_cast<const HeadNode&>(inner).group_by()
                                : static_cast<const TailNode&>(inner).group_by();
-    if (!outer_gb.empty() || !inner_gb.empty()) {
+    if (!outer_gb.empty() || !inner_gb.empty() || !outer_count.has_value() ||
+        !inner_count.has_value()) {
         return {false, std::move(node)};
     }
-    const auto merged_count = std::min(outer_count, inner_count);
+    const auto merged_count = std::min(*outer_count, *inner_count);
     const auto merged_id = node->id();
     NodePtr outer_owned = std::move(node);
     NodePtr inner_owned = take_unique_child(*outer_owned);
@@ -868,8 +871,12 @@ auto try_fuse_filter_limit(NodePtr node) -> TryResult {
     if (!group_by.empty()) {
         return {false, std::move(node)};
     }
-    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
-                                                : static_cast<const TailNode&>(*node).count();
+    const auto count = (kind == NodeKind::Head)
+                           ? static_cast<const HeadNode&>(*node).count_literal()
+                           : static_cast<const TailNode&>(*node).count_literal();
+    if (!count.has_value()) {
+        return {false, std::move(node)};
+    }
     const auto fused_id = node->id();
     NodePtr limit_owned = std::move(node);
     NodePtr filter_owned = take_unique_child(*limit_owned);
@@ -882,9 +889,9 @@ auto try_fuse_filter_limit(NodePtr node) -> TryResult {
     FilterExprPtr pred = filter.take_predicate();
     NodePtr fused;
     if (kind == NodeKind::Head) {
-        fused = std::make_unique<FilterHeadNode>(fused_id, std::move(pred), count);
+        fused = std::make_unique<FilterHeadNode>(fused_id, std::move(pred), *count);
     } else {
-        fused = std::make_unique<FilterTailNode>(fused_id, std::move(pred), count);
+        fused = std::make_unique<FilterTailNode>(fused_id, std::move(pred), *count);
     }
     fused->add_child(std::move(x));
     return {true, std::move(fused)};
@@ -900,8 +907,12 @@ auto try_fuse_topk(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Order) {
         return {false, std::move(node)};
     }
-    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
-                                                : static_cast<const TailNode&>(*node).count();
+    const auto count = (kind == NodeKind::Head)
+                           ? static_cast<const HeadNode&>(*node).count_literal()
+                           : static_cast<const TailNode&>(*node).count_literal();
+    if (!count.has_value()) {
+        return {false, std::move(node)};
+    }
     std::vector<ColumnRef> group_by = (kind == NodeKind::Head)
                                           ? static_cast<const HeadNode&>(*node).group_by()
                                           : static_cast<const TailNode&>(*node).group_by();
@@ -917,7 +928,7 @@ auto try_fuse_topk(NodePtr node) -> TryResult {
     }
     std::vector<OrderKey> keys = order_n.keys();
     NodePtr x = take_unique_child(order_n);
-    auto fused = std::make_unique<TopKNode>(fused_id, std::move(keys), count, std::move(group_by),
+    auto fused = std::make_unique<TopKNode>(fused_id, std::move(keys), *count, std::move(group_by),
                                             keep_mode);
     fused->add_child(std::move(x));
     return {true, std::move(fused)};
@@ -949,8 +960,8 @@ auto try_limit_past_metadata(NodePtr node) -> TryResult {
     if (!safe) {
         return {false, std::move(node)};
     }
-    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
-                                                : static_cast<const TailNode&>(*node).count();
+    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count_expr()
+                                                : static_cast<const TailNode&>(*node).count_expr();
     const auto limit_id = node->id();
     NodePtr limit = std::move(node);
     NodePtr wrapper = take_unique_child(*limit);

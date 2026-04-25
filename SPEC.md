@@ -1180,6 +1180,7 @@ this gives the usual “top-k” behaviour:
 
 ```
 trades[order { score desc }, head 10]
+trades[head n]
 ```
 
 When combined with `by`, `head` keeps the first `n` rows **per group** in the
@@ -1191,7 +1192,10 @@ trades[order { score desc }, head 3, by symbol]
 
 Rules:
 
+- `n` may be an integer literal or any scalar expression that evaluates to
+  `Int64`.
 - `head 0` returns the same schema with zero rows.
+- negative `n` is a runtime error.
 - Without `order`, “first” means encounter order of the input/result rows.
 - With `by`, the implementation counts rows per group while scanning the
   current row order; rows that exceed the per-group quota are dropped.
@@ -1205,6 +1209,7 @@ this gives the usual “bottom-k” behaviour:
 
 ```
 trades[order { score desc }, tail 10]
+trades[tail n]
 ```
 
 When combined with `by`, `tail` keeps the last `n` rows **per group** in the
@@ -1216,7 +1221,10 @@ trades[order { score desc }, tail 3, by symbol]
 
 Rules:
 
+- `n` may be an integer literal or any scalar expression that evaluates to
+  `Int64`.
 - `tail 0` returns the same schema with zero rows.
+- negative `n` is a runtime error.
 - Without `order`, “last” means the trailing encounter order of the input/result rows.
 - With `by`, the implementation keeps the trailing `n` rows per group while
   preserving their encounter order within each group.

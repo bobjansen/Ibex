@@ -1,0 +1,54 @@
+import "csv";
+
+let employee = read_csv(
+    "examples/leetcode/data/employee_second_highest.csv",
+    "",
+    ",",
+    true,
+    "id:int,salary:int"
+);
+
+// LeetCode 176: Second Highest Salary.
+//
+// Translation pattern:
+// 1. Keep unique salaries only.
+// 2. Order descending and keep the top two.
+// 3. If two unique salaries exist, the minimum of those two is the answer.
+// 4. Left join against a one-row dummy table to force a one-row null result
+//    when there is no second-highest salary.
+
+fn top_two_salaries(df: DataFrame<{salary: Int64}>) -> DataFrame<{salary: Int64}> effects {} {
+    df[
+        distinct { salary },
+        order { salary desc },
+        head 2
+    ];
+}
+
+fn second_highest_salary(df: DataFrame<{salary: Int64}>)
+    -> DataFrame<{second_highest_salary: Int64}> effects {} {
+    let top_two = top_two_salaries(df);
+
+    let second_salary =
+        top_two[
+        select {
+            dummy = 1,
+            second_highest_salary = min(salary),
+            n = count()
+        }
+    ][
+        filter n == 2
+    ];
+
+    let result =
+        (
+            Table { dummy = [1] }
+            left join second_salary on dummy
+        )[
+        select { second_highest_salary }
+    ];
+
+    result;
+}
+
+second_highest_salary(employee);

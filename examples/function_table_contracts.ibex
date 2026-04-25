@@ -1,0 +1,22 @@
+import "csv";
+
+let employee = read_csv(
+    "examples/leetcode/data/employee_second_highest.csv",
+    "",
+    ",",
+    true,
+    "id:int,salary:int"
+);
+
+// Functions can already express "this table must contain these columns".
+// Extra columns are allowed; only the declared contract is validated.
+
+fn top_two_salaries(df: DataFrame<{salary: Int64}>) -> DataFrame effects {} {
+    df[
+        distinct { salary },
+        order { salary desc },
+        head 2
+    ];
+}
+
+top_two_salaries(employee);

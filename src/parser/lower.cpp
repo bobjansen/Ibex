@@ -100,6 +100,10 @@ auto clone_clause(const Clause& clause) -> Clause {
                     out.fields.push_back(clone_field(f));
                 }
                 return out;
+            } else if constexpr (std::is_same_v<T, HeadClause>) {
+                return HeadClause{.count = clone_expr(*c.count)};
+            } else if constexpr (std::is_same_v<T, TailClause>) {
+                return TailClause{.count = clone_expr(*c.count)};
             } else if constexpr (std::is_same_v<T, ByClause>) {
                 ByClause out{.keys = {}, .is_braced = c.is_braced};
                 out.keys.reserve(c.keys.size());
@@ -1410,8 +1414,11 @@ class Lowerer {
                 }
                 head_group_by = std::move(group_by_result.value());
             }
-            auto head_node = builder_.head(static_cast<std::size_t>(state.head->count),
-                                           std::move(head_group_by));
+            auto count_expr = lower_expr_to_ir(*state.head->count);
+            if (!count_expr.has_value()) {
+                return std::unexpected(count_expr.error());
+            }
+            auto head_node = builder_.head(std::move(count_expr.value()), std::move(head_group_by));
             head_node->add_child(std::move(node));
             node = std::move(head_node);
         }
@@ -1425,8 +1432,11 @@ class Lowerer {
                 }
                 tail_group_by = std::move(group_by_result.value());
             }
-            auto tail_node = builder_.tail(static_cast<std::size_t>(state.tail->count),
-                                           std::move(tail_group_by));
+            auto count_expr = lower_expr_to_ir(*state.tail->count);
+            if (!count_expr.has_value()) {
+                return std::unexpected(count_expr.error());
+            }
+            auto tail_node = builder_.tail(std::move(count_expr.value()), std::move(tail_group_by));
             tail_node->add_child(std::move(node));
             node = std::move(tail_node);
         }
@@ -2760,12 +2770,12 @@ class Lowerer {
             }
             case ir::NodeKind::Head: {
                 const auto& head = static_cast<const ir::HeadNode&>(node);
-                clone = builder_.head(head.count(), head.group_by());
+                clone = builder_.head(head.count_expr(), head.group_by());
                 break;
             }
             case ir::NodeKind::Tail: {
                 const auto& tail = static_cast<const ir::TailNode&>(node);
-                clone = builder_.tail(tail.count(), tail.group_by());
+                clone = builder_.tail(tail.count_expr(), tail.group_by());
                 break;
             }
             case ir::NodeKind::Aggregate: {

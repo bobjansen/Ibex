@@ -1018,10 +1018,77 @@ auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
     return 0;
 }
 
+// Pair of (binding name, CSV path) for include-read mode. When non-empty,
+// each timed iteration reloads the listed CSVs into a fresh registry so the
+// timer includes read_csv() — apples-to-apples with `pl.scan_csv(...).collect()`.
+using ScanPaths = std::vector<std::pair<std::string, std::string>>;
+
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
-                   std::size_t warmup_iters, std::size_t iters, bool include_parse) -> int {
+                   std::size_t warmup_iters, std::size_t iters, bool include_parse,
+                   const ScanPaths& scan_paths = {}) -> int {
     auto normalized = normalize_input(query.source);
     ibex::runtime::ScalarRegistry scalars;
+
+    if (!scan_paths.empty()) {
+        // Scan mode: time CSV-read + parse + lower + interpret per iteration.
+        // The supplied `tables` arg is ignored — we build a fresh registry
+        // inside the loop. Forces include_parse semantics regardless of flag.
+        auto run_once_scan = [&](std::size_t& last_rows) -> int {
+            ibex::runtime::TableRegistry fresh;
+            for (const auto& [name, path] : scan_paths) {
+                try {
+                    fresh.emplace(name, read_csv(path));
+                } catch (const std::exception& e) {
+                    fmt::print("error: read_csv({}) failed for {}: {}\n", path, query.name,
+                               e.what());
+                    return 1;
+                }
+            }
+            auto parsed = ibex::parser::parse(normalized);
+            if (!parsed) {
+                fmt::print("error: parse failed for {}: {}\n", query.name, parsed.error().format());
+                return 1;
+            }
+            auto lowered = ibex::parser::lower(*parsed);
+            if (!lowered) {
+                fmt::print("error: lower failed for {}: {}\n", query.name, lowered.error().message);
+                return 1;
+            }
+            auto result = ibex::runtime::interpret(*lowered.value(), fresh, &scalars);
+            if (!result) {
+                fmt::print("error: interpret failed for {}: {}\n", query.name, result.error());
+                return 1;
+            }
+            last_rows = result->rows();
+            return 0;
+        };
+
+        std::size_t warmup_rows = 0;
+        for (std::size_t i = 0; i < warmup_iters; ++i) {
+            if (run_once_scan(warmup_rows) != 0) {
+                return 1;
+            }
+        }
+        std::size_t last_rows = 0;
+        std::vector<double> times(iters);
+        for (std::size_t i = 0; i < iters; ++i) {
+            auto t0 = std::chrono::steady_clock::now();
+            if (run_once_scan(last_rows) != 0) {
+                return 1;
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            times[i] =
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0)
+                    .count();
+        }
+        auto s = compute_stats(std::move(times));
+        fmt::print(
+            "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
+            "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
+            query.name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
+            s.p99_ms, last_rows);
+        return 0;
+    }
 
     if (!include_parse) {
         auto parsed = ibex::parser::parse(normalized);
@@ -1130,6 +1197,7 @@ int main(int argc, char** argv) {
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
+    bool include_read = false;
     bool print_types = false;
     bool verify = false;
     std::size_t verify_rows = 10000;
@@ -1160,6 +1228,9 @@ int main(int argc, char** argv) {
     app.add_flag("--no-include-parse", include_parse,
                  "Exclude parse + lower from timing (legacy mode)")
         ->excludes("--include-parse");
+    app.add_flag("--include-read", include_read,
+                 "Time read_csv() inside each iteration ('data still needs to be read'); "
+                 "matches pl.scan_csv(path).<chain>.collect(). Tagged as ibex_scan in output.");
     app.add_flag("--print-types", print_types, "Print column types for loaded benchmark tables");
     app.add_flag("--verify", verify, "Verify benchmark outputs on a sample of rows");
     app.add_option("--verify-rows", verify_rows,
@@ -1297,8 +1368,12 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
+                ScanPaths sp;
+                if (include_read && queries[qi].name.rfind("parse_", 0) != 0) {
+                    sp.emplace_back("prices", csv_path);
+                }
                 status =
-                    run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse);
+                    run_benchmark(queries[qi], tables, warmup_iters, iters, this_include_parse, sp);
                 if (status != 0) {
                     break;
                 }
@@ -1315,7 +1390,11 @@ int main(int argc, char** argv) {
                 {"cumprod_price", "prices[update { cp = cumprod(price) }]"},
             };
             for (const auto& query : cumulative_queries) {
-                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse);
+                ScanPaths sp;
+                if (include_read) {
+                    sp.emplace_back("prices", csv_path);
+                }
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse, sp);
                 if (status != 0) {
                     break;
                 }
@@ -1481,7 +1560,12 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            status = run_benchmark(query, trades_tables, warmup_iters, iters, saved_include_parse);
+            ScanPaths sp;
+            if (include_read) {
+                sp.emplace_back("trades", csv_trades_path);
+            }
+            status =
+                run_benchmark(query, trades_tables, warmup_iters, iters, saved_include_parse, sp);
             if (status != 0) {
                 break;
             }
@@ -1527,7 +1611,12 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            status = run_benchmark(query, multi_tables, warmup_iters, iters, saved_include_parse);
+            ScanPaths sp;
+            if (include_read) {
+                sp.emplace_back("prices_multi", csv_multi_path);
+            }
+            status =
+                run_benchmark(query, multi_tables, warmup_iters, iters, saved_include_parse, sp);
             if (status != 0) {
                 break;
             }

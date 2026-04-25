@@ -64,6 +64,17 @@ namespace ibex::ir {
 ///  R19. `Filter(p1, Filter(p2, x))` → `Filter(p1 AND p2, x)` — merges adjacent
 ///       filters so downstream rules see one combined predicate (richer column
 ///       refs, more fusion/push opportunities).
+///  R20. `Aggregate(gb, aggs, x)` → `Aggregate(gb, aggs, Project(needed, x))` —
+///       inserts a column-pruning Project below the aggregate, where `needed`
+///       is the union of `gb` and each agg's input column. Skipped when `x` is
+///       already Project / FilterProject / FilterUpdateProject (avoids redundant
+///       projection and rule-driver loops). The Project then composes with R5
+///       (FilterProject fusion) when `x` is a Filter.
+///  R21. `Project(c, Project(_, x))` → `Project(c, x)` (and same for
+///       `FilterProject(c, p, Project(_, x))`). The outer node's columns are a
+///       subset of the inner Project's, so dropping the inner Project is sound
+///       and removes a redundant schema pass — particularly useful after R20
+///       inserts a pruning Project that R5 fuses with into a FilterProject.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

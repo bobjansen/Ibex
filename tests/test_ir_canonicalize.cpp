@@ -551,7 +551,10 @@ TEST_CASE("canonicalize R18: Filter on group_by column pushes below Aggregate",
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Aggregate);
     REQUIRE(out->children().size() == 1);
-    REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
+    // R18 pushes Filter below Aggregate; R20 then inserts a column-pruning
+    // Project between Aggregate and Filter, which fuses with the Filter via R5
+    // into a FilterProject node.
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::FilterProject);
     REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
 }
 
@@ -587,4 +590,35 @@ TEST_CASE("canonicalize R18: Filter does not push past Aggregate with empty grou
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Filter);
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Aggregate);
+}
+
+TEST_CASE("canonicalize R20: pruning Project inserted below Aggregate over Scan",
+          "[ir][canonicalize]") {
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
+                               .column = ir::ColumnRef{.name = "x", .source = {0}},
+                               .alias = "s"});
+    auto tree = with_child(make_aggregate({1}, {"g"}, std::move(aggs)), make_scan({2}, "t"));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Aggregate);
+    REQUIRE(out->children().size() == 1);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Project);
+    const auto& proj = static_cast<const ir::ProjectNode&>(*out->children().front());
+    REQUIRE(proj.columns().size() == 2);
+    REQUIRE(proj.columns()[0].name == "g");
+    REQUIRE(proj.columns()[1].name == "x");
+    REQUIRE(proj.children().front()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R20: not inserted when child is already Project", "[ir][canonicalize]") {
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
+                               .column = ir::ColumnRef{.name = "x", .source = {0}},
+                               .alias = "s"});
+    auto tree = with_child(make_aggregate({1}, {"g"}, std::move(aggs)),
+                           with_child(make_project({2}, {"g", "x"}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Aggregate);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Project);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
 }

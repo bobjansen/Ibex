@@ -57,8 +57,17 @@
         <h3>Concise bracket syntax</h3>
         <p>
           Pipeline operations chain left-to-right inside <code>[ ]</code>, in the
-          order they execute. No SQL keywords, no macro magic, no implicit coercions.
+          order they execute. No SQL keywords, no user-defined macros, no implicit coercions.
           Backtick-quoted names handle columns with dots or spaces.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Compile-time map</h3>
+        <p>
+          Braced <code>select</code> and <code>update</code> blocks can expand
+          whole families of generated fields at compile time with
+          <code>map</code>, <code>get(name)</code>, and interpolated backtick
+          aliases such as <code>`avg_${m}`</code>.
         </p>
       </article>
       <article class="card">

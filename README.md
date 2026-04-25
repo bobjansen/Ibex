@@ -6,6 +6,12 @@ interpreter and transpiliable to C++23.
 See the [website](https://bobjansen.github.io/Ibex/#get-started) for more
 information.
 
+Notable language features:
+- bracket pipelines for filter/select/update/group/order/join flows
+- compile-time `map` expansion inside braced `select` / `update` blocks
+- typed `fn` definitions with required parameter and return types
+- `DataFrame<{...}>` contracts for minimum required columns on table arguments
+
 ```
 import "csv";
 
@@ -36,6 +42,9 @@ trades[select {
     map m in measures => `avg_${m}` = mean(get(m))
 }, by symbol];
 ```
+
+This keeps feature-family generation in Ibex itself instead of pushing schema
+construction back out into Python or notebook host code.
 
 ## IPython and Jupyter
 

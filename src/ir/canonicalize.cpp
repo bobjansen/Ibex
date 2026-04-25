@@ -2,6 +2,9 @@
 #include <ibex/ir/expr_predicates.hpp>
 
 #include <algorithm>
+#include <array>
+#include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -184,6 +187,649 @@ void collect_equality_pinned_cols(const FilterExpr& expr, std::unordered_set<std
 }
 
 auto canon(NodePtr node) -> NodePtr;
+auto rewrite_root(NodePtr node) -> NodePtr;
+
+// Helpers for predicate simplification (R17).
+
+auto make_bool_lit(bool b) -> FilterExprPtr {
+    return std::make_unique<FilterExpr>(FilterExpr{.node = FilterLiteral{.value = b}});
+}
+
+auto try_get_bool(const FilterExpr& expr) -> std::optional<bool> {
+    if (const auto* lit = std::get_if<FilterLiteral>(&expr.node)) {
+        if (const auto* b = std::get_if<bool>(&lit->value)) {
+            return *b;
+        }
+    }
+    return std::nullopt;
+}
+
+// Evaluate a binary comparison between two FilterLiteral values, when their
+// underlying types match. Returns std::nullopt if the comparison isn't
+// well-defined (mismatched types, or the variant alternative isn't ordered).
+auto fold_cmp(CompareOp op, const FilterLiteral& l, const FilterLiteral& r) -> std::optional<bool> {
+    if (l.value.index() != r.value.index()) {
+        return std::nullopt;
+    }
+    return std::visit(
+        [&](const auto& lv) -> std::optional<bool> {
+            using T = std::decay_t<decltype(lv)>;
+            const auto& rv = std::get<T>(r.value);
+            switch (op) {
+                case CompareOp::Eq:
+                    return lv == rv;
+                case CompareOp::Ne:
+                    return lv != rv;
+                case CompareOp::Lt:
+                    return lv < rv;
+                case CompareOp::Le:
+                    return lv <= rv;
+                case CompareOp::Gt:
+                    return lv > rv;
+                case CompareOp::Ge:
+                    return lv >= rv;
+            }
+            return std::nullopt;
+        },
+        l.value);
+}
+
+// Fold an arithmetic op on two literals when both are numeric (int64 or
+// double, matching types). Mod is integer-only. Returns nullopt otherwise.
+auto fold_arith(ArithmeticOp op, const FilterLiteral& l, const FilterLiteral& r)
+    -> std::optional<FilterLiteral> {
+    if (const auto* li = std::get_if<std::int64_t>(&l.value)) {
+        const auto* ri = std::get_if<std::int64_t>(&r.value);
+        if (ri == nullptr) {
+            return std::nullopt;
+        }
+        switch (op) {
+            case ArithmeticOp::Add:
+                return FilterLiteral{.value = *li + *ri};
+            case ArithmeticOp::Sub:
+                return FilterLiteral{.value = *li - *ri};
+            case ArithmeticOp::Mul:
+                return FilterLiteral{.value = *li * *ri};
+            case ArithmeticOp::Div:
+                if (*ri == 0) {
+                    return std::nullopt;
+                }
+                return FilterLiteral{.value = *li / *ri};
+            case ArithmeticOp::Mod:
+                if (*ri == 0) {
+                    return std::nullopt;
+                }
+                return FilterLiteral{.value = *li % *ri};
+        }
+        return std::nullopt;
+    }
+    if (const auto* ld = std::get_if<double>(&l.value)) {
+        const auto* rd = std::get_if<double>(&r.value);
+        if (rd == nullptr) {
+            return std::nullopt;
+        }
+        switch (op) {
+            case ArithmeticOp::Add:
+                return FilterLiteral{.value = *ld + *rd};
+            case ArithmeticOp::Sub:
+                return FilterLiteral{.value = *ld - *rd};
+            case ArithmeticOp::Mul:
+                return FilterLiteral{.value = *ld * *rd};
+            case ArithmeticOp::Div:
+                return FilterLiteral{.value = *ld / *rd};
+            case ArithmeticOp::Mod:
+                return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+// Bottom-up predicate simplification. Sets `*changed` to true if the result
+// differs structurally from the input. Rewrites:
+//   - boolean identity/absorbing: x AND true → x, x OR false → x, etc.
+//   - double-negation: NOT NOT x → x; NOT literal → folded literal.
+//   - literal-only Cmp / Arith → folded literal (Eq, Ne, Lt, …, +, -, …).
+//   - IsNull/IsNotNull on a literal → folded bool (literals are never null).
+auto simplify_expr(FilterExprPtr expr, bool* changed) -> FilterExprPtr {
+    return std::visit(
+        [&](auto& n) -> FilterExprPtr {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, FilterAnd>) {
+                n.left = simplify_expr(std::move(n.left), changed);
+                n.right = simplify_expr(std::move(n.right), changed);
+                if (auto lb = try_get_bool(*n.left); lb.has_value()) {
+                    *changed = true;
+                    return *lb ? std::move(n.right) : make_bool_lit(false);
+                }
+                if (auto rb = try_get_bool(*n.right); rb.has_value()) {
+                    *changed = true;
+                    return *rb ? std::move(n.left) : make_bool_lit(false);
+                }
+                return std::move(expr);
+            } else if constexpr (std::is_same_v<T, FilterOr>) {
+                n.left = simplify_expr(std::move(n.left), changed);
+                n.right = simplify_expr(std::move(n.right), changed);
+                if (auto lb = try_get_bool(*n.left); lb.has_value()) {
+                    *changed = true;
+                    return *lb ? make_bool_lit(true) : std::move(n.right);
+                }
+                if (auto rb = try_get_bool(*n.right); rb.has_value()) {
+                    *changed = true;
+                    return *rb ? make_bool_lit(true) : std::move(n.left);
+                }
+                return std::move(expr);
+            } else if constexpr (std::is_same_v<T, FilterNot>) {
+                n.operand = simplify_expr(std::move(n.operand), changed);
+                if (auto b = try_get_bool(*n.operand); b.has_value()) {
+                    *changed = true;
+                    return make_bool_lit(!*b);
+                }
+                if (auto* inner = std::get_if<FilterNot>(&n.operand->node)) {
+                    *changed = true;
+                    return std::move(inner->operand);
+                }
+                return std::move(expr);
+            } else if constexpr (std::is_same_v<T, FilterCmp>) {
+                n.left = simplify_expr(std::move(n.left), changed);
+                n.right = simplify_expr(std::move(n.right), changed);
+                const auto* ll = std::get_if<FilterLiteral>(&n.left->node);
+                const auto* rl = std::get_if<FilterLiteral>(&n.right->node);
+                if ((ll != nullptr) && (rl != nullptr)) {
+                    if (auto folded = fold_cmp(n.op, *ll, *rl); folded.has_value()) {
+                        *changed = true;
+                        return make_bool_lit(*folded);
+                    }
+                }
+                return std::move(expr);
+            } else if constexpr (std::is_same_v<T, FilterArith>) {
+                n.left = simplify_expr(std::move(n.left), changed);
+                n.right = simplify_expr(std::move(n.right), changed);
+                const auto* ll = std::get_if<FilterLiteral>(&n.left->node);
+                const auto* rl = std::get_if<FilterLiteral>(&n.right->node);
+                if ((ll != nullptr) && (rl != nullptr)) {
+                    if (auto folded = fold_arith(n.op, *ll, *rl); folded.has_value()) {
+                        *changed = true;
+                        return std::make_unique<FilterExpr>(FilterExpr{.node = std::move(*folded)});
+                    }
+                }
+                return std::move(expr);
+            } else if constexpr (std::is_same_v<T, FilterIsNull> ||
+                                 std::is_same_v<T, FilterIsNotNull>) {
+                n.operand = simplify_expr(std::move(n.operand), changed);
+                if (std::holds_alternative<FilterLiteral>(n.operand->node)) {
+                    *changed = true;
+                    return make_bool_lit(std::is_same_v<T, FilterIsNotNull>);
+                }
+                return std::move(expr);
+            } else {
+                return std::move(expr);
+            }
+        },
+        expr->node);
+}
+
+// Result of a single rule attempt: if the rule fired, `changed` is true and
+// `node` holds the rewritten tree; otherwise `node` is returned unchanged.
+struct TryResult {
+    bool changed;
+    NodePtr node;
+};
+
+// R17: Simplify a Filter's predicate (boolean identity/absorption, double
+// negation, literal-only comparison/arithmetic folding). If the predicate
+// reduces to literal `true`, the Filter is dropped; if it reduces to literal
+// `false`, the Filter is replaced by Head(0, x) so downstream stages see an
+// empty input without a custom node.
+auto try_simplify_predicate(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Filter || node->children().empty()) {
+        return {false, std::move(node)};
+    }
+    auto& filter = static_cast<FilterNode&>(*node);
+    FilterExprPtr pred = filter.take_predicate();
+    bool changed = false;
+    pred = simplify_expr(std::move(pred), &changed);
+    if (auto b = try_get_bool(*pred); b.has_value()) {
+        const auto filter_id = node->id();
+        NodePtr filter_owned = std::move(node);
+        NodePtr x = take_unique_child(*filter_owned);
+        if (*b) {
+            return {true, std::move(x)};
+        }
+        auto h = std::make_unique<HeadNode>(filter_id, 0, std::vector<ColumnRef>{});
+        h->add_child(std::move(x));
+        return {true, std::move(h)};
+    }
+    if (!changed) {
+        // Put the predicate back unchanged.
+        const auto filter_id = node->id();
+        NodePtr filter_owned = std::move(node);
+        NodePtr x = take_unique_child(*filter_owned);
+        auto restored = std::make_unique<FilterNode>(filter_id, std::move(pred));
+        restored->add_child(std::move(x));
+        return {false, std::move(restored)};
+    }
+    const auto filter_id = node->id();
+    NodePtr filter_owned = std::move(node);
+    NodePtr x = take_unique_child(*filter_owned);
+    auto rebuilt = std::make_unique<FilterNode>(filter_id, std::move(pred));
+    rebuilt->add_child(std::move(x));
+    return {true, std::move(rebuilt)};
+}
+
+// R1: Filter(Order(x)) → Order(Filter(x))
+auto try_filter_past_order(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Filter || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Order) {
+        return {false, std::move(node)};
+    }
+    NodePtr filter = std::move(node);
+    NodePtr order = take_unique_child(*filter);
+    NodePtr x = take_unique_child(*order);
+    filter->add_child(std::move(x));
+    filter = rewrite_root(std::move(filter));
+    order->add_child(std::move(filter));
+    return {true, std::move(order)};
+}
+
+// R2: Project(Order(x)) → Order(Project(x)) when all keys are preserved.
+auto try_project_past_order(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Project || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Order) {
+        return {false, std::move(node)};
+    }
+    const auto& proj = static_cast<const ProjectNode&>(*node);
+    const auto& order = static_cast<const OrderNode&>(*node->children().front());
+    if (!keys_preserved_by_project(order.keys(), proj)) {
+        return {false, std::move(node)};
+    }
+    NodePtr project = std::move(node);
+    NodePtr order_n = take_unique_child(*project);
+    NodePtr x = take_unique_child(*order_n);
+    project->add_child(std::move(x));
+    project = rewrite_root(std::move(project));
+    order_n->add_child(std::move(project));
+    return {true, std::move(order_n)};
+}
+
+// R3: Order(Rename(x)) → Rename(Order(x)) with keys remapped new→old.
+auto try_order_past_rename(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Order || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Rename) {
+        return {false, std::move(node)};
+    }
+    auto& order_n = static_cast<OrderNode&>(*node);
+    const auto& rename = static_cast<const RenameNode&>(*node->children().front());
+    auto remapped = remap_keys_through_rename(order_n.keys(), rename.renames());
+    NodePtr order_owned = std::move(node);
+    NodePtr rename_owned = take_unique_child(*order_owned);
+    NodePtr x = take_unique_child(*rename_owned);
+    NodePtr new_order = std::make_unique<OrderNode>(order_owned->id(), std::move(remapped));
+    new_order->add_child(std::move(x));
+    new_order = rewrite_root(std::move(new_order));
+    rename_owned->add_child(std::move(new_order));
+    return {true, std::move(rename_owned)};
+}
+
+// R9: Rename(Rename(x)) → single Rename with composed mappings.
+auto try_rename_compose(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Rename || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Rename) {
+        return {false, std::move(node)};
+    }
+    const auto& outer = static_cast<const RenameNode&>(*node);
+    const auto& inner = static_cast<const RenameNode&>(*node->children().front());
+    auto composed = compose_renames(outer.renames(), inner.renames());
+    const auto merged_id = node->id();
+    NodePtr outer_owned = std::move(node);
+    NodePtr inner_owned = take_unique_child(*outer_owned);
+    NodePtr x = take_unique_child(*inner_owned);
+    if (composed.empty()) {
+        return {true, std::move(x)};
+    }
+    auto merged = std::make_unique<RenameNode>(merged_id, std::move(composed));
+    merged->add_child(std::move(x));
+    return {true, std::move(merged)};
+}
+
+// R10: Drop a Rename whose entries are empty or all identity.
+auto try_rename_drop_identity(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Rename || node->children().empty()) {
+        return {false, std::move(node)};
+    }
+    const auto& rn = static_cast<const RenameNode&>(*node);
+    const bool all_identity =
+        std::all_of(rn.renames().begin(), rn.renames().end(),
+                    [](const RenameSpec& rs) { return rs.new_name == rs.old_name; });
+    if (!rn.renames().empty() && !all_identity) {
+        return {false, std::move(node)};
+    }
+    NodePtr rename_owned = std::move(node);
+    return {true, take_unique_child(*rename_owned)};
+}
+
+// R11: Filter(Rename(x)) → Rename(Filter'(x)) with predicate column refs remapped.
+auto try_filter_past_rename(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Filter || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Rename) {
+        return {false, std::move(node)};
+    }
+    auto& filter = static_cast<FilterNode&>(*node);
+    const auto& rename = static_cast<const RenameNode&>(*node->children().front());
+    std::unordered_map<std::string, std::string> n2o;
+    n2o.reserve(rename.renames().size());
+    for (const auto& rs : rename.renames()) {
+        n2o.emplace(rs.new_name, rs.old_name);
+    }
+    FilterExprPtr pred = filter.take_predicate();
+    remap_filter_expr_through_rename(*pred, n2o);
+    const auto filter_id = node->id();
+    NodePtr filter_owned = std::move(node);
+    NodePtr rename_owned = take_unique_child(*filter_owned);
+    NodePtr x = take_unique_child(*rename_owned);
+    auto new_filter = std::make_unique<FilterNode>(filter_id, std::move(pred));
+    new_filter->add_child(std::move(x));
+    NodePtr bubbled = rewrite_root(std::move(new_filter));
+    rename_owned->add_child(std::move(bubbled));
+    return {true, rewrite_root(std::move(rename_owned))};
+}
+
+// R13/R14: Head(Head(x)) / Tail(Tail(x)) → single node with tighter bound.
+auto try_limit_collapse(NodePtr node) -> TryResult {
+    const auto kind = node->kind();
+    if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty() ||
+        node->children().front()->kind() != kind) {
+        return {false, std::move(node)};
+    }
+    const auto outer_count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
+                                                      : static_cast<const TailNode&>(*node).count();
+    const auto& outer_gb = (kind == NodeKind::Head)
+                               ? static_cast<const HeadNode&>(*node).group_by()
+                               : static_cast<const TailNode&>(*node).group_by();
+    const auto& inner = *node->children().front();
+    const auto inner_count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(inner).count()
+                                                      : static_cast<const TailNode&>(inner).count();
+    const auto& inner_gb = (kind == NodeKind::Head)
+                               ? static_cast<const HeadNode&>(inner).group_by()
+                               : static_cast<const TailNode&>(inner).group_by();
+    if (!outer_gb.empty() || !inner_gb.empty()) {
+        return {false, std::move(node)};
+    }
+    const auto merged_count = std::min(outer_count, inner_count);
+    const auto merged_id = node->id();
+    NodePtr outer_owned = std::move(node);
+    NodePtr inner_owned = take_unique_child(*outer_owned);
+    NodePtr x = take_unique_child(*inner_owned);
+    NodePtr merged;
+    if (kind == NodeKind::Head) {
+        merged = std::make_unique<HeadNode>(merged_id, merged_count, std::vector<ColumnRef>{});
+    } else {
+        merged = std::make_unique<TailNode>(merged_id, merged_count, std::vector<ColumnRef>{});
+    }
+    merged->add_child(std::move(x));
+    return {true, std::move(merged)};
+}
+
+// R15: Drop Order keys pinned to constants by an immediate Filter child.
+auto try_order_drop_pinned_keys(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Order || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Filter) {
+        return {false, std::move(node)};
+    }
+    const auto& order_n = static_cast<const OrderNode&>(*node);
+    const auto& filter = static_cast<const FilterNode&>(*node->children().front());
+    std::unordered_set<std::string> pinned;
+    collect_equality_pinned_cols(filter.predicate(), pinned);
+    if (pinned.empty()) {
+        return {false, std::move(node)};
+    }
+    std::vector<OrderKey> surviving;
+    surviving.reserve(order_n.keys().size());
+    for (const auto& k : order_n.keys()) {
+        if (!pinned.contains(k.name)) {
+            surviving.push_back(k);
+        }
+    }
+    if (surviving.size() == order_n.keys().size()) {
+        return {false, std::move(node)};
+    }
+    const auto order_id = node->id();
+    NodePtr order_owned = std::move(node);
+    NodePtr filter_owned = take_unique_child(*order_owned);
+    if (surviving.empty()) {
+        return {true, std::move(filter_owned)};
+    }
+    auto new_order = std::make_unique<OrderNode>(order_id, std::move(surviving));
+    new_order->add_child(std::move(filter_owned));
+    return {true, std::move(new_order)};
+}
+
+// R12: Filter(Update(x)) → Update(Filter(x)) when Update is row-local and
+// the predicate reads none of the Update's output columns.
+auto try_filter_past_update(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Filter || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Update) {
+        return {false, std::move(node)};
+    }
+    auto& filter = static_cast<FilterNode&>(*node);
+    const auto& upd = static_cast<const UpdateNode&>(*node->children().front());
+    const bool update_eligible =
+        !upd.children().empty() && upd.group_by().empty() && upd.tuple_fields().empty() &&
+        std::all_of(upd.fields().begin(), upd.fields().end(),
+                    [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
+    if (!update_eligible) {
+        return {false, std::move(node)};
+    }
+    std::unordered_set<std::string> pred_cols;
+    collect_filter_column_refs(filter.predicate(), pred_cols);
+    const bool predicate_independent =
+        std::none_of(upd.fields().begin(), upd.fields().end(),
+                     [&](const FieldSpec& f) { return pred_cols.contains(f.alias); });
+    if (!predicate_independent) {
+        return {false, std::move(node)};
+    }
+    FilterExprPtr pred = filter.take_predicate();
+    const auto filter_id = node->id();
+    NodePtr filter_owned = std::move(node);
+    NodePtr update_owned = take_unique_child(*filter_owned);
+    NodePtr x = take_unique_child(*update_owned);
+    auto new_filter = std::make_unique<FilterNode>(filter_id, std::move(pred));
+    new_filter->add_child(std::move(x));
+    NodePtr bubbled = rewrite_root(std::move(new_filter));
+    update_owned->add_child(std::move(bubbled));
+    return {true, std::move(update_owned)};
+}
+
+// R5: Project(Filter(x)) → FilterProject(x).
+auto try_fuse_filter_project(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Project || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Filter) {
+        return {false, std::move(node)};
+    }
+    auto& proj = static_cast<ProjectNode&>(*node);
+    std::vector<ColumnRef> cols = proj.columns();
+    NodePtr project_owned = std::move(node);
+    NodePtr filter_owned = take_unique_child(*project_owned);
+    auto& filter = static_cast<FilterNode&>(*filter_owned);
+    if (filter.children().empty()) {
+        project_owned->add_child(std::move(filter_owned));
+        return {false, std::move(project_owned)};
+    }
+    NodePtr x = take_unique_child(filter);
+    FilterExprPtr pred = filter.take_predicate();
+    auto fused =
+        std::make_unique<FilterProjectNode>(project_owned->id(), std::move(pred), std::move(cols));
+    fused->add_child(std::move(x));
+    return {true, std::move(fused)};
+}
+
+// R6: Project(Update(Filter(x))) → FilterUpdateProject(x) when update is row-local.
+auto try_fuse_filter_update_project(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Project || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Update) {
+        return {false, std::move(node)};
+    }
+    auto& proj = static_cast<ProjectNode&>(*node);
+    auto& upd = static_cast<UpdateNode&>(*node->children().front());
+    const bool update_eligible =
+        !upd.children().empty() && upd.group_by().empty() && upd.tuple_fields().empty() &&
+        std::all_of(upd.fields().begin(), upd.fields().end(),
+                    [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
+    if (!update_eligible || upd.children().front()->kind() != NodeKind::Filter) {
+        return {false, std::move(node)};
+    }
+    auto& filter = static_cast<FilterNode&>(*upd.children().front());
+    if (filter.children().empty()) {
+        return {false, std::move(node)};
+    }
+    std::vector<ColumnRef> proj_cols = proj.columns();
+    std::vector<FieldSpec> fields = upd.fields();
+    NodePtr project_owned = std::move(node);
+    NodePtr update_owned = take_unique_child(*project_owned);
+    NodePtr filter_owned = take_unique_child(*update_owned);
+    auto& filter_ref = static_cast<FilterNode&>(*filter_owned);
+    NodePtr x = take_unique_child(filter_ref);
+    FilterExprPtr pred = filter_ref.take_predicate();
+    auto fused = std::make_unique<FilterUpdateProjectNode>(project_owned->id(), std::move(pred),
+                                                           std::move(fields), std::move(proj_cols));
+    fused->add_child(std::move(x));
+    return {true, std::move(fused)};
+}
+
+// R7/R8: Head(Filter(x)) → FilterHead(x), Tail(Filter(x)) → FilterTail(x)
+// when the limit has no group_by.
+auto try_fuse_filter_limit(NodePtr node) -> TryResult {
+    const auto kind = node->kind();
+    if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Filter) {
+        return {false, std::move(node)};
+    }
+    const auto& group_by = (kind == NodeKind::Head)
+                               ? static_cast<const HeadNode&>(*node).group_by()
+                               : static_cast<const TailNode&>(*node).group_by();
+    if (!group_by.empty()) {
+        return {false, std::move(node)};
+    }
+    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
+                                                : static_cast<const TailNode&>(*node).count();
+    const auto fused_id = node->id();
+    NodePtr limit_owned = std::move(node);
+    NodePtr filter_owned = take_unique_child(*limit_owned);
+    auto& filter = static_cast<FilterNode&>(*filter_owned);
+    if (filter.children().empty()) {
+        limit_owned->add_child(std::move(filter_owned));
+        return {false, std::move(limit_owned)};
+    }
+    NodePtr x = take_unique_child(filter);
+    FilterExprPtr pred = filter.take_predicate();
+    NodePtr fused;
+    if (kind == NodeKind::Head) {
+        fused = std::make_unique<FilterHeadNode>(fused_id, std::move(pred), count);
+    } else {
+        fused = std::make_unique<FilterTailNode>(fused_id, std::move(pred), count);
+    }
+    fused->add_child(std::move(x));
+    return {true, std::move(fused)};
+}
+
+// R16: Head(Order(x)) → TopK(..., First), Tail(Order(x)) → TopK(..., Last).
+// Fusing into a single IR node lets the runtime use a partial heap-select
+// (O(n log k)) instead of the default full-sort-then-truncate, and lets
+// codegen emit the fast path as a single op call.
+auto try_fuse_topk(NodePtr node) -> TryResult {
+    const auto kind = node->kind();
+    if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Order) {
+        return {false, std::move(node)};
+    }
+    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
+                                                : static_cast<const TailNode&>(*node).count();
+    std::vector<ColumnRef> group_by = (kind == NodeKind::Head)
+                                          ? static_cast<const HeadNode&>(*node).group_by()
+                                          : static_cast<const TailNode&>(*node).group_by();
+    const auto keep_mode =
+        (kind == NodeKind::Head) ? TopKNode::KeepMode::First : TopKNode::KeepMode::Last;
+    const auto fused_id = node->id();
+    NodePtr limit_owned = std::move(node);
+    NodePtr order_owned = take_unique_child(*limit_owned);
+    auto& order_n = static_cast<OrderNode&>(*order_owned);
+    if (order_n.children().empty()) {
+        limit_owned->add_child(std::move(order_owned));
+        return {false, std::move(limit_owned)};
+    }
+    std::vector<OrderKey> keys = order_n.keys();
+    NodePtr x = take_unique_child(order_n);
+    auto fused = std::make_unique<TopKNode>(fused_id, std::move(keys), count, std::move(group_by),
+                                            keep_mode);
+    fused->add_child(std::move(x));
+    return {true, std::move(fused)};
+}
+
+// R4: Head/Tail past Project or Rename.
+auto try_limit_past_metadata(NodePtr node) -> TryResult {
+    const auto kind = node->kind();
+    if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty()) {
+        return {false, std::move(node)};
+    }
+    const auto child_kind = node->children().front()->kind();
+    if (child_kind != NodeKind::Project && child_kind != NodeKind::Rename) {
+        return {false, std::move(node)};
+    }
+    const auto& group_by = (kind == NodeKind::Head)
+                               ? static_cast<const HeadNode&>(*node).group_by()
+                               : static_cast<const TailNode&>(*node).group_by();
+    bool safe = false;
+    std::vector<ColumnRef> remapped_group_by = group_by;
+    if (child_kind == NodeKind::Project) {
+        const auto& proj = static_cast<const ProjectNode&>(*node->children().front());
+        safe = group_by.empty() || group_by_preserved_by_project(group_by, proj);
+    } else {
+        const auto& ren = static_cast<const RenameNode&>(*node->children().front());
+        remapped_group_by = remap_group_by_through_rename(group_by, ren.renames());
+        safe = true;
+    }
+    if (!safe) {
+        return {false, std::move(node)};
+    }
+    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count()
+                                                : static_cast<const TailNode&>(*node).count();
+    const auto limit_id = node->id();
+    NodePtr limit = std::move(node);
+    NodePtr wrapper = take_unique_child(*limit);
+    NodePtr x = take_unique_child(*wrapper);
+    NodePtr new_limit;
+    if (kind == NodeKind::Head) {
+        new_limit = std::make_unique<HeadNode>(limit_id, count, std::move(remapped_group_by));
+    } else {
+        new_limit = std::make_unique<TailNode>(limit_id, count, std::move(remapped_group_by));
+    }
+    new_limit->add_child(std::move(x));
+    new_limit = rewrite_root(std::move(new_limit));
+    wrapper->add_child(std::move(new_limit));
+    return {true, std::move(wrapper)};
+}
+
+using RuleFn = TryResult (*)(NodePtr);
+
+// Ordered list of rules. The driver tries each in turn; on any fire, it
+// restarts from the top, so earlier rules are re-tried against shapes exposed
+// by later ones. Rule names mirror the Rx labels in canonicalize.hpp.
+constexpr std::array<std::pair<std::string_view, RuleFn>, 15> kRules{{
+    {"R17:simplify-predicate", try_simplify_predicate},
+    {"R1:filter-past-order", try_filter_past_order},
+    {"R2:project-past-order", try_project_past_order},
+    {"R3:order-past-rename", try_order_past_rename},
+    {"R9:rename-compose", try_rename_compose},
+    {"R10:rename-drop-identity", try_rename_drop_identity},
+    {"R11:filter-past-rename", try_filter_past_rename},
+    {"R13-14:limit-collapse", try_limit_collapse},
+    {"R15:order-drop-pinned-keys", try_order_drop_pinned_keys},
+    {"R12:filter-past-update", try_filter_past_update},
+    {"R5:fuse-filter-project", try_fuse_filter_project},
+    {"R6:fuse-filter-update-project", try_fuse_filter_update_project},
+    {"R7-8:fuse-filter-limit", try_fuse_filter_limit},
+    {"R16:fuse-topk", try_fuse_topk},
+    {"R4:limit-past-metadata", try_limit_past_metadata},
+}};
 
 // Apply the rewrite rules at this node's root, looping until a fixpoint is
 // reached. Children are assumed already canonicalized. Returns the new root
@@ -195,376 +841,13 @@ auto rewrite_root(NodePtr node) -> NodePtr {
         if (!node) {
             return node;
         }
-        const auto kind = node->kind();
-
-        // R1: Filter(Order(x)) → Order(Filter(x))
-        if (kind == NodeKind::Filter && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Order) {
-            NodePtr filter = std::move(node);
-            NodePtr order = take_unique_child(*filter);
-            NodePtr x = take_unique_child(*order);
-            filter->add_child(std::move(x));
-            filter = rewrite_root(std::move(filter));
-            order->add_child(std::move(filter));
-            node = std::move(order);
-            changed = true;
-            continue;
-        }
-
-        // R2: Project(Order(x)) → Order(Project(x)) (keys preserved)
-        if (kind == NodeKind::Project && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Order) {
-            const auto& proj = static_cast<const ProjectNode&>(*node);
-            const auto& order = static_cast<const OrderNode&>(*node->children().front());
-            if (keys_preserved_by_project(order.keys(), proj)) {
-                NodePtr project = std::move(node);
-                NodePtr order_n = take_unique_child(*project);
-                NodePtr x = take_unique_child(*order_n);
-                project->add_child(std::move(x));
-                project = rewrite_root(std::move(project));
-                order_n->add_child(std::move(project));
-                node = std::move(order_n);
+        for (const auto& [name, fn] : kRules) {
+            (void)name;
+            auto result = fn(std::move(node));
+            node = std::move(result.node);
+            if (result.changed) {
                 changed = true;
-                continue;
-            }
-        }
-
-        // R3: Order(Rename(x)) → Rename(Order(x)) (keys remapped new→old)
-        if (kind == NodeKind::Order && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Rename) {
-            auto& order_n = static_cast<OrderNode&>(*node);
-            const auto& rename = static_cast<const RenameNode&>(*node->children().front());
-            auto remapped = remap_keys_through_rename(order_n.keys(), rename.renames());
-            NodePtr order_owned = std::move(node);
-            NodePtr rename_owned = take_unique_child(*order_owned);
-            NodePtr x = take_unique_child(*rename_owned);
-            // Replace the order node with a new one carrying the remapped keys,
-            // since OrderNode's keys_ member is private.
-            NodePtr new_order = std::make_unique<OrderNode>(order_owned->id(), std::move(remapped));
-            new_order->add_child(std::move(x));
-            new_order = rewrite_root(std::move(new_order));
-            rename_owned->add_child(std::move(new_order));
-            node = std::move(rename_owned);
-            changed = true;
-            continue;
-        }
-
-        // R9: Rename(Rename(x)) → Rename(x) with composed mappings. Identity
-        // pairs (new == old) drop out of the result.
-        if (kind == NodeKind::Rename && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Rename) {
-            const auto& outer = static_cast<const RenameNode&>(*node);
-            const auto& inner = static_cast<const RenameNode&>(*node->children().front());
-            auto composed = compose_renames(outer.renames(), inner.renames());
-            const auto merged_id = node->id();
-            NodePtr outer_owned = std::move(node);
-            NodePtr inner_owned = take_unique_child(*outer_owned);
-            NodePtr x = take_unique_child(*inner_owned);
-            if (composed.empty()) {
-                node = std::move(x);
-            } else {
-                auto merged = std::make_unique<RenameNode>(merged_id, std::move(composed));
-                merged->add_child(std::move(x));
-                node = std::move(merged);
-            }
-            changed = true;
-            continue;
-        }
-
-        // R10: Drop a Rename whose entries are all identity (new == old) or
-        // empty. Safe: produces the same schema as its input.
-        if (kind == NodeKind::Rename && !node->children().empty()) {
-            const auto& rn = static_cast<const RenameNode&>(*node);
-            const bool all_identity =
-                std::all_of(rn.renames().begin(), rn.renames().end(),
-                            [](const RenameSpec& rs) { return rs.new_name == rs.old_name; });
-            if (rn.renames().empty() || all_identity) {
-                NodePtr rename_owned = std::move(node);
-                node = take_unique_child(*rename_owned);
-                changed = true;
-                continue;
-            }
-        }
-
-        // R11: Filter(Rename(x)) → Rename(Filter'(x)) with the predicate's
-        // column references remapped new→old. Symmetric to R3 for Order;
-        // bubbles Rename toward the root so it can compose via R9 and stop
-        // blocking Project/Filter fusions beneath it.
-        if (kind == NodeKind::Filter && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Rename) {
-            auto& filter = static_cast<FilterNode&>(*node);
-            const auto& rename = static_cast<const RenameNode&>(*node->children().front());
-            std::unordered_map<std::string, std::string> n2o;
-            n2o.reserve(rename.renames().size());
-            for (const auto& rs : rename.renames()) {
-                n2o.emplace(rs.new_name, rs.old_name);
-            }
-            FilterExprPtr pred = filter.take_predicate();
-            remap_filter_expr_through_rename(*pred, n2o);
-            const auto filter_id = node->id();
-            NodePtr filter_owned = std::move(node);
-            NodePtr rename_owned = take_unique_child(*filter_owned);
-            NodePtr x = take_unique_child(*rename_owned);
-            auto new_filter = std::make_unique<FilterNode>(filter_id, std::move(pred));
-            new_filter->add_child(std::move(x));
-            NodePtr bubbled = rewrite_root(std::move(new_filter));
-            rename_owned->add_child(std::move(bubbled));
-            node = rewrite_root(std::move(rename_owned));
-            changed = true;
-            continue;
-        }
-
-        // R13/R14: Collapse Head(Head(x)) / Tail(Tail(x)) to a single node
-        // with the tighter bound. Only when both have empty group_by.
-        if ((kind == NodeKind::Head || kind == NodeKind::Tail) && !node->children().empty() &&
-            node->children().front()->kind() == kind) {
-            const auto outer_count = (kind == NodeKind::Head)
-                                         ? static_cast<const HeadNode&>(*node).count()
-                                         : static_cast<const TailNode&>(*node).count();
-            const auto& outer_gb = (kind == NodeKind::Head)
-                                       ? static_cast<const HeadNode&>(*node).group_by()
-                                       : static_cast<const TailNode&>(*node).group_by();
-            const auto& inner = *node->children().front();
-            const auto inner_count = (kind == NodeKind::Head)
-                                         ? static_cast<const HeadNode&>(inner).count()
-                                         : static_cast<const TailNode&>(inner).count();
-            const auto& inner_gb = (kind == NodeKind::Head)
-                                       ? static_cast<const HeadNode&>(inner).group_by()
-                                       : static_cast<const TailNode&>(inner).group_by();
-            if (outer_gb.empty() && inner_gb.empty()) {
-                const auto merged_count = std::min(outer_count, inner_count);
-                const auto merged_id = node->id();
-                NodePtr outer_owned = std::move(node);
-                NodePtr inner_owned = take_unique_child(*outer_owned);
-                NodePtr x = take_unique_child(*inner_owned);
-                NodePtr merged;
-                if (kind == NodeKind::Head) {
-                    merged = std::make_unique<HeadNode>(merged_id, merged_count,
-                                                        std::vector<ColumnRef>{});
-                } else {
-                    merged = std::make_unique<TailNode>(merged_id, merged_count,
-                                                        std::vector<ColumnRef>{});
-                }
-                merged->add_child(std::move(x));
-                node = std::move(merged);
-                changed = true;
-                continue;
-            }
-        }
-
-        // R15: Drop Order keys pinned to constants by an immediate Filter
-        // child. If every key drops, the Order node itself is redundant.
-        if (kind == NodeKind::Order && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Filter) {
-            const auto& order_n = static_cast<const OrderNode&>(*node);
-            const auto& filter = static_cast<const FilterNode&>(*node->children().front());
-            std::unordered_set<std::string> pinned;
-            collect_equality_pinned_cols(filter.predicate(), pinned);
-            if (!pinned.empty()) {
-                std::vector<OrderKey> surviving;
-                surviving.reserve(order_n.keys().size());
-                for (const auto& k : order_n.keys()) {
-                    if (!pinned.contains(k.name)) {
-                        surviving.push_back(k);
-                    }
-                }
-                if (surviving.size() != order_n.keys().size()) {
-                    const auto order_id = node->id();
-                    NodePtr order_owned = std::move(node);
-                    NodePtr filter_owned = take_unique_child(*order_owned);
-                    if (surviving.empty()) {
-                        node = std::move(filter_owned);
-                    } else {
-                        auto new_order =
-                            std::make_unique<OrderNode>(order_id, std::move(surviving));
-                        new_order->add_child(std::move(filter_owned));
-                        node = std::move(new_order);
-                    }
-                    changed = true;
-                    continue;
-                }
-            }
-        }
-
-        // R12: Filter(Update(x)) → Update(Filter(x)) when the Update is
-        // row-local and the predicate reads no column the Update produces.
-        // Exposes Project(Update(Filter(x))) shapes to R6 for fusion.
-        if (kind == NodeKind::Filter && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Update) {
-            auto& filter = static_cast<FilterNode&>(*node);
-            const auto& upd = static_cast<const UpdateNode&>(*node->children().front());
-            const bool update_eligible =
-                !upd.children().empty() && upd.group_by().empty() && upd.tuple_fields().empty() &&
-                std::all_of(upd.fields().begin(), upd.fields().end(),
-                            [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
-            if (update_eligible) {
-                std::unordered_set<std::string> pred_cols;
-                collect_filter_column_refs(filter.predicate(), pred_cols);
-                const bool predicate_independent =
-                    std::none_of(upd.fields().begin(), upd.fields().end(),
-                                 [&](const FieldSpec& f) { return pred_cols.contains(f.alias); });
-                if (predicate_independent) {
-                    FilterExprPtr pred = filter.take_predicate();
-                    const auto filter_id = node->id();
-                    NodePtr filter_owned = std::move(node);
-                    NodePtr update_owned = take_unique_child(*filter_owned);
-                    NodePtr x = take_unique_child(*update_owned);
-                    auto new_filter = std::make_unique<FilterNode>(filter_id, std::move(pred));
-                    new_filter->add_child(std::move(x));
-                    NodePtr bubbled = rewrite_root(std::move(new_filter));
-                    update_owned->add_child(std::move(bubbled));
-                    node = std::move(update_owned);
-                    changed = true;
-                    continue;
-                }
-            }
-        }
-
-        // R5: Project(Filter(x)) → FilterProject(x) — move the filter+project
-        // fusion from build_operator into the IR so the interpreter and codegen
-        // both see a single fused node instead of pattern-matching a shape.
-        if (kind == NodeKind::Project && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Filter) {
-            auto& proj = static_cast<ProjectNode&>(*node);
-            std::vector<ColumnRef> cols = proj.columns();
-            NodePtr project_owned = std::move(node);
-            NodePtr filter_owned = take_unique_child(*project_owned);
-            auto& filter = static_cast<FilterNode&>(*filter_owned);
-            if (filter.children().empty()) {
-                // Malformed — put it back and stop rewriting this position.
-                project_owned->add_child(std::move(filter_owned));
-                node = std::move(project_owned);
                 break;
-            }
-            NodePtr x = take_unique_child(filter);
-            FilterExprPtr pred = filter.take_predicate();
-            auto fused = std::make_unique<FilterProjectNode>(project_owned->id(), std::move(pred),
-                                                             std::move(cols));
-            fused->add_child(std::move(x));
-            node = std::move(fused);
-            changed = true;
-            continue;
-        }
-
-        // R6: Project(Update(Filter(x))) → FilterUpdateProject(x) when the
-        // update is row-local (no tuple_fields, no group_by, no cross-row
-        // callees in any field expression).
-        if (kind == NodeKind::Project && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Update) {
-            auto& proj = static_cast<ProjectNode&>(*node);
-            auto& upd = static_cast<UpdateNode&>(*node->children().front());
-            const bool update_eligible =
-                !upd.children().empty() && upd.group_by().empty() && upd.tuple_fields().empty() &&
-                std::all_of(upd.fields().begin(), upd.fields().end(),
-                            [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
-            if (update_eligible && upd.children().front()->kind() == NodeKind::Filter) {
-                auto& filter = static_cast<FilterNode&>(*upd.children().front());
-                if (!filter.children().empty()) {
-                    std::vector<ColumnRef> proj_cols = proj.columns();
-                    // UpdateNode stores fields privately — reconstruct a new
-                    // UpdateNode temporarily to steal the fields via a move
-                    // from the mutable children path. Since the UpdateNode is
-                    // about to be discarded, do a const_cast-free move through
-                    // a temporary: build a moved copy of the fields vector.
-                    // (The accessor returns const&; we copy once here.)
-                    std::vector<FieldSpec> fields = upd.fields();
-                    NodePtr project_owned = std::move(node);
-                    NodePtr update_owned = take_unique_child(*project_owned);
-                    NodePtr filter_owned = take_unique_child(*update_owned);
-                    auto& filter_ref = static_cast<FilterNode&>(*filter_owned);
-                    NodePtr x = take_unique_child(filter_ref);
-                    FilterExprPtr pred = filter_ref.take_predicate();
-                    auto fused = std::make_unique<FilterUpdateProjectNode>(
-                        project_owned->id(), std::move(pred), std::move(fields),
-                        std::move(proj_cols));
-                    fused->add_child(std::move(x));
-                    node = std::move(fused);
-                    changed = true;
-                    continue;
-                }
-            }
-        }
-
-        // R7/R8: Head(Filter(x)) → FilterHead(x), Tail(Filter(x)) → FilterTail(x)
-        // when the Head/Tail has no group_by. The fused operator stops pulling
-        // from the source as soon as n surviving rows are found (Head) or
-        // maintains only a rolling tail buffer (Tail).
-        if ((kind == NodeKind::Head || kind == NodeKind::Tail) && !node->children().empty() &&
-            node->children().front()->kind() == NodeKind::Filter) {
-            const auto& group_by = (kind == NodeKind::Head)
-                                       ? static_cast<const HeadNode&>(*node).group_by()
-                                       : static_cast<const TailNode&>(*node).group_by();
-            if (group_by.empty()) {
-                const auto count = (kind == NodeKind::Head)
-                                       ? static_cast<const HeadNode&>(*node).count()
-                                       : static_cast<const TailNode&>(*node).count();
-                const auto fused_id = node->id();
-                NodePtr limit_owned = std::move(node);
-                NodePtr filter_owned = take_unique_child(*limit_owned);
-                auto& filter = static_cast<FilterNode&>(*filter_owned);
-                if (!filter.children().empty()) {
-                    NodePtr x = take_unique_child(filter);
-                    FilterExprPtr pred = filter.take_predicate();
-                    NodePtr fused;
-                    if (kind == NodeKind::Head) {
-                        fused = std::make_unique<FilterHeadNode>(fused_id, std::move(pred), count);
-                    } else {
-                        fused = std::make_unique<FilterTailNode>(fused_id, std::move(pred), count);
-                    }
-                    fused->add_child(std::move(x));
-                    node = std::move(fused);
-                    changed = true;
-                    continue;
-                }
-                // Malformed: put it back.
-                limit_owned->add_child(std::move(filter_owned));
-                node = std::move(limit_owned);
-            }
-        }
-
-        // R4: Head/Tail past Project and Rename.
-        if (kind == NodeKind::Head || kind == NodeKind::Tail) {
-            if (node->children().empty()) {
-                break;
-            }
-            const auto child_kind = node->children().front()->kind();
-            if (child_kind == NodeKind::Project || child_kind == NodeKind::Rename) {
-                const auto& group_by = (kind == NodeKind::Head)
-                                           ? static_cast<const HeadNode&>(*node).group_by()
-                                           : static_cast<const TailNode&>(*node).group_by();
-                bool safe = false;
-                std::vector<ColumnRef> remapped_group_by = group_by;
-                if (child_kind == NodeKind::Project) {
-                    const auto& proj = static_cast<const ProjectNode&>(*node->children().front());
-                    safe = group_by.empty() || group_by_preserved_by_project(group_by, proj);
-                } else {
-                    const auto& ren = static_cast<const RenameNode&>(*node->children().front());
-                    remapped_group_by = remap_group_by_through_rename(group_by, ren.renames());
-                    safe = true;
-                }
-                if (safe) {
-                    const auto count = (kind == NodeKind::Head)
-                                           ? static_cast<const HeadNode&>(*node).count()
-                                           : static_cast<const TailNode&>(*node).count();
-                    const auto limit_id = node->id();
-                    NodePtr limit = std::move(node);
-                    NodePtr wrapper = take_unique_child(*limit);
-                    NodePtr x = take_unique_child(*wrapper);
-                    NodePtr new_limit;
-                    if (kind == NodeKind::Head) {
-                        new_limit = std::make_unique<HeadNode>(limit_id, count,
-                                                               std::move(remapped_group_by));
-                    } else {
-                        new_limit = std::make_unique<TailNode>(limit_id, count,
-                                                               std::move(remapped_group_by));
-                    }
-                    new_limit->add_child(std::move(x));
-                    new_limit = rewrite_root(std::move(new_limit));
-                    wrapper->add_child(std::move(new_limit));
-                    node = std::move(wrapper);
-                    changed = true;
-                    continue;
-                }
             }
         }
     }

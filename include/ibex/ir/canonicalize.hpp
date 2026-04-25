@@ -47,6 +47,14 @@ namespace ibex::ir {
 ///  R14. `Tail(m, Tail(n, x))`        → `Tail(min(m,n), x)`         — both group_by empty.
 ///  R15. `Order(Filter(... AND col==K AND ..., x))` drops `col` from Order keys (pinned by
 ///       equality). If all keys drop, the Order is removed entirely.
+///  R16. `Head(Order(x))` → `TopK(keys, n, First, x)` and `Tail(Order(x))` → `TopK(..., Last, x)`
+///       — fused node so runtime + codegen both use partial heap-select (O(n log k)) instead
+///       of full sort + truncate. Preserves any group_by on the limit.
+///  R17. Predicate simplification on `Filter(pred, x)`: boolean identity/absorption
+///       (`x AND true → x`, `x OR false → x`, etc.), double-negation (`NOT NOT x → x`),
+///       literal-only comparison and arithmetic folding (`5 == 5 → true`, `2 + 3 → 5`),
+///       and `IsNull/IsNotNull` over a literal. If `pred` reduces to `true`, the Filter
+///       is dropped; if to `false`, it becomes `Head(0, x)`.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

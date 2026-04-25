@@ -217,6 +217,16 @@ auto tail(const runtime::Table& t, std::size_t count, const std::vector<std::str
     return delegate(std::move(tail_node), t);
 }
 
+auto top_k(const runtime::Table& t, const std::vector<ir::OrderKey>& keys, std::size_t count,
+           const std::vector<std::string>& group_by, bool keep_first) -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    const auto keep = keep_first ? ir::TopKNode::KeepMode::First : ir::TopKNode::KeepMode::Last;
+    auto topk_node = b.top_k(keys, count, to_col_refs(group_by), keep);
+    topk_node->add_child(std::move(scan_node));
+    return delegate(std::move(topk_node), t);
+}
+
 auto aggregate(const runtime::Table& t, const std::vector<std::string>& group_by,
                const std::vector<ir::AggSpec>& aggs) -> runtime::Table {
     ir::Builder b;

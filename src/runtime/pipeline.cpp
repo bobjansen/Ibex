@@ -24,6 +24,7 @@ auto classify_node(ir::NodeKind kind) noexcept -> PipelineRole {
         case ir::NodeKind::FilterTail:
         case ir::NodeKind::Aggregate:
         case ir::NodeKind::Order:
+        case ir::NodeKind::TopK:
         case ir::NodeKind::Distinct:
         case ir::NodeKind::Join:
         case ir::NodeKind::Window:

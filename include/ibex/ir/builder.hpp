@@ -39,6 +39,13 @@ class Builder {
         return std::make_unique<TailNode>(next_id(), count, std::move(group_by));
     }
 
+    [[nodiscard]] auto top_k(std::vector<OrderKey> keys, std::size_t count,
+                             std::vector<ColumnRef> group_by, TopKNode::KeepMode keep_mode)
+        -> NodePtr {
+        return std::make_unique<TopKNode>(next_id(), std::move(keys), count, std::move(group_by),
+                                          keep_mode);
+    }
+
     [[nodiscard]] auto aggregate(std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
         -> NodePtr {
         return std::make_unique<AggregateNode>(next_id(), std::move(group_by),

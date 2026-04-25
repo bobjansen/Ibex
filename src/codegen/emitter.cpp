@@ -324,6 +324,32 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::TopK: {
+            const auto& topk = static_cast<const ir::TopKNode&>(node);
+            auto child = emit_node(require_single_child(topk, "TopKNode"));
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::top_k(" << child << ", {";
+            bool first = true;
+            for (const auto& key : topk.keys()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << "ibex::ir::OrderKey{\"" << escape_string(key.name) << "\", "
+                      << (key.ascending ? "true" : "false") << "}";
+            }
+            *out_ << "}, " << topk.count() << ", {";
+            first = true;
+            for (const auto& key : topk.group_by()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << '"' << escape_string(key.name) << '"';
+            }
+            *out_ << "}, " << (topk.keep_mode() == ir::TopKNode::KeepMode::First ? "true" : "false")
+                  << ");\n";
+            return var;
+        }
+
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);
             auto child = emit_node(require_single_child(agg, "AggregateNode"));

@@ -11,8 +11,15 @@ using namespace ibex;
 namespace {
 
 auto make_filter(ir::NodeId id) -> ir::NodePtr {
-    auto pred =
-        std::make_unique<ir::FilterExpr>(ir::FilterExpr{.node = ir::FilterLiteral{.value = true}});
+    // Use a non-trivial predicate (`x == 1`) so canonicalize R17 doesn't
+    // simplify the Filter away — these tests want the structural Filter node.
+    auto col =
+        std::make_unique<ir::FilterExpr>(ir::FilterExpr{.node = ir::FilterColumn{.name = "x"}});
+    auto lit = std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{.node = ir::FilterLiteral{.value = std::int64_t{1}}});
+    auto pred = std::make_unique<ir::FilterExpr>(ir::FilterExpr{
+        .node = ir::FilterCmp{
+            .op = ir::CompareOp::Eq, .left = std::move(col), .right = std::move(lit)}});
     return std::make_unique<ir::FilterNode>(id, std::move(pred));
 }
 
@@ -379,4 +386,123 @@ TEST_CASE("canonicalize composes R3, R11, R1: Filter(Order(Rename(x)))", "[ir][c
     REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Filter);
     REQUIRE(out->children().front()->children().front()->children().front()->kind() ==
             ir::NodeKind::Scan);
+}
+
+namespace {
+
+auto fexpr(ir::FilterExpr e) -> ir::FilterExprPtr {
+    return std::make_unique<ir::FilterExpr>(std::move(e));
+}
+
+auto blit(bool b) -> ir::FilterExprPtr {
+    return fexpr({.node = ir::FilterLiteral{.value = b}});
+}
+
+auto ilit(std::int64_t v) -> ir::FilterExprPtr {
+    return fexpr({.node = ir::FilterLiteral{.value = v}});
+}
+
+auto col_ref(std::string name) -> ir::FilterExprPtr {
+    return fexpr({.node = ir::FilterColumn{.name = std::move(name)}});
+}
+
+auto make_filter_with(ir::NodeId id, ir::FilterExprPtr pred) -> ir::NodePtr {
+    return std::make_unique<ir::FilterNode>(id, std::move(pred));
+}
+
+}  // namespace
+
+TEST_CASE("canonicalize R17: Filter(true) is dropped", "[ir][canonicalize]") {
+    auto tree = with_child(make_filter_with({1}, blit(true)), make_scan({2}, "t"));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R17: Filter(false) becomes Head(0)", "[ir][canonicalize]") {
+    auto tree = with_child(make_filter_with({1}, blit(false)), make_scan({2}, "t"));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Head);
+    const auto& h = static_cast<const ir::HeadNode&>(*out);
+    REQUIRE(h.count() == 0);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R17: x AND true → x; NOT NOT x → x", "[ir][canonicalize]") {
+    // (col == 5) AND true  →  col == 5
+    auto eq = fexpr(
+        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(5)}});
+    auto pred = fexpr({.node = ir::FilterAnd{.left = std::move(eq), .right = blit(true)}});
+    auto tree = with_child(make_filter_with({1}, std::move(pred)), make_scan({2}, "t"));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    const auto& f = static_cast<const ir::FilterNode&>(*out);
+    const auto* cmp = std::get_if<ir::FilterCmp>(&f.predicate().node);
+    REQUIRE(cmp != nullptr);
+    REQUIRE(cmp->op == ir::CompareOp::Eq);
+
+    // NOT NOT (col == 5)  →  col == 5
+    auto eq2 = fexpr(
+        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(5)}});
+    auto nn = fexpr({.node = ir::FilterNot{
+                         .operand = fexpr({.node = ir::FilterNot{.operand = std::move(eq2)}})}});
+    auto tree2 = with_child(make_filter_with({3}, std::move(nn)), make_scan({4}, "t"));
+    auto out2 = ir::canonicalize(std::move(tree2));
+    REQUIRE(out2->kind() == ir::NodeKind::Filter);
+}
+
+TEST_CASE("canonicalize R17: literal-only comparison folds to bool", "[ir][canonicalize]") {
+    // 5 == 5 → true → Filter dropped
+    auto pred =
+        fexpr({.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = ilit(5), .right = ilit(5)}});
+    auto tree = with_child(make_filter_with({1}, std::move(pred)), make_scan({2}, "t"));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R17: arithmetic on literals folds", "[ir][canonicalize]") {
+    // (col == 2 + 3) → (col == 5), still a non-trivial Filter.
+    auto add = fexpr(
+        {.node = ir::FilterArith{.op = ir::ArithmeticOp::Add, .left = ilit(2), .right = ilit(3)}});
+    auto pred =
+        fexpr({.node = ir::FilterCmp{
+                   .op = ir::CompareOp::Eq, .left = col_ref("c"), .right = std::move(add)}});
+    auto tree = with_child(make_filter_with({1}, std::move(pred)), make_scan({2}, "t"));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    const auto& f = static_cast<const ir::FilterNode&>(*out);
+    const auto* cmp = std::get_if<ir::FilterCmp>(&f.predicate().node);
+    REQUIRE(cmp != nullptr);
+    const auto* lit = std::get_if<ir::FilterLiteral>(&cmp->right->node);
+    REQUIRE(lit != nullptr);
+    REQUIRE(std::get<std::int64_t>(lit->value) == 5);
+}
+
+TEST_CASE("canonicalize R16: Head(Order(x)) fuses to TopK(First)", "[ir][canonicalize]") {
+    auto tree = with_child(
+        make_head({1}, 10),
+        with_child(make_order({2}, {{.name = "price", .ascending = false}}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::TopK);
+    const auto& topk = static_cast<const ir::TopKNode&>(*out);
+    REQUIRE(topk.count() == 10);
+    REQUIRE(topk.keep_mode() == ir::TopKNode::KeepMode::First);
+    REQUIRE(topk.keys().size() == 1);
+    REQUIRE(topk.keys().front().name == "price");
+    REQUIRE(topk.keys().front().ascending == false);
+    REQUIRE(topk.children().front()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R16: Tail(Order(x)) fuses to TopK(Last) preserving group_by",
+          "[ir][canonicalize]") {
+    std::vector<ir::ColumnRef> gb{{.name = "symbol", .source = {0}}};
+    auto tree = with_child(
+        make_tail({1}, 3, std::move(gb)),
+        with_child(make_order({2}, {{.name = "score", .ascending = true}}), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::TopK);
+    const auto& topk = static_cast<const ir::TopKNode&>(*out);
+    REQUIRE(topk.count() == 3);
+    REQUIRE(topk.keep_mode() == ir::TopKNode::KeepMode::Last);
+    REQUIRE(topk.group_by().size() == 1);
+    REQUIRE(topk.group_by().front().name == "symbol");
 }

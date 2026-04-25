@@ -230,6 +230,7 @@ enum class NodeKind : std::uint8_t {
     FilterUpdateProject,  ///< Fused Project(Update(Filter(x))) — produced by canonicalize R6.
     FilterHead,           ///< Fused Head(Filter(x)) — produced by canonicalize R7.
     FilterTail,           ///< Fused Tail(Filter(x)) — produced by canonicalize R8.
+    TopK,                 ///< Fused Head(Order(x)) / Tail(Order(x)) — produced by canonicalize R16.
 };
 
 /// How a StreamNode triggers output emission.
@@ -834,6 +835,37 @@ class FilterTailNode final : public Node {
    private:
     FilterExprPtr predicate_;
     std::size_t count_;
+};
+
+/// Fused Head(Order(x)) / Tail(Order(x)) — produced by canonicalize R16.
+/// A partial heap-select is asymptotically better than a full sort followed by
+/// truncation: O(n log k) vs. O(n log n) when k ≪ n. The single child is the
+/// pre-sort input `x`; `keep_mode` selects the top (Head) or bottom (Tail) k
+/// rows according to `keys`.
+class TopKNode final : public Node {
+   public:
+    enum class KeepMode : std::uint8_t { First, Last };
+
+    TopKNode(NodeId id, std::vector<OrderKey> keys, std::size_t count,
+             std::vector<ColumnRef> group_by, KeepMode keep_mode)
+        : Node(NodeKind::TopK, id),
+          keys_(std::move(keys)),
+          count_(count),
+          group_by_(std::move(group_by)),
+          keep_mode_(keep_mode) {}
+
+    [[nodiscard]] auto keys() const noexcept -> const std::vector<OrderKey>& { return keys_; }
+    [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
+    [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
+        return group_by_;
+    }
+    [[nodiscard]] auto keep_mode() const noexcept -> KeepMode { return keep_mode_; }
+
+   private:
+    std::vector<OrderKey> keys_;
+    std::size_t count_;
+    std::vector<ColumnRef> group_by_;
+    KeepMode keep_mode_;
 };
 
 }  // namespace ibex::ir

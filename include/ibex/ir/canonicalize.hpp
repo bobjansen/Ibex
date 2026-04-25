@@ -61,6 +61,9 @@ namespace ibex::ir {
 ///       literal-only comparison and arithmetic folding (`5 == 5 → true`, `2 + 3 → 5`),
 ///       and `IsNull/IsNotNull` over a literal. If `pred` reduces to `true`, the Filter
 ///       is dropped; if to `false`, it becomes `Head(0, x)`.
+///  R19. `Filter(p1, Filter(p2, x))` → `Filter(p1 AND p2, x)` — merges adjacent
+///       filters so downstream rules see one combined predicate (richer column
+///       refs, more fusion/push opportunities).
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

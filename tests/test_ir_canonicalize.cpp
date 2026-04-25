@@ -507,6 +507,21 @@ TEST_CASE("canonicalize R16: Tail(Order(x)) fuses to TopK(Last) preserving group
     REQUIRE(topk.group_by().front().name == "symbol");
 }
 
+TEST_CASE("canonicalize R19: adjacent Filters merge into Filter(AND)", "[ir][canonicalize]") {
+    auto p_outer = fexpr(
+        {.node = ir::FilterCmp{.op = ir::CompareOp::Gt, .left = col_ref("a"), .right = ilit(0)}});
+    auto p_inner = fexpr(
+        {.node = ir::FilterCmp{.op = ir::CompareOp::Lt, .left = col_ref("b"), .right = ilit(10)}});
+    auto tree =
+        with_child(make_filter_with({1}, std::move(p_outer)),
+                   with_child(make_filter_with({2}, std::move(p_inner)), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+    const auto& f = static_cast<const ir::FilterNode&>(*out);
+    REQUIRE(std::holds_alternative<ir::FilterAnd>(f.predicate().node));
+}
+
 namespace {
 
 auto make_aggregate(ir::NodeId id, std::vector<std::string> gb_cols, std::vector<ir::AggSpec> aggs)

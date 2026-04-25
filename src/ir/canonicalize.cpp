@@ -639,6 +639,49 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
     return {true, std::move(update_owned)};
 }
 
+// R18: Filter(Aggregate(x)) → Aggregate(Filter(x)) when the predicate only
+// references group_by columns. Group_by columns pass through the aggregate
+// unchanged, so filtering them above is observably the same as below — but
+// below the aggregate the input is typically much larger (every row), so the
+// filter eliminates work for the aggregate itself. Predicates referencing
+// aggregation aliases (HAVING-style) cannot push down and are left in place.
+auto try_filter_past_aggregate(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Filter || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Aggregate) {
+        return {false, std::move(node)};
+    }
+    auto& filter = static_cast<FilterNode&>(*node);
+    const auto& agg = static_cast<const AggregateNode&>(*node->children().front());
+    if (agg.children().empty() || agg.group_by().empty()) {
+        // No group_by ⇒ exactly one output row; predicate either keeps it or
+        // drops it, but that's a HAVING-style filter — not pushable.
+        return {false, std::move(node)};
+    }
+    std::unordered_set<std::string> gb_names;
+    gb_names.reserve(agg.group_by().size());
+    for (const auto& c : agg.group_by()) {
+        gb_names.insert(c.name);
+    }
+    std::unordered_set<std::string> pred_cols;
+    collect_filter_column_refs(filter.predicate(), pred_cols);
+    const bool only_group_by =
+        std::all_of(pred_cols.begin(), pred_cols.end(),
+                    [&](const std::string& c) { return gb_names.contains(c); });
+    if (!only_group_by) {
+        return {false, std::move(node)};
+    }
+    FilterExprPtr pred = filter.take_predicate();
+    const auto filter_id = node->id();
+    NodePtr filter_owned = std::move(node);
+    NodePtr agg_owned = take_unique_child(*filter_owned);
+    NodePtr x = take_unique_child(*agg_owned);
+    auto new_filter = std::make_unique<FilterNode>(filter_id, std::move(pred));
+    new_filter->add_child(std::move(x));
+    NodePtr bubbled = rewrite_root(std::move(new_filter));
+    agg_owned->add_child(std::move(bubbled));
+    return {true, std::move(agg_owned)};
+}
+
 // R5: Project(Filter(x)) → FilterProject(x).
 auto try_fuse_filter_project(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Project || node->children().empty() ||
@@ -813,7 +856,7 @@ using RuleFn = TryResult (*)(NodePtr);
 // Ordered list of rules. The driver tries each in turn; on any fire, it
 // restarts from the top, so earlier rules are re-tried against shapes exposed
 // by later ones. Rule names mirror the Rx labels in canonicalize.hpp.
-constexpr std::array<std::pair<std::string_view, RuleFn>, 15> kRules{{
+constexpr std::array<std::pair<std::string_view, RuleFn>, 16> kRules{{
     {"R17:simplify-predicate", try_simplify_predicate},
     {"R1:filter-past-order", try_filter_past_order},
     {"R2:project-past-order", try_project_past_order},
@@ -824,6 +867,7 @@ constexpr std::array<std::pair<std::string_view, RuleFn>, 15> kRules{{
     {"R13-14:limit-collapse", try_limit_collapse},
     {"R15:order-drop-pinned-keys", try_order_drop_pinned_keys},
     {"R12:filter-past-update", try_filter_past_update},
+    {"R18:filter-past-aggregate", try_filter_past_aggregate},
     {"R5:fuse-filter-project", try_fuse_filter_project},
     {"R6:fuse-filter-update-project", try_fuse_filter_update_project},
     {"R7-8:fuse-filter-limit", try_fuse_filter_limit},

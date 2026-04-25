@@ -506,3 +506,70 @@ TEST_CASE("canonicalize R16: Tail(Order(x)) fuses to TopK(Last) preserving group
     REQUIRE(topk.group_by().size() == 1);
     REQUIRE(topk.group_by().front().name == "symbol");
 }
+
+namespace {
+
+auto make_aggregate(ir::NodeId id, std::vector<std::string> gb_cols, std::vector<ir::AggSpec> aggs)
+    -> ir::NodePtr {
+    std::vector<ir::ColumnRef> gb;
+    gb.reserve(gb_cols.size());
+    for (auto& c : gb_cols) {
+        gb.push_back(ir::ColumnRef{.name = std::move(c), .source = {0}});
+    }
+    return std::make_unique<ir::AggregateNode>(id, std::move(gb), std::move(aggs));
+}
+
+}  // namespace
+
+TEST_CASE("canonicalize R18: Filter on group_by column pushes below Aggregate",
+          "[ir][canonicalize]") {
+    // Filter(g == 1, Aggregate(group_by=[g], [sum(x) as s], scan))
+    auto pred = fexpr(
+        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("g"), .right = ilit(1)}});
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
+                               .column = ir::ColumnRef{.name = "x", .source = {0}},
+                               .alias = "s"});
+    auto tree =
+        with_child(make_filter_with({1}, std::move(pred)),
+                   with_child(make_aggregate({2}, {"g"}, std::move(aggs)), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Aggregate);
+    REQUIRE(out->children().size() == 1);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("canonicalize R18: Filter on agg alias stays above Aggregate (HAVING-style)",
+          "[ir][canonicalize]") {
+    // Filter(s > 5, Aggregate(group_by=[g], [sum(x) as s], scan))
+    auto pred = fexpr(
+        {.node = ir::FilterCmp{.op = ir::CompareOp::Gt, .left = col_ref("s"), .right = ilit(5)}});
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
+                               .column = ir::ColumnRef{.name = "x", .source = {0}},
+                               .alias = "s"});
+    auto tree =
+        with_child(make_filter_with({1}, std::move(pred)),
+                   with_child(make_aggregate({2}, {"g"}, std::move(aggs)), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Aggregate);
+}
+
+TEST_CASE("canonicalize R18: Filter does not push past Aggregate with empty group_by",
+          "[ir][canonicalize]") {
+    // Filter(c == 1, Aggregate(group_by=[], [sum(x) as s], scan))
+    auto pred = fexpr(
+        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(1)}});
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
+                               .column = ir::ColumnRef{.name = "x", .source = {0}},
+                               .alias = "s"});
+    auto tree =
+        with_child(make_filter_with({1}, std::move(pred)),
+                   with_child(make_aggregate({2}, {}, std::move(aggs)), make_scan({3}, "t")));
+    auto out = ir::canonicalize(std::move(tree));
+    REQUIRE(out->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Aggregate);
+}

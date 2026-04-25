@@ -31,7 +31,8 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 ## Key Design Decisions
 - Language keywords: `filter` (not `where`), `select`, `update`, `by`, `window`
 - IR nodes: Scan, Filter, Project, Aggregate, Update, Window
-- No SQL keywords in surface syntax, no pipes, no macros
+- No SQL keywords in surface syntax, no pipes, no user-defined macros
+- Built-in compile-time `map` expansion exists inside braced `select` and `update` blocks
 - Column resolution: column scope → lexical scope → built-in scope
 - `select` and `update` are mutually exclusive in a block
 - `by` requires `select` or `update`

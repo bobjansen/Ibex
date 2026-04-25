@@ -645,6 +645,29 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
 // below the aggregate the input is typically much larger (every row), so the
 // filter eliminates work for the aggregate itself. Predicates referencing
 // aggregation aliases (HAVING-style) cannot push down and are left in place.
+// R19: Filter(p1, Filter(p2, x)) → Filter(p1 AND p2, x). Merges adjacent
+// filters so downstream rules see one combined predicate (richer column-ref
+// set, more chances to fuse/push).
+auto try_filter_merge(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Filter || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Filter) {
+        return {false, std::move(node)};
+    }
+    auto& outer = static_cast<FilterNode&>(*node);
+    auto& inner = static_cast<FilterNode&>(*node->children().front());
+    FilterExprPtr p1 = outer.take_predicate();
+    FilterExprPtr p2 = inner.take_predicate();
+    auto combined = std::make_unique<FilterExpr>(
+        FilterExpr{.node = FilterAnd{.left = std::move(p1), .right = std::move(p2)}});
+    const auto outer_id = node->id();
+    NodePtr outer_owned = std::move(node);
+    NodePtr inner_owned = take_unique_child(*outer_owned);
+    NodePtr x = take_unique_child(*inner_owned);
+    auto merged = std::make_unique<FilterNode>(outer_id, std::move(combined));
+    merged->add_child(std::move(x));
+    return {true, std::move(merged)};
+}
+
 auto try_filter_past_aggregate(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Aggregate) {
@@ -856,7 +879,8 @@ using RuleFn = TryResult (*)(NodePtr);
 // Ordered list of rules. The driver tries each in turn; on any fire, it
 // restarts from the top, so earlier rules are re-tried against shapes exposed
 // by later ones. Rule names mirror the Rx labels in canonicalize.hpp.
-constexpr std::array<std::pair<std::string_view, RuleFn>, 16> kRules{{
+constexpr std::array<std::pair<std::string_view, RuleFn>, 17> kRules{{
+    {"R19:filter-merge", try_filter_merge},
     {"R17:simplify-predicate", try_simplify_predicate},
     {"R1:filter-past-order", try_filter_past_order},
     {"R2:project-past-order", try_project_past_order},

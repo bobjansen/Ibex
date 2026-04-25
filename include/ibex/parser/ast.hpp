@@ -183,11 +183,11 @@ struct OrderClause {
 };
 
 struct HeadClause {
-    std::int64_t count = 0;
+    ExprPtr count;
 };
 
 struct TailClause {
-    std::int64_t count = 0;
+    ExprPtr count;
 };
 
 struct ByClause {

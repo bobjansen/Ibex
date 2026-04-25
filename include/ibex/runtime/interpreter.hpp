@@ -232,6 +232,11 @@ class ExternRegistry;
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)
     -> std::expected<ScalarValue, std::string>;
 
+[[nodiscard]] auto evaluate_row_count_expr(const ir::Expr& expr,
+                                           const ScalarRegistry* scalars = nullptr,
+                                           const ExternRegistry* externs = nullptr)
+    -> std::expected<std::size_t, std::string>;
+
 /// Merge two validity bitmaps (`a && b`) for the first `n` rows.
 /// Returns nullopt when both inputs are nullopt-equivalent (nullptr).
 /// Exposed for micro-benchmarking and runtime-level utilities.

@@ -84,6 +84,9 @@
           <code>extern fn</code> let Ibex check side-effect assumptions early.
           Extern parameters can also declare call semantics with
           <code>const</code>, <code>mutable</code>, or <code>consume</code>.
+          Table-valued parameters may also declare minimum required columns with
+          types such as <code>DataFrame&lt;{ salary: Int64 }&gt;</code>; extra
+          columns are still allowed.
           A first conservative optimizer pass can now elide unused pure
           top-level calls; richer effect-driven rewrites are planned.
         </p>
@@ -96,6 +99,14 @@
           <code>Float64(x)</code>) and a five-mode <code>round()</code>
           built-in — including banker&rsquo;s rounding — cover every numeric
           conversion. Optional annotations are validated when present.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Scalar Limits</h3>
+        <p>
+          <code>head</code> and <code>tail</code> accept integer scalar
+          expressions, not just literals, so reusable helpers can write
+          <code>head n</code> and <code>tail n</code> directly.
         </p>
       </article>
       <article class="card">

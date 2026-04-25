@@ -224,6 +224,10 @@ iris[order];
 // First 10 rows in the current order
 iris[head 10];
 
+// First n rows using a scalar binding
+let n = 10;
+iris[head n];
+
 // Top 3 rows per species after sorting
 iris[order { `Sepal.Length` desc }, head 3, by Species];
 
@@ -275,6 +279,21 @@ extern fn compute_greeks(p: Float64) -> DataFrame from "greeks.hpp";
 
 trades[update { (delta, gamma) = compute_greeks(price) }]
 ```
+
+### Function table contracts
+
+User-defined functions can already require a minimum input table schema with
+`DataFrame<{ ... }>` parameter types. Declared columns must exist with the
+right types; extra columns are allowed:
+
+```
+fn top_two_salaries(df: DataFrame<{ salary: Int64 }>) -> DataFrame effects {} {
+    df[distinct { salary }, order { salary desc }, head 2];
+}
+```
+
+This is the shape to build reusable dataframe helpers on. See
+`examples/function_table_contracts.ibex` for a runnable example.
 
 ### Null handling
 

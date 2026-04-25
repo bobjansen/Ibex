@@ -1134,30 +1134,18 @@ class Parser {
             return OrderClause{.keys = std::move(keys->first), .is_braced = keys->second};
         }
         if (match(TokenKind::KeywordHead)) {
-            if (!consume(TokenKind::IntLiteral, "expected integer row count after 'head'")) {
+            auto count = parse_expression();
+            if (!count) {
                 return std::nullopt;
             }
-            std::int64_t count = 0;
-            auto text = previous().lexeme;
-            auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), count);
-            if (ec != std::errc{} || ptr != text.data() + text.size()) {
-                error_ = make_error(previous(), "invalid integer row count after 'head'");
-                return std::nullopt;
-            }
-            return HeadClause{.count = count};
+            return HeadClause{.count = std::move(count)};
         }
         if (match(TokenKind::KeywordTail)) {
-            if (!consume(TokenKind::IntLiteral, "expected integer row count after 'tail'")) {
+            auto count = parse_expression();
+            if (!count) {
                 return std::nullopt;
             }
-            std::int64_t count = 0;
-            auto text = previous().lexeme;
-            auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), count);
-            if (ec != std::errc{} || ptr != text.data() + text.size()) {
-                error_ = make_error(previous(), "invalid integer row count after 'tail'");
-                return std::nullopt;
-            }
-            return TailClause{.count = count};
+            return TailClause{.count = std::move(count)};
         }
         if (match(TokenKind::KeywordUpdate)) {
             // `update = expr`: merge all columns from a table-returning expression.

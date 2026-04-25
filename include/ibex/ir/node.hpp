@@ -336,32 +336,60 @@ class OrderNode final : public Node {
 /// Head node: keep the first N rows, optionally per group.
 class HeadNode final : public Node {
    public:
-    HeadNode(NodeId id, std::size_t count, std::vector<ColumnRef> group_by = {})
-        : Node(NodeKind::Head, id), count_(count), group_by_(std::move(group_by)) {}
+    HeadNode(NodeId id, Expr count, std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Head, id), count_(std::move(count)), group_by_(std::move(group_by)) {}
 
-    [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
+    HeadNode(NodeId id, std::size_t count, std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Head, id),
+          count_(Expr{.node = Literal{.value = static_cast<std::int64_t>(count)}}),
+          group_by_(std::move(group_by)) {}
+
+    [[nodiscard]] auto count_expr() const noexcept -> const Expr& { return count_; }
+    [[nodiscard]] auto count_literal() const noexcept -> std::optional<std::size_t> {
+        if (const auto* lit = std::get_if<Literal>(&count_.node)) {
+            if (const auto* i = std::get_if<std::int64_t>(&lit->value); i != nullptr && *i >= 0) {
+                return static_cast<std::size_t>(*i);
+            }
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] auto count() const -> std::size_t { return count_literal().value(); }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
         return group_by_;
     }
 
    private:
-    std::size_t count_;
+    Expr count_;
     std::vector<ColumnRef> group_by_;
 };
 
 /// Tail node: keep the last N rows, optionally per group.
 class TailNode final : public Node {
    public:
-    TailNode(NodeId id, std::size_t count, std::vector<ColumnRef> group_by = {})
-        : Node(NodeKind::Tail, id), count_(count), group_by_(std::move(group_by)) {}
+    TailNode(NodeId id, Expr count, std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Tail, id), count_(std::move(count)), group_by_(std::move(group_by)) {}
 
-    [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
+    TailNode(NodeId id, std::size_t count, std::vector<ColumnRef> group_by = {})
+        : Node(NodeKind::Tail, id),
+          count_(Expr{.node = Literal{.value = static_cast<std::int64_t>(count)}}),
+          group_by_(std::move(group_by)) {}
+
+    [[nodiscard]] auto count_expr() const noexcept -> const Expr& { return count_; }
+    [[nodiscard]] auto count_literal() const noexcept -> std::optional<std::size_t> {
+        if (const auto* lit = std::get_if<Literal>(&count_.node)) {
+            if (const auto* i = std::get_if<std::int64_t>(&lit->value); i != nullptr && *i >= 0) {
+                return static_cast<std::size_t>(*i);
+            }
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] auto count() const -> std::size_t { return count_literal().value(); }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
         return group_by_;
     }
 
    private:
-    std::size_t count_;
+    Expr count_;
     std::vector<ColumnRef> group_by_;
 };
 

@@ -13,6 +13,34 @@ namespace ibex::ir {
 
 namespace {
 
+// Counter for synthesizing fresh NodeIds during a canonicalize pass. Seeded at
+// canonicalize() entry to (max id in tree + 1) so it never collides with
+// existing IDs in the input.
+thread_local std::uint64_t g_next_id = 0;
+
+auto fresh_id() -> NodeId {
+    return NodeId{g_next_id++};
+}
+
+auto collect_max_id(const Node& n, std::uint64_t& m) -> void {
+    m = std::max(m, n.id().value);
+    for (const auto& c : n.children()) {
+        collect_max_id(*c, m);
+    }
+    if (n.kind() == NodeKind::Program) {
+        const auto& prog = static_cast<const ProgramNode&>(n);
+        for (const auto& p : prog.preamble()) {
+            if (p) {
+                collect_max_id(*p, m);
+            }
+        }
+        const auto& main_ptr = const_cast<ProgramNode&>(prog).mutable_main_node();
+        if (main_ptr) {
+            collect_max_id(*main_ptr, m);
+        }
+    }
+}
+
 // Move-steal a unique child out of `parent`, returning it and leaving `parent`
 // with an empty children vector. Precondition: parent has exactly one child.
 auto take_unique_child(Node& parent) -> NodePtr {
@@ -645,6 +673,71 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
 // below the aggregate the input is typically much larger (every row), so the
 // filter eliminates work for the aggregate itself. Predicates referencing
 // aggregation aliases (HAVING-style) cannot push down and are left in place.
+// R21: collapse a redundant Project below a Project / FilterProject. The outer
+// node already restricts columns to its own list; the inner Project's column
+// list must be a superset (otherwise the outer would reference missing cols),
+// so dropping it is always sound and removes a needless schema-shuffle pass.
+auto try_project_collapse(NodePtr node) -> TryResult {
+    const auto kind = node->kind();
+    if ((kind != NodeKind::Project && kind != NodeKind::FilterProject) ||
+        node->children().empty() || node->children().front()->kind() != NodeKind::Project) {
+        return {false, std::move(node)};
+    }
+    auto& outer_kids = node->mutable_children();
+    NodePtr inner = std::move(outer_kids.front());
+    outer_kids.clear();
+    NodePtr grandchild = take_unique_child(*inner);
+    node->add_child(std::move(grandchild));
+    return {true, std::move(node)};
+}
+
+// R20: Aggregate(gb, aggs, x) → Aggregate(gb, aggs, Project(needed, x)) where
+// `needed` = unique columns referenced by `gb` ∪ each agg's input column. Drops
+// unused columns before the breaker so the aggregate scans less data. Skipped
+// when `x` is already a projecting node, which both avoids redundant work and
+// prevents an infinite loop (the inserted Project would re-trigger the rule).
+auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
+    if (node->kind() != NodeKind::Aggregate || node->children().empty()) {
+        return {false, std::move(node)};
+    }
+    const auto child_kind = node->children().front()->kind();
+    if (child_kind == NodeKind::Project || child_kind == NodeKind::FilterProject ||
+        child_kind == NodeKind::FilterUpdateProject) {
+        return {false, std::move(node)};
+    }
+    auto& agg = static_cast<AggregateNode&>(*node);
+    std::vector<ColumnRef> needed;
+    std::unordered_set<std::string> seen;
+    needed.reserve(agg.group_by().size() + agg.aggregations().size());
+    for (const auto& g : agg.group_by()) {
+        if (seen.insert(g.name).second) {
+            needed.push_back(g);
+        }
+    }
+    for (const auto& a : agg.aggregations()) {
+        if (a.column.name.empty()) {
+            // count(*) / unbound input — can't safely prune since the agg
+            // doesn't name a specific column.
+            return {false, std::move(node)};
+        }
+        if (seen.insert(a.column.name).second) {
+            needed.push_back(a.column);
+        }
+    }
+    if (needed.empty()) {
+        return {false, std::move(node)};
+    }
+    NodePtr agg_owned = std::move(node);
+    NodePtr child = take_unique_child(*agg_owned);
+    auto proj = std::make_unique<ProjectNode>(fresh_id(), std::move(needed));
+    proj->add_child(std::move(child));
+    // Rewrite the freshly inserted Project at root so any pending rules (e.g.
+    // R5 Project(Filter) → FilterProject) fire before the Aggregate sees it.
+    NodePtr proj_canon = rewrite_root(std::move(proj));
+    agg_owned->add_child(std::move(proj_canon));
+    return {true, std::move(agg_owned)};
+}
+
 // R19: Filter(p1, Filter(p2, x)) → Filter(p1 AND p2, x). Merges adjacent
 // filters so downstream rules see one combined predicate (richer column-ref
 // set, more chances to fuse/push).
@@ -879,7 +972,7 @@ using RuleFn = TryResult (*)(NodePtr);
 // Ordered list of rules. The driver tries each in turn; on any fire, it
 // restarts from the top, so earlier rules are re-tried against shapes exposed
 // by later ones. Rule names mirror the Rx labels in canonicalize.hpp.
-constexpr std::array<std::pair<std::string_view, RuleFn>, 17> kRules{{
+constexpr std::array<std::pair<std::string_view, RuleFn>, 19> kRules{{
     {"R19:filter-merge", try_filter_merge},
     {"R17:simplify-predicate", try_simplify_predicate},
     {"R1:filter-past-order", try_filter_past_order},
@@ -892,6 +985,8 @@ constexpr std::array<std::pair<std::string_view, RuleFn>, 17> kRules{{
     {"R15:order-drop-pinned-keys", try_order_drop_pinned_keys},
     {"R12:filter-past-update", try_filter_past_update},
     {"R18:filter-past-aggregate", try_filter_past_aggregate},
+    {"R20:project-prune-above-aggregate", try_project_prune_above_aggregate},
+    {"R21:project-collapse", try_project_collapse},
     {"R5:fuse-filter-project", try_fuse_filter_project},
     {"R6:fuse-filter-update-project", try_fuse_filter_update_project},
     {"R7-8:fuse-filter-limit", try_fuse_filter_limit},
@@ -946,6 +1041,11 @@ auto canon(NodePtr node) -> NodePtr {
 }  // namespace
 
 auto canonicalize(NodePtr root) -> NodePtr {
+    if (root) {
+        std::uint64_t max_id = 0;
+        collect_max_id(*root, max_id);
+        g_next_id = max_id + 1;
+    }
     return canon(std::move(root));
 }
 

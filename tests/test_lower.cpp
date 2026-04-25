@@ -111,7 +111,12 @@ TEST_CASE("Lower grouped aggregation with null cleanup wrapper to IR") {
     REQUIRE(agg->aggregations()[0].func == ir::AggFunc::Mean);
 
     REQUIRE(agg->children().size() == 1);
-    const auto* update = as_node<ir::UpdateNode>(agg->children()[0].get());
+    // Canonicalize R20 inserts a column-pruning Project between the Aggregate
+    // and the Update so the breaker scans only the columns it needs.
+    const auto* proj = as_node<ir::ProjectNode>(agg->children()[0].get());
+    REQUIRE(proj != nullptr);
+    REQUIRE(proj->children().size() == 1);
+    const auto* update = as_node<ir::UpdateNode>(proj->children()[0].get());
     REQUIRE(update != nullptr);
     REQUIRE(update->fields().size() == 1);
     REQUIRE(update->fields()[0].alias == "_agg0");
@@ -137,7 +142,10 @@ TEST_CASE("Lower grouped aggregation with computed input to IR") {
     REQUIRE(agg->aggregations()[0].column.name == "_agg0");
 
     REQUIRE(agg->children().size() == 1);
-    const auto* update = as_node<ir::UpdateNode>(agg->children()[0].get());
+    const auto* proj = as_node<ir::ProjectNode>(agg->children()[0].get());
+    REQUIRE(proj != nullptr);
+    REQUIRE(proj->children().size() == 1);
+    const auto* update = as_node<ir::UpdateNode>(proj->children()[0].get());
     REQUIRE(update != nullptr);
     REQUIRE(update->fields().size() == 1);
     REQUIRE(update->fields()[0].alias == "_agg0");

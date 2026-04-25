@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """Benchmark pandas and polars on the same aggregation queries as ibex_bench.
 
+Two polars modes are available so the comparison covers both shapes a real
+caller hits:
+  • eager (always on): `pl.read_csv` once, then `df.<op>` per iteration. This
+    is the "data is already in memory" path and intentionally bypasses the
+    polars query optimizer.
+  • lazy (`--polars-lazy`): `pl.scan_csv(path).<chain>.collect()` per iteration.
+    This is the "data still needs to be read" path; the optimizer fires
+    (predicate pushdown into the CSV reader, projection pruning, slice/topk
+    fusion) and CSV I/O is part of the timed work.
+
 Writes tab-separated results to --out (default: results/python.tsv).
 Progress goes to stderr; TSV rows go to the output file.
 
 Usage:
   uv run bench_python.py --csv data/prices.csv --csv-multi data/prices_multi.csv
   uv run bench_python.py --csv data/prices.csv --skip-pandas
+  uv run bench_python.py --csv data/prices.csv --polars-lazy --skip-pandas
 """
 import argparse, csv, pathlib, sys, time
 import numpy as np
@@ -310,6 +321,155 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         run(
             "filter_or",
             lambda: dft.filter((pl.col("price") > 900.0) | (pl.col("qty") < 10)),
+        )
+
+    return rows
+
+
+# ── Polars lazy: data still needs to be read ─────────────────────────────────
+# Mirrors `bench_polars` query-for-query but each iteration starts from
+# `pl.scan_csv(path)` and ends in `.collect()`, so polars' query optimizer
+# (predicate pushdown, projection pushdown, slice/topk fusion, …) is engaged
+# and CSV I/O is part of the timed work — the realistic shape for the
+# "I have a CSV on disk and I want this answer" workflow. Pair with the
+# eager `bench_polars` for the "data is already in memory" baseline.
+def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
+    print("polars-lazy: warming OS page cache...", file=sys.stderr, flush=True)
+    pl.scan_csv(csv_path).collect()  # prime the page cache once
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = len(result)
+        print(
+            f"  polars_lazy/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            (
+                "polars_lazy",
+                name,
+                f"{avg_ms:.3f}",
+                f"{min_ms:.3f}",
+                f"{max_ms:.3f}",
+                f"{stddev_ms:.3f}",
+                f"{p95_ms:.3f}",
+                f"{p99_ms:.3f}",
+                n,
+            )
+        )
+
+    def scan():
+        return pl.scan_csv(csv_path)
+
+    run(
+        "mean_by_symbol",
+        lambda: scan().group_by("symbol").agg(pl.col("price").mean().alias("avg_price")).collect(),
+    )
+    run(
+        "ohlc_by_symbol",
+        lambda: scan().group_by("symbol").agg(
+            pl.col("price").first().alias("open"),
+            pl.col("price").max().alias("high"),
+            pl.col("price").min().alias("low"),
+            pl.col("price").last().alias("last"),
+        ).collect(),
+    )
+    run(
+        "update_price_x2",
+        lambda: scan().with_columns((pl.col("price") * 2).alias("price_x2")).collect(),
+    )
+    run(
+        "distinct_symbol",
+        lambda: scan().select("symbol").unique(maintain_order=True).collect(),
+    )
+    run(
+        "order_head_topk",
+        lambda: scan().sort("price", descending=True).head(100).collect(),
+    )
+    run(
+        "order_head_topk_by_symbol",
+        lambda: scan()
+        .sort("price", descending=True)
+        .group_by("symbol", maintain_order=True)
+        .head(3)
+        .collect(),
+    )
+    run(
+        "order_tail_topk",
+        lambda: scan().sort("price", descending=True).tail(100).collect(),
+    )
+    run(
+        "order_tail_topk_by_symbol",
+        lambda: scan()
+        .sort("price", descending=True)
+        .group_by("symbol", maintain_order=True)
+        .tail(3)
+        .collect(),
+    )
+    run(
+        "cumsum_price",
+        lambda: scan().with_columns(pl.col("price").cum_sum().alias("cs")).collect(),
+    )
+    run(
+        "cumprod_price",
+        lambda: scan().with_columns(pl.col("price").cum_prod().alias("cp")).collect(),
+    )
+    # rand_* benchmarks inject a numpy-generated Series; skipping in lazy mode
+    # since the inputs aren't expressible as a scan-only chain.
+
+    if csv_multi_path:
+        def scan_multi():
+            return pl.scan_csv(csv_multi_path)
+
+        run(
+            "count_by_symbol_day",
+            lambda: scan_multi().group_by(["symbol", "day"]).agg(pl.len().alias("n")).collect(),
+        )
+        run(
+            "mean_by_symbol_day",
+            lambda: scan_multi().group_by(["symbol", "day"]).agg(
+                pl.col("price").mean().alias("avg_price")
+            ).collect(),
+        )
+        run(
+            "ohlc_by_symbol_day",
+            lambda: scan_multi().group_by(["symbol", "day"]).agg(
+                pl.col("price").first().alias("open"),
+                pl.col("price").max().alias("high"),
+                pl.col("price").min().alias("low"),
+                pl.col("price").last().alias("last"),
+            ).collect(),
+        )
+
+    if csv_trades_path:
+        def scan_trades():
+            return pl.scan_csv(csv_trades_path)
+
+        run(
+            "filter_simple",
+            lambda: scan_trades().filter(pl.col("price") > 500.0).collect(),
+        )
+        run(
+            "filter_and",
+            lambda: scan_trades()
+            .filter((pl.col("price") > 500.0) & (pl.col("qty") < 100))
+            .collect(),
+        )
+        run(
+            "filter_arith",
+            lambda: scan_trades()
+            .filter(pl.col("price") * pl.col("qty") > 50000.0)
+            .collect(),
+        )
+        run(
+            "filter_or",
+            lambda: scan_trades()
+            .filter((pl.col("price") > 900.0) | (pl.col("qty") < 10))
+            .collect(),
         )
 
     return rows
@@ -728,6 +888,12 @@ def main():
     ap.add_argument("--skip-pandas", action="store_true", help="Run polars only")
     ap.add_argument("--skip-polars", action="store_true", help="Run pandas only")
     ap.add_argument(
+        "--polars-lazy",
+        action="store_true",
+        help="Also run polars in lazy mode via pl.scan_csv (data still needs to be read; "
+        "engages the polars query optimizer + I/O pushdown).",
+    )
+    ap.add_argument(
         "--fill-rows",
         type=int,
         default=4_000_000,
@@ -751,6 +917,10 @@ def main():
         )
     if not args.skip_polars:
         all_rows += bench_polars(
+            args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters
+        )
+    if not args.skip_polars and args.polars_lazy:
+        all_rows += bench_polars_lazy(
             args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters
         )
     if args.csv_multi:

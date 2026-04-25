@@ -13,7 +13,12 @@
 #   ./bench_ibex.sh [--csv path] [--csv-multi path] [--warmup N] [--iters N]
 #                   [--suite name[,name...]] [--merge-validity-rows N]
 #                   [--rng-micro-rows N] [--reshape-rows N]
-#                   [--out results/ibex.tsv]
+#                   [--mode memory|scan] [--out results/ibex.tsv]
+#
+# --mode memory (default): time pure execution; CSVs are read once outside the
+#   timer (matches polars eager). Framework tag: "ibex".
+# --mode scan: read CSVs and parse+lower+execute inside the timer (matches
+#   polars lazy scan_csv().collect()). Framework tag: "ibex_scan".
 
 set -euo pipefail
 
@@ -40,6 +45,7 @@ SUITE=""
 MERGE_VALIDITY_ROWS=""
 RNG_MICRO_ROWS=""
 RESHAPE_ROWS=""
+MODE="memory"
 OUT="$SCRIPT_DIR/results/ibex.tsv"
 
 while [[ $# -gt 0 ]]; do
@@ -55,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
         --rng-micro-rows) RNG_MICRO_ROWS="$2"; shift 2 ;;
         --reshape-rows) RESHAPE_ROWS="$2"; shift 2 ;;
+        --mode)        MODE="$2";        shift 2 ;;
         --out)         OUT="$2";         shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
@@ -88,10 +95,16 @@ mkdir -p "$(dirname "$OUT")"
 # ── Run ibex_bench ────────────────────────────────────────────────────────────
 # --no-include-parse: queries[0,1] (mean_by_symbol, ohlc_by_symbol) measure
 #   pure execution only. queries[2,3] (parse_*) always include parse regardless.
+case "$MODE" in
+    memory) MODE_ARGS=(--no-include-parse); FW_TAG="ibex" ;;
+    scan)   MODE_ARGS=(--include-read);     FW_TAG="ibex_scan" ;;
+    *) echo "unknown --mode: $MODE (expected memory|scan)" >&2; exit 1 ;;
+esac
+
 BENCH_ARGS=(
     --warmup  "$WARMUP"
     --iters   "$ITERS"
-    --no-include-parse
+    "${MODE_ARGS[@]}"
 )
 [[ "$NEEDS_CSV" -eq 1 ]] && BENCH_ARGS+=(--csv "$CSV")
 [[ -n "$SUITE" ]] && BENCH_ARGS+=(--suite "$SUITE")
@@ -103,7 +116,7 @@ BENCH_ARGS=(
 [[ -f "$CSV_EVENTS" ]]  && BENCH_ARGS+=(--csv-events  "$CSV_EVENTS")
 [[ -f "$CSV_LOOKUP" ]]  && BENCH_ARGS+=(--csv-lookup  "$CSV_LOOKUP")
 
-echo "=== ibex ===" >&2
+echo "=== $FW_TAG ===" >&2
 raw="$("$IBEX_BENCH" "${BENCH_ARGS[@]}")"
 echo "$raw" >&2
 
@@ -127,7 +140,7 @@ echo "$raw" >&2
             if (v ~ /^p99_ms=/)    { split(v, a, "="); p99_ms    = a[2] }
             if (v ~ /^rows=/)      { split(v, a, "="); rows      = a[2] }
         }
-        fw = (name ~ /^parse_/) ? "ibex+parse" : "ibex"
+        fw = (name ~ /^parse_/) ? "ibex+parse" : "'"$FW_TAG"'"
         q  = name; sub(/^parse_/, "", q)
         print fw "\t" q "\t" avg_ms "\t" min_ms "\t" max_ms "\t" stddev_ms "\t" p95_ms "\t" p99_ms "\t" rows
     }'

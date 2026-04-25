@@ -72,9 +72,10 @@
       <article class="card">
         <h3>Kafka plugin</h3>
         <p>
-          Consume JSON messages from Kafka-compatible brokers such as Redpanda,
-          turn them into one-row typed tables, and plug them directly into
-          <code>Stream { ... }</code> pipelines or WebSocket dashboards.
+          Consume JSON or Schema-Registry-backed Avro messages from
+          Kafka-compatible brokers such as Redpanda, turn them into one-row
+          typed tables, and plug them directly into <code>Stream { ... }</code>
+          pipelines or WebSocket dashboards.
         </p>
       </article>
     </div>
@@ -101,6 +102,10 @@
 <span class="kw">let</span> tick = <span class="fn-name">kafka_recv</span>(<span class="str">"localhost:19092"</span>, <span class="str">"ticks"</span>,
                           <span class="str">"ibex-demo"</span>,
                           <span class="str">"ts:timestamp,symbol:str,price:f64,size:i64"</span>);</code></pre>
+        <p style="margin-top:0.75rem;">
+          For Schema Registry-backed Avro, use
+          <code>kafka_recv_avro(..., schema, registry_url[, options])</code>.
+        </p>
     </article>
   </section>
 
@@ -175,10 +180,10 @@
 
   <section class="section">
     <p class="section-label">Kafka via Redpanda</p>
-    <h2>Run a visible live-stream demo with Kafka input and WebSocket output</h2>
+    <h2>Run visible live-stream demos with Kafka input and WebSocket output</h2>
     <div>
       <article class="card">
-        <h3>What the demo does</h3>
+        <h3>JSON demo</h3>
         <p>
           The bundled Kafka demo uses Redpanda as a local Kafka-compatible
           broker. A synthetic tick producer writes JSON ticks into the
@@ -196,7 +201,7 @@
       </article>
 
       <article class="card" style="margin-top:1rem;">
-        <h3>Start the demo</h3>
+        <h3>Start the JSON dashboard</h3>
 <pre><code><span class="cm"># shell</span>
 scripts/demo-kafka.sh
 scripts/run-kafka-dashboard.sh
@@ -212,7 +217,7 @@ python3 demo/kafka/ohlc_ws_client.py</code></pre>
       </article>
 
       <article class="card" style="margin-top:1rem;">
-        <h3>The Ibex side</h3>
+        <h3>The JSON Ibex side</h3>
 <pre><code><span class="kw">import</span> <span class="str">"kafka"</span>;
 <span class="kw">import</span> <span class="str">"websocket"</span>;
 
@@ -242,12 +247,69 @@ python3 demo/kafka/ohlc_ws_client.py</code></pre>
       </article>
 
       <article class="card" style="margin-top:1rem;">
+        <h3>Avro demo with Schema Registry</h3>
+        <p>
+          The same Docker stack also starts Redpanda Schema Registry on
+          <code>http://127.0.0.1:18081</code> and a second producer that writes
+          Avro ticks into <code>ticks_avro</code>. The Avro dashboard uses two
+          separate websocket feeds:
+        </p>
+        <ul>
+          <li><code>ws://127.0.0.1:8775</code> for grouped trade summaries</li>
+          <li><code>ws://127.0.0.1:8776</code> for 5-second OHLC bars</li>
+        </ul>
+<pre><code><span class="cm"># shell</span>
+scripts/demo-kafka.sh
+scripts/run-kafka-avro-dashboard.sh
+
+<span class="cm"># optional terminal viewers</span>
+python3 demo/kafka/ws_client.py --port 8775
+python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
+        <p>
+          Open <code>demo/kafka/ws_dashboard_avro.html</code> to view the Avro
+          dashboard in the browser.
+        </p>
+      </article>
+
+      <article class="card" style="margin-top:1rem;">
+        <h3>The Avro Ibex side</h3>
+<pre><code><span class="kw">import</span> <span class="str">"kafka"</span>;
+<span class="kw">import</span> <span class="str">"websocket"</span>;
+
+<span class="fn-name">ws_listen</span>(<span class="num">8775</span>);
+
+<span class="kw">let</span> summary = Stream {
+    source = <span class="fn-name">kafka_recv_avro</span>(
+        <span class="str">"localhost:19092"</span>,
+        <span class="str">"ticks_avro"</span>,
+        <span class="str">"ibex-demo-summary-avro"</span>,
+        <span class="str">"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</span>,
+        <span class="str">"http://localhost:18081"</span>,
+        <span class="str">"poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"</span>
+    ),
+    transform = [<span class="kw">by</span> { symbol, venue }, <span class="kw">select</span> {
+        trades = <span class="fn-name">count</span>(),
+        last_px = <span class="fn-name">last</span>(price),
+        total_size = <span class="fn-name">sum</span>(size)
+    }],
+    sink = <span class="fn-name">ws_send</span>(<span class="num">8775</span>)
+};</code></pre>
+        <p>
+          The matching OHLC job in <code>examples/kafka_ohlc_avro.ibex</code>
+          reads the same <code>ticks_avro</code> topic and writes to
+          <code>ws://127.0.0.1:8776</code>.
+        </p>
+      </article>
+
+      <article class="card" style="margin-top:1rem;">
         <h3>Kafka-specific notes</h3>
         <ul>
           <li>The schema string is explicit and required: use <code>name:type</code> entries like <code>"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</code>.</li>
           <li>For live dashboards, prefer <code>consumer.auto.offset.reset=latest</code> so the stream starts at current traffic instead of replaying old messages.</li>
           <li><code>poll_timeout_ms</code> is only the wait between polls. It is not a lifetime timeout for the stream.</li>
           <li>For per-message live streams, <code>str</code> is a better demo key type than <code>cat</code>; it avoids per-message categorical dictionary churn.</li>
+          <li><code>kafka_recv_avro(...)</code> requires a Schema Registry base URL and currently supports flat records only.</li>
+          <li>The Avro v1 path does not support schema references or null-valued unions yet.</li>
         </ul>
       </article>
     </div>

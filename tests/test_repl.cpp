@@ -440,6 +440,208 @@ df;
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("function parameter: DataFrame schema validates required columns and allows extras") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("salary", ibex::Column<std::int64_t>{100, 200, 300});
+                                t.add_column("dept", ibex::Column<std::string>{"A", "B", "A"});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+
+fn keep_salary(df: DataFrame<{salary: Int64}>) -> DataFrame {
+    df[select { salary }];
+}
+
+let df = get_data();
+keep_salary(df);
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function parameter: DataFrame schema rejects missing required column") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("dept", ibex::Column<std::string>{"A", "B"});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+
+fn keep_salary(df: DataFrame<{salary: Int64}>) -> DataFrame {
+    df;
+}
+
+let df = get_data();
+keep_salary(df);
+)";
+
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function parameter: DataFrame schema rejects wrong required column type") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table("get_data",
+                            [](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                ibex::runtime::Table t;
+                                t.add_column("salary", ibex::Column<double>{100.0, 200.0});
+                                return ibex::runtime::ExternValue{std::move(t)};
+                            });
+
+    const char* src = R"(
+extern fn get_data() -> DataFrame from "fake.hpp";
+
+fn keep_salary(df: DataFrame<{salary: Int64}>) -> DataFrame {
+    df;
+}
+
+let df = get_data();
+keep_salary(df);
+)";
+
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function return: DataFrame schema validates declared required columns") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn only_salary(df: DataFrame<{salary: Int64}>) -> DataFrame<{salary: Int64}> {
+    df[select { salary }];
+}
+
+let df = Table { salary = [100, 200], dept = ["A", "B"] };
+only_salary(df);
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function return: DataFrame schema rejects missing declared column") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn broken(df: DataFrame<{salary: Int64}>) -> DataFrame<{salary: Int64, dept: String}> {
+    df[select { salary }];
+}
+
+let df = Table { salary = [100, 200] };
+broken(df);
+)";
+
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function parameter: Series type validates declared scalar element type") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn id_col(x: Series<Int64>) -> Series<Int64> {
+    x;
+}
+
+let t = Table { x = [1, 2, 3] };
+id_col(t[select { x }]);
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function parameter: Series type rejects wrong scalar element type") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn id_col(x: Series<Int64>) -> Series<Int64> {
+    x;
+}
+
+let t = Table { x = [1.0, 2.0, 3.0] };
+id_col(t[select { x }]);
+)";
+
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function return: Series type validates declared scalar element type") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn salary_col(df: DataFrame<{salary: Int64}>) -> Series<Int64> {
+    df[select { salary }];
+}
+
+let df = Table { salary = [100, 200] };
+salary_col(df);
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("function return: Series type rejects wrong scalar element type") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn salary_col(df: DataFrame<{salary: Float64}>) -> Series<Int64> {
+    df[select { salary }];
+}
+
+let df = Table { salary = [100.0, 200.0] };
+salary_col(df);
+)";
+
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL accepts head with scalar let binding") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let n = 2;
+let t = Table { x = [10, 20, 30] };
+t[head n];
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL accepts head with function scalar parameter") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn take_n(df: DataFrame<{x: Int64}>, n: Int64) -> DataFrame<{x: Int64}> {
+    df[head n];
+}
+
+let t = Table { x = [10, 20, 30] };
+take_n(t, 2);
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL rejects negative head count expression") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let n = -1;
+let t = Table { x = [10, 20, 30] };
+t[head n];
+)";
+
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
 // --- Explicit cast expressions ---
 
 TEST_CASE("cast: Float64(int_literal) allows passing to Float64 param") {

@@ -23,6 +23,7 @@ struct TupleSource {
 };
 
 void set_scalars(const runtime::ScalarRegistry* scalars);
+[[nodiscard]] auto eval_row_count(const ir::Expr& expr) -> std::size_t;
 
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.

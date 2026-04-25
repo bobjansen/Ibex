@@ -1,0 +1,54 @@
+import "csv";
+
+let employee = read_csv(
+    "examples/leetcode/data/employee_second_highest.csv",
+    "",
+    ",",
+    true,
+    "id:int,salary:int"
+);
+
+let n = 3;
+
+// LeetCode 177: Nth Highest Salary.
+//
+// Generalized from the second-highest case by allowing `head n`.
+// Ibex keeps a stable output column name here instead of the dynamic
+// `getNthHighestSalary(n)` label from the SQL / pandas formulation.
+
+fn top_n_salaries(df: DataFrame<{salary: Int64}>, n: Int64)
+    -> DataFrame<{salary: Int64}> effects {} {
+    df[
+        distinct { salary },
+        order { salary desc },
+        head n
+    ];
+}
+
+fn nth_highest_salary(df: DataFrame<{salary: Int64}>, n: Int64)
+    -> DataFrame<{nth_highest_salary: Int64}> effects {} {
+    let top_n = top_n_salaries(df, n);
+
+    let nth_salary =
+        top_n[
+            select {
+                dummy = 1,
+                nth_highest_salary = min(salary),
+                rows = count()
+            }
+        ][
+            filter rows == n
+        ];
+
+    let result =
+        (
+            Table { dummy = [1] }
+            left join nth_salary on dummy
+        )[
+            select { nth_highest_salary }
+        ];
+
+    result;
+}
+
+nth_highest_salary(employee, n);

@@ -537,7 +537,29 @@ TEST_CASE("Parse head clause") {
     REQUIRE(block.clauses.size() == 1);
 
     const auto& head = std::get<HeadClause>(block.clauses[0]);
-    REQUIRE(head.count == 10);
+    REQUIRE(head.count != nullptr);
+    const auto* lit = std::get_if<LiteralExpr>(&head.count->node);
+    REQUIRE(lit != nullptr);
+    REQUIRE(std::get<std::int64_t>(lit->value) == 10);
+}
+
+TEST_CASE("Parse head clause with identifier count") {
+    const char* source = "df[head n];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& head = std::get<HeadClause>(block.clauses[0]);
+    REQUIRE(head.count != nullptr);
+    const auto* ident = std::get_if<IdentifierExpr>(&head.count->node);
+    REQUIRE(ident != nullptr);
+    REQUIRE(ident->name == "n");
 }
 
 TEST_CASE("Parse tail clause") {
@@ -553,7 +575,10 @@ TEST_CASE("Parse tail clause") {
     REQUIRE(block.clauses.size() == 1);
 
     const auto& tail = std::get<TailClause>(block.clauses[0]);
-    REQUIRE(tail.count == 10);
+    REQUIRE(tail.count != nullptr);
+    const auto* lit = std::get_if<LiteralExpr>(&tail.count->node);
+    REQUIRE(lit != nullptr);
+    REQUIRE(std::get<std::int64_t>(lit->value) == 10);
 }
 
 TEST_CASE("Parse select assignment without braces") {

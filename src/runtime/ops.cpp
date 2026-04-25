@@ -167,6 +167,14 @@ void set_scalars(const runtime::ScalarRegistry* scalars) {
     g_scalars = scalars;
 }
 
+auto eval_row_count(const ir::Expr& expr) -> std::size_t {
+    auto count = runtime::evaluate_row_count_expr(expr, g_scalars, nullptr);
+    if (!count) {
+        throw std::runtime_error(count.error());
+    }
+    return *count;
+}
+
 auto filter(const runtime::Table& t, ir::FilterExprPtr pred) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);

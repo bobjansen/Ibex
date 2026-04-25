@@ -294,8 +294,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             const auto& head = static_cast<const ir::HeadNode&>(node);
             auto child = emit_node(require_single_child(head, "HeadNode"));
             auto var = fresh_var();
-            *out_ << "    auto " << var << " = ibex::ops::head(" << child << ", " << head.count()
-                  << ", {";
+            *out_ << "    auto " << var << " = ibex::ops::head(" << child
+                  << ", ibex::ops::eval_row_count(" << emit_expr(head.count_expr()) << "), {";
             bool first = true;
             for (const auto& key : head.group_by()) {
                 if (!first)
@@ -311,8 +311,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             const auto& tail = static_cast<const ir::TailNode&>(node);
             auto child = emit_node(require_single_child(tail, "TailNode"));
             auto var = fresh_var();
-            *out_ << "    auto " << var << " = ibex::ops::tail(" << child << ", " << tail.count()
-                  << ", {";
+            *out_ << "    auto " << var << " = ibex::ops::tail(" << child
+                  << ", ibex::ops::eval_row_count(" << emit_expr(tail.count_expr()) << "), {";
             bool first = true;
             for (const auto& key : tail.group_by()) {
                 if (!first)

@@ -1,0 +1,47 @@
+import "csv";
+
+let employee = read_csv(
+    "examples/leetcode/data/employee.csv",
+    "",
+    ",",
+    true,
+    "id:int,name:str,salary:int,departmentId:int"
+);
+
+let department = read_csv(
+    "examples/leetcode/data/department.csv",
+    "",
+    ",",
+    true,
+    "id:int,name:str"
+);
+
+// LeetCode 185: Department Top Three Salaries.
+//
+// Translation pattern:
+// 1. Reduce to unique (departmentId, salary) pairs.
+// 2. Keep the top three unique salaries per department.
+// 3. Semi join back to employees to recover all matching people.
+// 4. Join department names and project the final columns.
+
+let distinct_salaries =
+    employee[distinct { departmentId, salary }];
+
+let top_salaries =
+    distinct_salaries[
+        order { salary desc },
+        head 3,
+        by departmentId
+    ];
+
+let result =
+    (
+        employee
+        semi join top_salaries on { departmentId, salary }
+        join department[select { departmentId = id, department = name }] on departmentId
+    )[
+        select { department, employee = name, salary = salary },
+        order { department asc, salary desc, employee asc }
+    ];
+
+result;

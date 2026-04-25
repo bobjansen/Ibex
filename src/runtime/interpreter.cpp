@@ -4650,6 +4650,23 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
     return std::unexpected("unsupported expression");
 }
 
+auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* scalars,
+                                  const ExternRegistry* externs)
+    -> std::expected<std::size_t, std::string> {
+    Table empty;
+    auto value = eval_expr(expr, empty, 0, scalars, externs);
+    if (!value) {
+        return std::unexpected("row count expression: " + value.error());
+    }
+    if (const auto* i = std::get_if<std::int64_t>(&value.value())) {
+        if (*i < 0) {
+            return std::unexpected("row count expression must be non-negative");
+        }
+        return static_cast<std::size_t>(*i);
+    }
+    return std::unexpected("row count expression must evaluate to Int64");
+}
+
 // Evaluate a single field expression against a (potentially growing) table,
 // returning the resulting column. Handles fast-path binary ops and row-by-row eval.
 auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
@@ -6482,22 +6499,30 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (head.children().empty()) {
                 return std::unexpected("head node missing child");
             }
+            auto count = evaluate_row_count_expr_impl(head.count_expr(), scalars, externs);
+            if (!count) {
+                return std::unexpected(count.error());
+            }
             auto child = interpret_node(*head.children().front(), registry, scalars, externs);
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return head_table(child.value(), head.count(), head.group_by());
+            return head_table(child.value(), *count, head.group_by());
         }
         case ir::NodeKind::Tail: {
             const auto& tail = static_cast<const ir::TailNode&>(node);
             if (tail.children().empty()) {
                 return std::unexpected("tail node missing child");
             }
+            auto count = evaluate_row_count_expr_impl(tail.count_expr(), scalars, externs);
+            if (!count) {
+                return std::unexpected(count.error());
+            }
             auto child = interpret_node(*tail.children().front(), registry, scalars, externs);
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return tail_table(child.value(), tail.count(), tail.group_by());
+            return tail_table(child.value(), *count, tail.group_by());
         }
         case ir::NodeKind::Update: {
             const auto& update = static_cast<const ir::UpdateNode&>(node);
@@ -7176,6 +7201,12 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
 // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
 
 }  // namespace
+
+auto evaluate_row_count_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
+                             const ExternRegistry* externs)
+    -> std::expected<std::size_t, std::string> {
+    return evaluate_row_count_expr_impl(expr, scalars, externs);
+}
 
 auto merge_validity_bitmaps(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
     -> std::optional<ValidityBitmap> {
@@ -10692,6 +10723,10 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (head.children().empty()) {
             return std::unexpected("head node missing child");
         }
+        auto count = evaluate_row_count_expr_impl(head.count_expr(), scalars, externs);
+        if (!count.has_value()) {
+            return std::unexpected(count.error());
+        }
         // Head(Order(x)) is rewritten by canonicalize R16 into TopK(x);
         // Head(Filter(x)) with no group_by is rewritten by R7 into FilterHead(x);
         // Head past Project/Rename is handled by R4.
@@ -10700,7 +10735,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
-        return std::make_unique<ChunkedHeadOperator>(std::move(child_op.value()), head.count(),
+        return std::make_unique<ChunkedHeadOperator>(std::move(child_op.value()), *count,
                                                      &head.group_by());
     }
 
@@ -10709,11 +10744,15 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (tail.children().empty()) {
             return std::unexpected("tail node missing child");
         }
+        auto count = evaluate_row_count_expr_impl(tail.count_expr(), scalars, externs);
+        if (!count.has_value()) {
+            return std::unexpected(count.error());
+        }
         // Tail(Order(x)) → TopK via R16; Tail(Filter(x)) no-group_by → FilterTail via R8;
         // Tail past Project/Rename via R4.
         return build_unary_materializing_operator(
             *tail.children().front(), registry, scalars, externs, model_out,
-            [&](Table input) { return tail_table(input, tail.count(), tail.group_by()); });
+            [&](Table input) { return tail_table(input, *count, tail.group_by()); });
     }
 
     if (node.kind() == ir::NodeKind::Columns) {

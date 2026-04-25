@@ -317,6 +317,7 @@
             <tr><td><code>read_parquet(path)</code></td><td>Load Apache Parquet into a DataFrame.</td></tr>
             <tr><td><code>write_parquet(df, path)</code></td><td>Write a DataFrame to Parquet and return row count.</td></tr>
             <tr><td><code>kafka_recv(brokers, topic, group, schema[, options])</code></td><td>Poll one JSON Kafka message, decode it with an explicit schema, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
+            <tr><td><code>kafka_recv_avro(brokers, topic, group, schema, registry_url[, options])</code></td><td>Poll one Schema-Registry-framed Avro Kafka message, decode it with an explicit schema plus registry URL, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
             <tr><td><code>kafka_send(df, brokers, topic[, options])</code></td><td>Serialize each DataFrame row to one JSON Kafka message and return sent-row count.</td></tr>
             <tr><td><code>udp_recv(port)</code></td><td>Read rows from UDP into a DataFrame batch.</td></tr>
             <tr><td><code>udp_send(df, host, port)</code></td><td>Send a DataFrame batch via UDP and return sent-row count.</td></tr>

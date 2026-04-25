@@ -50,6 +50,12 @@ namespace ibex::ir {
 ///  R16. `Head(Order(x))` → `TopK(keys, n, First, x)` and `Tail(Order(x))` → `TopK(..., Last, x)`
 ///       — fused node so runtime + codegen both use partial heap-select (O(n log k)) instead
 ///       of full sort + truncate. Preserves any group_by on the limit.
+///  R18. `Filter(pred, Aggregate(group_by, aggs, x))` → `Aggregate(group_by, aggs, Filter(pred,
+///  x))`
+///       when `pred` only references columns in `group_by` (not aggregation aliases). Group_by
+///       columns survive the aggregate unchanged, so the filter is equivalent above or below;
+///       below it usually eliminates many more rows. HAVING-style predicates over agg aliases
+///       are left in place.
 ///  R17. Predicate simplification on `Filter(pred, x)`: boolean identity/absorption
 ///       (`x AND true → x`, `x OR false → x`, etc.), double-negation (`NOT NOT x → x`),
 ///       literal-only comparison and arithmetic folding (`5 == 5 → true`, `2 + 3 → 5`),

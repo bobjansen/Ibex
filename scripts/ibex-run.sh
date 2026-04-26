@@ -7,14 +7,20 @@
 #
 # Environment overrides:
 #   IBEX_ROOT   — repo root          (default: directory above this script)
-#   BUILD_DIR   — cmake build dir    (default: $IBEX_ROOT/build)
+#   BUILD_DIR   — cmake build dir    (default: $IBEX_ROOT/build-release when available, else $IBEX_ROOT/build)
 #   CXX         — C++ compiler       (default: clang++)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
-BUILD_DIR="${BUILD_DIR:-$IBEX_ROOT/build}"
+if [[ -z "${BUILD_DIR:-}" ]]; then
+    if [[ -x "$IBEX_ROOT/build-release/tools/ibex_compile" ]]; then
+        BUILD_DIR="$IBEX_ROOT/build-release"
+    else
+        BUILD_DIR="$IBEX_ROOT/build"
+    fi
+fi
 CXX="${CXX:-clang++}"
 
 detect_cxx_std_flag() {
@@ -61,6 +67,7 @@ IBEX_INCS=(
     "-I$IBEX_ROOT/libraries"
     "-I$BUILD_DIR/_deps/fmt-src/include"
     "-I$BUILD_DIR/_deps/spdlog-src/include"
+    "-I$BUILD_DIR/_deps/fast_float-src/include"
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
 

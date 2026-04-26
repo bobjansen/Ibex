@@ -182,6 +182,10 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
 [[nodiscard]] auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr;
 [[nodiscard]] auto fn_call(std::string callee, std::vector<ir::Expr> args,
                            std::vector<NamedArgExpr> named_args = {}) -> ir::Expr;
+[[nodiscard]] auto rank_expr(std::vector<ir::OrderKey> order_keys,
+                             ir::RankMethod method = ir::RankMethod::Average,
+                             ir::RankNaOption na_option = ir::RankNaOption::Keep, bool pct = false)
+    -> ir::Expr;
 
 // ─── Compound builders ────────────────────────────────────────────────────────
 

@@ -1151,6 +1151,50 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                     s += "})";
                 }
                 return s;
+            } else if constexpr (std::is_same_v<T, ir::RankExpr>) {
+                std::string s = "ibex::ops::rank_expr({";
+                bool first = true;
+                for (const auto& key : node.order_keys) {
+                    if (!first)
+                        s += ", ";
+                    first = false;
+                    s += "ibex::ir::OrderKey{\"" + escape_string(key.name) + "\", " +
+                         std::string(key.ascending ? "true" : "false") + "}";
+                }
+                s += "}, ibex::ir::RankMethod::";
+                switch (node.method) {
+                    case ir::RankMethod::Average:
+                        s += "Average";
+                        break;
+                    case ir::RankMethod::Min:
+                        s += "Min";
+                        break;
+                    case ir::RankMethod::Max:
+                        s += "Max";
+                        break;
+                    case ir::RankMethod::First:
+                        s += "First";
+                        break;
+                    case ir::RankMethod::Dense:
+                        s += "Dense";
+                        break;
+                }
+                s += ", ibex::ir::RankNaOption::";
+                switch (node.na_option) {
+                    case ir::RankNaOption::Keep:
+                        s += "Keep";
+                        break;
+                    case ir::RankNaOption::Top:
+                        s += "Top";
+                        break;
+                    case ir::RankNaOption::Bottom:
+                        s += "Bottom";
+                        break;
+                }
+                s += ", ";
+                s += node.pct ? "true" : "false";
+                s += ")";
+                return s;
             }
             throw std::runtime_error("ibex_compile: unknown expression type");
         },

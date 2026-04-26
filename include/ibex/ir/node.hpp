@@ -66,8 +66,34 @@ struct CallExpr {
     std::vector<NamedArg> named_args;
 };
 
+struct OrderKey {
+    std::string name;
+    bool ascending = true;
+};
+
+enum class RankMethod : std::uint8_t {
+    Average,
+    Min,
+    Max,
+    First,
+    Dense,
+};
+
+enum class RankNaOption : std::uint8_t {
+    Keep,
+    Top,
+    Bottom,
+};
+
+struct RankExpr {
+    std::vector<OrderKey> order_keys;
+    RankMethod method = RankMethod::Average;
+    RankNaOption na_option = RankNaOption::Keep;
+    bool pct = false;
+};
+
 struct Expr {
-    std::variant<ColumnRef, Literal, BinaryExpr, CallExpr> node;
+    std::variant<ColumnRef, Literal, BinaryExpr, CallExpr, RankExpr> node;
 };
 
 /// A computed field: an alias mapped to an expression (represented as
@@ -85,11 +111,6 @@ struct FieldSpec {
 struct TupleFieldSpec {
     std::vector<std::string> aliases;
     NodePtr source;
-};
-
-struct OrderKey {
-    std::string name;
-    bool ascending = true;
 };
 
 /// Supported comparison operators for filter predicates.

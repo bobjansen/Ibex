@@ -258,6 +258,10 @@ class EffectAnalyzer {
                     for (const auto& named : node.named_args) {
                         collect_expr_effects(*named.value, direct, deps);
                     }
+                } else if constexpr (std::is_same_v<T, RankExpr>) {
+                    for (const auto& named : node.named_args) {
+                        collect_expr_effects(*named.value, direct, deps);
+                    }
                 } else if constexpr (std::is_same_v<T, UnaryExpr>) {
                     collect_expr_effects(*node.expr, direct, deps);
                 } else if constexpr (std::is_same_v<T, BinaryExpr>) {

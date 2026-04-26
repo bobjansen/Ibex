@@ -43,6 +43,12 @@ const CallExpr& require_call(const Expr& expr) {
     return *node;
 }
 
+const RankExpr& require_rank(const Expr& expr) {
+    const auto* node = std::get_if<RankExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    return *node;
+}
+
 const BlockExpr& require_block(const Expr& expr) {
     const auto* node = std::get_if<BlockExpr>(&expr.node);
     REQUIRE(node != nullptr);
@@ -601,6 +607,57 @@ TEST_CASE("Parse head clause with identifier count") {
     const auto* ident = std::get_if<IdentifierExpr>(&head.count->node);
     REQUIRE(ident != nullptr);
     REQUIRE(ident->name == "n");
+}
+
+TEST_CASE("Parse rank shorthand expression") {
+    const char* source =
+        R"(scores[update { r = rank(score, method = dense, ascending = false) }];)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.size() == 1);
+    const auto& rank = require_rank(require_expr(update.fields[0].expr));
+    REQUIRE_FALSE(rank.explicit_order);
+    REQUIRE(rank.order_keys.size() == 1);
+    REQUIRE(rank.order_keys[0].name == "score");
+    REQUIRE(rank.order_keys[0].ascending == true);
+    REQUIRE(rank.named_args.size() == 2);
+    REQUIRE(rank.named_args[0].name == "method");
+    REQUIRE(rank.named_args[1].name == "ascending");
+}
+
+TEST_CASE("Parse rank expression with explicit order clause") {
+    const char* source =
+        R"(scores[update { r = rank(order { score desc, ts asc }, method = "dense") }];)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& update = std::get<UpdateClause>(block.clauses[0]);
+    REQUIRE(update.fields.size() == 1);
+    const auto& rank = require_rank(require_expr(update.fields[0].expr));
+    REQUIRE(rank.explicit_order);
+    REQUIRE(rank.order_keys.size() == 2);
+    REQUIRE(rank.order_keys[0].name == "score");
+    REQUIRE(rank.order_keys[0].ascending == false);
+    REQUIRE(rank.order_keys[1].name == "ts");
+    REQUIRE(rank.order_keys[1].ascending == true);
+    REQUIRE(rank.named_args.size() == 1);
+    REQUIRE(rank.named_args[0].name == "method");
 }
 
 TEST_CASE("Parse tail clause") {

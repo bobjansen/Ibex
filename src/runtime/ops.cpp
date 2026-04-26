@@ -590,6 +590,16 @@ auto fn_call(std::string callee, std::vector<ir::Expr> args, std::vector<NamedAr
     return ir::Expr{std::move(call)};
 }
 
+auto rank_expr(std::vector<ir::OrderKey> order_keys, ir::RankMethod method,
+               ir::RankNaOption na_option, bool pct) -> ir::Expr {
+    ir::RankExpr rank;
+    rank.order_keys = std::move(order_keys);
+    rank.method = method;
+    rank.na_option = na_option;
+    rank.pct = pct;
+    return ir::Expr{std::move(rank)};
+}
+
 // ─── FilterExpr builders ──────────────────────────────────────────────────────
 
 auto filter_col(std::string name) -> ir::FilterExprPtr {

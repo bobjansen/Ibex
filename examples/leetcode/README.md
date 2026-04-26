@@ -40,3 +40,7 @@ The third example generalizes the same pattern:
 - parameterized by `n`
 - reusable `top_n_salaries(...)` and `nth_highest_salary(...)` helpers
 - stable output column name in Ibex instead of a dynamic column label
+
+The Ibex versions now also use named CSV arguments where that improves
+readability, for example:
+- `read_csv("...", schema = "...")`

@@ -1,20 +1,11 @@
 import "csv";
 
-let employee = read_csv(
-    "examples/leetcode/data/employee.csv",
-    "",
-    ",",
-    true,
-    "id:int,name:str,salary:int,departmentId:int"
-);
+let employee =
+    read_csv("examples/leetcode/data/employee.csv",
+             schema = "id:int,name:str,salary:int,departmentId:int");
 
-let department = read_csv(
-    "examples/leetcode/data/department.csv",
-    "",
-    ",",
-    true,
-    "id:int,name:str"
-);
+let department =
+    read_csv("examples/leetcode/data/department.csv", schema = "id:int,name:str");
 
 // LeetCode 185: Department Top Three Salaries.
 //

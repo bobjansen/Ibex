@@ -31,6 +31,8 @@ auto is_row_local_update_expr(const Expr& expr) -> bool {
                     }
                 }
                 return true;
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                return false;
             } else {
                 return false;
             }
@@ -55,6 +57,10 @@ void collect_expr_column_refs(const Expr& expr, std::unordered_set<std::string>&
                 }
                 for (const auto& na : n.named_args) {
                     collect_expr_column_refs(*na.value, out);
+                }
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                for (const auto& key : n.order_keys) {
+                    out.insert(key.name);
                 }
             }
         },

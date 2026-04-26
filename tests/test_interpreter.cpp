@@ -226,6 +226,72 @@ TEST_CASE("Interpret update alias") {
     REQUIRE((*alias_ints)[1] == 7);
 }
 
+TEST_CASE("Interpret rank shorthand with dense descending order") {
+    runtime::Table table;
+    table.add_column("score", Column<std::int64_t>{100, 100, 90, 80});
+
+    runtime::TableRegistry registry;
+    registry.emplace("scores", table);
+
+    auto ir =
+        require_ir(R"(scores[update { r = rank(score, method = dense, ascending = false) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* ranks = std::get_if<Column<std::int64_t>>(result->find("r"));
+    REQUIRE(ranks != nullptr);
+    REQUIRE(ranks->size() == 4);
+    REQUIRE((*ranks)[0] == 1);
+    REQUIRE((*ranks)[1] == 1);
+    REQUIRE((*ranks)[2] == 2);
+    REQUIRE((*ranks)[3] == 3);
+}
+
+TEST_CASE("Interpret rank with explicit multi-key order") {
+    runtime::Table table;
+    table.add_column("score", Column<std::int64_t>{100, 100, 90, 90});
+    table.add_column("ts", Column<std::int64_t>{2, 1, 5, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("scores", table);
+
+    auto ir =
+        require_ir(R"(scores[update { r = rank(order { score desc, ts asc }, method = first) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* ranks = std::get_if<Column<std::int64_t>>(result->find("r"));
+    REQUIRE(ranks != nullptr);
+    REQUIRE(ranks->size() == 4);
+    REQUIRE((*ranks)[0] == 2);
+    REQUIRE((*ranks)[1] == 1);
+    REQUIRE((*ranks)[2] == 4);
+    REQUIRE((*ranks)[3] == 3);
+}
+
+TEST_CASE("Interpret grouped rank with dense descending order") {
+    runtime::Table table;
+    table.add_column("dept", Column<std::string>{"A", "A", "A", "B", "B"});
+    table.add_column("score", Column<std::int64_t>{100, 90, 90, 50, 40});
+
+    runtime::TableRegistry registry;
+    registry.emplace("scores", table);
+
+    auto ir = require_ir(
+        R"(scores[update { r = rank(score, method = dense, ascending = false) }, by dept];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* ranks = std::get_if<Column<std::int64_t>>(result->find("r"));
+    REQUIRE(ranks != nullptr);
+    REQUIRE(ranks->size() == 5);
+    REQUIRE((*ranks)[0] == 1);
+    REQUIRE((*ranks)[1] == 2);
+    REQUIRE((*ranks)[2] == 2);
+    REQUIRE((*ranks)[3] == 1);
+    REQUIRE((*ranks)[4] == 2);
+}
+
 TEST_CASE("Interpret compile-time map expansion in aggregate select") {
     runtime::Table table;
     table.add_column("symbol", Column<std::string>{"A", "A", "B"});

@@ -28,7 +28,7 @@ uv run examples/leetcode/nth_highest_salary.py
 
 The LeetCode-style translation pattern in this first example is:
 - grouped dense-rank/filter in pandas
-- `distinct + order + head by + semi join` in Ibex
+- grouped `rank(..., method = dense, ascending = false)` plus `filter` in Ibex
 
 The second example shows another recurring pattern:
 - `drop_duplicates() + nlargest(k)` in pandas

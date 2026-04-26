@@ -64,6 +64,15 @@ auto ordering_keys_for_table(const Table& input, const std::vector<ir::OrderKey>
     return resolved;
 }
 
+struct ComputedColumn {
+    ColumnValue column;
+    std::optional<ValidityBitmap> validity;
+};
+
+auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
+                          const std::vector<ir::ColumnRef>& group_by)
+    -> std::expected<ComputedColumn, std::string>;
+
 auto format_tables(const TableRegistry& registry) -> std::string {
     if (registry.empty()) {
         return "<none>";
@@ -6174,6 +6183,8 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+        } else if (std::holds_alternative<ir::RankExpr>(field.expr.node)) {
+            return std::unexpected("rank(): not supported inside windowed update");
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
             const auto* entry = output.find_entry(col_ref->name);
@@ -6301,6 +6312,17 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+        } else if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {
+            auto res = evaluate_rank_column(output, *rank, {});
+            if (!res) {
+                return std::unexpected(res.error());
+            }
+            if (res->validity.has_value()) {
+                output.add_column(field.alias, std::move(res->column), std::move(*res->validity));
+            } else {
+                output.add_column(field.alias, std::move(res->column));
+            }
+            continue;
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
             const auto* entry = output.find_entry(col_ref->name);
@@ -6529,12 +6551,33 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (update.children().empty()) {
                 return std::unexpected("update node missing child");
             }
-            if (!update.group_by().empty()) {
-                return std::unexpected("grouped update not supported in interpreter");
-            }
             auto child = interpret_node(*update.children().front(), registry, scalars, externs);
             if (!child) {
                 return std::unexpected(child.error());
+            }
+            if (!update.group_by().empty()) {
+                const bool all_rank = std::all_of(
+                    update.fields().begin(), update.fields().end(), [](const ir::FieldSpec& f) {
+                        return std::holds_alternative<ir::RankExpr>(f.expr.node);
+                    });
+                if (!all_rank || !update.tuple_fields().empty()) {
+                    return std::unexpected("grouped update not supported in interpreter");
+                }
+                Table result = std::move(child.value());
+                for (const auto& field : update.fields()) {
+                    const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node);
+                    auto res = evaluate_rank_column(result, *rank, update.group_by());
+                    if (!res) {
+                        return std::unexpected(res.error());
+                    }
+                    if (res->validity.has_value()) {
+                        result.add_column(field.alias, std::move(res->column),
+                                          std::move(*res->validity));
+                    } else {
+                        result.add_column(field.alias, std::move(res->column));
+                    }
+                }
+                return result;
             }
             auto result = update_table(std::move(child.value()), update.fields(), scalars, externs);
             if (!result) {
@@ -7835,6 +7878,250 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
             }
         },
         lhs, rhs);
+}
+
+auto scalar_at_for_order(const ColumnValue& col, std::size_t row) -> ScalarValue {
+    return std::visit(
+        [row](const auto& c) -> ScalarValue {
+            using T = typename std::decay_t<decltype(c)>::value_type;
+            if constexpr (std::is_same_v<T, bool>) {
+                return static_cast<std::int64_t>(c[row] ? 1 : 0);
+            } else if constexpr (std::is_same_v<T, std::string_view>) {
+                return std::string(c[row]);
+            } else {
+                return c[row];
+            }
+        },
+        col);
+}
+
+auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
+                          const std::vector<ir::ColumnRef>& group_by)
+    -> std::expected<ComputedColumn, std::string> {
+    const std::size_t rows = input.rows();
+    auto order_keys = ordering_keys_for_table(input, rank.order_keys);
+    if (order_keys.empty()) {
+        return std::unexpected("rank(): expected at least one order key");
+    }
+
+    struct ResolvedKey {
+        const ColumnEntry* entry = nullptr;
+        bool ascending = true;
+    };
+    std::vector<ResolvedKey> resolved_keys;
+    resolved_keys.reserve(order_keys.size());
+    for (const auto& key : order_keys) {
+        const auto* entry = input.find_entry(key.name);
+        if (entry == nullptr) {
+            return std::unexpected("rank(): order column not found: " + key.name +
+                                   " (available: " + format_columns(input) + ")");
+        }
+        resolved_keys.push_back(ResolvedKey{.entry = entry, .ascending = key.ascending});
+    }
+
+    std::vector<const ColumnEntry*> group_entries;
+    group_entries.reserve(group_by.size());
+    for (const auto& key : group_by) {
+        const auto* entry = input.find_entry(key.name);
+        if (entry == nullptr) {
+            return std::unexpected("rank(): group column not found: " + key.name +
+                                   " (available: " + format_columns(input) + ")");
+        }
+        group_entries.push_back(entry);
+    }
+
+    auto is_null_row_for_keys = [&](std::size_t row) -> bool {
+        for (const auto& key : resolved_keys) {
+            if (key.entry->validity.has_value() && !(*key.entry->validity)[row]) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto same_group = [&](std::size_t lhs, std::size_t rhs) -> bool {
+        for (const auto* entry : group_entries) {
+            if (entry->validity.has_value()) {
+                const bool lv = (*entry->validity)[lhs];
+                const bool rv = (*entry->validity)[rhs];
+                if (lv != rv) {
+                    return false;
+                }
+                if (!lv) {
+                    continue;
+                }
+            }
+            if (compare_scalar_for_order(scalar_at_for_order(*entry->column, lhs),
+                                         scalar_at_for_order(*entry->column, rhs)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto compare_rows = [&](std::size_t lhs, std::size_t rhs) -> bool {
+        const bool lhs_null = is_null_row_for_keys(lhs);
+        const bool rhs_null = is_null_row_for_keys(rhs);
+        if (lhs_null || rhs_null) {
+            if (lhs_null != rhs_null) {
+                if (rank.na_option == ir::RankNaOption::Top) {
+                    return lhs_null;
+                }
+                if (rank.na_option == ir::RankNaOption::Bottom) {
+                    return !lhs_null;
+                }
+                return lhs < rhs;
+            }
+            return lhs < rhs;
+        }
+        for (const auto& key : resolved_keys) {
+            int cmp = compare_scalar_for_order(scalar_at_for_order(*key.entry->column, lhs),
+                                               scalar_at_for_order(*key.entry->column, rhs));
+            if (cmp != 0) {
+                return key.ascending ? (cmp < 0) : (cmp > 0);
+            }
+        }
+        return lhs < rhs;
+    };
+
+    auto equal_rank_keys = [&](std::size_t lhs, std::size_t rhs) -> bool {
+        const bool lhs_null = is_null_row_for_keys(lhs);
+        const bool rhs_null = is_null_row_for_keys(rhs);
+        if (lhs_null || rhs_null) {
+            return lhs_null == rhs_null;
+        }
+        for (const auto& key : resolved_keys) {
+            if (compare_scalar_for_order(scalar_at_for_order(*key.entry->column, lhs),
+                                         scalar_at_for_order(*key.entry->column, rhs)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<std::size_t> idx(rows);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+        if (!group_entries.empty()) {
+            const bool same = same_group(lhs, rhs);
+            const bool reverse_same = same_group(rhs, lhs);
+            if (!same || !reverse_same) {
+                for (const auto* entry : group_entries) {
+                    if (entry->validity.has_value()) {
+                        const bool lv = (*entry->validity)[lhs];
+                        const bool rv = (*entry->validity)[rhs];
+                        if (lv != rv) {
+                            return lv < rv;
+                        }
+                        if (!lv) {
+                            continue;
+                        }
+                    }
+                    int cmp = compare_scalar_for_order(scalar_at_for_order(*entry->column, lhs),
+                                                       scalar_at_for_order(*entry->column, rhs));
+                    if (cmp != 0) {
+                        return cmp < 0;
+                    }
+                }
+            }
+        }
+        return compare_rows(lhs, rhs);
+    });
+
+    std::vector<double> rank_values(rows, 0.0);
+    ValidityBitmap validity(rows, true);
+
+    std::size_t pos = 0;
+    while (pos < rows) {
+        std::size_t group_end = pos + 1;
+        while (group_end < rows && same_group(idx[pos], idx[group_end])) {
+            ++group_end;
+        }
+
+        std::size_t dense_rank = 1;
+        std::size_t ordinal = 1;
+        std::size_t i = pos;
+        while (i < group_end) {
+            std::size_t tie_end = i + 1;
+            while (tie_end < group_end && equal_rank_keys(idx[i], idx[tie_end])) {
+                ++tie_end;
+            }
+
+            const bool null_tie = is_null_row_for_keys(idx[i]);
+            double assigned = 0.0;
+            if (null_tie && rank.na_option == ir::RankNaOption::Keep) {
+                for (std::size_t k = i; k < tie_end; ++k) {
+                    validity.set(idx[k], false);
+                }
+            } else {
+                switch (rank.method) {
+                    case ir::RankMethod::Average: {
+                        const double first_rank = static_cast<double>(ordinal);
+                        const double last_rank = static_cast<double>(ordinal + (tie_end - i) - 1);
+                        assigned = (first_rank + last_rank) / 2.0;
+                        break;
+                    }
+                    case ir::RankMethod::Min:
+                    case ir::RankMethod::Dense:
+                        assigned = static_cast<double>(
+                            rank.method == ir::RankMethod::Dense ? dense_rank : ordinal);
+                        break;
+                    case ir::RankMethod::Max:
+                        assigned = static_cast<double>(ordinal + (tie_end - i) - 1);
+                        break;
+                    case ir::RankMethod::First:
+                        break;
+                }
+                if (rank.method == ir::RankMethod::First) {
+                    for (std::size_t k = i; k < tie_end; ++k) {
+                        double value = static_cast<double>(ordinal + (k - i));
+                        rank_values[idx[k]] =
+                            rank.pct ? value / static_cast<double>(group_end - pos) : value;
+                    }
+                } else {
+                    if (rank.pct) {
+                        assigned /= static_cast<double>(group_end - pos);
+                    }
+                    for (std::size_t k = i; k < tie_end; ++k) {
+                        rank_values[idx[k]] = assigned;
+                    }
+                }
+            }
+
+            ordinal += (tie_end - i);
+            if (!null_tie || rank.na_option != ir::RankNaOption::Keep) {
+                ++dense_rank;
+            }
+            i = tie_end;
+        }
+
+        pos = group_end;
+    }
+
+    const bool integral = !rank.pct && rank.method != ir::RankMethod::Average;
+    if (integral) {
+        Column<std::int64_t> out;
+        out.reserve(rows);
+        for (double value : rank_values) {
+            out.push_back(static_cast<std::int64_t>(value));
+        }
+        ComputedColumn result{.column = std::move(out), .validity = std::nullopt};
+        if (rank.na_option == ir::RankNaOption::Keep) {
+            result.validity = std::move(validity);
+        }
+        return result;
+    }
+
+    Column<double> out;
+    out.reserve(rows);
+    for (double value : rank_values) {
+        out.push_back(value);
+    }
+    ComputedColumn result{.column = std::move(out), .validity = std::nullopt};
+    if (rank.na_option == ir::RankNaOption::Keep) {
+        result.validity = std::move(validity);
+    }
+    return result;
 }
 
 /// Chunk-preserving `Order`: buffers incoming chunks, validates sortedness
@@ -10883,7 +11170,32 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("update node missing child");
         }
         if (!update.group_by().empty()) {
-            return std::unexpected("grouped update not supported in interpreter");
+            const bool all_rank = std::all_of(
+                update.fields().begin(), update.fields().end(), [](const ir::FieldSpec& f) {
+                    return std::holds_alternative<ir::RankExpr>(f.expr.node);
+                });
+            if (!all_rank || !update.tuple_fields().empty()) {
+                return std::unexpected("grouped update not supported in interpreter");
+            }
+            return build_unary_materializing_operator(
+                *update.children().front(), registry, scalars, externs, model_out,
+                [&](Table input) -> std::expected<Table, std::string> {
+                    Table result = std::move(input);
+                    for (const auto& field : update.fields()) {
+                        const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node);
+                        auto res = evaluate_rank_column(result, *rank, update.group_by());
+                        if (!res) {
+                            return std::unexpected(res.error());
+                        }
+                        if (res->validity.has_value()) {
+                            result.add_column(field.alias, std::move(res->column),
+                                              std::move(*res->validity));
+                        } else {
+                            result.add_column(field.alias, std::move(res->column));
+                        }
+                    }
+                    return std::expected<Table, std::string>{std::move(result)};
+                });
         }
         // Route to a streaming ChunkedUpdateOperator when every field is
         // row-local and there are no table-valued tuple assignments.

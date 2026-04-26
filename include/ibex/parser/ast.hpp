@@ -275,6 +275,12 @@ struct CallExpr {
     std::vector<NamedArg> named_args;
 };
 
+struct RankExpr {
+    std::vector<OrderKey> order_keys;
+    bool explicit_order = false;
+    std::vector<NamedArg> named_args;
+};
+
 struct UnaryExpr {
     UnaryOp op = UnaryOp::Negate;
     ExprPtr expr;
@@ -332,8 +338,8 @@ struct StreamExpr {
 };
 
 struct Expr {
-    std::variant<IdentifierExpr, LiteralExpr, CallExpr, UnaryExpr, BinaryExpr, GroupExpr, BlockExpr,
-                 JoinExpr, StreamExpr, ArrayLiteralExpr, TableExpr>
+    std::variant<IdentifierExpr, LiteralExpr, CallExpr, RankExpr, UnaryExpr, BinaryExpr, GroupExpr,
+                 BlockExpr, JoinExpr, StreamExpr, ArrayLiteralExpr, TableExpr>
         node;
 };
 

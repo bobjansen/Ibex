@@ -818,6 +818,9 @@ class Parser {
                 return parse_table_expr();
             }
             if (match(TokenKind::LParen)) {
+                if (name == "rank") {
+                    return parse_rank_call();
+                }
                 std::vector<ExprPtr> args;
                 std::vector<NamedArg> named_args;
                 bool seen_named = false;
@@ -1481,6 +1484,58 @@ class Parser {
             ascending = false;
         }
         return OrderKey{.name = std::move(*name), .ascending = ascending};
+    }
+
+    auto parse_rank_call() -> ExprPtr {
+        std::vector<OrderKey> order_keys;
+        bool explicit_order = false;
+        std::vector<NamedArg> named_args;
+        bool seen_named = false;
+
+        if (match(TokenKind::KeywordOrder)) {
+            explicit_order = true;
+            auto parsed = parse_order_keys();
+            if (!parsed.has_value()) {
+                return nullptr;
+            }
+            order_keys = std::move(parsed->first);
+            if (order_keys.empty()) {
+                return fail_expr(previous(), "rank(order ...): expected at least one order key");
+            }
+        } else {
+            auto key = parse_order_key();
+            if (!key.has_value()) {
+                return nullptr;
+            }
+            order_keys.push_back(std::move(*key));
+        }
+
+        while (match(TokenKind::Comma)) {
+            seen_named = true;
+            if (peek().kind != TokenKind::Identifier || peek_next().kind != TokenKind::Eq) {
+                return fail_expr(peek(), "rank(): expected named argument after ','");
+            }
+            std::string arg_name{peek().lexeme};
+            advance();
+            advance();
+            auto val = parse_expression();
+            if (!val) {
+                return nullptr;
+            }
+            named_args.push_back(NamedArg{.name = std::move(arg_name), .value = std::move(val)});
+        }
+
+        (void)seen_named;
+        if (!consume(TokenKind::RParen, "expected ')' after rank arguments")) {
+            return nullptr;
+        }
+        auto expr = std::make_unique<Expr>();
+        expr->node = RankExpr{
+            .order_keys = std::move(order_keys),
+            .explicit_order = explicit_order,
+            .named_args = std::move(named_args),
+        };
+        return expr;
     }
 
     auto parse_field_list_or_single() -> std::optional<std::vector<Field>> {

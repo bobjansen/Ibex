@@ -48,6 +48,12 @@ using ModelRegistry = std::unordered_map<std::string, runtime::ModelResult>;
 using CompileTimeListRegistry = std::unordered_map<std::string, std::vector<std::string>>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
+struct BoundCallArg {
+    const parser::Param* param = nullptr;
+    parser::Expr* expr = nullptr;
+    bool is_default = false;
+};
+
 #ifdef IBEX_HAS_READLINE
 constexpr std::array<std::string_view, 12> kColonCommands = {
     ":q",    ":quit",     ":exit", ":tables", ":scalars", ":schema",
@@ -266,6 +272,53 @@ auto format_timestamp(Timestamp ts) -> std::string {
                        static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()),
                        hms.hours().count(), hms.minutes().count(), hms.seconds().count(),
                        hms.subseconds().count());
+}
+
+auto bind_call_arguments(const std::string& callee, parser::CallExpr& call,
+                         const std::vector<parser::Param>& params)
+    -> std::expected<std::vector<BoundCallArg>, std::string> {
+    std::vector<BoundCallArg> bound(params.size());
+    std::unordered_map<std::string, std::size_t> param_index;
+    param_index.reserve(params.size());
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        param_index.emplace(params[i].name, i);
+        bound[i].param = &params[i];
+    }
+
+    if (call.args.size() > params.size()) {
+        return std::unexpected(callee + ": too many positional arguments");
+    }
+
+    for (std::size_t i = 0; i < call.args.size(); ++i) {
+        bound[i].expr = call.args[i].get();
+    }
+
+    for (auto& named_arg : call.named_args) {
+        auto it = param_index.find(named_arg.name);
+        if (it == param_index.end()) {
+            return std::unexpected(callee + ": unknown named argument '" + named_arg.name + "'");
+        }
+        auto& slot = bound[it->second];
+        if (slot.expr != nullptr) {
+            return std::unexpected(callee + ": duplicate argument for parameter '" +
+                                   slot.param->name + "'");
+        }
+        slot.expr = named_arg.value.get();
+    }
+
+    for (auto& slot : bound) {
+        if (slot.expr != nullptr) {
+            continue;
+        }
+        if (slot.param->default_value != nullptr) {
+            slot.expr = slot.param->default_value.get();
+            slot.is_default = true;
+            continue;
+        }
+        return std::unexpected(callee + ": missing required argument '" + slot.param->name + "'");
+    }
+
+    return bound;
 }
 
 auto normalize_float_text(std::string text) -> std::string {
@@ -1373,21 +1426,26 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (fn->kind != runtime::ExternReturnKind::Scalar) {
                 return std::unexpected("extern function returns table: " + call->callee);
             }
+            auto bound_args = bind_call_arguments(call->callee, *call, decl.params);
+            if (!bound_args) {
+                return std::unexpected(bound_args.error());
+            }
             if (fn->first_arg_is_table) {
                 // First argument is a DataFrame; remaining arguments are scalars.
-                if (call->args.empty()) {
+                if (bound_args->empty()) {
                     return std::unexpected(call->callee + "() requires a DataFrame first argument");
                 }
-                auto table = eval_table_expr(*call->args[0], tables, scalars, columns, models,
-                                             functions, compile_time_lists, extern_decls, externs);
+                auto table =
+                    eval_table_expr(*(*bound_args)[0].expr, tables, scalars, columns, models,
+                                    functions, compile_time_lists, extern_decls, externs);
                 if (!table) {
                     return std::unexpected(table.error());
                 }
                 runtime::ExternArgs scalar_args;
-                scalar_args.reserve(call->args.size() - 1);
-                for (std::size_t i = 1; i < call->args.size(); ++i) {
+                scalar_args.reserve(bound_args->size() - 1);
+                for (std::size_t i = 1; i < bound_args->size(); ++i) {
                     auto value =
-                        eval_scalar_expr(*call->args[i], tables, scalars, columns, models,
+                        eval_scalar_expr(*(*bound_args)[i].expr, tables, scalars, columns, models,
                                          functions, compile_time_lists, extern_decls, externs);
                     if (!value) {
                         return std::unexpected(value.error());
@@ -1404,10 +1462,10 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::unexpected("extern function returned table: " + call->callee);
             }
             runtime::ExternArgs args;
-            args.reserve(call->args.size());
-            for (const auto& arg : call->args) {
-                auto value = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
-                                              compile_time_lists, extern_decls, externs);
+            args.reserve(bound_args->size());
+            for (const auto& arg : *bound_args) {
+                auto value = eval_scalar_expr(*arg.expr, tables, scalars, columns, models,
+                                              functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -1481,10 +1539,14 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (fn->kind != runtime::ExternReturnKind::Table) {
             return std::unexpected("extern function returns scalar: " + call.callee);
         }
+        auto bound_args = bind_call_arguments(call.callee, call, decl.params);
+        if (!bound_args) {
+            return std::unexpected(bound_args.error());
+        }
         runtime::ExternArgs args;
-        args.reserve(call.args.size());
-        for (const auto& arg : call.args) {
-            auto value = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
+        args.reserve(bound_args->size());
+        for (const auto& arg : *bound_args) {
+            auto value = eval_scalar_expr(*arg.expr, tables, scalars, columns, models, functions,
                                           compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
@@ -1594,8 +1656,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                                format_function_names(functions, extern_decls) + ")");
     }
     const auto& fn = it->second;
-    if (call.args.size() != fn.params.size()) {
-        return std::unexpected("function argument count mismatch");
+    auto bound_args = bind_call_arguments(call.callee, call, fn.params);
+    if (!bound_args) {
+        return std::unexpected(bound_args.error());
     }
 
     runtime::TableRegistry local_tables = tables;
@@ -1606,7 +1669,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
 
     for (std::size_t i = 0; i < fn.params.size(); ++i) {
         const auto& param = fn.params[i];
-        auto& arg = *call.args[i];
+        auto& arg = *(*bound_args)[i].expr;
         switch (param.type.kind) {
             case parser::Type::Kind::Scalar: {
                 auto value = eval_scalar_expr(arg, tables, scalars, columns, models, functions,
@@ -1970,10 +2033,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             print_comment_group((*comment_groups)[stmt_index]);
         }
         if (std::holds_alternative<parser::ExternDecl>(stmt)) {
-            const auto& decl = std::get<parser::ExternDecl>(stmt);
-            extern_decls.insert_or_assign(decl.name, decl);
-            if (!decl.source_path.empty()) {
-                auto stem = plugin_stem(decl.source_path);
+            auto decl = std::get<parser::ExternDecl>(std::move(stmt));
+            auto decl_name = decl.name;
+            extern_decls.insert_or_assign(decl_name, std::move(decl));
+            const auto& stored_decl = extern_decls.at(decl_name);
+            if (!stored_decl.source_path.empty()) {
+                auto stem = plugin_stem(stored_decl.source_path);
                 auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
                 if (result.status == PluginLoadStatus::NotFound) {
                     fmt::print("warning: could not find plugin '{}.so' in search path\n", stem);

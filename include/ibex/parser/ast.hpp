@@ -34,6 +34,9 @@ struct SchemaType {
 
 using TypeArg = std::variant<ScalarType, SchemaType>;
 
+struct Expr;
+using ExprPtr = std::unique_ptr<Expr>;
+
 struct Type {
     enum class Kind : std::uint8_t {
         Scalar,
@@ -49,6 +52,7 @@ struct Type {
 struct Param {
     std::string name;
     Type type;
+    ExprPtr default_value;
     enum class Effect : std::uint8_t {
         Const,
         Mutable,
@@ -116,9 +120,6 @@ enum class JoinKind : std::uint8_t {
     Cross,
     Asof,
 };
-
-struct Expr;
-using ExprPtr = std::unique_ptr<Expr>;
 
 struct Field {
     std::string name;

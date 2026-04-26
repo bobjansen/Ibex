@@ -763,7 +763,7 @@ join_keys       = IDENT
 (* --- Parameters --- *)
 
 param_list      = param { "," param } [ "," ] ;
-param           = [ param_effect ] IDENT ":" type ;
+param           = [ param_effect ] IDENT ":" type [ "=" expr ] ;
 param_effect    = "const" | "mutable" | "consume" ;
 
 effect_decl     = "effects" "{" [ effect_spec { "," effect_spec } [ "," ] ] "}" ;
@@ -827,10 +827,12 @@ resolve all ambiguities in a recursive-descent or Pratt parser:
 
 8. **Named arguments.** Within a call's argument list, `IDENT "=" expr` is a
    named argument. The `IDENT` must be immediately followed by a single `=`
-   (not `==`). Named arguments may be mixed with positional arguments; all
-   positional arguments must precede named arguments. Order of named arguments
-   is not semantically significant — built-in functions that accept them
-   interpret them by name.
+   (not `==`). Named arguments may be mixed with positional arguments, but all
+   positional arguments must precede named arguments.
+
+9. **Default parameters.** Function and extern parameter lists may attach a
+   default expression to trailing parameters only. A required parameter may not
+   follow a defaulted one.
 
 ---
 
@@ -2102,6 +2104,7 @@ fn <name>(<params>) -> <return_type> { <statements> }
 - The function body may contain `let` statements and expression statements.
 - The **last expression statement** is the return value.
 - Nested function declarations are not supported.
+- Parameters may have trailing default values.
 
 `Column<T>` is accepted in function signatures as an alias for `Series<T>`.
 Functions may return scalars, tables, or columns; the return expression must
@@ -2110,6 +2113,27 @@ match the declared return type.
 Function calls inside DataFrame clause expressions are resolved against
 built-ins or extern functions. User-defined functions are evaluated at the
 statement level in the REPL/runtime.
+
+Call sites may use positional arguments, named arguments, or a mix where all
+positional arguments come first:
+
+```
+fn add3(x: Int, y: Int = 1, z: Int = 2) -> Int {
+    x + y + z
+}
+
+add3(10)
+add3(10, z = 5)
+add3(x = 10, z = 5, y = 7)
+```
+
+Rules:
+
+- named arguments must match declared parameter names exactly
+- a parameter may be bound at most once
+- unknown named arguments are compile-time errors
+- required parameters must appear before all defaulted parameters
+- omitted defaulted parameters use their declared default expression
 
 ### 10.1 Function Effect Annotations
 
@@ -2191,6 +2215,21 @@ extern fn read_csv(path: String) -> DataFrame
 
 If omitted, extern effects default conservatively to:
 `io_read`, `io_write`, `nondet`, `state`, `blocking`, `may_fail`.
+
+Extern declarations follow the same argument rules as user-defined functions,
+including named arguments and trailing default parameters:
+
+```
+extern fn read_csv(
+    path: String,
+    nulls: String = "",
+    delimiter: String = ",",
+    has_header: Bool = true
+) -> DataFrame
+    from "csv.hpp";
+
+let ticks = read_csv("ticks.csv", has_header = false, delimiter = ";");
+```
 
 The `from` clause specifies the C++ header that provides the function. The
 compiler generates the appropriate `#include` directive in the transpiled

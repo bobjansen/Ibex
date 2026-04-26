@@ -127,6 +127,15 @@
         </p>
       </article>
       <article class="card">
+        <h3>Grouped Rank</h3>
+        <p>
+          <code>rank(score, method = dense, ascending = false)</code> handles
+          grouped top-k and leaderboard patterns directly inside
+          <code>update</code>, with an explicit
+          <code>rank(order { ... })</code> form for multi-key tie-breaking.
+        </p>
+      </article>
+      <article class="card">
         <h3>Vectorized RNG</h3>
         <p>
           Eight built-in <code>rand_*</code> functions &mdash; covering normal,
@@ -687,6 +696,42 @@ iris[<span class="kw">distinct</span> Species];
 
 <span class="cm">// Unique (species, length) pairs</span>
 iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Rank</span>
+          <h3>Assign dense, first, min/max, or average ranks inside update.</h3>
+          <p>
+            <code>rank(col)</code> is the shorthand single-key form. For
+            multi-key ranking, use
+            <code>rank(order { ... })</code> and spell sort direction per key.
+          </p>
+          <p>
+            The surrounding <code>by</code> clause partitions ranking by group,
+            which makes dense top-k filters much cleaner than
+            <code>distinct + order + head + semi join</code> rewrites.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Dense descending rank by score within each symbol</span>
+scores[
+    <span class="kw">update</span> { dense_rank = <span class="fn-name">rank</span>(score, method = dense, ascending = <span class="kw">false</span>) },
+    <span class="kw">by</span> symbol
+];
+
+<span class="cm">// Multi-key ranking with an explicit tie-break</span>
+scores[
+    <span class="kw">update</span> { order_rank = <span class="fn-name">rank</span>(<span class="kw">order</span> { score <span class="kw">desc</span>, ts <span class="kw">asc</span> }, method = first) },
+    <span class="kw">by</span> symbol
+];
+
+<span class="cm">// Top 3 dense ranks per department</span>
+employee[
+    <span class="kw">update</span> { salary_rank = <span class="fn-name">rank</span>(salary, method = dense, ascending = <span class="kw">false</span>) },
+    <span class="kw">by</span> departmentId
+][<span class="kw">filter</span> salary_rank &lt;= <span class="num">3</span>];</code></pre>
         </div>
       </div>
 

@@ -1056,6 +1056,18 @@ quotes[update {
 }];
 ```
 
+`update` also supports ranking expressions that depend on row order within the
+current table or current group:
+
+```
+scores[update { dense_rank = rank(score, method = dense, ascending = false) }]
+scores[update { tie_break = rank(order { score desc, ts asc }, method = first) }]
+scores[update { dept_rank = rank(score, method = dense, ascending = false) }, by department]
+```
+
+`rank(...)` is not row-local: it observes the full table (or full group when
+combined with `by`) before assigning output values.
+
 **Tuple-LHS assignment in `update`**
 
 When an expression returns a multi-column DataFrame, multiple new columns can
@@ -2479,6 +2491,66 @@ round(-3.7, trunc)    // → -3
 
 // Typical use: round a Float column to Int before an explicit cast
 prices[update { vol_int = round(volume_f, bankers) }];
+```
+
+### 12.6.1 Ranking
+
+`rank(...)` assigns row ranks inside `update`, optionally partitioned by the
+surrounding `by` clause.
+
+Supported forms:
+
+```
+rank(score)
+rank(score, method = dense, ascending = false)
+rank(order { score desc, ts asc })
+rank(order { score desc, ts asc }, method = first, pct = true)
+```
+
+Rules:
+
+- `rank(col)` is shorthand for ranking on one column in ascending order.
+- `rank(order { ... })` ranks on a lexicographic multi-key ordering.
+- When `rank(order { ... })` is used, sort direction must be expressed per key;
+  `ascending = ...` is a compile-time error in that form.
+- `rank(...)` is valid in `update`, including grouped `update ... , by ...`.
+- `rank(...)` is not valid in `select`.
+- Without `by`, ranks are computed over the whole input table.
+- With `by`, ranks reset independently within each group.
+
+Named arguments:
+
+- `method = average | min | max | first | dense`
+- `ascending = true | false` for the shorthand single-key form only
+- `na_option = keep | top | bottom`
+- `pct = true | false`
+
+Semantics:
+
+- `average`, `min`, `max`, and `first` match the usual Pandas-style tie methods.
+- `dense` assigns consecutive ranks without gaps across ties.
+- `first` breaks ties by encounter order after the specified ordering keys.
+- `na_option = keep` leaves rows with null ranking keys as null in the result.
+- `na_option = top` and `na_option = bottom` place null-key rows at the
+  beginning or end of the ordering and assign ordinary ranks to them.
+- `pct = true` divides the assigned rank by the group size (or table size when
+  ungrouped).
+
+Return type:
+
+- `Int64` / `Series<Int64>` for `min`, `max`, `first`, and `dense` when
+  `pct = false`
+- `Float64` / `Series<Float64>` for `average`, or whenever `pct = true`
+
+Examples:
+
+```
+scores[update { dense_rank = rank(score, method = dense, ascending = false) }]
+
+scores[
+    update { tie_rank = rank(order { score desc, ts asc }, method = first) },
+    by symbol
+]
 ```
 
 ### 12.7 Vectorized RNG Functions

@@ -12,6 +12,8 @@ Notable language features:
 - typed `fn` definitions with required parameter and return types
 - named arguments plus trailing default parameters for readable call sites
 - `DataFrame<{...}>` contracts for minimum required columns on table arguments
+- grouped `rank(...)` inside `update`, including `rank(order { ... })` for
+  multi-key tie-breaking
 
 ```
 import "csv";
@@ -246,6 +248,22 @@ iris[tail 10];
 
 // Bottom 3 rows per species after sorting
 iris[order { `Sepal.Length` desc }, tail 3, by Species];
+```
+
+### Rank
+
+```
+// Dense descending rank within each symbol
+scores[
+    update { dense_rank = rank(score, method = dense, ascending = false) },
+    by symbol
+];
+
+// Multi-key ranking with an explicit tie-break
+scores[
+    update { order_rank = rank(order { score desc, ts asc }, method = first) },
+    by symbol
+];
 ```
 
 ### Scalar extraction

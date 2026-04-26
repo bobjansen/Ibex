@@ -151,6 +151,18 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
                         NamedArg{.name = named.name, .value = clone_expr(*named.value)});
                 }
                 out->node = std::move(call);
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                RankExpr rank{
+                    .order_keys = node.order_keys,
+                    .explicit_order = node.explicit_order,
+                    .named_args = {},
+                };
+                rank.named_args.reserve(node.named_args.size());
+                for (const auto& named : node.named_args) {
+                    rank.named_args.push_back(
+                        NamedArg{.name = named.name, .value = clone_expr(*named.value)});
+                }
+                out->node = std::move(rank);
             } else if constexpr (std::is_same_v<T, UnaryExpr>) {
                 out->node = UnaryExpr{.op = node.op, .expr = clone_expr(*node.expr)};
             } else if constexpr (std::is_same_v<T, BinaryExpr>) {
@@ -596,6 +608,24 @@ auto substitute_map_expr(const Expr& expr,
                 }
                 auto out = std::make_unique<Expr>();
                 out->node = std::move(call);
+                return out;
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                RankExpr rank{
+                    .order_keys = node.order_keys,
+                    .explicit_order = node.explicit_order,
+                    .named_args = {},
+                };
+                rank.named_args.reserve(node.named_args.size());
+                for (const auto& named : node.named_args) {
+                    auto lowered = substitute_map_expr(*named.value, env);
+                    if (!lowered.has_value()) {
+                        return lowered;
+                    }
+                    rank.named_args.push_back(
+                        NamedArg{.name = named.name, .value = std::move(*lowered)});
+                }
+                auto out = std::make_unique<Expr>();
+                out->node = std::move(rank);
                 return out;
             } else if constexpr (std::is_same_v<T, UnaryExpr>) {
                 auto inner = substitute_map_expr(*node.expr, env);
@@ -1947,6 +1977,126 @@ class Lowerer {
                     .value = std::make_shared<ir::Expr>(std::move(lowered_val.value()))});
             }
             return ir::Expr{.node = std::move(lowered_call)};
+        }
+        if (const auto* rank = std::get_if<RankExpr>(&expr.node)) {
+            ir::RankExpr lowered_rank;
+            lowered_rank.order_keys.reserve(rank->order_keys.size());
+            for (const auto& key : rank->order_keys) {
+                lowered_rank.order_keys.push_back(
+                    ir::OrderKey{.name = key.name, .ascending = key.ascending});
+            }
+            std::unordered_set<std::string> seen_named;
+            for (const auto& narg : rank->named_args) {
+                if (!seen_named.insert(narg.name).second) {
+                    return std::unexpected(LowerError{
+                        .message = "rank(): duplicate named argument '" + narg.name + "'"});
+                }
+                if (narg.name == "method") {
+                    std::optional<std::string> value_name;
+                    if (const auto* ident = std::get_if<IdentifierExpr>(&narg.value->node)) {
+                        value_name = ident->name;
+                    } else if (const auto* lit = std::get_if<LiteralExpr>(&narg.value->node)) {
+                        if (const auto* text = std::get_if<std::string>(&lit->value)) {
+                            value_name = *text;
+                        }
+                    }
+                    if (!value_name.has_value()) {
+                        return std::unexpected(LowerError{
+                            .message = "rank(): method must be a bare identifier or string"});
+                    }
+                    if (*value_name == "average") {
+                        lowered_rank.method = ir::RankMethod::Average;
+                    } else if (*value_name == "min") {
+                        lowered_rank.method = ir::RankMethod::Min;
+                    } else if (*value_name == "max") {
+                        lowered_rank.method = ir::RankMethod::Max;
+                    } else if (*value_name == "first") {
+                        lowered_rank.method = ir::RankMethod::First;
+                    } else if (*value_name == "dense") {
+                        lowered_rank.method = ir::RankMethod::Dense;
+                    } else {
+                        return std::unexpected(
+                            LowerError{.message = "rank(): unknown method '" + *value_name + "'"});
+                    }
+                } else if (narg.name == "ascending") {
+                    if (rank->explicit_order) {
+                        return std::unexpected(LowerError{
+                            .message =
+                                "rank(order {...}): ascending must be expressed per order key"});
+                    }
+                    bool ascending = true;
+                    if (const auto* lit = std::get_if<LiteralExpr>(&narg.value->node)) {
+                        if (const auto* flag = std::get_if<bool>(&lit->value)) {
+                            ascending = *flag;
+                        } else {
+                            return std::unexpected(
+                                LowerError{.message = "rank(): ascending must be Bool"});
+                        }
+                    } else if (const auto* ident = std::get_if<IdentifierExpr>(&narg.value->node)) {
+                        if (ident->name == "true") {
+                            ascending = true;
+                        } else if (ident->name == "false") {
+                            ascending = false;
+                        } else {
+                            return std::unexpected(
+                                LowerError{.message = "rank(): ascending must be Bool"});
+                        }
+                    } else {
+                        return std::unexpected(
+                            LowerError{.message = "rank(): ascending must be Bool"});
+                    }
+                    for (auto& key : lowered_rank.order_keys) {
+                        key.ascending = ascending;
+                    }
+                } else if (narg.name == "na_option") {
+                    std::optional<std::string> value_name;
+                    if (const auto* ident = std::get_if<IdentifierExpr>(&narg.value->node)) {
+                        value_name = ident->name;
+                    } else if (const auto* lit = std::get_if<LiteralExpr>(&narg.value->node)) {
+                        if (const auto* text = std::get_if<std::string>(&lit->value)) {
+                            value_name = *text;
+                        }
+                    }
+                    if (!value_name.has_value()) {
+                        return std::unexpected(LowerError{
+                            .message = "rank(): na_option must be a bare identifier or string"});
+                    }
+                    if (*value_name == "keep") {
+                        lowered_rank.na_option = ir::RankNaOption::Keep;
+                    } else if (*value_name == "top") {
+                        lowered_rank.na_option = ir::RankNaOption::Top;
+                    } else if (*value_name == "bottom") {
+                        lowered_rank.na_option = ir::RankNaOption::Bottom;
+                    } else {
+                        return std::unexpected(LowerError{.message = "rank(): unknown na_option '" +
+                                                                     *value_name + "'"});
+                    }
+                } else if (narg.name == "pct") {
+                    if (const auto* lit = std::get_if<LiteralExpr>(&narg.value->node)) {
+                        if (const auto* flag = std::get_if<bool>(&lit->value)) {
+                            lowered_rank.pct = *flag;
+                        } else {
+                            return std::unexpected(
+                                LowerError{.message = "rank(): pct must be Bool"});
+                        }
+                    } else if (const auto* ident = std::get_if<IdentifierExpr>(&narg.value->node)) {
+                        if (ident->name == "true") {
+                            lowered_rank.pct = true;
+                        } else if (ident->name == "false") {
+                            lowered_rank.pct = false;
+                        } else {
+                            return std::unexpected(
+                                LowerError{.message = "rank(): pct must be Bool"});
+                        }
+                    } else {
+                        return std::unexpected(LowerError{.message = "rank(): pct must be Bool"});
+                    }
+                } else {
+                    return std::unexpected(LowerError{
+                        .message = "rank(): unknown named argument '" + narg.name + "'"});
+                }
+            }
+            return ir::Expr{.node = std::move(lowered_rank)};
         }
         if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
             auto left = lower_expr_to_ir(*binary->left);

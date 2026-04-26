@@ -10,6 +10,7 @@ Notable language features:
 - bracket pipelines for filter/select/update/group/order/join flows
 - compile-time `map` expansion inside braced `select` / `update` blocks
 - typed `fn` definitions with required parameter and return types
+- named arguments plus trailing default parameters for readable call sites
 - `DataFrame<{...}>` contracts for minimum required columns on table arguments
 
 ```
@@ -842,8 +843,14 @@ let df = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
 The equivalent explicit declaration is:
 
 ```ibex
-extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
-let df = read_csv("examples/data/null_metrics.txt", "<empty>,NA");
+extern fn read_csv(
+    path: String,
+    nulls: String = "",
+    delimiter: String = ",",
+    has_header: Bool = true
+) -> DataFrame from "csv.hpp";
+
+let df = read_csv("examples/data/null_metrics.txt", nulls = "<empty>,NA");
 ```
 
 `<empty>` marks empty fields as null; additional comma-separated tokens are

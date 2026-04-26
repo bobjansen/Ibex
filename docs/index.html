@@ -101,6 +101,14 @@
         </p>
       </article>
       <article class="card">
+        <h3>Named call arguments</h3>
+        <p>
+          Function calls support strict named arguments and trailing default
+          parameters, so I/O-heavy APIs can stay readable:
+          <code>read_csv("ticks.csv", has_header = false)</code>.
+        </p>
+      </article>
+      <article class="card">
         <h3>Strict type system</h3>
         <p>
           No implicit <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
@@ -402,12 +410,18 @@ generated[<span class="kw">filter</span> name != <span class="str">"row_id"</spa
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
+    <span class="fn-name">path</span>: String,
+    <span class="fn-name">nulls</span>: String = <span class="str">""</span>,
+    <span class="fn-name">delimiter</span>: String = <span class="str">","</span>,
+    <span class="fn-name">has_header</span>: Bool = <span class="kw">true</span>
+) -&gt; DataFrame
     <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
 <span class="kw">extern fn</span> <span class="fn-name">read_json</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
     <span class="kw">from</span> <span class="str">"json.hpp"</span>;
 
 <span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
+<span class="kw">let</span> headerless = <span class="fn-name">read_csv</span>(<span class="str">"ticks.csv"</span>, <span class="fn-name">has_header</span> = <span class="kw">false</span>);
 <span class="kw">let</span> config = <span class="fn-name">read_json</span>(<span class="str">"config.json"</span>);
 
 <span class="cm">// Keep rows where price exceeds 1.0</span>

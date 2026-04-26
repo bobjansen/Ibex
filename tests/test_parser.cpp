@@ -204,6 +204,47 @@ TEST_CASE("Parse allows parameter names that match modifier words") {
     REQUIRE(fn.params[2].effect == Param::Effect::Const);
 }
 
+TEST_CASE("Parse function and extern defaults") {
+    const char* source = R"(
+extern fn read_csv(path: String, nulls: String = "", delimiter: String = ",", has_header: Bool = true)
+    -> DataFrame
+    from "csv.hpp";
+fn top_n(df: DataFrame<{ salary: Int64 }>, n: Int = 3) -> DataFrame<{ salary: Int64 }> {
+  df[distinct { salary }, order { salary desc }, head n];
+}
+)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 2);
+
+    const auto& ext = std::get<ExternDecl>(result->statements[0]);
+    REQUIRE(ext.params.size() == 4);
+    REQUIRE(ext.params[0].default_value == nullptr);
+    REQUIRE(ext.params[1].default_value != nullptr);
+    REQUIRE(ext.params[2].default_value != nullptr);
+    REQUIRE(ext.params[3].default_value != nullptr);
+
+    const auto& fn = std::get<FunctionDecl>(result->statements[1]);
+    REQUIRE(fn.params.size() == 2);
+    REQUIRE(fn.params[0].default_value == nullptr);
+    REQUIRE(fn.params[1].default_value != nullptr);
+}
+
+TEST_CASE("Parse rejects required parameter after defaulted parameter") {
+    auto result = parse(R"(fn f(x: Int = 1, y: Int) -> Int { y; })");
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("required parameter cannot follow a defaulted parameter") !=
+            std::string::npos);
+}
+
+TEST_CASE("Parse rejects positional arguments after named arguments") {
+    auto result = parse(R"(f(x = 1, 2);)");
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().message.find("positional arguments must precede named arguments") !=
+            std::string::npos);
+}
+
 TEST_CASE("Parse optimization showcase example script") {
     const auto script_path =
         std::filesystem::path(IBEX_SOURCE_DIR) / "examples" / "optimization_showcase.ibex";

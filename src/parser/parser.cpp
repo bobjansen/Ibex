@@ -108,6 +108,9 @@ class Parser {
                 params.push_back(std::move(*param));
             } while (match(TokenKind::Comma));
         }
+        if (!validate_param_defaults(params)) {
+            return std::nullopt;
+        }
         if (!consume(TokenKind::RParen, "expected ')' after parameter list")) {
             return std::nullopt;
         }
@@ -161,6 +164,9 @@ class Parser {
                 }
                 params.push_back(std::move(*param));
             } while (match(TokenKind::Comma));
+        }
+        if (!validate_param_defaults(params)) {
+            return std::nullopt;
         }
         if (!consume(TokenKind::RParen, "expected ')' after parameter list")) {
             return std::nullopt;
@@ -308,9 +314,17 @@ class Parser {
         if (!param_type.has_value()) {
             return std::nullopt;
         }
+        ExprPtr default_value;
+        if (match(TokenKind::Eq)) {
+            default_value = parse_expression();
+            if (!default_value) {
+                return std::nullopt;
+            }
+        }
         return Param{
             .name = std::move(*param_name),
             .type = std::move(*param_type),
+            .default_value = std::move(default_value),
             .effect = effect,
         };
     }
@@ -806,11 +820,13 @@ class Parser {
             if (match(TokenKind::LParen)) {
                 std::vector<ExprPtr> args;
                 std::vector<NamedArg> named_args;
+                bool seen_named = false;
                 if (!check(TokenKind::RParen)) {
                     do {
                         // Named arg: identifier = expr (only when not followed by == or !=)
                         if (peek().kind == TokenKind::Identifier &&
                             peek_next().kind == TokenKind::Eq) {
+                            seen_named = true;
                             std::string arg_name{peek().lexeme};
                             advance();  // consume identifier
                             advance();  // consume '='
@@ -821,6 +837,10 @@ class Parser {
                             named_args.push_back(
                                 NamedArg{.name = std::move(arg_name), .value = std::move(val)});
                         } else {
+                            if (seen_named) {
+                                return fail_expr(
+                                    peek(), "positional arguments must precede named arguments");
+                            }
                             auto arg = parse_expression();
                             if (!arg) {
                                 return nullptr;
@@ -1235,6 +1255,22 @@ class Parser {
         }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
+    }
+
+    auto validate_param_defaults(const std::vector<Param>& params) -> bool {
+        bool saw_default = false;
+        for (const auto& param : params) {
+            if (param.default_value != nullptr) {
+                saw_default = true;
+                continue;
+            }
+            if (saw_default) {
+                error_ =
+                    make_error(peek(), "required parameter cannot follow a defaulted parameter");
+                return false;
+            }
+        }
+        return true;
     }
 
     /// Parse a formula term: a column name, `.` wildcard, or an interaction `a:b`.

@@ -252,6 +252,84 @@ TEST_CASE("seed_rng rejects wrong argument count") {
     REQUIRE_FALSE(ibex::repl::execute_script("seed_rng();", registry));
 }
 
+TEST_CASE("REPL supports named arguments and defaults for user functions") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn add3(x: Int, y: Int = 1, z: Int = 2) -> Int {
+  x + y + z;
+}
+let a = add3(10);
+let b = add3(10, z = 5);
+let c = add3(x = 10, z = 5, y = 7);
+c;
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL supports named arguments and defaults for extern functions") {
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "read_fake",
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            if (args.size() != 4) {
+                return std::unexpected("read_fake() expects 4 arguments");
+            }
+            const auto* path = std::get_if<std::string>(&args[0]);
+            const auto* nulls = std::get_if<std::string>(&args[1]);
+            const auto* delimiter = std::get_if<std::string>(&args[2]);
+            const auto* has_header = std::get_if<bool>(&args[3]);
+            if (path == nullptr || nulls == nullptr || delimiter == nullptr ||
+                has_header == nullptr) {
+                return std::unexpected("read_fake(): wrong argument types");
+            }
+            if (*path != "data.csv" || *nulls != "" || *delimiter != "," || *has_header != false) {
+                return std::unexpected("read_fake(): defaults/named binding mismatch");
+            }
+            ibex::runtime::Table t;
+            t.add_column("x", ibex::Column<std::int64_t>{1, 2, 3});
+            return ibex::runtime::ExternValue{std::move(t)};
+        });
+
+    const char* src = R"(
+extern fn read_fake(
+    path: String,
+    nulls: String = "",
+    delimiter: String = ",",
+    has_header: Bool = true
+) -> DataFrame from "fake.hpp";
+
+let t = read_fake("data.csv", has_header = false);
+t;
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL rejects duplicate named arguments") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn add3(x: Int, y: Int = 1) -> Int {
+  x + y;
+}
+add3(10, y = 2, y = 3);
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL rejects unknown named arguments") {
+    ibex::runtime::ExternRegistry registry;
+    const char* src = R"(
+fn add3(x: Int, y: Int = 1) -> Int {
+  x + y;
+}
+add3(10, z = 2);
+)";
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
 TEST_CASE("REPL tuple let binding: bound columns usable in expressions") {
     ibex::runtime::ExternRegistry registry;
 

@@ -1,0 +1,9 @@
+fn add3(x: Int, y: Int = 1, z: Int = 2) -> Int {
+    x + y + z;
+}
+
+let a = add3(10);
+let b = add3(10, z = 5);
+let c = add3(x = 10, z = 5, y = 7);
+
+c;

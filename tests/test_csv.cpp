@@ -52,6 +52,91 @@ TEST_CASE("Read simple CSV - int and string columns") {
     REQUIRE(get_string_at(table, "symbol", 2) == "A");
 }
 
+TEST_CASE("Read CSV - categorical promotion preserves single code per distinct value",
+          "[csv][categorical]") {
+    // Reproduces a bug where the categorical-inference path stored
+    // `std::string_view` keys in its dedup map, with the views pointing into
+    // `dict.back()`. As `dict` grew it could reallocate, invalidating every
+    // existing key view; subsequent rows that should have hashed to an
+    // existing entry instead created fresh dictionary entries with new codes.
+    // Symptom downstream: `select { ... } by symbol` returned more groups than
+    // distinct symbols. This test guards a many-distinct-key CSV that's small
+    // enough to stay under the 10% categorical-promotion ratio.
+    auto path = tmp("ibex_test_categorical_dedup.csv");
+    constexpr std::size_t kSymbols = 252;
+    constexpr std::size_t kRepeats = 200;
+    {
+        std::ofstream out(path);
+        out << "symbol,price\n";
+        std::uint64_t lcg = 0x9E3779B97F4A7C15ULL;
+        for (std::size_t i = 0; i < kSymbols * kRepeats; ++i) {
+            lcg = (lcg * 6364136223846793005ULL) + 1442695040888963407ULL;
+            const std::size_t s = static_cast<std::size_t>(lcg >> 32) % kSymbols;
+            char sym[4] = {
+                static_cast<char>('A' + ((s / (26 * 26)) % 26)),
+                static_cast<char>('A' + ((s / 26) % 26)),
+                static_cast<char>('A' + (s % 26)),
+                '\0',
+            };
+            out << sym << "," << s << "\n";
+        }
+    }
+
+    auto table = read_csv(path.string());
+    const auto* sym_col = std::get_if<ibex::Column<ibex::Categorical>>(table.find("symbol"));
+    REQUIRE(sym_col != nullptr);
+    REQUIRE(sym_col->size() == kSymbols * kRepeats);
+
+    // The dictionary must contain exactly the kSymbols distinct values; if the
+    // bug is present the dictionary swells past kSymbols because re-encountered
+    // values get fresh codes after each `dict` reallocation.
+    REQUIRE(sym_col->dictionary().size() == kSymbols);
+
+    // Every code must round-trip through the dictionary back to the same
+    // 3-character symbol that was written for that row.
+    std::uint64_t lcg = 0x9E3779B97F4A7C15ULL;
+    for (std::size_t i = 0; i < kSymbols * kRepeats; ++i) {
+        lcg = (lcg * 6364136223846793005ULL) + 1442695040888963407ULL;
+        const std::size_t s = static_cast<std::size_t>(lcg >> 32) % kSymbols;
+        const std::string expected = {
+            static_cast<char>('A' + ((s / (26 * 26)) % 26)),
+            static_cast<char>('A' + ((s / 26) % 26)),
+            static_cast<char>('A' + (s % 26)),
+        };
+        REQUIRE((*sym_col)[i] == expected);
+    }
+}
+
+TEST_CASE("Read CSV - schema-hinted categorical preserves single code per distinct value",
+          "[csv][categorical][schema]") {
+    auto path = tmp("ibex_test_categorical_schema.csv");
+    constexpr std::size_t kSymbols = 252;
+    constexpr std::size_t kRepeats = 200;
+    {
+        std::ofstream out(path);
+        out << "symbol,price\n";
+        std::uint64_t lcg = 0x9E3779B97F4A7C15ULL;
+        for (std::size_t i = 0; i < kSymbols * kRepeats; ++i) {
+            lcg = (lcg * 6364136223846793005ULL) + 1442695040888963407ULL;
+            const std::size_t s = static_cast<std::size_t>(lcg >> 32) % kSymbols;
+            char sym[4] = {
+                static_cast<char>('A' + ((s / (26 * 26)) % 26)),
+                static_cast<char>('A' + ((s / 26) % 26)),
+                static_cast<char>('A' + (s % 26)),
+                '\0',
+            };
+            out << sym << "," << s << "\n";
+        }
+    }
+
+    auto table = read_csv(path.string(), /*null_spec=*/"", /*delimiter=*/",",
+                          /*has_header=*/true, /*schema=*/"symbol:cat,price:int");
+    const auto* sym_col = std::get_if<ibex::Column<ibex::Categorical>>(table.find("symbol"));
+    REQUIRE(sym_col != nullptr);
+    REQUIRE(sym_col->size() == kSymbols * kRepeats);
+    REQUIRE(sym_col->dictionary().size() == kSymbols);
+}
+
 TEST_CASE("Read CSV - float64 column detection") {
     auto path = tmp("ibex_test_float.csv");
     write_csv(path, "price,qty\n1.5,10\n2.25,20\n0.5,5\n");

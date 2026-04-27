@@ -1,0 +1,29 @@
+import "csv";
+
+let employee =
+    read_csv("examples/leetcode/data/employee_managers.csv",
+             nulls = "<empty>",
+             schema = "id:int,name:str,salary:int,managerId:int");
+
+// LeetCode 181: Employees Earning More Than Their Managers.
+//
+// Translation pattern:
+// 1. Shape the employee table into a manager lookup keyed by managerId.
+// 2. Join employees to their manager rows.
+// 3. Keep employees whose salary is greater than their manager's salary.
+
+let managers =
+    employee[
+        select {
+            managerId = id,
+            manager_salary = salary
+        }
+    ];
+
+let result =
+    (employee join managers on managerId)[
+        filter salary > manager_salary,
+        select { Employee = name }
+    ];
+
+result;

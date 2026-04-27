@@ -13,6 +13,9 @@ Current examples:
 - `second_highest_salary`
 - `nth_highest_salary`
 - `consecutive_numbers`
+- `employees_earning_more_than_managers`
+- `customers_who_never_order`
+- `rising_temperature`
 
 Run an example from the repository root with:
 
@@ -28,6 +31,15 @@ uv run examples/leetcode/nth_highest_salary.py
 
 uv run examples/leetcode/consecutive_numbers.py
 ./build-release/tools/ibex :load examples/leetcode/consecutive_numbers.ibex
+
+uv run examples/leetcode/employees_earning_more_than_managers.py
+./build-release/tools/ibex :load examples/leetcode/employees_earning_more_than_managers.ibex
+
+uv run examples/leetcode/customers_who_never_order.py
+./build-release/tools/ibex :load examples/leetcode/customers_who_never_order.ibex
+
+uv run examples/leetcode/rising_temperature.py
+./build-release/tools/ibex :load examples/leetcode/rising_temperature.ibex
 ```
 
 The LeetCode-style translation pattern in this first example is:
@@ -48,6 +60,19 @@ The third example generalizes the same pattern:
 The consecutive-numbers example shows a shift-style pattern:
 - two pandas `shift(...)` calls
 - direct `lag(...)` calls in an Ibex `filter`
+
+The employee-manager example shows a compact self-join pattern:
+- pandas self-merge against `employee[["salary", "id"]]`
+- Ibex `select` to shape the manager lookup, then `join` and `filter`
+
+The never-ordered-customers example shows an anti-join pattern:
+- pandas `~isin(...)`
+- Ibex `anti join` against a shaped key lookup
+
+The rising-temperature example shows an ordered lag pattern over dates:
+- pandas `diff().dt.days` plus `shift(1)`
+- Ibex `order`, direct `lag(...)` in `filter`, and `Date - Date` day deltas
+- the pandas side uses a CSV fixture; the Ibex side uses `Table { ... }` because CSV date parsing is not supported yet
 
 The Ibex versions now also use named CSV arguments where that improves
 readability, for example:

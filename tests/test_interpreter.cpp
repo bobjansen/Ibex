@@ -1535,6 +1535,28 @@ TEST_CASE("lag on DataFrame uses current row order") {
     REQUIRE((*prev)[2] == 20);
 }
 
+TEST_CASE("lag offset accepts scalar expression") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30, 40});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("n", std::int64_t{1});
+
+    auto ir = require_ir("data[update { prev = lag(val, n + 1) }];");
+    auto result = runtime::interpret(*ir, registry, &scalars);
+    REQUIRE(result.has_value());
+
+    const auto* prev = std::get_if<Column<std::int64_t>>(result->find("prev"));
+    REQUIRE(prev != nullptr);
+    REQUIRE((*prev)[0] == 0);
+    REQUIRE((*prev)[1] == 0);
+    REQUIRE((*prev)[2] == 10);
+    REQUIRE((*prev)[3] == 20);
+}
+
 TEST_CASE("filter accepts lag and lead directly") {
     runtime::Table table;
     table.add_column("id", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7});
@@ -1547,6 +1569,29 @@ TEST_CASE("filter accepts lag and lead directly") {
         "logs[filter num == lag(num, 1) && num == lag(num, 2), distinct { ConsecutiveNums = num "
         "}];");
     auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* consecutive = std::get_if<Column<std::string>>(result->find("ConsecutiveNums"));
+    REQUIRE(consecutive != nullptr);
+    REQUIRE((*consecutive)[0] == "1");
+}
+
+TEST_CASE("filter lag offset accepts scalar expression") {
+    runtime::Table table;
+    table.add_column("id", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7});
+    table.add_column("num", Column<std::string>{"1", "1", "1", "2", "1", "1", "1"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("logs", table);
+
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("n", std::int64_t{1});
+
+    auto ir = require_ir(
+        "logs[filter num == lag(num, n) && num == lag(num, n + 1), distinct { ConsecutiveNums = "
+        "num }];");
+    auto result = runtime::interpret(*ir, registry, &scalars);
     REQUIRE(result.has_value());
     REQUIRE(result->rows() == 1);
 

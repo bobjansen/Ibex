@@ -4,6 +4,8 @@ let logs =
     read_csv("examples/leetcode/data/logs.csv",
              schema = "id:int,num:str");
 
+let n = 1;
+
 // LeetCode 180: Consecutive Numbers.
 //
 // Translation pattern:
@@ -12,7 +14,7 @@ let logs =
 
 let result =
     logs[
-        filter num == lag(num, 1) && num == lag(num, 2)
+        filter num == lag(num, n) && num == lag(num, n + 1)
     ][
         distinct { ConsecutiveNums = num }
     ];

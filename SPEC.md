@@ -2073,11 +2073,11 @@ Rolling functions are **aggregate-like**: they produce one scalar per row
 | `lag(col, n)`      | Value `n` rows before current, by index order |
 | `lead(col, n)`     | Value `n` rows after current, by index order  |
 
-`n` must be a non-negative integer literal. In `update`, if the offset exceeds
-the available range, the result is the type's default value (0 for numerics,
-empty string for `String`, epoch for `Date` and `Timestamp`). In `filter`,
-out-of-range shifted values are treated as null, so comparisons involving them
-do not match.
+`n` may be an integer literal or any scalar expression that evaluates to a
+non-negative `Int64`. In `update`, if the offset exceeds the available range,
+the result is the type's default value (0 for numerics, empty string for
+`String`, epoch for `Date` and `Timestamp`). In `filter`, out-of-range shifted
+values are treated as null, so comparisons involving them do not match.
 
 `lag` and `lead` use the current row order. If an explicit ordering is needed,
 apply `order` in a preceding block:

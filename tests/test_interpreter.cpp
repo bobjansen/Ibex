@@ -491,6 +491,95 @@ TEST_CASE("Interpret grouped aggregation") {
     REQUIRE((*totals)[2] == 25);
 }
 
+TEST_CASE("Interpret grouped aggregation many string keys interleaved",
+          "[interpreter][aggregate][string]") {
+    // Reproduces the benchmark shape: many distinct string keys (>>cache-line),
+    // many rows per key, repeated/interleaved order. The bug to guard against
+    // was that the string fast path produced one *result row per (key, run)*
+    // instead of one per distinct key, because string_view keys stored in the
+    // hash map were silently invalidated.
+    constexpr std::size_t kSymbols = 252;
+    constexpr std::size_t kRepeats = 16000;
+
+    auto make_symbol = [](std::size_t i) -> std::string {
+        std::string s(3, 'A');
+        s[0] = static_cast<char>('A' + (i / (26 * 26)) % 26);
+        s[1] = static_cast<char>('A' + (i / 26) % 26);
+        s[2] = static_cast<char>('A' + i % 26);
+        return s;
+    };
+
+    std::vector<std::string> symbols;
+    std::vector<std::int64_t> prices;
+    const std::size_t total_rows = kSymbols * kRepeats;
+    symbols.reserve(total_rows);
+    prices.reserve(total_rows);
+    // Pseudo-random index sequence (LCG) so symbol order is shuffled like the
+    // benchmark CSV — same symbol can appear many rows apart, matching the bug
+    // shape where the string fast path mismatches re-encountered keys.
+    std::uint64_t lcg = 0x9E3779B97F4A7C15ULL;
+    for (std::size_t i = 0; i < total_rows; ++i) {
+        lcg = (lcg * 6364136223846793005ULL) + 1442695040888963407ULL;
+        const std::size_t s = static_cast<std::size_t>(lcg >> 32) % kSymbols;
+        symbols.push_back(make_symbol(s));
+        prices.push_back(static_cast<std::int64_t>(s + 1));
+    }
+    std::vector<std::int64_t> expected_counts(kSymbols, 0);
+    std::vector<std::int64_t> expected_sums(kSymbols, 0);
+    for (std::size_t i = 0; i < total_rows; ++i) {
+        const std::size_t s =
+            static_cast<std::size_t>(static_cast<unsigned char>(symbols[i][0] - 'A')) * 26 * 26 +
+            static_cast<std::size_t>(static_cast<unsigned char>(symbols[i][1] - 'A')) * 26 +
+            static_cast<std::size_t>(static_cast<unsigned char>(symbols[i][2] - 'A'));
+        expected_counts[s] += 1;
+        expected_sums[s] += prices[i];
+    }
+
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>(symbols));
+    table.add_column("price", Column<std::int64_t>(prices));
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[select { symbol, n = count(), s = sum(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbol_col = result->find("symbol");
+    const auto* n_col = result->find("n");
+    const auto* s_col = result->find("s");
+    REQUIRE(symbol_col != nullptr);
+    REQUIRE(n_col != nullptr);
+    REQUIRE(s_col != nullptr);
+
+    const auto* sym_strs = std::get_if<Column<std::string>>(symbol_col);
+    const auto* counts = std::get_if<Column<std::int64_t>>(n_col);
+    const auto* sums = std::get_if<Column<std::int64_t>>(s_col);
+    REQUIRE(sym_strs != nullptr);
+    REQUIRE(counts != nullptr);
+    REQUIRE(sums != nullptr);
+
+    REQUIRE(sym_strs->size() == kSymbols);
+    REQUIRE(counts->size() == kSymbols);
+    REQUIRE(sums->size() == kSymbols);
+
+    // Every distinct symbol must appear exactly once with the expected counts.
+    std::vector<bool> seen(kSymbols, false);
+    for (std::size_t row = 0; row < sym_strs->size(); ++row) {
+        const std::string_view sym = (*sym_strs)[row];
+        REQUIRE(sym.size() == 3);
+        std::size_t idx = (static_cast<std::size_t>(sym[0] - 'A') * 26 * 26) +
+                          (static_cast<std::size_t>(sym[1] - 'A') * 26) +
+                          static_cast<std::size_t>(sym[2] - 'A');
+        REQUIRE(idx < kSymbols);
+        REQUIRE_FALSE(seen[idx]);
+        seen[idx] = true;
+        CHECK((*counts)[row] == expected_counts[idx]);
+        CHECK((*sums)[row] == expected_sums[idx]);
+    }
+}
+
 TEST_CASE("Interpret aggregate arithmetic") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{10, 20, 30, 25});

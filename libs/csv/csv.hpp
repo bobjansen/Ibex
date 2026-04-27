@@ -875,7 +875,11 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
                 codes.reserve(n);
                 std::vector<std::string> dict;
-                std::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type>
+                // Keys are owned `std::string`. Storing `std::string_view`
+                // would dangle when `dict.push_back` reallocates the dict
+                // buffer, causing repeat values to be assigned fresh codes.
+                std::unordered_map<std::string, ibex::Column<ibex::Categorical>::code_type,
+                                   ibex::detail::StringHash, std::equal_to<>>
                     index;
                 for (std::size_t i = 0; i < n; ++i) {
                     if (is_null(i)) {
@@ -1004,7 +1008,14 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
             codes.reserve(n);
             std::vector<std::string> dict;
-            std::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type> index;
+            // Keys are owned `std::string`. Storing `std::string_view` here
+            // would dangle when `dict.push_back` reallocates the dict buffer
+            // (or moves SSO strings during reallocation), causing repeat
+            // values to be assigned fresh codes — which downstream looks like
+            // group-by producing more groups than distinct keys.
+            std::unordered_map<std::string, ibex::Column<ibex::Categorical>::code_type,
+                               ibex::detail::StringHash, std::equal_to<>>
+                index;
             bool ok = true;
             for (auto sv : vals) {
                 auto it = index.find(sv);

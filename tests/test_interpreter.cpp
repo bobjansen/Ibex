@@ -1517,7 +1517,7 @@ TEST_CASE("lag on bool column preserves packed values", "[lag][bool]") {
     REQUIRE((*prev)[2] == false);
 }
 
-TEST_CASE("lag on non-TimeFrame returns error") {
+TEST_CASE("lag on DataFrame uses current row order") {
     runtime::Table table;
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
 
@@ -1526,8 +1526,33 @@ TEST_CASE("lag on non-TimeFrame returns error") {
 
     auto ir = require_ir("data[update { prev = lag(val, 1) }];");
     auto result = runtime::interpret(*ir, registry);
-    REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
+    REQUIRE(result.has_value());
+
+    const auto* prev = std::get_if<Column<std::int64_t>>(result->find("prev"));
+    REQUIRE(prev != nullptr);
+    REQUIRE((*prev)[0] == 0);
+    REQUIRE((*prev)[1] == 10);
+    REQUIRE((*prev)[2] == 20);
+}
+
+TEST_CASE("filter accepts lag and lead directly") {
+    runtime::Table table;
+    table.add_column("id", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7});
+    table.add_column("num", Column<std::string>{"1", "1", "1", "2", "1", "1", "1"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("logs", table);
+
+    auto ir = require_ir(
+        "logs[filter num == lag(num, 1) && num == lag(num, 2), distinct { ConsecutiveNums = num "
+        "}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* consecutive = std::get_if<Column<std::string>>(result->find("ConsecutiveNums"));
+    REQUIRE(consecutive != nullptr);
+    REQUIRE((*consecutive)[0] == "1");
 }
 
 // --- cumsum / cumprod tests ---------------------------------------------------

@@ -140,8 +140,8 @@
             <tr><td><code>rolling_quantile(col, p)</code></td><td>Rolling quantile within each window.</td></tr>
             <tr><td><code>rolling_skew(col)</code></td><td>Rolling sample skewness.</td></tr>
             <tr><td><code>rolling_kurtosis(col)</code></td><td>Rolling sample excess kurtosis.</td></tr>
-            <tr><td><code>lag(col, n)</code></td><td>Shift backward by <code>n</code> rows (previous values).</td></tr>
-            <tr><td><code>lead(col, n)</code></td><td>Shift forward by <code>n</code> rows (next values).</td></tr>
+            <tr><td><code>lag(col, n)</code></td><td>Shift backward by <code>n</code> rows in current row order; valid in <code>update</code> and <code>filter</code>.</td></tr>
+            <tr><td><code>lead(col, n)</code></td><td>Shift forward by <code>n</code> rows in current row order; valid in <code>update</code> and <code>filter</code>.</td></tr>
             <tr><td><code>cumsum(col)</code></td><td>Prefix sum, one output per row.</td></tr>
             <tr><td><code>cumprod(col)</code></td><td>Prefix product, one output per row.</td></tr>
           </tbody>

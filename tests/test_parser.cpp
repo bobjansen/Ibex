@@ -499,6 +499,28 @@ TEST_CASE("Parse block expression with filter and select") {
     REQUIRE(select.fields[1].expr != nullptr);
 }
 
+TEST_CASE("Parse filter with lag call") {
+    const char* source = "logs[filter num == lag(num, 1) && num == lag(num, 2)];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& filter = std::get<FilterClause>(block.clauses[0]);
+    const auto& and_expr = require_binary(require_expr(filter.predicate), BinaryOp::And);
+    const auto& left_cmp = require_binary(require_expr(and_expr.left), BinaryOp::Eq);
+    const auto& lag_call = require_call(require_expr(left_cmp.right));
+    REQUIRE(lag_call.callee == "lag");
+    REQUIRE(lag_call.args.size() == 2);
+    REQUIRE(require_identifier(require_expr(lag_call.args[0])).name == "num");
+    REQUIRE(std::get<std::int64_t>(require_literal(require_expr(lag_call.args[1])).value) == 1);
+}
+
 TEST_CASE("Parse select without braces") {
     const char* source = "df[select price];";
 

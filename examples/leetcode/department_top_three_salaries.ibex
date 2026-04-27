@@ -20,6 +20,6 @@ let department =
     [filter salary_rank <= 3]
     join department[select { departmentId = id, department = name }] on departmentId
 )[
-    select { `Department` = department, `Employee` = name, `Salary` = salary },
-    order { `Department` asc, `Salary` desc, `Employee` asc }
+    select { Department = department, Employee = name, Salary = salary },
+    order { Department asc, Salary desc, Employee asc }
 ];

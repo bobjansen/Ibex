@@ -1073,6 +1073,14 @@ auto Emitter::emit_filter_expr(const ir::FilterExpr& expr) -> std::string {
                 return "ibex::ops::filter_arith(ibex::ir::ArithmeticOp::" + emit_arith_op(node.op) +
                        ", " + emit_filter_expr(*node.left) + ", " + emit_filter_expr(*node.right) +
                        ")";
+            } else if constexpr (std::is_same_v<T, ir::FilterCall>) {
+                std::string s = "([]{ std::vector<ibex::ir::FilterExprPtr> args;";
+                for (const auto& arg : node.args) {
+                    s += " args.push_back(" + emit_filter_expr(*arg) + ");";
+                }
+                s += " return ibex::ops::filter_call(\"" + escape_string(node.callee) +
+                     "\", std::move(args)); })()";
+                return s;
             } else if constexpr (std::is_same_v<T, ir::FilterCmp>) {
                 return "ibex::ops::filter_cmp(ibex::ir::CompareOp::" + emit_compare_op(node.op) +
                        ", " + emit_filter_expr(*node.left) + ", " + emit_filter_expr(*node.right) +

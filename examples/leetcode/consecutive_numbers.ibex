@@ -1,0 +1,20 @@
+import "csv";
+
+let logs =
+    read_csv("examples/leetcode/data/logs.csv",
+             schema = "id:int,num:str");
+
+// LeetCode 180: Consecutive Numbers.
+//
+// Translation pattern:
+// 1. Compare each row with the previous two rows using lag directly in filter.
+// 2. Deduplicate matching numbers.
+
+let result =
+    logs[
+        filter num == lag(num, 1) && num == lag(num, 2)
+    ][
+        distinct { ConsecutiveNums = num }
+    ];
+
+result;

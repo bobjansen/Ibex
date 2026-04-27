@@ -43,6 +43,8 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
     -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_call(std::string callee, std::vector<ir::FilterExprPtr> args)
+    -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
     -> ir::FilterExprPtr;
 [[nodiscard]] auto filter_and(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr;

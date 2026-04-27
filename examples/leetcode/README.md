@@ -12,6 +12,7 @@ Current examples:
 - `department_top_three_salaries`
 - `second_highest_salary`
 - `nth_highest_salary`
+- `consecutive_numbers`
 
 Run an example from the repository root with:
 
@@ -24,6 +25,9 @@ uv run examples/leetcode/second_highest_salary.py
 
 uv run examples/leetcode/nth_highest_salary.py
 ./build-release/tools/ibex :load examples/leetcode/nth_highest_salary.ibex
+
+uv run examples/leetcode/consecutive_numbers.py
+./build-release/tools/ibex :load examples/leetcode/consecutive_numbers.ibex
 ```
 
 The LeetCode-style translation pattern in this first example is:
@@ -40,6 +44,10 @@ The third example generalizes the same pattern:
 - parameterized by `n`
 - reusable `top_n_salaries(...)` and `nth_highest_salary(...)` helpers
 - stable output column name in Ibex instead of a dynamic column label
+
+The consecutive-numbers example shows a shift-style pattern:
+- two pandas `shift(...)` calls
+- direct `lag(...)` calls in an Ibex `filter`
 
 The Ibex versions now also use named CSV arguments where that improves
 readability, for example:

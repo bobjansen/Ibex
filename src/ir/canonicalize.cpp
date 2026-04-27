@@ -122,6 +122,10 @@ void collect_filter_column_refs(const FilterExpr& expr, std::unordered_set<std::
                                  std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
                 collect_filter_column_refs(*n.left, out);
                 collect_filter_column_refs(*n.right, out);
+            } else if constexpr (std::is_same_v<T, FilterCall>) {
+                for (const auto& arg : n.args) {
+                    collect_filter_column_refs(*arg, out);
+                }
             } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
                                  std::is_same_v<T, FilterIsNotNull>) {
                 collect_filter_column_refs(*n.operand, out);
@@ -145,6 +149,10 @@ void remap_filter_expr_through_rename(FilterExpr& expr,
                                  std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
                 remap_filter_expr_through_rename(*n.left, n2o);
                 remap_filter_expr_through_rename(*n.right, n2o);
+            } else if constexpr (std::is_same_v<T, FilterCall>) {
+                for (auto& arg : n.args) {
+                    remap_filter_expr_through_rename(*arg, n2o);
+                }
             } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
                                  std::is_same_v<T, FilterIsNotNull>) {
                 remap_filter_expr_through_rename(*n.operand, n2o);
@@ -379,6 +387,11 @@ auto simplify_expr(FilterExprPtr expr, bool* changed) -> FilterExprPtr {
                         *changed = true;
                         return std::make_unique<FilterExpr>(FilterExpr{.node = std::move(*folded)});
                     }
+                }
+                return std::move(expr);
+            } else if constexpr (std::is_same_v<T, FilterCall>) {
+                for (auto& arg : n.args) {
+                    arg = simplify_expr(std::move(arg), changed);
                 }
                 return std::move(expr);
             } else if constexpr (std::is_same_v<T, FilterIsNull> ||

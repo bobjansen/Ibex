@@ -905,8 +905,16 @@ is identical to the input schema.
 trades[filter price > 100.0 && volume > 0]
 ```
 
-Current implementation restricts filter predicates to simple comparisons of
-the form `column <op> literal` or `column <op> scalar`.
+Pure row-preserving functions may appear inside `filter` predicates. For
+example, positional shifts can be used directly without first materializing
+temporary columns:
+
+```
+logs[filter num == lag(num, 1) && num == lag(num, 2)]
+```
+
+Aggregate expressions that collapse cardinality are not valid in plain
+`filter` predicates.
 
 **`select { field, ... }`**
 
@@ -2065,12 +2073,20 @@ Rolling functions are **aggregate-like**: they produce one scalar per row
 | `lag(col, n)`      | Value `n` rows before current, by index order |
 | `lead(col, n)`     | Value `n` rows after current, by index order  |
 
-`n` must be a non-negative integer literal. If the offset exceeds the available
-range, the result is the type's default value (0 for numerics, empty string for
-`String`, epoch for `Date` and `Timestamp`).
+`n` must be a non-negative integer literal. In `update`, if the offset exceeds
+the available range, the result is the type's default value (0 for numerics,
+empty string for `String`, epoch for `Date` and `Timestamp`). In `filter`,
+out-of-range shifted values are treated as null, so comparisons involving them
+do not match.
 
-`lag` and `lead` respect the TimeFrame's index ordering. They are valid in any
-TimeFrame block, with or without a `window` clause.
+`lag` and `lead` use the current row order. If an explicit ordering is needed,
+apply `order` in a preceding block:
+
+```
+logs[order id][filter num == lag(num, 1) && num == lag(num, 2)]
+```
+
+For `TimeFrame`, the current row order is the time-index ordering.
 
 **Cumulative functions (no `window` required):**
 

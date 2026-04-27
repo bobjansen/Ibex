@@ -219,9 +219,7 @@ offset = <span class="num">10</span>
 
 %%ibex --bind trades=trades --bind offset=offset --as pandas --out grouped
 trades[
-    <span class="kw">update</span> { qty_plus_offset = qty + offset }
-][
-    <span class="kw">select</span> { total_qty = <span class="fn-name">sum</span>(qty_plus_offset), avg_px = <span class="fn-name">mean</span>(px) },
+    <span class="kw">select</span> { total_qty = <span class="fn-name">sum</span>(qty + offset), avg_px = <span class="fn-name">mean</span>(px) },
     <span class="kw">by</span> symbol,
     <span class="kw">order</span> symbol
 ];

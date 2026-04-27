@@ -85,9 +85,7 @@ offset = 10
 ```python
 %%ibex --bind trades=trades --bind offset=offset --as pandas --out grouped
 trades[
-    update { qty_plus_offset = qty + offset }
-][
-    select { total_qty = sum(qty_plus_offset), avg_px = mean(px) },
+    select { total_qty = sum(qty + offset), avg_px = mean(px) },
     by symbol,
     order symbol
 ];

@@ -1721,6 +1721,26 @@ class Lowerer {
             return std::make_unique<ir::FilterExpr>(
                 ir::FilterExpr{ir::FilterLiteral{.value = std::move(wrapped)}});
         }
+        if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            if (!call->named_args.empty()) {
+                return std::unexpected(
+                    LowerError{.message = "named arguments are not supported in filter calls"});
+            }
+            if (call->callee != "lag" && call->callee != "lead") {
+                return std::unexpected(LowerError{
+                    .message = "unsupported function in filter predicate: " + call->callee});
+            }
+            ir::FilterCall lowered{.callee = call->callee, .args = {}};
+            lowered.args.reserve(call->args.size());
+            for (const auto& arg : call->args) {
+                auto lowered_arg = lower_filter_expr(*arg);
+                if (!lowered_arg.has_value()) {
+                    return std::unexpected(lowered_arg.error());
+                }
+                lowered.args.push_back(std::move(lowered_arg.value()));
+            }
+            return std::make_unique<ir::FilterExpr>(ir::FilterExpr{.node = std::move(lowered)});
+        }
         // Parenthesized expression
         if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
             return lower_filter_expr(*group->expr);
@@ -1743,6 +1763,14 @@ class Lowerer {
                 } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
                     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterArith{
                         node.op, clone_filter_expr(*node.left), clone_filter_expr(*node.right)}});
+                } else if constexpr (std::is_same_v<T, ir::FilterCall>) {
+                    ir::FilterCall call{.callee = node.callee, .args = {}};
+                    call.args.reserve(node.args.size());
+                    for (const auto& arg : node.args) {
+                        call.args.push_back(clone_filter_expr(*arg));
+                    }
+                    return std::make_unique<ir::FilterExpr>(
+                        ir::FilterExpr{.node = std::move(call)});
                 } else if constexpr (std::is_same_v<T, ir::FilterCmp>) {
                     return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterCmp{
                         node.op, clone_filter_expr(*node.left), clone_filter_expr(*node.right)}});

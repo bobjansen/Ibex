@@ -642,6 +642,11 @@ auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
         ir::FilterExpr{ir::FilterArith{.op = op, .left = std::move(l), .right = std::move(r)}});
 }
 
+auto filter_call(std::string callee, std::vector<ir::FilterExprPtr> args) -> ir::FilterExprPtr {
+    return std::make_unique<ir::FilterExpr>(
+        ir::FilterExpr{ir::FilterCall{.callee = std::move(callee), .args = std::move(args)}});
+}
+
 auto filter_cmp(ir::CompareOp op, ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr {
     return std::make_unique<ir::FilterExpr>(
         ir::FilterExpr{ir::FilterCmp{.op = op, .left = std::move(l), .right = std::move(r)}});

@@ -701,6 +701,33 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
 
       <div class="tour-item">
         <div class="tour-text">
+          <span class="tour-tag">Filter With Lag</span>
+          <h3>Use previous or next rows directly in predicates.</h3>
+          <p>
+            Pure row-preserving functions such as <code>lag</code> and
+            <code>lead</code> can appear directly inside <code>filter</code>.
+            They use the current row order, so add a preceding
+            <code>order</code> block when the input order needs to be explicit.
+          </p>
+          <p>
+            This keeps shift-style patterns concise without materializing
+            temporary columns first.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Numbers that appear at least three times consecutively</span>
+logs[
+    <span class="kw">order</span> id
+][
+    <span class="kw">filter</span> num == <span class="fn-name">lag</span>(num, <span class="num">1</span>) &amp;&amp; num == <span class="fn-name">lag</span>(num, <span class="num">2</span>)
+][
+    <span class="kw">distinct</span> { ConsecutiveNums = num }
+];</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
           <span class="tour-tag">Rank</span>
           <h3>Assign dense, first, min/max, or average ranks inside update.</h3>
           <p>

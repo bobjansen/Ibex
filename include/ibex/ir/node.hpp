@@ -173,6 +173,11 @@ struct FilterArith {
     ArithmeticOp op;
     FilterExprPtr left, right;
 };
+/// Pure table-aware/value call in a filter expression, e.g. lag(col, 1).
+struct FilterCall {
+    std::string callee;
+    std::vector<FilterExprPtr> args;
+};
 /// Comparison between two value expressions — produces a bool.
 struct FilterCmp {
     CompareOp op;
@@ -199,8 +204,8 @@ struct FilterIsNotNull {
 };
 
 struct FilterExpr {
-    std::variant<FilterColumn, FilterLiteral, FilterArith, FilterCmp, FilterAnd, FilterOr,
-                 FilterNot, FilterIsNull, FilterIsNotNull>
+    std::variant<FilterColumn, FilterLiteral, FilterArith, FilterCall, FilterCmp, FilterAnd,
+                 FilterOr, FilterNot, FilterIsNull, FilterIsNotNull>
         node;
 };
 

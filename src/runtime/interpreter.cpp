@@ -1210,6 +1210,101 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
                 ColResult res{std::move(*result)};
                 res.owned_validity = merge_validity(lhs->get_validity(), rhs->get_validity(), n);
                 return res;
+            } else if constexpr (std::is_same_v<T, ir::FilterCall>) {
+                if (node.callee != "lag" && node.callee != "lead") {
+                    return std::unexpected("filter: unsupported function '" + node.callee + "'");
+                }
+                if (node.args.size() != 2) {
+                    return std::unexpected(node.callee + ": expected 2 arguments");
+                }
+                const auto* col_ref = std::get_if<ir::FilterColumn>(&node.args[0]->node);
+                if (col_ref == nullptr) {
+                    return std::unexpected(node.callee + ": first argument must be a column name");
+                }
+                const auto* offset_lit = std::get_if<ir::FilterLiteral>(&node.args[1]->node);
+                const std::int64_t* offset_val =
+                    offset_lit ? std::get_if<std::int64_t>(&offset_lit->value) : nullptr;
+                if (offset_val == nullptr || *offset_val < 0) {
+                    return std::unexpected(
+                        node.callee + ": second argument must be a non-negative integer literal");
+                }
+                const auto* source = table.find_entry(col_ref->name);
+                if (source == nullptr) {
+                    return std::unexpected(node.callee + ": unknown column '" + col_ref->name +
+                                           "'");
+                }
+                const bool is_lag = node.callee == "lag";
+                const std::size_t offset = static_cast<std::size_t>(*offset_val);
+                ColumnValue shifted = std::visit(
+                    [&](const auto& col) -> ColumnValue {
+                        using ColT = std::decay_t<decltype(col)>;
+                        ColT result;
+                        if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
+                                      std::is_same_v<ColT, Column<std::string>>) {
+                            result.reserve(n);
+                            for (std::size_t row = 0; row < n; ++row) {
+                                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                                    result.push_back(is_lag
+                                                         ? (row >= offset ? col[row - offset]
+                                                                          : std::string_view{})
+                                                         : (row + offset < n ? col[row + offset]
+                                                                             : std::string_view{}));
+                                } else {
+                                    using ValueT = typename ColT::value_type;
+                                    result.push_back(
+                                        is_lag ? (row >= offset ? col[row - offset] : ValueT{})
+                                               : (row + offset < n ? col[row + offset] : ValueT{}));
+                                }
+                            }
+                        } else {
+                            using ValueT = typename ColT::value_type;
+                            result.resize(n);
+                            if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                                for (std::size_t row = 0; row < n; ++row) {
+                                    if (is_lag) {
+                                        if (row >= offset) {
+                                            result.set(row, col[row - offset]);
+                                        }
+                                    } else if (row + offset < n) {
+                                        result.set(row, col[row + offset]);
+                                    }
+                                }
+                            } else {
+                                if (is_lag) {
+                                    if (offset < n) {
+                                        std::memcpy(result.data() + offset, col.data(),
+                                                    (n - offset) * sizeof(ValueT));
+                                    }
+                                } else if (offset < n) {
+                                    std::memcpy(result.data(), col.data() + offset,
+                                                (n - offset) * sizeof(ValueT));
+                                }
+                            }
+                        }
+                        return result;
+                    },
+                    *source->column);
+
+                ColResult result{std::move(shifted)};
+                ValidityBitmap validity(n, false);
+                for (std::size_t row = 0; row < n; ++row) {
+                    std::optional<std::size_t> source_row;
+                    if (is_lag) {
+                        if (row >= offset) {
+                            source_row = row - offset;
+                        }
+                    } else if (row + offset < n) {
+                        source_row = row + offset;
+                    }
+                    if (!source_row.has_value()) {
+                        continue;
+                    }
+                    const bool source_valid =
+                        !source->validity.has_value() || (*source->validity)[*source_row];
+                    validity.set(row, source_valid);
+                }
+                result.owned_validity = std::move(validity);
+                return result;
             } else {
                 return std::unexpected("filter: not a value expression");
             }
@@ -6243,9 +6338,6 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     for (const auto& field : fields) {
         if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
             if (call->callee == "lag" || call->callee == "lead") {
-                if (!output.time_index.has_value()) {
-                    return std::unexpected(call->callee + ": requires a TimeFrame");
-                }
                 auto col = eval_lag_lead_column(*call, output, call->callee == "lag");
                 if (!col) {
                     return std::unexpected(col.error());

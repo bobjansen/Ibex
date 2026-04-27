@@ -1,0 +1,22 @@
+import "csv";
+
+let customers =
+    read_csv("examples/leetcode/data/customers.csv", schema = "id:int,name:str");
+
+let orders =
+    read_csv("examples/leetcode/data/orders.csv", schema = "id:int,customerId:int");
+
+// LeetCode 183: Customers Who Never Order.
+//
+// Translation pattern:
+// 1. Shape orders into a customer-key lookup.
+// 2. Anti-join customers against the ordered customer ids.
+// 3. Project the requested output column.
+
+(
+    customers
+    anti join orders[select { id = customerId }] on id
+)[
+    select { Customers = name },
+    order Customers
+];

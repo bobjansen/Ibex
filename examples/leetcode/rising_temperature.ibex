@@ -1,0 +1,28 @@
+// LeetCode 197: Rising Temperature.
+//
+// The CSV reader does not yet parse Date columns from text, so this Ibex
+// example uses a typed inline table with Date literals.
+//
+// Translation pattern:
+// 1. Order rows by recordDate.
+// 2. Use lag directly in filter to compare with the previous row.
+// 3. Require both a one-day date delta and a higher temperature.
+
+let weather = Table {
+    id = [1, 2, 3, 4],
+    recordDate = [
+        date"2015-01-01",
+        date"2015-01-02",
+        date"2015-01-03",
+        date"2015-01-04"
+    ],
+    temperature = [10, 25, 20, 30]
+};
+
+weather[
+    order recordDate
+][
+    filter (recordDate - lag(recordDate, 1)) == 1 &&
+           temperature > lag(temperature, 1),
+    select { Id = id }
+];

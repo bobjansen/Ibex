@@ -1151,6 +1151,66 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
     }
 }
 
+auto eval_filter_int_scalar_arg(const ir::FilterExpr& expr, const Table& table,
+                                const ScalarRegistry* scalars)
+    -> std::expected<std::int64_t, std::string> {
+    return std::visit(
+        [&](const auto& node) -> std::expected<std::int64_t, std::string> {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+                if (const auto* value = std::get_if<std::int64_t>(&node.value)) {
+                    return *value;
+                }
+                return std::unexpected("expected Int64 scalar argument");
+            } else if constexpr (std::is_same_v<T, ir::FilterColumn>) {
+                if (table.find(node.name) != nullptr) {
+                    return std::unexpected("expected scalar argument, got column '" + node.name +
+                                           "'");
+                }
+                if (scalars != nullptr) {
+                    auto it = scalars->find(node.name);
+                    if (it != scalars->end()) {
+                        if (const auto* value = std::get_if<std::int64_t>(&it->second)) {
+                            return *value;
+                        }
+                        return std::unexpected("scalar argument must be Int64: " + node.name);
+                    }
+                }
+                return std::unexpected("unknown scalar argument: " + node.name);
+            } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
+                auto lhs = eval_filter_int_scalar_arg(*node.left, table, scalars);
+                if (!lhs) {
+                    return std::unexpected(lhs.error());
+                }
+                auto rhs = eval_filter_int_scalar_arg(*node.right, table, scalars);
+                if (!rhs) {
+                    return std::unexpected(rhs.error());
+                }
+                switch (node.op) {
+                    case ir::ArithmeticOp::Add:
+                        return *lhs + *rhs;
+                    case ir::ArithmeticOp::Sub:
+                        return *lhs - *rhs;
+                    case ir::ArithmeticOp::Mul:
+                        return *lhs * *rhs;
+                    case ir::ArithmeticOp::Div:
+                        if (*rhs == 0) {
+                            return std::unexpected("division by zero in scalar argument");
+                        }
+                        return *lhs / *rhs;
+                    case ir::ArithmeticOp::Mod:
+                        if (*rhs == 0) {
+                            return std::unexpected("modulo by zero in scalar argument");
+                        }
+                        return *lhs % *rhs;
+                }
+            } else {
+                return std::unexpected("expected scalar argument");
+            }
+        },
+        expr.node);
+}
+
 // Evaluate a value sub-expression over all n rows, returning a column.
 // Returns a pointer into the table for simple column references (zero-copy),
 // or an owned ColumnValue for computed intermediates.
@@ -1221,12 +1281,13 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
                 if (col_ref == nullptr) {
                     return std::unexpected(node.callee + ": first argument must be a column name");
                 }
-                const auto* offset_lit = std::get_if<ir::FilterLiteral>(&node.args[1]->node);
-                const std::int64_t* offset_val =
-                    offset_lit ? std::get_if<std::int64_t>(&offset_lit->value) : nullptr;
-                if (offset_val == nullptr || *offset_val < 0) {
+                auto offset_result = eval_filter_int_scalar_arg(*node.args[1], table, scalars);
+                if (!offset_result) {
+                    return std::unexpected(node.callee + ": " + offset_result.error());
+                }
+                if (*offset_result < 0) {
                     return std::unexpected(
-                        node.callee + ": second argument must be a non-negative integer literal");
+                        node.callee + ": second argument must evaluate to a non-negative Int64");
                 }
                 const auto* source = table.find_entry(col_ref->name);
                 if (source == nullptr) {
@@ -1234,7 +1295,7 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
                                            "'");
                 }
                 const bool is_lag = node.callee == "lag";
-                const std::size_t offset = static_cast<std::size_t>(*offset_val);
+                const std::size_t offset = static_cast<std::size_t>(*offset_result);
                 ColumnValue shifted = std::visit(
                     [&](const auto& col) -> ColumnValue {
                         using ColT = std::decay_t<decltype(col)>;
@@ -4876,7 +4937,8 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
 
 // Produce a shifted copy of a column: lag(col, n)[i] = col[i-n], lead(col, n)[i] = col[i+n].
 // Out-of-bounds entries are filled with type-appropriate zero/default values.
-auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag)
+auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,
+                          const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ColumnValue, std::string> {
     const std::string fname = is_lag ? "lag" : "lead";
     if (call.args.size() != 2) {
@@ -4886,11 +4948,14 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
     if (!col_ref) {
         return std::unexpected(fname + ": first argument must be a column name");
     }
-    const auto* offset_lit = std::get_if<ir::Literal>(&call.args[1]->node);
-    const std::int64_t* offset_val =
-        offset_lit ? std::get_if<std::int64_t>(&offset_lit->value) : nullptr;
+    Table empty;
+    auto offset_value = eval_expr(*call.args[1], empty, 0, scalars, externs);
+    if (!offset_value) {
+        return std::unexpected(fname + ": " + offset_value.error());
+    }
+    const auto* offset_val = std::get_if<std::int64_t>(&offset_value.value());
     if (offset_val == nullptr || *offset_val < 0) {
-        return std::unexpected(fname + ": second argument must be a non-negative integer literal");
+        return std::unexpected(fname + ": second argument must evaluate to a non-negative Int64");
     }
     const auto* src = input.find(col_ref->name);
     if (!src) {
@@ -6215,7 +6280,8 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 continue;
             }
             if (call->callee == "lag" || call->callee == "lead") {
-                auto col = eval_lag_lead_column(*call, output, call->callee == "lag");
+                auto col =
+                    eval_lag_lead_column(*call, output, call->callee == "lag", scalars, externs);
                 if (!col) {
                     return std::unexpected(col.error());
                 }
@@ -6338,7 +6404,8 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     for (const auto& field : fields) {
         if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
             if (call->callee == "lag" || call->callee == "lead") {
-                auto col = eval_lag_lead_column(*call, output, call->callee == "lag");
+                auto col =
+                    eval_lag_lead_column(*call, output, call->callee == "lag", scalars, externs);
                 if (!col) {
                     return std::unexpected(col.error());
                 }

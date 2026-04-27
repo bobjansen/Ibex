@@ -266,6 +266,18 @@ scores[
 ];
 ```
 
+### Filter With Lag / Lead
+
+```
+// Numbers that appear at least three times consecutively
+let n = 1;
+logs[order id][
+    filter num == lag(num, n) && num == lag(num, n + 1)
+][
+    distinct { ConsecutiveNums = num }
+];
+```
+
 ### Scalar extraction
 
 ```

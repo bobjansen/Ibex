@@ -55,9 +55,9 @@ struct BoundCallArg {
 };
 
 #ifdef IBEX_HAS_READLINE
-constexpr std::array<std::string_view, 12> kColonCommands = {
-    ":q",    ":quit",     ":exit", ":tables", ":scalars", ":schema",
-    ":head", ":describe", ":load", ":timing", ":time",    ":comments",
+constexpr std::array<std::string_view, 13> kColonCommands = {
+    ":q",    ":quit",     ":exit", ":tables", ":scalars", ":schema",   ":head",
+    ":peek", ":describe", ":load", ":timing", ":time",    ":comments",
 };
 
 auto colon_command_generator(const char* text, int state) -> char* {
@@ -899,6 +899,120 @@ void print_schema(const runtime::Table& table) {
 void describe_table(const runtime::Table& table, std::size_t max_rows = 10) {
     print_schema(table);
     print_table(table, max_rows);
+}
+
+auto column_bytes(const runtime::ColumnEntry& entry) -> std::size_t {
+    std::size_t bytes = std::visit(
+        [](const auto& col) -> std::size_t {
+            using ColType = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<ColType, Column<std::string>>) {
+                return col.size() * sizeof(std::uint32_t)  // offsets
+                       + (col.size() == 0 ? 0 : col.offsets_data()[col.size()]);
+            } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                std::size_t dict_chars = 0;
+                for (const auto& s : col.dictionary()) {
+                    dict_chars += s.size();
+                }
+                return col.size() * sizeof(Column<Categorical>::code_type) + dict_chars;
+            } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
+                return (col.size() + 7) / 8;
+            } else {
+                using V = typename ColType::value_type;
+                return col.size() * sizeof(V);
+            }
+        },
+        *entry.column);
+    if (entry.validity.has_value()) {
+        bytes += (entry.validity->size() + 7) / 8;
+    }
+    return bytes;
+}
+
+auto format_bytes(std::size_t bytes) -> std::string {
+    constexpr double kKiB = 1024.0;
+    constexpr double kMiB = kKiB * 1024.0;
+    constexpr double kGiB = kMiB * 1024.0;
+    auto b = static_cast<double>(bytes);
+    if (b >= kGiB) {
+        return fmt::format("{:.2f} GiB", b / kGiB);
+    }
+    if (b >= kMiB) {
+        return fmt::format("{:.1f} MiB", b / kMiB);
+    }
+    if (b >= kKiB) {
+        return fmt::format("{:.1f} KiB", b / kKiB);
+    }
+    return fmt::format("{} B", bytes);
+}
+
+/// Compact one-shot inspection: types + first rows + total row count + an
+/// estimated in-memory footprint. Replaces the `:schema` / `:head` /
+/// length-query loop a typical exploratory session leans on.
+void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
+    fmt::print("rows: {}", table.rows());
+    if (!table.columns.empty()) {
+        std::size_t total = 0;
+        for (const auto& entry : table.columns) {
+            total += column_bytes(entry);
+        }
+        fmt::print("  cols: {}  ~{}", table.columns.size(), format_bytes(total));
+        if (table.time_index.has_value()) {
+            fmt::print("  time_index: {}", *table.time_index);
+        }
+    }
+    fmt::print("\n");
+    if (table.columns.empty()) {
+        fmt::print("<empty>\n");
+        return;
+    }
+
+    const std::size_t shown_rows = std::min(table.rows(), max_rows);
+    const std::size_t col_count = table.columns.size();
+
+    std::vector<std::string> type_row(col_count);
+    std::vector<std::size_t> widths(col_count);
+    std::vector<std::vector<std::string>> cells(col_count);
+    for (std::size_t c = 0; c < col_count; ++c) {
+        type_row[c] = std::string("<") + column_type_name(*table.columns[c].column) + ">";
+        widths[c] = std::max(table.columns[c].name.size(), type_row[c].size());
+        cells[c].reserve(shown_rows);
+        for (std::size_t r = 0; r < shown_rows; ++r) {
+            auto cell = format_cell(table.columns[c], r);
+            widths[c] = std::max(widths[c], cell.size());
+            cells[c].push_back(std::move(cell));
+        }
+    }
+
+    auto print_sep = [&]() {
+        fmt::print("+");
+        for (std::size_t c = 0; c < col_count; ++c) {
+            fmt::print("{:-<{}}+", "", widths[c] + 2);
+        }
+        fmt::print("\n");
+    };
+
+    print_sep();
+    fmt::print("|");
+    for (std::size_t c = 0; c < col_count; ++c) {
+        fmt::print(" {:<{}} |", table.columns[c].name, widths[c]);
+    }
+    fmt::print("\n|");
+    for (std::size_t c = 0; c < col_count; ++c) {
+        fmt::print(" {:<{}} |", type_row[c], widths[c]);
+    }
+    fmt::print("\n");
+    print_sep();
+    for (std::size_t r = 0; r < shown_rows; ++r) {
+        fmt::print("|");
+        for (std::size_t c = 0; c < col_count; ++c) {
+            fmt::print(" {:<{}} |", cells[c][r], widths[c]);
+        }
+        fmt::print("\n");
+    }
+    print_sep();
+    if (table.rows() > shown_rows) {
+        fmt::print("... ({} more rows)\n", table.rows() - shown_rows);
+    }
 }
 
 std::string_view ltrim(std::string_view text) {
@@ -2419,6 +2533,45 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             }
             std::size_t count = parse_optional_size(count_text, 10);
             print_table(it->second, count);
+            continue;
+        }
+        if (line_view.starts_with(":peek")) {
+            auto rest = std::string(trim(line_view.substr(std::string_view(":peek").size())));
+            if (rest.empty()) {
+                fmt::print("usage: :peek <expr>\n");
+                continue;
+            }
+            if (auto it = tables.find(rest); it != tables.end()) {
+                peek_table(it->second);
+                continue;
+            }
+            auto normalized = normalize_input(rest);
+            auto parsed = parser::parse(normalized);
+            if (!parsed) {
+                fmt::print("error: {}\n", parsed.error().format());
+                continue;
+            }
+            if (parsed->statements.size() != 1 ||
+                !std::holds_alternative<parser::ExprStmt>(parsed->statements.front())) {
+                fmt::print("error: :peek expects a single expression\n");
+                continue;
+            }
+            auto& expr_stmt = std::get<parser::ExprStmt>(parsed->statements.front());
+            auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, models,
+                                         functions, compile_time_lists, extern_decls, registry);
+            if (!value) {
+                fmt::print("error: {}\n", value.error());
+                continue;
+            }
+            if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+                fmt::print("{}\n", format_scalar(*scalar));
+            } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                runtime::Table temp;
+                temp.add_column("column", *col);
+                peek_table(temp);
+            } else {
+                peek_table(std::get<runtime::Table>(std::move(value.value())));
+            }
             continue;
         }
         if (line_view.starts_with(":describe")) {

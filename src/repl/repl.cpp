@@ -2535,8 +2535,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             print_table(it->second, count);
             continue;
         }
-        if (line_view.starts_with(":peek")) {
-            auto rest = std::string(trim(line_view.substr(std::string_view(":peek").size())));
+        // Accept the obvious typo `:peak` as an alias for `:peek`.
+        const bool is_peek = line_view.starts_with(":peek") &&
+                             (line_view.size() == 5 || line_view[5] == ' ' || line_view[5] == '\t');
+        const bool is_peak = line_view.starts_with(":peak") &&
+                             (line_view.size() == 5 || line_view[5] == ' ' || line_view[5] == '\t');
+        if (is_peek || is_peak) {
+            auto rest = std::string(trim(line_view.substr(5)));
             if (rest.empty()) {
                 fmt::print("usage: :peek <expr>\n");
                 continue;
@@ -2638,6 +2643,19 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 continue;
             }
             report_timing();
+            continue;
+        }
+
+        // Catch typo'd colon commands so the user gets a clear error instead
+        // of falling through to the parser — `:peak trades` would otherwise
+        // surface as `error: 1:1: expected expression`.
+        if (line_view.starts_with(':')) {
+            auto cmd_end = line_view.find_first_of(" \t");
+            auto cmd = cmd_end == std::string_view::npos ? line_view : line_view.substr(0, cmd_end);
+            fmt::print("error: unknown REPL command '{}'\n", cmd);
+            fmt::print(
+                "known: :tables, :scalars, :schema, :head, :peek, :describe, :load, "
+                ":timing, :time, :comments, :quit\n");
             continue;
         }
 

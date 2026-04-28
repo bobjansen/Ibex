@@ -6835,6 +6835,21 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     "window: only 'update' is currently supported inside a window block");
             }
             const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
+            if (!update_node.group_by().empty()) {
+                std::string by_list;
+                for (std::size_t i = 0; i < update_node.group_by().size(); ++i) {
+                    if (i > 0) {
+                        by_list.append(", ");
+                    }
+                    by_list.append(update_node.group_by()[i].name);
+                }
+                return std::unexpected(
+                    "window + update with `by " + by_list +
+                    "` is not yet implemented — the rolling buffer would silently pool across "
+                    "groups, producing wrong results.\n  hint: drop the `by` clause for a "
+                    "single pooled rolling, or split the table per group and run the windowed "
+                    "update on each piece");
+            }
             // Evaluate the source (grandchild) without the window context.
             auto source =
                 interpret_node(*child_node.children().front(), registry, scalars, externs);
@@ -11448,6 +11463,21 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 "window: only 'update' is currently supported inside a window block");
         }
         const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
+        if (!update_node.group_by().empty()) {
+            std::string by_list;
+            for (std::size_t i = 0; i < update_node.group_by().size(); ++i) {
+                if (i > 0) {
+                    by_list.append(", ");
+                }
+                by_list.append(update_node.group_by()[i].name);
+            }
+            return std::unexpected(
+                "window + update with `by " + by_list +
+                "` is not yet implemented — the rolling buffer would silently pool across "
+                "groups, producing wrong results.\n  hint: drop the `by` clause for a "
+                "single pooled rolling, or split the table per group and run the windowed "
+                "update on each piece");
+        }
         if (child_node.children().empty()) {
             return std::unexpected("window: update node missing child");
         }

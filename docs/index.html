@@ -711,7 +711,9 @@ iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
           </p>
           <p>
             This keeps shift-style patterns concise without materializing
-            temporary columns first.
+            temporary columns first. <code>Date - Date</code> returns an
+            integer day delta, so calendar-adjacent filters can combine
+            <code>lag(date_col, 1)</code> with date arithmetic directly.
           </p>
         </div>
         <div class="tour-code">

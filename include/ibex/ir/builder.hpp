@@ -52,6 +52,26 @@ class Builder {
                                           keep_mode);
     }
 
+    [[nodiscard]] auto filter_project(FilterExprPtr predicate, std::vector<ColumnRef> columns)
+        -> NodePtr {
+        return std::make_unique<FilterProjectNode>(next_id(), std::move(predicate),
+                                                   std::move(columns));
+    }
+
+    [[nodiscard]] auto filter_update_project(FilterExprPtr predicate, std::vector<FieldSpec> fields,
+                                             std::vector<ColumnRef> project_columns) -> NodePtr {
+        return std::make_unique<FilterUpdateProjectNode>(
+            next_id(), std::move(predicate), std::move(fields), std::move(project_columns));
+    }
+
+    [[nodiscard]] auto filter_head(FilterExprPtr predicate, std::size_t count) -> NodePtr {
+        return std::make_unique<FilterHeadNode>(next_id(), std::move(predicate), count);
+    }
+
+    [[nodiscard]] auto filter_tail(FilterExprPtr predicate, std::size_t count) -> NodePtr {
+        return std::make_unique<FilterTailNode>(next_id(), std::move(predicate), count);
+    }
+
     [[nodiscard]] auto aggregate(std::vector<ColumnRef> group_by, std::vector<AggSpec> aggregations)
         -> NodePtr {
         return std::make_unique<AggregateNode>(next_id(), std::move(group_by),

@@ -143,6 +143,7 @@ auto collect_scalar_bindings(const ibex::parser::Program& program)
             if (ext->return_type.kind == ibex::parser::Type::Kind::DataFrame ||
                 ext->return_type.kind == ibex::parser::Type::Kind::TimeFrame) {
                 lower_ctx.table_externs.insert(ext->name);
+                lower_ctx.table_extern_decls.insert_or_assign(ext->name, ext);
             }
             if (!ext->params.empty() &&
                 ext->params[0].type.kind == ibex::parser::Type::Kind::DataFrame) {

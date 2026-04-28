@@ -1813,9 +1813,31 @@ class Lowerer {
                 return std::unexpected(
                     LowerError{.message = "named arguments are not supported in filter calls"});
             }
+            // Function-call form for null checks: `is_null(col)` and
+            // `is_not_null(col)`. The postfix forms (`col is null`,
+            // `col is not null`) lower to the same IR via the UnaryExpr path
+            // above; both spellings are accepted because the function-call
+            // form is what users coming from pandas / Polars reach for first.
+            if (call->callee == "is_null" || call->callee == "is_not_null") {
+                if (call->args.size() != 1) {
+                    return std::unexpected(
+                        LowerError{.message = call->callee + ": expected 1 argument"});
+                }
+                auto operand = lower_filter_expr(*call->args[0]);
+                if (!operand.has_value()) {
+                    return std::unexpected(operand.error());
+                }
+                if (call->callee == "is_null") {
+                    return std::make_unique<ir::FilterExpr>(
+                        ir::FilterExpr{ir::FilterIsNull{.operand = std::move(*operand)}});
+                }
+                return std::make_unique<ir::FilterExpr>(
+                    ir::FilterExpr{ir::FilterIsNotNull{.operand = std::move(*operand)}});
+            }
             if (call->callee != "lag" && call->callee != "lead") {
                 return std::unexpected(LowerError{
-                    .message = "unsupported function in filter predicate: " + call->callee});
+                    .message = "unsupported function in filter predicate: " + call->callee +
+                               " (supported: lag, lead, is_null, is_not_null)"});
             }
             ir::FilterCall lowered{.callee = call->callee, .args = {}};
             lowered.args.reserve(call->args.size());

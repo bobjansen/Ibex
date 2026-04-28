@@ -41,6 +41,107 @@ struct KeyEq {
 // Sentinel: SIZE_MAX means "emit a default/null value for this position".
 constexpr std::size_t kNull = SIZE_MAX;
 
+/// Pick a column on `side` that's a plausible time index — first preference
+/// `Timestamp`, then `Date`, then `Int`. Used to make the asof "not a
+/// TimeFrame" error actionable (suggest `as_timeframe(side, "<col>")`).
+auto find_candidate_time_column(const Table& side) -> std::optional<std::string> {
+    std::optional<std::string> ts_match;
+    std::optional<std::string> date_match;
+    std::optional<std::string> int_match;
+    for (const auto& entry : side.columns) {
+        const auto kind = column_kind(*entry.column);
+        if (kind == ExprType::Timestamp && !ts_match.has_value()) {
+            ts_match = entry.name;
+        } else if (kind == ExprType::Date && !date_match.has_value()) {
+            date_match = entry.name;
+        } else if (kind == ExprType::Int && !int_match.has_value()) {
+            int_match = entry.name;
+        }
+    }
+    if (ts_match.has_value()) {
+        return ts_match;
+    }
+    if (date_match.has_value()) {
+        return date_match;
+    }
+    return int_match;
+}
+
+auto format_expr_type(ExprType kind) -> std::string {
+    switch (kind) {
+        case ExprType::Int:
+            return "Int";
+        case ExprType::Double:
+            return "Double";
+        case ExprType::Bool:
+            return "Bool";
+        case ExprType::Date:
+            return "Date";
+        case ExprType::Timestamp:
+            return "Timestamp";
+        case ExprType::String:
+            return "String";
+    }
+    return "?";
+}
+
+auto format_keys(const std::vector<std::string>& keys) -> std::string {
+    if (keys.empty()) {
+        return "<none>";
+    }
+    if (keys.size() == 1) {
+        return keys.front();
+    }
+    std::string out = "{";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i > 0) {
+            out.append(", ");
+        }
+        out.append(keys[i]);
+    }
+    out.push_back('}');
+    return out;
+}
+
+/// Build the "not a TimeFrame" diagnostic. Names which side(s) are bare
+/// DataFrames, lists their columns, and — when there's an obvious time-like
+/// column on a failing side — suggests the precise `as_timeframe(...)` call
+/// that would fix the call site.
+auto asof_not_timeframe_error(const Table& left, const Table& right) -> std::string {
+    const bool left_bad = !left.time_index.has_value();
+    const bool right_bad = !right.time_index.has_value();
+
+    std::string msg = "asof join requires both sides to be TimeFrame";
+    if (left_bad && right_bad) {
+        msg.append("; neither side has been promoted with as_timeframe()");
+    } else if (left_bad) {
+        msg.append("; left side is a DataFrame (right is TimeFrame on '" + *right.time_index +
+                   "')");
+    } else {
+        msg.append("; right side is a DataFrame (left is TimeFrame on '" + *left.time_index + "')");
+    }
+
+    auto add_side_hint = [&](const Table& side, const char* label) {
+        if (side.time_index.has_value()) {
+            return;
+        }
+        msg.append("\n  ");
+        msg.append(label);
+        msg.append(" columns: ");
+        msg.append(format_columns(side));
+        if (auto cand = find_candidate_time_column(side); cand.has_value()) {
+            msg.append("\n  hint: promote it first — let ");
+            msg.append(label);
+            msg.append("_tf = as_timeframe(");
+            msg.append(label);
+            msg.append(", \"" + *cand + "\");");
+        }
+    };
+    add_side_hint(left, "left");
+    add_side_hint(right, "right");
+    return msg;
+}
+
 }  // namespace
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
@@ -49,6 +150,50 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
+    }
+
+    // Asof preconditions run before per-key column validation: a typical
+    // "forgot as_timeframe" mistake produces a Timestamp-vs-Int mismatch on
+    // the time key, but the actionable diagnosis is "promote the other side",
+    // not "your types don't match".
+    std::optional<std::size_t> asof_time_key_pos;
+    if (kind == ir::JoinKind::Asof) {
+        if (!left.time_index.has_value() || !right.time_index.has_value()) {
+            return std::unexpected(asof_not_timeframe_error(left, right));
+        }
+        if (*left.time_index != *right.time_index) {
+            return std::unexpected(
+                "asof join requires both TimeFrames to share the same time index column"
+                "\n  left  time index: '" +
+                *left.time_index + "'\n  right time index: '" + *right.time_index +
+                "'\n  hint: re-promote one side with the matching name, e.g. "
+                "as_timeframe(<table>, \"" +
+                *left.time_index + "\")");
+        }
+        const std::string& time_key = *left.time_index;
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == time_key) {
+                asof_time_key_pos = i;
+                break;
+            }
+        }
+        if (!asof_time_key_pos.has_value()) {
+            std::string suggested;
+            if (keys.empty()) {
+                suggested = time_key;
+            } else {
+                suggested = "{" + time_key;
+                for (const auto& k : keys) {
+                    suggested.append(", ");
+                    suggested.append(k);
+                }
+                suggested.push_back('}');
+            }
+            return std::unexpected("asof join: the 'on' keys must include the time index '" +
+                                   time_key + "'\n  got:  on " + format_keys(keys) +
+                                   "\n  hint: did you mean `... asof join ... on " + suggested +
+                                   "`?");
+        }
     }
 
     std::vector<const ColumnValue*> left_keys;
@@ -71,28 +216,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         left_keys.push_back(left_col);
         right_keys.push_back(right_col);
-    }
-
-    std::optional<std::size_t> asof_time_key_pos;
-    if (kind == ir::JoinKind::Asof) {
-        if (!left.time_index.has_value() || !right.time_index.has_value()) {
-            return std::unexpected("asof join requires both operands to be TimeFrame");
-        }
-        if (*left.time_index != *right.time_index) {
-            return std::unexpected(
-                "asof join requires both TimeFrames to share the same time index column");
-        }
-        const std::string& time_key = *left.time_index;
-        for (std::size_t i = 0; i < keys.size(); ++i) {
-            if (keys[i] == time_key) {
-                asof_time_key_pos = i;
-                break;
-            }
-        }
-        if (!asof_time_key_pos.has_value()) {
-            return std::unexpected("asof join requires the 'on' keys to include the time index '" +
-                                   time_key + "'");
-        }
     }
 
     std::unordered_set<std::string> key_set(keys.begin(), keys.end());
@@ -737,13 +860,20 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return std::nullopt;
         };
 
+        const std::string& time_key = keys[time_pos];
+
+        auto wrong_type_error = [&](const char* label, const ColumnValue& col) {
+            return "asof join: time index column '" + time_key + "' on " + label + " has type " +
+                   format_expr_type(column_kind(col)) +
+                   ", but asof requires Timestamp, Date, or Int";
+        };
+
         std::vector<std::int64_t> left_times;
         left_times.reserve(n_left);
         for (std::size_t l = 0; l < n_left; ++l) {
             auto v = time_value(*left_time_col, l);
             if (!v.has_value()) {
-                return std::unexpected(
-                    "asof join requires a Timestamp/Date/Int time index column in left operand");
+                return std::unexpected(wrong_type_error("left", *left_time_col));
             }
             left_times.push_back(*v);
         }
@@ -753,16 +883,23 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         for (std::size_t r = 0; r < n_right; ++r) {
             auto v = time_value(*right_time_col, r);
             if (!v.has_value()) {
-                return std::unexpected(
-                    "asof join requires a Timestamp/Date/Int time index column in right operand");
+                return std::unexpected(wrong_type_error("right", *right_time_col));
             }
             right_times.push_back(*v);
         }
 
-        if (!std::is_sorted(left_times.begin(), left_times.end()) ||
-            !std::is_sorted(right_times.begin(), right_times.end())) {
+        const bool left_sorted = std::is_sorted(left_times.begin(), left_times.end());
+        const bool right_sorted = std::is_sorted(right_times.begin(), right_times.end());
+        if (!left_sorted || !right_sorted) {
+            const char* which = (!left_sorted && !right_sorted)
+                                    ? "both sides are"
+                                    : (!left_sorted ? "left is" : "right is");
             return std::unexpected(
-                "asof join requires both TimeFrames to be sorted ascending by their time index");
+                std::string("asof join: ") + which + " not sorted ascending by time index '" +
+                time_key +
+                "' — silent look-ahead bias would be the result if this were allowed"
+                "\n  hint: order the offending side first, e.g. `<table>[order " +
+                time_key + "]` before promoting with as_timeframe()");
         }
 
         std::vector<const ColumnValue*> left_eq_keys;

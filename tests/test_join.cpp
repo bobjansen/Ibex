@@ -275,6 +275,95 @@ TEST_CASE("join: asof join requires time index key in on-list", "[join]") {
 
     auto error = interpret_error("lhs asof join rhs on symbol;", tables);
     CHECK(error.find("include the time index") != std::string::npos);
+    // Diagnostic content: name what was provided and suggest the fix.
+    CHECK(error.find("got:  on symbol") != std::string::npos);
+    CHECK(error.find("on {ts, symbol}") != std::string::npos);
+}
+
+TEST_CASE("join: asof error names which side is a DataFrame and suggests as_timeframe",
+          "[join][asof][diagnostic]") {
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{2}});
+    lhs.add_column("symbol", Column<std::string>{"A", "A"});
+    // No time_index — lhs is a DataFrame.
+
+    runtime::Table rhs;
+    rhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
+    rhs.add_column("symbol", Column<std::string>{"A"});
+    rhs.time_index = "ts";
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto error = interpret_error("lhs asof join rhs on {ts, symbol};", tables);
+    CHECK(error.find("requires both sides to be TimeFrame") != std::string::npos);
+    CHECK(error.find("left side is a DataFrame") != std::string::npos);
+    CHECK(error.find("right is TimeFrame on 'ts'") != std::string::npos);
+    // Suggests a concrete fix using the discoverable Timestamp column.
+    CHECK(error.find("as_timeframe(left, \"ts\")") != std::string::npos);
+}
+
+TEST_CASE("join: asof error reports both sides when neither is a TimeFrame",
+          "[join][asof][diagnostic]") {
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
+    lhs.add_column("symbol", Column<std::string>{"A"});
+
+    runtime::Table rhs;
+    rhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
+    rhs.add_column("symbol", Column<std::string>{"A"});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto error = interpret_error("lhs asof join rhs on {ts, symbol};", tables);
+    CHECK(error.find("neither side has been promoted") != std::string::npos);
+    CHECK(error.find("as_timeframe(left, \"ts\")") != std::string::npos);
+    CHECK(error.find("as_timeframe(right, \"ts\")") != std::string::npos);
+}
+
+TEST_CASE("join: asof error names mismatched time indexes", "[join][asof][diagnostic]") {
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
+    lhs.add_column("symbol", Column<std::string>{"A"});
+    lhs.time_index = "ts";
+
+    runtime::Table rhs;
+    rhs.add_column("event_time", Column<Timestamp>{Timestamp{1}});
+    rhs.add_column("symbol", Column<std::string>{"A"});
+    rhs.time_index = "event_time";
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto error = interpret_error("lhs asof join rhs on symbol;", tables);
+    CHECK(error.find("share the same time index") != std::string::npos);
+    CHECK(error.find("left  time index: 'ts'") != std::string::npos);
+    CHECK(error.find("right time index: 'event_time'") != std::string::npos);
+}
+
+TEST_CASE("join: asof error names which side is unsorted", "[join][asof][diagnostic]") {
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<Timestamp>{Timestamp{3}, Timestamp{1}, Timestamp{2}});
+    lhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
+    lhs.time_index = "ts";
+
+    runtime::Table rhs;
+    rhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{2}, Timestamp{3}});
+    rhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
+    rhs.time_index = "ts";
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto error = interpret_error("lhs asof join rhs on {ts, symbol};", tables);
+    CHECK(error.find("left is not sorted ascending") != std::string::npos);
+    CHECK(error.find("look-ahead bias") != std::string::npos);
+    CHECK(error.find("[order ts]") != std::string::npos);
 }
 
 TEST_CASE("join: semi join keeps matching left rows only", "[join]") {

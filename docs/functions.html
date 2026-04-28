@@ -142,6 +142,7 @@
             <tr><td><code>rolling_kurtosis(col)</code></td><td>Rolling sample excess kurtosis.</td></tr>
             <tr><td><code>lag(col, n)</code></td><td>Shift backward by <code>n</code> rows in current row order; <code>n</code> may be an <code>Int64</code> scalar expression.</td></tr>
             <tr><td><code>lead(col, n)</code></td><td>Shift forward by <code>n</code> rows in current row order; <code>n</code> may be an <code>Int64</code> scalar expression.</td></tr>
+            <tr><td><code>Date - Date</code></td><td>Calendar day delta as <code>Int64</code>, useful with <code>lag</code>/<code>lead</code>.</td></tr>
             <tr><td><code>cumsum(col)</code></td><td>Prefix sum, one output per row.</td></tr>
             <tr><td><code>cumprod(col)</code></td><td>Prefix product, one output per row.</td></tr>
           </tbody>

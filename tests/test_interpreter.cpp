@@ -1689,6 +1689,30 @@ TEST_CASE("filter lag offset accepts scalar expression") {
     REQUIRE((*consecutive)[0] == "1");
 }
 
+TEST_CASE("filter supports Date subtraction for lag day deltas") {
+    runtime::Table table;
+    table.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
+    table.add_column("recordDate",
+                     Column<Date>{date_from_ymd(2015, 1, 1), date_from_ymd(2015, 1, 2),
+                                  date_from_ymd(2015, 1, 3), date_from_ymd(2015, 1, 4)});
+    table.add_column("temperature", Column<std::int64_t>{10, 25, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("weather", table);
+
+    auto ir = require_ir(
+        "weather[order recordDate][filter (recordDate - lag(recordDate, 1)) == 1 && temperature > "
+        "lag(temperature, 1), select { Id = id }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* ids = std::get_if<Column<std::int64_t>>(result->find("Id"));
+    REQUIRE(ids != nullptr);
+    REQUIRE((*ids)[0] == 2);
+    REQUIRE((*ids)[1] == 4);
+}
+
 // --- cumsum / cumprod tests ---------------------------------------------------
 
 TEST_CASE("cumsum on Int column produces running sum") {

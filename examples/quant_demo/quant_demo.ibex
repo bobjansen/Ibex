@@ -44,11 +44,20 @@ let bars = tick_stream[resample 1m, by symbol, select {
 //   Every bar gets its symbol's sector and (assumed-stationary) vol regime.
 let enriched = bars asof join reference on {ts, symbol};
 
-// ── 3. Features computed off the closed bar — pure arithmetic, no rolling ──
-let features = enriched[update {
+// ── 3a. Per-symbol rolling features (5-bar window) ─────────────────────────
+//   `update + by symbol + window` partitions the rolling buffer per group, so
+//   AAPL's mean never includes NVDA bars. (Implemented 2026-04-28; before
+//   that the rolling pooled across groups.)
+let with_rolling = enriched[window 5m, by symbol, update {
+    rmean5 = rolling_mean(close)
+}];
+
+// ── 3b. Bar-level features built on top of the rolling state ────────────────
+let features = with_rolling[update {
     spread     = high - low,
     range      = (high - low) / open,
     mid        = (high + low) / 2.0,
+    z5         = (close - rmean5) / (rmean5 + 0.0001),
     next_close = lead(close, 1)
 }];
 
@@ -56,7 +65,7 @@ let features = enriched[update {
 //   `lead(close, 1)` returns 0 for the last bar per symbol; drop those rows so
 //   the fit matches what a `shift(-1) → drop_nulls` step would do in Polars.
 let labelled = features[filter next_close > 0.0];
-let fit = labelled[model { next_close ~ open + range + mid + vol_regime,
+let fit = labelled[model { next_close ~ open + range + mid + z5 + vol_regime,
                             method = ridge,
                             lambda = 0.1 }];
 

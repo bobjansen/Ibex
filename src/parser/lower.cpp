@@ -311,6 +311,24 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             }
             return names;
         }
+        case NodeKind::FilterProject: {
+            const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+            std::vector<std::string> names;
+            names.reserve(fp.columns().size());
+            for (const auto& col : fp.columns()) {
+                names.push_back(col.name);
+            }
+            return names;
+        }
+        case NodeKind::FilterUpdateProject: {
+            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+            std::vector<std::string> names;
+            names.reserve(fup.project_columns().size());
+            for (const auto& col : fup.project_columns()) {
+                names.push_back(col.name);
+            }
+            return names;
+        }
         case NodeKind::Resample: {
             const auto& rs = static_cast<const ir::ResampleNode&>(node);
             std::vector<std::string> names;
@@ -330,6 +348,9 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
         case NodeKind::Order:
         case NodeKind::Head:
         case NodeKind::Tail:
+        case NodeKind::FilterHead:
+        case NodeKind::FilterTail:
+        case NodeKind::TopK:
         case NodeKind::Window: {
             if (node.children().empty()) {
                 return std::nullopt;
@@ -718,11 +739,13 @@ class Lowerer {
         std::unordered_map<std::string, ir::NodePtr>* bindings,
         std::unordered_map<std::string, std::vector<std::string>> initial_compile_time_lists = {},
         std::unordered_set<std::string> initial_table_externs = {},
-        std::unordered_set<std::string> initial_sink_externs = {})
+        std::unordered_set<std::string> initial_sink_externs = {},
+        std::unordered_map<std::string, const ExternDecl*> initial_table_extern_decls = {})
         : bindings_(bindings),
           compile_time_lists_(std::move(initial_compile_time_lists)),
           table_externs_(std::move(initial_table_externs)),
-          sink_externs_(std::move(initial_sink_externs)) {}
+          sink_externs_(std::move(initial_sink_externs)),
+          table_extern_decls_(std::move(initial_table_extern_decls)) {}
 
     auto lower_program(const Program& program) -> LowerResult {
         ir::NodePtr last_expr;
@@ -750,6 +773,7 @@ class Lowerer {
                 if (ext->return_type.kind == Type::Kind::DataFrame ||
                     ext->return_type.kind == Type::Kind::TimeFrame) {
                     table_externs_.insert(ext->name);
+                    table_extern_decls_.insert_or_assign(ext->name, ext);
                 }
                 // Track externs whose first argument is a DataFrame — these are sink candidates
                 // (e.g. write_csv, udp_send).  lower_stream uses this to validate sink calls.
@@ -1000,9 +1024,13 @@ class Lowerer {
         if (!table_externs_.contains(call.callee)) {
             return std::unexpected(LowerError{.message = "unknown table function: " + call.callee});
         }
+        auto bound_args = bind_extern_call_args(call);
+        if (!bound_args.has_value()) {
+            return std::unexpected(std::move(bound_args.error()));
+        }
         std::vector<ir::Expr> args;
-        args.reserve(call.args.size());
-        for (const auto& arg : call.args) {
+        args.reserve(bound_args->size());
+        for (const auto* arg : *bound_args) {
             auto expr = lower_expr_to_ir(*arg);
             if (!expr.has_value()) {
                 return std::unexpected(expr.error());
@@ -1010,6 +1038,65 @@ class Lowerer {
             args.push_back(std::move(expr.value()));
         }
         return builder_.extern_call(call.callee, std::move(args));
+    }
+
+    auto bind_extern_call_args(const CallExpr& call)
+        -> std::expected<std::vector<const Expr*>, LowerError> {
+        const auto decl_it = table_extern_decls_.find(call.callee);
+        if (decl_it == table_extern_decls_.end()) {
+            if (!call.named_args.empty()) {
+                return std::unexpected(LowerError{
+                    .message = call.callee + ": named arguments require an extern declaration"});
+            }
+            std::vector<const Expr*> positional;
+            positional.reserve(call.args.size());
+            for (const auto& arg : call.args) {
+                positional.push_back(arg.get());
+            }
+            return positional;
+        }
+
+        const auto& params = decl_it->second->params;
+        std::vector<const Expr*> bound(params.size(), nullptr);
+        std::unordered_map<std::string, std::size_t> param_index;
+        param_index.reserve(params.size());
+        for (std::size_t i = 0; i < params.size(); ++i) {
+            param_index.emplace(params[i].name, i);
+        }
+
+        if (call.args.size() > params.size()) {
+            return std::unexpected(
+                LowerError{.message = call.callee + ": too many positional arguments"});
+        }
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            bound[i] = call.args[i].get();
+        }
+        for (const auto& named_arg : call.named_args) {
+            const auto it = param_index.find(named_arg.name);
+            if (it == param_index.end()) {
+                return std::unexpected(LowerError{
+                    .message = call.callee + ": unknown named argument '" + named_arg.name + "'"});
+            }
+            auto& slot = bound[it->second];
+            if (slot != nullptr) {
+                return std::unexpected(
+                    LowerError{.message = call.callee + ": duplicate argument for parameter '" +
+                                          params[it->second].name + "'"});
+            }
+            slot = named_arg.value.get();
+        }
+        for (std::size_t i = 0; i < params.size(); ++i) {
+            if (bound[i] != nullptr) {
+                continue;
+            }
+            if (params[i].default_value != nullptr) {
+                bound[i] = params[i].default_value.get();
+                continue;
+            }
+            return std::unexpected(LowerError{
+                .message = call.callee + ": missing required argument '" + params[i].name + "'"});
+        }
+        return bound;
     }
 
     auto lower_identifier(const IdentifierExpr& ident) -> LowerResult {
@@ -3059,6 +3146,33 @@ class Lowerer {
                 clone = builder_.program(std::move(preamble), clone_node(prog.main_node()));
                 break;
             }
+            case ir::NodeKind::FilterProject: {
+                const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+                clone = builder_.filter_project(clone_filter_expr(fp.predicate()), fp.columns());
+                break;
+            }
+            case ir::NodeKind::FilterUpdateProject: {
+                const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+                clone = builder_.filter_update_project(clone_filter_expr(fup.predicate()),
+                                                       fup.fields(), fup.project_columns());
+                break;
+            }
+            case ir::NodeKind::FilterHead: {
+                const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+                clone = builder_.filter_head(clone_filter_expr(fh.predicate()), fh.count());
+                break;
+            }
+            case ir::NodeKind::FilterTail: {
+                const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+                clone = builder_.filter_tail(clone_filter_expr(ft.predicate()), ft.count());
+                break;
+            }
+            case ir::NodeKind::TopK: {
+                const auto& topk = static_cast<const ir::TopKNode&>(node);
+                clone =
+                    builder_.top_k(topk.keys(), topk.count(), topk.group_by(), topk.keep_mode());
+                break;
+            }
         }
 
         if (!clone) {
@@ -3178,6 +3292,7 @@ class Lowerer {
     std::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     std::unordered_set<std::string> table_externs_;
     std::unordered_set<std::string> sink_externs_;
+    std::unordered_map<std::string, const ExternDecl*> table_extern_decls_;
 };
 
 }  // namespace
@@ -3204,7 +3319,7 @@ auto lower(const Program& program) -> LowerResult {
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,
-                    context.sink_externs);
+                    context.sink_externs, context.table_extern_decls);
     return lowerer.lower_expression(expr);
 }
 

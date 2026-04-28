@@ -23,6 +23,9 @@ struct LowerContext {
     /// Populate before calling lower_expr so that tuple-LHS RHS expressions
     /// that call table-returning externs are lowered correctly.
     std::unordered_set<std::string> table_externs;
+    /// Optional declarations for table-returning externs. When present, named
+    /// arguments and defaults are bound before lowering to ExternCall IR.
+    std::unordered_map<std::string, const ExternDecl*> table_extern_decls;
     /// Names of extern functions whose first argument is a DataFrame.
     /// Populate before calling lower_expr so Stream sink calls can be validated.
     std::unordered_set<std::string> sink_externs;

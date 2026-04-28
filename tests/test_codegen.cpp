@@ -1,6 +1,8 @@
 #include <ibex/codegen/emitter.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/parser/lower.hpp>
+#include <ibex/parser/parser.hpp>
 #include <ibex/runtime/ops.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -46,6 +48,28 @@ TEST_CASE("emitter: extern call node", "[codegen]") {
     CHECK(contains(out, "read_csv(\"trades.csv\")"));
     CHECK(contains(out, "ibex::ops::print("));
     CHECK(contains(out, "return 0;"));
+}
+
+TEST_CASE("lower/codegen: table extern named args are bound before emission", "[codegen]") {
+    const char* src = R"(
+extern fn read_csv(
+    path: String,
+    nulls: String = "",
+    delimiter: String = ",",
+    has_header: Bool = true,
+    schema: String = ""
+) -> DataFrame from "csv.hpp";
+
+read_csv("employees.csv", nulls = "<empty>", schema = "id:int,name:str");
+)";
+
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+
+    auto out = emit_to_string(**lowered);
+    CHECK(contains(out, R"(read_csv("employees.csv", "<empty>", ",", 1, "id:int,name:str"))"));
 }
 
 // --- Filter ------------------------------------------------------------------

@@ -1622,6 +1622,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (decl.return_type.kind == parser::Type::Kind::DataFrame ||
             decl.return_type.kind == parser::Type::Kind::TimeFrame) {
             context.table_externs.insert(name);
+            context.table_extern_decls.insert_or_assign(name, &decl);
         }
         if (!decl.params.empty() && decl.params[0].type.kind == parser::Type::Kind::DataFrame) {
             context.sink_externs.insert(name);

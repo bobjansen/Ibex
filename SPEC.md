@@ -247,6 +247,10 @@ precision.
 Non-associative operators cannot be chained: `a < b < c` is a parse error.
 Use `a < b && b < c`.
 
+Arithmetic operators are defined for numeric operands. `Date - Date` is also
+defined and returns an `Int64` day delta, which is useful with `lag`/`lead` for
+calendar-adjacent row checks.
+
 **Unary prefix (highest precedence among operators):**
 
 | Operator | Meaning              |

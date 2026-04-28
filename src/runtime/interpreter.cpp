@@ -327,6 +327,19 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& r
             return ColumnValue{std::move(out)};
         }
     }
+    if (op == ir::ArithmeticOp::Sub) {
+        if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
+            if (const auto* r = std::get_if<Column<Date>>(&rhs)) {
+                Column<std::int64_t> out;
+                out.resize(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    out[i] = static_cast<std::int64_t>((*l)[i].days) -
+                             static_cast<std::int64_t>((*r)[i].days);
+                }
+                return ColumnValue{std::move(out)};
+            }
+        }
+    }
     return std::unexpected("filter: arithmetic on string column");
 }
 

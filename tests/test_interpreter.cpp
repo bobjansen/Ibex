@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <limits>
+#include <map>
 #include <sstream>
 
 namespace {
@@ -1837,28 +1838,48 @@ TEST_CASE("rolling_sum outside window clause returns error") {
     REQUIRE(result.error().find("requires a window clause") != std::string::npos);
 }
 
-TEST_CASE("windowed update + by rejects loudly until grouped rolling lands",
-          "[interpreter][window][grouped]") {
-    // Until per-group windowed rolling is implemented, the runtime would
-    // silently pool the rolling buffer across groups. Reject the combination
-    // with an actionable error so users don't get wrong results.
+TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][grouped]") {
+    // Symbol A: ts = {1,2,3} val = {10,20,30}; window 1ns -> mean = {10, 15, 25}
+    // Symbol B: ts = {1,2,3} val = {100,200,300}; window 1ns -> mean = {100, 150, 250}
+    // Rows are interleaved in the time-sorted output (A, B, A, B, A, B).
     runtime::Table table;
-    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
-                                             ts_from_nanos(3)});
-    table.add_column("symbol", Column<std::string>{"A", "A", "B", "B"});
-    table.add_column("val", Column<double>{10.0, 20.0, 100.0, 200.0});
-    table.time_index = "ts";
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3),
+                                             ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3)});
+    table.add_column("symbol", Column<std::string>{"A", "A", "A", "B", "B", "B"});
+    table.add_column("val", Column<double>{10.0, 20.0, 30.0, 100.0, 200.0, 300.0});
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 1ns, by symbol, update { m = rolling_mean(val) }];");
+    auto ir = require_ir(
+        "as_timeframe(data, \"ts\")[window 1ns, by symbol, "
+        "update { m = rolling_mean(val), n = rolling_count() }];");
     auto result = runtime::interpret(*ir, registry);
-    REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().find("not yet implemented") != std::string::npos);
-    CHECK(result.error().find("by symbol") != std::string::npos);
-    CHECK(result.error().find("silently pool") != std::string::npos);
-    CHECK(result.error().find("hint:") != std::string::npos);
+    REQUIRE(result.has_value());
+
+    const auto* symbol_col = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* mean_col = std::get_if<Column<double>>(result->find("m"));
+    const auto* count_col = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(symbol_col != nullptr);
+    REQUIRE(mean_col != nullptr);
+    REQUIRE(count_col != nullptr);
+    REQUIRE(mean_col->size() == 6);
+
+    std::map<std::string, std::vector<double>> expected_means = {
+        {"A", {10.0, 15.0, 25.0}},
+        {"B", {100.0, 150.0, 250.0}},
+    };
+    std::map<std::string, std::vector<std::int64_t>> expected_counts = {
+        {"A", {1, 2, 2}},
+        {"B", {1, 2, 2}},
+    };
+    std::map<std::string, std::size_t> seen;
+    for (std::size_t r = 0; r < mean_col->size(); ++r) {
+        std::string sym{(*symbol_col)[r]};
+        std::size_t i = seen[sym]++;
+        CHECK((*mean_col)[r] == Catch::Approx(expected_means.at(sym).at(i)));
+        CHECK((*count_col)[r] == expected_counts.at(sym).at(i));
+    }
 }
 
 // --- rolling aggregate tests --------------------------------------------------

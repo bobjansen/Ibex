@@ -81,8 +81,7 @@ construction, not by convention.
   scikit-learn's `Ridge(alpha=0.1)` parameterise the L2 penalty differently
   and standardise features differently. Both fits are internally consistent;
   the demo is about pipeline shape, not coefficient reproducibility.
-- Per-symbol rolling features (`rolling_mean over by symbol` inside an
-  update + window block) aren't implemented yet — the demo uses bar-level
-  features instead. Once the runtime grows grouped rolling, the natural
-  next step is a per-symbol z-score column added with one extra `update`
-  line.
+- The demo includes a per-symbol rolling z-score (`z5 = (close - rmean5) /
+  (rmean5 + 1e-4)`) as one of the ridge features. The `[window 5m, by symbol,
+  update { ... }]` clause runs a 5-minute rolling mean partitioned per
+  symbol — AAPL's mean never includes NVDA bars. Implemented 2026-04-28.

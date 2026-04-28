@@ -6388,6 +6388,187 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     return output;
 }
 
+/// Per-group windowed update: partition the input by `group_by`, run the
+/// regular `windowed_update_table` on each per-group slice, then scatter the
+/// new field columns back into a single full-sized output. The rolling
+/// buffer therefore never crosses group boundaries.
+///
+/// Input rows are assumed time-sorted globally (precondition of TimeFrame),
+/// which means within each group the sub-table is also time-sorted.
+auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
+                                   ir::Duration duration,
+                                   const std::vector<ir::ColumnRef>& group_by,
+                                   const ScalarRegistry* scalars, const ExternRegistry* externs)
+    -> std::expected<Table, std::string> {
+    if (group_by.empty()) {
+        return windowed_update_table(std::move(input), fields, duration, scalars, externs);
+    }
+    if (!input.time_index.has_value()) {
+        return std::unexpected("window: requires a TimeFrame");
+    }
+    for (const auto& field : fields) {
+        if (field.alias == *input.time_index) {
+            return std::unexpected("cannot update time index column: " + field.alias);
+        }
+    }
+
+    std::vector<const ColumnValue*> group_columns;
+    group_columns.reserve(group_by.size());
+    for (const auto& key : group_by) {
+        const auto* col = input.find(key.name);
+        if (col == nullptr) {
+            return std::unexpected("window + by: unknown group key '" + key.name +
+                                   "' (available: " + format_columns(input) + ")");
+        }
+        group_columns.push_back(col);
+    }
+
+    const std::size_t rows = input.rows();
+    if (rows == 0) {
+        return windowed_update_table(std::move(input), fields, duration, scalars, externs);
+    }
+
+    // Bucket rows by group key — the row indices land in original
+    // (time-sorted) order within each group, which is the precondition the
+    // single-buffer rolling implementation relies on.
+    robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+    std::vector<std::vector<std::size_t>> group_rows;
+    for (std::size_t r = 0; r < rows; ++r) {
+        Key key;
+        key.values.reserve(group_columns.size());
+        for (const auto* col : group_columns) {
+            key.values.push_back(scalar_from_column(*col, r));
+        }
+        auto [it, inserted] =
+            group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));
+        if (inserted) {
+            group_rows.emplace_back();
+        }
+        group_rows[it->second].push_back(r);
+    }
+
+    auto run_group =
+        [&](const std::vector<std::size_t>& row_idx) -> std::expected<Table, std::string> {
+        Table sub;
+        for (const auto& entry : input.columns) {
+            ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
+            sub.add_column(entry.name, std::move(gathered));
+        }
+        sub.time_index = input.time_index;
+        return windowed_update_table(std::move(sub), fields, duration, scalars, externs);
+    };
+
+    // Run the first group to learn the new field column types/names.
+    auto first = run_group(group_rows[0]);
+    if (!first.has_value()) {
+        return std::unexpected(first.error());
+    }
+    const std::size_t first_new_idx = input.columns.size();
+    if (first->columns.size() <= first_new_idx) {
+        return std::unexpected("window: grouped update produced no new columns");
+    }
+    std::vector<std::string> new_field_names;
+    new_field_names.reserve(first->columns.size() - first_new_idx);
+    for (std::size_t c = first_new_idx; c < first->columns.size(); ++c) {
+        new_field_names.push_back(first->columns[c].name);
+    }
+
+    // Allocate output's new columns at full size, with the same types as the
+    // first sub-result. Strings/categoricals would need a different scatter
+    // strategy (per-row write isn't free for flat-buffer strings); rolling /
+    // lag / fill ops produce numeric columns in practice, so reject the
+    // string/categorical case explicitly until that's needed.
+    Table output = input;
+    auto allocate_full = [&](const ColumnValue& sample) -> std::expected<ColumnValue, std::string> {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<std::string>> ||
+                              std::is_same_v<ColT, Column<Categorical>>) {
+                    return std::unexpected(
+                        "window + by: scatter of string/Categorical results not yet implemented");
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    ColT out;
+                    out.resize(rows);
+                    return ColumnValue{std::move(out)};
+                } else {
+                    ColT out;
+                    out.resize(rows);
+                    return ColumnValue{std::move(out)};
+                }
+            },
+            sample);
+    };
+    for (const auto& fname : new_field_names) {
+        const auto* sample = first->find(fname);
+        if (sample == nullptr) {
+            return std::unexpected("window: missing new column '" + fname + "' in sub-result");
+        }
+        auto full = allocate_full(*sample);
+        if (!full.has_value()) {
+            return std::unexpected(full.error());
+        }
+        output.add_column(fname, std::move(full.value()));
+    }
+
+    auto scatter_into = [](ColumnValue& dst, const ColumnValue& src,
+                           const std::vector<std::size_t>& indices) -> std::optional<std::string> {
+        return std::visit(
+            [&](auto& dcol) -> std::optional<std::string> {
+                using DT = std::decay_t<decltype(dcol)>;
+                const DT* scol = std::get_if<DT>(&src);
+                if (scol == nullptr) {
+                    return "window: type mismatch in grouped scatter";
+                }
+                if constexpr (std::is_same_v<DT, Column<std::string>> ||
+                              std::is_same_v<DT, Column<Categorical>>) {
+                    return "window: scatter for string/Categorical not implemented";
+                } else if constexpr (std::is_same_v<DT, Column<bool>>) {
+                    for (std::size_t i = 0; i < indices.size(); ++i) {
+                        dcol.set(indices[i], (*scol)[i]);
+                    }
+                } else {
+                    auto* dp = dcol.data();
+                    const auto* sp = scol->data();
+                    for (std::size_t i = 0; i < indices.size(); ++i) {
+                        dp[indices[i]] = sp[i];
+                    }
+                }
+                return std::nullopt;
+            },
+            dst);
+    };
+
+    for (const auto& fname : new_field_names) {
+        auto* dst = output.find(fname);
+        const auto* src = first->find(fname);
+        if (auto err = scatter_into(*dst, *src, group_rows[0])) {
+            return std::unexpected(*err);
+        }
+    }
+
+    for (std::size_t g = 1; g < group_rows.size(); ++g) {
+        auto sub = run_group(group_rows[g]);
+        if (!sub.has_value()) {
+            return std::unexpected(sub.error());
+        }
+        for (const auto& fname : new_field_names) {
+            auto* dst = output.find(fname);
+            const auto* src = sub->find(fname);
+            if (src == nullptr) {
+                return std::unexpected("window: missing column '" + fname +
+                                       "' in grouped sub-result");
+            }
+            if (auto err = scatter_into(*dst, *src, group_rows[g])) {
+                return std::unexpected(*err);
+            }
+        }
+    }
+
+    normalize_time_index(output);
+    return output;
+}
+
 auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<Table, std::string> {
@@ -6835,21 +7016,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     "window: only 'update' is currently supported inside a window block");
             }
             const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
-            if (!update_node.group_by().empty()) {
-                std::string by_list;
-                for (std::size_t i = 0; i < update_node.group_by().size(); ++i) {
-                    if (i > 0) {
-                        by_list.append(", ");
-                    }
-                    by_list.append(update_node.group_by()[i].name);
-                }
-                return std::unexpected(
-                    "window + update with `by " + by_list +
-                    "` is not yet implemented — the rolling buffer would silently pool across "
-                    "groups, producing wrong results.\n  hint: drop the `by` clause for a "
-                    "single pooled rolling, or split the table per group and run the windowed "
-                    "update on each piece");
-            }
             // Evaluate the source (grandchild) without the window context.
             auto source =
                 interpret_node(*child_node.children().front(), registry, scalars, externs);
@@ -6860,6 +7026,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(
                     "window requires a TimeFrame — use as_timeframe() to designate a timestamp "
                     "column");
+            }
+            if (!update_node.group_by().empty()) {
+                return grouped_windowed_update_table(std::move(source.value()),
+                                                     update_node.fields(), win.duration(),
+                                                     update_node.group_by(), scalars, externs);
             }
             return windowed_update_table(std::move(source.value()), update_node.fields(),
                                          win.duration(), scalars, externs);
@@ -11463,21 +11634,6 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 "window: only 'update' is currently supported inside a window block");
         }
         const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
-        if (!update_node.group_by().empty()) {
-            std::string by_list;
-            for (std::size_t i = 0; i < update_node.group_by().size(); ++i) {
-                if (i > 0) {
-                    by_list.append(", ");
-                }
-                by_list.append(update_node.group_by()[i].name);
-            }
-            return std::unexpected(
-                "window + update with `by " + by_list +
-                "` is not yet implemented — the rolling buffer would silently pool across "
-                "groups, producing wrong results.\n  hint: drop the `by` clause for a "
-                "single pooled rolling, or split the table per group and run the windowed "
-                "update on each piece");
-        }
         if (child_node.children().empty()) {
             return std::unexpected("window: update node missing child");
         }
@@ -11494,8 +11650,12 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected(
                 "window requires a TimeFrame — use as_timeframe() to designate a timestamp column");
         }
-        auto result = windowed_update_table(std::move(source.value()), update_node.fields(),
-                                            win.duration(), scalars, externs);
+        auto result = update_node.group_by().empty()
+                          ? windowed_update_table(std::move(source.value()), update_node.fields(),
+                                                  win.duration(), scalars, externs)
+                          : grouped_windowed_update_table(std::move(source.value()),
+                                                          update_node.fields(), win.duration(),
+                                                          update_node.group_by(), scalars, externs);
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));
         }

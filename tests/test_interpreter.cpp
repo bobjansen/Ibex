@@ -1837,6 +1837,30 @@ TEST_CASE("rolling_sum outside window clause returns error") {
     REQUIRE(result.error().find("requires a window clause") != std::string::npos);
 }
 
+TEST_CASE("windowed update + by rejects loudly until grouped rolling lands",
+          "[interpreter][window][grouped]") {
+    // Until per-group windowed rolling is implemented, the runtime would
+    // silently pool the rolling buffer across groups. Reject the combination
+    // with an actionable error so users don't get wrong results.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("symbol", Column<std::string>{"A", "A", "B", "B"});
+    table.add_column("val", Column<double>{10.0, 20.0, 100.0, 200.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1ns, by symbol, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("not yet implemented") != std::string::npos);
+    CHECK(result.error().find("by symbol") != std::string::npos);
+    CHECK(result.error().find("silently pool") != std::string::npos);
+    CHECK(result.error().find("hint:") != std::string::npos);
+}
+
 // --- rolling aggregate tests --------------------------------------------------
 // Timestamps: 0ns, 1ns, 2ns  Values: 10, 20, 30
 // Window 1ns: [t-1, t]

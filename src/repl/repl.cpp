@@ -697,6 +697,22 @@ auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType exp
     return false;
 }
 
+/// Widen an integer scalar to Float when a let binding (or function argument)
+/// declares a Float type. Avoids the `let x: Float64 = Float64(42)` ceremony
+/// that nothing in the language gains from. This is the only implicit
+/// conversion accepted; other type mismatches still error.
+auto try_widen_int_to_float(runtime::ScalarValue& val, parser::ScalarType expected) -> bool {
+    if (expected != parser::ScalarType::Float32 && expected != parser::ScalarType::Float64) {
+        return false;
+    }
+    const auto* iv = std::get_if<std::int64_t>(&val);
+    if (iv == nullptr) {
+        return false;
+    }
+    val = static_cast<double>(*iv);
+    return true;
+}
+
 auto column_type_matches(const runtime::ColumnValue& col, parser::ScalarType expected) -> bool {
     switch (expected) {
         case parser::ScalarType::Int32:
@@ -1793,6 +1809,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     return std::unexpected(value.error());
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&param.type.arg);
+                if (st != nullptr) {
+                    try_widen_int_to_float(value.value(), *st);
+                }
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
                     return std::unexpected("type mismatch for parameter '" + param.name +
                                            "': expected " + std::string(scalar_type_name(*st)) +
@@ -1863,6 +1882,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     return std::unexpected(value.error());
                 }
                 const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
+                if (st != nullptr) {
+                    try_widen_int_to_float(value.value(), *st);
+                }
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
                     return std::unexpected("type error: '" + let_stmt.name + "' declared as " +
                                            std::string(scalar_type_name(*st)) + " but value is " +
@@ -2220,6 +2242,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         return false;
                     }
                     const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
+                    if (st != nullptr) {
+                        try_widen_int_to_float(value.value(), *st);
+                    }
                     if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
                         fmt::print("error: '{}' declared as {} but value is {}\n", let_stmt.name,
                                    scalar_type_name(*st), scalar_value_type_name(value.value()));

@@ -2591,6 +2591,51 @@ TEST_CASE("null 3vl: IS NULL predicate keeps null rows", "[null][3vl]") {
     CHECK(id_col[0] == 2);
 }
 
+TEST_CASE("null 3vl: is_null(col) function-call form is accepted in filter",
+          "[null][3vl][filter]") {
+    // Same shape as the postfix `is null` test, but using the pandas/Polars
+    // function-call spelling that users coming from those tools reach for.
+    runtime::Table left, right;
+    left.add_column("id", Column<std::int64_t>{1, 2, 3});
+
+    right.add_column("id", Column<std::int64_t>{1, 3});
+    right.add_column("sector", Column<std::string>{"Tech", "Finance"});
+
+    auto joined = runtime::join_tables(left, right, ir::JoinKind::Left, {"id"});
+    REQUIRE(joined.has_value());
+
+    runtime::TableRegistry registry;
+    registry.emplace("j", *joined);
+
+    SECTION("is_null(col) keeps the unmatched row") {
+        auto ir = require_ir("j[filter is_null(sector)];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->rows() == 1);
+        const auto& id_col =
+            std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
+        CHECK(id_col[0] == 2);
+    }
+
+    SECTION("!is_null(col) keeps the matched rows") {
+        auto ir = require_ir("j[filter !is_null(sector)];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->rows() == 2);
+        const auto& id_col =
+            std::get<Column<std::int64_t>>(*result->columns[result->index.at("id")].column);
+        CHECK(id_col[0] == 1);
+        CHECK(id_col[1] == 3);
+    }
+
+    SECTION("is_not_null(col) is the same as !is_null(col)") {
+        auto ir = require_ir("j[filter is_not_null(sector)];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->rows() == 2);
+    }
+}
+
 TEST_CASE("null 3vl: IS NOT NULL predicate keeps valid rows", "[null][3vl]") {
     runtime::Table left, right;
     left.add_column("id", Column<std::int64_t>{1, 2, 3});

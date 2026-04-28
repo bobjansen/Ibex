@@ -57,6 +57,27 @@ TEST_CASE("REPL accepts scalar expression statements") {
     REQUIRE(ibex::repl::execute_script("1+1;", registry));
 }
 
+TEST_CASE("REPL: integer literal widens to Float64 in let binding", "[repl][coerce]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Float64 = 42; x + 0.5;", registry));
+}
+
+TEST_CASE("REPL: integer literal widens to Float32 in let binding", "[repl][coerce]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let x: Float32 = 7; x;", registry));
+}
+
+TEST_CASE("REPL: float literal does NOT silently narrow to Int", "[repl][coerce]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let x: Int64 = 3.14;", registry));
+}
+
+TEST_CASE("REPL: integer literal does NOT auto-coerce to Bool or String", "[repl][coerce]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("let b: Bool = 1;", registry));
+    REQUIRE_FALSE(ibex::repl::execute_script("let s: String = 5;", registry));
+}
+
 TEST_CASE("REPL executes multi-statement script with chained let bindings") {
     ibex::runtime::TableRegistry tables;
     ibex::runtime::Table t;
@@ -368,9 +389,11 @@ TEST_CASE("type annotation: Float64 let binding accepts float literal") {
     REQUIRE(ibex::repl::execute_script("let x: Float64 = 3.0;", registry));
 }
 
-TEST_CASE("type annotation: Float64 let binding rejects int literal") {
+TEST_CASE("type annotation: Float64 let binding widens int literal") {
+    // Implicit Int → Float widening on let-binding values: this is the only
+    // automatic numeric coercion we accept. Float → Int still errors.
     ibex::runtime::ExternRegistry registry;
-    REQUIRE_FALSE(ibex::repl::execute_script("let x: Float64 = 3;", registry));
+    REQUIRE(ibex::repl::execute_script("let x: Float64 = 3; x + 0.5;", registry));
 }
 
 TEST_CASE("type annotation: untyped let binding accepts either scalar") {
@@ -390,7 +413,9 @@ f(3.0);
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
-TEST_CASE("type annotation: function call rejects Int where Float64 expected") {
+TEST_CASE("type annotation: function call widens Int argument when Float64 expected") {
+    // Symmetric with the let-binding widening: passing 3 to f(x: Float64)
+    // should not require f(Float64(3)) at the call site.
     ibex::runtime::ExternRegistry registry;
     const char* src = R"(
 fn f(x: Float64) -> Float64 {
@@ -398,7 +423,7 @@ fn f(x: Float64) -> Float64 {
 }
 f(3);
 )";
-    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+    REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
 TEST_CASE("type annotation: function call accepts matching Int64 argument") {

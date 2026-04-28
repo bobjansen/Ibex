@@ -1,0 +1,5 @@
+data/ticks.csv
+data/reference.csv
+data/coefficients*.csv
+data/features*.csv
+data/predictions*.csv

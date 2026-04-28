@@ -1,0 +1,73 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex Quant Demo · Batch
+//
+//  Pipeline:
+//    ticks.csv  ─┐
+//                ├─► resample 1m by symbol  (OHLC bars + size aggregates)
+//                ├─► asof-join reference    (sector / vol_regime per symbol)
+//                ├─► feature engineering    (spread, range, log-mid)
+//                ├─► fit ridge regression   (close ~ open + range + vol_regime)
+//                └─► save coefficients + fitted predictions to CSV
+//
+//  The same `transform` block (resample + asof + features) is reused in
+//  quant_demo_stream.ibex. Only the source and sink change for streaming —
+//  the feature engineering is identical, eliminating the train/serve skew that
+//  separate batch and live pipelines accumulate over time.
+//
+//  Run:
+//    python3 examples/quant_demo/gen_data.py
+//    ./build-release/tools/ibex --plugin-path build-release/tools \
+//        examples/quant_demo/quant_demo.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "csv";
+
+let ticks = read_csv("examples/quant_demo/data/ticks.csv");
+let reference_raw = read_csv("examples/quant_demo/data/reference.csv");
+
+// Promote both to TimeFrames so the asof join is type-checked.
+let tick_stream = as_timeframe(ticks, "ts");
+let reference  = as_timeframe(reference_raw, "ts");
+
+// ── 1. Resample ticks to 1-minute OHLC + traded size ────────────────────────
+//   The same expression runs in the streaming variant; resample triggers the
+//   TimeBucket stream kind that emits one row per closed minute.
+let bars = tick_stream[resample 1m, by symbol, select {
+    open  = first(price),
+    high  = max(price),
+    low   = min(price),
+    close = last(price),
+    bar_size = sum(size)
+}];
+
+// ── 2. Asof-join the per-symbol reference table ─────────────────────────────
+//   Every bar gets its symbol's sector and (assumed-stationary) vol regime.
+let enriched = bars asof join reference on {ts, symbol};
+
+// ── 3. Features computed off the closed bar — pure arithmetic, no rolling ──
+let features = enriched[update {
+    spread     = high - low,
+    range      = (high - low) / open,
+    mid        = (high + low) / 2.0,
+    next_close = lead(close, 1)
+}];
+
+// ── 4. Train: fit a ridge regression of close on the bar features ──────────
+//   `lead(close, 1)` returns 0 for the last bar per symbol; drop those rows so
+//   the fit matches what a `shift(-1) → drop_nulls` step would do in Polars.
+let labelled = features[filter next_close > 0.0];
+let fit = labelled[model { next_close ~ open + range + mid + vol_regime,
+                            method = ridge,
+                            lambda = 0.1 }];
+
+let coefficients = model_coef(fit);
+coefficients;
+
+// ── 5. Score: persist features + fitted predictions in row order ───────────
+//    (Reattaching prediction values per-row is a one-liner once Ibex grows
+//    horizontal concat; today we hand the consumer the row-aligned pair.)
+let predictions = model_fitted(fit);
+
+write_csv(coefficients, "examples/quant_demo/data/coefficients.csv");
+write_csv(labelled,     "examples/quant_demo/data/features.csv");
+write_csv(predictions,  "examples/quant_demo/data/predictions.csv");

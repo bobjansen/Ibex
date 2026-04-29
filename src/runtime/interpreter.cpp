@@ -6818,6 +6818,172 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     return output;
 }
 
+/// Per-group update: partition the input by `group_by`, run the regular
+/// `update_table` on each per-group slice, then scatter the new field
+/// columns back into a single full-sized output. Ordered ops like `lag`,
+/// `lead`, `cumsum`, and `fill_forward` therefore see only their group's
+/// rows; pure arithmetic gives the same answer per row regardless.
+auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
+                          const std::vector<ir::ColumnRef>& group_by, const ScalarRegistry* scalars,
+                          const ExternRegistry* externs) -> std::expected<Table, std::string> {
+    if (group_by.empty()) {
+        return update_table(std::move(input), fields, scalars, externs);
+    }
+    if (input.time_index.has_value()) {
+        for (const auto& field : fields) {
+            if (field.alias == *input.time_index) {
+                return std::unexpected("cannot update time index column: " + field.alias);
+            }
+        }
+    }
+
+    std::vector<const ColumnValue*> group_columns;
+    group_columns.reserve(group_by.size());
+    for (const auto& key : group_by) {
+        const auto* col = input.find(key.name);
+        if (col == nullptr) {
+            return std::unexpected("update + by: unknown group key '" + key.name +
+                                   "' (available: " + format_columns(input) + ")");
+        }
+        group_columns.push_back(col);
+    }
+
+    const std::size_t rows = input.rows();
+    if (rows == 0) {
+        return update_table(std::move(input), fields, scalars, externs);
+    }
+
+    robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+    std::vector<std::vector<std::size_t>> group_rows;
+    for (std::size_t r = 0; r < rows; ++r) {
+        Key key;
+        key.values.reserve(group_columns.size());
+        for (const auto* col : group_columns) {
+            key.values.push_back(scalar_from_column(*col, r));
+        }
+        auto [it, inserted] =
+            group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));
+        if (inserted) {
+            group_rows.emplace_back();
+        }
+        group_rows[it->second].push_back(r);
+    }
+
+    auto run_group =
+        [&](const std::vector<std::size_t>& row_idx) -> std::expected<Table, std::string> {
+        Table sub;
+        for (const auto& entry : input.columns) {
+            ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
+            sub.add_column(entry.name, std::move(gathered));
+        }
+        sub.time_index = input.time_index;
+        return update_table(std::move(sub), fields, scalars, externs);
+    };
+
+    auto first = run_group(group_rows[0]);
+    if (!first.has_value()) {
+        return std::unexpected(first.error());
+    }
+    const std::size_t first_new_idx = input.columns.size();
+    if (first->columns.size() <= first_new_idx) {
+        return std::unexpected("update: grouped update produced no new columns");
+    }
+    std::vector<std::string> new_field_names;
+    new_field_names.reserve(first->columns.size() - first_new_idx);
+    for (std::size_t c = first_new_idx; c < first->columns.size(); ++c) {
+        new_field_names.push_back(first->columns[c].name);
+    }
+
+    Table output = input;
+    auto allocate_full = [&](const ColumnValue& sample) -> std::expected<ColumnValue, std::string> {
+        return std::visit(
+            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<std::string>> ||
+                              std::is_same_v<ColT, Column<Categorical>>) {
+                    return std::unexpected(
+                        "update + by: scatter of string/Categorical results not yet implemented");
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    ColT out;
+                    out.resize(rows);
+                    return ColumnValue{std::move(out)};
+                } else {
+                    ColT out;
+                    out.resize(rows);
+                    return ColumnValue{std::move(out)};
+                }
+            },
+            sample);
+    };
+    for (const auto& fname : new_field_names) {
+        const auto* sample = first->find(fname);
+        if (sample == nullptr) {
+            return std::unexpected("update: missing new column '" + fname + "' in sub-result");
+        }
+        auto full = allocate_full(*sample);
+        if (!full.has_value()) {
+            return std::unexpected(full.error());
+        }
+        output.add_column(fname, std::move(full.value()));
+    }
+
+    auto scatter_into = [](ColumnValue& dst, const ColumnValue& src,
+                           const std::vector<std::size_t>& indices) -> std::optional<std::string> {
+        return std::visit(
+            [&](auto& dcol) -> std::optional<std::string> {
+                using DT = std::decay_t<decltype(dcol)>;
+                const DT* scol = std::get_if<DT>(&src);
+                if (scol == nullptr) {
+                    return "update: type mismatch in grouped scatter";
+                }
+                if constexpr (std::is_same_v<DT, Column<std::string>> ||
+                              std::is_same_v<DT, Column<Categorical>>) {
+                    return "update: scatter for string/Categorical not implemented";
+                } else if constexpr (std::is_same_v<DT, Column<bool>>) {
+                    for (std::size_t i = 0; i < indices.size(); ++i) {
+                        dcol.set(indices[i], (*scol)[i]);
+                    }
+                } else {
+                    auto* dp = dcol.data();
+                    const auto* sp = scol->data();
+                    for (std::size_t i = 0; i < indices.size(); ++i) {
+                        dp[indices[i]] = sp[i];
+                    }
+                }
+                return std::nullopt;
+            },
+            dst);
+    };
+
+    for (const auto& fname : new_field_names) {
+        auto* dst = output.find(fname);
+        const auto* src = first->find(fname);
+        if (auto err = scatter_into(*dst, *src, group_rows[0])) {
+            return std::unexpected(*err);
+        }
+    }
+
+    for (std::size_t g = 1; g < group_rows.size(); ++g) {
+        auto sub = run_group(group_rows[g]);
+        if (!sub.has_value()) {
+            return std::unexpected(sub.error());
+        }
+        for (const auto& fname : new_field_names) {
+            auto* dst = output.find(fname);
+            const auto* src = sub->find(fname);
+            if (src == nullptr) {
+                return std::unexpected("update: missing column '" + fname +
+                                       "' in grouped sub-result");
+            }
+            if (auto err = scatter_into(*dst, *src, group_rows[g])) {
+                return std::unexpected(*err);
+            }
+        }
+    }
+    normalize_time_index(output);
+    return output;
+}
+
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
@@ -6921,24 +7087,31 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     update.fields().begin(), update.fields().end(), [](const ir::FieldSpec& f) {
                         return std::holds_alternative<ir::RankExpr>(f.expr.node);
                     });
-                if (!all_rank || !update.tuple_fields().empty()) {
-                    return std::unexpected("grouped update not supported in interpreter");
-                }
-                Table result = std::move(child.value());
-                for (const auto& field : update.fields()) {
-                    const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node);
-                    auto res = evaluate_rank_column(result, *rank, update.group_by());
-                    if (!res) {
-                        return std::unexpected(res.error());
+                // Pure-rank grouped update has a fast path: rank only needs
+                // group keys + ordering, so it skips the gather/scatter dance.
+                if (all_rank && update.tuple_fields().empty()) {
+                    Table result = std::move(child.value());
+                    for (const auto& field : update.fields()) {
+                        const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node);
+                        auto res = evaluate_rank_column(result, *rank, update.group_by());
+                        if (!res) {
+                            return std::unexpected(res.error());
+                        }
+                        if (res->validity.has_value()) {
+                            result.add_column(field.alias, std::move(res->column),
+                                              std::move(*res->validity));
+                        } else {
+                            result.add_column(field.alias, std::move(res->column));
+                        }
                     }
-                    if (res->validity.has_value()) {
-                        result.add_column(field.alias, std::move(res->column),
-                                          std::move(*res->validity));
-                    } else {
-                        result.add_column(field.alias, std::move(res->column));
-                    }
+                    return result;
                 }
-                return result;
+                if (!update.tuple_fields().empty()) {
+                    return std::unexpected(
+                        "update + by: tuple-bound fields are not yet supported in grouped updates");
+                }
+                return grouped_update_table(std::move(child.value()), update.fields(),
+                                            update.group_by(), scalars, externs);
             }
             auto result = update_table(std::move(child.value()), update.fields(), scalars, externs);
             if (!result) {
@@ -11540,8 +11713,17 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 update.fields().begin(), update.fields().end(), [](const ir::FieldSpec& f) {
                     return std::holds_alternative<ir::RankExpr>(f.expr.node);
                 });
+            if (!all_rank && update.tuple_fields().empty()) {
+                return build_unary_materializing_operator(
+                    *update.children().front(), registry, scalars, externs, model_out,
+                    [&](Table input) -> std::expected<Table, std::string> {
+                        return grouped_update_table(std::move(input), update.fields(),
+                                                    update.group_by(), scalars, externs);
+                    });
+            }
             if (!all_rank || !update.tuple_fields().empty()) {
-                return std::unexpected("grouped update not supported in interpreter");
+                return std::unexpected(
+                    "update + by: tuple-bound fields are not yet supported in grouped updates");
             }
             return build_unary_materializing_operator(
                 *update.children().front(), registry, scalars, externs, model_out,

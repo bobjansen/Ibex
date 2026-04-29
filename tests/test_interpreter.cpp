@@ -1838,6 +1838,44 @@ TEST_CASE("rolling_sum outside window clause returns error") {
     REQUIRE(result.error().find("requires a window clause") != std::string::npos);
 }
 
+TEST_CASE("update + by partitions lag per group", "[interpreter][update][grouped]") {
+    // Per-symbol lag is the canonical use case for `update + by`. The lag
+    // boundary must be the group, not the table — otherwise the first row of
+    // symbol B would reach back into the last row of symbol A.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3),
+                                             ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3)});
+    table.add_column("symbol", Column<std::string>{"A", "A", "A", "B", "B", "B"});
+    table.add_column("close", Column<double>{10.0, 11.0, 12.0, 100.0, 105.0, 102.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("as_timeframe(data, \"ts\")[update { prev = lag(close, 1) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* symbol_col = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* prev_col = std::get_if<Column<double>>(result->find("prev"));
+    REQUIRE(symbol_col != nullptr);
+    REQUIRE(prev_col != nullptr);
+    REQUIRE(prev_col->size() == 6);
+
+    // Each group's first row has no predecessor — lag returns 0.0 (the
+    // default for out-of-bounds, no validity bitmap today). Subsequent rows
+    // reference only their own group's prior close.
+    std::map<std::string, std::vector<double>> expected = {
+        {"A", {0.0, 10.0, 11.0}},
+        {"B", {0.0, 100.0, 105.0}},
+    };
+    std::map<std::string, std::size_t> seen;
+    for (std::size_t r = 0; r < prev_col->size(); ++r) {
+        std::string sym{(*symbol_col)[r]};
+        std::size_t i = seen[sym]++;
+        CHECK((*prev_col)[r] == Catch::Approx(expected.at(sym).at(i)));
+    }
+}
+
 TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][grouped]") {
     // Symbol A: ts = {1,2,3} val = {10,20,30}; window 1ns -> mean = {10, 15, 25}
     // Symbol B: ts = {1,2,3} val = {100,200,300}; window 1ns -> mean = {100, 150, 250}
@@ -4948,9 +4986,16 @@ TEST_CASE("ExternCall: unknown extern function returns error", "[extern]") {
     REQUIRE(result.error().find("unknown extern function") != std::string::npos);
 }
 
-// --- Grouped update error ----------------------------------------------------
+// --- Grouped update with aggregate function ---------------------------------
 
-TEST_CASE("grouped update returns unsupported error", "[update]") {
+TEST_CASE("grouped update with broadcast-aggregate is not yet supported", "[update]") {
+    // Broadcast-aggregate semantics (`mean(price)` in an `update + by` block
+    // returns the per-group mean for every row in that group) aren't wired —
+    // mean/sum/etc. are aggregate functions, not row-level. Grouped update
+    // currently dispatches each field to the row-level evaluator, which
+    // rejects these names. Functional grouped updates (lag, lead, arithmetic
+    // on columns) work — see [interpreter][update][grouped] for the positive
+    // test.
     runtime::TableRegistry registry;
     runtime::Table trades;
     trades.add_column("symbol", Column<std::string>{"AAPL", "AAPL", "GOOG"});
@@ -4960,7 +5005,7 @@ TEST_CASE("grouped update returns unsupported error", "[update]") {
     auto ir = require_ir("trades[update { mean_price = mean(price) }, by symbol];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().find("grouped update not supported") != std::string::npos);
+    REQUIRE(result.error().find("unknown function") != std::string::npos);
 }
 
 // --- Filter type coverage: double / string columns ---------------------------

@@ -1838,10 +1838,13 @@ TEST_CASE("rolling_sum outside window clause returns error") {
     REQUIRE(result.error().find("requires a window clause") != std::string::npos);
 }
 
-TEST_CASE("update + by partitions lag per group", "[interpreter][update][grouped]") {
-    // Per-symbol lag is the canonical use case for `update + by`. The lag
-    // boundary must be the group, not the table — otherwise the first row of
-    // symbol B would reach back into the last row of symbol A.
+TEST_CASE("update + by partitions lag per group with null boundary",
+          "[interpreter][update][grouped]") {
+    // Per-symbol lag is the canonical use case for `update + by`. Two things
+    // matter: (1) the lag boundary is the group, not the table — symbol B's
+    // first row never reaches into symbol A; (2) that boundary row is
+    // *null*, not 0/empty, so downstream arithmetic doesn't silently produce
+    // a meaningful-looking wrong number.
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3),
                                              ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3)});
@@ -1856,23 +1859,30 @@ TEST_CASE("update + by partitions lag per group", "[interpreter][update][grouped
     REQUIRE(result.has_value());
 
     const auto* symbol_col = std::get_if<Column<std::string>>(result->find("symbol"));
-    const auto* prev_col = std::get_if<Column<double>>(result->find("prev"));
+    const auto* prev_entry = result->find_entry("prev");
     REQUIRE(symbol_col != nullptr);
-    REQUIRE(prev_col != nullptr);
-    REQUIRE(prev_col->size() == 6);
+    REQUIRE(prev_entry != nullptr);
+    REQUIRE(prev_entry->validity.has_value());
+    const auto& prev_col = std::get<Column<double>>(*prev_entry->column);
+    REQUIRE(prev_col.size() == 6);
+    const auto& prev_validity = *prev_entry->validity;
 
-    // Each group's first row has no predecessor — lag returns 0.0 (the
-    // default for out-of-bounds, no validity bitmap today). Subsequent rows
-    // reference only their own group's prior close.
-    std::map<std::string, std::vector<double>> expected = {
+    std::map<std::string, std::vector<double>> expected_values = {
         {"A", {0.0, 10.0, 11.0}},
         {"B", {0.0, 100.0, 105.0}},
     };
+    std::map<std::string, std::vector<bool>> expected_valid = {
+        {"A", {false, true, true}},
+        {"B", {false, true, true}},
+    };
     std::map<std::string, std::size_t> seen;
-    for (std::size_t r = 0; r < prev_col->size(); ++r) {
+    for (std::size_t r = 0; r < prev_col.size(); ++r) {
         std::string sym{(*symbol_col)[r]};
         std::size_t i = seen[sym]++;
-        CHECK((*prev_col)[r] == Catch::Approx(expected.at(sym).at(i)));
+        CHECK(prev_validity[r] == expected_valid.at(sym).at(i));
+        if (expected_valid.at(sym).at(i)) {
+            CHECK(prev_col[r] == Catch::Approx(expected_values.at(sym).at(i)));
+        }
     }
 }
 

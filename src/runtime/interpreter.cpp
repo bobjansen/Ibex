@@ -4958,9 +4958,14 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
 
 // Produce a shifted copy of a column: lag(col, n)[i] = col[i-n], lead(col, n)[i] = col[i+n].
 // Out-of-bounds entries are filled with type-appropriate zero/default values.
+struct LagLeadResult {
+    ColumnValue column;
+    std::optional<ValidityBitmap> validity;
+};
+
 auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,
                           const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<ColumnValue, std::string> {
+    -> std::expected<LagLeadResult, std::string> {
     const std::string fname = is_lag ? "lag" : "lead";
     if (call.args.size() != 2) {
         return std::unexpected(fname + ": expected 2 arguments");
@@ -4984,51 +4989,73 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
     }
     std::size_t n = static_cast<std::size_t>(*offset_val);
     std::size_t rows = input.rows();
-    return std::visit(
+    LagLeadResult result;
+    result.column = std::visit(
         [&](const auto& col) -> ColumnValue {
             using ColT = std::decay_t<decltype(col)>;
-            ColT result;
+            ColT out;
             if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
                           std::is_same_v<ColT, Column<std::string>>) {
                 // Categorical/string: element-wise fallback (no plain memcpy).
-                result.reserve(rows);
+                out.reserve(rows);
                 for (std::size_t i = 0; i < rows; ++i) {
                     if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                        result.push_back(is_lag ? (i >= n ? col[i - n] : std::string_view{})
-                                                : (i + n < rows ? col[i + n] : std::string_view{}));
+                        out.push_back(is_lag ? (i >= n ? col[i - n] : std::string_view{})
+                                             : (i + n < rows ? col[i + n] : std::string_view{}));
                     } else {
                         using T = typename ColT::value_type;
-                        result.push_back(is_lag ? (i >= n ? col[i - n] : T{})
-                                                : (i + n < rows ? col[i + n] : T{}));
+                        out.push_back(is_lag ? (i >= n ? col[i - n] : T{})
+                                             : (i + n < rows ? col[i + n] : T{}));
                     }
                 }
             } else {
                 // POD column: zero-fill then bulk-copy the shifted region.
                 using T = typename ColT::value_type;
-                result.resize(rows);  // zero-initialises
+                out.resize(rows);  // zero-initialises
                 if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     if (is_lag) {
                         for (std::size_t i = n; i < rows; ++i) {
-                            result.set(i, col[i - n]);
+                            out.set(i, col[i - n]);
                         }
                     } else {
                         for (std::size_t i = 0; i + n < rows; ++i) {
-                            result.set(i, col[i + n]);
+                            out.set(i, col[i + n]);
                         }
                     }
                 } else {
                     if (is_lag) {
                         if (n < rows)
-                            std::memcpy(result.data() + n, col.data(), (rows - n) * sizeof(T));
+                            std::memcpy(out.data() + n, col.data(), (rows - n) * sizeof(T));
                     } else {
                         if (n < rows)
-                            std::memcpy(result.data(), col.data() + n, (rows - n) * sizeof(T));
+                            std::memcpy(out.data(), col.data() + n, (rows - n) * sizeof(T));
                     }
                 }
             }
-            return result;
+            return out;
         },
         *src);
+
+    // Mark the out-of-bounds rows null. For lag, that's the first `n` rows;
+    // for lead, the last `n`. Without this every consumer would have to know
+    // that `lag(x, k)` returns 0/empty for the boundary rather than null —
+    // and `(close - lag(close, 1)) / lag(close, 1)` would silently produce a
+    // meaningful-looking number for the first row of each group.
+    if (n > 0 && rows > 0) {
+        ValidityBitmap bm(rows, true);
+        const std::size_t bad = std::min(n, rows);
+        if (is_lag) {
+            for (std::size_t i = 0; i < bad; ++i) {
+                bm.set(i, false);
+            }
+        } else {
+            for (std::size_t i = rows - bad; i < rows; ++i) {
+                bm.set(i, false);
+            }
+        }
+        result.validity = std::move(bm);
+    }
+    return result;
 }
 
 // Compute a cumulative sum or product column.
@@ -6301,12 +6328,17 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 continue;
             }
             if (call->callee == "lag" || call->callee == "lead") {
-                auto col =
+                auto res =
                     eval_lag_lead_column(*call, output, call->callee == "lag", scalars, externs);
-                if (!col) {
-                    return std::unexpected(col.error());
+                if (!res) {
+                    return std::unexpected(res.error());
                 }
-                output.add_column(field.alias, std::move(col.value()));
+                if (res->validity.has_value()) {
+                    output.add_column(field.alias, std::move(res->column),
+                                      std::move(*res->validity));
+                } else {
+                    output.add_column(field.alias, std::move(res->column));
+                }
                 continue;
             }
             if (is_cum_func(call->callee)) {
@@ -6547,12 +6579,37 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             dst);
     };
 
-    for (const auto& fname : new_field_names) {
+    // Lazy-allocated per-field validity bitmaps. We only construct one if at
+    // least one group's sub-result has a validity bitmap for that field —
+    // most pure-arithmetic outputs stay all-valid and pay nothing.
+    std::vector<std::optional<ValidityBitmap>> output_validity(new_field_names.size());
+
+    auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
+                                const std::vector<std::size_t>& indices) {
+        const auto* sub_entry = sub_table.find_entry(new_field_names[f_idx]);
+        if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
+            return;
+        }
+        if (!output_validity[f_idx].has_value()) {
+            output_validity[f_idx] = ValidityBitmap(rows, true);
+        }
+        const auto& sub_bm = *sub_entry->validity;
+        auto& out_bm = *output_validity[f_idx];
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            if (!sub_bm[i]) {
+                out_bm.set(indices[i], false);
+            }
+        }
+    };
+
+    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+        const auto& fname = new_field_names[f];
         auto* dst = output.find(fname);
         const auto* src = first->find(fname);
         if (auto err = scatter_into(*dst, *src, group_rows[0])) {
             return std::unexpected(*err);
         }
+        scatter_validity(f, *first, group_rows[0]);
     }
 
     for (std::size_t g = 1; g < group_rows.size(); ++g) {
@@ -6560,7 +6617,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         if (!sub.has_value()) {
             return std::unexpected(sub.error());
         }
-        for (const auto& fname : new_field_names) {
+        for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+            const auto& fname = new_field_names[f];
             auto* dst = output.find(fname);
             const auto* src = sub->find(fname);
             if (src == nullptr) {
@@ -6570,6 +6628,18 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             if (auto err = scatter_into(*dst, *src, group_rows[g])) {
                 return std::unexpected(*err);
             }
+            scatter_validity(f, *sub, group_rows[g]);
+        }
+    }
+
+    // Attach the lazy validity bitmaps to their output column entries.
+    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+        if (!output_validity[f].has_value()) {
+            continue;
+        }
+        auto idx_it = output.index.find(new_field_names[f]);
+        if (idx_it != output.index.end()) {
+            output.columns[idx_it->second].validity = std::move(output_validity[f]);
         }
     }
 
@@ -6606,12 +6676,17 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     for (const auto& field : fields) {
         if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
             if (call->callee == "lag" || call->callee == "lead") {
-                auto col =
+                auto res =
                     eval_lag_lead_column(*call, output, call->callee == "lag", scalars, externs);
-                if (!col) {
-                    return std::unexpected(col.error());
+                if (!res) {
+                    return std::unexpected(res.error());
                 }
-                output.add_column(field.alias, std::move(col.value()));
+                if (res->validity.has_value()) {
+                    output.add_column(field.alias, std::move(res->column),
+                                      std::move(*res->validity));
+                } else {
+                    output.add_column(field.alias, std::move(res->column));
+                }
                 continue;
             }
             if (is_rolling_func(call->callee)) {
@@ -6955,12 +7030,37 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             dst);
     };
 
-    for (const auto& fname : new_field_names) {
+    // Same lazy validity scatter as `grouped_windowed_update_table` —
+    // ordered ops like `lag(c, 1)` produce a per-group validity bitmap with
+    // the first `n` rows marked null; we OR those into the output's column.
+    std::vector<std::optional<ValidityBitmap>> output_validity(new_field_names.size());
+
+    auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
+                                const std::vector<std::size_t>& indices) {
+        const auto* sub_entry = sub_table.find_entry(new_field_names[f_idx]);
+        if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
+            return;
+        }
+        if (!output_validity[f_idx].has_value()) {
+            output_validity[f_idx] = ValidityBitmap(rows, true);
+        }
+        const auto& sub_bm = *sub_entry->validity;
+        auto& out_bm = *output_validity[f_idx];
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            if (!sub_bm[i]) {
+                out_bm.set(indices[i], false);
+            }
+        }
+    };
+
+    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+        const auto& fname = new_field_names[f];
         auto* dst = output.find(fname);
         const auto* src = first->find(fname);
         if (auto err = scatter_into(*dst, *src, group_rows[0])) {
             return std::unexpected(*err);
         }
+        scatter_validity(f, *first, group_rows[0]);
     }
 
     for (std::size_t g = 1; g < group_rows.size(); ++g) {
@@ -6968,7 +7068,8 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         if (!sub.has_value()) {
             return std::unexpected(sub.error());
         }
-        for (const auto& fname : new_field_names) {
+        for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+            const auto& fname = new_field_names[f];
             auto* dst = output.find(fname);
             const auto* src = sub->find(fname);
             if (src == nullptr) {
@@ -6978,6 +7079,16 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             if (auto err = scatter_into(*dst, *src, group_rows[g])) {
                 return std::unexpected(*err);
             }
+            scatter_validity(f, *sub, group_rows[g]);
+        }
+    }
+    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+        if (!output_validity[f].has_value()) {
+            continue;
+        }
+        auto idx_it = output.index.find(new_field_names[f]);
+        if (idx_it != output.index.end()) {
+            output.columns[idx_it->second].validity = std::move(output_validity[f]);
         }
     }
     normalize_time_index(output);

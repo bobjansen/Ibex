@@ -56,7 +56,7 @@ let with_rolling = enriched[window 5m, by symbol, update {
 let features = with_rolling[update {
     spread     = high - low,
     range      = (high - low) / open,
-    mid        = (high + low) / 2.0,
+    log_mid    = log((high + low) / 2.0),
     z5         = (close - rmean5) / (rmean5 + 0.0001),
     next_close = lead(close, 1)
 }];
@@ -65,7 +65,7 @@ let features = with_rolling[update {
 //   `lead(close, 1)` returns 0 for the last bar per symbol; drop those rows so
 //   the fit matches what a `shift(-1) → drop_nulls` step would do in Polars.
 let labelled = features[filter next_close > 0.0];
-let fit = labelled[model { next_close ~ open + range + mid + z5 + vol_regime,
+let fit = labelled[model { next_close ~ open + range + log_mid + z5 + vol_regime,
                             method = ridge,
                             lambda = 0.1 }];
 

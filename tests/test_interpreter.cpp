@@ -4322,6 +4322,49 @@ TEST_CASE("update: abs and sqrt work in interpreted expressions", "[update][math
     CHECK(root[2] == Catch::Approx(4.0));
 }
 
+TEST_CASE("update: log and exp work on Float and Int columns and round-trip", "[update][math]") {
+    runtime::Table table;
+    table.add_column("price", Column<double>{1.0, 10.0, 100.0});
+    table.add_column("qty", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { lp = log(price), ep = exp(log(price)), lq = log(qty) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& lp = std::get<Column<double>>(*result->find("lp"));
+    const auto& ep = std::get<Column<double>>(*result->find("ep"));
+    const auto& lq = std::get<Column<double>>(*result->find("lq"));
+
+    CHECK(lp[0] == Catch::Approx(0.0));
+    CHECK(lp[1] == Catch::Approx(std::log(10.0)));
+    CHECK(lp[2] == Catch::Approx(std::log(100.0)));
+
+    CHECK(ep[0] == Catch::Approx(1.0));
+    CHECK(ep[1] == Catch::Approx(10.0));
+    CHECK(ep[2] == Catch::Approx(100.0));
+
+    // log on Int column widens to Float64.
+    CHECK(lq[0] == Catch::Approx(0.0));
+    CHECK(lq[1] == Catch::Approx(std::log(2.0)));
+    CHECK(lq[2] == Catch::Approx(std::log(3.0)));
+}
+
+TEST_CASE("update: log/exp reject non-numeric arguments", "[update][math]") {
+    runtime::Table table;
+    table.add_column("name", Column<std::string>{"a", "b"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { lp = log(name) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("log:") != std::string::npos);
+}
+
 TEST_CASE("update: rowwise min/max work in interpreted expressions", "[update][math]") {
     runtime::Table table;
     table.add_column("a", Column<double>{10.0, 10.2});

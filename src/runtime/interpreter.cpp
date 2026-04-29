@@ -4377,9 +4377,9 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             return std::unexpected("abs: argument must be numeric");
         }
-        if (call->callee == "sqrt") {
+        if (call->callee == "sqrt" || call->callee == "log" || call->callee == "exp") {
             if (call->args.size() != 1) {
-                return std::unexpected("sqrt: expected 1 argument");
+                return std::unexpected(call->callee + ": expected 1 argument");
             }
             auto arg_type = infer_expr_type(*call->args[0], input, scalars, externs);
             if (!arg_type) {
@@ -4388,7 +4388,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             if (arg_type.value() == ExprType::Int || arg_type.value() == ExprType::Double) {
                 return ExprType::Double;
             }
-            return std::unexpected("sqrt: argument must be numeric");
+            return std::unexpected(call->callee + ": argument must be numeric");
         }
         // Null-fill functions (fill_null / fill_forward / fill_backward)
         if (is_fill_func(call->callee)) {
@@ -4702,21 +4702,29 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             }
             return std::unexpected("abs: argument must be numeric");
         }
-        if (call->callee == "sqrt") {
+        if (call->callee == "sqrt" || call->callee == "log" || call->callee == "exp") {
             if (call->args.size() != 1) {
-                return std::unexpected("sqrt: expected 1 argument");
+                return std::unexpected(call->callee + ": expected 1 argument");
             }
             auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
             if (!arg) {
                 return arg;
             }
-            if (const auto* value = std::get_if<std::int64_t>(&arg.value())) {
-                return std::sqrt(static_cast<double>(*value));
+            double x{};
+            if (const auto* iv = std::get_if<std::int64_t>(&arg.value())) {
+                x = static_cast<double>(*iv);
+            } else if (const auto* dv = std::get_if<double>(&arg.value())) {
+                x = *dv;
+            } else {
+                return std::unexpected(call->callee + ": argument must be numeric");
             }
-            if (const auto* value = std::get_if<double>(&arg.value())) {
-                return std::sqrt(*value);
+            if (call->callee == "sqrt") {
+                return std::sqrt(x);
             }
-            return std::unexpected("sqrt: argument must be numeric");
+            if (call->callee == "log") {
+                return std::log(x);
+            }
+            return std::exp(x);
         }
         if (call->callee == "pmin" || call->callee == "pmax") {
             if (call->args.size() < 2) {

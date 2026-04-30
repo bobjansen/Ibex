@@ -2410,7 +2410,8 @@ auto normalize_input(std::string_view input) -> std::string {
     return normalized;
 }
 
-auto execute_script(std::string_view source, runtime::ExternRegistry& registry) -> bool {
+auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
+                    const ReplConfig& config) -> bool {
     auto parsed = parser::parse(source);
     if (!parsed) {
         fmt::print("error: {}\n", parsed.error().format());
@@ -2423,10 +2424,15 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry) 
     FunctionRegistry functions;
     CompileTimeListRegistry compile_time_lists;
     ExternDeclRegistry extern_decls;
-    std::vector<std::string> no_paths;
     std::unordered_set<std::string> loaded_plugins;
     return execute_statements(parsed->statements, tables, scalars, columns, models, functions,
-                              compile_time_lists, extern_decls, registry, no_paths, loaded_plugins);
+                              compile_time_lists, extern_decls, registry,
+                              config.plugin_search_paths, loaded_plugins,
+                              config.import_search_paths);
+}
+
+auto execute_script(std::string_view source, runtime::ExternRegistry& registry) -> bool {
+    return execute_script(source, registry, ReplConfig{});
 }
 
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {

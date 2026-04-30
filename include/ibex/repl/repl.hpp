@@ -31,6 +31,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry);
 [[nodiscard]] auto execute_script(std::string_view source, runtime::ExternRegistry& registry)
     -> bool;
 
+/// Execute a script with the same plugin / import search paths the
+/// interactive REPL would use. Lets non-interactive callers (`ibex_eval`)
+/// run scripts that declare `extern fn ... from "csv.hpp"` etc., and use
+/// the REPL's full vocabulary including model accessors.
+[[nodiscard]] auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
+                                  const ReplConfig& config) -> bool;
+
 /// Normalize a single REPL input line (e.g., inject implicit semicolon).
 [[nodiscard]] auto normalize_input(std::string_view input) -> std::string;
 

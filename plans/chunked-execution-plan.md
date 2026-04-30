@@ -50,6 +50,8 @@ walkers or peek-ahead for node permutations. Current rules:
 | R4 | `Head/Tail(Project\|Rename(x))` → `Project\|Rename(Head/Tail(x))` | group_by (if any) remapped through Rename |
 | R5 | `Project(Filter(x))` → `FilterProject(x)` | Fused IR node; `build_operator` dispatches on `NodeKind::FilterProject` instead of pattern-matching the Project→Filter shape |
 | R6 | `Project(Update(Filter(x)))` → `FilterUpdateProject(x)` | Only when Update is row-local (no tuple_fields, no group_by, no cross-row callees); carries filter predicate + update fields + projection |
+| R7 | `Head(Filter(x))` → `FilterHead(x)` | Fused IR node; replaces shape-matching in `build_operator` |
+| R8 | `Tail(Filter(x))` → `FilterTail(x)` | Fused IR node; same dispatch story as R7 |
 
 New identities go here as data, not as branches in `build_operator`.
 

@@ -14,26 +14,16 @@ Target language rule:
   those expressions.
 - Aggregates that change cardinality should still stay out of plain `filter`.
 
-Recommended implementation order:
+Status:
 
-1. `filter` with table-aware value expressions
-- Detect supported non-row-local pure subexpressions in `filter`.
-- Lower them into `FilterCall` IR nodes.
-- Evaluate those calls once as vector-valued filter operands.
-- Keep result schemas unchanged; no temporary columns are exposed.
+- Stage 1 (`filter` with non-row-local pure subexpressions via `FilterCall`)
+  is shipped: `lag`/`lead` and `is_null`/`is_not_null` work directly inside
+  `filter`.
+- Arithmetic in `select` is shipped.
 
-Implemented first slice:
+Remaining:
 
-```ibex
-logs[filter num == lag(num, 1) && num == lag(num, 2)]
-```
-
-works directly, with `lag(...)` / `lead(...)` evaluated over current row order.
-
-2. Then generalize the same mechanism to `select`
-- Allow non-row-local pure expressions directly in computed `select` fields.
-
-3. Then extend context-sensitive support
+1. Extend context-sensitive support
 - `rank(...)` in `filter` / `select` with surrounding `by`
 - explicit `order { ... }` context
 - later `window` / rolling functions

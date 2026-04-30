@@ -195,9 +195,12 @@ set_target_properties(ibex_eval_bin PROPERTIES
 
 target_link_libraries(ibex_eval_bin
     PRIVATE
+        Ibex::repl
         Ibex::parser
         Ibex::runtime
         Ibex::CompilerOptions
+        CLI11::CLI11
+        spdlog::spdlog
 )
 
 if(TARGET Ibex::Sanitizers)

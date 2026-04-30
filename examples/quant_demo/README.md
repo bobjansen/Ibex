@@ -38,10 +38,9 @@ python3 examples/quant_demo/gen_data.py
 # 2. Build the Ibex release binary if you haven't.
 cmake --build build-release
 
-# 3. Ibex (the script is loaded into the REPL because the demo uses
-#    model_coef / model_fitted, which are REPL-bound today):
-printf ':load examples/quant_demo/quant_demo.ibex\n:quit\n' | \
-    ./build-release/tools/ibex --plugin-path build-release/tools
+# 3. Ibex:
+./build-release/tools/ibex_eval --plugin-path build-release/tools \
+    examples/quant_demo/quant_demo.ibex
 
 # 4. Polars + scikit-learn:
 python3 examples/quant_demo/quant_demo_polars.py

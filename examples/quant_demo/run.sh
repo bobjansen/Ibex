@@ -9,11 +9,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DATA_DIR="$SCRIPT_DIR/data"
 
 PYTHON="${PYTHON:-python3}"
-IBEX_BIN="${IBEX_BIN:-$REPO_ROOT/build-release/tools/ibex}"
+IBEX_EVAL="${IBEX_EVAL:-$REPO_ROOT/build-release/tools/ibex_eval}"
 PLUGIN_DIR="${PLUGIN_DIR:-$REPO_ROOT/build-release/tools}"
 
-if [[ ! -x "$IBEX_BIN" ]]; then
-    echo "error: ibex binary not found at $IBEX_BIN — run 'cmake --build build-release' first" >&2
+if [[ ! -x "$IBEX_EVAL" ]]; then
+    echo "error: ibex_eval binary not found at $IBEX_EVAL — run 'cmake --build build-release' first" >&2
     exit 1
 fi
 
@@ -23,8 +23,7 @@ echo
 
 echo "── Ibex pipeline ──────────────────────────────────────────────────"
 cd "$REPO_ROOT"
-printf ":load %s\n:quit\n" "$SCRIPT_DIR/quant_demo.ibex" | \
-    "$IBEX_BIN" --plugin-path "$PLUGIN_DIR" 2>&1 | grep -v '^ibex>\|REPL exit'
+"$IBEX_EVAL" --plugin-path "$PLUGIN_DIR" "$SCRIPT_DIR/quant_demo.ibex"
 echo
 
 echo "── Polars + scikit-learn pipeline ─────────────────────────────────"

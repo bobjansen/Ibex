@@ -8,6 +8,7 @@ add_library(ibex_runtime STATIC
     reshape.cpp
     rng.cpp
     runtime_internal.cpp
+    table_format.cpp
 )
 add_library(Ibex::runtime ALIAS ibex_runtime)
 

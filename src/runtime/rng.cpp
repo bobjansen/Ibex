@@ -58,12 +58,20 @@ void fill_exponential(double* __restrict out, std::size_t rows, double lambda) n
     g_rng_simd.fill_exponential(out, rows, lambda);
 }
 
+// The bulk int fills run a hot loop over a thread_local engine. Copy the
+// engine into a local for the duration of the fill so the optimizer can keep
+// its state in registers (a thread_local global is otherwise reloaded/stored
+// per call), then write the advanced state back. The generated sequence and
+// final engine state are identical to mutating g_rng_x4 in place, so
+// determinism is unchanged — this just recovers the speed the previous
+// inline-in-caller version had.
 void fill_bernoulli(std::int64_t* __restrict out, std::size_t rows, double p) noexcept {
     constexpr double kScale53 = 9007199254740992.0;  // 2^53
     const auto threshold = static_cast<std::uint64_t>(p * kScale53);
+    auto rng4 = g_rng_x4;
     std::size_t i = 0;
     while (i + 4 <= rows) {
-        const auto bits = g_rng_x4();
+        const auto bits = rng4();
         out[i] = ((bits[0] >> 11) < threshold) ? 1 : 0;
         out[i + 1] = ((bits[1] >> 11) < threshold) ? 1 : 0;
         out[i + 2] = ((bits[2] >> 11) < threshold) ? 1 : 0;
@@ -71,18 +79,20 @@ void fill_bernoulli(std::int64_t* __restrict out, std::size_t rows, double p) no
         i += 4;
     }
     if (i < rows) {
-        const auto bits = g_rng_x4();
+        const auto bits = rng4();
         for (std::size_t lane = 0; i < rows; ++lane, ++i) {
             out[i] = ((bits[lane] >> 11) < threshold) ? 1 : 0;
         }
     }
+    g_rng_x4 = rng4;
 }
 
 void fill_int(std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
               std::uint64_t span) noexcept {
+    auto rng4 = g_rng_x4;
     std::size_t i = 0;
     while (i + 4 <= rows) {
-        const auto bits = g_rng_x4();
+        const auto bits = rng4();
         out[i] = lo + static_cast<std::int64_t>(mul_shift53(bits[0] >> 11, span));
         out[i + 1] = lo + static_cast<std::int64_t>(mul_shift53(bits[1] >> 11, span));
         out[i + 2] = lo + static_cast<std::int64_t>(mul_shift53(bits[2] >> 11, span));
@@ -90,11 +100,12 @@ void fill_int(std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
         i += 4;
     }
     if (i < rows) {
-        const auto bits = g_rng_x4();
+        const auto bits = rng4();
         for (std::size_t lane = 0; i < rows; ++lane, ++i) {
             out[i] = lo + static_cast<std::int64_t>(mul_shift53(bits[lane] >> 11, span));
         }
     }
+    g_rng_x4 = rng4;
 }
 
 }  // namespace ibex::runtime

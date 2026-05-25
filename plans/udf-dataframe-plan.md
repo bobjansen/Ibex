@@ -106,8 +106,10 @@ Target:
 
 Requirements:
 
-- collect function signatures before evaluating bodies
-- support forward references between top-level function definitions
+- ~~collect function signatures before evaluating bodies~~ — done; `execute_statements`
+  pre-passes top-level `fn` declarations into the registry before walking the batch
+- ~~support forward references between top-level function definitions~~ — done;
+  covered by forward-reference tests in `tests/test_repl.cpp`
 - keep eager argument evaluation
 - preserve the current "last expression is the return value" rule
 - improve diagnostics for arity/type mismatches

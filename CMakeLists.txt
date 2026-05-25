@@ -49,6 +49,16 @@ endif()
 
 include(Coverage)  # no-op unless -DIBEX_COVERAGE=ON
 
+# Target architecture detection. Set here at the top level (rather than in a
+# single subdirectory) so every subdirectory — src/runtime, tools, tests —
+# sees the same value. Plain set() is directory-scoped and does NOT propagate
+# to sibling subdirectories, which previously left IBEX_TARGETS_X86 undefined
+# in tools/ and tests/ and silently dropped -mavx2 from the benchmarks.
+set(IBEX_TARGETS_X86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    set(IBEX_TARGETS_X86 ON)
+endif()
+
 # Core library
 add_subdirectory(src/core)
 add_subdirectory(src/ir)

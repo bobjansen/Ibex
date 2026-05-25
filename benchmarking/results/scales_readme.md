@@ -1,37 +1,42 @@
 ## Benchmark
 
-Scale benchmark snapshot on **4,000,000 rows** (warmup=2, iters=15).
+Scale benchmark snapshot on **1,000,000 rows** (requested 4,000,000; warmup=1, iters=3).
 
-| query                        |     ibex |   polars | polars-st |    duckdb | duckdb-st | datafusion | datafusion-st | clickhouse | clickhouse-st |     sqlite |    pandas | data.table |     dplyr |
-| ---------------------------- | -------: | -------: | --------: | --------: | --------: | ---------: | ------------: | ---------: | ------------: | ---------: | --------: | ---------: | --------: |
-| mean_by_symbol               |  28.0 ms |  33.0 ms |   65.2 ms |   9.20 ms |   40.0 ms |    4.76 ms |       26.2 ms |    9.66 ms |       54.7 ms |  1660.3 ms |   68.5 ms |    25.1 ms |   46.9 ms |
-| ohlc_by_symbol               |  33.0 ms |  24.6 ms |   74.3 ms |   13.4 ms |   58.8 ms |    9.33 ms |       63.6 ms |    7.42 ms |       56.6 ms |          - |   87.7 ms |    25.1 ms |   51.4 ms |
-| update_price_x2              |  3.26 ms |  2.70 ms |   3.27 ms |  118.6 ms |  156.4 ms |    4.28 ms |       5.99 ms |    2.99 ms |       3.70 ms |  2140.8 ms |   3.53 ms |    27.9 ms |   5.73 ms |
-| cumsum_price                 |  3.11 ms |  13.0 ms |   12.7 ms |  207.5 ms |  692.4 ms |   520.6 ms |      487.3 ms |    81.3 ms |       80.8 ms |  5003.1 ms |   12.8 ms |    24.9 ms |   9.20 ms |
-| cumprod_price                |  3.58 ms |  13.6 ms |   12.7 ms |         - |         - |          - |             - |          - |             - |          - |   12.7 ms |   343.2 ms |  347.1 ms |
-| rand_uniform                 |  2.60 ms |  8.29 ms |   8.20 ms |  119.6 ms |  188.9 ms |    5.68 ms |       13.8 ms |    3.29 ms |       4.29 ms |          - |   9.64 ms |    28.7 ms |   24.9 ms |
-| rand_normal                  |  11.4 ms |  31.8 ms |   30.1 ms |         - |         - |          - |             - |          - |             - |          - |   35.1 ms |    79.5 ms |   76.7 ms |
-| rand_int                     |  4.04 ms |  8.11 ms |   7.88 ms |         - |         - |          - |             - |          - |             - |          - |   10.1 ms |    62.3 ms |   62.3 ms |
-| rand_bernoulli               |  2.87 ms |  30.7 ms |   29.5 ms |         - |         - |          - |             - |          - |             - |          - |   32.7 ms |    59.7 ms |   59.3 ms |
-| fill_null                    |  3.97 ms |  3.11 ms |   2.65 ms |   14.6 ms |   29.3 ms |    8.44 ms |       28.3 ms |    4.18 ms |       5.27 ms |  1143.2 ms |   7.05 ms |    5.20 ms |   14.7 ms |
-| fill_forward                 |  3.71 ms |  8.95 ms |   8.73 ms |   58.0 ms |  225.4 ms |          - |             - |          - |             - |          - |   7.56 ms |    5.87 ms |   13.7 ms |
-| fill_backward                |  7.10 ms |  8.78 ms |   8.71 ms |   63.2 ms |  233.8 ms |          - |             - |          - |             - |          - |   8.41 ms |    10.4 ms |   14.8 ms |
-| null_left_join               |  75.4 ms |  30.9 ms |   80.1 ms |  189.1 ms |  294.2 ms |    17.2 ms |      114.8 ms |    24.7 ms |      147.9 ms |  3096.3 ms |  321.5 ms |   162.6 ms |  163.2 ms |
-| null_semi_join               |  35.3 ms |  23.3 ms |  104.0 ms |   54.4 ms |  116.2 ms |    13.5 ms |       85.6 ms |    19.7 ms |       63.2 ms | 18769.1 ms |  253.1 ms |    36.5 ms |   82.3 ms |
-| null_anti_join               |  35.1 ms |  26.3 ms |  103.1 ms |   56.8 ms |  158.8 ms |    14.0 ms |       86.1 ms |    18.3 ms |       62.5 ms | 18825.9 ms |   74.6 ms |    58.7 ms |  110.8 ms |
-| null_cross_join_small        |  2.50 ms | 0.659 ms |  0.786 ms |   7.59 ms |   7.46 ms |   0.879 ms |       1.09 ms |    1.60 ms |       2.54 ms |    83.4 ms |   4.70 ms |    3.13 ms |   53.2 ms |
-| filter_simple                |  11.8 ms |  7.38 ms |   12.8 ms |   59.8 ms |   95.7 ms |    7.73 ms |       19.3 ms |    5.84 ms |       19.9 ms |  1227.2 ms |   21.8 ms |    29.3 ms |   24.5 ms |
-| filter_and                   |  7.12 ms |  4.71 ms |   8.18 ms |   14.4 ms |   42.1 ms |    3.87 ms |       11.6 ms |    8.38 ms |       29.0 ms |   424.2 ms |   19.3 ms |    28.9 ms |   37.1 ms |
-| filter_arith                 |  16.2 ms |  8.25 ms |   16.7 ms |   77.9 ms |  122.7 ms |    8.96 ms |       25.5 ms |    8.67 ms |       23.4 ms |  1612.9 ms |   33.8 ms |    40.1 ms |   31.9 ms |
-| filter_or                    |  8.17 ms |  4.57 ms |   8.16 ms |   17.1 ms |   61.9 ms |    4.16 ms |       12.7 ms |    6.14 ms |       15.2 ms |   464.6 ms |   15.1 ms |    25.7 ms |   35.5 ms |
-| count_by_symbol_day          |  1.35 ms |  12.8 ms |   20.3 ms |   4.86 ms |   8.62 ms |    3.53 ms |       7.75 ms |    4.58 ms |       11.1 ms |   420.1 ms |   24.6 ms |    4.33 ms |   17.6 ms |
-| mean_by_symbol_day           |  1.55 ms |  13.2 ms |   22.0 ms |   4.56 ms |   9.26 ms |    3.92 ms |       8.30 ms |    4.93 ms |       13.0 ms |   503.8 ms |   27.1 ms |    4.67 ms |   20.9 ms |
-| ohlc_by_symbol_day           |  2.33 ms |  13.6 ms |   22.9 ms |   5.86 ms |   15.6 ms |    9.65 ms |       27.1 ms |    5.60 ms |       12.6 ms |          - |   31.9 ms |    5.33 ms |   39.9 ms |
-| sum_by_user                  |  54.4 ms |  50.6 ms |  221.7 ms |   28.5 ms |   94.1 ms |    38.0 ms |       56.8 ms |    80.9 ms |       81.4 ms |  2057.8 ms |  112.0 ms |    45.6 ms |  313.6 ms |
-| filter_events                |  12.2 ms |  7.05 ms |   13.4 ms |   78.7 ms |  109.5 ms |    9.65 ms |       24.5 ms |    8.44 ms |       21.0 ms |  1157.5 ms |   26.0 ms |    33.4 ms |   31.1 ms |
-| melt_wide_to_long            |  53.3 ms |  41.5 ms |   52.5 ms | 1030.5 ms | 1581.7 ms |    24.4 ms |       24.5 ms |    10.6 ms |       22.7 ms | 11266.4 ms |  216.1 ms |   223.3 ms |  358.1 ms |
-| dcast_long_to_wide           | 908.4 ms | 676.3 ms | 1605.1 ms |  308.1 ms | 1284.0 ms |   228.2 ms |      628.5 ms |   513.6 ms |     2086.1 ms | 16761.9 ms | 4309.7 ms |  1221.4 ms | 1884.6 ms |
-| dcast_long_to_wide_int_pivot | 801.8 ms |        - |         - |         - |         - |          - |             - |          - |             - |          - |         - |          - |         - |
-| dcast_long_to_wide_cat_pivot | 897.5 ms |        - |         - |         - |         - |          - |             - |          - |             - |          - |         - |          - |         - |
+| query                        |     ibex |   polars | polars-st |   duckdb | duckdb-st | datafusion | datafusion-st | clickhouse | clickhouse-st |    sqlite |   pandas | data.table |    dplyr |
+| ---------------------------- | -------: | -------: | --------: | -------: | --------: | ---------: | ------------: | ---------: | ------------: | --------: | -------: | ---------: | -------: |
+| mean_by_symbol               |  9.02 ms |  13.3 ms |   16.3 ms |  5.99 ms |   11.0 ms |    3.68 ms |       8.72 ms |    11.1 ms |       20.9 ms |  360.9 ms |  16.3 ms |    8.67 ms |  19.7 ms |
+| ohlc_by_symbol               |  8.34 ms |  14.1 ms |   17.6 ms |  7.23 ms |   15.6 ms |    7.00 ms |       19.8 ms |    11.0 ms |       22.2 ms |         - |  21.1 ms |    24.0 ms |  30.0 ms |
+| update_price_x2              | 0.519 ms |  1.54 ms |   1.14 ms |  31.2 ms |   35.4 ms |    2.35 ms |       2.33 ms |    2.59 ms |       1.55 ms |  526.3 ms | 0.985 ms |    1.33 ms |  1.33 ms |
+| distinct_symbol              |  7.38 ms |  13.1 ms |   13.4 ms |        - |         - |          - |             - |          - |             - |         - |  14.6 ms |          - |        - |
+| order_head_topk              |  2.65 ms |  21.9 ms |   42.8 ms |        - |         - |          - |             - |          - |             - |         - | 104.7 ms |          - |        - |
+| order_head_topk_by_symbol    |  33.7 ms |  36.3 ms |   56.5 ms |        - |         - |          - |             - |          - |             - |         - | 135.5 ms |          - |        - |
+| order_tail_topk              |  2.48 ms |  25.5 ms |   44.5 ms |        - |         - |          - |             - |          - |             - |         - | 107.9 ms |          - |        - |
+| order_tail_topk_by_symbol    |  34.0 ms |  30.1 ms |   51.4 ms |        - |         - |          - |             - |          - |             - |         - | 154.0 ms |          - |        - |
+| cumsum_price                 | 0.505 ms |  3.28 ms |   3.40 ms |  59.8 ms |  161.8 ms |   130.7 ms |      128.4 ms |    24.4 ms |       21.4 ms | 1229.8 ms |  3.27 ms |    20.0 ms |  2.67 ms |
+| cumprod_price                |  1.15 ms |  3.30 ms |   3.33 ms |        - |         - |          - |             - |          - |             - |         - |  2.92 ms |    84.7 ms |  83.0 ms |
+| rand_uniform                 | 0.503 ms |  2.37 ms |   3.42 ms |  43.9 ms |   44.0 ms |    2.18 ms |       3.87 ms |    1.78 ms |       1.61 ms |         - |  2.44 ms |    5.67 ms |  6.00 ms |
+| rand_normal                  |  2.83 ms |  7.24 ms |   7.66 ms |        - |         - |          - |             - |          - |             - |         - |  7.86 ms |    32.0 ms |  19.7 ms |
+| rand_int                     |  1.71 ms |  1.84 ms |   2.44 ms |        - |         - |          - |             - |          - |             - |         - |  2.45 ms |    15.3 ms |  16.3 ms |
+| rand_bernoulli               |  1.79 ms |  7.05 ms |   7.40 ms |        - |         - |          - |             - |          - |             - |         - |  9.33 ms |    15.7 ms |  15.0 ms |
+| fill_null                    | 0.923 ms | 0.888 ms |  0.584 ms |  3.93 ms |   7.63 ms |    2.92 ms |       7.00 ms |    2.06 ms |       1.36 ms |  260.2 ms |  1.62 ms |    2.00 ms |  3.00 ms |
+| fill_forward                 | 0.580 ms |  2.16 ms |   2.13 ms |  18.1 ms |   64.8 ms |          - |             - |          - |             - |         - |  1.89 ms |    2.00 ms |  4.67 ms |
+| fill_backward                |  1.25 ms |  2.08 ms |   2.03 ms |  18.7 ms |   64.3 ms |          - |             - |          - |             - |         - |  1.61 ms |    2.33 ms |  4.33 ms |
+| null_left_join               |  7.73 ms |  14.8 ms |   20.1 ms |  54.3 ms |   79.1 ms |    7.41 ms |       29.0 ms |    9.85 ms |       34.4 ms |  783.2 ms |  70.4 ms |    45.0 ms |  45.0 ms |
+| null_semi_join               |  6.12 ms |  24.8 ms |   23.4 ms |  14.8 ms |   28.6 ms |    7.07 ms |       22.1 ms |    11.3 ms |       15.0 ms | 4554.3 ms |  56.0 ms |    10.3 ms |  26.0 ms |
+| null_anti_join               |  5.58 ms |  12.0 ms |   23.4 ms |  16.0 ms |   39.3 ms |    6.91 ms |       21.3 ms |    11.0 ms |       15.0 ms | 4643.4 ms |  18.7 ms |    18.3 ms |  26.3 ms |
+| null_cross_join_small        | 0.533 ms | 0.663 ms |  0.744 ms |  9.62 ms |   9.88 ms |    1.49 ms |      0.808 ms |    1.58 ms |       1.26 ms |   82.6 ms |  4.31 ms |    4.00 ms |  53.7 ms |
+| filter_simple                |  1.97 ms |  2.92 ms |   3.67 ms |  16.3 ms |   23.8 ms |    3.58 ms |       5.77 ms |    3.89 ms |       5.30 ms |  294.2 ms |  5.39 ms |    8.00 ms |  7.67 ms |
+| filter_and                   |  1.07 ms |  3.45 ms |   1.75 ms |  4.93 ms |   10.7 ms |    2.70 ms |       3.15 ms |    8.91 ms |       11.0 ms |   96.5 ms |  4.15 ms |    8.00 ms |  10.7 ms |
+| filter_arith                 |  2.97 ms |  4.26 ms |   4.95 ms |  20.2 ms |   31.0 ms |    3.50 ms |       6.50 ms |    7.51 ms |       9.47 ms |  390.5 ms |  8.28 ms |    9.67 ms |  9.00 ms |
+| filter_or                    |  1.09 ms |  1.48 ms |   1.65 ms |  5.16 ms |   15.6 ms |    2.04 ms |       3.08 ms |    8.06 ms |       7.88 ms |  107.1 ms |  3.40 ms |    9.33 ms |  8.33 ms |
+| count_by_symbol_day          |  7.43 ms |  16.5 ms |   27.6 ms |  7.08 ms |   11.5 ms |    4.07 ms |       11.5 ms |    5.36 ms |       14.8 ms |  571.2 ms |  32.4 ms |    6.00 ms |  20.0 ms |
+| mean_by_symbol_day           |  9.05 ms |  18.6 ms |   29.1 ms |  5.87 ms |   11.7 ms |    4.33 ms |       11.8 ms |    6.33 ms |       15.7 ms |  675.1 ms |  34.3 ms |    8.00 ms |  26.0 ms |
+| ohlc_by_symbol_day           |  3.26 ms |  18.7 ms |   30.7 ms |  7.59 ms |   17.4 ms |    11.1 ms |       37.3 ms |    6.89 ms |       16.0 ms |         - |  39.6 ms |    11.7 ms |  58.3 ms |
+| sum_by_user                  |  25.2 ms |  21.2 ms |   42.7 ms |  16.2 ms |   27.9 ms |    14.5 ms |       15.8 ms |    38.2 ms |       22.7 ms |  534.8 ms |  33.9 ms |    36.7 ms | 303.0 ms |
+| filter_events                |  2.07 ms |  3.75 ms |   3.09 ms |  22.3 ms |   26.9 ms |    3.98 ms |       5.86 ms |    3.94 ms |       5.23 ms |  304.2 ms |  5.62 ms |    10.0 ms |  8.33 ms |
+| melt_wide_to_long            |  12.7 ms |  24.1 ms |   35.9 ms | 269.8 ms |  311.4 ms |    8.07 ms |       7.99 ms |    5.18 ms |       6.87 ms | 2845.9 ms |  40.6 ms |    78.0 ms |  72.0 ms |
+| dcast_long_to_wide           | 250.3 ms | 156.9 ms |  308.4 ms | 107.3 ms |  286.6 ms |    69.1 ms |      137.9 ms |   125.7 ms |      318.6 ms | 3958.7 ms | 774.1 ms |   276.0 ms | 318.3 ms |
+| dcast_long_to_wide_int_pivot | 253.0 ms |        - |         - |        - |         - |          - |             - |          - |             - |         - |        - |          - |        - |
+| dcast_long_to_wide_cat_pivot | 248.9 ms |        - |         - |        - |         - |          - |             - |          - |             - |         - |        - |          - |        - |
 
 _Generated by `benchmarking/run_scale_suite.sh --to-readme` from `benchmarking/results/scales.tsv`._

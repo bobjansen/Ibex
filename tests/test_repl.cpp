@@ -289,6 +289,51 @@ c;
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("REPL resolves forward references between user functions") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+fn caller(x: Int) -> Int {
+  callee(x) + 1;
+}
+fn callee(x: Int) -> Int {
+  x * 2;
+}
+let r = caller(5);
+r;
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL resolves forward reference from a DataFrame helper to a later helper") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::runtime::Table employee;
+    employee.add_column("salary", ibex::Column<std::int64_t>{100, 200, 300, 200, 100});
+    registry.register_table("employee_src",
+                            [employee](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                return ibex::runtime::ExternValue{employee};
+                            });
+
+    const char* src = R"(
+extern fn employee_src() -> DataFrame from "fake.hpp";
+
+fn second_highest(df: DataFrame<{salary: Int64}>) -> DataFrame {
+  nth_highest(df, 2);
+}
+fn nth_highest(df: DataFrame<{salary: Int64}>, n: Int) -> DataFrame {
+  df[distinct { salary }, order { salary desc }, head n];
+}
+
+let employee = employee_src();
+let result = second_highest(employee);
+result;
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
 TEST_CASE("REPL supports named arguments and defaults for extern functions") {
     ibex::runtime::ExternRegistry registry;
     registry.register_table(

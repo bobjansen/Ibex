@@ -32,11 +32,9 @@ target_link_libraries(ibex_runtime
 # ── AVX2 / libmvec ────────────────────────────────────────────────────────────
 # Enable when the compiler supports -mavx2.  zorro.hpp (included via rng.hpp)
 # uses compile-time SIMD dispatch: __AVX512F__ → __AVX2__ → portable.
+# IBEX_TARGETS_X86 is detected once at the top-level CMakeLists.txt so that
+# tools/ and tests/ apply the same flag (see note there).
 include(CheckCXXCompilerFlag)
-set(IBEX_TARGETS_X86 OFF)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
-    set(IBEX_TARGETS_X86 ON)
-endif()
 
 if(MSVC)
     check_cxx_compiler_flag(/arch:AVX2 IBEX_HAS_AVX2)

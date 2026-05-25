@@ -2164,6 +2164,16 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         const std::vector<std::string>& import_search_paths = {},
                         const std::vector<std::vector<std::string>>* comment_groups = nullptr)
     -> bool {
+    // Pre-pass: register every top-level `fn` declaration in this batch so that
+    // function bodies can reference functions declared later in the same script
+    // or REPL submission. We move the decls into the registry; the main loop
+    // below treats FunctionDecl as a no-op since the pre-pass owns it.
+    for (auto& stmt : statements) {
+        if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
+            auto fn = std::get<parser::FunctionDecl>(std::move(stmt));
+            functions.insert_or_assign(fn.name, std::move(fn));
+        }
+    }
     for (std::size_t stmt_index = 0; stmt_index < statements.size(); ++stmt_index) {
         auto& stmt = statements[stmt_index];
         if (comment_groups != nullptr && stmt_index < comment_groups->size()) {
@@ -2222,8 +2232,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             continue;
         }
         if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
-            auto fn = std::get<parser::FunctionDecl>(std::move(stmt));
-            functions.insert_or_assign(fn.name, std::move(fn));
+            // Already registered by the pre-pass above.
             continue;
         }
         if (std::holds_alternative<parser::LetStmt>(stmt)) {

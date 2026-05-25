@@ -3779,6 +3779,56 @@ TEST_CASE("reseed produces identical rand_normal sequence") {
     }
 }
 
+TEST_CASE("reseed produces identical rand_bernoulli sequence") {
+    runtime::Table table;
+    // 33 rows: exercises the 4-wide main loop and the scalar tail in fill_bernoulli.
+    table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(33)));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { b = rand_bernoulli(0.7) }];");
+
+    runtime::reseed(0xABCDEF01);
+    auto r1 = runtime::interpret(*ir, registry);
+    REQUIRE(r1.has_value());
+    const auto& c1 = std::get<Column<std::int64_t>>(*r1->find("b"));
+
+    runtime::reseed(0xABCDEF01);
+    auto r2 = runtime::interpret(*ir, registry);
+    REQUIRE(r2.has_value());
+    const auto& c2 = std::get<Column<std::int64_t>>(*r2->find("b"));
+
+    REQUIRE(c1.size() == c2.size());
+    for (std::size_t i = 0; i < c1.size(); ++i) {
+        CHECK(c1[i] == c2[i]);
+    }
+}
+
+TEST_CASE("reseed produces identical rand_int sequence") {
+    runtime::Table table;
+    // 33 rows: exercises the 4-wide main loop and the scalar tail in fill_int.
+    table.add_column("x", Column<std::int64_t>(std::vector<std::int64_t>(33)));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { n = rand_int(1, 100) }];");
+
+    runtime::reseed(0x12345678);
+    auto r1 = runtime::interpret(*ir, registry);
+    REQUIRE(r1.has_value());
+    const auto& c1 = std::get<Column<std::int64_t>>(*r1->find("n"));
+
+    runtime::reseed(0x12345678);
+    auto r2 = runtime::interpret(*ir, registry);
+    REQUIRE(r2.has_value());
+    const auto& c2 = std::get<Column<std::int64_t>>(*r2->find("n"));
+
+    REQUIRE(c1.size() == c2.size());
+    for (std::size_t i = 0; i < c1.size(); ++i) {
+        CHECK(c1[i] == c2[i]);
+    }
+}
+
 // --- rep ---------------------------------------------------------------------
 
 TEST_CASE("rep scalar int fills table rows") {

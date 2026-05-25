@@ -117,12 +117,20 @@ EOF
         exit 1
     fi
 
+    # The runtime archive references symbols defined in the ir and core
+    # archives (e.g. ibex::ir::is_row_local_update_expr), so link all three
+    # in a group to resolve cross-archive references regardless of order.
     "$CXX" $CXXFLAGS \
         -I"$IBEX_ROOT/include" \
         -I"$IBEX_ROOT/libs/csv" \
         -I"$BUILD_DIR/_deps/fmt-src/include" \
+        -I"$BUILD_DIR/_deps/fast_float-src/include" \
         "$cpp_path" \
+        -Wl,--start-group \
         "$BUILD_DIR/src/runtime/libibex_runtime.a" \
+        "$BUILD_DIR/src/ir/libibex_ir.a" \
+        "$BUILD_DIR/src/core/libibex_core.a" \
+        -Wl,--end-group \
         "$fmt_lib" \
         -o "$bin_path"
 

@@ -43,12 +43,7 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 
 auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
                            const std::unordered_map<std::string, std::size_t>& index) -> bool {
-    for (const auto& key : keys) {
-        if (!index.contains(key.name)) {
-            return false;
-        }
-    }
-    return true;
+    return std::ranges::all_of(keys, [index](const auto& key) { return index.contains(key.name); });
 }
 
 auto ordering_keys_for_table(const Table& input, const std::vector<ir::OrderKey>& keys)
@@ -1562,7 +1557,6 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
 }
 
 namespace {
-
 auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
                        const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
                        const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
@@ -1669,7 +1663,8 @@ auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
                     std::size_t j = 0;
                     for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                    // Two-pass flat-buffer gather: compute total bytes, then bulk-memcpy slabs.
+                    // Two-pass flat-buffer gather: compute total bytes, then bulk-memcpy
+                    // slabs.
                     const uint32_t* src_off = src.offsets_data();
                     std::size_t total_chars = 0;
                     for_each_selected(
@@ -10883,8 +10878,9 @@ class ChunkedAggregateOperator final : public Operator {
                 for (std::size_t g = 0; g < n_groups_; ++g) {
                     std::uint64_t cell = 0;
                     for (std::size_t c = 0; c < n_keys; ++c) {
-                        cell += static_cast<std::uint64_t>(multi_cat_codes_flat_[g * n_keys + c]) *
-                                strides[c];
+                        cell +=
+                            static_cast<std::uint64_t>(multi_cat_codes_flat_[(g * n_keys) + c]) *
+                            strides[c];
                     }
                     multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(g));
                 }
@@ -10902,8 +10898,8 @@ class ChunkedAggregateOperator final : public Operator {
                 const std::uint64_t s0 = strides[0];
                 const std::uint64_t s1 = strides[1];
                 for (std::size_t row = 0; row < rows; ++row) {
-                    const std::uint64_t cell = static_cast<std::uint64_t>(k0[row]) * s0 +
-                                               static_cast<std::uint64_t>(k1[row]) * s1;
+                    const std::uint64_t cell = (static_cast<std::uint64_t>(k0[row]) * s0) +
+                                               (static_cast<std::uint64_t>(k1[row]) * s1);
                     auto [it, inserted] =
                         multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(n_groups_));
                     if (inserted) {
@@ -10967,7 +10963,7 @@ class ChunkedAggregateOperator final : public Operator {
         AggSlot* fs = flat_slots_.data();
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
             const auto slot_for = [&](std::uint32_t g) -> AggSlot& {
-                return fs[static_cast<std::size_t>(g) * n_aggs_ + agg_i];
+                return fs[(static_cast<std::size_t>(g) * n_aggs_) + agg_i];
             };
 
             if (plan_[agg_i].func == ir::AggFunc::Count) {
@@ -11152,7 +11148,7 @@ class ChunkedAggregateOperator final : public Operator {
                     const std::size_t n_keys = group_by_->size();
                     for (std::size_t ci = 0; ci < n_keys; ++ci) {
                         auto& cat_col = std::get<Column<Categorical>>(*out.columns[ci].column);
-                        cat_col.push_code(multi_cat_codes_flat_[g * n_keys + ci]);
+                        cat_col.push_code(multi_cat_codes_flat_[(g * n_keys) + ci]);
                     }
                 }
             } else if (str_fast_path_) {
@@ -11166,7 +11162,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
             for (std::size_t i = 0; i < aggregations_->size(); ++i) {
                 auto& column = *out.columns[group_by_->size() + i].column;
-                const AggSlot& slot = fs[g * n_aggs_ + i];
+                const AggSlot& slot = fs[(g * n_aggs_) + i];
                 if (track_validity[i] != 0U) {
                     const bool valid =
                         plan_[i].func == ir::AggFunc::Mean ? slot.count > 0 : slot.has_value;

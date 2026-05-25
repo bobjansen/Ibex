@@ -1,13 +1,9 @@
 #include <ibex/ir/builder.hpp>
 #include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/table_format.hpp>
 
 #include <fmt/format.h>
 
-#include <algorithm>
-#include <array>
-#include <charconv>
-#include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -49,114 +45,6 @@ auto to_col_refs(const std::vector<std::string>& names) -> std::vector<ir::Colum
         refs.push_back(ir::ColumnRef{.name = n});
     }
     return refs;
-}
-
-auto format_date(ibex::Date date) -> std::string {
-    using namespace std::chrono;
-    sys_days day = sys_days{days{date.days}};
-    year_month_day ymd{day};
-    return fmt::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
-                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
-}
-
-auto format_timestamp(ibex::Timestamp ts) -> std::string {
-    using namespace std::chrono;
-    sys_time<nanoseconds> tp{nanoseconds{ts.nanos}};
-    auto day = floor<days>(tp);
-    year_month_day ymd{day};
-    auto tod = tp - day;
-    hh_mm_ss<nanoseconds> hms{tod};
-    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
-                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()),
-                       hms.hours().count(), hms.minutes().count(), hms.seconds().count(),
-                       hms.subseconds().count());
-}
-
-auto normalize_float_text(std::string text) -> std::string {
-    auto trim_mantissa = [](std::string& mantissa) {
-        auto dot = mantissa.find('.');
-        if (dot != std::string::npos) {
-            while (!mantissa.empty() && mantissa.back() == '0') {
-                mantissa.pop_back();
-            }
-            if (!mantissa.empty() && mantissa.back() == '.') {
-                mantissa.pop_back();
-            }
-        }
-        if (mantissa == "-0") {
-            mantissa = "0";
-        }
-    };
-
-    auto exp_pos = text.find_first_of("eE");
-    if (exp_pos == std::string::npos) {
-        trim_mantissa(text);
-        return text;
-    }
-
-    std::string mantissa = text.substr(0, exp_pos);
-    trim_mantissa(mantissa);
-
-    std::string exponent = text.substr(exp_pos + 1);
-    char sign = '\0';
-    std::size_t idx = 0;
-    if (!exponent.empty() && (exponent[0] == '+' || exponent[0] == '-')) {
-        sign = exponent[0];
-        idx = 1;
-    }
-    while (idx < exponent.size() && exponent[idx] == '0') {
-        ++idx;
-    }
-    std::string digits = idx < exponent.size() ? exponent.substr(idx) : "0";
-
-    std::string out = std::move(mantissa);
-    out.push_back('e');
-    if (sign == '-') {
-        out.push_back('-');
-    }
-    out.append(digits);
-    return out;
-}
-
-auto format_float_mixed(double value) -> std::string {
-    if (std::isnan(value)) {
-        return "nan";
-    }
-    if (std::isinf(value)) {
-        return value > 0 ? "inf" : "-inf";
-    }
-    std::array<char, 128> buffer{};
-    auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
-                                   std::chars_format::general, 7);
-    if (ec == std::errc{}) {
-        return normalize_float_text(std::string(buffer.data(), ptr));
-    }
-    return normalize_float_text(fmt::format("{:.7g}", value));
-}
-
-auto format_value(const runtime::ColumnValue& col, std::size_t row) -> std::string {
-    // Table printer normalization:
-    // - keep temporal types human-readable,
-    // - keep NaN/Inf explicit,
-    // - avoid surprising std::to_string formatting for doubles.
-    return std::visit(
-        [row](const auto& c) -> std::string {
-            using T = typename std::decay_t<decltype(c)>::value_type;
-            if constexpr (std::is_same_v<T, std::string>) {
-                return c[row];
-            } else if constexpr (std::is_same_v<T, std::string_view>) {
-                return std::string(c[row]);
-            } else if constexpr (std::is_same_v<T, ibex::Date>) {
-                return format_date(c[row]);
-            } else if constexpr (std::is_same_v<T, ibex::Timestamp>) {
-                return format_timestamp(c[row]);
-            } else if constexpr (std::is_same_v<T, double>) {
-                return format_float_mixed(c[row]);
-            } else {
-                return std::to_string(c[row]);
-            }
-        },
-        col);
 }
 
 }  // namespace
@@ -486,57 +374,9 @@ auto join_with_predicate(const runtime::Table& left, const runtime::Table& right
 }
 
 void print(const runtime::Table& t, std::ostream& out) {
-    if (t.columns.empty()) {
-        out << "(empty table)\n";
-        return;
-    }
-
-    std::size_t rows = t.rows();
-
-    // Collect all cell strings and compute column widths.
-    std::vector<std::vector<std::string>> cells(t.columns.size());
-    std::vector<std::size_t> widths(t.columns.size());
-
-    for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        widths[c] = t.columns[c].name.size();
-        cells[c].reserve(rows);
-        for (std::size_t r = 0; r < rows; ++r) {
-            if (is_null(t.columns[c], r)) {
-                widths[c] = std::max(widths[c], std::size_t{4});  // "null"
-                cells[c].push_back("null");
-            } else {
-                auto s = format_value(*t.columns[c].column, r);
-                widths[c] = std::max(widths[c], s.size());
-                cells[c].push_back(std::move(s));
-            }
-        }
-    }
-
-    // Header row.
-    for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c > 0)
-            out << "  ";
-        out << fmt::format("{:<{}}", t.columns[c].name, widths[c]);
-    }
-    out << "\n";
-
-    // Separator.
-    for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c > 0)
-            out << "  ";
-        out << std::string(widths[c], '-');
-    }
-    out << "\n";
-
-    // Data rows.
-    for (std::size_t r = 0; r < rows; ++r) {
-        for (std::size_t c = 0; c < t.columns.size(); ++c) {
-            if (c > 0)
-                out << "  ";
-            out << fmt::format("{:<{}}", cells[c][r], widths[c]);
-        }
-        out << "\n";
-    }
+    // Delegate to the shared formatter so transpiled output is byte-identical
+    // to the interpreter REPL / ibex_eval path (capped at 10 rows like there).
+    runtime::format_table(t, out);
 }
 
 // ─── Expression builders ──────────────────────────────────────────────────────

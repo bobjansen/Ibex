@@ -91,6 +91,38 @@ jobs:
             -R '^StreamBuffered feeds a TimeBucket stream from a producer thread$' `
             --repeat until-pass:3
 
+  # LLVM Clang with -Werror — the regular legs use g++ (Linux), AppleClang
+  # (macOS) and MSVC (Windows), so clang-specific -Werror issues used to
+  # surface only in the release build (clang-18). This mirrors that toolchain
+  # and config so they're caught on PRs instead. Build-only (incl. tests):
+  # compiling under -Werror is the point; runtime is covered by the other legs.
+  clang-werror:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 cmake ninja-build
+
+      - name: Configure (mirrors the release toolchain)
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DIBEX_WARNINGS_AS_ERRORS=ON \
+            -DIBEX_ENABLE_MARCH_NATIVE=OFF \
+            -DIBEX_BUILD_TESTS=ON \
+            -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+            -DIBEX_BUILD_PARQUET=OFF
+
+      - name: Build (everything incl. tests, under -Werror)
+        run: cmake --build build --parallel
+
   clang-tidy:
     runs-on: ubuntu-24.04
     steps:

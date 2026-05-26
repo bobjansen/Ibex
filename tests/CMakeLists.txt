@@ -81,12 +81,17 @@ if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2 AND NOT MSVC)
 endif()
 
 # Catch2 uses __COUNTER__ heavily in its test macros, which Clang diagnoses as
-# a C2y extension under -Wpedantic. Keep the shared warnings for project code,
+# a C extension under -Wpedantic. Keep the shared warnings for project code,
 # but suppress this one test-framework-specific diagnostic after those flags.
+# The warning's spelling differs by Clang version — `c2x` on Clang <= 18,
+# `c2y` on newer — so pass both and tolerate whichever the compiler does not
+# recognize via -Wno-unknown-warning-option (otherwise the unknown flag is
+# fatal under -Werror, which broke the clang-18 release build).
 target_compile_options(ibex_test_warning_suppressions
     INTERFACE
-        $<$<CXX_COMPILER_ID:Clang>:-Wno-c2y-extensions>
-        $<$<CXX_COMPILER_ID:AppleClang>:-Wno-c2x-extensions>
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-unknown-warning-option>
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-c2y-extensions>
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-c2x-extensions>
         $<$<CXX_COMPILER_ID:MSVC>:/wd4459>
 )
 

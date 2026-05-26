@@ -427,7 +427,7 @@ TEST_CASE("canonicalize R17: Filter(false) becomes Head(0)", "[ir][canonicalize]
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
 }
 
-TEST_CASE("canonicalize R17: x AND true → x; NOT NOT x → x", "[ir][canonicalize]") {
+TEST_CASE("canonicalize R17: x AND true -> x; NOT NOT x -> x", "[ir][canonicalize]") {
     // (col == 5) AND true  →  col == 5
     auto eq = fexpr(
         {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(5)}});

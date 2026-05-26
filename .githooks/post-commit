@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Post-commit: informational performance check.
+#
+# This NEVER blocks and NEVER fails — the commit is already recorded by the
+# time post-commit runs. It only fires when the commit touched perf-relevant
+# code, runs the scale regression in the background against the current release
+# build, and appends a short summary to a log you can read when it finishes.
+#
+#   Skip for one commit:   IBEX_SKIP_PERF=1 git commit ...
+#   Watch results:         tail -f build-release/post_commit_perf.log
+#
+# IMPORTANT: absolute-vs-README numbers are only a coarse heads-up on a dev
+# machine (they drift with CPU load / hardware). A FAIL here is a prompt to
+# investigate, not proof of a regression — confirm with an A/B on the same
+# machine: benchmarking/compare_ibex_git.sh --base HEAD~1 --target HEAD
+
+set -uo pipefail
+
+[[ -n "${IBEX_SKIP_PERF:-}" ]] && exit 0
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+# Only run when this commit touched code that can plausibly affect runtime perf.
+if ! git diff-tree --no-commit-id --name-only -r HEAD |
+    grep -qE '^(src/runtime/|src/codegen/|src/ir/|include/)'; then
+    exit 0
+fi
+
+BENCH="$ROOT/build-release/tools/ibex_bench"
+if [[ ! -x "$BENCH" ]]; then
+    echo "[perf] build-release not built — skipping perf check" >&2
+    echo "[perf]   (cmake --build build-release, then it runs on the next commit)" >&2
+    exit 0
+fi
+
+LOG="$ROOT/build-release/post_commit_perf.log"
+COMMIT="$(git rev-parse --short HEAD)"
+SUBJECT="$(git log -1 --format=%s HEAD)"
+
+# TODO(perf-hook): this runs the full scale regression, incl. the
+# bandwidth-heavy dcast/melt benchmarks, whose absolute numbers swing widely
+# under load and produce noisy false-positive FAILs. If the FAIL line proves
+# too noisy to be useful, trim the per-commit run to the lighter suites (e.g.
+# `--ibex-suite core,multi,rng,filter`) and leave the heavy reshape benchmarks
+# to CI / the manual A/B. Kept full for now so we don't lose coverage.
+
+# Detach so the commit returns immediately; the benchmark takes ~1 minute.
+(
+    {
+        echo "=== $COMMIT  $(date -Is)  ${SUBJECT}"
+        if "$ROOT/benchmarking/run_scale_regression.sh" --iters 10 2>&1 |
+            grep -E 'FAIL|Geometric mean|passed'; then
+            :
+        fi
+        echo "    (informational — confirm any FAIL with compare_ibex_git.sh --base HEAD~1)"
+        echo
+    } >>"$LOG" 2>&1
+) &
+disown 2>/dev/null || true
+
+echo "[perf] background perf check started for $COMMIT → tail -f $LOG" >&2
+exit 0

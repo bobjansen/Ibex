@@ -29,9 +29,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 
     if(NOT IBEX_TOOLCHAIN_HAS_WORKING_STD_EXPECTED)
         message(STATUS "Ibex: enabling __cpp_concepts workaround for std::expected")
+        # Force-defining __cpp_concepts redefines a compiler builtin, which warns
+        # (-Wbuiltin-macro-redefined) and is fatal under -Werror — even when a
+        # newer Clang already defines it to the same 202002L value. Suppress just
+        # that warning so the workaround can coexist with -Werror.
         target_compile_options(ibex_compiler_options
             INTERFACE
                 -D__cpp_concepts=202002L
+                -Wno-builtin-macro-redefined
         )
     endif()
 endif()

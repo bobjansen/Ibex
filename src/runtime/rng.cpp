@@ -1,24 +1,6 @@
 #include <ibex/runtime/rng.hpp>
 
-#ifdef _MSC_VER
-#include <intrin.h>
-#endif
-
 namespace ibex::runtime {
-
-namespace {
-// Compute (a * b) >> 53 using 128-bit multiplication.
-// On GCC/Clang we use __uint128_t; on MSVC we use _umul128.
-inline auto mul_shift53(std::uint64_t a, std::uint64_t b) noexcept -> std::uint64_t {
-#ifdef _MSC_VER
-    std::uint64_t high = 0;
-    std::uint64_t low = _umul128(a, b, &high);
-    return __shiftright128(low, high, 53);
-#else
-    return static_cast<std::uint64_t>((static_cast<__uint128_t>(a) * b) >> 53);
-#endif
-}
-}  // namespace
 
 namespace {
 
@@ -58,54 +40,16 @@ void fill_exponential(double* __restrict out, std::size_t rows, double lambda) n
     g_rng_simd.fill_exponential(out, rows, lambda);
 }
 
-// The bulk int fills run a hot loop over a thread_local engine. Copy the
-// engine into a local for the duration of the fill so the optimizer can keep
-// its state in registers (a thread_local global is otherwise reloaded/stored
-// per call), then write the advanced state back. The generated sequence and
-// final engine state are identical to mutating g_rng_x4 in place, so
-// determinism is unchanged — this just recovers the speed the previous
-// inline-in-caller version had.
+// Bulk int64 fills delegate to the SIMD-dispatched zorro engine (the same one
+// that backs the double fills), so bernoulli/int are hand-vectorized rather
+// than relying on the compiler to auto-vectorize a portable loop.
 void fill_bernoulli(std::int64_t* __restrict out, std::size_t rows, double p) noexcept {
-    constexpr double kScale53 = 9007199254740992.0;  // 2^53
-    const auto threshold = static_cast<std::uint64_t>(p * kScale53);
-    auto rng4 = g_rng_x4;
-    std::size_t i = 0;
-    while (i + 4 <= rows) {
-        const auto bits = rng4();
-        out[i] = ((bits[0] >> 11) < threshold) ? 1 : 0;
-        out[i + 1] = ((bits[1] >> 11) < threshold) ? 1 : 0;
-        out[i + 2] = ((bits[2] >> 11) < threshold) ? 1 : 0;
-        out[i + 3] = ((bits[3] >> 11) < threshold) ? 1 : 0;
-        i += 4;
-    }
-    if (i < rows) {
-        const auto bits = rng4();
-        for (std::size_t lane = 0; i < rows; ++lane, ++i) {
-            out[i] = ((bits[lane] >> 11) < threshold) ? 1 : 0;
-        }
-    }
-    g_rng_x4 = rng4;
+    g_rng_simd.fill_bernoulli(out, rows, p);
 }
 
 void fill_int(std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
               std::uint64_t span) noexcept {
-    auto rng4 = g_rng_x4;
-    std::size_t i = 0;
-    while (i + 4 <= rows) {
-        const auto bits = rng4();
-        out[i] = lo + static_cast<std::int64_t>(mul_shift53(bits[0] >> 11, span));
-        out[i + 1] = lo + static_cast<std::int64_t>(mul_shift53(bits[1] >> 11, span));
-        out[i + 2] = lo + static_cast<std::int64_t>(mul_shift53(bits[2] >> 11, span));
-        out[i + 3] = lo + static_cast<std::int64_t>(mul_shift53(bits[3] >> 11, span));
-        i += 4;
-    }
-    if (i < rows) {
-        const auto bits = rng4();
-        for (std::size_t lane = 0; i < rows; ++lane, ++i) {
-            out[i] = lo + static_cast<std::int64_t>(mul_shift53(bits[lane] >> 11, span));
-        }
-    }
-    g_rng_x4 = rng4;
+    g_rng_simd.fill_int(out, rows, lo, span);
 }
 
 }  // namespace ibex::runtime

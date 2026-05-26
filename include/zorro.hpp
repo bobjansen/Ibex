@@ -128,6 +128,19 @@ inline constexpr std::uint64_t stream_offsets[4] = {
     0x6c62272e07bb0142ULL,
     0xd2a98b26625eee7bULL,
 };
+
+// Compute (a * b) >> 53 via a 128-bit product. Used to map a 53-bit uniform
+// word into [0, b) without division. __uint128_t on GCC/Clang; _umul128 on
+// MSVC (declared in <intrin.h>, pulled in via <immintrin.h> above).
+inline auto mul_shift53(std::uint64_t a, std::uint64_t b) noexcept -> std::uint64_t {
+#if defined(_MSC_VER)
+    std::uint64_t hi = 0;
+    std::uint64_t lo = _umul128(a, b, &hi);
+    return __shiftright128(lo, hi, 53);
+#else
+    return static_cast<std::uint64_t>((static_cast<unsigned __int128>(a) * b) >> 53);
+#endif
+}
 }  // namespace detail
 
 struct Xoshiro256pp_x2 {
@@ -625,6 +638,111 @@ class alignas(64) Rng {
         fill_bernoulli_avx2(out, count, threshold);
 #else
         fill_bernoulli_portable(out, count, threshold);
+#endif
+    }
+
+    // ── Bernoulli(p) → int64 (0 / 1) ─────────────────────────────────────────
+    // Compares the top 53 bits of each random word against p * 2^53. Because
+    // both operands are < 2^63 they compare correctly as signed, so no
+    // sign-flip is needed. p == 1 maps every draw to 1 (top-53 < 2^53 always).
+    void fill_bernoulli(std::int64_t* __restrict out, std::size_t count, double p) noexcept {
+        const auto threshold = static_cast<std::uint64_t>(p * 0x1.0p53);
+#if defined(__AVX2__)
+        auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
+        const __m256i thresh_vec = _mm256_set1_epi64x(static_cast<std::int64_t>(threshold));
+        const __m256i one_i = _mm256_set1_epi64x(1);
+        const auto sample = [&](__m256i r) noexcept -> __m256i {
+            return _mm256_and_si256(_mm256_cmpgt_epi64(thresh_vec, _mm256_srli_epi64(r, 11)),
+                                    one_i);
+        };
+        std::size_t i = 0;
+        while (i + 8 <= count) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i),
+                                sample(detail::next_x4_avx2(a0, a1, a2, a3)));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i + 4),
+                                sample(detail::next_x4_avx2(b0, b1, b2, b3)));
+            i += 8;
+        }
+        while (i + 4 <= count) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i),
+                                sample(detail::next_x4_avx2(a0, a1, a2, a3)));
+            i += 4;
+        }
+        if (i < count) {
+            alignas(32) std::int64_t tail[4];
+            _mm256_store_si256(reinterpret_cast<__m256i*>(tail),
+                               sample(detail::next_x4_avx2(a0, a1, a2, a3)));
+            for (std::size_t lane = 0; i < count; ++lane, ++i)
+                out[i] = tail[lane];
+        }
+        store_avx2(a0, a1, a2, a3, b0, b1, b2, b3);
+#else
+        std::uint64_t result[4];
+        std::size_t i = 0;
+        while (i + 4 <= count) {
+            next_x4_portable(result);
+            out[i] = (result[0] >> 11) < threshold ? 1 : 0;
+            out[i + 1] = (result[1] >> 11) < threshold ? 1 : 0;
+            out[i + 2] = (result[2] >> 11) < threshold ? 1 : 0;
+            out[i + 3] = (result[3] >> 11) < threshold ? 1 : 0;
+            i += 4;
+        }
+        if (i < count) {
+            next_x4_portable(result);
+            for (std::size_t lane = 0; i < count; ++lane, ++i)
+                out[i] = (result[lane] >> 11) < threshold ? 1 : 0;
+        }
+#endif
+    }
+
+    // ── Uniform integer → int64 in [lo, lo + span) ───────────────────────────
+    // span is the number of distinct values (>= 1). Each random word's top 53
+    // bits are mapped into [0, span) by multiply-shift, then offset by lo. The
+    // RNG generation (the hot part) is vectorized; the per-4 multiply-shift map
+    // is scalar, fused into the same loop to avoid a separate buffer pass.
+    void fill_int(std::int64_t* __restrict out, std::size_t count, std::int64_t lo,
+                  std::uint64_t span) noexcept {
+#if defined(__AVX2__)
+        auto [a0, a1, a2, a3, b0, b1, b2, b3] = load_avx2();
+        alignas(32) std::uint64_t w[4];
+        const auto map = [&](__m256i r, std::size_t base, std::size_t n) noexcept {
+            _mm256_store_si256(reinterpret_cast<__m256i*>(w), r);
+            for (std::size_t k = 0; k < n; ++k)
+                out[base + k] =
+                    lo + static_cast<std::int64_t>(detail::mul_shift53(w[k] >> 11, span));
+        };
+        std::size_t i = 0;
+        while (i + 8 <= count) {
+            map(detail::next_x4_avx2(a0, a1, a2, a3), i, 4);
+            map(detail::next_x4_avx2(b0, b1, b2, b3), i + 4, 4);
+            i += 8;
+        }
+        while (i + 4 <= count) {
+            map(detail::next_x4_avx2(a0, a1, a2, a3), i, 4);
+            i += 4;
+        }
+        if (i < count) {
+            map(detail::next_x4_avx2(a0, a1, a2, a3), i, count - i);
+            i = count;
+        }
+        store_avx2(a0, a1, a2, a3, b0, b1, b2, b3);
+#else
+        std::uint64_t result[4];
+        std::size_t i = 0;
+        while (i + 4 <= count) {
+            next_x4_portable(result);
+            out[i] = lo + static_cast<std::int64_t>(detail::mul_shift53(result[0] >> 11, span));
+            out[i + 1] = lo + static_cast<std::int64_t>(detail::mul_shift53(result[1] >> 11, span));
+            out[i + 2] = lo + static_cast<std::int64_t>(detail::mul_shift53(result[2] >> 11, span));
+            out[i + 3] = lo + static_cast<std::int64_t>(detail::mul_shift53(result[3] >> 11, span));
+            i += 4;
+        }
+        if (i < count) {
+            next_x4_portable(result);
+            for (std::size_t lane = 0; i < count; ++lane, ++i)
+                out[i] =
+                    lo + static_cast<std::int64_t>(detail::mul_shift53(result[lane] >> 11, span));
+        }
 #endif
     }
 

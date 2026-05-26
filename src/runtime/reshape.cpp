@@ -62,7 +62,19 @@ struct DcastKey {
     std::uint8_t n{0};
 
     auto operator==(const DcastKey& o) const noexcept -> bool {
-        return std::memcmp(v.data(), o.v.data(), n * sizeof(std::int64_t)) == 0;
+        // Element-wise rather than std::memcmp: this runs once per input row
+        // (incl. the prev-key shortcut), and a libc memcmp call for ~16 bytes
+        // is dominated by call overhead. n is small (typically 1–3), so an
+        // inlined loop of int64 compares is far cheaper.
+        if (n != o.n) {
+            return false;
+        }
+        for (std::uint8_t k = 0; k < n; ++k) {
+            if (v[k] != o.v[k]) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -954,15 +966,29 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         robin_hood::unordered_flat_map<std::string_view, std::int32_t, StringViewHash, StringViewEq>
             sv_to_code;
         sv_to_code.reserve((rows / n_pivots) + 1);
+        // Run-length shortcut: id columns are typically clustered (melt emits
+        // long runs of the same id), so reuse the previous row's code when the
+        // value repeats instead of hashing/probing the map every row.
+        std::string_view prev_sv;
+        std::int32_t prev_code = -1;
+        bool have_prev = false;
         for (std::size_t r = 0; r < rows; ++r) {
             if (is_null(input.columns[ki], r)) {
                 codes.push_back(-1);
+                have_prev = false;
                 continue;
             }
             const std::string_view sv = (*str_col)[r];
+            if (have_prev && sv == prev_sv) {
+                codes.push_back(prev_code);
+                continue;
+            }
             auto [it, inserted] =
                 sv_to_code.try_emplace(sv, static_cast<std::int32_t>(sv_to_code.size()));
             (void)inserted;
+            prev_sv = sv;
+            prev_code = it->second;
+            have_prev = true;
             codes.push_back(it->second);
         }
     }

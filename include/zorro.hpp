@@ -138,7 +138,10 @@ inline auto mul_shift53(std::uint64_t a, std::uint64_t b) noexcept -> std::uint6
     std::uint64_t lo = _umul128(a, b, &hi);
     return __shiftright128(lo, hi, 53);
 #else
-    return static_cast<std::uint64_t>((static_cast<unsigned __int128>(a) * b) >> 53);
+    // Use the predefined __uint128_t typedef rather than the `unsigned __int128`
+    // keyword form — the latter trips GCC's -Wpedantic (-Werror) in strict ISO
+    // mode, while the typedef is accepted (matching the rest of the codebase).
+    return static_cast<std::uint64_t>((static_cast<__uint128_t>(a) * b) >> 53);
 #endif
 }
 }  // namespace detail

@@ -183,6 +183,12 @@ struct Table {
     void add_column(std::string name, ColumnValue column);
     /// Add a column with an explicit validity bitmap (true = valid, false = null).
     void add_column(std::string name, ColumnValue column, ValidityBitmap validity);
+    /// Share an existing column without copying its data. Safe under the
+    /// copy-on-write invariant: shared columns are never mutated in place —
+    /// any modification reseats a fresh shared_ptr (see add_column above).
+    /// Used by zero-copy projection/rename to avoid deep-copying key columns.
+    void add_column_shared(std::string name, std::shared_ptr<ColumnValue> column,
+                           std::optional<ValidityBitmap> validity = std::nullopt);
     [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;
     [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;
     [[nodiscard]] auto find_entry(const std::string& name) const -> const ColumnEntry*;

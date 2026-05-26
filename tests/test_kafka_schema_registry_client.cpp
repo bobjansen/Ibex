@@ -18,6 +18,19 @@ TEST_CASE("Schema registry client builds schema and type URLs") {
     REQUIRE(*types_url == "http://registry:8081/schemas/types");
 }
 
+TEST_CASE("Schema registry client classifies transient failures") {
+    REQUIRE(ibex_kafka::is_transient_schema_registry_http_status(408));
+    REQUIRE(ibex_kafka::is_transient_schema_registry_http_status(429));
+    REQUIRE(ibex_kafka::is_transient_schema_registry_http_status(500));
+    REQUIRE(ibex_kafka::is_transient_schema_registry_http_status(503));
+    REQUIRE_FALSE(ibex_kafka::is_transient_schema_registry_http_status(400));
+    REQUIRE_FALSE(ibex_kafka::is_transient_schema_registry_http_status(404));
+
+    auto error = ibex_kafka::make_transient_schema_registry_error("temporary outage");
+    REQUIRE(ibex_kafka::is_transient_schema_registry_error(error));
+    REQUIRE_FALSE(ibex_kafka::is_transient_schema_registry_error("schema is invalid"));
+}
+
 TEST_CASE("Schema registry client caches schemas by id") {
     int calls = 0;
     ibex_kafka::SchemaRegistryClient client(

@@ -102,7 +102,12 @@ jobs:
           sudo apt-get install -y clang-20 clang-tidy-20 cmake ninja-build || \
           sudo apt-get install -y clang-18 clang-tidy-18 cmake ninja-build
 
-      - name: Configure
+      - name: Configure (also emits compile_commands.json)
+        # Ninja + CMAKE_EXPORT_COMPILE_COMMANDS (set in CMakeLists) writes
+        # compile_commands.json at configure time, and FetchContent populates
+        # the header-only deps (fmt/spdlog/robin_hood) here too — so no build
+        # is needed before clang-tidy. We only tidy our own src/*.cpp, which
+        # don't depend on any build-time-generated headers.
         run: |
           if command -v clang++-20 >/dev/null 2>&1; then CC=clang-20; CXX=clang++-20; else CC=clang-18; CXX=clang++-18; fi
           cmake -B build \
@@ -110,9 +115,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_COMPILER=$CC \
             -DCMAKE_CXX_COMPILER=$CXX
-
-      - name: Build (generate compile_commands.json)
-        run: cmake --build build --parallel
 
       - name: Run clang-tidy
         run: |

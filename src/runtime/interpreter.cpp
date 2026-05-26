@@ -1212,6 +1212,9 @@ auto eval_filter_int_scalar_arg(const ir::FilterExpr& expr, const Table& table,
                         }
                         return *lhs % *rhs;
                 }
+                // Unreachable for valid enum values, but MSVC (/WX) can't prove
+                // the switch is exhaustive and errors with C4715 otherwise.
+                return std::unexpected("unknown arithmetic operator in scalar argument");
             } else {
                 return std::unexpected("expected scalar argument");
             }

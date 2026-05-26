@@ -1,0 +1,86 @@
+name: perf-stats
+
+# Informational performance statistics. This NEVER gates a merge.
+#
+# Why A/B ratios instead of absolute numbers: GitHub's hosted runners vary in
+# CPU model and noisy-neighbour load, so absolute ms (and comparisons to the
+# README baseline, which was measured on a fixed machine) are not meaningful
+# here. Instead we build BOTH the base ref and the PR/HEAD on the SAME runner
+# and report the per-query speedup *ratio* — that cancels the runner's absolute
+# speed and measures only the effect of the change. Even ratios wobble on
+# shared hardware, so treat anything within ~±10% as noise.
+#
+# Triggers are deliberately conservative (manual, opt-in label, weekly) to
+# respect free-tier minutes — it builds the bench tool twice.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base git ref to compare HEAD against"
+        default: "HEAD~1"
+  pull_request:
+    types: [labeled]
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC, against the previous commit on main
+
+permissions:
+  contents: read
+
+jobs:
+  ab-compare:
+    # On PRs, only run when the 'perf' label is applied — not for every label.
+    if: github.event_name != 'pull_request' || github.event.label.name == 'perf'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history so the base ref can be built
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build python3
+
+      - name: Generate benchmark data
+        run: python3 benchmarking/data/gen_data.py --rows 1000000
+
+      - name: Determine base ref
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.base }}" ]; then
+            echo "ref=${{ github.event.inputs.base }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=HEAD~1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: A/B compare (base vs HEAD, same runner)
+        id: compare
+        continue-on-error: true
+        env:
+          CXX: clang++
+        run: |
+          set -o pipefail
+          benchmarking/compare_ibex_git.sh \
+            --base "${{ steps.base.outputs.ref }}" \
+            --target WORKTREE \
+            --ibex-suite core,multi,rng,filter \
+            --warmup 2 --iters 8 --repeats 2 \
+            2>&1 | tee perf_compare.txt || true
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "### Perf A/B — ratio vs \`${{ steps.base.outputs.ref }}\` (same runner)"
+            echo ""
+            echo "Informational only — never gates. \`speedup_x\` > 1.0 = faster;"
+            echo "treat anything within ~±10% as runner noise."
+            echo ""
+            echo '```'
+            # The summary table is the tail of the comparison output.
+            tail -n 40 perf_compare.txt 2>/dev/null || echo "(comparison produced no output — see job log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

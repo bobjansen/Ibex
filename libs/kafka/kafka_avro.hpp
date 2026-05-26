@@ -218,6 +218,211 @@ inline auto avro_to_timestamp_nanos(const avro::GenericDatum& datum, std::string
     }
 }
 
+inline auto kafka_avro_unsupported(std::string message) -> std::string {
+    return "Kafka Avro v1 does not support " + std::move(message);
+}
+
+inline auto avro_node_type_name(avro::Type type) -> std::string {
+    if (type == avro::AVRO_SYMBOLIC) {
+        return "symbolic";
+    }
+    return avro::toString(type);
+}
+
+inline auto dereference_symbolic_avro_node(const avro::NodePtr& node) -> avro::NodePtr {
+    if (node != nullptr && node->type() == avro::AVRO_SYMBOLIC && node->leaves() > 0) {
+        return node->leafAt(0);
+    }
+    return node;
+}
+
+inline auto kafka_avro_validate_flat_field(const avro::NodePtr& node, std::string_view field_name)
+    -> std::expected<void, std::string> {
+    const avro::NodePtr resolved = dereference_symbolic_avro_node(node);
+    if (resolved == nullptr) {
+        return std::unexpected(kafka_avro_unsupported(std::string("empty schema node for field '") +
+                                                      std::string(field_name) + "'"));
+    }
+
+    switch (resolved->type()) {
+        case avro::AVRO_RECORD:
+            return std::unexpected(kafka_avro_unsupported(std::string("nested record field '") +
+                                                          std::string(field_name) + "'"));
+        case avro::AVRO_ARRAY:
+            return std::unexpected(kafka_avro_unsupported(std::string("array field '") +
+                                                          std::string(field_name) + "'"));
+        case avro::AVRO_MAP:
+            return std::unexpected(
+                kafka_avro_unsupported(std::string("map field '") + std::string(field_name) + "'"));
+        case avro::AVRO_UNION:
+            return std::unexpected(
+                kafka_avro_unsupported(std::string("union field '") + std::string(field_name) +
+                                       "'; nullable unions are not supported yet"));
+        case avro::AVRO_FIXED:
+            return std::unexpected(kafka_avro_unsupported(std::string("fixed field '") +
+                                                          std::string(field_name) + "'"));
+        case avro::AVRO_BYTES:
+            return std::unexpected(kafka_avro_unsupported(std::string("bytes field '") +
+                                                          std::string(field_name) + "'"));
+        case avro::AVRO_NULL:
+            return std::unexpected(kafka_avro_unsupported(std::string("null field '") +
+                                                          std::string(field_name) + "'"));
+        default:
+            return {};
+    }
+}
+
+inline auto kafka_avro_logical_type_name(avro::LogicalType::Type type) -> std::string {
+    switch (type) {
+        case avro::LogicalType::NONE:
+            return "none";
+        case avro::LogicalType::BIG_DECIMAL:
+            return "big-decimal";
+        case avro::LogicalType::DECIMAL:
+            return "decimal";
+        case avro::LogicalType::DATE:
+            return "date";
+        case avro::LogicalType::TIME_MILLIS:
+            return "time-millis";
+        case avro::LogicalType::TIME_MICROS:
+            return "time-micros";
+        case avro::LogicalType::TIMESTAMP_MILLIS:
+            return "timestamp-millis";
+        case avro::LogicalType::TIMESTAMP_MICROS:
+            return "timestamp-micros";
+        case avro::LogicalType::TIMESTAMP_NANOS:
+            return "timestamp-nanos";
+        case avro::LogicalType::LOCAL_TIMESTAMP_MILLIS:
+            return "local-timestamp-millis";
+        case avro::LogicalType::LOCAL_TIMESTAMP_MICROS:
+            return "local-timestamp-micros";
+        case avro::LogicalType::LOCAL_TIMESTAMP_NANOS:
+            return "local-timestamp-nanos";
+        case avro::LogicalType::DURATION:
+            return "duration";
+        case avro::LogicalType::UUID:
+            return "uuid";
+        case avro::LogicalType::CUSTOM:
+            return "custom";
+    }
+    return "unknown";
+}
+
+inline auto kafka_avro_field_type_error(std::string_view field_name, std::string_view expected,
+                                        const avro::NodePtr& node)
+    -> std::expected<void, std::string> {
+    return std::unexpected("Avro field '" + std::string(field_name) + "' must be " +
+                           std::string(expected) + " for the requested Ibex schema, got " +
+                           avro_node_type_name(node->type()));
+}
+
+inline auto validate_kafka_avro_field_compatibility(const KafkaSchemaField& field,
+                                                    const avro::NodePtr& node)
+    -> std::expected<void, std::string> {
+    const avro::Type type = node->type();
+    const auto logical_type = node->logicalType().type();
+
+    switch (field.kind) {
+        case KafkaFieldKind::Int:
+            if (type != avro::AVRO_INT && type != avro::AVRO_LONG) {
+                return kafka_avro_field_type_error(field.name, "int/long", node);
+            }
+            if (logical_type != avro::LogicalType::NONE) {
+                return std::unexpected(
+                    "Avro field '" + field.name + "' has unsupported logical type '" +
+                    kafka_avro_logical_type_name(logical_type) + "' for requested Int");
+            }
+            return {};
+        case KafkaFieldKind::Double:
+            if (type != avro::AVRO_INT && type != avro::AVRO_LONG && type != avro::AVRO_FLOAT &&
+                type != avro::AVRO_DOUBLE) {
+                return kafka_avro_field_type_error(field.name, "numeric", node);
+            }
+            if (logical_type != avro::LogicalType::NONE) {
+                return std::unexpected(
+                    "Avro field '" + field.name + "' has unsupported logical type '" +
+                    kafka_avro_logical_type_name(logical_type) + "' for requested Float64");
+            }
+            return {};
+        case KafkaFieldKind::Bool:
+            if (type != avro::AVRO_BOOL) {
+                return kafka_avro_field_type_error(field.name, "boolean", node);
+            }
+            return {};
+        case KafkaFieldKind::String:
+        case KafkaFieldKind::Categorical:
+            if (type != avro::AVRO_STRING && type != avro::AVRO_ENUM) {
+                return kafka_avro_field_type_error(field.name, "string/enum", node);
+            }
+            return {};
+        case KafkaFieldKind::Date:
+            if (type != avro::AVRO_INT && type != avro::AVRO_LONG) {
+                return kafka_avro_field_type_error(field.name, "int/long days", node);
+            }
+            if (logical_type != avro::LogicalType::NONE &&
+                logical_type != avro::LogicalType::DATE) {
+                return std::unexpected(
+                    "Avro field '" + field.name + "' has unsupported logical type '" +
+                    kafka_avro_logical_type_name(logical_type) + "' for requested Date");
+            }
+            return {};
+        case KafkaFieldKind::Timestamp:
+            if (type != avro::AVRO_INT && type != avro::AVRO_LONG) {
+                return kafka_avro_field_type_error(field.name, "int/long timestamp", node);
+            }
+            switch (logical_type) {
+                case avro::LogicalType::NONE:
+                case avro::LogicalType::TIMESTAMP_MILLIS:
+                case avro::LogicalType::TIMESTAMP_MICROS:
+                case avro::LogicalType::TIMESTAMP_NANOS:
+                case avro::LogicalType::LOCAL_TIMESTAMP_MILLIS:
+                case avro::LogicalType::LOCAL_TIMESTAMP_MICROS:
+                case avro::LogicalType::LOCAL_TIMESTAMP_NANOS:
+                    return {};
+                default:
+                    return std::unexpected(
+                        "Avro field '" + field.name + "' has unsupported logical type '" +
+                        kafka_avro_logical_type_name(logical_type) + "' for requested Timestamp");
+            }
+    }
+    return {};
+}
+
+inline auto validate_kafka_avro_v1_schema(const avro::ValidSchema& writer_schema,
+                                          const std::vector<KafkaSchemaField>& requested_schema)
+    -> std::expected<void, std::string> {
+    avro::NodePtr root = dereference_symbolic_avro_node(writer_schema.root());
+    if (root == nullptr) {
+        return std::unexpected(kafka_avro_unsupported("empty writer schema"));
+    }
+    if (root->type() != avro::AVRO_RECORD) {
+        return std::unexpected(kafka_avro_unsupported(
+            std::string("top-level Avro ") + avro_node_type_name(root->type()) +
+            " schemas; the Schema Registry value schema must be a record"));
+    }
+
+    for (std::size_t i = 0; i < root->leaves(); ++i) {
+        auto valid = kafka_avro_validate_flat_field(root->leafAt(i), root->nameAt(i));
+        if (!valid) {
+            return std::unexpected(valid.error());
+        }
+    }
+
+    for (const auto& field : requested_schema) {
+        std::size_t index = 0;
+        if (!root->nameIndex(field.name, index)) {
+            return std::unexpected("Avro writer schema is missing required field '" + field.name +
+                                   "'");
+        }
+        avro::NodePtr node = dereference_symbolic_avro_node(root->leafAt(index));
+        auto compatible = validate_kafka_avro_field_compatibility(field, node);
+        if (!compatible) {
+            return std::unexpected(compatible.error());
+        }
+    }
+    return {};
+}
+
 inline auto table_from_avro_record(const avro::GenericDatum& datum,
                                    const std::vector<KafkaSchemaField>& schema)
     -> std::expected<ibex::runtime::Table, std::string> {
@@ -328,6 +533,10 @@ inline auto table_from_avro_registry_payload(std::string_view payload,
     auto writer_schema = cache.schema_by_id(wire->schema_id);
     if (!writer_schema) {
         return std::unexpected(writer_schema.error());
+    }
+    auto valid_schema = validate_kafka_avro_v1_schema(**writer_schema, schema);
+    if (!valid_schema) {
+        return std::unexpected(valid_schema.error());
     }
 
     try {

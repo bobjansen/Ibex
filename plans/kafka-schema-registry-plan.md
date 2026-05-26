@@ -1,7 +1,7 @@
 # Kafka Schema Registry Plan
 
-This is the concrete follow-on plan for extending the current JSON-only Kafka
-plugin to support Avro and Protobuf payloads through Redpanda Schema Registry.
+This is the concrete follow-on plan for finishing Schema Registry-backed Avro
+support in the Kafka plugin.
 
 ## Goal
 
@@ -12,7 +12,7 @@ Keep the existing demo shape:
 - Ibex transforms the stream
 - Ibex pushes results to WebSocket dashboards
 
-But replace JSON payloads with Schema Registry-backed Avro and Protobuf.
+But add a Schema Registry-backed Avro path alongside the existing JSON path.
 
 ## Scope decisions
 
@@ -21,6 +21,8 @@ But replace JSON payloads with Schema Registry-backed Avro and Protobuf.
 - Flat-record support first.
 - No nested/repeated/union-heavy generality in v1.
 - Keep the current JSON path intact.
+- Shelve Protobuf for now; do not spend implementation effort on it until Avro
+  is hardened and there is a concrete user need.
 
 ## Work items
 
@@ -35,7 +37,7 @@ But replace JSON payloads with Schema Registry-backed Avro and Protobuf.
 
 - [x] Add a small HTTP client layer for Schema Registry lookups.
 - [x] Cache schema lookups by schema id.
-- [ ] Handle transient registry errors without killing long-lived stream jobs.
+- [x] Handle transient registry errors without killing long-lived stream jobs.
 
 ### Phase 3: Avro v1
 
@@ -43,26 +45,25 @@ But replace JSON payloads with Schema Registry-backed Avro and Protobuf.
 - [x] Add `kafka_recv_avro(...)`.
 - [x] Decode flat Avro records from Schema Registry-backed Kafka messages.
 - [x] Map Avro scalars/logical timestamps/dates into Ibex columns.
-- [ ] Reject unsupported Avro features with clear runtime errors.
-- [ ] Add Avro-focused tests and one live demo producer path.
+- [x] Add Avro-focused tests.
+- [x] Add one live Avro demo producer path.
+- [x] Reject unsupported Avro features with clear runtime errors.
+- [ ] Re-run and document the end-to-end Avro demo after the final hardening pass.
 
-### Phase 4: Protobuf v1
+### Phase 4: Protobuf v1 - shelved
 
-- [ ] Add `kafka_recv_protobuf(...)`.
-- [ ] Decode flat Protobuf messages from Schema Registry-backed Kafka messages.
-- [ ] Support explicit message type selection when needed.
-- [ ] Map enums/logical scalars into Ibex columns.
-- [ ] Reject nested/repeated/oneof-heavy cases in v1.
-- [ ] Add Protobuf-focused tests and one live demo producer path.
+No active work. Revisit only after Avro is stable and there is a specific
+use case that justifies adding a second Schema Registry payload decoder.
 
 ### Phase 5: docs and demo polish
 
-- [ ] Extend the Kafka/Redpanda website docs with Avro/Protobuf examples.
-- [ ] Add terminal viewers / dashboard notes for the Avro/Protobuf demo path.
-- [ ] Document the supported type subset and explicit v1 limitations.
+- [x] Extend the Kafka/Redpanda website docs with Avro examples.
+- [x] Add terminal viewers / dashboard notes for the Avro demo path.
+- [x] Document the supported type subset and explicit v1 limitations.
+- [ ] Remove or rewrite any remaining wording that implies Protobuf is part of
+  the current plan.
 
 ## Suggested order
 
-1. Finish the shared registry/wire scaffolding.
-2. Build Avro end-to-end first.
-3. Reuse the same transport/registry path for Protobuf.
+1. Re-run the JSON and Avro dashboard demos end to end.
+2. Clean up remaining Protobuf-forward wording so the docs reflect the shelved scope.

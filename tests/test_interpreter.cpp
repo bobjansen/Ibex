@@ -3829,6 +3829,47 @@ TEST_CASE("reseed produces identical rand_int sequence") {
     }
 }
 
+TEST_CASE("Two-key categorical group-by spills to hash above the dense limit") {
+    // The chunked aggregator uses a dense Cartesian-cell array for multi-key
+    // categorical grouping while dict0 * dict1 stays under 4M cells, and spills
+    // to a hash map beyond that. Build two categorical keys with 2100 distinct
+    // values each (2100^2 ≈ 4.41M > 4M) to exercise the spill path, with every
+    // group appearing exactly twice so the answer is easy to verify.
+    constexpr int kDistinct = 2100;
+    std::vector<std::string> dict_a;
+    std::vector<std::string> dict_b;
+    dict_a.reserve(kDistinct);
+    dict_b.reserve(kDistinct);
+    for (int i = 0; i < kDistinct; ++i) {
+        dict_a.push_back("a" + std::to_string(i));
+        dict_b.push_back("b" + std::to_string(i));
+    }
+    Column<Categorical> a(dict_a);
+    Column<Categorical> b(dict_b);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < kDistinct; ++i) {
+            a.push_code(static_cast<Column<Categorical>::code_type>(i));
+            b.push_code(static_cast<Column<Categorical>::code_type>(i));
+        }
+    }
+
+    runtime::Table table;
+    table.add_column("a", std::move(a));
+    table.add_column("b", std::move(b));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { n = count() }, by {a, b}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& counts = std::get<Column<std::int64_t>>(*result->find("n"));
+    REQUIRE(counts.size() == static_cast<std::size_t>(kDistinct));
+    for (std::size_t g = 0; g < counts.size(); ++g) {
+        CHECK(counts[g] == 2);
+    }
+}
+
 // --- rep ---------------------------------------------------------------------
 
 TEST_CASE("rep scalar int fills table rows") {

@@ -117,3 +117,96 @@ TEST_CASE("Kafka Avro payload decodes flat schema-registry-framed records") {
     REQUIRE((*size)[0] == 42);
     REQUIRE((*active)[0]);
 }
+
+TEST_CASE("Kafka Avro payload preserves transient registry failures") {
+    ibex_kafka::AvroSchemaCache cache(
+        "http://registry:8081", {},
+        [](std::string_view) -> std::expected<std::string, std::string> {
+            return std::unexpected(
+                ibex_kafka::make_transient_schema_registry_error("registry unavailable"));
+        });
+
+    const std::string payload = make_wire_payload(17, "not decoded before schema lookup");
+    auto table = ibex_kafka::table_from_avro_registry_payload(
+        payload,
+        {
+            {.name = "ts", .kind = ibex_kafka::KafkaFieldKind::Timestamp},
+        },
+        cache);
+
+    REQUIRE_FALSE(table);
+    REQUIRE(ibex_kafka::is_transient_schema_registry_error(table.error()));
+}
+
+TEST_CASE("Kafka Avro v1 schema validator rejects unsupported shapes clearly") {
+    SECTION("top-level non-record schema") {
+        auto schema = avro::compileJsonSchemaFromString(R"({
+          "type":"array",
+          "items":"long"
+        })");
+        auto valid = ibex_kafka::validate_kafka_avro_v1_schema(schema, {});
+        REQUIRE_FALSE(valid);
+        REQUIRE(valid.error().find("top-level Avro array schemas") != std::string::npos);
+    }
+
+    SECTION("array field") {
+        auto schema = avro::compileJsonSchemaFromString(R"({
+          "type":"record",
+          "name":"tick",
+          "fields":[{"name":"tags","type":{"type":"array","items":"string"}}]
+        })");
+        auto valid = ibex_kafka::validate_kafka_avro_v1_schema(
+            schema, {{.name = "tags", .kind = ibex_kafka::KafkaFieldKind::String}});
+        REQUIRE_FALSE(valid);
+        REQUIRE(valid.error().find("array field 'tags'") != std::string::npos);
+    }
+
+    SECTION("nullable union field") {
+        auto schema = avro::compileJsonSchemaFromString(R"({
+          "type":"record",
+          "name":"tick",
+          "fields":[{"name":"size","type":["null","long"]}]
+        })");
+        auto valid = ibex_kafka::validate_kafka_avro_v1_schema(
+            schema, {{.name = "size", .kind = ibex_kafka::KafkaFieldKind::Int}});
+        REQUIRE_FALSE(valid);
+        REQUIRE(valid.error().find("union field 'size'") != std::string::npos);
+        REQUIRE(valid.error().find("nullable unions are not supported yet") != std::string::npos);
+    }
+
+    SECTION("missing requested field") {
+        auto schema = avro::compileJsonSchemaFromString(R"({
+          "type":"record",
+          "name":"tick",
+          "fields":[{"name":"price","type":"double"}]
+        })");
+        auto valid = ibex_kafka::validate_kafka_avro_v1_schema(
+            schema, {{.name = "size", .kind = ibex_kafka::KafkaFieldKind::Int}});
+        REQUIRE_FALSE(valid);
+        REQUIRE(valid.error().find("missing required field 'size'") != std::string::npos);
+    }
+
+    SECTION("field type mismatch") {
+        auto schema = avro::compileJsonSchemaFromString(R"({
+          "type":"record",
+          "name":"tick",
+          "fields":[{"name":"price","type":"string"}]
+        })");
+        auto valid = ibex_kafka::validate_kafka_avro_v1_schema(
+            schema, {{.name = "price", .kind = ibex_kafka::KafkaFieldKind::Double}});
+        REQUIRE_FALSE(valid);
+        REQUIRE(valid.error().find("must be numeric") != std::string::npos);
+    }
+
+    SECTION("unsupported logical type for requested timestamp") {
+        auto schema = avro::compileJsonSchemaFromString(R"({
+          "type":"record",
+          "name":"tick",
+          "fields":[{"name":"ts","type":{"type":"int","logicalType":"time-millis"}}]
+        })");
+        auto valid = ibex_kafka::validate_kafka_avro_v1_schema(
+            schema, {{.name = "ts", .kind = ibex_kafka::KafkaFieldKind::Timestamp}});
+        REQUIRE_FALSE(valid);
+        REQUIRE(valid.error().find("unsupported logical type 'time-millis'") != std::string::npos);
+    }
+}

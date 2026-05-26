@@ -55,6 +55,7 @@ struct AvroConsumerState {
     std::vector<KafkaSchemaField> schema;
     int poll_timeout_ms = 200;
     rd_kafka_message_t* pending_commit = nullptr;
+    rd_kafka_message_t* pending_decode = nullptr;
     AvroSchemaCache schema_cache;
 
     explicit AvroConsumerState(std::string registry_url, SchemaRegistryClientOptions options)
@@ -66,6 +67,9 @@ struct AvroConsumerState {
     ~AvroConsumerState() {
         if (pending_commit != nullptr) {
             rd_kafka_message_destroy(pending_commit);
+        }
+        if (pending_decode != nullptr) {
+            rd_kafka_message_destroy(pending_decode);
         }
         if (consumer != nullptr) {
             rd_kafka_consumer_close(consumer);
@@ -429,25 +433,33 @@ inline auto kafka_recv_avro(const std::string& brokers, const std::string& topic
         }
     }
 
-    rd_kafka_message_t* message = rd_kafka_consumer_poll(state->consumer, state->poll_timeout_ms);
+    rd_kafka_message_t* message = state->pending_decode;
+    state->pending_decode = nullptr;
     if (message == nullptr) {
-        return ibex::runtime::ExternValue{ibex::runtime::StreamTimeout{}};
-    }
-
-    if (message->err != RD_KAFKA_RESP_ERR_NO_ERROR) {
-        const rd_kafka_resp_err_t err = message->err;
-        rd_kafka_message_destroy(message);
-        if (err == RD_KAFKA_RESP_ERR__PARTITION_EOF ||
-            err == RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) {
+        message = rd_kafka_consumer_poll(state->consumer, state->poll_timeout_ms);
+        if (message == nullptr) {
             return ibex::runtime::ExternValue{ibex::runtime::StreamTimeout{}};
         }
-        return std::unexpected("kafka_recv_avro poll failed: " +
-                               std::string(rd_kafka_err2str(err)));
+
+        if (message->err != RD_KAFKA_RESP_ERR_NO_ERROR) {
+            const rd_kafka_resp_err_t err = message->err;
+            rd_kafka_message_destroy(message);
+            if (err == RD_KAFKA_RESP_ERR__PARTITION_EOF ||
+                err == RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) {
+                return ibex::runtime::ExternValue{ibex::runtime::StreamTimeout{}};
+            }
+            return std::unexpected("kafka_recv_avro poll failed: " +
+                                   std::string(rd_kafka_err2str(err)));
+        }
     }
 
     std::string_view payload(static_cast<const char*>(message->payload), message->len);
     auto table = table_from_avro_registry_payload(payload, state->schema, state->schema_cache);
     if (!table) {
+        if (is_transient_schema_registry_error(table.error())) {
+            state->pending_decode = message;
+            return ibex::runtime::ExternValue{ibex::runtime::StreamTimeout{}};
+        }
         rd_kafka_message_destroy(message);
         return std::unexpected(table.error());
     }

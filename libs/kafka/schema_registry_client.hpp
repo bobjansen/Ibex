@@ -23,6 +23,21 @@ struct SchemaRegistryClientOptions {
     long request_timeout_ms = 5000;
 };
 
+inline constexpr std::string_view transient_schema_registry_error_prefix =
+    "transient schema registry error: ";
+
+inline auto make_transient_schema_registry_error(std::string message) -> std::string {
+    return std::string(transient_schema_registry_error_prefix) + std::move(message);
+}
+
+inline auto is_transient_schema_registry_error(std::string_view message) -> bool {
+    return message.rfind(transient_schema_registry_error_prefix, 0) == 0;
+}
+
+inline auto is_transient_schema_registry_http_status(long status) -> bool {
+    return status == 408 || status == 425 || status == 429 || (status >= 500 && status <= 599);
+}
+
 inline auto trim_registry_url(std::string_view text) -> std::string_view {
     while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0) {
         text.remove_prefix(1);
@@ -67,6 +82,20 @@ inline auto schema_registry_supported_types_url(std::string_view base_url)
 }
 
 #if defined(IBEX_KAFKA_ENABLE_CURL)
+inline auto is_transient_schema_registry_curl_error(CURLcode rc) -> bool {
+    switch (rc) {
+        case CURLE_COULDNT_RESOLVE_HOST:
+        case CURLE_COULDNT_CONNECT:
+        case CURLE_OPERATION_TIMEDOUT:
+        case CURLE_SEND_ERROR:
+        case CURLE_RECV_ERROR:
+        case CURLE_GOT_NOTHING:
+            return true;
+        default:
+            return false;
+    }
+}
+
 inline auto curl_schema_registry_write(char* ptr, std::size_t size, std::size_t nmemb,
                                        void* userdata) -> std::size_t {
     auto* out = static_cast<std::string*>(userdata);
@@ -110,6 +139,10 @@ inline auto curl_schema_registry_get(std::string_view url,
         error += ": ";
         error += curl_easy_strerror(rc);
         curl_easy_cleanup(curl);
+        if (is_transient_schema_registry_http_status(status) ||
+            is_transient_schema_registry_curl_error(rc)) {
+            return std::unexpected(make_transient_schema_registry_error(std::move(error)));
+        }
         return std::unexpected(error);
     }
 

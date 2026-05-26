@@ -1764,10 +1764,10 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
             return std::unexpected("select column not found: " + col.name +
                                    " (available: " + format_columns(input) + ")");
         }
-        output.add_column(col.name, *entry->column);
-        if (entry->validity.has_value()) {
-            output.columns.back().validity = entry->validity;
-        }
+        // Share the column's shared_ptr instead of deep-copying its data. The
+        // projected table is a read-only selection; under copy-on-write any
+        // later mutation reseats a fresh column, so sharing is safe.
+        output.add_column_shared(col.name, entry->column, entry->validity);
     }
     if (input.ordering.has_value() && ordering_keys_present(*input.ordering, output.index)) {
         output.ordering = input.ordering;
@@ -1801,10 +1801,8 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
     for (const auto& entry : input.columns) {
         auto it = rename_map.find(entry.name);
         const std::string& out_name = (it != rename_map.end()) ? it->second : entry.name;
-        output.add_column(out_name, *entry.column);
-        if (entry.validity.has_value()) {
-            output.columns.back().validity = entry.validity;
-        }
+        // Rename only relabels columns; share the data rather than copying it.
+        output.add_column_shared(out_name, entry.column, entry.validity);
     }
 
     if (input.ordering.has_value()) {
@@ -7927,6 +7925,18 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
                                   .validity = std::move(validity)});
     index[columns.back().name] = pos;
 }
+void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> column,
+                              std::optional<ValidityBitmap> validity) {
+    if (auto it = index.find(name); it != index.end()) {
+        columns[it->second].column = std::move(column);
+        columns[it->second].validity = std::move(validity);
+        return;
+    }
+    std::size_t pos = columns.size();
+    columns.push_back(ColumnEntry{
+        .name = std::move(name), .column = std::move(column), .validity = std::move(validity)});
+    index[columns.back().name] = pos;
+}
 
 auto Table::find_entry(const std::string& name) const -> const ColumnEntry* {
     if (auto it = index.find(name); it != index.end()) {
@@ -10837,20 +10847,28 @@ class ChunkedAggregateOperator final : public Operator {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
         if (single_key) {
+            // A Categorical code is already a dense index into [0, dict_size),
+            // so map code → gid with a direct array instead of hashing. Dicts
+            // only grow and never reorder across chunks, so existing gids stay
+            // valid and new dict entries just extend the array with sentinels.
             const auto* codes = cat_cols[0]->codes_data();
+            const std::size_t dict_size = cat_cols[0]->dictionary().size();
+            if (cat_dense_gid_.size() < dict_size) {
+                cat_dense_gid_.resize(dict_size, kNoGid);
+            }
+            std::uint32_t* dense = cat_dense_gid_.data();
             for (std::size_t row = 0; row < rows; ++row) {
                 const auto code = codes[row];
-                auto [it, inserted] = cat_index_.emplace(code, n_groups_);
-                if (inserted) {
+                std::uint32_t gid = dense[code];
+                if (gid == kNoGid) {
+                    gid = alloc_group();
+                    dense[code] = gid;
                     cat_order_.push_back(code);
-                    gids[row] = alloc_group();
-                } else {
-                    gids[row] = static_cast<std::uint32_t>(it->second);
                 }
+                gids[row] = gid;
             }
         } else {
-            // Multi-key: encode each row as a uint64_t Cartesian cell so we
-            // avoid heap-allocating a CatKey (with its inner vector) per row.
+            // Multi-key: encode each row as a uint64_t Cartesian cell.
             // Strides may grow across chunks if a chunk introduces new dict
             // entries; we recompute per chunk and rebuild the index when that
             // happens (rare — Categorical dicts are usually stable).
@@ -10862,29 +10880,14 @@ class ChunkedAggregateOperator final : public Operator {
             }
             // Strides: cell = c0*s0 + c1*s1 + … with s_{n-1} = 1.
             std::vector<std::uint64_t> strides(n_keys);
+            std::uint64_t total_cells = 1;
             {
                 std::uint64_t s = 1;
                 for (int ci = static_cast<int>(n_keys) - 1; ci >= 0; --ci) {
                     strides[static_cast<std::size_t>(ci)] = s;
                     s *= dict_sizes[static_cast<std::size_t>(ci)];
                 }
-            }
-
-            // If strides changed since last chunk (new dict entries), rebuild
-            // multi_cat_cell_index_ from multi_cat_codes_flat_ using new strides.
-            if (multi_cat_strides_ != strides) {
-                multi_cat_cell_index_.clear();
-                multi_cat_cell_index_.reserve(n_groups_);
-                for (std::size_t g = 0; g < n_groups_; ++g) {
-                    std::uint64_t cell = 0;
-                    for (std::size_t c = 0; c < n_keys; ++c) {
-                        cell +=
-                            static_cast<std::uint64_t>(multi_cat_codes_flat_[(g * n_keys) + c]) *
-                            strides[c];
-                    }
-                    multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(g));
-                }
-                multi_cat_strides_ = strides;
+                total_cells = s;
             }
 
             // Hoist raw code pointers out of the row loop.
@@ -10892,37 +10895,90 @@ class ChunkedAggregateOperator final : public Operator {
             for (std::size_t c = 0; c < n_keys; ++c)
                 raws[c] = cat_cols[c]->codes_data();
 
-            if (n_keys == 2) {
-                const auto* k0 = raws[0];
-                const auto* k1 = raws[1];
-                const std::uint64_t s0 = strides[0];
-                const std::uint64_t s1 = strides[1];
-                for (std::size_t row = 0; row < rows; ++row) {
-                    const std::uint64_t cell = (static_cast<std::uint64_t>(k0[row]) * s0) +
-                                               (static_cast<std::uint64_t>(k1[row]) * s1);
-                    auto [it, inserted] =
-                        multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(n_groups_));
-                    if (inserted) {
-                        multi_cat_codes_flat_.push_back(k0[row]);
-                        multi_cat_codes_flat_.push_back(k1[row]);
-                        gids[row] = alloc_group();
-                    } else {
-                        gids[row] = it->second;
+            const auto cell_of_group = [&](std::size_t g) -> std::uint64_t {
+                std::uint64_t cell = 0;
+                for (std::size_t c = 0; c < n_keys; ++c) {
+                    cell += static_cast<std::uint64_t>(multi_cat_codes_flat_[(g * n_keys) + c]) *
+                            strides[c];
+                }
+                return cell;
+            };
+            const auto new_group = [&](std::size_t row) -> std::uint32_t {
+                for (std::size_t c = 0; c < n_keys; ++c)
+                    multi_cat_codes_flat_.push_back(raws[c][row]);
+                return alloc_group();
+            };
+
+            // When the Cartesian cell space is bounded, index a dense array
+            // (one load per row, no hashing). If a later chunk grows the dicts
+            // past the limit, migrate existing groups into the hash map once
+            // and stay there — dicts only grow, so total_cells never shrinks.
+            if (multi_dense_ && total_cells > kDenseCellLimit) {
+                multi_cat_cell_index_.clear();
+                multi_cat_cell_index_.reserve(n_groups_);
+                for (std::size_t g = 0; g < n_groups_; ++g)
+                    multi_cat_cell_index_.emplace(cell_of_group(g), static_cast<std::uint32_t>(g));
+                std::vector<std::uint32_t>().swap(multi_cat_cell_dense_);
+                multi_dense_ = false;
+                multi_cat_strides_ = strides;
+            }
+
+            if (multi_dense_) {
+                // Rebuild the dense array when strides change (new dict entries).
+                if (multi_cat_strides_ != strides) {
+                    multi_cat_cell_dense_.assign(static_cast<std::size_t>(total_cells), kNoGid);
+                    for (std::size_t g = 0; g < n_groups_; ++g)
+                        multi_cat_cell_dense_[cell_of_group(g)] = static_cast<std::uint32_t>(g);
+                    multi_cat_strides_ = strides;
+                }
+                std::uint32_t* dense = multi_cat_cell_dense_.data();
+                if (n_keys == 2) {
+                    const auto* k0 = raws[0];
+                    const auto* k1 = raws[1];
+                    const std::uint64_t s0 = strides[0];
+                    const std::uint64_t s1 = strides[1];
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        const std::uint64_t cell = (static_cast<std::uint64_t>(k0[row]) * s0) +
+                                                   (static_cast<std::uint64_t>(k1[row]) * s1);
+                        std::uint32_t gid = dense[cell];
+                        if (gid == kNoGid) {
+                            gid = new_group(row);
+                            dense[cell] = gid;
+                        }
+                        gids[row] = gid;
+                    }
+                } else {
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        std::uint64_t cell = 0;
+                        for (std::size_t c = 0; c < n_keys; ++c)
+                            cell += static_cast<std::uint64_t>(raws[c][row]) * strides[c];
+                        std::uint32_t gid = dense[cell];
+                        if (gid == kNoGid) {
+                            gid = new_group(row);
+                            dense[cell] = gid;
+                        }
+                        gids[row] = gid;
                     }
                 }
             } else {
+                // Hash fallback for unbounded cell spaces. Rebuild on stride
+                // change (new dict entries) just like the dense path.
+                if (multi_cat_strides_ != strides) {
+                    multi_cat_cell_index_.clear();
+                    multi_cat_cell_index_.reserve(n_groups_);
+                    for (std::size_t g = 0; g < n_groups_; ++g)
+                        multi_cat_cell_index_.emplace(cell_of_group(g),
+                                                      static_cast<std::uint32_t>(g));
+                    multi_cat_strides_ = strides;
+                }
                 for (std::size_t row = 0; row < rows; ++row) {
                     std::uint64_t cell = 0;
-                    for (std::size_t c = 0; c < n_keys; ++c) {
+                    for (std::size_t c = 0; c < n_keys; ++c)
                         cell += static_cast<std::uint64_t>(raws[c][row]) * strides[c];
-                    }
                     auto [it, inserted] =
                         multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(n_groups_));
                     if (inserted) {
-                        for (std::size_t c = 0; c < n_keys; ++c) {
-                            multi_cat_codes_flat_.push_back(raws[c][row]);
-                        }
-                        gids[row] = alloc_group();
+                        gids[row] = new_group(row);
                     } else {
                         gids[row] = it->second;
                     }
@@ -11278,12 +11334,22 @@ class ChunkedAggregateOperator final : public Operator {
     robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> index_;
     std::vector<Key> group_order_;
 
-    // Single-Categorical fast path.
+    // Sentinel for "no group assigned yet" in the dense index arrays.
+    static constexpr std::uint32_t kNoGid = std::numeric_limits<std::uint32_t>::max();
+    // Cartesian cell-space size below which multi-key grouping uses a dense
+    // array (one load per row) instead of hashing. 4M cells = 16 MB of u32.
+    static constexpr std::uint64_t kDenseCellLimit = 4'000'000ULL;
+
+    // Single-Categorical fast path: code → gid via direct array (codes are a
+    // dense [0, dict_size) index, so no hashing is needed).
     using cat_code = Column<Categorical>::code_type;
-    robin_hood::unordered_flat_map<cat_code, std::size_t> cat_index_;
+    std::vector<std::uint32_t> cat_dense_gid_;
     std::vector<cat_code> cat_order_;
 
-    // Multi-Categorical fast path: cell-encoded.
+    // Multi-Categorical fast path: cell-encoded. Dense array while the cell
+    // space stays under kDenseCellLimit; spills to the hash map otherwise.
+    bool multi_dense_ = true;
+    std::vector<std::uint32_t> multi_cat_cell_dense_;
     robin_hood::unordered_flat_map<std::uint64_t, std::uint32_t> multi_cat_cell_index_;
     std::vector<Column<Categorical>::code_type> multi_cat_codes_flat_;  // n_groups_ × n_keys
     std::vector<std::uint64_t> multi_cat_strides_;  // last-seen strides for rebuild detection

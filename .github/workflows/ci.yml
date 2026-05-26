@@ -117,8 +117,12 @@ jobs:
       - name: Run clang-tidy
         run: |
           if command -v clang-tidy-20 >/dev/null 2>&1; then TIDY=clang-tidy-20; else TIDY=clang-tidy-18; fi
-          find src include -name '*.cpp' -o -name '*.hpp' | \
-            xargs $TIDY -p build
+          # Run one clang-tidy process per core. Analyze only our .cpp TUs;
+          # headers are covered transitively via the TUs that include them, so
+          # tidying *.hpp standalone is redundant (and was a big chunk of the
+          # runtime). -n1 so each file is its own job for -P to parallelize.
+          find src -name '*.cpp' -print0 | \
+            xargs -0 -P "$(nproc)" -n1 "$TIDY" -p build
 
   format-check:
     runs-on: ubuntu-24.04

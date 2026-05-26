@@ -14,6 +14,9 @@
 #include <array>
 #include <cctype>
 #include <cfenv>
+#include <charconv>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #ifdef _WIN32

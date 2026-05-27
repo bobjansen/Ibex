@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Pre-push: structural fusion-invariant gate.
+#
+# Mirrors the "Fusion invariants" step in CI's clang-werror leg, but runs
+# BEFORE the push completes. On a direct-to-main workflow CI only catches a
+# regression *after* the commit has landed; this hook prevents it reaching
+# main in the first place.
+#
+# It BLOCKS the push (exit non-zero) when a fused query has stopped beating its
+# un-fused baseline by the expected ratio — i.e. a canonicalize rule (e.g. R16
+# TopK) or an operator-selection path regressed and we silently fell back to a
+# slower plan. The guard compares RATIOS between related cases, which are
+# intrinsic to the algorithm (full sort O(n log n) vs heap-select O(n log k)),
+# so they hold on a dev machine despite background load.
+#
+#   Skip for one push:   IBEX_SKIP_FUSION_CHECK=1 git push
+#
+# The check needs an OPTIMIZED build: in Debug the per-element overhead swamps
+# the algorithmic gap and the ratios collapse, so it runs the existing
+# build-release/ binary and does not rebuild.
+
+set -uo pipefail
+
+[[ -n "${IBEX_SKIP_FUSION_CHECK:-}" ]] && exit 0
+
+ROOT="$(git rev-parse --show-toplevel)"
+ZERO="0000000000000000000000000000000000000000"
+
+# Run only when a commit being pushed touches code that could affect fusion.
+# Pre-push feeds "<local_ref> <local_oid> <remote_ref> <remote_oid>" on stdin.
+RELEVANT_RE='^(src/runtime/|src/codegen/|src/ir/|include/ibex/|tools/ibex_fusion_bench)'
+relevant=0
+saw_line=0
+while read -r _local_ref local_oid _remote_ref remote_oid; do
+    saw_line=1
+    [[ "$local_oid" == "$ZERO" ]] && continue # branch deletion: nothing to check
+    if [[ "$remote_oid" == "$ZERO" ]]; then
+        relevant=1 # new ref on the remote — can't diff, so check to be safe
+        continue
+    fi
+    if diff_out="$(git diff --name-only "$remote_oid" "$local_oid" 2>/dev/null)"; then
+        grep -qE "$RELEVANT_RE" <<<"$diff_out" && relevant=1
+    else
+        relevant=1 # couldn't compute the range; fail safe toward running
+    fi
+done
+
+# No stdin (e.g. invoked by hand) → run anyway.
+[[ "$saw_line" -eq 0 ]] && relevant=1
+[[ "$relevant" -eq 0 ]] && exit 0
+
+BENCH="$ROOT/build-release/tools/ibex_fusion_bench"
+if [[ ! -x "$BENCH" ]]; then
+    echo "[fusion] build-release not built — skipping the fusion gate (push allowed)." >&2
+    echo "[fusion]   Build it so this gate can run:" >&2
+    echo "[fusion]     cmake --build build-release --target ibex_fusion_bench" >&2
+    echo "[fusion]   CI's clang-werror leg still checks this, post-push." >&2
+    exit 0
+fi
+
+# Heads-up when the binary predates tracked source: the check may not reflect
+# what you're about to push.
+if find "$ROOT/src" "$ROOT/include" "$ROOT/tools/ibex_fusion_bench.cpp" \
+    -type f -newer "$BENCH" 2>/dev/null | grep -q .; then
+    echo "[fusion] note: build-release looks older than source — rebuild for an accurate check:" >&2
+    echo "[fusion]   cmake --build build-release --target ibex_fusion_bench" >&2
+fi
+
+echo "[fusion] checking fusion invariants (build-release)…" >&2
+out="$("$BENCH" --check --rows 500000 --iters 3 --warmup 1 2>&1)"
+status=$?
+if [[ "$status" -eq 0 ]]; then
+    grep -E 'PASS|guard\(s\) failed' <<<"$out" >&2
+    exit 0
+fi
+
+echo "$out" >&2
+echo >&2
+echo "[fusion] PUSH BLOCKED: a fusion invariant regressed (see FAIL lines above)." >&2
+echo "[fusion] A fused query stopped beating its baseline — likely a canonicalize" >&2
+echo "[fusion] rule (e.g. R16 TopK) or an operator-selection path no longer fires." >&2
+echo "[fusion] If the change is intentional, update the guards in" >&2
+echo "[fusion] tools/ibex_fusion_bench.cpp, or bypass once with:" >&2
+echo "[fusion]   IBEX_SKIP_FUSION_CHECK=1 git push" >&2
+exit 1

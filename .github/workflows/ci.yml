@@ -123,6 +123,17 @@ jobs:
       - name: Build (everything incl. tests, under -Werror)
         run: cmake --build build --parallel
 
+      # Structural fusion guard. This is the only Release build on a PR, and the
+      # invariant only holds with optimization on (in Debug the per-element
+      # overhead swamps the O(n log k) vs O(n log n) gap), so it lives here. The
+      # check asserts ratios between related cases (fused vs un-fused baseline),
+      # which cancel hosted-runner speed — a failure means a fusion stopped
+      # firing (e.g. canonicalize R16 regressed), not a perf wobble. Unlike
+      # perf-stats.yml, this one *gates*, because it guards correctness of
+      # operator selection, not a tuning target.
+      - name: Fusion invariants
+        run: ./build/tools/ibex_fusion_bench --check --rows 500000 --iters 3 --warmup 1
+
   clang-tidy:
     runs-on: ubuntu-24.04
     steps:

@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <random>
 #include <string>
 #include <vector>
@@ -60,7 +61,8 @@ auto make_wide_table(std::size_t rows, std::size_t n_cols, std::uint64_t seed)
 }
 
 auto run(const std::string& name, const std::string& src,
-         const ibex::runtime::TableRegistry& tables, std::size_t warmup, std::size_t iters) -> int {
+         const ibex::runtime::TableRegistry& tables, std::size_t warmup, std::size_t iters,
+         std::map<std::string, double>* mins) -> int {
     std::string normalized = src;
     if (normalized.empty() || normalized.back() != ';') {
         normalized.push_back(';');
@@ -100,7 +102,64 @@ auto run(const std::string& name, const std::string& src,
     auto s = stats(std::move(times));
     fmt::print("bench {}: iters={}, avg_ms={:.3f}, min_ms={:.3f}, max_ms={:.3f}, rows={}\n", name,
                iters, s.avg_ms, s.min_ms, s.max_ms, last_rows);
+    if (mins != nullptr) {
+        (*mins)[name] = s.min_ms;
+    }
     return 0;
+}
+
+// Structural fusion invariants. Each guard asserts that a fused case runs at
+// least `min_ratio` times faster than an un-fused baseline, using the per-case
+// min_ms. Unlike absolute timings (which the perf-stats workflow deliberately
+// never gates on, because hosted runners vary), these RATIOS are intrinsic to
+// the algorithm: a full sort is O(n log n), TopK heap-select is O(n log k), so
+// the gap survives any runner speed or build mode. A guard failing means the
+// fusion silently stopped firing (e.g. R16 didn't match and we fell back to
+// sort-then-slice) — that is a wiring regression, not a perf wobble. Margins
+// are set far below the observed ratio (~40×) so runner noise can't trip them.
+struct Guard {
+    std::string fast;  // case expected to be fast (the fused shape)
+    std::string slow;  // un-fused baseline it must beat
+    double min_ratio;  // require slow_min_ms / fast_min_ms >= min_ratio
+    std::string reason;
+};
+
+const std::vector<Guard>& fusion_guards() {
+    static const std::vector<Guard> guards = {
+        {"order_head_10", "wide_order_unsorted", 8.0,
+         "Head(Order(x)) must fuse to TopK heap-select, not full sort + slice"},
+        {"order_tail_10", "wide_order_unsorted", 8.0,
+         "Tail(Order(x)) must fuse to TopK heap-select, not full sort + slice"},
+        // Looser margin: at modest row counts k=1000 is a larger fraction of n,
+        // so heap-select's edge narrows. 3x still catches a fallback to full
+        // sort (which would land near 1x) without tripping at small scales.
+        {"order_head_1000", "wide_order_unsorted", 3.0,
+         "TopK(k=1000) heap-select must still beat a full sort"},
+    };
+    return guards;
+}
+
+// Returns the number of failed guards (0 == all invariants hold).
+auto check_guards(const std::map<std::string, double>& mins) -> int {
+    fmt::print("\n--- fusion guards ---\n");
+    int failures = 0;
+    for (const auto& g : fusion_guards()) {
+        auto fast_it = mins.find(g.fast);
+        auto slow_it = mins.find(g.slow);
+        if (fast_it == mins.end() || slow_it == mins.end()) {
+            fmt::print("SKIP {} vs {}: case not run\n", g.fast, g.slow);
+            continue;
+        }
+        const double ratio = slow_it->second / fast_it->second;
+        const bool ok = ratio >= g.min_ratio;
+        fmt::print("{} {}: {:.1f}x faster than {} (require >= {:.1f}x) — {}\n",
+                   ok ? "PASS" : "FAIL", g.fast, ratio, g.slow, g.min_ratio, g.reason);
+        if (!ok) {
+            ++failures;
+        }
+    }
+    fmt::print("{} guard(s) failed\n", failures);
+    return failures;
 }
 
 }  // namespace
@@ -110,9 +169,12 @@ auto main(int argc, char** argv) -> int {
     std::size_t rows = 2'000'000;
     std::size_t warmup = 2;
     std::size_t iters = 5;
+    bool check = false;
     app.add_option("--rows", rows, "Rows per table");
     app.add_option("--warmup", warmup, "Warmup iterations");
     app.add_option("--iters", iters, "Measured iterations");
+    app.add_flag("--check", check,
+                 "Assert structural fusion invariants (ratio-based); exit non-zero on violation");
     CLI11_PARSE(app, argc, argv)
 
     ibex::runtime::TableRegistry tables;
@@ -246,12 +308,16 @@ auto main(int argc, char** argv) -> int {
          "wide[update { g = c0 % 100 }][by g, select { g, s = sum(c1) }][order s desc]"},
     };
 
+    std::map<std::string, double> mins;
     int status = 0;
     for (const auto& q : queries) {
-        status = run(q.name, q.src, tables, warmup, iters);
+        status = run(q.name, q.src, tables, warmup, iters, check ? &mins : nullptr);
         if (status != 0) {
             return status;
         }
+    }
+    if (check) {
+        return check_guards(mins) == 0 ? 0 : 1;
     }
     return 0;
 }

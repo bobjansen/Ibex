@@ -202,6 +202,20 @@ Every change leaves behind tests:
 - canonicalizer tests asserting the rewritten IR shape for each rule
 - `tools/ibex_fusion_bench` for perf regression gates on fused shapes
 
+**Fusion invariants gate.** `ibex_fusion_bench --check` asserts *ratios*
+between a fused case and its un-fused baseline (e.g. `order_head_10` must be
+≥8× faster than `wide_order_unsorted`). Ratios are intrinsic to the algorithm
+(full sort O(n log n) vs TopK heap-select O(n log k)), so they cancel runner
+speed and gate cleanly where absolute timings cannot. A failure means a fusion
+*stopped firing* (a canonicalize rule regressed, or an operator fell back to
+materialization) — a correctness regression in operator selection, not a perf
+wobble. Margins sit far below the observed ratio (~30–45× in Release) so noise
+can't trip them. The check only holds with optimization on — in Debug the
+per-element overhead swamps the algorithmic gap — so CI runs it in the
+Release `clang-werror` leg, not the Debug `build-and-test` leg. New fused
+shapes should add a guard to the `fusion_guards()` table. This is distinct from
+`perf-stats.yml`, which reports absolute A/B numbers and never gates.
+
 Benchmark gates compare against `build-release/` only, since debug runs
 ~4× slower.
 

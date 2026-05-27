@@ -11362,6 +11362,554 @@ class ChunkedAggregateOperator final : public Operator {
     std::vector<std::string> str_order_;
 };
 
+/// Replays one buffered chunk ahead of the rest of a child stream. Used by
+/// ChunkedSortedAggregateOperator to hand the already-pulled first chunk back
+/// to a fallback operator without losing it.
+class PrependChunkOperator final : public Operator {
+   public:
+    PrependChunkOperator(Chunk first, OperatorPtr rest)
+        : first_(std::move(first)), rest_(std::move(rest)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (!emitted_first_) {
+            emitted_first_ = true;
+            return std::optional<Chunk>{std::move(first_)};
+        }
+        return rest_->next();
+    }
+
+   private:
+    Chunk first_;
+    OperatorPtr rest_;
+    bool emitted_first_ = false;
+};
+
+/// Streaming aggregate for input already sorted on the group-by keys.
+///
+/// When the child's chunks declare an `ordering` whose leading keys cover the
+/// group_by columns, every group's rows are contiguous in the stream. We then
+/// keep accumulators for only the *current* group, emit each group as soon as
+/// its run ends, and produce output already sorted by the group keys. Peak
+/// memory is O(one group + one output chunk) instead of O(all groups), and
+/// there is no hashing — group changes are detected by a typed equality scan.
+///
+/// Eligibility is decided from the first non-empty chunk. If the input is not
+/// sorted on the group_by keys (no `ordering`, or it doesn't cover them, or a
+/// group key is nullable), the operator transparently falls back to the
+/// hash-based ChunkedAggregateOperator by replaying the already-pulled chunk
+/// ahead of the remaining child. The supported agg subset matches
+/// ChunkedAggregateOperator (Count/Sum/Min/Max/Mean on numeric columns);
+/// build_operator only routes that subset here.
+class ChunkedSortedAggregateOperator final : public Operator {
+   public:
+    ChunkedSortedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+                                   const std::vector<ir::AggSpec>* aggregations)
+        : child_(std::move(child)), group_by_(group_by), aggregations_(aggregations) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (fallback_) {
+            return fallback_->next();
+        }
+        if (!decided_) {
+            auto decided = decide_strategy();
+            if (!decided.has_value()) {
+                return std::unexpected(std::move(decided.error()));
+            }
+            if (fallback_) {
+                return fallback_->next();
+            }
+        }
+        return next_sorted();
+    }
+
+   private:
+    struct SlotPlan {
+        ir::AggFunc func = ir::AggFunc::Sum;
+        ExprType kind = ExprType::Int;
+    };
+
+    // Pull chunks until the first non-empty one, then choose sorted vs fallback.
+    auto decide_strategy() -> std::expected<void, std::string> {
+        decided_ = true;
+        Chunk first;
+        bool have = false;
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                break;  // EOF before any rows
+            }
+            if (chunk_res.value()->rows() == 0) {
+                continue;  // skip empty chunks
+            }
+            first = std::move(*chunk_res.value());
+            have = true;
+            break;
+        }
+        if (!have) {
+            done_ = true;  // empty input → no output, matching the hash operator
+            input_eof_ = true;
+            return {};
+        }
+        if (!sorted_on_group_by(first)) {
+            fallback_ = std::make_unique<ChunkedAggregateOperator>(
+                std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
+                group_by_, aggregations_);
+            return {};
+        }
+        if (auto err = init_plan(first)) {
+            return std::unexpected(*err);
+        }
+        if (auto err = consume(first)) {
+            return std::unexpected(*err);
+        }
+        return {};
+    }
+
+    // The input is grouped-contiguous iff the first |group_by| ordering keys
+    // are exactly the group_by columns (as a set; direction and intra-prefix
+    // order don't matter for contiguity). Nullable group keys fall back, since
+    // the streaming key compare ignores validity.
+    auto sorted_on_group_by(const Chunk& chunk) const -> bool {
+        if (group_by_->empty()) {
+            return false;  // global aggregate: let the hash path handle it
+        }
+        if (!chunk.ordering.has_value() || chunk.ordering->size() < group_by_->size()) {
+            return false;
+        }
+        const auto& ordering = *chunk.ordering;
+        for (std::size_t i = 0; i < group_by_->size(); ++i) {
+            bool in_group = false;
+            for (const auto& g : *group_by_) {
+                if (g.name == ordering[i].name) {
+                    in_group = true;
+                    break;
+                }
+            }
+            if (!in_group) {
+                return false;
+            }
+        }
+        for (const auto& g : *group_by_) {
+            const ColumnEntry* entry = find_entry(chunk, g.name);
+            if (entry == nullptr || entry->validity.has_value()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static auto find_entry(const Chunk& chunk, const std::string& name) -> const ColumnEntry* {
+        for (const auto& e : chunk.columns) {
+            if (e.name == name) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    auto init_plan(const Chunk& first) -> std::optional<std::string> {
+        n_aggs_ = aggregations_->size();
+        plan_.resize(n_aggs_);
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            const auto& agg = (*aggregations_)[i];
+            plan_[i].func = agg.func;
+            if (agg.func == ir::AggFunc::Count) {
+                plan_[i].kind = ExprType::Int;
+                continue;
+            }
+            const ColumnEntry* entry = find_entry(first, agg.column.name);
+            if (entry == nullptr) {
+                return "aggregate column not found: " + agg.column.name;
+            }
+            ExprType kind = expr_type_for_column(*entry->column);
+            if (kind != ExprType::Int && kind != ExprType::Double) {
+                return "ChunkedSortedAggregateOperator: non-numeric aggregation not supported";
+            }
+            plan_[i].kind = kind;
+        }
+        key_templates_.clear();
+        key_templates_.reserve(group_by_->size());
+        for (const auto& g : *group_by_) {
+            key_templates_.push_back(make_empty_like(*find_entry(first, g.name)->column));
+        }
+        track_validity_.assign(n_aggs_, 0U);
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            switch (plan_[i].func) {
+                case ir::AggFunc::Sum:
+                case ir::AggFunc::Mean:
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max:
+                    track_validity_[i] = 1U;
+                    break;
+                default:
+                    break;
+            }
+        }
+        // Capture the leading ordering keys so emitted chunks can advertise the
+        // group-sorted order they preserve (lets a downstream `order` skip work).
+        if (first.ordering.has_value()) {
+            out_ordering_.assign(
+                first.ordering->begin(),
+                first.ordering->begin() + static_cast<std::ptrdiff_t>(group_by_->size()));
+        }
+        cur_slots_.assign(n_aggs_, AggSlot{});
+        reset_output();
+        return std::nullopt;
+    }
+
+    void reset_output() {
+        out_columns_.clear();
+        out_columns_.reserve(group_by_->size() + n_aggs_);
+        for (std::size_t i = 0; i < group_by_->size(); ++i) {
+            ColumnEntry entry;
+            entry.name = (*group_by_)[i].name;
+            entry.column = std::make_shared<ColumnValue>(make_empty_like(key_templates_[i]));
+            std::visit([&](auto& c) { c.reserve(kEmitThreshold); }, *entry.column);
+            out_columns_.push_back(std::move(entry));
+        }
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            ColumnValue column;
+            switch (plan_[i].func) {
+                case ir::AggFunc::Count:
+                    column = Column<std::int64_t>{};
+                    break;
+                case ir::AggFunc::Mean:
+                    column = Column<double>{};
+                    break;
+                default:  // Sum / Min / Max
+                    column = plan_[i].kind == ExprType::Double
+                                 ? ColumnValue{Column<double>{}}
+                                 : ColumnValue{Column<std::int64_t>{}};
+                    break;
+            }
+            std::visit([&](auto& c) { c.reserve(kEmitThreshold); }, column);
+            ColumnEntry entry;
+            entry.name = (*aggregations_)[i].alias;
+            entry.column = std::make_shared<ColumnValue>(std::move(column));
+            out_columns_.push_back(std::move(entry));
+        }
+        out_validity_.assign(n_aggs_, ValidityBitmap{});
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            if (track_validity_[i] != 0U) {
+                out_validity_[i].reserve(kEmitThreshold);
+            }
+        }
+        pending_rows_ = 0;
+    }
+
+    // Drive input until we have a full output batch or hit EOF, then emit.
+    auto next_sorted() -> std::expected<std::optional<Chunk>, std::string> {
+        if (done_) {
+            return std::optional<Chunk>{};
+        }
+        while (!input_eof_ && pending_rows_ < kEmitThreshold) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                input_eof_ = true;
+                break;
+            }
+            if (chunk_res.value()->rows() == 0) {
+                continue;
+            }
+            if (auto err = consume(*chunk_res.value())) {
+                return std::unexpected(*err);
+            }
+        }
+        if (input_eof_ && open_) {
+            close_group();
+            open_ = false;
+        }
+        if (pending_rows_ == 0) {
+            done_ = true;
+            return std::optional<Chunk>{};
+        }
+        Chunk out = take_pending();
+        if (input_eof_) {
+            done_ = true;
+        }
+        return std::optional<Chunk>{std::move(out)};
+    }
+
+    // Fold one chunk into the streaming state. Rows are scanned as runs of
+    // equal group keys; each run is accumulated columnwise into the open
+    // group's slots, and a group-key change closes the open group.
+    auto consume(const Chunk& chunk) -> std::optional<std::string> {
+        std::vector<const ColumnValue*> key_cols;
+        key_cols.reserve(group_by_->size());
+        for (const auto& g : *group_by_) {
+            const ColumnEntry* entry = find_entry(chunk, g.name);
+            if (entry == nullptr) {
+                return "group-by column not found: " + g.name;
+            }
+            key_cols.push_back(entry->column.get());
+        }
+        std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            if (plan_[i].func == ir::AggFunc::Count) {
+                continue;
+            }
+            const ColumnEntry* entry = find_entry(chunk, (*aggregations_)[i].column.name);
+            if (entry == nullptr) {
+                return "aggregate column not found: " + (*aggregations_)[i].column.name;
+            }
+            if (expr_type_for_column(*entry->column) != plan_[i].kind) {
+                return "ChunkedSortedAggregateOperator: aggregate column type changed across "
+                       "chunks";
+            }
+            agg_entries[i] = entry;
+        }
+
+        const std::size_t rows = chunk.rows();
+        std::size_t r = 0;
+        while (r < rows) {
+            if (!open_) {
+                start_group(key_cols, r);
+            } else if (!row_matches_open(key_cols, r)) {
+                close_group();
+                start_group(key_cols, r);
+            }
+            std::size_t e = r + 1;
+            while (e < rows && cells_equal(key_cols, r, e)) {
+                ++e;
+            }
+            accumulate_range(agg_entries, r, e);
+            r = e;
+        }
+        return std::nullopt;
+    }
+
+    void start_group(const std::vector<const ColumnValue*>& key_cols, std::size_t row) {
+        open_key_.clear();
+        open_key_.reserve(key_cols.size());
+        for (const auto* col : key_cols) {
+            open_key_.push_back(scalar_from_column(*col, row));
+        }
+        std::fill(cur_slots_.begin(), cur_slots_.end(), AggSlot{});
+        open_ = true;
+    }
+
+    // Whether `row` continues the currently open group. Only called at run
+    // anchors (group boundaries and chunk starts), so the scalar build is
+    // paid per group, not per row.
+    auto row_matches_open(const std::vector<const ColumnValue*>& key_cols, std::size_t row) const
+        -> bool {
+        for (std::size_t i = 0; i < key_cols.size(); ++i) {
+            if (scalar_from_column(*key_cols[i], row) != open_key_[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static auto cell_equal(const ColumnValue& col, std::size_t a, std::size_t b) -> bool {
+        return std::visit(
+            [&](const auto& c) -> bool {
+                using ColT = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    return c.code_at(a) == c.code_at(b);
+                } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
+                    return c[a].days == c[b].days;
+                } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+                    return c[a].nanos == c[b].nanos;
+                } else {
+                    return c[a] == c[b];
+                }
+            },
+            col);
+    }
+
+    auto cells_equal(const std::vector<const ColumnValue*>& key_cols, std::size_t a,
+                     std::size_t b) const -> bool {
+        for (const auto* col : key_cols) {
+            if (!cell_equal(*col, a, b)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Accumulate the contiguous row range [start, end) — all one group — into
+    // the open group's slots, branch-hoisted per aggregation.
+    void accumulate_range(const std::vector<const ColumnEntry*>& agg_entries, std::size_t start,
+                          std::size_t end) {
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            AggSlot& slot = cur_slots_[i];
+            if (plan_[i].func == ir::AggFunc::Count) {
+                slot.count += static_cast<std::int64_t>(end - start);
+                continue;
+            }
+            const auto& entry = *agg_entries[i];
+            const bool has_nulls = entry.validity.has_value();
+            if (plan_[i].kind == ExprType::Double) {
+                const double* data = std::get<Column<double>>(*entry.column).data();
+                accumulate_typed(slot, plan_[i].func, data, entry, has_nulls, start, end);
+            } else {
+                const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
+                accumulate_typed(slot, plan_[i].func, data, entry, has_nulls, start, end);
+            }
+        }
+    }
+
+    template <typename T>
+    static void accumulate_typed(AggSlot& slot, ir::AggFunc func, const T* data,
+                                 const ColumnEntry& entry, bool has_nulls, std::size_t start,
+                                 std::size_t end) {
+        const auto valid = [&](std::size_t row) {
+            return !has_nulls || (*entry.validity)[row];
+        };
+        switch (func) {
+            case ir::AggFunc::Sum:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row)) {
+                        continue;
+                    }
+                    if constexpr (std::is_same_v<T, double>) {
+                        slot.double_value += data[row];
+                    } else {
+                        slot.int_value += data[row];
+                    }
+                    slot.has_value = true;
+                }
+                break;
+            case ir::AggFunc::Mean:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row)) {
+                        continue;
+                    }
+                    slot.sum += static_cast<double>(data[row]);
+                    slot.count++;
+                    slot.has_value = true;
+                }
+                break;
+            case ir::AggFunc::Min:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row)) {
+                        continue;
+                    }
+                    if constexpr (std::is_same_v<T, double>) {
+                        slot.double_value =
+                            slot.has_value ? std::min(slot.double_value, data[row]) : data[row];
+                    } else {
+                        slot.int_value =
+                            slot.has_value ? std::min(slot.int_value, data[row]) : data[row];
+                    }
+                    slot.has_value = true;
+                }
+                break;
+            case ir::AggFunc::Max:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row)) {
+                        continue;
+                    }
+                    if constexpr (std::is_same_v<T, double>) {
+                        slot.double_value =
+                            slot.has_value ? std::max(slot.double_value, data[row]) : data[row];
+                    } else {
+                        slot.int_value =
+                            slot.has_value ? std::max(slot.int_value, data[row]) : data[row];
+                    }
+                    slot.has_value = true;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Flush the open group's key + aggregate values into the output buffers.
+    void close_group() {
+        for (std::size_t i = 0; i < group_by_->size(); ++i) {
+            append_scalar(*out_columns_[i].column, open_key_[i]);
+        }
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            ColumnValue& column = *out_columns_[group_by_->size() + i].column;
+            const AggSlot& slot = cur_slots_[i];
+            if (track_validity_[i] != 0U) {
+                const bool valid =
+                    plan_[i].func == ir::AggFunc::Mean ? slot.count > 0 : slot.has_value;
+                out_validity_[i].push_back(valid);
+            }
+            switch (plan_[i].func) {
+                case ir::AggFunc::Count:
+                    append_scalar(column, ScalarValue{slot.count});
+                    break;
+                case ir::AggFunc::Mean:
+                    append_scalar(
+                        column,
+                        ScalarValue{slot.count == 0 ? 0.0
+                                                    : slot.sum / static_cast<double>(slot.count)});
+                    break;
+                default:  // Sum / Min / Max
+                    if (plan_[i].kind == ExprType::Double) {
+                        append_scalar(column, ScalarValue{slot.double_value});
+                    } else {
+                        append_scalar(column, ScalarValue{slot.int_value});
+                    }
+                    break;
+            }
+        }
+        ++pending_rows_;
+    }
+
+    auto take_pending() -> Chunk {
+        for (std::size_t i = 0; i < n_aggs_; ++i) {
+            if (track_validity_[i] == 0U || out_validity_[i].empty()) {
+                continue;
+            }
+            bool has_null = false;
+            for (std::size_t r = 0; r < out_validity_[i].size(); ++r) {
+                if (!out_validity_[i][r]) {
+                    has_null = true;
+                    break;
+                }
+            }
+            if (has_null) {
+                out_columns_[group_by_->size() + i].validity = std::move(out_validity_[i]);
+            }
+        }
+        Chunk out;
+        out.columns = std::move(out_columns_);
+        if (!out_ordering_.empty()) {
+            out.ordering = out_ordering_;
+        }
+        reset_output();
+        return out;
+    }
+
+    OperatorPtr child_;
+    const std::vector<ir::ColumnRef>* group_by_;
+    const std::vector<ir::AggSpec>* aggregations_;
+
+    bool decided_ = false;
+    bool done_ = false;
+    bool input_eof_ = false;
+    bool open_ = false;
+    OperatorPtr fallback_;
+
+    static constexpr std::size_t kEmitThreshold = 8192;
+
+    std::size_t n_aggs_ = 0;
+    std::vector<SlotPlan> plan_;
+    std::vector<ColumnValue> key_templates_;
+    std::vector<std::uint8_t> track_validity_;
+    std::vector<ir::OrderKey> out_ordering_;
+
+    // Open-group state.
+    std::vector<AggSlot> cur_slots_;
+    std::vector<ScalarValue> open_key_;
+
+    // Output buffers for closed groups awaiting emission.
+    std::vector<ColumnEntry> out_columns_;
+    std::vector<ValidityBitmap> out_validity_;
+    std::size_t pending_rows_ = 0;
+};
+
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     ModelResult* model_out) -> std::expected<OperatorPtr, std::string>;
@@ -11696,8 +12244,12 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             if (!child_op.has_value()) {
                 return std::unexpected(std::move(child_op.error()));
             }
-            return std::make_unique<ChunkedAggregateOperator>(std::move(child_op.value()),
-                                                              &agg.group_by(), &agg.aggregations());
+            // The sorted operator streams group-at-a-time when the child's
+            // chunks arrive sorted on the group keys, and otherwise replays the
+            // first chunk into a hash ChunkedAggregateOperator — so it is safe
+            // to route the whole streamable subset here.
+            return std::make_unique<ChunkedSortedAggregateOperator>(
+                std::move(child_op.value()), &agg.group_by(), &agg.aggregations());
         }
     }
 

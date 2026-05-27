@@ -6053,3 +6053,261 @@ TEST_CASE("model: WLS errors on missing weights column", "[model]") {
     REQUIRE(result.error().find("wls:") != std::string::npos);
     REQUIRE(result.error().find("not found") != std::string::npos);
 }
+
+// ── Sorted streaming aggregate (ChunkedSortedAggregateOperator) ─────────────
+//
+// When the aggregate's input arrives sorted on the group-by keys, the
+// interpreter streams group-at-a-time and emits groups in key order. These
+// cover correctness across agg funcs/types, multi-key, cross-chunk group
+// spanning, nulls, the unsorted fallback, and the advertised output ordering.
+
+TEST_CASE("Sorted aggregate streams groups in key order with correct values") {
+    runtime::Table t;
+    t.add_column("sym", Column<std::string>{"A", "A", "B", "B", "B", "C"});
+    t.add_column("v", Column<std::int64_t>{1, 3, 2, 4, 6, 5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[order sym asc][by sym, select { sym, s = sum(v), n = count(), mn = min(v), "
+        "mx = max(v), av = mean(v) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* sym = std::get_if<Column<std::string>>(result->find("sym"));
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    const auto* mn = std::get_if<Column<std::int64_t>>(result->find("mn"));
+    const auto* mx = std::get_if<Column<std::int64_t>>(result->find("mx"));
+    const auto* av = std::get_if<Column<double>>(result->find("av"));
+    REQUIRE(sym != nullptr);
+    REQUIRE(s != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(mn != nullptr);
+    REQUIRE(mx != nullptr);
+    REQUIRE(av != nullptr);
+
+    REQUIRE((*sym)[0] == "A");
+    REQUIRE((*s)[0] == 4);
+    REQUIRE((*n)[0] == 2);
+    REQUIRE((*mn)[0] == 1);
+    REQUIRE((*mx)[0] == 3);
+    REQUIRE((*av)[0] == Catch::Approx(2.0));
+
+    REQUIRE((*sym)[1] == "B");
+    REQUIRE((*s)[1] == 12);
+    REQUIRE((*n)[1] == 3);
+    REQUIRE((*mn)[1] == 2);
+    REQUIRE((*mx)[1] == 6);
+    REQUIRE((*av)[1] == Catch::Approx(4.0));
+
+    REQUIRE((*sym)[2] == "C");
+    REQUIRE((*s)[2] == 5);
+    REQUIRE((*n)[2] == 1);
+    REQUIRE((*mn)[2] == 5);
+    REQUIRE((*mx)[2] == 5);
+    REQUIRE((*av)[2] == Catch::Approx(5.0));
+
+    // The streamed output is sorted by the group key, and says so.
+    REQUIRE(result->ordering.has_value());
+    REQUIRE(result->ordering->size() == 1);
+    REQUIRE((*result->ordering)[0].name == "sym");
+}
+
+TEST_CASE("Sorted aggregate matches hash aggregate on the same data") {
+    // Same rows, two queries: one sorts first (streaming sorted path), one does
+    // not (hash path, first-seen order). After sorting the hash result by key,
+    // the two must be identical — a broad guard on the streaming accumulators.
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{3, 1, 2, 1, 3, 2, 1, 2, 3, 2});
+    t.add_column("v", Column<double>{1.5, 2.0, 3.0, 4.0, 5.5, 6.0, 7.0, 8.0, 9.0, 10.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto streamed = runtime::interpret(
+        *require_ir("t[order k asc][by k, select { k, s = sum(v), n = count(), mn = min(v), "
+                    "mx = max(v), av = mean(v) }];"),
+        registry);
+    auto hashed =
+        runtime::interpret(*require_ir("t[by k, select { k, s = sum(v), n = count(), mn = min(v), "
+                                       "mx = max(v), av = mean(v) }][order k asc];"),
+                           registry);
+    REQUIRE(streamed.has_value());
+    REQUIRE(hashed.has_value());
+    REQUIRE(streamed->rows() == 3);
+    REQUIRE(hashed->rows() == 3);
+
+    for (const char* name : {"s", "mn", "mx", "av"}) {
+        const auto* a = std::get_if<Column<double>>(streamed->find(name));
+        const auto* b = std::get_if<Column<double>>(hashed->find(name));
+        REQUIRE(a != nullptr);
+        REQUIRE(b != nullptr);
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            REQUIRE((*a)[i] == Catch::Approx((*b)[i]));
+        }
+    }
+    const auto* ka = std::get_if<Column<std::int64_t>>(streamed->find("k"));
+    const auto* na = std::get_if<Column<std::int64_t>>(streamed->find("n"));
+    REQUIRE(ka != nullptr);
+    REQUIRE(na != nullptr);
+    REQUIRE((*ka)[0] == 1);
+    REQUIRE((*ka)[1] == 2);
+    REQUIRE((*ka)[2] == 3);
+    REQUIRE((*na)[0] == 3);  // k=1 appears 3×
+    REQUIRE((*na)[1] == 4);  // k=2 appears 4×
+    REQUIRE((*na)[2] == 3);  // k=3 appears 3×
+}
+
+TEST_CASE("Sorted aggregate merges a group spanning a chunk boundary") {
+    // Chunked extern source: group "B" straddles the chunk boundary, so the
+    // streaming operator must carry the open group across chunks.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("sorted_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto c0 = make_str_int_chunk("sym", {"A", "A", "B"}, "v", {1, 2, 10});
+        auto c1 = make_str_int_chunk("sym", {"B", "B", "C"}, "v", {20, 30, 4});
+        const std::vector<ir::OrderKey> ord{ir::OrderKey{.name = "sym", .ascending = true}};
+        c0.ordering = ord;
+        c1.ordering = ord;
+        chunks.push_back(std::move(c0));
+        chunks.push_back(std::move(c1));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn sorted_src() -> DataFrame from \"x.hpp\"; "
+        "sorted_src()[by sym, select { sym, s = sum(v), n = count() }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* sym = std::get_if<Column<std::string>>(result->find("sym"));
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(sym != nullptr);
+    REQUIRE(s != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE((*sym)[0] == "A");
+    REQUIRE((*s)[0] == 3);
+    REQUIRE((*n)[0] == 2);
+    REQUIRE((*sym)[1] == "B");
+    REQUIRE((*s)[1] == 60);  // 10 + 20 + 30, spanning the boundary
+    REQUIRE((*n)[1] == 3);
+    REQUIRE((*sym)[2] == "C");
+    REQUIRE((*s)[2] == 4);
+    REQUIRE((*n)[2] == 1);
+}
+
+TEST_CASE("Sorted aggregate supports multi-key group prefixes") {
+    // Sorted by (a, b); grouping by {a, b} is a covering prefix.
+    runtime::Table t;
+    t.add_column("a", Column<std::int64_t>{1, 1, 1, 2, 2});
+    t.add_column("b", Column<std::int64_t>{1, 1, 2, 1, 1});
+    t.add_column("v", Column<std::int64_t>{10, 20, 30, 40, 50});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[order { a asc, b asc }][by { a, b }, select { a, b, s = sum(v) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* a = std::get_if<Column<std::int64_t>>(result->find("a"));
+    const auto* b = std::get_if<Column<std::int64_t>>(result->find("b"));
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(s != nullptr);
+    REQUIRE((*a)[0] == 1);
+    REQUIRE((*b)[0] == 1);
+    REQUIRE((*s)[0] == 30);  // (1,1): 10 + 20
+    REQUIRE((*a)[1] == 1);
+    REQUIRE((*b)[1] == 2);
+    REQUIRE((*s)[1] == 30);  // (1,2): 30
+    REQUIRE((*a)[2] == 2);
+    REQUIRE((*b)[2] == 1);
+    REQUIRE((*s)[2] == 90);  // (2,1): 40 + 50
+}
+
+TEST_CASE("Sorted aggregate skips nulls and emits null for an all-null group") {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 2, 2});
+    Column<std::int64_t> v{0, 5, 0, 0};
+    runtime::ValidityBitmap valid;
+    valid.push_back(false);  // k=1, null
+    valid.push_back(true);   // k=1, 5
+    valid.push_back(false);  // k=2, null
+    valid.push_back(false);  // k=2, null
+    t.add_column("v", std::move(v), std::move(valid));
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[order k asc][by k, select { k, s = sum(v), mn = min(v) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    REQUIRE(s != nullptr);
+    REQUIRE((*s)[0] == 5);  // k=1: only the non-null 5 contributes
+
+    // k=2 is all-null → result is null.
+    const auto* s_entry = result->find_entry("s");
+    REQUIRE(s_entry != nullptr);
+    REQUIRE(s_entry->validity.has_value());
+    REQUIRE_FALSE((*s_entry->validity)[1]);
+}
+
+TEST_CASE("Aggregate over unsorted input falls back to the hash path") {
+    // No `order`, so the input is not group-contiguous: the sorted operator
+    // must transparently fall back and still aggregate correctly.
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{2, 1, 2, 1, 3});
+    t.add_column("v", Column<std::int64_t>{10, 20, 30, 40, 50});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[by k, select { k, s = sum(v), n = count() }][order k asc];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* k = std::get_if<Column<std::int64_t>>(result->find("k"));
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(k != nullptr);
+    REQUIRE(s != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE((*k)[0] == 1);
+    REQUIRE((*s)[0] == 60);  // 20 + 40
+    REQUIRE((*n)[0] == 2);
+    REQUIRE((*k)[1] == 2);
+    REQUIRE((*s)[1] == 40);  // 10 + 30
+    REQUIRE((*n)[1] == 2);
+    REQUIRE((*k)[2] == 3);
+    REQUIRE((*s)[2] == 50);
+    REQUIRE((*n)[2] == 1);
+}
+
+TEST_CASE("Sorted aggregate handles empty input") {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{});
+    t.add_column("v", Column<std::int64_t>{});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[order k asc][by k, select { k, s = sum(v) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 0);
+}

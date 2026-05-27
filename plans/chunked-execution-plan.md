@@ -33,7 +33,7 @@ a fused `TopK` node landed (heap-select for `Head/Tail(Order)`), and grouped
 | `Order`     | `ChunkedOrderOperator` — buffer + validate sortedness; re-emit chunks if sorted, fall back to `order_table` on concat otherwise |
 | `AsTimeframe` | `ChunkedAsTimeframeOperator` — buffer + validate; re-emit chunks with `time_index` stamped if sorted, fall back to concat + `order_table` (SPEC §9.1) |
 | `Update`    | `ChunkedUpdateOperator` — row-local field expressions, no tuple_fields, no group_by |
-| `Aggregate` | `ChunkedAggregateOperator` — streaming for the supported subset (Count, Sum, Min, Max, Mean on numeric); fast paths for single categorical key and single string key (transparent `string_view` lookup, SSO-friendly) bypass the generic `ScalarValue` variant key |
+| `Aggregate` | `ChunkedSortedAggregateOperator` when the input chunks are sorted on the group keys (streams group-at-a-time, bounded memory, output emitted in key order); otherwise falls back to `ChunkedAggregateOperator` — hash-based, streaming for the supported subset (Count, Sum, Min, Max, Mean on numeric) with fast paths for single categorical key and single string key (transparent `string_view` lookup, SSO-friendly) bypassing the generic `ScalarValue` variant key |
 | `TopK`      | `ChunkedOrderedLimitOperator` — bounded heap-select (O(n log k)) for `Head/Tail(Order)`, global and grouped, `KeepMode::First`/`Last` |
 | `Head`      | `ChunkedHeadOperator` — global and grouped, short-circuits child on reach; `count == 0` early-exit |
 | `Tail`      | Materializing via `tail_table` (the streaming shapes — `Tail(Order)` and `Tail(Filter)` — are now rewritten to `TopK` / `FilterTail` upstream) |
@@ -110,6 +110,21 @@ full `Table` before processing.
 
 ## Recently Landed (was "Immediate Priorities")
 
+**Streaming sort-based Aggregate — done.** `ChunkedSortedAggregateOperator`
+detects (from the first chunk's `ordering`) when the input is sorted on the
+group keys, then keeps accumulators for only the current group, emits groups in
+key order, and advertises that ordering downstream. Peak in-flight memory is
+O(one group + one output chunk) instead of O(all groups), with no hashing. When
+the input isn't group-sorted it transparently falls back to the hash
+`ChunkedAggregateOperator` by replaying the first chunk through a prepend shim.
+Measured on a 2M-row table (`tools/ibex_fusion_bench`): ~1000 groups streams in
+3.5ms vs 39ms hashed (**11×**); high cardinality (one group per row, ~2M
+groups) is 69ms vs 1069ms (**15×**) — the hash path's cost is building a
+2M-entry table the stream never materializes. (Note: surfacing this exposed a
+pre-existing canonicalize infinite loop — R20 ↔ R2 oscillating on
+`Aggregate(Order(x))` when no `count(*)` is present; R20 now peeks past leading
+`Order` nodes, and `rewrite_root` has a safety iteration cap.)
+
 **Order pushed later in the pipeline — done.** Sinking `Order` past `Filter`,
 `Project`, and `Rename` is implemented as canonicalize R1/R2/R3 so the sort
 runs on the smallest table we can produce. Measured wins on a 2M × 16 table
@@ -139,18 +154,7 @@ materialize but are no longer rejected.
 Ordered roughly by expected payoff-to-effort. Confirm each against
 `tools/ibex_fusion_bench` (or a new case) before and after.
 
-### 1. Streaming sort-based Aggregate
-
-The biggest remaining win on aggregate-heavy queries. The current
-`ChunkedAggregateOperator` is hash-based and emits groups in first-seen order,
-so `Order` on its output can't push under it (measured and skipped — sorting
-K≪N groups is negligible: `agg_then_order_1k_groups` ≈ 51ms,
-`agg_then_order_100_groups` ≈ 61ms on 2M rows, dominated by the aggregate
-itself). A sort-based aggregate that consumes pre-sorted input (common after
-`as_timeframe`/`order`) would emit groups already ordered and bound memory to
-one group at a time. This is an operator, not an IR rewrite.
-
-### 2. Widen the streaming Aggregate function set
+### 1. Widen the streaming Aggregate function set
 
 `ChunkedAggregateOperator` streams only Count/Sum/Min/Max/Mean; everything else
 (e.g. median, quantile, stddev/var, first/last, nunique) drops to the
@@ -158,7 +162,7 @@ materializing path. Several are streamable: variance/stddev via Welford,
 first/last trivially, nunique via the same hash machinery `Distinct` already
 uses. Add them incrementally, each gated by a bench case.
 
-### 3. Document and harden the external chunked-source contract
+### 2. Document and harden the external chunked-source contract
 
 `ExternRegistry::register_chunked_table(...)` is the runtime entrypoint, and
 the Kafka examples (`examples/kafka_ticks.ibex`, `kafka_ohlc.ibex`, plus the
@@ -176,16 +180,16 @@ operators (not just the Kafka demos). Once stable, an `adbc` plugin reads
 Arrow `RecordBatch` objects as Ibex chunks with zero-copy where layouts match
 — path to PostgreSQL, DuckDB, Snowflake, BigQuery.
 
-### 4. Materialization hardening
+### 3. Materialization hardening
 
 `MaterializeOperator` assumes identical schema and shared categorical
 dictionaries across chunks, and has no multi-chunk validity-bitmap support.
 These become correctness bugs the moment a source emits chunks with
 independent dictionaries or differing validity — likely first triggered by the
-extern-source work in (3). Remove the assumptions deliberately as real
+extern-source work in (2). Remove the assumptions deliberately as real
 workloads expose them.
 
-### 5. Remaining fusion opportunities (only if a benchmark flags them)
+### 4. Remaining fusion opportunities (only if a benchmark flags them)
 
 - `Scan → Filter → Rename → Project` end-to-end fusion (cheap once it shows up
   in a profile; R5/R11 already cover most of it).
@@ -204,8 +208,10 @@ Every change leaves behind tests:
 
 **Fusion invariants gate.** `ibex_fusion_bench --check` asserts *ratios*
 between a fused case and its un-fused baseline (e.g. `order_head_10` must be
-≥8× faster than `wide_order_unsorted`). Ratios are intrinsic to the algorithm
-(full sort O(n log n) vs TopK heap-select O(n log k)), so they cancel runner
+≥8× faster than `wide_order_unsorted`; `agg_sorted_stream_*` must be ≥4× faster
+than their `agg_sorted_hash_*` counterparts). Ratios are intrinsic to the
+algorithm (full sort O(n log n) vs TopK heap-select O(n log k); no hash-table
+build for a sorted aggregate), so they cancel runner
 speed and gate cleanly where absolute timings cannot. A failure means a fusion
 *stopped firing* (a canonicalize rule regressed, or an operator fell back to
 materialization) — a correctness regression in operator selection, not a perf

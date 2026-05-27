@@ -716,7 +716,15 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Aggregate || node->children().empty()) {
         return {false, std::move(node)};
     }
-    const auto child_kind = node->children().front()->kind();
+    // Peek past any leading Order nodes: once this rule inserts a Project, R2
+    // (project-past-order) pushes it *below* the Order, leaving the Aggregate's
+    // direct child as Order again. Without looking through it, R20 would not see
+    // the Project it just created and would re-fire forever (R20 ↔ R2 loop).
+    const Node* descendant = node->children().front().get();
+    while (descendant->kind() == NodeKind::Order && !descendant->children().empty()) {
+        descendant = descendant->children().front().get();
+    }
+    const auto child_kind = descendant->kind();
     if (child_kind == NodeKind::Project || child_kind == NodeKind::FilterProject ||
         child_kind == NodeKind::FilterUpdateProject) {
         return {false, std::move(node)};
@@ -1023,6 +1031,12 @@ constexpr std::array<std::pair<std::string_view, RuleFn>, 19> kRules{{
 // (may differ from `node` if a rewrite fired).
 auto rewrite_root(NodePtr node) -> NodePtr {
     bool changed = true;
+    // Safety valve: rules should reach a fixpoint at a single node in a handful
+    // of fires (the longest legitimate chain is well under a dozen). If two
+    // rules ever oscillate, bail rather than hang — canonicalization is an
+    // optimization, so returning a less-canonical (but correct) tree is safe.
+    int iters = 0;
+    constexpr int kMaxRewrites = 256;
     while (changed) {
         changed = false;
         if (!node) {
@@ -1034,6 +1048,9 @@ auto rewrite_root(NodePtr node) -> NodePtr {
             node = std::move(result.node);
             if (result.changed) {
                 changed = true;
+                if (++iters >= kMaxRewrites) {
+                    return node;
+                }
                 break;
             }
         }

@@ -225,6 +225,18 @@ auto main(int argc, char** argv) -> int {
         // falls back to concat + order_table (spec §9.1).
         {"tf_sorted_as_timeframe", "as_timeframe(tf_sorted, \"ts\")"},
         {"wide_as_timeframe_unsorted", "as_timeframe(wide, \"c0\")"},
+        // TopK fusion (canonicalize R16): Head(Order(x)) → TopK(..., First),
+        // Tail(Order(x)) → TopK(..., Last). The runtime uses a bounded
+        // heap-select (O(n log k)) instead of the full sort + slice that
+        // `wide_order_unsorted` (~full O(n log n) on 2M rows) pays. Compare
+        // these against `wide_order_unsorted` to see the fusion payoff.
+        {"order_head_10", "wide[order c0 asc][head 10]"},
+        {"order_head_1000", "wide[order c0 asc][head 1000]"},
+        {"order_tail_10", "wide[order c0 asc][tail 10]"},
+        {"order_tail_1000", "wide[order c0 asc][tail 1000]"},
+        // Grouped TopK: Head(group_by=g, Order(c1)) → TopK(..., group_by=g).
+        // Exercises the per-group heap-select path (top 3 rows per group).
+        {"grouped_order_head_3", "wide[update { g = c0 % 100 }][order c1 asc][by g, head 3]"},
         // Order-after-Aggregate measurement: aggregate reduces 2M rows to K groups;
         // sorting K rows afterwards is cheap. Confirms pulling Order under Aggregate
         // has no payoff at current scales.

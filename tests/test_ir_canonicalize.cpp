@@ -622,3 +622,32 @@ TEST_CASE("canonicalize R20: not inserted when child is already Project", "[ir][
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Project);
     REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
 }
+
+TEST_CASE("canonicalize R20: Aggregate(Order(x)) prunes without looping (regression)",
+          "[ir][canonicalize]") {
+    // Regression: R20 inserts a column-pruning Project below the Aggregate, and
+    // R2 then pushes that Project beneath the Order. R20 used to re-fire because
+    // the Aggregate's direct child was Order again (not the Project it had just
+    // created), looping forever. The fix makes R20 peek past leading Order
+    // nodes. With no count(*) agg, R20 is active, so this exercises the path.
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
+                               .column = ir::ColumnRef{.name = "v", .source = {0}},
+                               .alias = "s"});
+    auto tree = with_child(make_aggregate({1}, {"a", "b"}, std::move(aggs)),
+                           with_child(make_order({2}, {{.name = "a", .ascending = true},
+                                                       {.name = "b", .ascending = true}}),
+                                      make_scan({3}, "t")));
+
+    auto out = ir::canonicalize(std::move(tree));  // must terminate
+
+    // Clean fixpoint: the pruning Project sits between the Order and the Scan
+    // (Aggregate(Order(Project(Scan)))) — not a deeper nest, which is what a
+    // capped-but-still-looping run would leave behind.
+    REQUIRE(out->kind() == ir::NodeKind::Aggregate);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Order);
+    const auto& order = *out->children().front();
+    REQUIRE(order.children().front()->kind() == ir::NodeKind::Project);
+    const auto& project = *order.children().front();
+    REQUIRE(project.children().front()->kind() == ir::NodeKind::Scan);
+}

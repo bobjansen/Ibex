@@ -135,6 +135,14 @@ const std::vector<Guard>& fusion_guards() {
         // sort (which would land near 1x) without tripping at small scales.
         {"order_head_1000", "wide_order_unsorted", 3.0,
          "TopK(k=1000) heap-select must still beat a full sort"},
+        // Sorted-input aggregate must stream group-at-a-time, not fall back to
+        // hashing. The gap is algorithmic (no hash-table build), ~12x at CI
+        // scale; 4x catches the streaming path silently disengaging (which
+        // would land near 1x — both paths hashing).
+        {"agg_sorted_stream_1k", "agg_sorted_hash_1k", 4.0,
+         "Aggregate on group-sorted input must stream, not hash"},
+        {"agg_sorted_stream_highcard", "agg_sorted_hash_highcard", 4.0,
+         "High-cardinality sorted aggregate must stream, not build a full hash table"},
     };
     return guards;
 }
@@ -219,6 +227,31 @@ auto main(int argc, char** argv) -> int {
         }
         t.add_column("v", std::move(v));
         tables["tf_sorted"] = std::move(t);
+    }
+
+    // A table pre-sorted on a low-cardinality key `g` (~1000 groups, runs of
+    // contiguous equal keys), used to compare the streaming sort-based
+    // aggregate against the hash aggregate on grouped-contiguous input.
+    {
+        ibex::runtime::Table t;
+        ibex::Column<std::int64_t> g;
+        g.resize(rows);
+        const std::int64_t n_groups = 1000;
+        const std::size_t per_group = rows / static_cast<std::size_t>(n_groups);
+        for (std::size_t i = 0; i < rows; ++i) {
+            auto grp = per_group == 0 ? 0 : i / per_group;
+            g.data()[i] = static_cast<std::int64_t>(
+                std::min<std::size_t>(grp, static_cast<std::size_t>(n_groups - 1)));
+        }
+        t.add_column("g", std::move(g));
+        ibex::Column<std::int64_t> v;
+        v.resize(rows);
+        std::mt19937_64 rng(45);
+        for (std::size_t i = 0; i < rows; ++i) {
+            v.data()[i] = static_cast<std::int64_t>(rng() % 1000);
+        }
+        t.add_column("v", std::move(v));
+        tables["grouped_sorted"] = std::move(t);
     }
 
     struct Q {
@@ -306,6 +339,21 @@ auto main(int argc, char** argv) -> int {
          "wide[update { g = c0 % 1000 }][by g, select { g, s = sum(c1) }][order s desc]"},
         {"agg_then_order_100_groups",
          "wide[update { g = c0 % 100 }][by g, select { g, s = sum(c1) }][order s desc]"},
+        // Streaming sort-based aggregate vs hash aggregate on grouped-contiguous
+        // input. When the aggregate's input arrives sorted on the group key, the
+        // chunked operator keeps accumulators for only the current group and
+        // emits groups in key order (bounded memory, no hash table). The `_hash`
+        // variants drop the `order` so the input has no ordering metadata and the
+        // operator falls back to the hash path — same query, same data, so the
+        // pair isolates streaming vs hashing.
+        //
+        // Moderate cardinality (~1000 groups):
+        {"agg_sorted_stream_1k", "grouped_sorted[order g asc][by g, select { g, s = sum(v) }]"},
+        {"agg_sorted_hash_1k", "grouped_sorted[by g, select { g, s = sum(v) }]"},
+        // High cardinality (one group per row → ~2M groups): the hash table holds
+        // every group at once, while the stream holds one at a time.
+        {"agg_sorted_stream_highcard", "sorted[order k asc][by k, select { k, s = sum(v) }]"},
+        {"agg_sorted_hash_highcard", "sorted[by k, select { k, s = sum(v) }]"},
     };
 
     std::map<std::string, double> mins;

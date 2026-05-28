@@ -88,8 +88,25 @@ TEST_CASE("schema: aggregate yields group keys plus aggregate outputs", "[ir][sc
     REQUIRE(s.is_known());
     REQUIRE(names(s) == std::vector<std::string>{"a", "total", "n"});
     REQUIRE(type_of(s, "a") == ColumnType::Int64);
-    REQUIRE(type_of(s, "n") == ColumnType::Int64);  // count -> Int64
-    REQUIRE(type_of(s, "total") == std::nullopt);   // sum type deferred
+    REQUIRE(type_of(s, "n") == ColumnType::Int64);        // count -> Int64
+    REQUIRE(type_of(s, "total") == ColumnType::Float64);  // sum(b) preserves Float64
+}
+
+TEST_CASE("schema: aggregate resolves sum and mean result types", "[ir][schema]") {
+    auto s = schema_of("t[select { a, si = sum(a), sf = sum(b), avg = mean(a) }, by a];",
+                       base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(type_of(s, "si") == ColumnType::Int64);     // sum preserves Int64
+    REQUIRE(type_of(s, "sf") == ColumnType::Float64);   // sum preserves Float64
+    REQUIRE(type_of(s, "avg") == ColumnType::Float64);  // mean is always Float64
+}
+
+TEST_CASE("schema: update infers arithmetic result types", "[ir][schema]") {
+    auto s = schema_of("t[update { i = a * 2, f = a * b, d = a / a }];", base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(type_of(s, "i") == ColumnType::Int64);    // Int * Int literal -> Int64
+    REQUIRE(type_of(s, "f") == ColumnType::Float64);  // Int * Float -> Float64
+    REQUIRE(type_of(s, "d") == ColumnType::Float64);  // division -> Float64
 }
 
 TEST_CASE("schema: an unknown source produces an unknown schema", "[ir][schema]") {

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -45,9 +46,38 @@ auto literal_type(const Literal& lit) -> ColumnType {
         lit.value);
 }
 
-/// Best-effort type of a computed-field expression given the input schema.
-/// Only the cases that are certain are inferred; everything else is nullopt
-/// (full expression type inference is a later stage).
+auto is_float(ColumnType t) -> bool {
+    return t == ColumnType::Float32 || t == ColumnType::Float64;
+}
+auto is_int(ColumnType t) -> bool {
+    return t == ColumnType::Int32 || t == ColumnType::Int64;
+}
+auto is_numeric(ColumnType t) -> bool {
+    return is_float(t) || is_int(t);
+}
+
+/// Target type of a scalar cast call (`Int64(x)`, `Float64(x)`, ...).
+auto cast_target(std::string_view callee) -> std::optional<ColumnType> {
+    if (callee == "Int" || callee == "Int64") {
+        return ColumnType::Int64;
+    }
+    if (callee == "Int32") {
+        return ColumnType::Int32;
+    }
+    if (callee == "Float64") {
+        return ColumnType::Float64;
+    }
+    if (callee == "Float32") {
+        return ColumnType::Float32;
+    }
+    return std::nullopt;
+}
+
+/// Best-effort result type of a computed-field expression given the input
+/// schema. Only the cases that are certain are inferred; anything uncertain is
+/// nullopt, which keeps the result sound. The runtime `infer_expr_type`
+/// (interpreter.cpp) remains the authoritative typing; this mirrors its
+/// common, unambiguous cases for the static pass.
 auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<ColumnType> {
     if (const auto* col = std::get_if<ColumnRef>(&expr.node)) {
         if (const auto* field = input.find(col->name)) {
@@ -58,6 +88,53 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
     if (const auto* lit = std::get_if<Literal>(&expr.node)) {
         return literal_type(*lit);
     }
+    if (const auto* bin = std::get_if<BinaryExpr>(&expr.node)) {
+        const auto left = expr_type(*bin->left, input);
+        const auto right = expr_type(*bin->right, input);
+        if (!left.has_value() || !right.has_value()) {
+            return std::nullopt;
+        }
+        if (!is_numeric(*left) || !is_numeric(*right)) {
+            return std::nullopt;  // non-numeric arithmetic is unsupported / uncertain
+        }
+        if (bin->op == ArithmeticOp::Div) {
+            return ColumnType::Float64;
+        }
+        if (is_float(*left) || is_float(*right)) {
+            return ColumnType::Float64;
+        }
+        return ColumnType::Int64;
+    }
+    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+        if (auto target = cast_target(call->callee)) {
+            return target;
+        }
+        // Functions that always return Float64.
+        if (call->callee == "sqrt" || call->callee == "log" || call->callee == "exp" ||
+            call->callee == "rolling_mean" || call->callee == "rolling_median" ||
+            call->callee == "rolling_std" || call->callee == "rolling_ewma" ||
+            call->callee == "rolling_quantile" || call->callee == "rolling_skew" ||
+            call->callee == "rolling_kurtosis") {
+            return ColumnType::Float64;
+        }
+        if (call->callee == "rolling_count") {
+            return ColumnType::Int64;
+        }
+        // `abs` and type-preserving columnar functions return their first
+        // argument's type.
+        if (call->callee == "abs" || call->callee == "cumsum" || call->callee == "cumprod" ||
+            call->callee == "lag" || call->callee == "lead" || call->callee == "rolling_sum" ||
+            call->callee == "rolling_min" || call->callee == "rolling_max") {
+            if (!call->args.empty()) {
+                const auto arg = expr_type(*call->args.front(), input);
+                if (arg.has_value() && is_numeric(*arg)) {
+                    return arg;
+                }
+            }
+            return std::nullopt;
+        }
+        return std::nullopt;
+    }
     return std::nullopt;
 }
 
@@ -66,13 +143,16 @@ auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::option
     switch (agg.func) {
         case AggFunc::Count:
             return ColumnType::Int64;
+        case AggFunc::Mean:
         case AggFunc::Median:
         case AggFunc::Stddev:
         case AggFunc::Ewma:
         case AggFunc::Quantile:
         case AggFunc::Skew:
         case AggFunc::Kurtosis:
+            // Always produce a Float64 result.
             return ColumnType::Float64;
+        case AggFunc::Sum:
         case AggFunc::Min:
         case AggFunc::Max:
         case AggFunc::First:
@@ -81,11 +161,6 @@ auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::option
             if (const auto* field = input.find(agg.column.name)) {
                 return field->type;
             }
-            return std::nullopt;
-        case AggFunc::Sum:
-        case AggFunc::Mean:
-            // Sum may widen; Mean's promotion rules are deferred to expression
-            // type inference. Leave the type unresolved but the column known.
             return std::nullopt;
     }
     return std::nullopt;

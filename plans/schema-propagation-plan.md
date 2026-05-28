@@ -45,9 +45,14 @@ as a real pass, not inventing semantics.
 ### 1. The `SchemaInfo` lattice
 
 ```
-SchemaInfo = Known(ordered list of { name, ScalarType })
+SchemaInfo = Known(ordered list of { name, optional<ScalarType> })
            | Unknown        // ⊥: anything; defeats static checking downstream
 ```
+
+(Implemented refinement: each field's type is `optional` — a column may be
+*known to exist* with its type *not yet inferred*. This lets `Known` carry the
+column-name set even before expression type inference exists, which is what
+unlocks early "missing column" detection without waiting for Stage 3.)
 
 `Unknown` is the top element: any operator fed an `Unknown` input generally
 produces `Unknown`, unless the operator fully determines its output regardless
@@ -145,11 +150,19 @@ equivalents (or run the pass before fusion).
 
 ## Staging
 
-1. **`SchemaInfo` + `schema_of` for determinate operators.** Scan (declared or
-   `Unknown`), filter/order/head/tail passthrough, project/distinct/update/
-   rename/aggregate/join, construct. `Unknown` for the data-dependent nodes.
-   Lower-time error when both sides `Known`; runtime fallback otherwise. No
-   surface-syntax change yet.
+1. **`SchemaInfo` + `schema_of` for determinate operators.** — **DONE.**
+   Implemented in `include/ibex/ir/schema.hpp` + `src/ir/schema.cpp`, tested in
+   `tests/test_ir_schema.cpp`. `ir::infer_schema(node, sources)` propagates
+   bottom-up. Covered: Scan/ExternCall (resolve from a `SourceSchemas` env, else
+   `Unknown`), filter/order/head/tail/as_timeframe/window/distinct passthrough,
+   project (fixes the column set even over an `Unknown` child), rename, update
+   (with trivial column-ref/literal type inference), aggregate (keys + outputs;
+   count→Int64, the always-double aggregates→Float64, min/max/first/last preserve
+   input type, sum/mean deferred), join (A ∪ B with key dedup), construct,
+   columns. Everything else returns `Unknown` (the sound default): resample,
+   melt, dcast, cov, corr, transpose, matmul, model, stream, and the fused
+   nodes. No surface-syntax change. Not yet wired into any error-reporting site —
+   that is Stage 4. Strict-g++ clean.
 2. **Schema ascription `as` (+ declared reader schemas).** The boundary that
    defeats `Unknown`. Grammar + lower + runtime validation reusing
    `validate_table_type`.

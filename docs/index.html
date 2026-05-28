@@ -1667,10 +1667,15 @@ cmake --build build-release</code></pre>
             <tbody>
               <tr><td><code>:load examples/quant.ibex</code></td><td>Load and execute an .ibex script</td></tr>
               <tr><td><code>:comments [on|off]</code></td><td>Toggle printing script comments during <code>:load</code></td></tr>
+              <tr><td><code>:help</code></td><td>Show REPL commands</td></tr>
               <tr><td><code>:tables</code></td><td>List all bound table names</td></tr>
+              <tr><td><code>:functions</code></td><td>List user and extern function signatures</td></tr>
+              <tr><td><code>:imports</code></td><td>List imported libraries and extern origins</td></tr>
               <tr><td><code>:schema &lt;table&gt;</code></td><td>Column names and types</td></tr>
               <tr><td><code>:head &lt;table&gt; [n]</code></td><td>First n rows (default&nbsp;10)</td></tr>
               <tr><td><code>:describe &lt;table&gt;</code></td><td>Schema + first n rows</td></tr>
+              <tr><td><code>:doc &lt;name&gt;</code></td><td>Docs or signatures for bindings and built-ins</td></tr>
+              <tr><td><code>:source &lt;fn&gt;</code></td><td>Source for a user-defined function</td></tr>
             </tbody>
           </table>
           <p style="margin-top: 0.7rem;">

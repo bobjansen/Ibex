@@ -33,6 +33,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 
@@ -50,6 +51,9 @@ using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
 using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
 using ModelRegistry = std::unordered_map<std::string, runtime::ModelResult>;
 using CompileTimeListRegistry = std::unordered_map<std::string, std::vector<std::string>>;
+using FunctionSourceRegistry = std::unordered_map<std::string, std::string>;
+using DeclarationDocRegistry = std::unordered_map<std::string, std::string>;
+using ImportRegistry = std::unordered_set<std::string>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
 struct BoundCallArg {
@@ -66,12 +70,14 @@ struct CompletionContext {
     const FunctionRegistry* functions = nullptr;
     const CompileTimeListRegistry* compile_time_lists = nullptr;
     const ExternDeclRegistry* extern_decls = nullptr;
+    const ImportRegistry* imports = nullptr;
 };
 
 #ifdef IBEX_HAS_READLINE
-constexpr std::array<std::string_view, 13> kColonCommands = {
-    ":q",    ":quit",     ":exit", ":tables", ":scalars", ":schema",   ":head",
-    ":peek", ":describe", ":load", ":timing", ":time",    ":comments",
+constexpr std::string_view kColonCommands[] = {
+    ":q",         ":quit",    ":exit",   ":help",     ":tables", ":scalars",
+    ":functions", ":imports", ":schema", ":head",     ":peek",   ":describe",
+    ":load",      ":timing",  ":time",   ":comments", ":doc",    ":source",
 };
 
 constexpr std::string_view kCompletionBuiltins[] = {
@@ -250,6 +256,16 @@ void add_map_keys(std::vector<std::string>& candidates, const Map* map) {
     }
 }
 
+void add_set_values(std::vector<std::string>& candidates, const ImportRegistry* set) {
+    if (set == nullptr) {
+        return;
+    }
+    candidates.reserve(candidates.size() + set->size());
+    for (const auto& value : *set) {
+        candidates.push_back(value);
+    }
+}
+
 void add_table_columns(std::vector<std::string>& candidates, const runtime::Table* table) {
     if (table == nullptr) {
         return;
@@ -319,6 +335,7 @@ auto expression_completion_candidates(std::string_view line, std::size_t cursor,
         add_map_keys(candidates, g_completion_context.functions);
         add_map_keys(candidates, g_completion_context.extern_decls);
         add_map_keys(candidates, g_completion_context.compile_time_lists);
+        add_set_values(candidates, g_completion_context.imports);
         return candidates;
     }
 
@@ -329,6 +346,7 @@ auto expression_completion_candidates(std::string_view line, std::size_t cursor,
     add_map_keys(candidates, g_completion_context.functions);
     add_map_keys(candidates, g_completion_context.extern_decls);
     add_map_keys(candidates, g_completion_context.compile_time_lists);
+    add_set_values(candidates, g_completion_context.imports);
     if (any_prefix_match(candidates, prefix)) {
         return candidates;
     }
@@ -418,7 +436,7 @@ auto repl_completion(const char* text, int start, int end) -> char** {
     const std::string_view line = rl_line_buffer != nullptr ? std::string_view(rl_line_buffer) : "";
     if (start == 0 && text != nullptr && text[0] == ':') {
         std::vector<std::string> commands;
-        commands.reserve(kColonCommands.size());
+        commands.reserve(std::size(kColonCommands));
         for (auto command : kColonCommands) {
             commands.emplace_back(command);
         }
@@ -435,6 +453,19 @@ auto repl_completion(const char* text, int start, int end) -> char** {
         std::vector<std::string> tables;
         add_map_keys(tables, g_completion_context.tables);
         return matches_from(std::move(tables), text);
+    }
+
+    if (command_matches(line, ":source")) {
+        std::vector<std::string> functions;
+        add_map_keys(functions, g_completion_context.functions);
+        return matches_from(std::move(functions), text);
+    }
+
+    if (command_matches(line, ":doc") || command_matches(line, ":help")) {
+        return matches_from(expression_completion_candidates(
+                                line, static_cast<std::size_t>(end),
+                                text != nullptr ? std::string_view(text) : std::string_view{}),
+                            text);
     }
 
     if (line.starts_with(':')) {
@@ -599,6 +630,35 @@ auto statement_end_line(const parser::Stmt& stmt) -> std::size_t {
     return std::visit([](const auto& s) { return s.end_line; }, stmt);
 }
 
+auto source_for_lines(std::string_view source, std::size_t start_line, std::size_t end_line)
+    -> std::string {
+    if (source.empty() || start_line == 0 || end_line < start_line) {
+        return {};
+    }
+    std::size_t line = 1;
+    std::size_t start = std::string_view::npos;
+    std::size_t end = source.size();
+    for (std::size_t i = 0; i <= source.size(); ++i) {
+        if (line == start_line && start == std::string_view::npos) {
+            start = i;
+        }
+        if (i == source.size()) {
+            break;
+        }
+        if (source[i] == '\n') {
+            if (line == end_line) {
+                end = i;
+                break;
+            }
+            ++line;
+        }
+    }
+    if (start == std::string_view::npos) {
+        return {};
+    }
+    return std::string(source.substr(start, end - start));
+}
+
 auto build_statement_comment_groups(const std::vector<parser::Stmt>& statements,
                                     const std::vector<ScriptCommentLine>& comments)
     -> std::vector<std::vector<std::string>> {
@@ -635,6 +695,20 @@ void print_comment_group(const std::vector<std::string>& comments) {
         fmt::print("  {}\n", line);
     }
     fmt::print("\n");
+}
+
+auto doc_from_comment_group(const std::vector<std::string>& comments) -> std::string {
+    std::string doc;
+    for (const auto& line : comments) {
+        if (line.empty()) {
+            continue;
+        }
+        if (!doc.empty()) {
+            doc.push_back('\n');
+        }
+        doc += line;
+    }
+    return doc;
 }
 
 auto bind_call_arguments(const std::string& callee, parser::CallExpr& call,
@@ -877,6 +951,135 @@ auto scalar_value_type_name(const runtime::ScalarValue& val) -> std::string_view
     return "Unknown";
 }
 
+auto type_to_string(const parser::Type& type) -> std::string {
+    auto schema_to_string = [](const parser::SchemaType& schema) {
+        if (schema.fields.empty()) {
+            return std::string{};
+        }
+        std::string out = "<{ ";
+        for (std::size_t i = 0; i < schema.fields.size(); ++i) {
+            if (i > 0) {
+                out += ", ";
+            }
+            out += schema.fields[i].name;
+            out += ": ";
+            out += scalar_type_name(schema.fields[i].type);
+        }
+        out += " }>";
+        return out;
+    };
+
+    if (type.kind == parser::Type::Kind::Scalar) {
+        if (const auto* scalar = std::get_if<parser::ScalarType>(&type.arg)) {
+            return std::string(scalar_type_name(*scalar));
+        }
+        return "Unknown";
+    }
+    if (type.kind == parser::Type::Kind::Series) {
+        std::string out = "Series";
+        if (const auto* scalar = std::get_if<parser::ScalarType>(&type.arg)) {
+            out += "<";
+            out += scalar_type_name(*scalar);
+            out += ">";
+        }
+        return out;
+    }
+    const char* base = type.kind == parser::Type::Kind::TimeFrame ? "TimeFrame" : "DataFrame";
+    if (const auto* schema = std::get_if<parser::SchemaType>(&type.arg)) {
+        return std::string(base) + schema_to_string(*schema);
+    }
+    return base;
+}
+
+auto param_to_string(const parser::Param& param) -> std::string {
+    std::string out;
+    if (param.effect == parser::Param::Effect::Mutable) {
+        out += "mutable ";
+    } else if (param.effect == parser::Param::Effect::Consume) {
+        out += "consume ";
+    }
+    out += param.name;
+    out += ": ";
+    out += type_to_string(param.type);
+    if (param.default_value != nullptr) {
+        out += " = <default>";
+    }
+    return out;
+}
+
+auto effects_to_string(const std::optional<std::vector<parser::EffectSpec>>& effects)
+    -> std::string {
+    if (!effects.has_value()) {
+        return {};
+    }
+    std::string out = " effects {";
+    for (std::size_t i = 0; i < effects->size(); ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        switch ((*effects)[i].kind) {
+            case parser::EffectKind::IoRead:
+                out += "io_read";
+                break;
+            case parser::EffectKind::IoWrite:
+                out += "io_write";
+                break;
+            case parser::EffectKind::Nondet:
+                out += "nondet";
+                break;
+            case parser::EffectKind::State:
+                out += "state";
+                break;
+            case parser::EffectKind::Blocking:
+                out += "blocking";
+                break;
+            case parser::EffectKind::MayFail:
+                out += "may_fail";
+                break;
+        }
+        if ((*effects)[i].resource.has_value()) {
+            out += "(\"";
+            out += *(*effects)[i].resource;
+            out += "\")";
+        }
+    }
+    out += "}";
+    return out;
+}
+
+auto function_signature(const parser::FunctionDecl& fn) -> std::string {
+    std::string out = "fn " + fn.name + "(";
+    for (std::size_t i = 0; i < fn.params.size(); ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        out += param_to_string(fn.params[i]);
+    }
+    out += ") -> ";
+    out += type_to_string(fn.return_type);
+    out += effects_to_string(fn.effects);
+    return out;
+}
+
+auto extern_signature(const parser::ExternDecl& decl) -> std::string {
+    std::string out = "extern fn " + decl.name + "(";
+    for (std::size_t i = 0; i < decl.params.size(); ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        out += param_to_string(decl.params[i]);
+    }
+    out += ") -> ";
+    out += type_to_string(decl.return_type);
+    out += effects_to_string(decl.effects);
+    if (!decl.source_path.empty()) {
+        out += " from \"";
+        out += decl.source_path;
+        out += "\"";
+    }
+    return out;
+}
+
 auto scalar_type_matches(const runtime::ScalarValue& val, parser::ScalarType expected) -> bool {
     switch (expected) {
         case parser::ScalarType::Int32:
@@ -1115,6 +1318,254 @@ void print_schema(const runtime::Table& table) {
 void describe_table(const runtime::Table& table, std::size_t max_rows = 10) {
     print_schema(table);
     print_table(table, max_rows);
+}
+
+struct BuiltinDoc {
+    std::string_view name;
+    std::string_view signature;
+    std::string_view summary;
+    std::string_view example;
+};
+
+constexpr BuiltinDoc kBuiltinDocs[] = {
+    {"mean", "mean(col) -> Float64", "Aggregate mean over each group.",
+     "trades[select { avg = mean(price) }, by symbol]"},
+    {"sum", "sum(col) -> same numeric type", "Aggregate sum over each group.",
+     "trades[select { total = sum(price) }, by symbol]"},
+    {"count", "count() -> Int64", "Count rows in the current group.",
+     "trades[select { n = count() }, by symbol]"},
+    {"min", "min(col) -> same type", "Aggregate minimum.", "trades[select { lo = min(price) }]"},
+    {"max", "max(col) -> same type", "Aggregate maximum.", "trades[select { hi = max(price) }]"},
+    {"first", "first(col) -> same type", "First value in group encounter order.",
+     "trades[select { first_px = first(price) }, by symbol]"},
+    {"last", "last(col) -> same type", "Last value in group encounter order.",
+     "trades[select { last_px = last(price) }, by symbol]"},
+    {"median", "median(col) -> Float64", "Aggregate median.",
+     "trades[select { med = median(price) }, by symbol]"},
+    {"std", "std(col) -> Float64", "Sample standard deviation.",
+     "trades[select { vol = std(price) }, by symbol]"},
+    {"quantile", "quantile(col, p) -> Float64", "Linear interpolated aggregate quantile.",
+     "trades[select { p95 = quantile(price, 0.95) }, by symbol]"},
+    {"scalar", "scalar(table, column) -> scalar", "Extract a scalar value from a one-row table.",
+     "scalar(summary, \"avg\")"},
+    {"columns", "columns(table) -> DataFrame", "Return a metadata table of column names.",
+     "let cols = columns(trades);"},
+    {"as_timeframe", "as_timeframe(table, \"timestamp_col\") -> TimeFrame",
+     "Mark a table as time-indexed and sorted by its timestamp/date column.",
+     "let tf = as_timeframe(trades, \"ts\");"},
+    {"lag", "lag(col, n) -> Series<T>", "Value n rows before the current row.",
+     "trades[update { prev = lag(price, 1) }, by symbol]"},
+    {"lead", "lead(col, n) -> Series<T>", "Value n rows after the current row.",
+     "trades[update { next = lead(price, 1) }, by symbol]"},
+    {"rank", "rank(expr, method = dense, ascending = true) -> Series<Int64>",
+     "Row rank, optionally partitioned by surrounding by clause.",
+     "scores[update { r = rank(score, method = dense, ascending = false) }, by dept]"},
+    {"round", "round(value, mode) -> Int64",
+     "Round Float64 using nearest/bankers/floor/ceil/trunc.", "round(2.5, bankers)"},
+    {"print", "print(value) -> value", "Print a human-readable value in scripts and REPL sessions.",
+     "print(trades[select { n = count() }])"},
+};
+
+auto find_builtin_doc(std::string_view name) -> const BuiltinDoc* {
+    for (const auto& doc : kBuiltinDocs) {
+        if (doc.name == name) {
+            return &doc;
+        }
+    }
+    return nullptr;
+}
+
+void print_help() {
+    fmt::print("Ibex REPL help\n");
+    fmt::print("  :help                 Show this help\n");
+    fmt::print("  :tables               List table bindings\n");
+    fmt::print("  :scalars              List scalar bindings\n");
+    fmt::print("  :functions            List user and extern functions\n");
+    fmt::print("  :imports              List imported libraries and extern origins\n");
+    fmt::print("  :schema <table>       Show column names and types\n");
+    fmt::print("  :head <table> [n]     Show first n rows\n");
+    fmt::print("  :peek <expr>          Evaluate and compactly display an expression\n");
+    fmt::print("  :describe <table>     Schema + first rows\n");
+    fmt::print("  :doc <name>           Show docs/signature for a binding or built-in\n");
+    fmt::print("  ?name                 Shorthand for :doc name\n");
+    fmt::print("  :source <fn>          Show source for a user-defined function\n");
+    fmt::print("  :load <file>          Load and execute an .ibex script\n");
+    fmt::print("  :time <command>       Time exactly one command\n");
+    fmt::print("  :timing [on|off]      Toggle command timing\n");
+    fmt::print("  :comments [on|off]    Toggle script comment echo during :load\n");
+    fmt::print("  :quit                 Exit\n");
+}
+
+void print_functions(const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls) {
+    if (functions.empty() && extern_decls.empty()) {
+        fmt::print("functions: <none>\n");
+        return;
+    }
+    std::vector<std::string> names;
+    names.reserve(functions.size());
+    for (const auto& entry : functions) {
+        names.push_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    if (!names.empty()) {
+        fmt::print("user functions:\n");
+        for (const auto& name : names) {
+            fmt::print("  {}\n", function_signature(functions.at(name)));
+        }
+    }
+    names.clear();
+    names.reserve(extern_decls.size());
+    for (const auto& entry : extern_decls) {
+        names.push_back(entry.first);
+    }
+    std::sort(names.begin(), names.end());
+    if (!names.empty()) {
+        fmt::print("extern functions:\n");
+        for (const auto& name : names) {
+            fmt::print("  {}\n", extern_signature(extern_decls.at(name)));
+        }
+    }
+}
+
+void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& extern_decls) {
+    if (imports.empty()) {
+        fmt::print("imports: <none>\n");
+    } else {
+        std::vector<std::string> names(imports.begin(), imports.end());
+        std::sort(names.begin(), names.end());
+        fmt::print("imports:");
+        for (const auto& name : names) {
+            fmt::print(" {}", name);
+        }
+        fmt::print("\n");
+    }
+
+    std::unordered_map<std::string, std::vector<std::string>> by_source;
+    for (const auto& [name, decl] : extern_decls) {
+        if (!decl.source_path.empty()) {
+            by_source[decl.source_path].push_back(name);
+        }
+    }
+    if (by_source.empty()) {
+        return;
+    }
+    std::vector<std::string> sources;
+    sources.reserve(by_source.size());
+    for (const auto& [source, _] : by_source) {
+        sources.push_back(source);
+    }
+    std::sort(sources.begin(), sources.end());
+    fmt::print("extern origins:\n");
+    for (const auto& source : sources) {
+        auto& names = by_source[source];
+        std::sort(names.begin(), names.end());
+        fmt::print("  {}:", source);
+        for (const auto& name : names) {
+            fmt::print(" {}", name);
+        }
+        fmt::print("\n");
+    }
+}
+
+void print_doc_text(const DeclarationDocRegistry& declaration_docs, const std::string& key) {
+    auto doc_it = declaration_docs.find(key);
+    if (doc_it == declaration_docs.end() || doc_it->second.empty()) {
+        return;
+    }
+    fmt::print("doc:\n");
+    std::string_view text = doc_it->second;
+    while (!text.empty()) {
+        auto newline = text.find('\n');
+        auto line = newline == std::string_view::npos ? text : text.substr(0, newline);
+        fmt::print("  {}\n", line);
+        if (newline == std::string_view::npos) {
+            break;
+        }
+        text.remove_prefix(newline + 1);
+    }
+}
+
+void print_doc(std::string_view name, const runtime::TableRegistry& tables,
+               const runtime::ScalarRegistry& scalars, const ColumnRegistry& columns,
+               const ModelRegistry& models, const FunctionRegistry& functions,
+               const ExternDeclRegistry& extern_decls,
+               const DeclarationDocRegistry& declaration_docs, const ImportRegistry& imports) {
+    if (name.empty()) {
+        fmt::print("usage: :doc <name>\n");
+        return;
+    }
+    const std::string key{name};
+    if (auto it = tables.find(key); it != tables.end()) {
+        fmt::print("table {}\n", key);
+        print_schema(it->second);
+        fmt::print("rows: {}\n", it->second.rows());
+        return;
+    }
+    if (auto it = scalars.find(key); it != scalars.end()) {
+        fmt::print("scalar {}: {} = {}\n", key, scalar_value_type_name(it->second),
+                   format_scalar(it->second));
+        return;
+    }
+    if (auto it = columns.find(key); it != columns.end()) {
+        fmt::print("column {}: {}\n", key, column_type_name(it->second));
+        return;
+    }
+    if (auto it = models.find(key); it != models.end()) {
+        fmt::print("model {}\n", key);
+        fmt::print("  method: {}\n", it->second.method);
+        fmt::print("  observations: {}\n", it->second.n_obs);
+        fmt::print("  r_squared: {}\n", runtime::format_float_mixed(it->second.r_squared));
+        return;
+    }
+    if (auto it = functions.find(key); it != functions.end()) {
+        fmt::print("{}\n", function_signature(it->second));
+        print_doc_text(declaration_docs, key);
+        fmt::print("source: use :source {}\n", key);
+        return;
+    }
+    if (auto it = extern_decls.find(key); it != extern_decls.end()) {
+        fmt::print("{}\n", extern_signature(it->second));
+        print_doc_text(declaration_docs, key);
+        if (!it->second.source_path.empty()) {
+            fmt::print("origin: {}\n", it->second.source_path);
+        }
+        return;
+    }
+    if (imports.contains(key)) {
+        fmt::print("import \"{}\"\n", key);
+        return;
+    }
+    if (const auto* doc = find_builtin_doc(name); doc != nullptr) {
+        fmt::print("{}\n", doc->signature);
+        fmt::print("{}\n", doc->summary);
+        if (!doc->example.empty()) {
+            fmt::print("example: {}\n", doc->example);
+        }
+        return;
+    }
+    fmt::print("no documentation for '{}'\n", name);
+}
+
+void print_source(std::string_view name, const FunctionRegistry& functions,
+                  const FunctionSourceRegistry& sources) {
+    if (name.empty()) {
+        fmt::print("usage: :source <function>\n");
+        return;
+    }
+    const std::string key{name};
+    auto fn_it = functions.find(key);
+    if (fn_it == functions.end()) {
+        fmt::print("error: unknown user function '{}'\n", name);
+        return;
+    }
+    auto source_it = sources.find(key);
+    if (source_it != sources.end() && !source_it->second.empty()) {
+        fmt::print("{}\n", source_it->second);
+        return;
+    }
+    fmt::print("{} {{\n", function_signature(fn_it->second));
+    fmt::print("  <source unavailable>\n");
+    fmt::print("}}\n");
 }
 
 auto column_bytes(const runtime::ColumnEntry& entry) -> std::size_t {
@@ -2362,26 +2813,51 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         const std::vector<std::string>& plugin_search_paths,
                         std::unordered_set<std::string>& loaded_plugins,
                         const std::vector<std::string>& import_search_paths = {},
-                        const std::vector<std::vector<std::string>>* comment_groups = nullptr)
+                        const std::vector<std::vector<std::string>>* print_comment_groups = nullptr,
+                        const std::vector<std::vector<std::string>>* doc_comment_groups = nullptr,
+                        FunctionSourceRegistry* function_sources = nullptr,
+                        DeclarationDocRegistry* declaration_docs = nullptr,
+                        ImportRegistry* imports = nullptr, std::string_view source_text = {})
     -> bool {
     // Pre-pass: register every top-level `fn` declaration in this batch so that
     // function bodies can reference functions declared later in the same script
     // or REPL submission. We move the decls into the registry; the main loop
     // below treats FunctionDecl as a no-op since the pre-pass owns it.
-    for (auto& stmt : statements) {
+    for (std::size_t stmt_index = 0; stmt_index < statements.size(); ++stmt_index) {
+        auto& stmt = statements[stmt_index];
         if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
             auto fn = std::get<parser::FunctionDecl>(std::move(stmt));
+            if (function_sources != nullptr) {
+                auto source = source_for_lines(source_text, fn.start_line, fn.end_line);
+                if (!source.empty()) {
+                    function_sources->insert_or_assign(fn.name, std::move(source));
+                }
+            }
+            if (declaration_docs != nullptr && doc_comment_groups != nullptr &&
+                stmt_index < doc_comment_groups->size()) {
+                auto doc = doc_from_comment_group((*doc_comment_groups)[stmt_index]);
+                if (!doc.empty()) {
+                    declaration_docs->insert_or_assign(fn.name, std::move(doc));
+                }
+            }
             functions.insert_or_assign(fn.name, std::move(fn));
         }
     }
     for (std::size_t stmt_index = 0; stmt_index < statements.size(); ++stmt_index) {
         auto& stmt = statements[stmt_index];
-        if (comment_groups != nullptr && stmt_index < comment_groups->size()) {
-            print_comment_group((*comment_groups)[stmt_index]);
+        if (print_comment_groups != nullptr && stmt_index < print_comment_groups->size()) {
+            print_comment_group((*print_comment_groups)[stmt_index]);
         }
         if (std::holds_alternative<parser::ExternDecl>(stmt)) {
             auto decl = std::get<parser::ExternDecl>(std::move(stmt));
             auto decl_name = decl.name;
+            if (declaration_docs != nullptr && doc_comment_groups != nullptr &&
+                stmt_index < doc_comment_groups->size()) {
+                auto doc = doc_from_comment_group((*doc_comment_groups)[stmt_index]);
+                if (!doc.empty()) {
+                    declaration_docs->insert_or_assign(decl_name, std::move(doc));
+                }
+            }
             extern_decls.insert_or_assign(decl_name, std::move(decl));
             const auto& stored_decl = extern_decls.at(decl_name);
             if (!stored_decl.source_path.empty()) {
@@ -2417,16 +2893,24 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                            imp.name, imp.name);
                 return false;
             }
+            if (imports != nullptr) {
+                imports->insert(imp.name);
+            }
             auto parsed = parser::parse(*source);
             if (!parsed) {
                 fmt::print("error: import '{}': {}\n", imp.name, parsed.error().format());
                 return false;
             }
+            auto import_comments = collect_script_comment_lines(*source);
+            auto import_doc_groups =
+                build_statement_comment_groups(parsed->statements, import_comments);
             // Recursively execute the imported file's statements (which will typically
             // only contain extern fn and fn declarations).
             if (!execute_statements(parsed->statements, tables, scalars, columns, models, functions,
                                     compile_time_lists, extern_decls, externs, plugin_search_paths,
-                                    loaded_plugins, import_search_paths)) {
+                                    loaded_plugins, import_search_paths, nullptr,
+                                    &import_doc_groups, function_sources, declaration_docs, imports,
+                                    *source)) {
                 return false;
             }
             continue;
@@ -2633,11 +3117,17 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
     FunctionRegistry functions;
     CompileTimeListRegistry compile_time_lists;
     ExternDeclRegistry extern_decls;
+    FunctionSourceRegistry function_sources;
+    DeclarationDocRegistry declaration_docs;
+    ImportRegistry imports;
+    auto comments = collect_script_comment_lines(source);
+    auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
     std::unordered_set<std::string> loaded_plugins;
     return execute_statements(parsed->statements, tables, scalars, columns, models, functions,
                               compile_time_lists, extern_decls, registry,
                               config.plugin_search_paths, loaded_plugins,
-                              config.import_search_paths);
+                              config.import_search_paths, nullptr, &doc_comment_groups,
+                              &function_sources, &declaration_docs, &imports, source);
 }
 
 auto execute_script(std::string_view source, runtime::ExternRegistry& registry) -> bool {
@@ -2656,6 +3146,9 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     FunctionRegistry functions;
     CompileTimeListRegistry compile_time_lists;
     ExternDeclRegistry extern_decls;
+    FunctionSourceRegistry function_sources;
+    DeclarationDocRegistry declaration_docs;
+    ImportRegistry imports;
     std::unordered_set<std::string> loaded_plugins;
     bool timing_enabled = false;
     bool load_comments_enabled = false;
@@ -2673,6 +3166,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             .functions = &functions,
             .compile_time_lists = &compile_time_lists,
             .extern_decls = &extern_decls,
+            .imports = &imports,
         });
         if (!read_repl_line(config.prompt, line)) {
             fmt::print("\n");
@@ -2685,6 +3179,51 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
 
         std::string_view line_view(line);
 
+        if (starts_with_command(line_view, ":help")) {
+            auto arg = trim(line_view.substr(std::string_view(":help").size()));
+            if (arg.empty()) {
+                print_help();
+            } else {
+                print_doc(arg, tables, scalars, columns, models, functions, extern_decls,
+                          declaration_docs, imports);
+            }
+            continue;
+        }
+        if (line_view.size() > 1 && line_view.front() == '?') {
+            auto arg = trim(line_view.substr(1));
+            print_doc(arg, tables, scalars, columns, models, functions, extern_decls,
+                      declaration_docs, imports);
+            continue;
+        }
+        if (starts_with_command(line_view, ":functions")) {
+            auto arg = trim(line_view.substr(std::string_view(":functions").size()));
+            if (!arg.empty()) {
+                fmt::print("usage: :functions\n");
+                continue;
+            }
+            print_functions(functions, extern_decls);
+            continue;
+        }
+        if (starts_with_command(line_view, ":imports")) {
+            auto arg = trim(line_view.substr(std::string_view(":imports").size()));
+            if (!arg.empty()) {
+                fmt::print("usage: :imports\n");
+                continue;
+            }
+            print_imports(imports, extern_decls);
+            continue;
+        }
+        if (starts_with_command(line_view, ":doc")) {
+            auto arg = trim(line_view.substr(std::string_view(":doc").size()));
+            print_doc(arg, tables, scalars, columns, models, functions, extern_decls,
+                      declaration_docs, imports);
+            continue;
+        }
+        if (starts_with_command(line_view, ":source")) {
+            auto arg = trim(line_view.substr(std::string_view(":source").size()));
+            print_source(arg, functions, function_sources);
+            continue;
+        }
         if (starts_with_command(line_view, ":timing")) {
             auto arg = trim(line_view.substr(std::string_view(":timing").size()));
             if (arg.empty()) {
@@ -2890,17 +3429,19 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 report_timing();
                 continue;
             }
-            std::vector<std::vector<std::string>> comment_groups;
-            const std::vector<std::vector<std::string>>* comment_groups_ptr = nullptr;
+            auto comments = collect_script_comment_lines(source);
+            auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
+            std::vector<std::vector<std::string>> print_comment_groups;
+            const std::vector<std::vector<std::string>>* print_comment_groups_ptr = nullptr;
             if (load_comments_enabled) {
-                auto comments = collect_script_comment_lines(source);
-                comment_groups = build_statement_comment_groups(parsed->statements, comments);
-                comment_groups_ptr = &comment_groups;
+                print_comment_groups = doc_comment_groups;
+                print_comment_groups_ptr = &print_comment_groups;
             }
-            if (!execute_statements(parsed->statements, tables, scalars, columns, models, functions,
-                                    compile_time_lists, extern_decls, registry,
-                                    config.plugin_search_paths, loaded_plugins,
-                                    config.import_search_paths, comment_groups_ptr)) {
+            if (!execute_statements(
+                    parsed->statements, tables, scalars, columns, models, functions,
+                    compile_time_lists, extern_decls, registry, config.plugin_search_paths,
+                    loaded_plugins, config.import_search_paths, print_comment_groups_ptr,
+                    &doc_comment_groups, &function_sources, &declaration_docs, &imports, source)) {
                 report_timing();
                 continue;
             }
@@ -2916,8 +3457,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             auto cmd = cmd_end == std::string_view::npos ? line_view : line_view.substr(0, cmd_end);
             fmt::print("error: unknown REPL command '{}'\n", cmd);
             fmt::print(
-                "known: :tables, :scalars, :schema, :head, :peek, :describe, :load, "
-                ":timing, :time, :comments, :quit\n");
+                "known: :help, :tables, :scalars, :functions, :imports, :schema, :head, "
+                ":peek, :describe, :doc, :source, :load, :timing, :time, :comments, :quit\n");
             continue;
         }
 
@@ -2930,7 +3471,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
 
         execute_statements(parsed->statements, tables, scalars, columns, models, functions,
                            compile_time_lists, extern_decls, registry, config.plugin_search_paths,
-                           loaded_plugins, config.import_search_paths);
+                           loaded_plugins, config.import_search_paths, nullptr, nullptr,
+                           &function_sources, &declaration_docs, &imports, normalized);
         report_timing();
     }
 

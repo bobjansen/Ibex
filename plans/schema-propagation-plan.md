@@ -186,9 +186,21 @@ equivalents (or run the pass before fusion).
    (interpreter.cpp) remains authoritative; the static pass mirrors its
    unambiguous cases (intentional partial duplication, noted in the source).
    Full per-builtin parity is a later refinement.
-4. **Promote contracts to static.** Switch function arg/return checking to
-   compile-time where schema is `Known`, keeping the runtime path as the
-   `Unknown` fallback. Update SPEC.md Section 10.3 accordingly.
+4. **Promote contracts to static.** — **DONE (for the ascription contract).**
+   `lower_ascribe` runs `infer_schema` on the lowered base; when the input
+   schema is `Known`, an ascription the input provably cannot satisfy (missing
+   required column, or a provably different column type) is a lower-time
+   `LowerError`. When the input is `Unknown` (e.g. an I/O source) the check
+   falls back to the interpreter's runtime validation. Documented in SPEC §3.6;
+   tested in test_lower (static rejection) and test_e2e (runtime fallback).
+
+   Function argument/return `DataFrame<Schema>` contracts remain runtime-checked
+   in the REPL: user functions are evaluated dynamically (bodies are not lowered
+   as a unit and arguments are eager runtime tables), so there is no static
+   caller schema to check against today. Promoting those to compile time depends
+   on whole-program schema flow / UDF transpilation — a later architectural step.
+   The `as` ascription is the supported way to assert a schema statically in the
+   meantime.
 
 ## Non-Goals (initial waves)
 

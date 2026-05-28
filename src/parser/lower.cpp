@@ -1,5 +1,6 @@
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/optimizer.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/lower.hpp>
 
@@ -25,6 +26,28 @@ struct CompileTimeValue {
 };
 
 auto clone_expr(const Expr& expr) -> ExprPtr;
+
+auto column_type_name(ir::ColumnType type) -> std::string_view {
+    switch (type) {
+        case ir::ColumnType::Int32:
+            return "Int32";
+        case ir::ColumnType::Int64:
+            return "Int64";
+        case ir::ColumnType::Float32:
+            return "Float32";
+        case ir::ColumnType::Float64:
+            return "Float64";
+        case ir::ColumnType::Bool:
+            return "Bool";
+        case ir::ColumnType::String:
+            return "String";
+        case ir::ColumnType::Date:
+            return "Date";
+        case ir::ColumnType::Timestamp:
+            return "Timestamp";
+    }
+    return "?";
+}
 
 /// Map a parser scalar type to the IR column-type used by schemas.
 auto to_ir_column_type(ScalarType type) -> ir::ColumnType {
@@ -931,6 +954,29 @@ class Lowerer {
             for (const auto& field : schema_type->fields) {
                 fields.push_back(
                     ir::SchemaField{.name = field.name, .type = to_ir_column_type(field.type)});
+            }
+        }
+        // When the input schema is statically known, an ascription that the
+        // input provably cannot satisfy is a lower-time error. When the input is
+        // Unknown (e.g. an I/O source), the check is deferred to the runtime
+        // validation in the interpreter.
+        const ir::SchemaInfo input = ir::infer_schema(*base.value());
+        if (input.is_known()) {
+            for (const auto& field : fields) {
+                const auto* have = input.find(field.name);
+                if (have == nullptr) {
+                    return std::unexpected(LowerError{.message = "schema ascription: column '" +
+                                                                 field.name +
+                                                                 "' is not present in the input"});
+                }
+                if (field.type.has_value() && have->type.has_value() &&
+                    *have->type != *field.type) {
+                    return std::unexpected(
+                        LowerError{.message = "schema ascription: column '" + field.name + "' is " +
+                                              std::string(column_type_name(*have->type)) +
+                                              " but the ascription requires " +
+                                              std::string(column_type_name(*field.type))});
+                }
             }
         }
         auto node = builder_.ascribe(std::move(fields));

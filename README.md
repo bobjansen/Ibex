@@ -967,19 +967,19 @@ The JSON producer emits messages of the form:
 Start the demo stack with:
 
 ```bash
-scripts/demo-kafka.sh
+demo/kafka/demo-kafka.sh
 ```
 
 Then, in another terminal, start either the JSON dashboard streams:
 
 ```bash
-scripts/run-kafka-dashboard.sh
+demo/kafka/run-kafka-dashboard.sh
 ```
 
 or the Avro dashboard streams:
 
 ```bash
-scripts/run-kafka-avro-dashboard.sh
+demo/kafka/run-kafka-avro-dashboard.sh
 ```
 
 The JSON dashboard consumes two live websocket feeds:

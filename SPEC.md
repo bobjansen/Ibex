@@ -2167,6 +2167,15 @@ Rules:
 - required parameters must appear before all defaulted parameters
 - omitted defaulted parameters use their declared default expression
 
+Named arguments resolve against a declared parameter list, so they are
+accepted wherever the callee declares its parameters: user-defined functions,
+`extern` functions, table-valued `extern` functions, and Stream sources (e.g.
+`kafka_recv(brokers = ..., topic = ...)`). A callee with no declaration cannot
+take named arguments; passing them is a compile-time error. The exceptions are
+the few built-ins that document their own named parameters (such as `rank`'s
+sort flags and `rep`'s `times` / `length_out`); these are described with the
+respective built-in.
+
 ### 10.1 Function Effect Annotations
 
 Functions may optionally declare tracked effects:

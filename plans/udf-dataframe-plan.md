@@ -292,6 +292,10 @@ The third form is the end state to optimize for.
   should function signatures prefer a named schema alias later?
 - Should wrong-type table arguments fail at parse/lower time when statically
   known, or always at runtime call validation?
+  **Resolved:** static where the schema is known, runtime fallback where it is
+  not — but static checking requires schema propagation, which is a prerequisite
+  tracked separately in `plans/schema-propagation-plan.md`. Runtime-only today;
+  contracts move to compile time once that lands.
 - Should function overloading by `DataFrame` schema ever be allowed?
   Recommendation: no, not in the first several iterations.
 - Should return-schema annotations participate in type inference, or remain

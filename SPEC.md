@@ -2226,6 +2226,54 @@ prefix (for example `mutable: Int`).
 > Note: transpilation of user-defined function bodies is planned. The current
 > implementation evaluates them in the REPL/runtime.
 
+### 10.3 DataFrame Arguments and Schema Contracts
+
+User-defined functions are the normal way to package reusable, table-shaped
+query helpers. A function may take and return `DataFrame` values, with an
+optional schema that acts as a **minimum-required-columns contract** rather
+than an exact-match type.
+
+- `DataFrame` and `DataFrame<{}>` accept any table; the function imposes no
+  column requirements.
+- `DataFrame<{ salary: Int }>` requires the argument to contain at least a
+  column `salary` of the given type. Extra columns are allowed and are
+  preserved through the call.
+- `DataFrame<{ departmentId: Int, salary: Int }>` requires both columns; other
+  columns remain permitted.
+
+This contract is checked at **call time**. A missing required column, or a
+required column with the wrong type, is a call-time error that names the
+parameter and the offending column. The same contract applies to a function's
+declared **return type**: the value produced by the body is validated against
+the return schema on the same minimum-required-columns basis.
+
+> The minimum-required-columns interpretation applies specifically when a
+> schema appears as a function parameter or return type: matching is by column
+> name, extra columns are allowed, and column order is not significant. This
+> differs from the structural schema **type equality** in Section 3.3 (same
+> fields, same order), which governs when two schema *types* are considered
+> identical.
+
+Examples of practical helpers:
+
+```
+fn top_three_salaries(employee: DataFrame) -> DataFrame {
+    let distinct_salaries = employee[distinct { departmentId, salary }];
+    distinct_salaries[order { salary desc }, head 3, by departmentId];
+}
+
+fn nth_highest_salary(employee: DataFrame, n: Int) -> DataFrame {
+    employee[distinct { salary }, order { salary desc }, head n];
+}
+
+fn second_highest_salary(employee: DataFrame<{ salary: Int }>) -> DataFrame {
+    employee[distinct { salary }, order { salary desc }, head 2];
+}
+```
+
+The third form documents and enforces the columns the helper depends on while
+remaining reusable across any wider table that provides them.
+
 ---
 
 ## 11. Extern Function Interop

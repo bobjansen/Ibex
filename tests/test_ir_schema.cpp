@@ -139,6 +139,15 @@ TEST_CASE("schema: join unions both sides, deduplicating shared keys", "[ir][sch
     REQUIRE(type_of(s, "c") == ColumnType::String);
 }
 
+TEST_CASE("schema: ascription recovers a known schema over an unknown child", "[ir][schema]") {
+    // The key unlock: `as` defeats an Unknown source so downstream is checkable.
+    auto s = schema_of("t as DataFrame<{ x: Int64, y: Float64 }>;");  // unknown source
+    REQUIRE(s.is_known());
+    REQUIRE(names(s) == std::vector<std::string>{"x", "y"});
+    REQUIRE(type_of(s, "x") == ColumnType::Int64);
+    REQUIRE(type_of(s, "y") == ColumnType::Float64);
+}
+
 TEST_CASE("schema: an unmodelled operator falls back to unknown", "[ir][schema]") {
     ibex::ir::TransposeNode transpose(ibex::ir::NodeId{2});
     transpose.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));

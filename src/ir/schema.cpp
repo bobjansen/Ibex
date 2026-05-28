@@ -256,6 +256,10 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             return SchemaInfo::known(std::move(out));
         }
 
+        case NodeKind::Ascribe:
+            // The ascription fixes the result schema (validated at run time).
+            return SchemaInfo::known(static_cast<const AscribeNode&>(node).schema());
+
         case NodeKind::Columns:
             // Exposes child column names as a single String column named "name".
             return SchemaInfo::known({SchemaField{.name = "name", .type = ColumnType::String}});

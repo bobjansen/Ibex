@@ -2,8 +2,6 @@
 
 #include <ibex/ir/node.hpp>
 
-#include <cstdint>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -11,28 +9,8 @@
 
 namespace ibex::ir {
 
-/// Column scalar type used by the schema-propagation pass. Mirrors
-/// `parser::ScalarType`; kept independent so the `ir` layer does not depend on
-/// `parser`. Conversion happens at the comparison boundary (e.g. when checking
-/// a `DataFrame<Schema>` contract).
-enum class ColumnType : std::uint8_t {
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Bool,
-    String,
-    Date,
-    Timestamp,
-};
-
-/// One column in a known schema. `type` is `nullopt` when the column is known
-/// to exist but its scalar type has not been inferred yet (e.g. an
-/// update-derived column before expression type inference exists).
-struct SchemaField {
-    std::string name;
-    std::optional<ColumnType> type;
-};
+// `ColumnType` and `SchemaField` are defined in node.hpp so that IR nodes
+// (e.g. AscribeNode) can carry a schema without depending on this header.
 
 /// Result of schema propagation for a node: either a `Known` ordered list of
 /// columns, or `Unknown` (⊥) — the sound default that defeats static checking

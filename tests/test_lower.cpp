@@ -379,6 +379,24 @@ TEST_CASE("Lower rename to IR") {
     REQUIRE(scan->source_name() == "df");
 }
 
+TEST_CASE("Lower schema ascription to AscribeNode") {
+    auto program = require_parse("df as DataFrame<{ a: Int64, b: Float64 }>;");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* ascribe = as_node<ir::AscribeNode>(result->get());
+    REQUIRE(ascribe != nullptr);
+    REQUIRE(ascribe->schema().size() == 2);
+    REQUIRE(ascribe->schema()[0].name == "a");
+    REQUIRE(ascribe->schema()[0].type == ir::ColumnType::Int64);
+    REQUIRE(ascribe->schema()[1].name == "b");
+    REQUIRE(ascribe->schema()[1].type == ir::ColumnType::Float64);
+    REQUIRE(ascribe->children().size() == 1);
+    const auto* scan = as_node<ir::ScanNode>(ascribe->children()[0].get());
+    REQUIRE(scan != nullptr);
+    REQUIRE(scan->source_name() == "df");
+}
+
 TEST_CASE("Lower rename with multiple renames") {
     auto program = require_parse("df[rename { cost = price, amount = qty }];");
     auto result = parser::lower(program);

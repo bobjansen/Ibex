@@ -152,7 +152,7 @@ filter select update  distinct order head tail by window
 rename resample melt  dcast  cov  corr  transpose
 join   left   right   outer   asof   on
 import Stream
-asc    desc
+asc    desc    as
 true   false
 Int32  Int64  Float32 Float64
 Bool   String Date    Timestamp
@@ -579,6 +579,36 @@ Null is represented as a validity bit in an Arrow-compatible bitmap, not as a
 sentinel value in the data buffer. The stored value in a null cell is
 unspecified and must not be read directly. This design avoids ambiguity between
 the value zero / empty string and "no value".
+
+### 3.6 Schema Ascription (`as`)
+
+A table expression may be ascribed a schema with the postfix `as` operator:
+
+```
+<table_expr> as DataFrame<{ field: Type, ... }>
+```
+
+The ascribed type must be a `DataFrame` or `TimeFrame` type. The ascription is a
+**runtime-checked identity**: the table is validated against the named schema
+and then passed through unchanged. As with `DataFrame<Schema>` function-argument
+contracts (Section 10.3), the check is **minimum-required-columns** — every
+listed column must exist with a matching type, extra columns are allowed, and
+column order is not significant. A missing or wrong-type column is an error.
+
+```
+let trades = read_csv("trades.csv") as DataFrame<{ date: Date, px: Float64 }>;
+```
+
+The purpose is to recover a statically known schema at a boundary where it would
+otherwise be unknown. Sources such as `read_csv` produce a `DataFrame` with an
+implementation-inferred (statically unknown) schema; ascribing a schema lets the
+compiler treat the result as a known schema from that point onward, so
+downstream column references can be checked statically. It is also the way to
+re-establish a known schema after a data-dependent operator (e.g. `dcast`).
+
+> Note: the runtime check is enforced on the interpreter/REPL execution path.
+> Generated C++ (the `ibex_compile` path) currently treats the ascription as a
+> transparent identity and does not yet re-validate at run time.
 
 ---
 

@@ -106,6 +106,23 @@ TEST_CASE("E2E: filter with greater-than", "[e2e]") {
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{30, 40, 50});
 }
 
+TEST_CASE("E2E: schema ascription passes a conforming table through", "[e2e][ascribe]") {
+    auto out =
+        run("Table { a = [1, 2], b = [1.5, 2.5] } as DataFrame<{ a: Int64, b: Float64 }>;", {});
+    CHECK(col_i64(out, "a") == std::vector<std::int64_t>{1, 2});
+    CHECK(col_dbl(out, "b") == std::vector<double>{1.5, 2.5});
+}
+
+TEST_CASE("E2E: schema ascription rejects a missing column", "[e2e][ascribe]") {
+    auto err = run_error("Table { a = [1, 2] } as DataFrame<{ salary: Int64 }>;", {});
+    CHECK(err.find("missing column 'salary'") != std::string::npos);
+}
+
+TEST_CASE("E2E: schema ascription rejects a wrong-type column", "[e2e][ascribe]") {
+    auto err = run_error("Table { a = [1, 2] } as DataFrame<{ a: Float64 }>;", {});
+    CHECK(err.find("wrong type") != std::string::npos);
+}
+
 TEST_CASE("E2E: filter with equality", "[e2e]") {
     auto tables = make_trades();
     auto out = run("trades[filter price == 20];", tables);

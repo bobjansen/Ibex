@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <cfenv>
 #include <charconv>
 #include <chrono>
@@ -28,8 +29,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <unordered_set>
 #include <variant>
 
@@ -61,6 +64,76 @@ constexpr std::array<std::string_view, 13> kColonCommands = {
     ":peek", ":describe", ":load", ":timing", ":time",    ":comments",
 };
 
+auto default_history_path() -> std::string {
+    if (const char* env = std::getenv("IBEX_HISTORY_FILE"); env != nullptr && env[0] != '\0') {
+        return env;
+    }
+    if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+        return (std::filesystem::path(home) / ".ibex_history").string();
+    }
+#ifdef _WIN32
+    if (const char* profile = std::getenv("USERPROFILE");
+        profile != nullptr && profile[0] != '\0') {
+        return (std::filesystem::path(profile) / ".ibex_history").string();
+    }
+#endif
+    return {};
+}
+
+auto resolve_history_path(const ReplConfig& config) -> std::string {
+    if (!config.persistent_history) {
+        return {};
+    }
+    if (!config.history_path.empty()) {
+        return config.history_path;
+    }
+    return default_history_path();
+}
+
+void load_history_file(const std::string& path, std::size_t limit) {
+    if (path.empty()) {
+        return;
+    }
+    ::using_history();
+    if (limit > 0) {
+        ::stifle_history(static_cast<int>(std::min<std::size_t>(
+            limit, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+    }
+    const int rc = ::read_history(path.c_str());
+    if (rc != 0 && rc != ENOENT) {
+        spdlog::debug("failed to read REPL history '{}': {}", path, std::strerror(rc));
+    }
+}
+
+void save_history_file(const std::string& path, std::size_t limit) {
+    if (path.empty()) {
+        return;
+    }
+    std::error_code ec;
+    if (auto parent = std::filesystem::path(path).parent_path(); !parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            spdlog::debug("failed to create REPL history directory '{}': {}", parent.string(),
+                          ec.message());
+            return;
+        }
+    }
+    const int write_rc = ::write_history(path.c_str());
+    if (write_rc != 0) {
+        spdlog::debug("failed to write REPL history '{}': {}", path, std::strerror(write_rc));
+        return;
+    }
+    if (limit > 0) {
+        const int truncate_rc = ::history_truncate_file(
+            path.c_str(), static_cast<int>(std::min<std::size_t>(
+                              limit, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+        if (truncate_rc != 0) {
+            spdlog::debug("failed to truncate REPL history '{}': {}", path,
+                          std::strerror(truncate_rc));
+        }
+    }
+}
+
 auto colon_command_generator(const char* text, int state) -> char* {
     static std::size_t index = 0;
     static std::string prefix;
@@ -89,14 +162,21 @@ void configure_line_editing() {
     rl_attempted_completion_function = repl_completion;
 }
 
+auto should_record_history(std::string_view line) -> bool {
+    return !line.empty() && line != ":q" && line != ":quit" && line != ":exit";
+}
+
 auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
     char* raw = ::readline(prompt.c_str());
     if (raw == nullptr) {
         return false;
     }
     out.assign(raw);
-    if (!out.empty()) {
-        ::add_history(raw);
+    if (should_record_history(out)) {
+        HIST_ENTRY* previous = history_length > 0 ? ::history_get(history_length) : nullptr;
+        if (previous == nullptr || previous->line == nullptr || out != previous->line) {
+            ::add_history(raw);
+        }
     }
     std::free(raw);
     return true;
@@ -108,6 +188,14 @@ auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
     fmt::print("{}", prompt);
     return static_cast<bool>(std::getline(std::cin, out));
 }
+
+auto resolve_history_path(const ReplConfig& /*config*/) -> std::string {
+    return {};
+}
+
+void load_history_file(const std::string& /*path*/, std::size_t /*limit*/) {}
+
+void save_history_file(const std::string& /*path*/, std::size_t /*limit*/) {}
 #endif
 
 std::string_view trim(std::string_view text);
@@ -2277,6 +2365,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     bool timing_enabled = false;
     bool load_comments_enabled = false;
     configure_line_editing();
+    const std::string history_path = resolve_history_path(config);
+    load_history_file(history_path, config.history_limit);
 
     std::string line;
     while (true) {
@@ -2528,6 +2618,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                            loaded_plugins, config.import_search_paths);
         report_timing();
     }
+
+    save_history_file(history_path, config.history_limit);
 
     spdlog::info("Ibex REPL exiting");
 }

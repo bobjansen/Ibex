@@ -2,6 +2,7 @@
 
 #include <ibex/runtime/extern_registry.hpp>
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,12 @@ namespace ibex::repl {
 struct ReplConfig {
     bool verbose = false;
     std::string prompt = "ibex> ";
+    bool persistent_history = true;
+    /// History file used when readline is available. Empty means
+    /// `$IBEX_HISTORY_FILE`, then `$HOME/.ibex_history` where possible.
+    std::string history_path;
+    /// Maximum number of entries kept in the persistent history file.
+    std::size_t history_limit = 10000;
     /// Directories searched (in order) for plugin shared libraries (*.so).
     /// When a script declares `extern fn foo(...) from "bar.hpp"`, the REPL
     /// looks for `bar.so` in each of these directories and loads it via dlopen.

@@ -5089,24 +5089,30 @@ TEST_CASE("ExternCall: unknown extern function returns error", "[extern]") {
 
 // --- Grouped update with aggregate function ---------------------------------
 
-TEST_CASE("grouped update with broadcast-aggregate is not yet supported", "[update]") {
-    // Broadcast-aggregate semantics (`mean(price)` in an `update + by` block
-    // returns the per-group mean for every row in that group) aren't wired —
-    // mean/sum/etc. are aggregate functions, not row-level. Grouped update
-    // currently dispatches each field to the row-level evaluator, which
-    // rejects these names. Functional grouped updates (lag, lead, arithmetic
-    // on columns) work — see [interpreter][update][grouped] for the positive
-    // test.
+TEST_CASE("grouped update broadcasts aggregate values per group", "[update]") {
     runtime::TableRegistry registry;
     runtime::Table trades;
     trades.add_column("symbol", Column<std::string>{"AAPL", "AAPL", "GOOG"});
     trades.add_column("price", Column<std::int64_t>{100, 110, 200});
     registry["trades"] = std::move(trades);
 
-    auto ir = require_ir("trades[update { mean_price = mean(price) }, by symbol];");
+    auto ir = require_ir(
+        "trades[update { mean_price = mean(price), centered = price - mean_price }, by symbol];");
     auto result = runtime::interpret(*ir, registry);
-    REQUIRE_FALSE(result.has_value());
-    REQUIRE(result.error().find("unknown function") != std::string::npos);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* mean_col = std::get_if<Column<double>>(result->find("mean_price"));
+    REQUIRE(mean_col != nullptr);
+    REQUIRE((*mean_col)[0] == 105.0);
+    REQUIRE((*mean_col)[1] == 105.0);
+    REQUIRE((*mean_col)[2] == 200.0);
+
+    const auto* centered_col = std::get_if<Column<double>>(result->find("centered"));
+    REQUIRE(centered_col != nullptr);
+    REQUIRE((*centered_col)[0] == -5.0);
+    REQUIRE((*centered_col)[1] == 5.0);
+    REQUIRE((*centered_col)[2] == 0.0);
 }
 
 // --- Filter type coverage: double / string columns ---------------------------

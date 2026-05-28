@@ -1,12 +1,7 @@
-// JSON plugin — standard extern fn declarations.
-//
-// Usage:
-//   import "json";
-//
-// After importing, the following functions are available without any
-// explicit `extern fn` declaration in the script:
-//   read_json(path: String) -> DataFrame
-//   write_json(df: DataFrame, path: String) -> Int
-
+// Read a JSON file into a DataFrame.
+// Supports the JSON formats implemented by the bundled json plugin.
 extern fn read_json(path: String) -> DataFrame from "json.hpp";
+
+// Write a DataFrame to a JSON file.
+// Returns the number of rows written.
 extern fn write_json(df: DataFrame, path: String) -> Int from "json.hpp";

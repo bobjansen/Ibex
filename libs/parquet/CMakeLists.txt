@@ -198,9 +198,14 @@ else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()
 
-add_custom_command(TARGET ibex_parquet_plugin POST_BUILD
+set(_ibex_parquet_stub "${_ibex_parquet_output_dir}/parquet.ibex")
+add_custom_command(
+    OUTPUT "${_ibex_parquet_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/parquet.ibex"
-        "${_ibex_parquet_output_dir}/parquet.ibex"
+        "${_ibex_parquet_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/parquet.ibex"
     COMMENT "Installing parquet.ibex stub"
 )
+add_custom_target(ibex_parquet_stub DEPENDS "${_ibex_parquet_stub}")
+add_dependencies(ibex_parquet_plugin ibex_parquet_stub)

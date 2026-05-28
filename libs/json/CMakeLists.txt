@@ -24,11 +24,17 @@ if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_json_plugin PRIVATE Ibex::Sanitizers)
 endif()
 
+set(_ibex_json_stub "${IBEX_PLUGIN_OUTPUT_DIR}/json.ibex")
+
 # Copy the library stub to the plugin output directory so that
 # `import "json";` works when IBEX_LIBRARY_PATH points to that directory.
-add_custom_command(TARGET ibex_json_plugin POST_BUILD
+add_custom_command(
+    OUTPUT "${_ibex_json_stub}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/json.ibex"
-        "${IBEX_PLUGIN_OUTPUT_DIR}/json.ibex"
+        "${_ibex_json_stub}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/json.ibex"
     COMMENT "Installing json.ibex stub"
 )
+add_custom_target(ibex_json_stub DEPENDS "${_ibex_json_stub}")
+add_dependencies(ibex_json_plugin ibex_json_stub)

@@ -1,19 +1,8 @@
-// CSV plugin — standard extern fn declarations.
-//
-// Usage:
-//   import "csv";
-//
-// After importing, the following functions are available without any
-// explicit `extern fn` declaration in the script:
-//   read_csv(
-//       path: String,
-//       nulls: String = "",
-//       delimiter: String = ",",
-//       has_header: Bool = true,
-//       schema: String = ""
-//   ) -> DataFrame
-//   write_csv(df: DataFrame, path: String) -> Int
-
+// Read a CSV file into a DataFrame.
+// `nulls` marks matching cells as null; the default keeps empty fields as strings.
+// `delimiter` defaults to ",".
+// `has_header` controls whether the first row contains column names.
+// `schema` optionally supplies explicit column types.
 extern fn read_csv(
     path: String,
     nulls: String = "",
@@ -21,4 +10,7 @@ extern fn read_csv(
     has_header: Bool = true,
     schema: String = ""
 ) -> DataFrame from "csv.hpp";
+
+// Write a DataFrame to a CSV file.
+// Returns the number of rows written.
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";

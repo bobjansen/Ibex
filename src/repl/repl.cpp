@@ -2464,9 +2464,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     try_widen_int_to_float(value.value(), *st);
                 }
                 if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
-                    return std::unexpected("type mismatch for parameter '" + param.name +
-                                           "': expected " + std::string(scalar_type_name(*st)) +
-                                           " but got " +
+                    return std::unexpected(call.callee + ": type mismatch for parameter '" +
+                                           param.name + "': expected " +
+                                           std::string(scalar_type_name(*st)) + " but got " +
                                            std::string(scalar_value_type_name(value.value())));
                 }
                 local_scalars.insert_or_assign(param.name, std::move(value.value()));
@@ -2480,8 +2480,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     return std::unexpected(value.error());
                 }
                 if (auto err = validate_table_type(value.value(), param.type)) {
-                    return std::unexpected("type mismatch for parameter '" + param.name +
-                                           "': " + *err);
+                    return std::unexpected(call.callee + ": type mismatch for parameter '" +
+                                           param.name + "': " + *err);
                 }
                 local_tables.insert_or_assign(param.name, std::move(value.value()));
                 break;
@@ -2491,8 +2491,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                                                  compile_time_lists, extern_decls, externs)) {
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                         if (auto err = validate_column_type(*col, param.type)) {
-                            return std::unexpected("type mismatch for parameter '" + param.name +
-                                                   "': " + *err);
+                            return std::unexpected(call.callee + ": type mismatch for parameter '" +
+                                                   param.name + "': " + *err);
                         }
                         local_columns.insert_or_assign(param.name, std::move(*col));
                         break;
@@ -2503,8 +2503,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         }
                         if (auto err =
                                 validate_column_type(*table->columns.front().column, param.type)) {
-                            return std::unexpected("type mismatch for parameter '" + param.name +
-                                                   "': " + *err);
+                            return std::unexpected(call.callee + ": type mismatch for parameter '" +
+                                                   param.name + "': " + *err);
                         }
                         local_columns.insert_or_assign(param.name, *table->columns.front().column);
                         break;
@@ -2668,18 +2668,18 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
 
     if (fn.return_type.kind == parser::Type::Kind::Scalar) {
         if (!std::holds_alternative<runtime::ScalarValue>(*last_value)) {
-            return std::unexpected("function return type mismatch (expected scalar)");
+            return std::unexpected(call.callee + ": return type mismatch (expected scalar)");
         }
         return EvalValue{std::get<runtime::ScalarValue>(std::move(*last_value))};
     }
     if (fn.return_type.kind == parser::Type::Kind::DataFrame ||
         fn.return_type.kind == parser::Type::Kind::TimeFrame) {
         if (!std::holds_alternative<runtime::Table>(*last_value)) {
-            return std::unexpected("function return type mismatch (expected table)");
+            return std::unexpected(call.callee + ": return type mismatch (expected table)");
         }
         auto table = std::get<runtime::Table>(std::move(*last_value));
         if (auto err = validate_table_type(table, fn.return_type)) {
-            return std::unexpected("function return type mismatch: " + *err);
+            return std::unexpected(call.callee + ": return type mismatch: " + *err);
         }
         return EvalValue{std::move(table)};
     }
@@ -2687,7 +2687,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     if (fn.return_type.kind == parser::Type::Kind::Series) {
         if (auto* col = std::get_if<runtime::ColumnValue>(&last_value.value())) {
             if (auto err = validate_column_type(*col, fn.return_type)) {
-                return std::unexpected("function return type mismatch: " + *err);
+                return std::unexpected(call.callee + ": return type mismatch: " + *err);
             }
             return EvalValue{std::move(*col)};
         }
@@ -2696,11 +2696,11 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 return std::unexpected("Column return must have exactly one column");
             }
             if (auto err = validate_column_type(*table->columns.front().column, fn.return_type)) {
-                return std::unexpected("function return type mismatch: " + *err);
+                return std::unexpected(call.callee + ": return type mismatch: " + *err);
             }
             return EvalValue{*table->columns.front().column};
         }
-        return std::unexpected("function return type mismatch (expected column)");
+        return std::unexpected(call.callee + ": return type mismatch (expected column)");
     }
 
     return std::unexpected("unsupported return type");

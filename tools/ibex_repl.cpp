@@ -11,15 +11,21 @@ auto main(int argc, char** argv) -> int {
     CLI::App app{"Ibex — interactive columnar DSL"};
 
     bool verbose = false;
+    bool no_history = false;
     std::string plugin_path;
     std::string import_path;
+    std::string history_file;
     app.add_flag("-v,--verbose", verbose, "Enable verbose output");
+    app.add_flag("--no-history", no_history, "Disable persistent readline history");
     app.add_option("--plugin-path", plugin_path,
                    "Directory to search for plugin shared libraries (*.so). "
                    "Defaults to IBEX_LIBRARY_PATH environment variable.");
     app.add_option("--import-path", import_path,
                    "Directory to search for library stub files (*.ibex) used by "
                    "`import` declarations.  Defaults to the plugin search path.");
+    app.add_option("--history-file", history_file,
+                   "Read/write REPL history at this path. Defaults to IBEX_HISTORY_FILE "
+                   "or ~/.ibex_history.");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -42,6 +48,8 @@ auto main(int argc, char** argv) -> int {
 
     ibex::repl::ReplConfig config;
     config.verbose = verbose;
+    config.persistent_history = !no_history;
+    config.history_path = history_file;
     if (!plugin_path.empty()) {
         config.plugin_search_paths.push_back(plugin_path);
     }

@@ -397,6 +397,29 @@ TEST_CASE("Lower schema ascription to AscribeNode") {
     REQUIRE(scan->source_name() == "df");
 }
 
+TEST_CASE("Lower rejects an impossible ascription over a known input") {
+    // A Table literal has a statically known schema, so an ascription it cannot
+    // satisfy is a lower-time error rather than a deferred runtime check.
+    SECTION("missing required column") {
+        auto program = require_parse("Table { a = [1] } as DataFrame<{ salary: Int64 }>;");
+        auto result = parser::lower(program);
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("salary") != std::string::npos);
+    }
+    SECTION("wrong column type") {
+        auto program = require_parse("Table { a = [1] } as DataFrame<{ a: Float64 }>;");
+        auto result = parser::lower(program);
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("Float64") != std::string::npos);
+    }
+    SECTION("extra columns are allowed") {
+        auto program = require_parse("Table { a = [1], b = [2.5] } as DataFrame<{ a: Int64 }>;");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+        REQUIRE(as_node<ir::AscribeNode>(result->get()) != nullptr);
+    }
+}
+
 TEST_CASE("Lower rename with multiple renames") {
     auto program = require_parse("df[rename { cost = price, amount = qty }];");
     auto result = parser::lower(program);

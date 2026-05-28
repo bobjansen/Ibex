@@ -149,18 +149,50 @@ both above the Aggregate (R20) and across stacked Projects (R21).
 along with rank-only grouped updates and grouped windowed updates. These still
 materialize but are no longer rejected.
 
+**Streaming aggregate set widened to the central moments — done.** `std`,
+`skew`, and `kurtosis` now stream (both the hash and the sorted operators) via
+online central moments (Welford/Pébay; `m3`/`m4` added to `AggSlot`, shared
+`agg_update_*`/`agg_finalize_*` helpers). `std`'s M2 update is bit-identical to
+the materializing Welford; `skew`/`kurtosis` match the two-pass materializing
+results to floating-point rounding (parity test: same query streamed vs forced
+materializing via an added `median`). Null thresholds match the materializing
+path (`std` needs ≥2, `skew` ≥3, `kurtosis` ≥4 non-null observations). Still
+materializing: `median`/`quantile` (need all values), `first`/`last` (need
+type-preserving output, can't be func-gated without schema), and `ewma`
+(row-order coupled). Benchmarked via `ibex_fusion_bench` (`agg_moments_stream`/
+`agg_moments_hash`) with a polars companion (`tools/bench_polars_agg.py`) on the
+same shape (2M rows, 1000 groups): streaming std+skew+kurtosis ≈ 28ms vs the
+hash path ≈ 66ms (no hashing of every row). polars is faster, and threading is
+*not* the reason: single-threaded polars does ≈ 6ms with its sorted-group fast
+path (`.sort()` sets a sortedness flag) and ≈ 34ms via hashing — its 24-thread
+run (~7ms) barely beats its own single-threaded sorted path. So the gap is
+per-core efficiency, ≈ 4.6× on the sorted path and ≈ 1.9× on hash. Two concrete
+opportunities: (1) ibex runs the Pébay moment update once *per moment agg* even
+when several read the same column — a shared per-column moment accumulator would
+fold std+skew+kurtosis into one pass; (2) the per-row work isn't vectorized.
+(Polars exploiting sortedness ~6× single-threaded also validates this whole
+sorted-aggregate direction.)
+
 ## Next Steps
 
 Ordered roughly by expected payoff-to-effort. Confirm each against
 `tools/ibex_fusion_bench` (or a new case) before and after.
 
-### 1. Widen the streaming Aggregate function set
+### 1. Finish widening the streaming Aggregate function set
 
-`ChunkedAggregateOperator` streams only Count/Sum/Min/Max/Mean; everything else
-(e.g. median, quantile, stddev/var, first/last, nunique) drops to the
-materializing path. Several are streamable: variance/stddev via Welford,
-first/last trivially, nunique via the same hash machinery `Distinct` already
-uses. Add them incrementally, each gated by a bench case.
+Count/Sum/Min/Max/Mean/Std/Skew/Kurtosis now stream (see Recently Landed). The
+remaining materializing aggregates:
+
+- `first`/`last` — O(1) and trivial *for numeric columns*, but the value type
+  must be preserved (string/categorical/date), and `build_operator` can't gate
+  by column type (no schema there). Path: let the operators handle any type
+  (numeric via `int/double` slots, others via the existing `first_value`/
+  `last_value` `ScalarValue` fields, mirroring the materializing accumulator)
+  so func-gating stays safe.
+- `median`/`quantile` — need all values per group (O(group) state), so not a
+  bounded-memory stream; leave on the materializing path.
+- `ewma` — depends on within-group row order; streamable only with care, low
+  priority.
 
 ### 2. Document and harden the external chunked-source contract
 

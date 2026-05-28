@@ -225,11 +225,11 @@ python3 demo/kafka/ohlc_ws_client.py</code></pre>
 
 <span class="kw">let</span> summary = Stream {
     source = <span class="fn-name">kafka_recv</span>(
-        <span class="str">"localhost:19092"</span>,
-        <span class="str">"ticks"</span>,
-        <span class="str">"ibex-demo-summary"</span>,
-        <span class="str">"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</span>,
-        <span class="str">"poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"</span>
+        brokers = <span class="str">"localhost:19092"</span>,
+        topic = <span class="str">"ticks"</span>,
+        group = <span class="str">"ibex-demo-summary"</span>,
+        schema = <span class="str">"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</span>,
+        options = <span class="str">"poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"</span>
     ),
     transform = [<span class="kw">by</span> { symbol, venue }, <span class="kw">select</span> {
         trades = <span class="fn-name">count</span>(),
@@ -280,12 +280,12 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
 
 <span class="kw">let</span> summary = Stream {
     source = <span class="fn-name">kafka_recv_avro</span>(
-        <span class="str">"localhost:19092"</span>,
-        <span class="str">"ticks_avro"</span>,
-        <span class="str">"ibex-demo-summary-avro"</span>,
-        <span class="str">"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</span>,
-        <span class="str">"http://localhost:18081"</span>,
-        <span class="str">"poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"</span>
+        brokers = <span class="str">"localhost:19092"</span>,
+        topic = <span class="str">"ticks_avro"</span>,
+        group = <span class="str">"ibex-demo-summary-avro"</span>,
+        schema = <span class="str">"ts:timestamp,symbol:str,venue:str,price:f64,size:i64"</span>,
+        registry_url = <span class="str">"http://localhost:18081"</span>,
+        options = <span class="str">"poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"</span>
     ),
     transform = [<span class="kw">by</span> { symbol, venue }, <span class="kw">select</span> {
         trades = <span class="fn-name">count</span>(),

@@ -4380,6 +4380,128 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     return output;
 }
 
+auto parse_aggregate_func(std::string_view name) -> std::optional<ir::AggFunc> {
+    if (name == "sum")
+        return ir::AggFunc::Sum;
+    if (name == "mean")
+        return ir::AggFunc::Mean;
+    if (name == "min")
+        return ir::AggFunc::Min;
+    if (name == "max")
+        return ir::AggFunc::Max;
+    if (name == "count")
+        return ir::AggFunc::Count;
+    if (name == "first")
+        return ir::AggFunc::First;
+    if (name == "last")
+        return ir::AggFunc::Last;
+    if (name == "median")
+        return ir::AggFunc::Median;
+    if (name == "std")
+        return ir::AggFunc::Stddev;
+    if (name == "ewma")
+        return ir::AggFunc::Ewma;
+    if (name == "quantile")
+        return ir::AggFunc::Quantile;
+    if (name == "skew")
+        return ir::AggFunc::Skew;
+    if (name == "kurtosis")
+        return ir::AggFunc::Kurtosis;
+    return std::nullopt;
+}
+
+auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)
+    -> std::expected<std::optional<ir::AggSpec>, std::string> {
+    auto func = parse_aggregate_func(call.callee);
+    if (!func.has_value()) {
+        return std::optional<ir::AggSpec>{};
+    }
+    if (call.callee == "count") {
+        if (!call.args.empty()) {
+            return std::unexpected("count() takes no arguments");
+        }
+        return std::optional<ir::AggSpec>{
+            ir::AggSpec{.func = *func, .column = ir::ColumnRef{.name = ""}, .alias = alias}};
+    }
+    if (call.args.empty()) {
+        return std::unexpected(call.callee + "(): expected column argument");
+    }
+    if (call.callee == "ewma" || call.callee == "quantile") {
+        if (call.args.size() != 2) {
+            return std::unexpected(call.callee + "(): expected two arguments");
+        }
+    } else if (call.args.size() != 1) {
+        return std::unexpected("aggregate functions take one argument");
+    }
+
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (col_ref == nullptr) {
+        return std::unexpected(call.callee +
+                               "(): grouped update aggregate argument must be a column name");
+    }
+
+    double param = 0.0;
+    if (call.callee == "ewma" || call.callee == "quantile") {
+        const auto* lit = std::get_if<ir::Literal>(&call.args[1]->node);
+        if (lit == nullptr) {
+            return std::unexpected(call.callee + "(): second argument must be a numeric literal");
+        }
+        if (const auto* dv = std::get_if<double>(&lit->value)) {
+            param = *dv;
+        } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+            param = static_cast<double>(*iv);
+        } else {
+            return std::unexpected(call.callee + "(): second argument must be a numeric literal");
+        }
+    }
+
+    return std::optional<ir::AggSpec>{ir::AggSpec{
+        .func = *func,
+        .column = ir::ColumnRef{.name = col_ref->name},
+        .alias = std::move(alias),
+        .param = param,
+    }};
+}
+
+struct BroadcastAggregateColumn {
+    ColumnValue column;
+    std::optional<ValidityBitmap> validity;
+};
+
+auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field)
+    -> std::expected<std::optional<BroadcastAggregateColumn>, std::string> {
+    const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
+    if (call == nullptr) {
+        return std::optional<BroadcastAggregateColumn>{};
+    }
+    auto spec = aggregate_call_to_spec(*call, field.alias);
+    if (!spec) {
+        return std::unexpected(spec.error());
+    }
+    if (!spec->has_value()) {
+        return std::optional<BroadcastAggregateColumn>{};
+    }
+
+    auto aggregated = aggregate_table(input, {}, std::vector<ir::AggSpec>{std::move(**spec)});
+    if (!aggregated) {
+        return std::unexpected(aggregated.error());
+    }
+    const auto* entry = aggregated->find_entry(field.alias);
+    if (entry == nullptr || entry->column == nullptr || column_size(*entry->column) != 1) {
+        return std::unexpected("grouped update aggregate produced invalid result: " + field.alias);
+    }
+
+    auto scalar = scalar_from_column(*entry->column, 0);
+    BroadcastAggregateColumn result{
+        .column = broadcast_scalar_column(scalar, input.rows()),
+        .validity = std::nullopt,
+    };
+    if (entry->validity.has_value() && !(*entry->validity)[0]) {
+        result.validity = ValidityBitmap(input.rows(), false);
+    }
+    return std::optional<BroadcastAggregateColumn>{std::move(result)};
+}
+
 using ir::is_cum_func;
 using ir::is_rng_func;
 using ir::is_rolling_func;
@@ -7042,7 +7164,44 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             sub.add_column(entry.name, std::move(gathered));
         }
         sub.time_index = input.time_index;
-        return update_table(std::move(sub), fields, scalars, externs);
+
+        std::vector<ir::FieldSpec> pending_row_fields;
+        auto flush_pending = [&]() -> std::expected<void, std::string> {
+            if (pending_row_fields.empty()) {
+                return {};
+            }
+            auto updated = update_table(std::move(sub), pending_row_fields, scalars, externs);
+            if (!updated) {
+                return std::unexpected(updated.error());
+            }
+            sub = std::move(updated.value());
+            pending_row_fields.clear();
+            return {};
+        };
+
+        for (const auto& field : fields) {
+            auto aggregate = broadcast_aggregate_column(sub, field);
+            if (!aggregate) {
+                return std::unexpected(aggregate.error());
+            }
+            if (!aggregate->has_value()) {
+                pending_row_fields.push_back(field);
+                continue;
+            }
+            if (auto flushed = flush_pending(); !flushed) {
+                return std::unexpected(flushed.error());
+            }
+            if ((*aggregate)->validity.has_value()) {
+                sub.add_column(field.alias, std::move((*aggregate)->column),
+                               std::move(*(*aggregate)->validity));
+            } else {
+                sub.add_column(field.alias, std::move((*aggregate)->column));
+            }
+        }
+        if (auto flushed = flush_pending(); !flushed) {
+            return std::unexpected(flushed.error());
+        }
+        return sub;
     };
 
     auto first = run_group(group_rows[0]);

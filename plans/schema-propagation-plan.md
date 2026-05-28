@@ -176,8 +176,16 @@ equivalents (or run the pass before fusion).
    Documented in SPEC §3.6. Tested in test_parser/test_lower/test_e2e/
    test_ir_schema. Declared reader return schemas (`extern fn ... -> DataFrame<S>`
    feeding the source env) remain for a later pass.
-3. **Expression type inference** for select/update-derived columns, so their
-   output types are exact rather than `Unknown`.
+3. **Expression type inference** for select/update-derived columns. — **DONE.**
+   `expr_type` in `src/ir/schema.cpp` now resolves binary arithmetic (with
+   numeric promotion; `/` → Float64), scalar casts (`Int64(x)` etc.), and the
+   common columnar/rolling built-ins (`abs`/`cumsum`/`lag`/`rolling_*` preserve
+   or produce their documented type). Aggregate Sum/Mean are resolved (Sum
+   preserves the input type, Mean is Float64). Anything uncertain stays
+   `nullopt`, keeping results sound. The runtime `infer_expr_type`
+   (interpreter.cpp) remains authoritative; the static pass mirrors its
+   unambiguous cases (intentional partial duplication, noted in the source).
+   Full per-builtin parity is a later refinement.
 4. **Promote contracts to static.** Switch function arg/return checking to
    compile-time where schema is `Known`, keeping the runtime path as the
    `Unknown` fallback. Update SPEC.md Section 10.3 accordingly.

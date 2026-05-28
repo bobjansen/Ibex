@@ -354,6 +354,15 @@ auto main(int argc, char** argv) -> int {
         // every group at once, while the stream holds one at a time.
         {"agg_sorted_stream_highcard", "sorted[order k asc][by k, select { k, s = sum(v) }]"},
         {"agg_sorted_hash_highcard", "sorted[by k, select { k, s = sum(v) }]"},
+        // Central-moment aggregates (std/skew/kurtosis) — the widened streaming
+        // set, computed online (Welford/Pébay). `_stream` runs the sorted
+        // group-at-a-time path; `_hash` the hash path. Compare against
+        // tools/bench_polars_agg.py on equivalent data (1000 groups).
+        {"agg_moments_stream",
+         "grouped_sorted[order g asc][by g, select { g, sd = std(v), sk = skew(v), "
+         "ku = kurtosis(v) }]"},
+        {"agg_moments_hash",
+         "grouped_sorted[by g, select { g, sd = std(v), sk = skew(v), ku = kurtosis(v) }]"},
     };
 
     std::map<std::string, double> mins;

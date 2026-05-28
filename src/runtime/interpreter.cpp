@@ -1871,12 +1871,106 @@ struct AggSlot {
     std::int64_t int_value = 0;
     double double_value = 0.0;
     double sum = 0.0;
-    double m2 = 0.0;     ///< Welford M2 accumulator for sample stddev.
+    double m2 = 0.0;     ///< Welford M2 accumulator: Σ(x-mean)². `double_value`
+                         ///< doubles as the running mean for the moment aggs.
+    double m3 = 0.0;     ///< Σ(x-mean)³ (online), for skewness.
+    double m4 = 0.0;     ///< Σ(x-mean)⁴ (online), for kurtosis.
     double param = 0.0;  ///< Function-specific parameter (e.g. EWMA alpha).
     ScalarValue first_value;
     ScalarValue last_value;
     std::vector<double> values;  ///< Collected values for median.
 };
+
+// Online central-moment accumulators (Welford / Pébay), shared by the chunked
+// aggregate operators. `double_value` holds the running mean; m2/m3/m4 hold
+// Σ(x-mean)^k. These match the two-pass central moments the materializing
+// aggregate computes to within floating-point rounding — and for stddev the
+// M2 update is bit-identical (Pébay's term1 reduces to the simple Welford
+// step), so `stddev` results agree exactly across paths.
+inline void agg_update_stddev(AggSlot& slot, double x) {
+    slot.count += 1;
+    const double delta = x - slot.double_value;
+    slot.double_value += delta / static_cast<double>(slot.count);
+    slot.m2 += delta * (x - slot.double_value);
+}
+
+// Full m2/m3/m4 update for skewness/kurtosis (Pébay single-value recurrence).
+// Updates m4 and m3 before m2 because they read the pre-update accumulators.
+inline void agg_update_moments(AggSlot& slot, double x) {
+    const double n1 = static_cast<double>(slot.count);
+    slot.count += 1;
+    const double n = static_cast<double>(slot.count);
+    const double delta = x - slot.double_value;
+    const double delta_n = delta / n;
+    const double delta_n2 = delta_n * delta_n;
+    const double term1 = delta * delta_n * n1;
+    slot.double_value += delta_n;
+    slot.m4 += term1 * delta_n2 * ((n * n) - (3.0 * n) + 3.0) + (6.0 * delta_n2 * slot.m2) -
+               (4.0 * delta_n * slot.m3);
+    slot.m3 += (term1 * delta_n * (n - 2.0)) - (3.0 * delta_n * slot.m2);
+    slot.m2 += term1;
+}
+
+inline auto agg_finalize_stddev(const AggSlot& slot) -> double {
+    return slot.count < 2 ? 0.0 : std::sqrt(slot.m2 / static_cast<double>(slot.count - 1));
+}
+
+inline auto agg_finalize_skew(const AggSlot& slot) -> double {
+    if (slot.count < 3 || slot.m2 == 0.0) {
+        return 0.0;
+    }
+    const auto n = static_cast<double>(slot.count);
+    // Fisher–Pearson sample skewness (matches pandas/scipy default).
+    return (n * std::sqrt(n - 1.0) / (n - 2.0)) * (slot.m3 / std::pow(slot.m2, 1.5));
+}
+
+inline auto agg_finalize_kurtosis(const AggSlot& slot) -> double {
+    if (slot.count < 4 || slot.m2 == 0.0) {
+        return 0.0;
+    }
+    const auto n = static_cast<double>(slot.count);
+    // Unbiased Fisher excess kurtosis (matches pandas/scipy default).
+    return (n - 1.0) / ((n - 2.0) * (n - 3.0)) *
+           (((n + 1.0) * n * slot.m4 / (slot.m2 * slot.m2)) - (3.0 * (n - 1.0)));
+}
+
+// Whether a streamed aggregate slot has enough observations to be non-null.
+// Mirrors the materializing aggregate's `agg_result_is_valid`.
+inline auto chunked_agg_valid(ir::AggFunc func, const AggSlot& slot) -> bool {
+    switch (func) {
+        case ir::AggFunc::Mean:
+            return slot.count > 0;
+        case ir::AggFunc::Sum:
+        case ir::AggFunc::Min:
+        case ir::AggFunc::Max:
+            return slot.has_value;
+        case ir::AggFunc::Stddev:
+            return slot.count >= 2;
+        case ir::AggFunc::Skew:
+            return slot.count >= 3;
+        case ir::AggFunc::Kurtosis:
+            return slot.count >= 4;
+        default:  // Count
+            return true;
+    }
+}
+
+// Whether a streamed aggregate carries a validity bitmap at all (Count never
+// produces nulls; the value-bearing aggs may).
+inline auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
+    switch (func) {
+        case ir::AggFunc::Sum:
+        case ir::AggFunc::Mean:
+        case ir::AggFunc::Min:
+        case ir::AggFunc::Max:
+        case ir::AggFunc::Stddev:
+        case ir::AggFunc::Skew:
+        case ir::AggFunc::Kurtosis:
+            return true;
+        default:
+            return false;
+    }
+}
 
 struct AggState {
     std::vector<AggSlot> slots;
@@ -11077,6 +11171,21 @@ class ChunkedAggregateOperator final : public Operator {
                             slot.has_value = true;
                         }
                         break;
+                    case ir::AggFunc::Stddev:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            agg_update_stddev(slot_for(gids[row]), data[row]);
+                        }
+                        break;
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            agg_update_moments(slot_for(gids[row]), data[row]);
+                        }
+                        break;
                     default:
                         break;
                 }
@@ -11122,6 +11231,21 @@ class ChunkedAggregateOperator final : public Operator {
                             slot.has_value = true;
                         }
                         break;
+                    case ir::AggFunc::Stddev:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            agg_update_stddev(slot_for(gids[row]), static_cast<double>(data[row]));
+                        }
+                        break;
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            agg_update_moments(slot_for(gids[row]), static_cast<double>(data[row]));
+                        }
+                        break;
                     default:
                         break;
                 }
@@ -11155,6 +11279,9 @@ class ChunkedAggregateOperator final : public Operator {
                     column = Column<std::int64_t>{};
                     break;
                 case ir::AggFunc::Mean:
+                case ir::AggFunc::Stddev:
+                case ir::AggFunc::Skew:
+                case ir::AggFunc::Kurtosis:
                     column = Column<double>{};
                     break;
                 case ir::AggFunc::Sum:
@@ -11183,16 +11310,9 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<ValidityBitmap> agg_validity(aggregations_->size());
         std::vector<std::uint8_t> track_validity(aggregations_->size(), 0U);
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
-            switch (plan_[i].func) {
-                case ir::AggFunc::Sum:
-                case ir::AggFunc::Mean:
-                case ir::AggFunc::Min:
-                case ir::AggFunc::Max:
-                    track_validity[i] = 1U;
-                    agg_validity[i].reserve(n_groups_);
-                    break;
-                default:
-                    break;
+            if (chunked_agg_tracks_validity(plan_[i].func)) {
+                track_validity[i] = 1U;
+                agg_validity[i].reserve(n_groups_);
             }
         }
 
@@ -11223,9 +11343,7 @@ class ChunkedAggregateOperator final : public Operator {
                 auto& column = *out.columns[group_by_->size() + i].column;
                 const AggSlot& slot = fs[(g * n_aggs_) + i];
                 if (track_validity[i] != 0U) {
-                    const bool valid =
-                        plan_[i].func == ir::AggFunc::Mean ? slot.count > 0 : slot.has_value;
-                    agg_validity[i].push_back(valid);
+                    agg_validity[i].push_back(chunked_agg_valid(plan_[i].func, slot));
                 }
                 switch (plan_[i].func) {
                     case ir::AggFunc::Count:
@@ -11244,6 +11362,15 @@ class ChunkedAggregateOperator final : public Operator {
                         } else {
                             append_scalar(column, slot.int_value);
                         }
+                        break;
+                    case ir::AggFunc::Stddev:
+                        append_scalar(column, agg_finalize_stddev(slot));
+                        break;
+                    case ir::AggFunc::Skew:
+                        append_scalar(column, agg_finalize_skew(slot));
+                        break;
+                    case ir::AggFunc::Kurtosis:
+                        append_scalar(column, agg_finalize_kurtosis(slot));
                         break;
                     default:
                         break;
@@ -11537,16 +11664,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
         track_validity_.assign(n_aggs_, 0U);
         for (std::size_t i = 0; i < n_aggs_; ++i) {
-            switch (plan_[i].func) {
-                case ir::AggFunc::Sum:
-                case ir::AggFunc::Mean:
-                case ir::AggFunc::Min:
-                case ir::AggFunc::Max:
-                    track_validity_[i] = 1U;
-                    break;
-                default:
-                    break;
-            }
+            track_validity_[i] = chunked_agg_tracks_validity(plan_[i].func) ? 1U : 0U;
         }
         // Capture the leading ordering keys so emitted chunks can advertise the
         // group-sorted order they preserve (lets a downstream `order` skip work).
@@ -11577,6 +11695,9 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     column = Column<std::int64_t>{};
                     break;
                 case ir::AggFunc::Mean:
+                case ir::AggFunc::Stddev:
+                case ir::AggFunc::Skew:
+                case ir::AggFunc::Kurtosis:
                     column = Column<double>{};
                     break;
                 default:  // Sum / Min / Max
@@ -11817,6 +11938,23 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     slot.has_value = true;
                 }
                 break;
+            case ir::AggFunc::Stddev:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row)) {
+                        continue;
+                    }
+                    agg_update_stddev(slot, static_cast<double>(data[row]));
+                }
+                break;
+            case ir::AggFunc::Skew:
+            case ir::AggFunc::Kurtosis:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row)) {
+                        continue;
+                    }
+                    agg_update_moments(slot, static_cast<double>(data[row]));
+                }
+                break;
             default:
                 break;
         }
@@ -11831,9 +11969,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             ColumnValue& column = *out_columns_[group_by_->size() + i].column;
             const AggSlot& slot = cur_slots_[i];
             if (track_validity_[i] != 0U) {
-                const bool valid =
-                    plan_[i].func == ir::AggFunc::Mean ? slot.count > 0 : slot.has_value;
-                out_validity_[i].push_back(valid);
+                out_validity_[i].push_back(chunked_agg_valid(plan_[i].func, slot));
             }
             switch (plan_[i].func) {
                 case ir::AggFunc::Count:
@@ -11844,6 +11980,15 @@ class ChunkedSortedAggregateOperator final : public Operator {
                         column,
                         ScalarValue{slot.count == 0 ? 0.0
                                                     : slot.sum / static_cast<double>(slot.count)});
+                    break;
+                case ir::AggFunc::Stddev:
+                    append_scalar(column, ScalarValue{agg_finalize_stddev(slot)});
+                    break;
+                case ir::AggFunc::Skew:
+                    append_scalar(column, ScalarValue{agg_finalize_skew(slot)});
+                    break;
+                case ir::AggFunc::Kurtosis:
+                    append_scalar(column, ScalarValue{agg_finalize_kurtosis(slot)});
                     break;
                 default:  // Sum / Min / Max
                     if (plan_[i].kind == ExprType::Double) {
@@ -12229,8 +12374,14 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 case ir::AggFunc::Min:
                 case ir::AggFunc::Max:
                 case ir::AggFunc::Mean:
+                case ir::AggFunc::Stddev:
+                case ir::AggFunc::Skew:
+                case ir::AggFunc::Kurtosis:
                     break;
                 default:
+                    // Median/Quantile need all values; First/Last need
+                    // type-preserving output; Ewma is row-order coupled — these
+                    // stay on the materializing path.
                     streamable = false;
                     break;
             }

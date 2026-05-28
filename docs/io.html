@@ -203,8 +203,8 @@
       <article class="card" style="margin-top:1rem;">
         <h3>Start the JSON dashboard</h3>
 <pre><code><span class="cm"># shell</span>
-scripts/demo-kafka.sh
-scripts/run-kafka-dashboard.sh
+demo/kafka/demo-kafka.sh
+demo/kafka/run-kafka-dashboard.sh
 
 <span class="cm"># optional terminal viewers</span>
 python3 demo/kafka/ws_client.py
@@ -239,7 +239,7 @@ python3 demo/kafka/ohlc_ws_client.py</code></pre>
     sink = <span class="fn-name">ws_send</span>(<span class="num">8765</span>)
 };</code></pre>
         <p>
-          The OHLC job in <code>examples/kafka_ohlc.ibex</code> uses the same
+          The OHLC job in <code>demo/kafka/kafka_ohlc.ibex</code> uses the same
           source but switches the transform to
           <code>[resample 5s, by { symbol }, select { ... }]</code> and writes
           to <code>ws://127.0.0.1:8766</code>.
@@ -259,8 +259,8 @@ python3 demo/kafka/ohlc_ws_client.py</code></pre>
           <li><code>ws://127.0.0.1:8776</code> for 5-second OHLC bars</li>
         </ul>
 <pre><code><span class="cm"># shell</span>
-scripts/demo-kafka.sh
-scripts/run-kafka-avro-dashboard.sh
+demo/kafka/demo-kafka.sh
+demo/kafka/run-kafka-avro-dashboard.sh
 
 <span class="cm"># optional terminal viewers</span>
 python3 demo/kafka/ws_client.py --port 8775
@@ -295,7 +295,7 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
     sink = <span class="fn-name">ws_send</span>(<span class="num">8775</span>)
 };</code></pre>
         <p>
-          The matching OHLC job in <code>examples/kafka_ohlc_avro.ibex</code>
+          The matching OHLC job in <code>demo/kafka/kafka_ohlc_avro.ibex</code>
           reads the same <code>ticks_avro</code> topic and writes to
           <code>ws://127.0.0.1:8776</code>.
         </p>

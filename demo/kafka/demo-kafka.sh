@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$ROOT/demo/kafka/docker-compose.yml"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -45,10 +45,10 @@ Avro OHLC websocket:
   ws://127.0.0.1:8776
 
 Start both Ibex websocket streams:
-  scripts/run-kafka-dashboard.sh
+  demo/kafka/run-kafka-dashboard.sh
 
 Start both Ibex Avro websocket streams:
-  scripts/run-kafka-avro-dashboard.sh
+  demo/kafka/run-kafka-avro-dashboard.sh
 
 Open dashboard:
   demo/kafka/ws_dashboard.html

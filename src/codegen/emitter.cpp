@@ -527,6 +527,13 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Ascribe: {
+            // The ascription is a checked identity. Codegen does not yet emit the
+            // runtime schema check (the interpreter/REPL path enforces it), so
+            // emit the child subtree directly.
+            return emit_node(require_single_child(node, "AscribeNode"));
+        }
+
         case ir::NodeKind::Columns: {
             auto child = emit_node(require_single_child(node, "ColumnsNode"));
             auto var = fresh_var();

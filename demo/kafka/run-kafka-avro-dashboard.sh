@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IBEX_BIN="${IBEX_BIN:-$ROOT/build-release/tools/ibex}"
 PLUGIN_PATH="${PLUGIN_PATH:-$ROOT/build-release/tools}"
 LOG_DIR="${LOG_DIR:-/tmp/ibex-kafka-avro-dashboard}"
@@ -50,9 +50,9 @@ wait_for_listen() {
   return 1
 }
 
-start_stream summary examples/kafka_ticks_avro.ibex
+start_stream summary demo/kafka/kafka_ticks_avro.ibex
 summary_pid="$STARTED_PID"
-start_stream ohlc examples/kafka_ohlc_avro.ibex
+start_stream ohlc demo/kafka/kafka_ohlc_avro.ibex
 ohlc_pid="$STARTED_PID"
 
 cleanup() {

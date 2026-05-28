@@ -812,11 +812,18 @@ IBEX_LIBRARY_PATH=./build-release/tools ./build-release/tools/ibex
 ### REPL Commands
 
 ```
+:help                    Show REPL commands
 :tables                  List available tables
 :scalars                 List scalar bindings and values
+:functions               List user and extern function signatures
+:imports                 List imported libraries and extern origins
 :schema <table>          Show column names and types
 :head <table> [n]        Show first n rows (default 10)
+:peek <expr>             Evaluate and compactly display an expression
 :describe <table> [n]    Schema + first n rows
+:doc <name>              Show docs/signature for a binding or built-in
+?name                    Shorthand for :doc <name>
+:source <fn>             Show source for a user-defined function
 :load <file>             Load and execute an .ibex script
 :comments [on|off]       Toggle/force printing script comments during :load
 :timing [on|off]         Toggle/force command timing output

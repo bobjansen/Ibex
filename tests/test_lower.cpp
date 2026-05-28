@@ -3,6 +3,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <string>
+
 namespace {
 
 using namespace ibex;
@@ -589,4 +592,36 @@ Stream {
     REQUIRE(stream != nullptr);
     REQUIRE(stream->source_callee() == "udp_recv");
     REQUIRE(stream->sink_callee() == "ws_send");
+}
+
+TEST_CASE("Lower stream source binds named arguments to declared positions") {
+    // Named args are supplied out of order; they must bind to the declared
+    // parameter order (brokers, topic, group, schema) in source_args.
+    auto program = require_parse(R"(
+extern fn feed(brokers: String, topic: String, group: String, schema: String)
+    -> DataFrame from "x";
+extern fn ws_send(df: DataFrame, port: Int) -> Int from "x";
+Stream {
+    source = feed(group = "g", brokers = "b", topic = "t", schema = "s"),
+    transform = [select { x = price }],
+    sink = ws_send(8080)
+};
+)");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* stream = as_node<ir::StreamNode>(result->get());
+    REQUIRE(stream != nullptr);
+    REQUIRE(stream->source_callee() == "feed");
+
+    const auto& args = stream->source_args();
+    REQUIRE(args.size() == 4);
+    const std::array<std::string, 4> expected{"b", "t", "g", "s"};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        const auto* lit = std::get_if<ir::Literal>(&args[i].node);
+        REQUIRE(lit != nullptr);
+        const auto* str = std::get_if<std::string>(&lit->value);
+        REQUIRE(str != nullptr);
+        REQUIRE(*str == expected[i]);
+    }
 }

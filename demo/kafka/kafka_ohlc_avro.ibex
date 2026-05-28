@@ -5,12 +5,12 @@ ws_listen(8776);
 
 let ohlc = Stream {
     source = kafka_recv_avro(
-        "localhost:19092",
-        "ticks_avro",
-        "ibex-demo-ohlc-avro",
-        "ts:timestamp,symbol:str,venue:str,price:f64,size:i64",
-        "http://localhost:18081",
-        "poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"
+        brokers = "localhost:19092",
+        topic = "ticks_avro",
+        group = "ibex-demo-ohlc-avro",
+        schema = "ts:timestamp,symbol:str,venue:str,price:f64,size:i64",
+        registry_url = "http://localhost:18081",
+        options = "poll_timeout_ms=100;consumer.auto.offset.reset=latest;consumer.session.timeout.ms=6000"
     ),
 
     transform = [resample 5s, by { symbol }, select {

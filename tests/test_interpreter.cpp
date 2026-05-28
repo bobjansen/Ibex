@@ -6311,3 +6311,206 @@ TEST_CASE("Sorted aggregate handles empty input") {
     REQUIRE(result.has_value());
     REQUIRE(result->rows() == 0);
 }
+
+// ── Widened streaming aggregates: Stddev / Skew / Kurtosis ──────────────────
+//
+// These stream via online central moments (Welford/Pébay). The strongest check
+// is parity with the materializing path, whose skew/kurtosis use independent
+// two-pass code: adding a non-streamable agg (median) to the query forces the
+// whole aggregate to materialize, so comparing the two isolates the streaming
+// moment math.
+
+TEST_CASE("Streaming stddev/skew/kurtosis match hand-computed values") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 1, 1});
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[order g asc][by g, select { g, sd = std(x), sk = skew(x), ku = kurtosis(x) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* sd = std::get_if<Column<double>>(result->find("sd"));
+    const auto* sk = std::get_if<Column<double>>(result->find("sk"));
+    const auto* ku = std::get_if<Column<double>>(result->find("ku"));
+    REQUIRE(sd != nullptr);
+    REQUIRE(sk != nullptr);
+    REQUIRE(ku != nullptr);
+    REQUIRE((*sd)[0] == Catch::Approx(1.5811388301));  // sqrt(2.5)
+    REQUIRE((*sk)[0] == Catch::Approx(0.0));           // symmetric
+    REQUIRE((*ku)[0] == Catch::Approx(-1.2));          // matches scipy/pandas default
+}
+
+TEST_CASE("Streaming moments match the materializing path (parity)") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 1, 1, 2, 2, 2, 2});
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0, 1.0, 1.0, 2.0, 10.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // Streamed: all aggs are streamable, input sorted on g.
+    auto streamed = runtime::interpret(
+        *require_ir("t[order g asc][by g, select { g, sd = std(x), sk = skew(x), "
+                    "ku = kurtosis(x) }];"),
+        registry);
+    // Materialized: median is not streamable, forcing the whole aggregate onto
+    // the materializing path (which computes skew/kurtosis via two passes).
+    auto materialized = runtime::interpret(
+        *require_ir("t[by g, select { g, sd = std(x), sk = skew(x), ku = kurtosis(x), "
+                    "md = median(x) }][order g asc];"),
+        registry);
+    REQUIRE(streamed.has_value());
+    REQUIRE(materialized.has_value());
+    REQUIRE(streamed->rows() == 2);
+    REQUIRE(materialized->rows() == 2);
+
+    for (const char* name : {"sd", "sk", "ku"}) {
+        const auto* a = std::get_if<Column<double>>(streamed->find(name));
+        const auto* b = std::get_if<Column<double>>(materialized->find(name));
+        REQUIRE(a != nullptr);
+        REQUIRE(b != nullptr);
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            REQUIRE((*a)[i] == Catch::Approx((*b)[i]));
+        }
+    }
+}
+
+TEST_CASE("Streaming moments also work on the unsorted hash path") {
+    // No `order` → input has no ordering → the hash ChunkedAggregateOperator
+    // computes the moments. Same expected values as the sorted path.
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{2, 1, 2, 1, 1, 2});
+    t.add_column("x", Column<double>{10.0, 1.0, 20.0, 2.0, 3.0, 30.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[by g, select { g, sd = std(x) }][order g asc];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* g = std::get_if<Column<std::int64_t>>(result->find("g"));
+    const auto* sd = std::get_if<Column<double>>(result->find("sd"));
+    REQUIRE(g != nullptr);
+    REQUIRE(sd != nullptr);
+    REQUIRE((*g)[0] == 1);
+    REQUIRE((*sd)[0] == Catch::Approx(1.0));  // std([1,2,3]) = 1
+    REQUIRE((*g)[1] == 2);
+    REQUIRE((*sd)[1] == Catch::Approx(10.0));  // std([10,20,30]) = 10
+}
+
+TEST_CASE("Streaming moments emit null below the per-function row threshold") {
+    // Group sizes 1/2/3/4 exercise the null edges: stddev needs ≥2, skew ≥3,
+    // kurtosis ≥4 valid observations.
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 2, 2, 3, 3, 3, 4, 4, 4, 4});
+    t.add_column("x", Column<double>{5.0, 1.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 4.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[order g asc][by g, select { g, sd = std(x), sk = skew(x), ku = kurtosis(x) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto* sd = result->find_entry("sd");
+    const auto* sk = result->find_entry("sk");
+    const auto* ku = result->find_entry("ku");
+    REQUIRE(sd != nullptr);
+    REQUIRE(sk != nullptr);
+    REQUIRE(ku != nullptr);
+    REQUIRE(sd->validity.has_value());
+    REQUIRE(sk->validity.has_value());
+    REQUIRE(ku->validity.has_value());
+
+    // Row order is g = 1,2,3,4.
+    REQUIRE_FALSE((*sd->validity)[0]);  // n=1: stddev null
+    REQUIRE((*sd->validity)[1]);        // n=2: stddev valid
+    REQUIRE((*sd->validity)[2]);        // n=3
+    REQUIRE((*sd->validity)[3]);        // n=4
+
+    REQUIRE_FALSE((*sk->validity)[0]);  // n=1: skew null
+    REQUIRE_FALSE((*sk->validity)[1]);  // n=2: skew null
+    REQUIRE((*sk->validity)[2]);        // n=3: skew valid
+    REQUIRE((*sk->validity)[3]);        // n=4
+
+    REQUIRE_FALSE((*ku->validity)[0]);  // n=1: kurtosis null
+    REQUIRE_FALSE((*ku->validity)[1]);  // n=2
+    REQUIRE_FALSE((*ku->validity)[2]);  // n=3: kurtosis null
+    REQUIRE((*ku->validity)[3]);        // n=4: kurtosis valid
+}
+
+TEST_CASE("Streaming stddev skips nulls") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 1});
+    Column<double> x{1.0, 0.0, 2.0, 3.0};
+    runtime::ValidityBitmap valid;
+    valid.push_back(true);
+    valid.push_back(false);  // null — must be skipped
+    valid.push_back(true);
+    valid.push_back(true);
+    t.add_column("x", std::move(x), std::move(valid));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[order g asc][by g, select { g, sd = std(x) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* sd = std::get_if<Column<double>>(result->find("sd"));
+    REQUIRE(sd != nullptr);
+    REQUIRE((*sd)[0] == Catch::Approx(1.0));  // std([1,2,3]) = 1, null ignored
+}
+
+TEST_CASE("Streaming stddev accumulates moments across chunk boundaries") {
+    // One group whose rows span two chunks; the running mean/M2 must carry over.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    auto make_g_x_chunk = [](std::vector<std::int64_t> gs,
+                             std::vector<std::int64_t> xs) -> runtime::Chunk {
+        runtime::Chunk chunk;
+        runtime::ColumnEntry ge;
+        ge.name = "g";
+        ge.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+        auto& gc = std::get<Column<std::int64_t>>(*ge.column);
+        for (auto v : gs) {
+            gc.push_back(v);
+        }
+        chunk.columns.push_back(std::move(ge));
+        runtime::ColumnEntry xe;
+        xe.name = "x";
+        xe.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+        auto& xc = std::get<Column<std::int64_t>>(*xe.column);
+        for (auto v : xs) {
+            xc.push_back(v);
+        }
+        chunk.columns.push_back(std::move(xe));
+        chunk.ordering = std::vector<ir::OrderKey>{ir::OrderKey{.name = "g", .ascending = true}};
+        return chunk;
+    };
+
+    externs.register_chunked_table("moments_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_g_x_chunk({1, 1, 1}, {1, 2, 3}));
+        chunks.push_back(make_g_x_chunk({1, 1}, {4, 5}));  // group 1 continues
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn moments_src() -> DataFrame from \"x.hpp\"; "
+        "moments_src()[by g, select { g, sd = std(x) }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* sd = std::get_if<Column<double>>(result->find("sd"));
+    REQUIRE(sd != nullptr);
+    REQUIRE((*sd)[0] == Catch::Approx(1.5811388301));  // std([1,2,3,4,5]) = sqrt(2.5)
+}

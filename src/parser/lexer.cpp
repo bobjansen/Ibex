@@ -59,6 +59,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"not", TokenKind::KeywordNot},
         {"asc", TokenKind::KeywordAsc},
         {"desc", TokenKind::KeywordDesc},
+        {"as", TokenKind::KeywordAs},
         {"Int", TokenKind::KeywordInt},
         {"Int32", TokenKind::KeywordInt32},
         {"Int64", TokenKind::KeywordInt64},

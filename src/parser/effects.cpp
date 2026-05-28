@@ -299,6 +299,10 @@ class EffectAnalyzer {
                     for (const auto& col : node.columns) {
                         collect_expr_effects(*col.expr, direct, deps);
                     }
+                } else if constexpr (std::is_same_v<T, AscribeExpr>) {
+                    if (node.base) {
+                        collect_expr_effects(*node.base, direct, deps);
+                    }
                 }
             },
             expr.node);

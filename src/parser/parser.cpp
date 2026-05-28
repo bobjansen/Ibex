@@ -747,20 +747,38 @@ class Parser {
         if (!expr) {
             return nullptr;
         }
-        while (match(TokenKind::LBracket)) {
-            auto clauses = parse_clause_list();
-            if (!clauses.has_value()) {
-                return nullptr;
+        while (true) {
+            if (match(TokenKind::LBracket)) {
+                auto clauses = parse_clause_list();
+                if (!clauses.has_value()) {
+                    return nullptr;
+                }
+                if (!consume(TokenKind::RBracket, "expected ']' after clause list")) {
+                    return nullptr;
+                }
+                auto block = std::make_unique<Expr>();
+                block->node = BlockExpr{
+                    .base = std::move(expr),
+                    .clauses = std::move(*clauses),
+                };
+                expr = std::move(block);
+                continue;
             }
-            if (!consume(TokenKind::RBracket, "expected ']' after clause list")) {
-                return nullptr;
+            if (match(TokenKind::KeywordAs)) {
+                auto type = parse_type();
+                if (!type.has_value()) {
+                    return nullptr;
+                }
+                if (type->kind != Type::Kind::DataFrame && type->kind != Type::Kind::TimeFrame) {
+                    return fail_expr(previous(),
+                                     "'as' ascription requires a DataFrame or TimeFrame type");
+                }
+                auto ascribe = std::make_unique<Expr>();
+                ascribe->node = AscribeExpr{.base = std::move(expr), .type = std::move(*type)};
+                expr = std::move(ascribe);
+                continue;
             }
-            auto block = std::make_unique<Expr>();
-            block->node = BlockExpr{
-                .base = std::move(expr),
-                .clauses = std::move(*clauses),
-            };
-            expr = std::move(block);
+            break;
         }
         return expr;
     }

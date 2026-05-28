@@ -163,9 +163,19 @@ equivalents (or run the pass before fusion).
    melt, dcast, cov, corr, transpose, matmul, model, stream, and the fused
    nodes. No surface-syntax change. Not yet wired into any error-reporting site —
    that is Stage 4. Strict-g++ clean.
-2. **Schema ascription `as` (+ declared reader schemas).** The boundary that
-   defeats `Unknown`. Grammar + lower + runtime validation reusing
-   `validate_table_type`.
+2. **Schema ascription `as`.** — **DONE.** Surface syntax
+   `expr as DataFrame<{...}>` (KeywordAs in the lexer; postfix in
+   `parse_postfix`; `AscribeExpr` in the AST). Lowers to a new `ir::AscribeNode`
+   (NodeKind::Ascribe) carrying the schema as `ir::SchemaField`s. The interpreter
+   validates the child table against the schema (minimum-required-columns: each
+   listed column must exist with a matching type) and passes it through; missing
+   or wrong-type columns error. `infer_schema(Ascribe)` returns `Known(schema)`,
+   which is the boundary that defeats `Unknown`. Classified as a pipeline Breaker
+   so the chunked path routes through `interpret_node`. Codegen emits the child
+   as a transparent identity (does not yet re-validate — noted in SPEC §3.6).
+   Documented in SPEC §3.6. Tested in test_parser/test_lower/test_e2e/
+   test_ir_schema. Declared reader return schemas (`extern fn ... -> DataFrame<S>`
+   feeding the source env) remain for a later pass.
 3. **Expression type inference** for select/update-derived columns, so their
    output types are exact rather than `Unknown`.
 4. **Promote contracts to static.** Switch function arg/return checking to

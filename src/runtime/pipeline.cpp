@@ -30,6 +30,7 @@ auto classify_node(ir::NodeKind kind) noexcept -> PipelineRole {
         case ir::NodeKind::Window:
         case ir::NodeKind::Resample:
         case ir::NodeKind::AsTimeframe:
+        case ir::NodeKind::Ascribe:
         case ir::NodeKind::Melt:
         case ir::NodeKind::Dcast:
         case ir::NodeKind::Stream:

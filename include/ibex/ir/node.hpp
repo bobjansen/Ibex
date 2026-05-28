@@ -223,6 +223,26 @@ struct RenameSpec {
     std::string old_name;
 };
 
+/// Column scalar type used by schema propagation and schema ascription.
+/// Mirrors `parser::ScalarType`; kept here so the `ir` layer is self-contained.
+enum class ColumnType : std::uint8_t {
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Bool,
+    String,
+    Date,
+    Timestamp,
+};
+
+/// One column in a schema. `type` is `nullopt` when the column is known to
+/// exist but its scalar type has not been inferred.
+struct SchemaField {
+    std::string name;
+    std::optional<ColumnType> type;
+};
+
 /// IR node types.
 /// See SPEC.md Section 1.3 (Mapping to Relational Algebra).
 enum class NodeKind : std::uint8_t {
@@ -239,6 +259,7 @@ enum class NodeKind : std::uint8_t {
     Window,
     Resample,
     AsTimeframe,
+    Ascribe,  ///< Runtime-checked schema ascription (`expr as DataFrame<{...}>`).
     Columns,
     ExternCall,
     Join,
@@ -493,6 +514,24 @@ class AsTimeframeNode final : public Node {
 
    private:
     std::string column_;
+};
+
+/// Ascribe node: a runtime-checked schema ascription (`expr as DataFrame<{...}>`).
+/// At interpret time the child table is validated against `schema` (each listed
+/// column must exist with a matching type); the table is then passed through
+/// unchanged. Statically, the result schema is exactly `schema`, which lets the
+/// schema-propagation pass recover a Known schema past an Unknown source.
+class AscribeNode final : public Node {
+   public:
+    AscribeNode(NodeId id, std::vector<SchemaField> schema)
+        : Node(NodeKind::Ascribe, id), schema_(std::move(schema)) {}
+
+    [[nodiscard]] auto schema() const noexcept -> const std::vector<SchemaField>& {
+        return schema_;
+    }
+
+   private:
+    std::vector<SchemaField> schema_;
 };
 
 /// Columns node: exposes the child table's column names as a one-column table.

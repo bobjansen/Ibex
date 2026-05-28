@@ -3257,13 +3257,28 @@ class Lowerer {
                                       "' is not a known table-returning extern"});
         }
         std::vector<ir::Expr> source_args;
-        source_args.reserve(src_call->args.size());
-        for (const auto& arg : src_call->args) {
-            auto lowered = lower_expr_to_ir(*arg);
-            if (!lowered.has_value()) {
-                return std::unexpected(lowered.error());
+        if (src_call->named_args.empty()) {
+            source_args.reserve(src_call->args.size());
+            for (const auto& arg : src_call->args) {
+                auto lowered = lower_expr_to_ir(*arg);
+                if (!lowered.has_value()) {
+                    return std::unexpected(lowered.error());
+                }
+                source_args.push_back(std::move(lowered.value()));
             }
-            source_args.push_back(std::move(lowered.value()));
+        } else {
+            auto bound = bind_extern_call_args(*src_call);
+            if (!bound.has_value()) {
+                return std::unexpected(bound.error());
+            }
+            source_args.reserve(bound.value().size());
+            for (const auto* arg : bound.value()) {
+                auto lowered = lower_expr_to_ir(*arg);
+                if (!lowered.has_value()) {
+                    return std::unexpected(lowered.error());
+                }
+                source_args.push_back(std::move(lowered.value()));
+            }
         }
 
         // --- sink ---

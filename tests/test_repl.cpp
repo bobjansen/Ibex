@@ -3,11 +3,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <csv.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <string>
+#include <utility>
 
 using ibex::repl::normalize_input;
 
@@ -332,6 +335,165 @@ result;
 )";
 
     REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+// --- Plan litmus tests: user-defined query helpers (plans/udf-dataframe-plan.md) ---
+// These exercise the motivating examples end to end through the REPL/runtime path
+// and assert on the produced values, not just that the script runs. A scalar
+// table-consumer extern ("capture") stashes the helper's result table so the test
+// can inspect it.
+
+TEST_CASE("REPL litmus: table-in table-out helper (top three salaries per dept)", "[repl][udf]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::runtime::Table employee;
+    employee.add_column("departmentId", ibex::Column<std::int64_t>{1, 1, 1, 1, 2, 2});
+    employee.add_column("salary", ibex::Column<std::int64_t>{100, 200, 300, 300, 400, 500});
+    registry.register_table("employee_src",
+                            [employee](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                return ibex::runtime::ExternValue{employee};
+                            });
+    ibex::runtime::Table captured;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&captured](const ibex::runtime::Table& t, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            captured = t;
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+
+    const char* src = R"(
+extern fn employee_src() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+fn top_three_salaries(employee: DataFrame) -> DataFrame {
+  let distinct_salaries = employee[distinct { departmentId, salary }];
+  distinct_salaries[order { salary desc }, head 3, by departmentId];
+}
+
+let employee = employee_src();
+capture(top_three_salaries(employee));
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+
+    // dept 1 distinct salaries {100,200,300} -> top 3 = {300,200,100}
+    // dept 2 distinct salaries {400,500}     -> top 3 = {500,400}
+    const auto* dept = std::get_if<ibex::Column<std::int64_t>>(captured.find("departmentId"));
+    const auto* salary = std::get_if<ibex::Column<std::int64_t>>(captured.find("salary"));
+    REQUIRE(dept != nullptr);
+    REQUIRE(salary != nullptr);
+    REQUIRE(salary->size() == 5);
+    std::set<std::pair<std::int64_t, std::int64_t>> pairs;
+    for (std::size_t i = 0; i < salary->size(); ++i) {
+        pairs.insert({(*dept)[i], (*salary)[i]});
+    }
+    const std::set<std::pair<std::int64_t, std::int64_t>> expected{
+        {1, 300}, {1, 200}, {1, 100}, {2, 500}, {2, 400},
+    };
+    REQUIRE(pairs == expected);
+}
+
+TEST_CASE("REPL litmus: table plus scalar helper (nth highest salaries)", "[repl][udf]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::runtime::Table employee;
+    employee.add_column("salary", ibex::Column<std::int64_t>{100, 200, 300, 300, 400, 500});
+    registry.register_table("employee_src",
+                            [employee](const ibex::runtime::ExternArgs&)
+                                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                return ibex::runtime::ExternValue{employee};
+                            });
+    ibex::runtime::Table captured;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&captured](const ibex::runtime::Table& t, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            captured = t;
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+
+    const char* src = R"(
+extern fn employee_src() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+fn nth_highest_salary(employee: DataFrame, n: Int) -> DataFrame {
+  let top_n = employee[distinct { salary }, order { salary desc }, head n];
+  top_n;
+}
+
+let employee = employee_src();
+capture(nth_highest_salary(employee, 3));
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+
+    // distinct salaries {100,200,300,400,500} ordered desc, head 3 -> {500,400,300}
+    const auto* salary = std::get_if<ibex::Column<std::int64_t>>(captured.find("salary"));
+    REQUIRE(salary != nullptr);
+    const std::vector<std::int64_t> values(salary->begin(), salary->end());
+    REQUIRE(values == std::vector<std::int64_t>{500, 400, 300});
+}
+
+TEST_CASE("REPL litmus: DataFrame<{salary}> contract requires the declared column", "[repl][udf]") {
+    // A helper whose argument declares a required column. The contract is a
+    // minimum-required-columns check: extra columns are allowed, a missing
+    // required column is a call-time error.
+    const char* fn_src = R"(
+extern fn employee_src() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+fn second_highest_salary(employee: DataFrame<{ salary: Int }>) -> DataFrame {
+  employee[distinct { salary }, order { salary desc }, head 2];
+}
+)";
+
+    SECTION("accepts a table that provides the required column (plus extras)") {
+        ibex::runtime::ExternRegistry registry;
+        ibex::runtime::Table employee;
+        employee.add_column("departmentId", ibex::Column<std::int64_t>{1, 1, 2});
+        employee.add_column("salary", ibex::Column<std::int64_t>{100, 300, 200});
+        registry.register_table("employee_src",
+                                [employee](const ibex::runtime::ExternArgs&)
+                                    -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                    return ibex::runtime::ExternValue{employee};
+                                });
+        ibex::runtime::Table captured;
+        registry.register_scalar_table_consumer(
+            "capture", ibex::runtime::ScalarKind::Int,
+            [&captured](const ibex::runtime::Table& t, const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                captured = t;
+                return ibex::runtime::ExternValue{std::int64_t{0}};
+            });
+
+        const std::string src = std::string(fn_src) + "let employee = employee_src();\n" +
+                                "capture(second_highest_salary(employee));\n";
+        REQUIRE(ibex::repl::execute_script(src, registry));
+
+        const auto* salary = std::get_if<ibex::Column<std::int64_t>>(captured.find("salary"));
+        REQUIRE(salary != nullptr);
+        const std::vector<std::int64_t> values(salary->begin(), salary->end());
+        REQUIRE(values == std::vector<std::int64_t>{300, 200});
+    }
+
+    SECTION("rejects a table missing the required column") {
+        ibex::runtime::ExternRegistry registry;
+        ibex::runtime::Table no_salary;
+        no_salary.add_column("departmentId", ibex::Column<std::int64_t>{1, 2, 3});
+        registry.register_table("employee_src",
+                                [no_salary](const ibex::runtime::ExternArgs&)
+                                    -> std::expected<ibex::runtime::ExternValue, std::string> {
+                                    return ibex::runtime::ExternValue{no_salary};
+                                });
+        registry.register_scalar_table_consumer(
+            "capture", ibex::runtime::ScalarKind::Int,
+            [](const ibex::runtime::Table&, const ibex::runtime::ExternArgs&)
+                -> std::expected<ibex::runtime::ExternValue, std::string> {
+                return ibex::runtime::ExternValue{std::int64_t{0}};
+            });
+
+        const std::string src = std::string(fn_src) + "let employee = employee_src();\n" +
+                                "capture(second_highest_salary(employee));\n";
+        REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+    }
 }
 
 TEST_CASE("REPL supports named arguments and defaults for extern functions") {

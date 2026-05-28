@@ -12,6 +12,7 @@ set(IBEX_TEST_SOURCES
     test_ir_canonicalize.cpp
     test_ir_node.cpp
     test_ir_optimizer.cpp
+    test_ir_schema.cpp
     test_kafka_common.cpp
     test_kafka_schema_registry.cpp
     test_kafka_schema_registry_client.cpp

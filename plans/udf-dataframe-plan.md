@@ -215,6 +215,36 @@ Possible staging:
 This is valuable, but it is not required to unlock the initial corpus of query
 helpers.
 
+### Aggregate UDF follow-up
+
+There are two different features here and they should not be conflated:
+
+1. Scalar-returning UDFs inside aggregate arguments:
+
+```ibex
+trades[select { avg_adj = mean(adjust_price(price)) }, by symbol]
+```
+
+This is the smaller feature. It mainly depends on allowing scalar UDF calls in
+clause expressions and making sure aggregate argument lowering can materialize
+the intermediate column before aggregation.
+
+2. True aggregate UDFs:
+
+```ibex
+agg fn weighted_mean(price: Series<Float64>, weight: Series<Float64>) -> Float64 {
+    ...
+}
+
+trades[select { wavg = weighted_mean(price, qty) }, by symbol]
+```
+
+This is a language/runtime design item, not a small parser extension. Today's
+aggregate IR is `AggSpec { AggFunc enum, single column, alias, param }`, so true
+aggregate UDFs need a richer aggregate representation plus defined null,
+empty-group, state, type, interpreter, chunked execution, sorted aggregation,
+and codegen behavior. Treat this as a later design phase.
+
 ## Recommended Priorities
 
 1. Stabilize user-defined function calls for table-shaped helpers.

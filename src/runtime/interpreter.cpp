@@ -7614,6 +7614,46 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             normalize_time_index(*sorted);
             return sorted;
         }
+        case ir::NodeKind::Ascribe: {
+            const auto& asc = static_cast<const ir::AscribeNode&>(node);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            if (!child.has_value()) {
+                return child;
+            }
+            const Table& t = child.value();
+            auto type_matches = [](const ColumnValue& col, ir::ColumnType type) -> bool {
+                switch (type) {
+                    case ir::ColumnType::Int32:
+                    case ir::ColumnType::Int64:
+                        return std::holds_alternative<Column<std::int64_t>>(col);
+                    case ir::ColumnType::Float32:
+                    case ir::ColumnType::Float64:
+                        return std::holds_alternative<Column<double>>(col);
+                    case ir::ColumnType::Bool:
+                        return std::holds_alternative<Column<bool>>(col);
+                    case ir::ColumnType::String:
+                        return std::holds_alternative<Column<std::string>>(col) ||
+                               std::holds_alternative<Column<Categorical>>(col);
+                    case ir::ColumnType::Date:
+                        return std::holds_alternative<Column<Date>>(col);
+                    case ir::ColumnType::Timestamp:
+                        return std::holds_alternative<Column<Timestamp>>(col);
+                }
+                return false;
+            };
+            for (const auto& field : asc.schema()) {
+                const auto* col = t.find(field.name);
+                if (col == nullptr) {
+                    return std::unexpected("schema ascription: missing column '" + field.name +
+                                           "'");
+                }
+                if (field.type.has_value() && !type_matches(*col, *field.type)) {
+                    return std::unexpected("schema ascription: column '" + field.name +
+                                           "' has the wrong type");
+                }
+            }
+            return child;
+        }
         case ir::NodeKind::Columns: {
             if (node.children().empty()) {
                 return std::unexpected("columns node missing child");

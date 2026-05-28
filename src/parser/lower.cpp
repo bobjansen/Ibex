@@ -26,6 +26,29 @@ struct CompileTimeValue {
 
 auto clone_expr(const Expr& expr) -> ExprPtr;
 
+/// Map a parser scalar type to the IR column-type used by schemas.
+auto to_ir_column_type(ScalarType type) -> ir::ColumnType {
+    switch (type) {
+        case ScalarType::Int32:
+            return ir::ColumnType::Int32;
+        case ScalarType::Int64:
+            return ir::ColumnType::Int64;
+        case ScalarType::Float32:
+            return ir::ColumnType::Float32;
+        case ScalarType::Float64:
+            return ir::ColumnType::Float64;
+        case ScalarType::Bool:
+            return ir::ColumnType::Bool;
+        case ScalarType::String:
+            return ir::ColumnType::String;
+        case ScalarType::Date:
+            return ir::ColumnType::Date;
+        case ScalarType::Timestamp:
+            return ir::ColumnType::Timestamp;
+    }
+    return ir::ColumnType::Int64;
+}
+
 auto clone_field(const Field& field) -> Field {
     return Field{
         .name = field.name,
@@ -211,6 +234,8 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
                     arr.elements.push_back(clone_expr(*elem));
                 }
                 out->node = std::move(arr);
+            } else if constexpr (std::is_same_v<T, AscribeExpr>) {
+                out->node = AscribeExpr{.base = clone_expr(*node.base), .type = node.type};
             } else {
                 TableExpr table;
                 table.columns.reserve(node.columns.size());
@@ -343,6 +368,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             return names;
         }
         case NodeKind::AsTimeframe:
+        case NodeKind::Ascribe:
         case NodeKind::Filter:
         case NodeKind::Distinct:
         case NodeKind::Order:
@@ -885,7 +911,31 @@ class Lowerer {
         if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
             return lower_expr(*group->expr);
         }
+        if (const auto* ascribe = std::get_if<AscribeExpr>(&expr.node)) {
+            return lower_ascribe(*ascribe);
+        }
         return std::unexpected(LowerError{.message = "expected DataFrame expression"});
+    }
+
+    /// Lower `base as DataFrame<{...}>` into an AscribeNode over the lowered base,
+    /// converting the declared schema fields to the IR column-type representation.
+    auto lower_ascribe(const AscribeExpr& ascribe) -> LowerResult {
+        auto base = lower_expr(*ascribe.base);
+        if (!base.has_value()) {
+            return base;
+        }
+        const auto* schema_type = std::get_if<SchemaType>(&ascribe.type.arg);
+        std::vector<ir::SchemaField> fields;
+        if (schema_type != nullptr) {
+            fields.reserve(schema_type->fields.size());
+            for (const auto& field : schema_type->fields) {
+                fields.push_back(
+                    ir::SchemaField{.name = field.name, .type = to_ir_column_type(field.type)});
+            }
+        }
+        auto node = builder_.ascribe(std::move(fields));
+        node->add_child(std::move(base.value()));
+        return node;
     }
 
     /// Lower a `Table { col = expr, ... }` expression into a ConstructNode.
@@ -3094,6 +3144,11 @@ class Lowerer {
             case ir::NodeKind::AsTimeframe: {
                 const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
                 clone = builder_.as_timeframe(atf.column());
+                break;
+            }
+            case ir::NodeKind::Ascribe: {
+                const auto& asc = static_cast<const ir::AscribeNode&>(node);
+                clone = builder_.ascribe(asc.schema());
                 break;
             }
             case ir::NodeKind::Columns: {

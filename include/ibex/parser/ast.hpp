@@ -337,9 +337,16 @@ struct StreamExpr {
         sink_args;  ///< extra scalar args for the sink (table prepended at runtime)
 };
 
+/// `expr as DataFrame<{ ... }>` — a runtime-checked schema ascription.
+/// `type` is a DataFrame/TimeFrame type carrying the asserted schema.
+struct AscribeExpr {
+    ExprPtr base;
+    Type type;
+};
+
 struct Expr {
     std::variant<IdentifierExpr, LiteralExpr, CallExpr, RankExpr, UnaryExpr, BinaryExpr, GroupExpr,
-                 BlockExpr, JoinExpr, StreamExpr, ArrayLiteralExpr, TableExpr>
+                 BlockExpr, JoinExpr, StreamExpr, ArrayLiteralExpr, TableExpr, AscribeExpr>
         node;
 };
 

@@ -4,6 +4,7 @@ add_library(ibex_ir STATIC
     expr_predicates.cpp
     node.cpp
     optimizer.cpp
+    schema.cpp
 )
 add_library(Ibex::ir ALIAS ibex_ir)
 

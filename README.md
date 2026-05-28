@@ -823,8 +823,10 @@ IBEX_LIBRARY_PATH=./build-release/tools ./build-release/tools/ibex
 :time <command>          Time exactly one command
 ```
 
-Tab completion for `:` commands is enabled when Ibex is built with `readline`
-available on the system (e.g. `libreadline-dev` on Debian/Ubuntu).
+Tab completion is enabled when Ibex is built with `readline` available on the
+system (e.g. `libreadline-dev` on Debian/Ubuntu). It completes REPL commands,
+`:load` file paths, table/scalar/function names, and column names inside
+`table[...]` expressions.
 Readline builds also persist command history to `~/.ibex_history` by default.
 Use `IBEX_HISTORY_FILE`, `--history-file <path>`, or `--no-history` to override
 that behavior.

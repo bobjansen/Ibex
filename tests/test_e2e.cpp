@@ -113,13 +113,17 @@ TEST_CASE("E2E: schema ascription passes a conforming table through", "[e2e][asc
     CHECK(col_dbl(out, "b") == std::vector<double>{1.5, 2.5});
 }
 
-TEST_CASE("E2E: schema ascription rejects a missing column", "[e2e][ascribe]") {
-    auto err = run_error("Table { a = [1, 2] } as DataFrame<{ salary: Int64 }>;", {});
+// Over a source with an unknown static schema (a registry table), the
+// ascription check is deferred to the runtime validation.
+TEST_CASE("E2E: schema ascription rejects a missing column at run time", "[e2e][ascribe]") {
+    auto tables = make_trades();
+    auto err = run_error("trades as DataFrame<{ salary: Int64 }>;", tables);
     CHECK(err.find("missing column 'salary'") != std::string::npos);
 }
 
-TEST_CASE("E2E: schema ascription rejects a wrong-type column", "[e2e][ascribe]") {
-    auto err = run_error("Table { a = [1, 2] } as DataFrame<{ a: Float64 }>;", {});
+TEST_CASE("E2E: schema ascription rejects a wrong-type column at run time", "[e2e][ascribe]") {
+    auto tables = make_trades();
+    auto err = run_error("trades as DataFrame<{ price: Float64 }>;", tables);
     CHECK(err.find("wrong type") != std::string::npos);
 }
 

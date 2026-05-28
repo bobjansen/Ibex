@@ -606,6 +606,13 @@ compiler treat the result as a known schema from that point onward, so
 downstream column references can be checked statically. It is also the way to
 re-establish a known schema after a data-dependent operator (e.g. `dcast`).
 
+When the input's schema is **statically known** (for example a `Table { ... }`
+literal, or any pipeline built on one or on another ascription), an ascription
+the input provably cannot satisfy — a missing required column, or a column with
+a provably different type — is reported as a **compile-time (lowering) error**.
+When the input schema is statically unknown (e.g. an I/O source), the check is
+deferred to the runtime validation described above.
+
 > Note: the runtime check is enforced on the interpreter/REPL execution path.
 > Generated C++ (the `ibex_compile` path) currently treats the ascription as a
 > transparent identity and does not yet re-validate at run time.

@@ -58,11 +58,291 @@ struct BoundCallArg {
     bool is_default = false;
 };
 
+struct CompletionContext {
+    const runtime::TableRegistry* tables = nullptr;
+    const runtime::ScalarRegistry* scalars = nullptr;
+    const ColumnRegistry* columns = nullptr;
+    const ModelRegistry* models = nullptr;
+    const FunctionRegistry* functions = nullptr;
+    const CompileTimeListRegistry* compile_time_lists = nullptr;
+    const ExternDeclRegistry* extern_decls = nullptr;
+};
+
 #ifdef IBEX_HAS_READLINE
 constexpr std::array<std::string_view, 13> kColonCommands = {
     ":q",    ":quit",     ":exit", ":tables", ":scalars", ":schema",   ":head",
     ":peek", ":describe", ":load", ":timing", ":time",    ":comments",
 };
+
+constexpr std::string_view kCompletionBuiltins[] = {
+    "Bool",
+    "Date",
+    "Float32",
+    "Float64",
+    "Int",
+    "Int32",
+    "Int64",
+    "String",
+    "Timestamp",
+    "abs",
+    "as_timeframe",
+    "bankers",
+    "ceil",
+    "coef",
+    "columns",
+    "count",
+    "cumprod",
+    "cumsum",
+    "ewma",
+    "exp",
+    "fill_backward",
+    "fill_forward",
+    "fill_null",
+    "fitted",
+    "floor",
+    "first",
+    "get",
+    "is_nan",
+    "is_not_null",
+    "is_null",
+    "kurtosis",
+    "lag",
+    "last",
+    "lead",
+    "log",
+    "matmul",
+    "max",
+    "mean",
+    "median",
+    "min",
+    "model_coef",
+    "model_fitted",
+    "model_residuals",
+    "model_r_squared",
+    "model_summary",
+    "nearest",
+    "nrow",
+    "null_if_nan",
+    "null_if_not_finite",
+    "pmax",
+    "pmin",
+    "print",
+    "quantile",
+    "r_squared",
+    "rand_bernoulli",
+    "rand_exponential",
+    "rand_gamma",
+    "rand_int",
+    "rand_normal",
+    "rand_poisson",
+    "rand_student_t",
+    "rand_uniform",
+    "rep",
+    "residuals",
+    "rolling_count",
+    "rolling_ewma",
+    "rolling_kurtosis",
+    "rolling_max",
+};
+
+constexpr std::string_view kMoreCompletionBuiltins[] = {
+    "rolling_mean", "rolling_median",
+    "rolling_min",  "rolling_quantile",
+    "rolling_skew", "rolling_std",
+    "rolling_sum",  "round",
+    "scalar",       "seed_rng",
+    "skew",         "sqrt",
+    "std",          "sum",
+    "summary",      "trunc",
+    "filter",       "select",
+    "update",       "by",
+    "window",       "order",
+    "rename",       "distinct",
+    "head",         "tail",
+    "top",          "melt",
+    "dcast",        "join",
+    "on",
+};
+
+CompletionContext g_completion_context;
+std::vector<std::string> g_completion_candidates;
+
+void set_completion_context(CompletionContext context) {
+    g_completion_context = context;
+}
+
+auto is_ident_char(char c) -> bool {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+auto trim_left(std::string_view text) -> std::string_view {
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0) {
+        text.remove_prefix(1);
+    }
+    return text;
+}
+
+auto command_matches(std::string_view line, std::string_view command) -> bool {
+    line = trim_left(line);
+    return line.starts_with(command) &&
+           (line.size() == command.size() ||
+            std::isspace(static_cast<unsigned char>(line[command.size()])) != 0);
+}
+
+auto identifier_before(std::string_view line, std::size_t pos) -> std::string {
+    pos = std::min(pos, line.size());
+    while (pos > 0 && std::isspace(static_cast<unsigned char>(line[pos - 1])) != 0) {
+        --pos;
+    }
+    const auto end = pos;
+    while (pos > 0 && is_ident_char(line[pos - 1])) {
+        --pos;
+    }
+    if (pos == end) {
+        return {};
+    }
+    return std::string(line.substr(pos, end - pos));
+}
+
+auto table_context_for_line(std::string_view line, std::size_t cursor) -> const runtime::Table* {
+    if (g_completion_context.tables == nullptr) {
+        return nullptr;
+    }
+    cursor = std::min(cursor, line.size());
+    std::size_t active_bracket = std::string_view::npos;
+    int depth = 0;
+    for (std::size_t i = 0; i < cursor; ++i) {
+        if (line[i] == '[') {
+            ++depth;
+            active_bracket = i;
+        } else if (line[i] == ']' && depth > 0) {
+            --depth;
+            if (depth == 0) {
+                active_bracket = std::string_view::npos;
+            }
+        }
+    }
+    if (active_bracket == std::string_view::npos) {
+        return nullptr;
+    }
+    auto table_name = identifier_before(line, active_bracket);
+    if (table_name.empty()) {
+        return nullptr;
+    }
+    auto it = g_completion_context.tables->find(table_name);
+    return it == g_completion_context.tables->end() ? nullptr : &it->second;
+}
+
+void add_candidate(std::vector<std::string>& candidates, std::string_view candidate) {
+    if (!candidate.empty()) {
+        candidates.emplace_back(candidate);
+    }
+}
+
+template <typename Map>
+void add_map_keys(std::vector<std::string>& candidates, const Map* map) {
+    if (map == nullptr) {
+        return;
+    }
+    candidates.reserve(candidates.size() + map->size());
+    for (const auto& entry : *map) {
+        candidates.push_back(entry.first);
+    }
+}
+
+void add_table_columns(std::vector<std::string>& candidates, const runtime::Table* table) {
+    if (table == nullptr) {
+        return;
+    }
+    candidates.reserve(candidates.size() + table->columns.size());
+    for (const auto& column : table->columns) {
+        candidates.push_back(column.name);
+    }
+}
+
+void add_static_candidates(std::vector<std::string>& candidates) {
+    for (auto value : kCompletionBuiltins) {
+        add_candidate(candidates, value);
+    }
+    for (auto value : kMoreCompletionBuiltins) {
+        add_candidate(candidates, value);
+    }
+}
+
+auto unique_sorted(std::vector<std::string> candidates) -> std::vector<std::string> {
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    return candidates;
+}
+
+auto any_prefix_match(const std::vector<std::string>& candidates, std::string_view prefix) -> bool {
+    if (prefix.empty()) {
+        return false;
+    }
+    return std::any_of(candidates.begin(), candidates.end(),
+                       [&](const auto& candidate) { return candidate.starts_with(prefix); });
+}
+
+auto completion_generator(const char* text, int state) -> char* {
+    static std::size_t index = 0;
+    static std::string prefix;
+    if (state == 0) {
+        index = 0;
+        prefix = text != nullptr ? text : "";
+    }
+    while (index < g_completion_candidates.size()) {
+        const auto& candidate = g_completion_candidates[index++];
+        if (candidate.starts_with(prefix)) {
+            return ::strdup(candidate.c_str());
+        }
+    }
+    return nullptr;
+}
+
+auto matches_from(std::vector<std::string> candidates, const char* text) -> char** {
+    g_completion_candidates = unique_sorted(std::move(candidates));
+    rl_attempted_completion_over = 1;
+    return rl_completion_matches(text, completion_generator);
+}
+
+auto expression_completion_candidates(std::string_view line, std::size_t cursor,
+                                      std::string_view prefix) -> std::vector<std::string> {
+    std::vector<std::string> candidates;
+    if (const auto* table = table_context_for_line(line, cursor); table != nullptr) {
+        add_table_columns(candidates, table);
+        if (any_prefix_match(candidates, prefix)) {
+            return candidates;
+        }
+        add_static_candidates(candidates);
+        add_map_keys(candidates, g_completion_context.scalars);
+        add_map_keys(candidates, g_completion_context.columns);
+        add_map_keys(candidates, g_completion_context.functions);
+        add_map_keys(candidates, g_completion_context.extern_decls);
+        add_map_keys(candidates, g_completion_context.compile_time_lists);
+        return candidates;
+    }
+
+    add_map_keys(candidates, g_completion_context.tables);
+    add_map_keys(candidates, g_completion_context.scalars);
+    add_map_keys(candidates, g_completion_context.columns);
+    add_map_keys(candidates, g_completion_context.models);
+    add_map_keys(candidates, g_completion_context.functions);
+    add_map_keys(candidates, g_completion_context.extern_decls);
+    add_map_keys(candidates, g_completion_context.compile_time_lists);
+    if (any_prefix_match(candidates, prefix)) {
+        return candidates;
+    }
+    add_static_candidates(candidates);
+    add_candidate(candidates, "let");
+    add_candidate(candidates, "fn");
+    add_candidate(candidates, "extern");
+    add_candidate(candidates, "import");
+    add_candidate(candidates, "model");
+    add_candidate(candidates, "Table");
+    add_candidate(candidates, "true");
+    add_candidate(candidates, "false");
+    return candidates;
+}
 
 auto default_history_path() -> std::string {
     if (const char* env = std::getenv("IBEX_HISTORY_FILE"); env != nullptr && env[0] != '\0') {
@@ -134,28 +414,37 @@ void save_history_file(const std::string& path, std::size_t limit) {
     }
 }
 
-auto colon_command_generator(const char* text, int state) -> char* {
-    static std::size_t index = 0;
-    static std::string prefix;
-    if (state == 0) {
-        index = 0;
-        prefix = text != nullptr ? text : "";
-    }
-    while (index < kColonCommands.size()) {
-        const auto command = kColonCommands[index++];
-        if (command.starts_with(prefix)) {
-            return ::strdup(std::string(command).c_str());
+auto repl_completion(const char* text, int start, int end) -> char** {
+    const std::string_view line = rl_line_buffer != nullptr ? std::string_view(rl_line_buffer) : "";
+    if (start == 0 && text != nullptr && text[0] == ':') {
+        std::vector<std::string> commands;
+        commands.reserve(kColonCommands.size());
+        for (auto command : kColonCommands) {
+            commands.emplace_back(command);
         }
+        return matches_from(std::move(commands), text);
     }
-    return nullptr;
-}
 
-auto repl_completion(const char* text, int start, int /*end*/) -> char** {
-    if (start != 0 || text == nullptr || text[0] != ':') {
+    if (command_matches(line, ":load")) {
+        rl_attempted_completion_over = 1;
+        return rl_completion_matches(text, rl_filename_completion_function);
+    }
+
+    if (command_matches(line, ":schema") || command_matches(line, ":head") ||
+        command_matches(line, ":describe")) {
+        std::vector<std::string> tables;
+        add_map_keys(tables, g_completion_context.tables);
+        return matches_from(std::move(tables), text);
+    }
+
+    if (line.starts_with(':')) {
         return nullptr;
     }
-    rl_attempted_completion_over = 1;
-    return rl_completion_matches(text, colon_command_generator);
+
+    return matches_from(expression_completion_candidates(
+                            line, static_cast<std::size_t>(end),
+                            text != nullptr ? std::string_view(text) : std::string_view{}),
+                        text);
 }
 
 void configure_line_editing() {
@@ -163,6 +452,10 @@ void configure_line_editing() {
 }
 
 auto should_record_history(std::string_view line) -> bool {
+    line = trim_left(line);
+    while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())) != 0) {
+        line.remove_suffix(1);
+    }
     return !line.empty() && line != ":q" && line != ":quit" && line != ":exit";
 }
 
@@ -183,6 +476,8 @@ auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
 }
 #else
 void configure_line_editing() {}
+
+void set_completion_context(CompletionContext) {}
 
 auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
     fmt::print("{}", prompt);
@@ -2370,6 +2665,15 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
 
     std::string line;
     while (true) {
+        set_completion_context(CompletionContext{
+            .tables = &tables,
+            .scalars = &scalars,
+            .columns = &columns,
+            .models = &models,
+            .functions = &functions,
+            .compile_time_lists = &compile_time_lists,
+            .extern_decls = &extern_decls,
+        });
         if (!read_repl_line(config.prompt, line)) {
             fmt::print("\n");
             break;
@@ -2435,14 +2739,25 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             }
         };
 
-        if (line == ":q" || line == ":quit" || line == ":exit") {
+        if (starts_with_command(line_view, ":q") || starts_with_command(line_view, ":quit") ||
+            starts_with_command(line_view, ":exit")) {
             break;
         }
-        if (line == ":tables") {
+        if (starts_with_command(line_view, ":tables")) {
+            auto arg = trim(line_view.substr(std::string_view(":tables").size()));
+            if (!arg.empty()) {
+                fmt::print("usage: :tables\n");
+                continue;
+            }
             print_tables(tables);
             continue;
         }
-        if (line == ":scalars") {
+        if (starts_with_command(line_view, ":scalars")) {
+            auto arg = trim(line_view.substr(std::string_view(":scalars").size()));
+            if (!arg.empty()) {
+                fmt::print("usage: :scalars\n");
+                continue;
+            }
             print_scalars(scalars);
             continue;
         }

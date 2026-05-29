@@ -263,10 +263,24 @@ equivalents (or run the pass before fusion).
    now a lower-time error (was runtime). Tested in test_repl; demo/schema
    updated to the natural let-based flow.
 
+8. **More operators in `infer_schema`.** — **DONE.**
+   - `melt` → id columns (types from input) + `variable: String` + `value`
+     (common measure type when determinable); closed.
+   - `cov` / `corr` → `column: String` + one `Float64` per numeric input column;
+     requires a fully-typed closed input (else `Unknown`).
+   - `resample` → group keys + aggregate outputs, marked **open**: the output
+     time-bucket column is named after the input's time index, which is not part
+     of the static schema, so the column set is not fully pinned down.
+
+   `dcast`/`transpose`/`matmul`/`model` remain `Unknown` (genuinely
+   data-dependent — see Non-Goals). Tested in test_ir_schema.
+
 ## Follow-ups (post-merge candidates)
 
 - **Named schema aliases** (`type X = { ... }`) to avoid repeating column lists.
-- **More operators** (`melt`/`cov`/`corr`/`resample`) modelled in `infer_schema`.
+- **Time-index in `SchemaInfo`** would let `resample` (and TimeFrame ops
+  generally) report a closed schema with the correctly-named time column,
+  upgrading `resample` from open to closed.
 
 Note on the two paths: cross-`let` checking works on **both** execution paths,
 by different mechanisms. The whole-program `lower()` / `ibex_compile` path

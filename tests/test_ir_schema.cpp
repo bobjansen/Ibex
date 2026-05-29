@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -163,6 +164,41 @@ TEST_CASE("schema: ascription recovers a known schema over an unknown child", "[
     REQUIRE(names(s) == std::vector<std::string>{"x", "y"});
     REQUIRE(type_of(s, "x") == ColumnType::Int64);
     REQUIRE(type_of(s, "y") == ColumnType::Float64);
+}
+
+TEST_CASE("schema: melt yields id columns plus variable/value", "[ir][schema]") {
+    ibex::ir::MeltNode melt(ibex::ir::NodeId{2}, {"a"}, {"b"});  // id=a, measure=b
+    melt.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));
+    auto s = ibex::ir::infer_schema(melt, base_sources());  // t = {a:Int64, b:Float64, c:String}
+    REQUIRE(s.is_known());
+    REQUIRE(names(s) == std::vector<std::string>{"a", "variable", "value"});
+    REQUIRE(type_of(s, "a") == ColumnType::Int64);
+    REQUIRE(type_of(s, "variable") == ColumnType::String);
+    REQUIRE(type_of(s, "value") == ColumnType::Float64);  // measure b is Float64
+}
+
+TEST_CASE("schema: cov yields 'column' plus one Float64 per numeric column", "[ir][schema]") {
+    ibex::ir::CovNode cov(ibex::ir::NodeId{2});
+    cov.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));
+    auto s = ibex::ir::infer_schema(cov, base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(names(s) == std::vector<std::string>{"column", "a", "b"});  // c (String) excluded
+    REQUIRE(type_of(s, "column") == ColumnType::String);
+    REQUIRE(type_of(s, "a") == ColumnType::Float64);
+    REQUIRE(type_of(s, "b") == ColumnType::Float64);
+}
+
+TEST_CASE("schema: resample is open with group keys and aggregate outputs", "[ir][schema]") {
+    std::vector<ibex::ir::ColumnRef> group_by{{.name = "a"}};
+    std::vector<ibex::ir::AggSpec> aggs{
+        {.func = ibex::ir::AggFunc::Sum, .column = {.name = "b"}, .alias = "total", .param = 0.0}};
+    ibex::ir::ResampleNode rs(ibex::ir::NodeId{2}, std::chrono::seconds{1}, group_by, aggs);
+    rs.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));
+    auto s = ibex::ir::infer_schema(rs, base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(s.is_open());  // the time-bucket column is not statically named
+    REQUIRE(s.find("a") != nullptr);
+    REQUIRE(type_of(s, "total") == ColumnType::Float64);  // sum(b), b is Float64
 }
 
 TEST_CASE("schema: an unmodelled operator falls back to unknown", "[ir][schema]") {

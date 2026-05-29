@@ -188,17 +188,55 @@ TEST_CASE("schema: cov yields 'column' plus one Float64 per numeric column", "[i
     REQUIRE(type_of(s, "b") == ColumnType::Float64);
 }
 
-TEST_CASE("schema: resample is open with group keys and aggregate outputs", "[ir][schema]") {
+TEST_CASE("schema: resample is open when the input has no known time index", "[ir][schema]") {
     std::vector<ibex::ir::ColumnRef> group_by{{.name = "a"}};
     std::vector<ibex::ir::AggSpec> aggs{
         {.func = ibex::ir::AggFunc::Sum, .column = {.name = "b"}, .alias = "total", .param = 0.0}};
     ibex::ir::ResampleNode rs(ibex::ir::NodeId{2}, std::chrono::seconds{1}, group_by, aggs);
     rs.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));
-    auto s = ibex::ir::infer_schema(rs, base_sources());
+    auto s = ibex::ir::infer_schema(rs, base_sources());  // t has no time index
     REQUIRE(s.is_known());
-    REQUIRE(s.is_open());  // the time-bucket column is not statically named
+    REQUIRE(s.is_open());  // the time-bucket column cannot be named
     REQUIRE(s.find("a") != nullptr);
     REQUIRE(type_of(s, "total") == ColumnType::Float64);  // sum(b), b is Float64
+}
+
+TEST_CASE("schema: as_timeframe designates the time index (promoting it to Timestamp)",
+          "[ir][schema]") {
+    SourceSchemas sources{
+        {"src", SchemaInfo::known({{.name = "ts", .type = ColumnType::Int64},
+                                   {.name = "px", .type = ColumnType::Float64}})}};
+    ibex::ir::AsTimeframeNode atf(ibex::ir::NodeId{2}, "ts");
+    atf.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "src"));
+    auto s = ibex::ir::infer_schema(atf, sources);
+    REQUIRE(s.is_known());
+    REQUIRE(s.time_index() == "ts");
+    REQUIRE(type_of(s, "ts") == ColumnType::Timestamp);  // promoted from Int64
+    REQUIRE(type_of(s, "px") == ColumnType::Float64);
+}
+
+TEST_CASE("schema: resample over a time-indexed input is closed", "[ir][schema]") {
+    SourceSchemas sources{
+        {"src", SchemaInfo::known({{.name = "ts", .type = ColumnType::Int64},
+                                   {.name = "sym", .type = ColumnType::String},
+                                   {.name = "px", .type = ColumnType::Float64}})}};
+    auto atf = std::make_unique<ibex::ir::AsTimeframeNode>(ibex::ir::NodeId{2}, "ts");
+    atf->add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "src"));
+
+    std::vector<ibex::ir::ColumnRef> group_by{{.name = "sym"}};
+    std::vector<ibex::ir::AggSpec> aggs{
+        {.func = ibex::ir::AggFunc::Mean, .column = {.name = "px"}, .alias = "avg", .param = 0.0}};
+    ibex::ir::ResampleNode rs(ibex::ir::NodeId{3}, std::chrono::seconds{1}, group_by, aggs);
+    rs.add_child(std::move(atf));
+
+    auto s = ibex::ir::infer_schema(rs, sources);
+    REQUIRE(s.is_known());
+    REQUIRE_FALSE(s.is_open());  // now closed — bucket column named after the index
+    REQUIRE(names(s) == std::vector<std::string>{"ts", "sym", "avg"});
+    REQUIRE(type_of(s, "ts") == ColumnType::Timestamp);
+    REQUIRE(type_of(s, "sym") == ColumnType::String);
+    REQUIRE(type_of(s, "avg") == ColumnType::Float64);  // mean(px)
+    REQUIRE(s.time_index() == "ts");
 }
 
 TEST_CASE("schema: an unmodelled operator falls back to unknown", "[ir][schema]") {

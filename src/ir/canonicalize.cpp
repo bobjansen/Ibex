@@ -111,50 +111,56 @@ auto remap_group_by_through_rename(std::vector<ColumnRef> group_by,
     return group_by;
 }
 
-// Collect the set of column names referenced by a FilterExpr tree.
-void collect_filter_column_refs(const FilterExpr& expr, std::unordered_set<std::string>& out) {
+// Collect the set of column names referenced by a predicate expression.
+void collect_filter_column_refs(const Expr& expr, std::unordered_set<std::string>& out) {
     std::visit(
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, FilterColumn>) {
+            if constexpr (std::is_same_v<T, ColumnRef>) {
                 out.insert(n.name);
-            } else if constexpr (std::is_same_v<T, FilterArith> || std::is_same_v<T, FilterCmp> ||
-                                 std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
                 collect_filter_column_refs(*n.left, out);
                 collect_filter_column_refs(*n.right, out);
-            } else if constexpr (std::is_same_v<T, FilterCall>) {
+            } else if constexpr (std::is_same_v<T, LogicalExpr>) {
+                collect_filter_column_refs(*n.left, out);
+                if (n.right) {
+                    collect_filter_column_refs(*n.right, out);
+                }
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
                 for (const auto& arg : n.args) {
                     collect_filter_column_refs(*arg, out);
                 }
-            } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
-                                 std::is_same_v<T, FilterIsNotNull>) {
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
                 collect_filter_column_refs(*n.operand, out);
             }
         },
         expr.node);
 }
 
-// Remap FilterColumn references inside a FilterExpr tree new→old.
-void remap_filter_expr_through_rename(FilterExpr& expr,
+// Remap ColumnRef references inside a predicate expression new→old.
+void remap_filter_expr_through_rename(Expr& expr,
                                       const std::unordered_map<std::string, std::string>& n2o) {
     std::visit(
         [&](auto& n) {
             using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, FilterColumn>) {
+            if constexpr (std::is_same_v<T, ColumnRef>) {
                 auto it = n2o.find(n.name);
                 if (it != n2o.end()) {
                     n.name = it->second;
                 }
-            } else if constexpr (std::is_same_v<T, FilterArith> || std::is_same_v<T, FilterCmp> ||
-                                 std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
                 remap_filter_expr_through_rename(*n.left, n2o);
                 remap_filter_expr_through_rename(*n.right, n2o);
-            } else if constexpr (std::is_same_v<T, FilterCall>) {
+            } else if constexpr (std::is_same_v<T, LogicalExpr>) {
+                remap_filter_expr_through_rename(*n.left, n2o);
+                if (n.right) {
+                    remap_filter_expr_through_rename(*n.right, n2o);
+                }
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
                 for (auto& arg : n.args) {
                     remap_filter_expr_through_rename(*arg, n2o);
                 }
-            } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
-                                 std::is_same_v<T, FilterIsNotNull>) {
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
                 remap_filter_expr_through_rename(*n.operand, n2o);
             }
         },
@@ -198,19 +204,21 @@ auto compose_renames(const std::vector<RenameSpec>& outer, const std::vector<Ren
 // Walks through FilterAnd nodes; any `col == literal` (or `literal == col`)
 // contributes `col`. Other shapes (OR, NOT, arithmetic, non-Eq comparisons)
 // are skipped — the column is not provably constant under those.
-void collect_equality_pinned_cols(const FilterExpr& expr, std::unordered_set<std::string>& out) {
+void collect_equality_pinned_cols(const Expr& expr, std::unordered_set<std::string>& out) {
     std::visit(
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, FilterAnd>) {
-                collect_equality_pinned_cols(*n.left, out);
-                collect_equality_pinned_cols(*n.right, out);
-            } else if constexpr (std::is_same_v<T, FilterCmp>) {
+            if constexpr (std::is_same_v<T, LogicalExpr>) {
+                if (n.op == LogicalOp::And) {
+                    collect_equality_pinned_cols(*n.left, out);
+                    collect_equality_pinned_cols(*n.right, out);
+                }
+            } else if constexpr (std::is_same_v<T, CompareExpr>) {
                 if (n.op == CompareOp::Eq) {
-                    const auto* lcol = std::get_if<FilterColumn>(&n.left->node);
-                    const auto* llit = std::get_if<FilterLiteral>(&n.left->node);
-                    const auto* rcol = std::get_if<FilterColumn>(&n.right->node);
-                    const auto* rlit = std::get_if<FilterLiteral>(&n.right->node);
+                    const auto* lcol = std::get_if<ColumnRef>(&n.left->node);
+                    const auto* llit = std::get_if<Literal>(&n.left->node);
+                    const auto* rcol = std::get_if<ColumnRef>(&n.right->node);
+                    const auto* rlit = std::get_if<Literal>(&n.right->node);
                     if ((lcol != nullptr) && (rlit != nullptr)) {
                         out.insert(lcol->name);
                     } else if ((rcol != nullptr) && (llit != nullptr)) {
@@ -227,12 +235,12 @@ auto rewrite_root(NodePtr node) -> NodePtr;
 
 // Helpers for predicate simplification (R17).
 
-auto make_bool_lit(bool b) -> FilterExprPtr {
-    return std::make_unique<FilterExpr>(FilterExpr{.node = FilterLiteral{.value = b}});
+auto make_bool_lit(bool b) -> Expr {
+    return Expr{.node = Literal{.value = b}};
 }
 
-auto try_get_bool(const FilterExpr& expr) -> std::optional<bool> {
-    if (const auto* lit = std::get_if<FilterLiteral>(&expr.node)) {
+auto try_get_bool(const Expr& expr) -> std::optional<bool> {
+    if (const auto* lit = std::get_if<Literal>(&expr.node)) {
         if (const auto* b = std::get_if<bool>(&lit->value)) {
             return *b;
         }
@@ -243,7 +251,7 @@ auto try_get_bool(const FilterExpr& expr) -> std::optional<bool> {
 // Evaluate a binary comparison between two FilterLiteral values, when their
 // underlying types match. Returns std::nullopt if the comparison isn't
 // well-defined (mismatched types, or the variant alternative isn't ordered).
-auto fold_cmp(CompareOp op, const FilterLiteral& l, const FilterLiteral& r) -> std::optional<bool> {
+auto fold_cmp(CompareOp op, const Literal& l, const Literal& r) -> std::optional<bool> {
     if (l.value.index() != r.value.index()) {
         return std::nullopt;
     }
@@ -272,8 +280,7 @@ auto fold_cmp(CompareOp op, const FilterLiteral& l, const FilterLiteral& r) -> s
 
 // Fold an arithmetic op on two literals when both are numeric (int64 or
 // double, matching types). Mod is integer-only. Returns nullopt otherwise.
-auto fold_arith(ArithmeticOp op, const FilterLiteral& l, const FilterLiteral& r)
-    -> std::optional<FilterLiteral> {
+auto fold_arith(ArithmeticOp op, const Literal& l, const Literal& r) -> std::optional<Literal> {
     if (const auto* li = std::get_if<std::int64_t>(&l.value)) {
         const auto* ri = std::get_if<std::int64_t>(&r.value);
         if (ri == nullptr) {
@@ -281,21 +288,21 @@ auto fold_arith(ArithmeticOp op, const FilterLiteral& l, const FilterLiteral& r)
         }
         switch (op) {
             case ArithmeticOp::Add:
-                return FilterLiteral{.value = *li + *ri};
+                return Literal{.value = *li + *ri};
             case ArithmeticOp::Sub:
-                return FilterLiteral{.value = *li - *ri};
+                return Literal{.value = *li - *ri};
             case ArithmeticOp::Mul:
-                return FilterLiteral{.value = *li * *ri};
+                return Literal{.value = *li * *ri};
             case ArithmeticOp::Div:
                 if (*ri == 0) {
                     return std::nullopt;
                 }
-                return FilterLiteral{.value = *li / *ri};
+                return Literal{.value = *li / *ri};
             case ArithmeticOp::Mod:
                 if (*ri == 0) {
                     return std::nullopt;
                 }
-                return FilterLiteral{.value = *li % *ri};
+                return Literal{.value = *li % *ri};
         }
         return std::nullopt;
     }
@@ -306,13 +313,13 @@ auto fold_arith(ArithmeticOp op, const FilterLiteral& l, const FilterLiteral& r)
         }
         switch (op) {
             case ArithmeticOp::Add:
-                return FilterLiteral{.value = *ld + *rd};
+                return Literal{.value = *ld + *rd};
             case ArithmeticOp::Sub:
-                return FilterLiteral{.value = *ld - *rd};
+                return Literal{.value = *ld - *rd};
             case ArithmeticOp::Mul:
-                return FilterLiteral{.value = *ld * *rd};
+                return Literal{.value = *ld * *rd};
             case ArithmeticOp::Div:
-                return FilterLiteral{.value = *ld / *rd};
+                return Literal{.value = *ld / *rd};
             case ArithmeticOp::Mod:
                 return std::nullopt;
         }
@@ -326,50 +333,47 @@ auto fold_arith(ArithmeticOp op, const FilterLiteral& l, const FilterLiteral& r)
 //   - double-negation: NOT NOT x → x; NOT literal → folded literal.
 //   - literal-only Cmp / Arith → folded literal (Eq, Ne, Lt, …, +, -, …).
 //   - IsNull/IsNotNull on a literal → folded bool (literals are never null).
-auto simplify_expr(FilterExprPtr expr, bool* changed) -> FilterExprPtr {
+auto simplify_expr(Expr expr, bool* changed) -> Expr {
     return std::visit(
-        [&](auto& n) -> FilterExprPtr {
+        [&](auto& n) -> Expr {
             using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, FilterAnd>) {
-                n.left = simplify_expr(std::move(n.left), changed);
-                n.right = simplify_expr(std::move(n.right), changed);
+            if constexpr (std::is_same_v<T, LogicalExpr>) {
+                if (n.op == LogicalOp::Not) {
+                    *n.left = simplify_expr(std::move(*n.left), changed);
+                    if (auto b = try_get_bool(*n.left); b.has_value()) {
+                        *changed = true;
+                        return make_bool_lit(!*b);
+                    }
+                    if (auto* inner = std::get_if<LogicalExpr>(&n.left->node);
+                        (inner != nullptr) && inner->op == LogicalOp::Not) {
+                        *changed = true;
+                        return std::move(*inner->left);
+                    }
+                    return std::move(expr);
+                }
+                *n.left = simplify_expr(std::move(*n.left), changed);
+                *n.right = simplify_expr(std::move(*n.right), changed);
+                const bool is_and = n.op == LogicalOp::And;
                 if (auto lb = try_get_bool(*n.left); lb.has_value()) {
                     *changed = true;
-                    return *lb ? std::move(n.right) : make_bool_lit(false);
+                    if (is_and) {
+                        return *lb ? std::move(*n.right) : make_bool_lit(false);
+                    }
+                    return *lb ? make_bool_lit(true) : std::move(*n.right);
                 }
                 if (auto rb = try_get_bool(*n.right); rb.has_value()) {
                     *changed = true;
-                    return *rb ? std::move(n.left) : make_bool_lit(false);
+                    if (is_and) {
+                        return *rb ? std::move(*n.left) : make_bool_lit(false);
+                    }
+                    return *rb ? make_bool_lit(true) : std::move(*n.left);
                 }
                 return std::move(expr);
-            } else if constexpr (std::is_same_v<T, FilterOr>) {
-                n.left = simplify_expr(std::move(n.left), changed);
-                n.right = simplify_expr(std::move(n.right), changed);
-                if (auto lb = try_get_bool(*n.left); lb.has_value()) {
-                    *changed = true;
-                    return *lb ? make_bool_lit(true) : std::move(n.right);
-                }
-                if (auto rb = try_get_bool(*n.right); rb.has_value()) {
-                    *changed = true;
-                    return *rb ? make_bool_lit(true) : std::move(n.left);
-                }
-                return std::move(expr);
-            } else if constexpr (std::is_same_v<T, FilterNot>) {
-                n.operand = simplify_expr(std::move(n.operand), changed);
-                if (auto b = try_get_bool(*n.operand); b.has_value()) {
-                    *changed = true;
-                    return make_bool_lit(!*b);
-                }
-                if (auto* inner = std::get_if<FilterNot>(&n.operand->node)) {
-                    *changed = true;
-                    return std::move(inner->operand);
-                }
-                return std::move(expr);
-            } else if constexpr (std::is_same_v<T, FilterCmp>) {
-                n.left = simplify_expr(std::move(n.left), changed);
-                n.right = simplify_expr(std::move(n.right), changed);
-                const auto* ll = std::get_if<FilterLiteral>(&n.left->node);
-                const auto* rl = std::get_if<FilterLiteral>(&n.right->node);
+            } else if constexpr (std::is_same_v<T, CompareExpr>) {
+                *n.left = simplify_expr(std::move(*n.left), changed);
+                *n.right = simplify_expr(std::move(*n.right), changed);
+                const auto* ll = std::get_if<Literal>(&n.left->node);
+                const auto* rl = std::get_if<Literal>(&n.right->node);
                 if ((ll != nullptr) && (rl != nullptr)) {
                     if (auto folded = fold_cmp(n.op, *ll, *rl); folded.has_value()) {
                         *changed = true;
@@ -377,36 +381,35 @@ auto simplify_expr(FilterExprPtr expr, bool* changed) -> FilterExprPtr {
                     }
                 }
                 return std::move(expr);
-            } else if constexpr (std::is_same_v<T, FilterArith>) {
-                n.left = simplify_expr(std::move(n.left), changed);
-                n.right = simplify_expr(std::move(n.right), changed);
-                const auto* ll = std::get_if<FilterLiteral>(&n.left->node);
-                const auto* rl = std::get_if<FilterLiteral>(&n.right->node);
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                *n.left = simplify_expr(std::move(*n.left), changed);
+                *n.right = simplify_expr(std::move(*n.right), changed);
+                const auto* ll = std::get_if<Literal>(&n.left->node);
+                const auto* rl = std::get_if<Literal>(&n.right->node);
                 if ((ll != nullptr) && (rl != nullptr)) {
                     if (auto folded = fold_arith(n.op, *ll, *rl); folded.has_value()) {
                         *changed = true;
-                        return std::make_unique<FilterExpr>(FilterExpr{.node = std::move(*folded)});
+                        return Expr{.node = std::move(*folded)};
                     }
                 }
                 return std::move(expr);
-            } else if constexpr (std::is_same_v<T, FilterCall>) {
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
                 for (auto& arg : n.args) {
-                    arg = simplify_expr(std::move(arg), changed);
+                    *arg = simplify_expr(std::move(*arg), changed);
                 }
                 return std::move(expr);
-            } else if constexpr (std::is_same_v<T, FilterIsNull> ||
-                                 std::is_same_v<T, FilterIsNotNull>) {
-                n.operand = simplify_expr(std::move(n.operand), changed);
-                if (std::holds_alternative<FilterLiteral>(n.operand->node)) {
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                *n.operand = simplify_expr(std::move(*n.operand), changed);
+                if (std::holds_alternative<Literal>(n.operand->node)) {
                     *changed = true;
-                    return make_bool_lit(std::is_same_v<T, FilterIsNotNull>);
+                    return make_bool_lit(n.negated);
                 }
                 return std::move(expr);
             } else {
                 return std::move(expr);
             }
         },
-        expr->node);
+        expr.node);
 }
 
 // Result of a single rule attempt: if the rule fired, `changed` is true and
@@ -426,10 +429,10 @@ auto try_simplify_predicate(NodePtr node) -> TryResult {
         return {false, std::move(node)};
     }
     auto& filter = static_cast<FilterNode&>(*node);
-    FilterExprPtr pred = filter.take_predicate();
+    Expr pred = filter.take_predicate();
     bool changed = false;
     pred = simplify_expr(std::move(pred), &changed);
-    if (auto b = try_get_bool(*pred); b.has_value()) {
+    if (auto b = try_get_bool(pred); b.has_value()) {
         const auto filter_id = node->id();
         NodePtr filter_owned = std::move(node);
         NodePtr x = take_unique_child(*filter_owned);
@@ -561,8 +564,8 @@ auto try_filter_past_rename(NodePtr node) -> TryResult {
     for (const auto& rs : rename.renames()) {
         n2o.emplace(rs.new_name, rs.old_name);
     }
-    FilterExprPtr pred = filter.take_predicate();
-    remap_filter_expr_through_rename(*pred, n2o);
+    Expr pred = filter.take_predicate();
+    remap_filter_expr_through_rename(pred, n2o);
     const auto filter_id = node->id();
     NodePtr filter_owned = std::move(node);
     NodePtr rename_owned = take_unique_child(*filter_owned);
@@ -671,7 +674,7 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
     if (!predicate_independent) {
         return {false, std::move(node)};
     }
-    FilterExprPtr pred = filter.take_predicate();
+    Expr pred = filter.take_predicate();
     const auto filter_id = node->id();
     NodePtr filter_owned = std::move(node);
     NodePtr update_owned = take_unique_child(*filter_owned);
@@ -772,10 +775,11 @@ auto try_filter_merge(NodePtr node) -> TryResult {
     }
     auto& outer = static_cast<FilterNode&>(*node);
     auto& inner = static_cast<FilterNode&>(*node->children().front());
-    FilterExprPtr p1 = outer.take_predicate();
-    FilterExprPtr p2 = inner.take_predicate();
-    auto combined = std::make_unique<FilterExpr>(
-        FilterExpr{.node = FilterAnd{.left = std::move(p1), .right = std::move(p2)}});
+    Expr p1 = outer.take_predicate();
+    Expr p2 = inner.take_predicate();
+    Expr combined{.node = LogicalExpr{.op = LogicalOp::And,
+                                      .left = std::make_shared<Expr>(std::move(p1)),
+                                      .right = std::make_shared<Expr>(std::move(p2))}};
     const auto outer_id = node->id();
     NodePtr outer_owned = std::move(node);
     NodePtr inner_owned = take_unique_child(*outer_owned);
@@ -810,7 +814,7 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
     if (!only_group_by) {
         return {false, std::move(node)};
     }
-    FilterExprPtr pred = filter.take_predicate();
+    Expr pred = filter.take_predicate();
     const auto filter_id = node->id();
     NodePtr filter_owned = std::move(node);
     NodePtr agg_owned = take_unique_child(*filter_owned);
@@ -838,7 +842,7 @@ auto try_fuse_filter_project(NodePtr node) -> TryResult {
         return {false, std::move(project_owned)};
     }
     NodePtr x = take_unique_child(filter);
-    FilterExprPtr pred = filter.take_predicate();
+    Expr pred = filter.take_predicate();
     auto fused =
         std::make_unique<FilterProjectNode>(project_owned->id(), std::move(pred), std::move(cols));
     fused->add_child(std::move(x));
@@ -871,7 +875,7 @@ auto try_fuse_filter_update_project(NodePtr node) -> TryResult {
     NodePtr filter_owned = take_unique_child(*update_owned);
     auto& filter_ref = static_cast<FilterNode&>(*filter_owned);
     NodePtr x = take_unique_child(filter_ref);
-    FilterExprPtr pred = filter_ref.take_predicate();
+    Expr pred = filter_ref.take_predicate();
     auto fused = std::make_unique<FilterUpdateProjectNode>(project_owned->id(), std::move(pred),
                                                            std::move(fields), std::move(proj_cols));
     fused->add_child(std::move(x));
@@ -907,7 +911,7 @@ auto try_fuse_filter_limit(NodePtr node) -> TryResult {
         return {false, std::move(limit_owned)};
     }
     NodePtr x = take_unique_child(filter);
-    FilterExprPtr pred = filter.take_predicate();
+    Expr pred = filter.take_predicate();
     NodePtr fused;
     if (kind == NodeKind::Head) {
         fused = std::make_unique<FilterHeadNode>(fused_id, std::move(pred), *count);

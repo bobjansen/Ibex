@@ -92,8 +92,49 @@ struct RankExpr {
     bool pct = false;
 };
 
+/// Supported comparison operators.
+/// See SPEC.md Section 2.5 (Operators).
+enum class CompareOp : std::uint8_t {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+};
+
+/// Logical connectives for boolean expressions. `Not` is unary (uses `left`).
+enum class LogicalOp : std::uint8_t {
+    And,
+    Or,
+    Not,
+};
+
+/// Comparison between two value expressions — produces a Bool.
+struct CompareExpr {
+    CompareOp op = CompareOp::Eq;
+    ExprPtr left;
+    ExprPtr right;
+};
+
+/// Logical combination of boolean expressions. For `Not`, `right` is null.
+struct LogicalExpr {
+    LogicalOp op = LogicalOp::And;
+    ExprPtr left;
+    ExprPtr right;
+};
+
+/// Null test — always produces a valid Bool (never null itself).
+/// `negated` selects IS NOT NULL.
+struct IsNullExpr {
+    ExprPtr operand;
+    bool negated = false;
+};
+
 struct Expr {
-    std::variant<ColumnRef, Literal, BinaryExpr, CallExpr, RankExpr> node;
+    std::variant<ColumnRef, Literal, BinaryExpr, CallExpr, RankExpr, CompareExpr, LogicalExpr,
+                 IsNullExpr>
+        node;
 };
 
 /// A computed field: an alias mapped to an expression (represented as
@@ -111,17 +152,6 @@ struct FieldSpec {
 struct TupleFieldSpec {
     std::vector<std::string> aliases;
     NodePtr source;
-};
-
-/// Supported comparison operators for filter predicates.
-/// See SPEC.md Section 2.5 (Operators).
-enum class CompareOp : std::uint8_t {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
 };
 
 /// Supported aggregation functions.

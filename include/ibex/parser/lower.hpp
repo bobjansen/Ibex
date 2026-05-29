@@ -29,6 +29,12 @@ struct LowerContext {
     /// Names of extern functions whose first argument is a DataFrame.
     /// Populate before calling lower_expr so Stream sink calls can be validated.
     std::unordered_set<std::string> sink_externs;
+    /// All in-scope lexical binding names (scalars, columns, models, functions,
+    /// compile-time lists, table bindings). Used to suppress false positives when
+    /// statically validating column references in `filter`/computed expressions:
+    /// a bare name there may resolve to one of these rather than a column. A
+    /// superset is safe. When empty, expression-level reference checking is off.
+    std::unordered_set<std::string> lexical_names;
 };
 
 /// Lower a parsed Program into an IR node tree.

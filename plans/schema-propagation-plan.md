@@ -204,15 +204,23 @@ equivalents (or run the pass before fusion).
 
 5. **Clause-level column-reference validation.** — **DONE.**
    `ir::check_column_refs` (src/ir/schema.cpp) walks the lowered IR and, where
-   the input schema is `Known`, rejects references to absent columns in the
-   unambiguously column-only positions: `select`/`order`/`rename` targets, `by`
-   group keys, and aggregate source columns. Wired into `lower()` (before the
-   optimizer fuses nodes) and `lower_expr()` (the REPL path). Deliberately skips
-   `filter` and computed `select`/`update` expressions, where a bare name can be
-   a bound scalar (the interpreter resolves column-or-scalar there), and skips
-   `Count`/computed-input aggregates — so the pass never false-positives.
-   `Unknown` inputs fall back to runtime validation. Documented in SPEC §6.6;
-   tested in test_lower.
+   the input schema is `Known`, rejects references to absent columns. Wired into
+   `lower()` (before the optimizer fuses nodes) and `lower_expr()` (the REPL
+   path). `Unknown` inputs fall back to runtime validation. Documented in
+   SPEC §6.6; tested in test_lower and test_repl.
+
+   The column-only positions (`select`/`order`/`rename` targets, `by` group
+   keys, aggregate source columns) are always checked. `filter` and computed
+   `select`/`update` expressions are also checked **when the caller supplies the
+   complete set of in-scope binding names** (`LowerContext::lexical_names`,
+   populated by the REPL from its registries): a reference is flagged only when
+   it is neither a column nor an in-scope binding, since the interpreter resolves
+   those positions against operand-columns ∪ scalars. The check confirmed the
+   resolver only consults columns+scalars there, so the binding set is complete
+   and the pass does not false-positive (verified by the full suite). The
+   compile path (whole-program `lower()`) leaves expression checking off, as it
+   does not assemble the in-scope binding set. `Count`/computed-input aggregates
+   are skipped.
 
 ## Non-Goals (initial waves)
 

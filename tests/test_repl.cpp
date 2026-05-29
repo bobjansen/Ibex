@@ -558,6 +558,33 @@ add3(10, z = 2);
     REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
 }
 
+// Clause-level column-reference validation over a statically known schema.
+// In the REPL the complete set of in-scope scalar names is known, so filter and
+// computed-expression references are validated too — a bare name is rejected
+// only when it is neither a column nor an in-scope binding.
+TEST_CASE("REPL rejects a filter on a missing column over a known schema", "[repl][schema]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("Table { a = [1, 2] }[filter b > 0];", registry));
+}
+
+TEST_CASE("REPL allows a filter referencing an in-scope scalar", "[repl][schema]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let thr = 1;\nTable { a = [1, 2] }[filter a > thr];",
+                                       registry));
+}
+
+TEST_CASE("REPL rejects an update expression on a missing column", "[repl][schema]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(
+        ibex::repl::execute_script("Table { a = [1, 2] }[update { x = nope * 2 }];", registry));
+}
+
+TEST_CASE("REPL allows an update expression referencing an in-scope scalar", "[repl][schema]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let k = 10;\nTable { a = [1, 2] }[update { x = a * k }];",
+                                       registry));
+}
+
 TEST_CASE("REPL tuple let binding: bound columns usable in expressions") {
     ibex::runtime::ExternRegistry registry;
 

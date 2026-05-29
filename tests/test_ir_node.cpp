@@ -33,10 +33,10 @@ TEST_CASE("FilterNode stores predicate", "[ir][filter]") {
 
     auto* filter_node = dynamic_cast<ibex::ir::FilterNode*>(node.get());
     REQUIRE(filter_node != nullptr);
-    const auto* cmp = std::get_if<ibex::ir::FilterCmp>(&filter_node->predicate().node);
+    const auto* cmp = std::get_if<ibex::ir::CompareExpr>(&filter_node->predicate().node);
     REQUIRE(cmp != nullptr);
     REQUIRE(cmp->op == ibex::ir::CompareOp::Ge);
-    const auto* col = std::get_if<ibex::ir::FilterColumn>(&cmp->left->node);
+    const auto* col = std::get_if<ibex::ir::ColumnRef>(&cmp->left->node);
     REQUIRE(col != nullptr);
     REQUIRE(col->name == "volume");
 }

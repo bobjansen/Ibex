@@ -652,7 +652,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     first = false;
                     *out_ << '"' << escape_string(key) << '"';
                 }
-                *out_ << "}, " << emit_filter_expr(**join.predicate()) << ");\n";
+                *out_ << "}, " << emit_filter_expr(*join.predicate()) << ");\n";
                 return var;
             }
             *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right;
@@ -1083,13 +1083,13 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
     throw std::runtime_error("ibex_compile: unknown IR node kind");
 }
 
-auto Emitter::emit_filter_expr(const ir::FilterExpr& expr) -> std::string {
+auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {
     return std::visit(
         [](const auto& node) -> std::string {
             using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::FilterColumn>) {
+            if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 return "ibex::ops::filter_col(\"" + escape_string(node.name) + "\")";
-            } else if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+            } else if constexpr (std::is_same_v<T, ir::Literal>) {
                 return std::visit(
                     [](const auto& v) -> std::string {
                         using V = std::decay_t<decltype(v)>;
@@ -1112,35 +1112,40 @@ auto Emitter::emit_filter_expr(const ir::FilterExpr& expr) -> std::string {
                         }
                     },
                     node.value);
-            } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
                 return "ibex::ops::filter_arith(ibex::ir::ArithmeticOp::" + emit_arith_op(node.op) +
                        ", " + emit_filter_expr(*node.left) + ", " + emit_filter_expr(*node.right) +
                        ")";
-            } else if constexpr (std::is_same_v<T, ir::FilterCall>) {
-                std::string s = "([]{ std::vector<ibex::ir::FilterExprPtr> args;";
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                std::string s = "([]{ std::vector<ibex::ir::Expr> args;";
                 for (const auto& arg : node.args) {
                     s += " args.push_back(" + emit_filter_expr(*arg) + ");";
                 }
                 s += " return ibex::ops::filter_call(\"" + escape_string(node.callee) +
                      "\", std::move(args)); })()";
                 return s;
-            } else if constexpr (std::is_same_v<T, ir::FilterCmp>) {
+            } else if constexpr (std::is_same_v<T, ir::CompareExpr>) {
                 return "ibex::ops::filter_cmp(ibex::ir::CompareOp::" + emit_compare_op(node.op) +
                        ", " + emit_filter_expr(*node.left) + ", " + emit_filter_expr(*node.right) +
                        ")";
-            } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
-                return "ibex::ops::filter_and(" + emit_filter_expr(*node.left) + ", " +
-                       emit_filter_expr(*node.right) + ")";
-            } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
-                return "ibex::ops::filter_or(" + emit_filter_expr(*node.left) + ", " +
-                       emit_filter_expr(*node.right) + ")";
-            } else if constexpr (std::is_same_v<T, ir::FilterNot>) {
-                return "ibex::ops::filter_not(" + emit_filter_expr(*node.operand) + ")";
-            } else if constexpr (std::is_same_v<T, ir::FilterIsNull>) {
-                return "ibex::ops::filter_is_null(" + emit_filter_expr(*node.operand) + ")";
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                if (node.op == ir::LogicalOp::And) {
+                    return "ibex::ops::filter_and(" + emit_filter_expr(*node.left) + ", " +
+                           emit_filter_expr(*node.right) + ")";
+                }
+                if (node.op == ir::LogicalOp::Or) {
+                    return "ibex::ops::filter_or(" + emit_filter_expr(*node.left) + ", " +
+                           emit_filter_expr(*node.right) + ")";
+                }
+                return "ibex::ops::filter_not(" + emit_filter_expr(*node.left) + ")";
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return node.negated
+                           ? "ibex::ops::filter_is_not_null(" + emit_filter_expr(*node.operand) +
+                                 ")"
+                           : "ibex::ops::filter_is_null(" + emit_filter_expr(*node.operand) + ")";
             } else {
-                static_assert(std::is_same_v<T, ir::FilterIsNotNull>);
-                return "ibex::ops::filter_is_not_null(" + emit_filter_expr(*node.operand) + ")";
+                throw std::runtime_error(
+                    "ibex_compile: unsupported expression node in filter predicate");
             }
         },
         expr.node);

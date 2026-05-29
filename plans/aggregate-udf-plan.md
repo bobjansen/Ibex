@@ -141,6 +141,11 @@ vectorising/compiling it is a later optimisation.)
 2. **Feature 1 in aggregate args** — **DONE** (folded into stage 1 via the
    existing computed-arg materialisation; `mean(adjust(price)) by sym` verified
    in test_e2e).
+   **Sequencing:** stages 3+ are gated on `plans/unify-filter-expr-plan.md`.
+   Aggregate / scalar UDFs will be usable in predicates too, so the
+   `FilterExpr` → `ir::Expr` unification lands first; the richer aggregate-UDF
+   machinery is then built once on the unified expression IR rather than twice.
+
 3. **`agg fn` syntax + declaration** (parser/AST) and the aggregate IR
    representation (`AggUdfSpec` / variant, multi-column args).
 4. **Interpreter per-group evaluation** (bind slices → evaluate body → scalar).

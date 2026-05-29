@@ -267,10 +267,14 @@ equivalents (or run the pass before fusion).
 
 - **Named schema aliases** (`type X = { ... }`) to avoid repeating column lists.
 - **More operators** (`melt`/`cov`/`corr`/`resample`) modelled in `infer_schema`.
-- **Compile-path binding schemas.** Whole-program `lower()` does not yet build
-  binding schemas across its own `let` statements (only the REPL/script path
-  does); wiring the same env there would extend cross-`let` checks to
-  `ibex_compile`.
+
+Note on the two paths: cross-`let` checking works on **both** execution paths,
+by different mechanisms. The whole-program `lower()` / `ibex_compile` path
+inlines a clone of each let-bound subtree at its use site (`lower_identifier`),
+so schemas flow through `infer_schema` directly — no binding-schema env needed.
+The REPL/script path keeps let-bound tables as runtime values and re-reads them
+as opaque `ScanNode`s, so it supplies their schemas via
+`LowerContext::source_schemas` (built from the runtime registry, stage 7).
 
 ## Open Questions
 

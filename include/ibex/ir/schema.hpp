@@ -22,12 +22,14 @@ class SchemaInfo {
     SchemaInfo() = default;  ///< Unknown.
 
     [[nodiscard]] static auto unknown() -> SchemaInfo { return SchemaInfo{}; }
-    [[nodiscard]] static auto known(std::vector<SchemaField> fields, bool open = false)
+    [[nodiscard]] static auto known(std::vector<SchemaField> fields, bool open = false,
+                                    std::optional<std::string> time_index = std::nullopt)
         -> SchemaInfo {
         SchemaInfo info;
         info.known_ = true;
         info.open_ = open;
         info.fields_ = std::move(fields);
+        info.time_index_ = std::move(time_index);
         return info;
     }
 
@@ -39,6 +41,11 @@ class SchemaInfo {
     [[nodiscard]] auto fields() const noexcept -> const std::vector<SchemaField>& {
         return fields_;
     }
+    /// Name of the designated time-index column for a TimeFrame, if any. A
+    /// `DataFrame` has none; `as_timeframe` and `resample` set it.
+    [[nodiscard]] auto time_index() const noexcept -> const std::optional<std::string>& {
+        return time_index_;
+    }
 
     /// Returns the field named `name`, or nullptr if absent (or schema Unknown).
     [[nodiscard]] auto find(std::string_view name) const -> const SchemaField*;
@@ -47,6 +54,7 @@ class SchemaInfo {
     bool known_ = false;
     bool open_ = false;
     std::vector<SchemaField> fields_;
+    std::optional<std::string> time_index_;
 };
 
 /// Maps a source/extern table name to its declared schema. An entry that is

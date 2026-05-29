@@ -196,15 +196,31 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             return SchemaInfo::unknown();
         }
 
-        // Pure row-shaping operators: schema passes through unchanged.
+        // Pure row-shaping operators: schema (and time index) pass through.
         case NodeKind::Filter:
         case NodeKind::Order:
         case NodeKind::Head:
         case NodeKind::Tail:
         case NodeKind::Distinct:
-        case NodeKind::AsTimeframe:
         case NodeKind::Window:
             return child_schema(node, sources);
+
+        case NodeKind::AsTimeframe: {
+            // Designates the time-index column. The index column is materialised
+            // as a Timestamp (integer time columns are converted at run time).
+            const auto& atf = static_cast<const AsTimeframeNode&>(node);
+            const SchemaInfo input = child_schema(node, sources);
+            if (!input.is_known()) {
+                return SchemaInfo::unknown();
+            }
+            std::vector<SchemaField> out = input.fields();
+            for (auto& field : out) {
+                if (field.name == atf.column()) {
+                    field.type = ColumnType::Timestamp;
+                }
+            }
+            return SchemaInfo::known(std::move(out), input.is_open(), atf.column());
+        }
 
         case NodeKind::Project: {
             // Output is exactly the listed columns; carry types over from the
@@ -221,7 +237,17 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 }
                 out.push_back(SchemaField{.name = ref.name, .type = type});
             }
-            return SchemaInfo::known(std::move(out));
+            // Keep the time index only if the projection retains that column.
+            std::optional<std::string> time_index;
+            if (input.time_index().has_value()) {
+                const bool kept = std::any_of(
+                    project.columns().begin(), project.columns().end(),
+                    [&](const ColumnRef& ref) { return ref.name == *input.time_index(); });
+                if (kept) {
+                    time_index = input.time_index();
+                }
+            }
+            return SchemaInfo::known(std::move(out), /*open=*/false, std::move(time_index));
         }
 
         case NodeKind::Rename: {
@@ -231,14 +257,18 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 return SchemaInfo::unknown();
             }
             std::vector<SchemaField> out = input.fields();
+            std::optional<std::string> time_index = input.time_index();
             for (const auto& spec : rename.renames()) {
                 for (auto& field : out) {
                     if (field.name == spec.old_name) {
                         field.name = spec.new_name;
                     }
                 }
+                if (time_index.has_value() && *time_index == spec.old_name) {
+                    time_index = spec.new_name;  // the index column was renamed
+                }
             }
-            return SchemaInfo::known(std::move(out), input.is_open());
+            return SchemaInfo::known(std::move(out), input.is_open(), std::move(time_index));
         }
 
         case NodeKind::Update: {
@@ -267,7 +297,8 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     upsert(alias, std::nullopt);
                 }
             }
-            return SchemaInfo::known(std::move(out), input.is_open());
+            // Update retains every existing column, so the time index survives.
+            return SchemaInfo::known(std::move(out), input.is_open(), input.time_index());
         }
 
         case NodeKind::Aggregate: {
@@ -414,13 +445,17 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
 
         case NodeKind::Resample: {
             // Output: a time-bucket column (Timestamp, named after the input's
-            // time index) + group keys + one column per aggregate. The bucket
-            // column's name is the input's time index, which is not part of the
-            // static schema, so the result is OPEN (its full column set is not
-            // statically pinned down).
+            // time index) + group keys + one column per aggregate. When the
+            // input's time index is known the column set is fully pinned down
+            // (closed); otherwise the bucket column cannot be named, so the
+            // result is left OPEN.
             const auto& rs = static_cast<const ResampleNode&>(node);
             const SchemaInfo input = child_schema(node, sources);
+            const std::optional<std::string>& bucket = input.time_index();
             std::vector<SchemaField> out;
+            if (bucket.has_value()) {
+                out.push_back(SchemaField{.name = *bucket, .type = ColumnType::Timestamp});
+            }
             for (const auto& key : rs.group_by()) {
                 std::optional<ColumnType> type;
                 if (const auto* field = input.find(key.name)) {
@@ -432,7 +467,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 out.push_back(
                     SchemaField{.name = spec.alias, .type = agg_result_type(spec, input)});
             }
-            return SchemaInfo::known(std::move(out), /*open=*/true);
+            return SchemaInfo::known(std::move(out), /*open=*/!bucket.has_value(), bucket);
         }
 
         // Data-dependent output columns or not yet modelled: Unknown is sound.

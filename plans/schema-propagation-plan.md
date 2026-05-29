@@ -174,8 +174,8 @@ equivalents (or run the pass before fusion).
    so the chunked path routes through `interpret_node`. Codegen emits the child
    as a transparent identity (does not yet re-validate — noted in SPEC §3.6).
    Documented in SPEC §3.6. Tested in test_parser/test_lower/test_e2e/
-   test_ir_schema. Declared reader return schemas (`extern fn ... -> DataFrame<S>`
-   feeding the source env) remain for a later pass.
+   test_ir_schema. (Ascription is now exact-with-`*` and reader return schemas
+   feed the source env — see stage 6.)
 3. **Expression type inference** for select/update-derived columns. — **DONE.**
    `expr_type` in `src/ir/schema.cpp` now resolves binary arithmetic (with
    numeric promotion; `/` → Float64), scalar casts (`Int64(x)` etc.), and the
@@ -221,6 +221,28 @@ equivalents (or run the pass before fusion).
    compile path (whole-program `lower()`) leaves expression checking off, as it
    does not assemble the in-scope binding set. `Count`/computed-input aggregates
    are skipped.
+
+6. **Exact schemas, wildcards, and reader return schemas.** — **DONE.**
+   Declared schemas are now **exact/closed by default** with an opt-in `*`
+   wildcard for "extras allowed" (`DataFrame<{a: Int, *}>`). Added:
+   - `SchemaType::open` (parser) + `*` parsing; `ir::SchemaInfo::is_open()` and
+     `AscribeNode::open()`; openness propagates in `infer_schema` (literals/
+     projections/aggregates close the set; passthrough/update/rename inherit;
+     join open if either side is).
+   - `check_column_refs` only runs missing-column checks on a **closed** Known
+     input, so wildcard schemas never false-positive.
+   - `as` ascription is exact: besides required+type checks it now forbids
+     unlisted extra columns (statically when the input is closed-Known, and at
+     runtime in the interpreter) unless `*` is given.
+   - Declared **reader return schemas** feed the source env
+     (`build_source_schemas` from the extern decls), so a typed reader call like
+     `read_typed(...)[select { typo }]` is checked at lower time. A reader that
+     may yield more columns declares `-> DataFrame<{..., *}>`.
+
+   Distinction documented: reader/ascription schemas are exact (assert concrete
+   data shape), while function-parameter `DataFrame<Schema>` contracts stay
+   minimum-required (reusability) — SPEC §3.3/§3.6/§10.3. Tested in test_lower
+   (reader + ascription, exact vs wildcard) and test_repl.
 
 ## Non-Goals (initial waves)
 

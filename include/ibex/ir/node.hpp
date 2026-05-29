@@ -523,15 +523,18 @@ class AsTimeframeNode final : public Node {
 /// schema-propagation pass recover a Known schema past an Unknown source.
 class AscribeNode final : public Node {
    public:
-    AscribeNode(NodeId id, std::vector<SchemaField> schema)
-        : Node(NodeKind::Ascribe, id), schema_(std::move(schema)) {}
+    AscribeNode(NodeId id, std::vector<SchemaField> schema, bool open = false)
+        : Node(NodeKind::Ascribe, id), schema_(std::move(schema)), open_(open) {}
 
     [[nodiscard]] auto schema() const noexcept -> const std::vector<SchemaField>& {
         return schema_;
     }
+    /// True if the ascription ends with a `*` wildcard (extra columns allowed).
+    [[nodiscard]] auto open() const noexcept -> bool { return open_; }
 
    private:
     std::vector<SchemaField> schema_;
+    bool open_;
 };
 
 /// Columns node: exposes the child table's column names as a one-column table.

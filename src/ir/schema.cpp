@@ -238,7 +238,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     }
                 }
             }
-            return SchemaInfo::known(std::move(out));
+            return SchemaInfo::known(std::move(out), input.is_open());
         }
 
         case NodeKind::Update: {
@@ -267,7 +267,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     upsert(alias, std::nullopt);
                 }
             }
-            return SchemaInfo::known(std::move(out));
+            return SchemaInfo::known(std::move(out), input.is_open());
         }
 
         case NodeKind::Aggregate: {
@@ -309,7 +309,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     out.push_back(field);
                 }
             }
-            return SchemaInfo::known(std::move(out));
+            return SchemaInfo::known(std::move(out), left.is_open() || right.is_open());
         }
 
         case NodeKind::Construct: {
@@ -331,9 +331,12 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             return SchemaInfo::known(std::move(out));
         }
 
-        case NodeKind::Ascribe:
-            // The ascription fixes the result schema (validated at run time).
-            return SchemaInfo::known(static_cast<const AscribeNode&>(node).schema());
+        case NodeKind::Ascribe: {
+            // The ascription fixes the result schema (validated at run time); a
+            // wildcard ascription is open (extra columns allowed).
+            const auto& asc = static_cast<const AscribeNode&>(node);
+            return SchemaInfo::known(asc.schema(), asc.open());
+        }
 
         case NodeKind::Columns:
             // Exposes child column names as a single String column named "name".
@@ -436,11 +439,13 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
         }
     }
 
-    // Input schema of a single-input operator. Checks run only when it is Known.
+    // Missing-column checks are only sound on a closed Known input: an open
+    // (wildcard) schema may have extra columns, so an absent name is not
+    // provably missing.
     const SchemaInfo input = node.children().empty()
                                  ? SchemaInfo::unknown()
                                  : infer_schema(*node.children().front(), sources);
-    if (!input.is_known()) {
+    if (!input.is_known() || input.is_open()) {
         return std::nullopt;
     }
 

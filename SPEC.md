@@ -367,7 +367,7 @@ language’s static typing rules.
 A schema describes the typed column layout of a DataFrame or TimeFrame:
 
 ```
-schema_type = "{" schema_field { "," schema_field } [ "," ] "}" ;
+schema_type = "{" [ schema_field { "," schema_field } [ "," "*" ] ] "}" ;
 schema_field = IDENT ":" scalar_type ;
 ```
 
@@ -379,6 +379,17 @@ Example:
 
 Schemas are structural: two schemas with the same fields in the same order are
 the same type. Field order is significant.
+
+A trailing `*` marks the schema **open**: it lists the columns that must be
+present but permits additional, unlisted columns. Without `*` a schema is
+**exact (closed)** — exactly the listed columns, no more. The distinction
+governs validation where a declared schema meets actual data (Sections 3.6 and
+6.6):
+
+```
+{ a: Int64 }       // exact: the table has exactly column a
+{ a: Int64, * }    // open: at least column a, extras allowed
+```
 
 ### 3.4 Local Type Inference and Annotation Validation
 
@@ -590,13 +601,15 @@ A table expression may be ascribed a schema with the postfix `as` operator:
 
 The ascribed type must be a `DataFrame` or `TimeFrame` type. The ascription is a
 **runtime-checked identity**: the table is validated against the named schema
-and then passed through unchanged. As with `DataFrame<Schema>` function-argument
-contracts (Section 10.3), the check is **minimum-required-columns** — every
-listed column must exist with a matching type, extra columns are allowed, and
-column order is not significant. A missing or wrong-type column is an error.
+and then passed through unchanged. The schema is **exact (closed) by default** —
+every listed column must be present with a matching type, *and* the table must
+not contain columns the schema does not list. A trailing `*` wildcard
+(Section 3.3) relaxes this to allow extra columns. A missing column, a
+wrong-type column, or (without `*`) an unlisted extra column is an error.
 
 ```
 let trades = read_csv("trades.csv") as DataFrame<{ date: Date, px: Float64 }>;
+let wide   = read_csv("trades.csv") as DataFrame<{ date: Date, * }>;  // extras ok
 ```
 
 The purpose is to recover a statically known schema at a boundary where it would
@@ -606,12 +619,25 @@ compiler treat the result as a known schema from that point onward, so
 downstream column references can be checked statically. It is also the way to
 re-establish a known schema after a data-dependent operator (e.g. `dcast`).
 
-When the input's schema is **statically known** (for example a `Table { ... }`
-literal, or any pipeline built on one or on another ascription), an ascription
-the input provably cannot satisfy — a missing required column, or a column with
-a provably different type — is reported as a **compile-time (lowering) error**.
-When the input schema is statically unknown (e.g. an I/O source), the check is
+(This exact-by-default behavior is distinct from `DataFrame<Schema>` *function
+parameter* contracts in Section 10.3, which are minimum-required — "at least
+these columns" — so that helpers compose over wider tables. A reader/ascription
+asserts the shape of concrete data, where exact-with-opt-in-`*` is the safer
+default; a parameter declares what a reusable function needs.)
+
+When the input's schema is **statically known and closed** (for example a
+`Table { ... }` literal, or any pipeline built on one or on another exact
+ascription), an ascription the input provably cannot satisfy — a missing
+required column, a column with a provably different type, or (without `*`) an
+unlisted extra column — is reported as a **compile-time (lowering) error**. When
+the input schema is statically unknown (e.g. an I/O source) or open, the check is
 deferred to the runtime validation described above.
+
+Declared **reader return schemas** participate the same way: an
+`extern fn read_typed(path: String) -> DataFrame<{ ... }>` declaration is taken
+as the reader's exact output schema (add `*` if the reader may yield more
+columns), so a call like `read_typed(...)[select { typo }]` is checked
+statically against the declared columns.
 
 > Note: the runtime check is enforced on the interpreter/REPL execution path.
 > Generated C++ (the `ibex_compile` path) currently treats the ascription as a

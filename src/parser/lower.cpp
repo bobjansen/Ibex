@@ -49,6 +49,29 @@ auto column_type_name(ir::ColumnType type) -> std::string_view {
     return "?";
 }
 
+auto to_ir_schema_fields(const SchemaType& schema) -> std::vector<ir::SchemaField>;
+
+/// Build an `ir::SourceSchemas` env from extern declarations: each extern whose
+/// return type is a DataFrame/TimeFrame carrying a schema contributes its
+/// declared output schema, keyed by the extern name. Used so a typed reader call
+/// (`read_typed(...)`) lowers to an ExternCall with a statically Known schema.
+auto build_source_schemas(const std::unordered_map<std::string, const ExternDecl*>& decls)
+    -> ir::SourceSchemas {
+    ir::SourceSchemas sources;
+    for (const auto& [name, decl] : decls) {
+        const auto& ret = decl->return_type;
+        if (ret.kind != Type::Kind::DataFrame && ret.kind != Type::Kind::TimeFrame) {
+            continue;
+        }
+        const auto* schema = std::get_if<SchemaType>(&ret.arg);
+        if (schema == nullptr || (schema->fields.empty() && !schema->open)) {
+            continue;  // bare DataFrame carries no schema -> leave Unknown
+        }
+        sources.emplace(name, ir::SchemaInfo::known(to_ir_schema_fields(*schema), schema->open));
+    }
+    return sources;
+}
+
 /// Map a parser scalar type to the IR column-type used by schemas.
 auto to_ir_column_type(ScalarType type) -> ir::ColumnType {
     switch (type) {
@@ -70,6 +93,16 @@ auto to_ir_column_type(ScalarType type) -> ir::ColumnType {
             return ir::ColumnType::Timestamp;
     }
     return ir::ColumnType::Int64;
+}
+
+auto to_ir_schema_fields(const SchemaType& schema) -> std::vector<ir::SchemaField> {
+    std::vector<ir::SchemaField> fields;
+    fields.reserve(schema.fields.size());
+    for (const auto& field : schema.fields) {
+        fields.push_back(
+            ir::SchemaField{.name = field.name, .type = to_ir_column_type(field.type)});
+    }
+    return fields;
 }
 
 auto clone_field(const Field& field) -> Field {
@@ -796,6 +829,11 @@ class Lowerer {
           sink_externs_(std::move(initial_sink_externs)),
           table_extern_decls_(std::move(initial_table_extern_decls)) {}
 
+    [[nodiscard]] auto table_extern_decls() const
+        -> const std::unordered_map<std::string, const ExternDecl*>& {
+        return table_extern_decls_;
+    }
+
     auto lower_program(const Program& program) -> LowerResult {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
@@ -949,19 +987,18 @@ class Lowerer {
         }
         const auto* schema_type = std::get_if<SchemaType>(&ascribe.type.arg);
         std::vector<ir::SchemaField> fields;
+        bool open = false;
         if (schema_type != nullptr) {
-            fields.reserve(schema_type->fields.size());
-            for (const auto& field : schema_type->fields) {
-                fields.push_back(
-                    ir::SchemaField{.name = field.name, .type = to_ir_column_type(field.type)});
-            }
+            fields = to_ir_schema_fields(*schema_type);
+            open = schema_type->open;
         }
-        // When the input schema is statically known, an ascription that the
-        // input provably cannot satisfy is a lower-time error. When the input is
-        // Unknown (e.g. an I/O source), the check is deferred to the runtime
-        // validation in the interpreter.
-        const ir::SchemaInfo input = ir::infer_schema(*base.value());
-        if (input.is_known()) {
+        // When the input schema is statically known and closed, an ascription
+        // the input provably cannot satisfy is a lower-time error. When the
+        // input is Unknown (e.g. an I/O source) or open, the check is deferred to
+        // the runtime validation in the interpreter.
+        const ir::SchemaInfo input =
+            ir::infer_schema(*base.value(), build_source_schemas(table_extern_decls_));
+        if (input.is_known() && !input.is_open()) {
             for (const auto& field : fields) {
                 const auto* have = input.find(field.name);
                 if (have == nullptr) {
@@ -978,8 +1015,22 @@ class Lowerer {
                                               std::string(column_type_name(*field.type))});
                 }
             }
+            // Exact (non-wildcard) ascription forbids columns the input has that
+            // the ascription does not list. Add a `*` wildcard to allow extras.
+            if (!open) {
+                for (const auto& have : input.fields()) {
+                    const bool listed =
+                        std::any_of(fields.begin(), fields.end(),
+                                    [&](const ir::SchemaField& f) { return f.name == have.name; });
+                    if (!listed) {
+                        return std::unexpected(LowerError{
+                            .message = "schema ascription: input has extra column '" + have.name +
+                                       "' not in the ascribed schema (add `*` to allow extras)"});
+                    }
+                }
+            }
         }
-        auto node = builder_.ascribe(std::move(fields));
+        auto node = builder_.ascribe(std::move(fields), open);
         node->add_child(std::move(base.value()));
         return node;
     }
@@ -3449,7 +3500,8 @@ auto lower(const Program& program) -> LowerResult {
     }
     // Validate column references against statically known schemas before the
     // optimizer fuses nodes (the pass understands the un-fused operators).
-    if (auto err = ir::check_column_refs(*lowered.value())) {
+    if (auto err = ir::check_column_refs(*lowered.value(),
+                                         build_source_schemas(lowerer.table_extern_decls()))) {
         return std::unexpected(LowerError{.message = *err});
     }
 
@@ -3467,7 +3519,9 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     if (lowered.has_value()) {
         // The REPL supplies the complete set of in-scope lexical names, so
         // filter/computed-expression references can be checked too.
-        if (auto err = ir::check_column_refs(*lowered.value(), {}, context.lexical_names,
+        if (auto err = ir::check_column_refs(*lowered.value(),
+                                             build_source_schemas(context.table_extern_decls),
+                                             context.lexical_names,
                                              /*check_expressions=*/true)) {
             return std::unexpected(LowerError{.message = *err});
         }

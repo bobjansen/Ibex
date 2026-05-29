@@ -1847,8 +1847,15 @@ class Parser {
             return std::nullopt;
         }
         std::vector<SchemaField> fields;
+        bool open = false;
         if (!check(TokenKind::RBrace)) {
             do {
+                // A `*` entry marks the schema open (extra columns allowed). It
+                // must be the last entry.
+                if (match(TokenKind::Star)) {
+                    open = true;
+                    break;
+                }
                 auto name = consume_column_identifier("expected schema field name");
                 if (!name.has_value()) {
                     return std::nullopt;
@@ -1867,7 +1874,7 @@ class Parser {
         if (!consume(TokenKind::RBrace, "expected '}' after schema type")) {
             return std::nullopt;
         }
-        return SchemaType{.fields = std::move(fields)};
+        return SchemaType{.fields = std::move(fields), .open = open};
     }
 
     auto parse_scalar_type() -> std::optional<ScalarType> {

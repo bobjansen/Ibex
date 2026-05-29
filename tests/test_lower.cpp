@@ -412,11 +412,42 @@ TEST_CASE("Lower rejects an impossible ascription over a known input") {
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().message.find("Float64") != std::string::npos);
     }
-    SECTION("extra columns are allowed") {
+    SECTION("an exact ascription forbids unlisted extra columns") {
         auto program = require_parse("Table { a = [1], b = [2.5] } as DataFrame<{ a: Int64 }>;");
         auto result = parser::lower(program);
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("extra column 'b'") != std::string::npos);
+    }
+    SECTION("a wildcard ascription allows extra columns") {
+        auto program = require_parse("Table { a = [1], b = [2.5] } as DataFrame<{ a: Int64, * }>;");
+        auto result = parser::lower(program);
         REQUIRE(result.has_value());
-        REQUIRE(as_node<ir::AscribeNode>(result->get()) != nullptr);
+        const auto* ascribe = as_node<ir::AscribeNode>(result->get());
+        REQUIRE(ascribe != nullptr);
+        REQUIRE(ascribe->open());
+    }
+}
+
+TEST_CASE("Lower validates references against a declared reader return schema") {
+    SECTION("missing column is rejected at lower time") {
+        auto program = require_parse(
+            "extern fn read_typed(p: String) -> DataFrame<{ a: Int64 }> from \"x.hpp\";\n"
+            "read_typed(\"f\")[select { b }];");
+        auto result = parser::lower(program);
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("b") != std::string::npos);
+    }
+    SECTION("a declared column lowers cleanly") {
+        auto program = require_parse(
+            "extern fn read_typed(p: String) -> DataFrame<{ a: Int64 }> from \"x.hpp\";\n"
+            "read_typed(\"f\")[select { a }];");
+        REQUIRE(parser::lower(program).has_value());
+    }
+    SECTION("a wildcard reader allows unlisted columns") {
+        auto program = require_parse(
+            "extern fn read_open(p: String) -> DataFrame<{ a: Int64, * }> from \"x.hpp\";\n"
+            "read_open(\"f\")[select { b }];");
+        REQUIRE(parser::lower(program).has_value());
     }
 }
 

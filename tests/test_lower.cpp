@@ -428,6 +428,29 @@ TEST_CASE("Lower rejects an impossible ascription over a known input") {
     }
 }
 
+TEST_CASE("Lower `as { ... }` sugar desugars to a DataFrame ascription") {
+    // `df` is an unknown source, so the static forbid-extras check is skipped;
+    // this isolates the sugar's parse/lower behavior.
+    SECTION("bare schema") {
+        auto result = parser::lower(require_parse("df as { a: Int64, b: Float64 };"));
+        REQUIRE(result.has_value());
+        const auto* asc = as_node<ir::AscribeNode>(result->get());
+        REQUIRE(asc != nullptr);
+        REQUIRE(asc->schema().size() == 2);
+        REQUIRE(asc->schema()[0].name == "a");
+        REQUIRE(asc->schema()[0].type == ir::ColumnType::Int64);
+        REQUIRE(asc->schema()[1].name == "b");
+        REQUIRE_FALSE(asc->open());
+    }
+    SECTION("with wildcard") {
+        auto result = parser::lower(require_parse("df as { a: Int64, * };"));
+        REQUIRE(result.has_value());
+        const auto* asc = as_node<ir::AscribeNode>(result->get());
+        REQUIRE(asc != nullptr);
+        REQUIRE(asc->open());
+    }
+}
+
 TEST_CASE("Lower validates references against a declared reader return schema") {
     SECTION("missing column is rejected at lower time") {
         auto program = require_parse(

@@ -268,19 +268,29 @@ equivalents (or run the pass before fusion).
      (common measure type when determinable); closed.
    - `cov` / `corr` → `column: String` + one `Float64` per numeric input column;
      requires a fully-typed closed input (else `Unknown`).
-   - `resample` → group keys + aggregate outputs, marked **open**: the output
-     time-bucket column is named after the input's time index, which is not part
-     of the static schema, so the column set is not fully pinned down.
+   - `resample` → time-bucket column (named after the input's time index) +
+     group keys + aggregate outputs; **closed** when the input's time index is
+     known, otherwise open (see stage 9).
 
    `dcast`/`transpose`/`matmul`/`model` remain `Unknown` (genuinely
    data-dependent — see Non-Goals). Tested in test_ir_schema.
 
+9. **Time index in `SchemaInfo`.** — **DONE.** `SchemaInfo` carries an optional
+   `time_index` (the designated TimeFrame time-column name). `as_timeframe` sets
+   it (and promotes that column to `Timestamp`); passthrough ops preserve it;
+   `update` keeps it; `rename` remaps it; `project` keeps it only if the column
+   is retained; `aggregate`/`join`/`melt`/`cov`/`corr`/`construct` clear it.
+   `resample` reads it to name the output bucket column, so a resample over a
+   time-indexed input is now a **closed** schema (was open). The `TimeFrame`
+   *type kind* is intentionally kept distinct from `DataFrame` (it carries
+   invariants the schema does not). Tested in test_ir_schema.
+
 ## Follow-ups (post-merge candidates)
 
 - **Named schema aliases** (`type X = { ... }`) to avoid repeating column lists.
-- **Time-index in `SchemaInfo`** would let `resample` (and TimeFrame ops
-  generally) report a closed schema with the correctly-named time column,
-  upgrading `resample` from open to closed.
+- **Time index from declared `TimeFrame<S>`** sources/ascriptions: infer the
+  index as the sole `Timestamp` field. (Today only `as_timeframe` sets it; the
+  ascription/reader-declared TimeFrame case leaves it unset.)
 
 Note on the two paths: cross-`let` checking works on **both** execution paths,
 by different mechanisms. The whole-program `lower()` / `ibex_compile` path

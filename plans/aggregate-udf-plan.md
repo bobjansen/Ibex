@@ -122,11 +122,25 @@ vectorising/compiling it is a later optimisation.)
 
 ## Staging
 
-1. **Scalar UDF inlining in clause expressions.** Lower-time body substitution
-   for single-expression scalar `fn`s; arity/type checks; clear error for
-   non-inlinable bodies. (Feature 1 core; also udf-dataframe Phase 5.)
-2. **Feature 1 in aggregate args** end-to-end (`mean(adjust(price))`) + tests +
-   SPEC.
+1. **Scalar UDF inlining in clause expressions.** — **DONE.** A scalar
+   user-function call in a `select`/`update` computed expression is inlined at
+   lowering time (`inline_scalar_udf` in `lower.cpp`): parameters are bound to
+   the lowered argument expressions via an inline-scope stack and the body is
+   lowered with those substitutions; calls nest. Only single-expression,
+   scalar-returning bodies inline; recursion and multi-statement bodies are
+   lower-time errors. `FunctionDecl`s reach the lowerer via
+   `LowerContext::functions` (REPL) / collected in `lower_program` (compile
+   path). Because the existing aggregate lowering already materialises computed
+   args, this gives **feature 1 in aggregate args for free**
+   (`mean(adjust(price))` works — stage 2 below). Tested in test_e2e/test_repl;
+   SPEC §10 updated.
+
+   *Not yet:* `filter` predicates use a separate, restricted `FilterExpr`
+   sublanguage (a `static` lowering path), so scalar UDFs aren't inlined there
+   yet — deferred follow-up.
+2. **Feature 1 in aggregate args** — **DONE** (folded into stage 1 via the
+   existing computed-arg materialisation; `mean(adjust(price)) by sym` verified
+   in test_e2e).
 3. **`agg fn` syntax + declaration** (parser/AST) and the aggregate IR
    representation (`AggUdfSpec` / variant, multi-column args).
 4. **Interpreter per-group evaluation** (bind slices → evaluate body → scalar).

@@ -1777,13 +1777,21 @@ To reference a computed column, use a separate block or `let` binding.
 When the schema of a block's operand is **statically known** (a `Table { ... }`
 literal, an `as`-ascribed expression — Section 3.6 — or a pipeline built on
 one), a reference to a column the operand does not provide is reported as a
-**compile-time (lowering) error** rather than a runtime one. This applies to the
-column-only clause positions: `select`/`order`/`rename` targets, `by` group
-keys, and aggregate source columns. `filter` and computed `select`/`update`
-expressions are not statically rejected this way, because a bare identifier
-there may resolve to a lexical (scalar) binding rather than a column. When the
-operand's schema is not statically known (e.g. an I/O source without an
-ascription), these references are validated at run time as before.
+**compile-time (lowering) error** rather than a runtime one.
+
+The **column-only** positions — `select`/`order`/`rename` targets, `by` group
+keys, and aggregate source columns — are always validated this way: a name there
+can only be a column.
+
+In `filter` predicates and computed `select`/`update` expressions a bare name
+may instead resolve to a lexical binding (per the resolution order above). These
+positions are validated when the complete set of in-scope binding names is
+available (as in the REPL): a reference is rejected only when it is neither a
+column of the operand nor any in-scope binding. A reference that resolves to a
+binding (e.g. `filter price > threshold`) is accepted.
+
+When the operand's schema is not statically known (e.g. an I/O source without an
+ascription), all of these references are validated at run time as before.
 
 ---
 

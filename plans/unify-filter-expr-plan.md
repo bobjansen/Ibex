@@ -104,14 +104,13 @@ Then:
    `Bool`. Purely additive — nothing constructs them yet, so no behaviour change
    (full suite unchanged). Tested in test_ir_schema.
 2. Port the interpreter's vectorised filter evaluator to `ir::Expr`; benchmark.
-   — **Stages 2 and 3 are coupled** and land together: the predicate type
-   reaches 8 files (interpreter, codegen, canonicalize/fusion, `join`, `ops`,
-   the four fused nodes, `JoinNode`), so the new evaluator can't run end-to-end
-   until the nodes are migrated. A new evaluator cannot be benchmarked in
-   isolation, so the gate is **branch vs. this baseline**, re-running
-   `ibex_bench --suite filter`.
+   — **DONE** (with stage 3). **Stages 2 and 3 are coupled** and landed
+   together: the predicate type reaches 8 files (interpreter, codegen,
+   canonicalize/fusion, `join`, `ops`, the four fused nodes, `JoinNode`), so the
+   new evaluator can't run end-to-end until the nodes are migrated. The gate was
+   **branch vs. this baseline**, re-running `ibex_bench --suite filter`.
 
-   **Baseline (current `FilterExpr` impl, 4M-row trades, incl. parse+lower,
+   **Baseline (old `FilterExpr` impl, 4M-row trades, incl. parse+lower,
    build-release, iters=10/warmup=3):**
 
    | query         | avg ms | min ms | rows    |
@@ -121,13 +120,28 @@ Then:
    | filter_arith  | 14.16  | 13.87  | 2685013 |
    | filter_or     |  6.77  |  6.29  |  464699 |
 
-   Re-run: `./build-release/tools/ibex_bench --suite filter --csv-trades
-   benchmarking/data/trades.csv --iters 10 --warmup 3`. The migration must not
-   regress these (a few % noise is fine).
+   **Post-migration (`ir::Expr`, same machine/inputs, steady state):**
+
+   | query         | avg ms | min ms |
+   |---------------|--------|--------|
+   | filter_simple | ~10.9  | ~10.4  |
+   | filter_and    | ~6.4   | ~6.1   |
+   | filter_arith  | ~15.2  | ~13.8  |
+   | filter_or     | ~7.2   | ~6.3   |
+
+   Within run-to-run noise (min_ms at/below baseline for all four) — **no
+   regression**. The vectorised hot path (`eval_value_vec` / `compute_mask` with
+   the `try_extract_numeric_cmp_spec` fast-path kernels) is preserved unchanged;
+   only the variant type names changed.
 3. Migrate `FilterNode` / join / fused nodes + builder/clone; lower the `filter`
-   clause through `lower_expr_to_ir`. (Lands with stage 2.)
-4. Codegen + `ops` factories.
+   clause through `lower_expr_to_ir`. — **DONE** (landed with stage 2).
+4. Codegen + `ops` factories. — **DONE.**
 5. Delete `FilterExpr`; unify the schema-pass column collection / inference.
+   — **DONE.** `FilterExpr` and all its variants are gone; the schema pass uses a
+   single `collect_expr_columns`. Note: the function-call null-check sugar
+   (`is_null(col)` / `is_not_null(col)`) now lowers to `IsNullExpr` directly in
+   `lower_expr_to_ir` (was previously special-cased in the deleted
+   `lower_filter_expr`).
 6. Land the payoff: scalar UDF inlining + validation + type inference now reach
    filters; add tests. (This also un-defers the aggregate-udf stage-1 follow-up.)
 

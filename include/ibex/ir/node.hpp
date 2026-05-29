@@ -185,60 +185,6 @@ enum class JoinKind : std::uint8_t {
     Asof,
 };
 
-/// Filter expression tree — unified value and boolean nodes.
-/// See SPEC.md Section 5.3 (filter clause semantics).
-struct FilterExpr;
-using FilterExprPtr = std::unique_ptr<FilterExpr>;
-
-/// Column reference in a filter expression (resolved at runtime as column or bound scalar).
-struct FilterColumn {
-    std::string name;
-};
-/// Literal value in a filter expression.
-struct FilterLiteral {
-    std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> value;
-};
-/// Arithmetic on two value expressions.
-struct FilterArith {
-    ArithmeticOp op;
-    FilterExprPtr left, right;
-};
-/// Pure table-aware/value call in a filter expression, e.g. lag(col, 1).
-struct FilterCall {
-    std::string callee;
-    std::vector<FilterExprPtr> args;
-};
-/// Comparison between two value expressions — produces a bool.
-struct FilterCmp {
-    CompareOp op;
-    FilterExprPtr left, right;
-};
-/// Logical AND of two boolean expressions.
-struct FilterAnd {
-    FilterExprPtr left, right;
-};
-/// Logical OR of two boolean expressions.
-struct FilterOr {
-    FilterExprPtr left, right;
-};
-/// Logical NOT of a boolean expression.
-struct FilterNot {
-    FilterExprPtr operand;
-};
-/// Null check — always produces a valid boolean (never null itself).
-struct FilterIsNull {
-    FilterExprPtr operand;
-};
-struct FilterIsNotNull {
-    FilterExprPtr operand;
-};
-
-struct FilterExpr {
-    std::variant<FilterColumn, FilterLiteral, FilterArith, FilterCall, FilterCmp, FilterAnd,
-                 FilterOr, FilterNot, FilterIsNull, FilterIsNotNull>
-        node;
-};
-
 /// Aggregation specification: apply function to column, store as alias.
 struct AggSpec {
     AggFunc func = AggFunc::Sum;
@@ -364,17 +310,16 @@ class ScanNode final : public Node {
 /// See SPEC.md Section 5.3 (filter clause).
 class FilterNode final : public Node {
    public:
-    FilterNode(NodeId id, FilterExprPtr predicate)
+    FilterNode(NodeId id, Expr predicate)
         : Node(NodeKind::Filter, id), predicate_(std::move(predicate)) {}
 
-    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
-    /// Move the predicate out of this node. Leaves the node without a predicate;
-    /// only call when you are about to discard the FilterNode (e.g. during an IR
-    /// rewrite that replaces it with a fused node).
-    [[nodiscard]] auto take_predicate() noexcept -> FilterExprPtr { return std::move(predicate_); }
+    [[nodiscard]] auto predicate() const noexcept -> const Expr& { return predicate_; }
+    /// Move the predicate out of this node. Only call when you are about to
+    /// discard the FilterNode (e.g. during an IR rewrite into a fused node).
+    [[nodiscard]] auto take_predicate() noexcept -> Expr { return std::move(predicate_); }
 
    private:
-    FilterExprPtr predicate_;
+    Expr predicate_;
 };
 
 /// Project node: selects and computes a subset of columns.
@@ -597,7 +542,7 @@ class ExternCallNode final : public Node {
 class JoinNode final : public Node {
    public:
     JoinNode(NodeId id, JoinKind kind, std::vector<std::string> keys,
-             std::optional<FilterExprPtr> predicate = std::nullopt)
+             std::optional<Expr> predicate = std::nullopt)
         : Node(NodeKind::Join, id),
           kind_(kind),
           keys_(std::move(keys)),
@@ -605,14 +550,14 @@ class JoinNode final : public Node {
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
     [[nodiscard]] auto keys() const noexcept -> const std::vector<std::string>& { return keys_; }
-    [[nodiscard]] auto predicate() const noexcept -> const std::optional<FilterExprPtr>& {
+    [[nodiscard]] auto predicate() const noexcept -> const std::optional<Expr>& {
         return predicate_;
     }
 
    private:
     JoinKind kind_;
     std::vector<std::string> keys_;
-    std::optional<FilterExprPtr> predicate_;
+    std::optional<Expr> predicate_;
 };
 
 /// ResampleNode: time-bucket aggregation on a TimeFrame.
@@ -892,18 +837,18 @@ class ModelNode final : public Node {
 /// the final projection list are carried by this node.
 class FilterProjectNode final : public Node {
    public:
-    FilterProjectNode(NodeId id, FilterExprPtr predicate, std::vector<ColumnRef> columns)
+    FilterProjectNode(NodeId id, Expr predicate, std::vector<ColumnRef> columns)
         : Node(NodeKind::FilterProject, id),
           predicate_(std::move(predicate)),
           columns_(std::move(columns)) {}
 
-    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto predicate() const noexcept -> const Expr& { return predicate_; }
     [[nodiscard]] auto columns() const noexcept -> const std::vector<ColumnRef>& {
         return columns_;
     }
 
    private:
-    FilterExprPtr predicate_;
+    Expr predicate_;
     std::vector<ColumnRef> columns_;
 };
 
@@ -914,21 +859,21 @@ class FilterProjectNode final : public Node {
 /// group_by and no cross-row callees in any field expression).
 class FilterUpdateProjectNode final : public Node {
    public:
-    FilterUpdateProjectNode(NodeId id, FilterExprPtr predicate, std::vector<FieldSpec> fields,
+    FilterUpdateProjectNode(NodeId id, Expr predicate, std::vector<FieldSpec> fields,
                             std::vector<ColumnRef> project_columns)
         : Node(NodeKind::FilterUpdateProject, id),
           predicate_(std::move(predicate)),
           fields_(std::move(fields)),
           project_columns_(std::move(project_columns)) {}
 
-    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto predicate() const noexcept -> const Expr& { return predicate_; }
     [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& { return fields_; }
     [[nodiscard]] auto project_columns() const noexcept -> const std::vector<ColumnRef>& {
         return project_columns_;
     }
 
    private:
-    FilterExprPtr predicate_;
+    Expr predicate_;
     std::vector<FieldSpec> fields_;
     std::vector<ColumnRef> project_columns_;
 };
@@ -937,14 +882,14 @@ class FilterUpdateProjectNode final : public Node {
 /// no group_by. The single child is the pre-filter input `x`.
 class FilterHeadNode final : public Node {
    public:
-    FilterHeadNode(NodeId id, FilterExprPtr predicate, std::size_t count)
+    FilterHeadNode(NodeId id, Expr predicate, std::size_t count)
         : Node(NodeKind::FilterHead, id), predicate_(std::move(predicate)), count_(count) {}
 
-    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto predicate() const noexcept -> const Expr& { return predicate_; }
     [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
 
    private:
-    FilterExprPtr predicate_;
+    Expr predicate_;
     std::size_t count_;
 };
 
@@ -952,14 +897,14 @@ class FilterHeadNode final : public Node {
 /// no group_by. The single child is the pre-filter input `x`.
 class FilterTailNode final : public Node {
    public:
-    FilterTailNode(NodeId id, FilterExprPtr predicate, std::size_t count)
+    FilterTailNode(NodeId id, Expr predicate, std::size_t count)
         : Node(NodeKind::FilterTail, id), predicate_(std::move(predicate)), count_(count) {}
 
-    [[nodiscard]] auto predicate() const noexcept -> const FilterExpr& { return *predicate_; }
+    [[nodiscard]] auto predicate() const noexcept -> const Expr& { return predicate_; }
     [[nodiscard]] auto count() const noexcept -> std::size_t { return count_; }
 
    private:
-    FilterExprPtr predicate_;
+    Expr predicate_;
     std::size_t count_;
 };
 

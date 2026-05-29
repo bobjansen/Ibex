@@ -98,7 +98,7 @@ auto format_tables(const TableRegistry& registry) -> std::string {
 
 // ─── Vectorized filter ────────────────────────────────────────────────────────
 //
-// Instead of evaluating the FilterExpr tree once per row (N × tree-depth
+// Instead of evaluating the predicate tree once per row (N × tree-depth
 // variant dispatches), we:
 //   1. compute_mask()  — walk the tree once, producing a uint8_t[N] mask via
 //                        tight typed loops the compiler can auto-vectorize.
@@ -982,25 +982,25 @@ struct NumericCmpSpec {
     double lit_dbl = 0.0;
 };
 
-auto try_extract_numeric_cmp_spec(const ir::FilterExpr& expr, const Table& table)
+auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table)
     -> std::optional<NumericCmpSpec> {
-    const auto* cmp = std::get_if<ir::FilterCmp>(&expr.node);
+    const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
     if (cmp == nullptr) {
         return std::nullopt;
     }
 
-    const ir::FilterColumn* col_node = nullptr;
-    const ir::FilterLiteral* lit_node = nullptr;
+    const ir::ColumnRef* col_node = nullptr;
+    const ir::Literal* lit_node = nullptr;
     ir::CompareOp op = cmp->op;
-    if (const auto* lcol = std::get_if<ir::FilterColumn>(&cmp->left->node)) {
-        if (const auto* rlit = std::get_if<ir::FilterLiteral>(&cmp->right->node)) {
+    if (const auto* lcol = std::get_if<ir::ColumnRef>(&cmp->left->node)) {
+        if (const auto* rlit = std::get_if<ir::Literal>(&cmp->right->node)) {
             col_node = lcol;
             lit_node = rlit;
         }
     }
     if (col_node == nullptr) {
-        if (const auto* llit = std::get_if<ir::FilterLiteral>(&cmp->left->node)) {
-            if (const auto* rcol = std::get_if<ir::FilterColumn>(&cmp->right->node)) {
+        if (const auto* llit = std::get_if<ir::Literal>(&cmp->left->node)) {
+            if (const auto* rcol = std::get_if<ir::ColumnRef>(&cmp->right->node)) {
                 col_node = rcol;
                 lit_node = llit;
                 op = flip_cmp(op);
@@ -1159,18 +1159,18 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
     }
 }
 
-auto eval_filter_int_scalar_arg(const ir::FilterExpr& expr, const Table& table,
+auto eval_filter_int_scalar_arg(const ir::Expr& expr, const Table& table,
                                 const ScalarRegistry* scalars)
     -> std::expected<std::int64_t, std::string> {
     return std::visit(
         [&](const auto& node) -> std::expected<std::int64_t, std::string> {
             using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+            if constexpr (std::is_same_v<T, ir::Literal>) {
                 if (const auto* value = std::get_if<std::int64_t>(&node.value)) {
                     return *value;
                 }
                 return std::unexpected("expected Int64 scalar argument");
-            } else if constexpr (std::is_same_v<T, ir::FilterColumn>) {
+            } else if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 if (table.find(node.name) != nullptr) {
                     return std::unexpected("expected scalar argument, got column '" + node.name +
                                            "'");
@@ -1185,7 +1185,7 @@ auto eval_filter_int_scalar_arg(const ir::FilterExpr& expr, const Table& table,
                     }
                 }
                 return std::unexpected("unknown scalar argument: " + node.name);
-            } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
                 auto lhs = eval_filter_int_scalar_arg(*node.left, table, scalars);
                 if (!lhs) {
                     return std::unexpected(lhs.error());
@@ -1225,12 +1225,12 @@ auto eval_filter_int_scalar_arg(const ir::FilterExpr& expr, const Table& table,
 // Evaluate a value sub-expression over all n rows, returning a column.
 // Returns a pointer into the table for simple column references (zero-copy),
 // or an owned ColumnValue for computed intermediates.
-auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const ScalarRegistry* scalars,
+auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
                     std::size_t n) -> std::expected<ColResult, std::string> {
     return std::visit(
         [&](const auto& node) -> std::expected<ColResult, std::string> {
             using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::FilterColumn>) {
+            if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 if (const auto* col = table.find(node.name)) {
                     ColResult r{col};
                     auto idx_it = table.index.find(node.name);
@@ -1257,7 +1257,7 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
                     }
                 }
                 return std::unexpected("filter: unknown column '" + node.name + "'");
-            } else if constexpr (std::is_same_v<T, ir::FilterLiteral>) {
+            } else if constexpr (std::is_same_v<T, ir::Literal>) {
                 // Broadcast literal into a full column (fallback; common path avoids this).
                 ColumnValue cv = std::visit(
                     [n](const auto& v) -> ColumnValue {
@@ -1268,7 +1268,7 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
                     },
                     node.value);
                 return ColResult{std::move(cv)};
-            } else if constexpr (std::is_same_v<T, ir::FilterArith>) {
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
                 auto lhs = eval_value_vec(*node.left, table, scalars, n);
                 if (!lhs)
                     return std::unexpected(lhs.error());
@@ -1281,14 +1281,14 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
                 ColResult res{std::move(*result)};
                 res.owned_validity = merge_validity(lhs->get_validity(), rhs->get_validity(), n);
                 return res;
-            } else if constexpr (std::is_same_v<T, ir::FilterCall>) {
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 if (node.callee != "lag" && node.callee != "lead") {
                     return std::unexpected("filter: unsupported function '" + node.callee + "'");
                 }
                 if (node.args.size() != 2) {
                     return std::unexpected(node.callee + ": expected 2 arguments");
                 }
-                const auto* col_ref = std::get_if<ir::FilterColumn>(&node.args[0]->node);
+                const auto* col_ref = std::get_if<ir::ColumnRef>(&node.args[0]->node);
                 if (col_ref == nullptr) {
                     return std::unexpected(node.callee + ": first argument must be a column name");
                 }
@@ -1386,14 +1386,14 @@ auto eval_value_vec(const ir::FilterExpr& expr, const Table& table, const Scalar
 
 // Compute a boolean Mask for all n rows, with 3-valued logic (3VL) for nulls.
 // valid==nullopt means all rows are valid (common non-null path, zero overhead).
-auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRegistry* scalars,
+auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
                   std::size_t n) -> std::expected<Mask, std::string> {
     return std::visit(
         [&](const auto& node) -> std::expected<Mask, std::string> {
             using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::FilterCmp>) {
+            if constexpr (std::is_same_v<T, ir::CompareExpr>) {
                 // Fast path: column/expr op literal (no broadcast needed).
-                if (const auto* lit = std::get_if<ir::FilterLiteral>(&node.right->node)) {
+                if (const auto* lit = std::get_if<ir::Literal>(&node.right->node)) {
                     auto lhs = eval_value_vec(*node.left, table, scalars, n);
                     if (!lhs)
                         return std::unexpected(lhs.error());
@@ -1401,7 +1401,7 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                                               lhs->get_validity());
                 }
                 // Fast path: literal op column/expr (flip the operator).
-                if (const auto* lit = std::get_if<ir::FilterLiteral>(&node.left->node)) {
+                if (const auto* lit = std::get_if<ir::Literal>(&node.left->node)) {
                     auto rhs = eval_value_vec(*node.right, table, scalars, n);
                     if (!rhs)
                         return std::unexpected(rhs.error());
@@ -1418,9 +1418,20 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                 auto res = compare_vec(node.op, deref_col(*lhs), deref_col(*rhs), n,
                                        lhs->get_validity(), rhs->get_validity());
                 return res;
-            } else if constexpr (std::is_same_v<T, ir::FilterAnd>) {
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                if (node.op == ir::LogicalOp::Not) {
+                    // NOT null = null; NOT true = false; NOT false = true
+                    auto mask = compute_mask(*node.left, table, scalars, n);
+                    if (!mask)
+                        return std::unexpected(mask.error());
+                    for (auto& v : mask->value)
+                        v ^= 1U;
+                    // valid stays as-is (null propagates)
+                    return std::move(*mask);
+                }
+                const bool is_and = node.op == ir::LogicalOp::And;
                 // Fast path: two numeric (column cmp literal) terms without nulls.
-                // Evaluate both comparisons and combine (AND) in a single pass.
+                // Evaluate both comparisons and combine in a single pass.
                 if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table);
                     lspec.has_value()) {
                     if (auto rspec = try_extract_numeric_cmp_spec(*node.right, table);
@@ -1428,15 +1439,18 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                         Mask fused;
                         fused.value.resize(n);
                         uint8_t* out = fused.value.data();
-                        dispatch_numeric_cmp_pair_kernel<true>(*lspec, *rspec, out, n);
+                        if (is_and) {
+                            dispatch_numeric_cmp_pair_kernel<true>(*lspec, *rspec, out, n);
+                        } else {
+                            dispatch_numeric_cmp_pair_kernel<false>(*lspec, *rspec, out, n);
+                        }
                         return fused;
                     }
                 }
 
-                // 3VL AND truth table:
-                //   T & T = T (valid), T & F = F (valid), T & null = null
-                //   F & T = F (valid), F & F = F (valid), F & null = F (valid!)
-                //   null & T = null,   null & F = F (valid!), null & null = null
+                // 3VL AND/OR (see truth tables): combine values, then recompute
+                // validity so a known-false (AND) / known-true (OR) on either
+                // side makes the row definitively valid.
                 auto left = compute_mask(*node.left, table, scalars, n);
                 if (!left)
                     return std::unexpected(left.error());
@@ -1446,7 +1460,7 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                 const uint8_t* lp = left->value.data();
                 const uint8_t* rp = right->value.data();
                 for (std::size_t i = 0; i < n; ++i)
-                    left->value[i] = lp[i] & rp[i];
+                    left->value[i] = is_and ? (lp[i] & rp[i]) : (lp[i] | rp[i]);
                 if (left->valid || right->valid) {
                     if (!left->valid)
                         left->valid.emplace(n, uint8_t{1});
@@ -1455,104 +1469,42 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
                     const uint8_t* lval = left->valid->data();
                     const uint8_t* rval = right->valid->data();
                     for (std::size_t i = 0; i < n; ++i) {
-                        // Row is definitively false if either side is a known false
-                        uint8_t a_false = lval[i] & (1U - lp[i]);
-                        uint8_t b_false = rval[i] & (1U - rp[i]);
-                        (*left->valid)[i] = (lval[i] & rval[i]) | a_false | b_false;
+                        if (is_and) {
+                            // definitively false if either side is a known false
+                            uint8_t a_false = lval[i] & (1U - lp[i]);
+                            uint8_t b_false = rval[i] & (1U - rp[i]);
+                            (*left->valid)[i] = (lval[i] & rval[i]) | a_false | b_false;
+                        } else {
+                            // definitively true if either side is a known true
+                            uint8_t a_true = lval[i] & lp[i];
+                            uint8_t b_true = rval[i] & rp[i];
+                            (*left->valid)[i] = (lval[i] & rval[i]) | a_true | b_true;
+                        }
                     }
                 }
                 return std::move(*left);
-            } else if constexpr (std::is_same_v<T, ir::FilterOr>) {
-                // Fast path: two numeric (column cmp literal) terms without nulls.
-                // Evaluate both comparisons and combine (OR) in a single pass.
-                if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table);
-                    lspec.has_value()) {
-                    if (auto rspec = try_extract_numeric_cmp_spec(*node.right, table);
-                        rspec.has_value()) {
-                        Mask fused;
-                        fused.value.resize(n);
-                        uint8_t* out = fused.value.data();
-                        dispatch_numeric_cmp_pair_kernel<false>(*lspec, *rspec, out, n);
-                        return fused;
-                    }
-                }
-
-                // 3VL OR truth table:
-                //   T | T = T (valid), T | F = T (valid), T | null = T (valid!)
-                //   F | T = T (valid), F | F = F (valid), F | null = null
-                //   null | T = T (valid!), null | F = null, null | null = null
-                auto left = compute_mask(*node.left, table, scalars, n);
-                if (!left)
-                    return std::unexpected(left.error());
-                auto right = compute_mask(*node.right, table, scalars, n);
-                if (!right)
-                    return std::unexpected(right.error());
-                const uint8_t* lp = left->value.data();
-                const uint8_t* rp = right->value.data();
-                for (std::size_t i = 0; i < n; ++i)
-                    left->value[i] = lp[i] | rp[i];
-                if (left->valid || right->valid) {
-                    if (!left->valid)
-                        left->valid.emplace(n, uint8_t{1});
-                    if (!right->valid)
-                        right->valid.emplace(n, uint8_t{1});
-                    const uint8_t* lval = left->valid->data();
-                    const uint8_t* rval = right->valid->data();
-                    for (std::size_t i = 0; i < n; ++i) {
-                        // Row is definitively true if either side is a known true
-                        uint8_t a_true = lval[i] & lp[i];
-                        uint8_t b_true = rval[i] & rp[i];
-                        (*left->valid)[i] = (lval[i] & rval[i]) | a_true | b_true;
-                    }
-                }
-                return std::move(*left);
-            } else if constexpr (std::is_same_v<T, ir::FilterNot>) {
-                // NOT null = null; NOT true = false; NOT false = true
-                auto mask = compute_mask(*node.operand, table, scalars, n);
-                if (!mask)
-                    return std::unexpected(mask.error());
-                for (auto& v : mask->value)
-                    v ^= 1U;
-                // valid stays as-is (null propagates)
-                return std::move(*mask);
-            } else if constexpr (std::is_same_v<T, ir::FilterIsNull>) {
-                // IS NULL: true where the column has no valid value
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                // IS NULL / IS NOT NULL: test the operand column's validity.
+                // Always produces a valid Bool (never null itself).
+                const bool want_null = !node.negated;
                 Mask m;
-                m.value.resize(n, uint8_t{0});
-                if (const auto* col_node = std::get_if<ir::FilterColumn>(&node.operand->node)) {
+                m.value.resize(n, want_null ? uint8_t{0} : uint8_t{1});
+                if (const auto* col_node = std::get_if<ir::ColumnRef>(&node.operand->node)) {
                     auto it = table.index.find(col_node->name);
                     if (it != table.index.end()) {
                         const auto& entry = table.columns[it->second];
                         if (entry.validity.has_value()) {
                             const auto& bm = *entry.validity;
                             for (std::size_t i = 0; i < n; ++i)
-                                m.value[i] = static_cast<uint8_t>(!bm[i]);
+                                m.value[i] = static_cast<uint8_t>(want_null ? !bm[i] : bm[i]);
                         }
-                        // no validity bitmap → all rows valid → none are null → stays 0
+                        // no validity bitmap → all rows valid → fill stays correct
                     }
                     return m;
                 }
                 return std::unexpected("filter: 'is null' operand must be a column reference");
-            } else if constexpr (std::is_same_v<T, ir::FilterIsNotNull>) {
-                // IS NOT NULL: true where the column has a valid value
-                Mask m;
-                m.value.resize(n, uint8_t{1});
-                if (const auto* col_node = std::get_if<ir::FilterColumn>(&node.operand->node)) {
-                    auto it = table.index.find(col_node->name);
-                    if (it != table.index.end()) {
-                        const auto& entry = table.columns[it->second];
-                        if (entry.validity.has_value()) {
-                            const auto& bm = *entry.validity;
-                            for (std::size_t i = 0; i < n; ++i)
-                                m.value[i] = static_cast<uint8_t>(bm[i]);
-                        }
-                        // no validity bitmap → all rows valid → all are not null → stays 1
-                    }
-                    return m;
-                }
-                return std::unexpected("filter: 'is not null' operand must be a column reference");
             } else {
-                // FilterColumn, FilterLiteral, FilterArith — not boolean expressions
+                // ColumnRef, Literal, BinaryExpr, CallExpr, RankExpr — not boolean
                 return std::unexpected("filter: not a boolean expression");
             }
         },
@@ -1560,7 +1512,7 @@ auto compute_mask(const ir::FilterExpr& expr, const Table& table, const ScalarRe
 }
 
 namespace {
-auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
+auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                        const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
                        const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     const std::size_t n = input.rows();
@@ -1742,18 +1694,18 @@ auto filter_table_impl(const Table& input, const ir::FilterExpr& predicate,
 
 }  // namespace
 
-auto filter_table(const Table& input, const ir::FilterExpr& predicate,
-                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+auto filter_table(const Table& input, const ir::Expr& predicate, const ScalarRegistry* scalars)
+    -> std::expected<Table, std::string> {
     return filter_table_impl(input, predicate, nullptr, 0, scalars);
 }
 
-auto filter_project_table(const Table& input, const ir::FilterExpr& predicate,
+auto filter_project_table(const Table& input, const ir::Expr& predicate,
                           const std::vector<ir::ColumnRef>& columns, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
     return filter_table_impl(input, predicate, &columns, 0, scalars);
 }
 
-auto filter_table_limit(const Table& input, const ir::FilterExpr& predicate, std::size_t row_limit,
+auto filter_table_limit(const Table& input, const ir::Expr& predicate, std::size_t row_limit,
                         const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     return filter_table_impl(input, predicate, nullptr, row_limit, scalars);
 }
@@ -7709,8 +7661,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!right) {
                 return std::unexpected(right.error());
             }
-            const ir::FilterExpr* pred =
-                join.predicate().has_value() ? join.predicate()->get() : nullptr;
+            const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
             return join_table_impl(left.value(), right.value(), join.kind(), join.keys(), pred,
                                    scalars, compute_mask);
         }
@@ -8297,7 +8248,7 @@ auto table_to_chunk(Table table) -> Chunk {
 /// the child stream ends.
 class ChunkedFilterOperator final : public Operator {
    public:
-    ChunkedFilterOperator(OperatorPtr child, const ir::FilterExpr* predicate,
+    ChunkedFilterOperator(OperatorPtr child, const ir::Expr* predicate,
                           const ScalarRegistry* scalars)
         : child_(std::move(child)), predicate_(predicate), scalars_(scalars) {}
 
@@ -8324,7 +8275,7 @@ class ChunkedFilterOperator final : public Operator {
 
    private:
     OperatorPtr child_;
-    const ir::FilterExpr* predicate_;
+    const ir::Expr* predicate_;
     const ScalarRegistry* scalars_;
 };
 
@@ -8363,7 +8314,7 @@ class ChunkedProjectOperator final : public Operator {
 /// `Project` as independent chunked operators.
 class ChunkedFilterProjectOperator final : public Operator {
    public:
-    ChunkedFilterProjectOperator(OperatorPtr child, const ir::FilterExpr* predicate,
+    ChunkedFilterProjectOperator(OperatorPtr child, const ir::Expr* predicate,
                                  const std::vector<ir::ColumnRef>* columns,
                                  const ScalarRegistry* scalars)
         : child_(std::move(child)), predicate_(predicate), columns_(columns), scalars_(scalars) {}
@@ -8391,7 +8342,7 @@ class ChunkedFilterProjectOperator final : public Operator {
 
    private:
     OperatorPtr child_;
-    const ir::FilterExpr* predicate_;
+    const ir::Expr* predicate_;
     const std::vector<ir::ColumnRef>* columns_;
     const ScalarRegistry* scalars_;
 };
@@ -8402,7 +8353,7 @@ class ChunkedFilterProjectOperator final : public Operator {
 /// `head` (no group_by); grouped head still uses ChunkedHeadOperator.
 class ChunkedFilterHeadOperator final : public Operator {
    public:
-    ChunkedFilterHeadOperator(OperatorPtr child, const ir::FilterExpr* predicate, std::size_t count,
+    ChunkedFilterHeadOperator(OperatorPtr child, const ir::Expr* predicate, std::size_t count,
                               const ScalarRegistry* scalars)
         : child_(std::move(child)),
           predicate_(predicate),
@@ -8447,7 +8398,7 @@ class ChunkedFilterHeadOperator final : public Operator {
 
    private:
     OperatorPtr child_;
-    const ir::FilterExpr* predicate_;
+    const ir::Expr* predicate_;
     std::size_t count_;
     std::size_t remaining_;
     const ScalarRegistry* scalars_;
@@ -8463,7 +8414,7 @@ class ChunkedFilterHeadOperator final : public Operator {
 /// tail still goes through the materializing path.
 class ChunkedFilterTailOperator final : public Operator {
    public:
-    ChunkedFilterTailOperator(OperatorPtr child, const ir::FilterExpr* predicate, std::size_t count,
+    ChunkedFilterTailOperator(OperatorPtr child, const ir::Expr* predicate, std::size_t count,
                               const ScalarRegistry* scalars)
         : child_(std::move(child)), predicate_(predicate), count_(count), scalars_(scalars) {}
 
@@ -8572,7 +8523,7 @@ class ChunkedFilterTailOperator final : public Operator {
     }
 
     OperatorPtr child_;
-    const ir::FilterExpr* predicate_;
+    const ir::Expr* predicate_;
     std::size_t count_;
     const ScalarRegistry* scalars_;
     std::deque<Table> buffered_;
@@ -8588,7 +8539,7 @@ class ChunkedFilterTailOperator final : public Operator {
 /// allowing computed fields in the select.
 class ChunkedFilterUpdateProjectOperator final : public Operator {
    public:
-    ChunkedFilterUpdateProjectOperator(OperatorPtr child, const ir::FilterExpr* predicate,
+    ChunkedFilterUpdateProjectOperator(OperatorPtr child, const ir::Expr* predicate,
                                        const std::vector<ir::FieldSpec>* fields,
                                        const std::vector<ir::ColumnRef>* project_columns,
                                        std::vector<ir::ColumnRef> gather_columns,
@@ -8632,7 +8583,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
 
    private:
     OperatorPtr child_;
-    const ir::FilterExpr* predicate_;
+    const ir::Expr* predicate_;
     const std::vector<ir::FieldSpec>* fields_;
     const std::vector<ir::ColumnRef>* project_columns_;
     std::vector<ir::ColumnRef> gather_columns_;
@@ -12776,8 +12727,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::make_unique<ChunkedInnerJoinOperator>(
                 std::move(left_op.value()), std::move(right.value()), &join.keys());
         }
-        const ir::FilterExpr* pred =
-            join.predicate().has_value() ? join.predicate()->get() : nullptr;
+        const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(
             *join.children()[0], *join.children()[1], registry, scalars, externs, model_out,
             [&](Table left, Table right) {
@@ -13025,7 +12975,7 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
 }
 
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
-                 const std::vector<std::string>& keys, const ir::FilterExpr* predicate,
+                 const std::vector<std::string>& keys, const ir::Expr* predicate,
                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     return join_table_impl(left, right, kind, keys, predicate, scalars, compute_mask);
 }

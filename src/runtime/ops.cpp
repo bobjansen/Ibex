@@ -63,7 +63,7 @@ auto eval_row_count(const ir::Expr& expr) -> std::size_t {
     return *count;
 }
 
-auto filter(const runtime::Table& t, ir::FilterExprPtr pred) -> runtime::Table {
+auto filter(const runtime::Table& t, ir::Expr pred) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);
     auto filter_node = b.filter(std::move(pred));
@@ -373,9 +373,9 @@ auto asof_join(const runtime::Table& left, const runtime::Table& right,
 }
 
 auto join_with_predicate(const runtime::Table& left, const runtime::Table& right, ir::JoinKind kind,
-                         const std::vector<std::string>& keys, ir::FilterExprPtr predicate)
+                         const std::vector<std::string>& keys, ir::Expr predicate)
     -> runtime::Table {
-    auto result = runtime::join_tables(left, right, kind, keys, predicate.get(), g_scalars);
+    auto result = runtime::join_tables(left, right, kind, keys, &predicate, g_scalars);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -449,79 +449,87 @@ auto rank_expr(std::vector<ir::OrderKey> order_keys, ir::RankMethod method,
     return ir::Expr{std::move(rank)};
 }
 
-// ─── FilterExpr builders ──────────────────────────────────────────────────────
+// ─── Predicate builders ───────────────────────────────────────────────────────
 
-auto filter_col(std::string name) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterColumn{std::move(name)}});
+namespace {
+auto mk_expr(ir::Expr e) -> ir::ExprPtr {
+    return std::make_shared<ir::Expr>(std::move(e));
+}
+auto lit_expr(std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> v)
+    -> ir::Expr {
+    return ir::Expr{.node = ir::Literal{.value = std::move(v)}};
+}
+}  // namespace
+
+auto filter_col(std::string name) -> ir::Expr {
+    return ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}};
 }
 
-auto filter_int(std::int64_t v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
-        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
+auto filter_int(std::int64_t v) -> ir::Expr {
+    return lit_expr(v);
+}
+auto filter_dbl(double v) -> ir::Expr {
+    return lit_expr(v);
+}
+auto filter_bool(bool v) -> ir::Expr {
+    return lit_expr(v);
+}
+auto filter_str(std::string v) -> ir::Expr {
+    return lit_expr(std::move(v));
+}
+auto filter_date(Date v) -> ir::Expr {
+    return lit_expr(v);
+}
+auto filter_timestamp(Timestamp v) -> ir::Expr {
+    return lit_expr(v);
 }
 
-auto filter_dbl(double v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
-        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
+auto filter_arith(ir::ArithmeticOp op, ir::Expr l, ir::Expr r) -> ir::Expr {
+    return ir::Expr{.node = ir::BinaryExpr{
+                        .op = op, .left = mk_expr(std::move(l)), .right = mk_expr(std::move(r))}};
 }
 
-auto filter_bool(bool v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
-        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
+auto filter_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr {
+    ir::CallExpr call;
+    call.callee = std::move(callee);
+    call.args.reserve(args.size());
+    for (auto& arg : args) {
+        call.args.push_back(mk_expr(std::move(arg)));
+    }
+    return ir::Expr{.node = std::move(call)};
 }
 
-auto filter_str(std::string v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
-        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{std::move(v)}}});
+auto filter_cmp(ir::CompareOp op, ir::Expr l, ir::Expr r) -> ir::Expr {
+    return ir::Expr{.node = ir::CompareExpr{
+                        .op = op, .left = mk_expr(std::move(l)), .right = mk_expr(std::move(r))}};
 }
 
-auto filter_date(Date v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
-        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
+auto filter_and(ir::Expr l, ir::Expr r) -> ir::Expr {
+    return ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::And,
+                                            .left = mk_expr(std::move(l)),
+                                            .right = mk_expr(std::move(r))}};
 }
 
-auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterLiteral{
-        std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>{v}}});
+auto filter_or(ir::Expr l, ir::Expr r) -> ir::Expr {
+    return ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::Or,
+                                            .left = mk_expr(std::move(l)),
+                                            .right = mk_expr(std::move(r))}};
 }
 
-auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
-    -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterArith{.op = op, .left = std::move(l), .right = std::move(r)}});
+auto filter_not(ir::Expr operand) -> ir::Expr {
+    return ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::Not,
+                                            .left = mk_expr(std::move(operand)),
+                                            .right = nullptr}};
 }
 
-auto filter_call(std::string callee, std::vector<ir::FilterExprPtr> args) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterCall{.callee = std::move(callee), .args = std::move(args)}});
+auto filter_is_null(ir::Expr operand) -> ir::Expr {
+    return ir::Expr{.node =
+                        ir::IsNullExpr{.operand = mk_expr(std::move(operand)), .negated = false}};
 }
 
-auto filter_cmp(ir::CompareOp op, ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterCmp{.op = op, .left = std::move(l), .right = std::move(r)}});
-}
-
-auto filter_and(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterAnd{.left = std::move(l), .right = std::move(r)}});
-}
-
-auto filter_or(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterOr{.left = std::move(l), .right = std::move(r)}});
-}
-
-auto filter_not(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterNot{std::move(operand)}});
-}
-
-auto filter_is_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(ir::FilterExpr{ir::FilterIsNull{std::move(operand)}});
-}
-
-auto filter_is_not_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{ir::FilterIsNotNull{std::move(operand)}});
+auto filter_is_not_null(ir::Expr operand) -> ir::Expr {
+    return ir::Expr{.node =
+                        ir::IsNullExpr{.operand = mk_expr(std::move(operand)), .negated = true}};
 }
 
 // ─── Compound builders ────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@ class Builder {
         return std::make_unique<ScanNode>(next_id(), std::move(source_name));
     }
 
-    [[nodiscard]] auto filter(FilterExprPtr predicate) -> NodePtr {
+    [[nodiscard]] auto filter(Expr predicate) -> NodePtr {
         return std::make_unique<FilterNode>(next_id(), std::move(predicate));
     }
 
@@ -52,23 +52,22 @@ class Builder {
                                           keep_mode);
     }
 
-    [[nodiscard]] auto filter_project(FilterExprPtr predicate, std::vector<ColumnRef> columns)
-        -> NodePtr {
+    [[nodiscard]] auto filter_project(Expr predicate, std::vector<ColumnRef> columns) -> NodePtr {
         return std::make_unique<FilterProjectNode>(next_id(), std::move(predicate),
                                                    std::move(columns));
     }
 
-    [[nodiscard]] auto filter_update_project(FilterExprPtr predicate, std::vector<FieldSpec> fields,
+    [[nodiscard]] auto filter_update_project(Expr predicate, std::vector<FieldSpec> fields,
                                              std::vector<ColumnRef> project_columns) -> NodePtr {
         return std::make_unique<FilterUpdateProjectNode>(
             next_id(), std::move(predicate), std::move(fields), std::move(project_columns));
     }
 
-    [[nodiscard]] auto filter_head(FilterExprPtr predicate, std::size_t count) -> NodePtr {
+    [[nodiscard]] auto filter_head(Expr predicate, std::size_t count) -> NodePtr {
         return std::make_unique<FilterHeadNode>(next_id(), std::move(predicate), count);
     }
 
-    [[nodiscard]] auto filter_tail(FilterExprPtr predicate, std::size_t count) -> NodePtr {
+    [[nodiscard]] auto filter_tail(Expr predicate, std::size_t count) -> NodePtr {
         return std::make_unique<FilterTailNode>(next_id(), std::move(predicate), count);
     }
 
@@ -140,7 +139,7 @@ class Builder {
     }
 
     [[nodiscard]] auto join(JoinKind kind, std::vector<std::string> keys,
-                            std::optional<FilterExprPtr> predicate = std::nullopt) -> NodePtr {
+                            std::optional<Expr> predicate = std::nullopt) -> NodePtr {
         return std::make_unique<JoinNode>(next_id(), kind, std::move(keys), std::move(predicate));
     }
 

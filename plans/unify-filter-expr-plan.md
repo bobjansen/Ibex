@@ -104,8 +104,28 @@ Then:
    `Bool`. Purely additive — nothing constructs them yet, so no behaviour change
    (full suite unchanged). Tested in test_ir_schema.
 2. Port the interpreter's vectorised filter evaluator to `ir::Expr`; benchmark.
+   — **Stages 2 and 3 are coupled** and land together: the predicate type
+   reaches 8 files (interpreter, codegen, canonicalize/fusion, `join`, `ops`,
+   the four fused nodes, `JoinNode`), so the new evaluator can't run end-to-end
+   until the nodes are migrated. A new evaluator cannot be benchmarked in
+   isolation, so the gate is **branch vs. this baseline**, re-running
+   `ibex_bench --suite filter`.
+
+   **Baseline (current `FilterExpr` impl, 4M-row trades, incl. parse+lower,
+   build-release, iters=10/warmup=3):**
+
+   | query         | avg ms | min ms | rows    |
+   |---------------|--------|--------|---------|
+   | filter_simple | 10.58  | 10.17  | 2001431 |
+   | filter_and    |  6.79  |  6.12  |  396247 |
+   | filter_arith  | 14.16  | 13.87  | 2685013 |
+   | filter_or     |  6.77  |  6.29  |  464699 |
+
+   Re-run: `./build-release/tools/ibex_bench --suite filter --csv-trades
+   benchmarking/data/trades.csv --iters 10 --warmup 3`. The migration must not
+   regress these (a few % noise is fine).
 3. Migrate `FilterNode` / join / fused nodes + builder/clone; lower the `filter`
-   clause through `lower_expr_to_ir`.
+   clause through `lower_expr_to_ir`. (Lands with stage 2.)
 4. Codegen + `ops` factories.
 5. Delete `FilterExpr`; unify the schema-pass column collection / inference.
 6. Land the payoff: scalar UDF inlining + validation + type inference now reach

@@ -94,6 +94,9 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto as_timeframe(const runtime::Table& t, const std::string& column)
     -> runtime::Table;
 
+[[nodiscard]] auto ascribe(const runtime::Table& t, std::vector<ir::SchemaField> schema, bool open)
+    -> runtime::Table;
+
 [[nodiscard]] auto columns(const runtime::Table& t) -> runtime::Table;
 
 [[nodiscard]] auto windowed_update(const runtime::Table& t, ir::Duration duration,

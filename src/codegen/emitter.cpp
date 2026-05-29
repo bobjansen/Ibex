@@ -528,10 +528,46 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
         }
 
         case ir::NodeKind::Ascribe: {
-            // The ascription is a checked identity. Codegen does not yet emit the
-            // runtime schema check (the interpreter/REPL path enforces it), so
-            // emit the child subtree directly.
-            return emit_node(require_single_child(node, "AscribeNode"));
+            const auto& asc = static_cast<const ir::AscribeNode&>(node);
+            auto child = emit_node(require_single_child(asc, "AscribeNode"));
+            auto var = fresh_var();
+            auto type_name = [](ir::ColumnType t) -> std::string_view {
+                switch (t) {
+                    case ir::ColumnType::Int32:
+                        return "Int32";
+                    case ir::ColumnType::Int64:
+                        return "Int64";
+                    case ir::ColumnType::Float32:
+                        return "Float32";
+                    case ir::ColumnType::Float64:
+                        return "Float64";
+                    case ir::ColumnType::Bool:
+                        return "Bool";
+                    case ir::ColumnType::String:
+                        return "String";
+                    case ir::ColumnType::Date:
+                        return "Date";
+                    case ir::ColumnType::Timestamp:
+                        return "Timestamp";
+                }
+                return "Int64";
+            };
+            *out_ << "    auto " << var << " = ibex::ops::ascribe(" << child << ", {";
+            bool first = true;
+            for (const auto& field : asc.schema()) {
+                if (!first)
+                    *out_ << ", ";
+                first = false;
+                *out_ << "ibex::ir::SchemaField{\"" << escape_string(field.name) << "\", ";
+                if (field.type.has_value()) {
+                    *out_ << "ibex::ir::ColumnType::" << type_name(*field.type);
+                } else {
+                    *out_ << "std::nullopt";
+                }
+                *out_ << "}";
+            }
+            *out_ << "}, " << (asc.open() ? "true" : "false") << ");\n";
+            return var;
         }
 
         case ir::NodeKind::Columns: {

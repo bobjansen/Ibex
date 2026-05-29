@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 
 #include <expected>
@@ -35,6 +36,11 @@ struct LowerContext {
     /// a bare name there may resolve to one of these rather than a column. A
     /// superset is safe. When empty, expression-level reference checking is off.
     std::unordered_set<std::string> lexical_names;
+    /// Schemas of in-scope table bindings, keyed by binding name, so a reference
+    /// to a let-bound table (which lowers to a `ScanNode`) carries its schema
+    /// into the current expression's static checks. Populated by the REPL from
+    /// the runtime tables registry; entries are exact (closed) schemas.
+    ir::SourceSchemas source_schemas;
 };
 
 /// Lower a parsed Program into an IR node tree.

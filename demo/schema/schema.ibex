@@ -2,31 +2,22 @@
 //   build-release/tools/ibex_eval demo/schema/schema.ibex
 //
 // Ibex tables from I/O sources start with a statically-unknown schema. Ascribing
-// a schema with `as` makes the columns known, so the rest of the *pipeline* is
+// a schema with `as` makes the columns known, so later column references are
 // checked at compile (lowering) time instead of only when rows are evaluated.
 
-// A stand-in for `read_csv("trades.csv")` — a small inline table.
-let raw = Table {
+// A stand-in for `read_csv("trades.csv")`, with its schema ascribed. `as { ... }`
+// is shorthand for `as DataFrame<{ ... }>`. Exact by default: the table must
+// have *exactly* these columns (a missing column, wrong type, or unlisted extra
+// is an error). Add a `*` (e.g. `as { symbol: String, * }`) to allow extras.
+let trades = Table {
     symbol = ["AAPL", "GOOG", "AAPL", "MSFT"],
     price  = [191.0, 142.5, 192.3, 415.2],
     qty    = [10, 5, 8, 3]
-};
+} as { symbol: String, price: Float64, qty: Int64 };
 
-// Ascribe the schema, then keep operating in the same expression. `as { ... }`
-// is shorthand for `as DataFrame<{ ... }>`. Exact by default: the table must have
-// *exactly* these columns (a missing column, wrong type, or unlisted extra is an
-// error). Add a `*` (e.g. `as { symbol: String, * }`) to allow extra columns.
-//
-// Because the schema is known from the ascription onward, the `update` and
-// `select` below are checked statically. Change `price` to `prize` and re-run:
-// it fails at lowering with "update: column 'prize' not found in input", before
-// any row is touched.
-raw as { symbol: String, price: Float64, qty: Int64 }
-   [update { value = price * qty }]
-   [select { symbol, value }, order { value desc }];
-
-// Note: static checking follows the schema *through a pipeline*. A schema does
-// not yet flow across `let` boundaries — a let-bound table is re-read as an
-// opaque source in later statements, so references to it are validated at run
-// time. Chain within one expression (as above) to get compile-time checks, or
-// re-ascribe after a `let`.
+// `trades` now carries a known schema across statements, so the references below
+// are checked statically. Change `price` to `prize` and re-run: it fails at
+// lowering with "update: column 'prize' not found in input", before any row is
+// touched — and likewise for a typo in `select`, `order`, or `by`.
+let enriched = trades[update { value = price * qty }];
+enriched[select { symbol, value }, order { value desc }];

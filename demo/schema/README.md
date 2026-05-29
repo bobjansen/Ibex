@@ -18,8 +18,9 @@ build-release/tools/ibex_eval demo/schema/schema.ibex
   a missing column, a wrong type, or an *unlisted extra* column is an error. A
   trailing `*` (e.g. `as { symbol: String, * }`) opts into allowing extras.
 - **Compile-time column checking** — once the schema is known, column references
-  in `select` / `order` / `update` later in the same pipeline are checked at
-  lowering time. Edit `price` to `prize` in `schema.ibex` and re-run to see a
+  in `select` / `order` / `update` / `by` are checked at lowering time, including
+  across `let` bindings (a let-bound table carries its schema into later
+  statements). Edit `price` to `prize` in `schema.ibex` and re-run to see a
   lowering error (`update: column 'prize' not found in input`) instead of a
   run-time one.
 
@@ -39,9 +40,10 @@ read_trades("trades.csv")[select { symbol, prize }];  // lowering error: 'prize'
 Add `*` to the declared schema (`-> DataFrame<{ symbol: String, * }>`) if the
 reader may return more columns than it names.
 
-## Current limitation
+## Scope
 
-Static checking follows a schema **through a pipeline expression**, but a schema
-does not yet flow across `let` boundaries: a let-bound table is re-read as an
-opaque source in later statements, so references to it fall back to run-time
-validation. Chain within one expression, or re-ascribe after a `let`.
+Static checking applies wherever the operand's schema is statically known —
+`Table { ... }` literals, `as`-ascribed expressions, typed readers, let-bound
+tables built from any of these, and pipelines over them. A source with an
+unknown schema (e.g. an untyped `read_csv`) or an open (`*`) schema falls back
+to run-time validation.

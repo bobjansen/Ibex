@@ -601,6 +601,29 @@ TEST_CASE("REPL accepts a valid reference to a let-bound table", "[repl][schema]
         registry));
 }
 
+// Scalar UDFs called inside clause expressions are inlined at lower time. Only
+// single-expression bodies inline; recursion is rejected.
+TEST_CASE("REPL inlines a scalar UDF in a clause expression", "[repl][udf]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script(
+        "fn adjust(p: Float64) -> Float64 { p * 1.01; }\n"
+        "Table { price = [100.0, 200.0] }[select { adj = adjust(price) }];",
+        registry));
+}
+
+TEST_CASE("REPL rejects a recursive scalar UDF in a clause expression", "[repl][udf]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script(
+        "fn f(x: Int) -> Int { f(x); }\nTable { a = [1] }[select { y = f(a) }];", registry));
+}
+
+TEST_CASE("REPL rejects a multi-statement scalar UDF in a clause expression", "[repl][udf]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script(
+        "fn g(x: Int) -> Int { let y = x; y; }\nTable { a = [1] }[select { y = g(a) }];",
+        registry));
+}
+
 TEST_CASE("REPL tuple let binding: bound columns usable in expressions") {
     ibex::runtime::ExternRegistry registry;
 

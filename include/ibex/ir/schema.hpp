@@ -22,14 +22,20 @@ class SchemaInfo {
     SchemaInfo() = default;  ///< Unknown.
 
     [[nodiscard]] static auto unknown() -> SchemaInfo { return SchemaInfo{}; }
-    [[nodiscard]] static auto known(std::vector<SchemaField> fields) -> SchemaInfo {
+    [[nodiscard]] static auto known(std::vector<SchemaField> fields, bool open = false)
+        -> SchemaInfo {
         SchemaInfo info;
         info.known_ = true;
+        info.open_ = open;
         info.fields_ = std::move(fields);
         return info;
     }
 
     [[nodiscard]] auto is_known() const noexcept -> bool { return known_; }
+    /// True for an "open" schema — the listed columns are present, but extra
+    /// columns may also exist (a `*` wildcard). Missing-column checks are only
+    /// sound on a closed (non-open) Known schema.
+    [[nodiscard]] auto is_open() const noexcept -> bool { return open_; }
     [[nodiscard]] auto fields() const noexcept -> const std::vector<SchemaField>& {
         return fields_;
     }
@@ -39,6 +45,7 @@ class SchemaInfo {
 
    private:
     bool known_ = false;
+    bool open_ = false;
     std::vector<SchemaField> fields_;
 };
 

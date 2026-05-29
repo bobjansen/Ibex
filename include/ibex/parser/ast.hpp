@@ -30,6 +30,10 @@ struct SchemaField {
 
 struct SchemaType {
     std::vector<SchemaField> fields;
+    /// True when the schema ends with a `*` wildcard, meaning "at least these
+    /// columns; extra columns are allowed" (an open schema). When false the
+    /// schema is exact/closed: exactly the listed columns.
+    bool open = false;
 };
 
 using TypeArg = std::variant<ScalarType, SchemaType>;

@@ -1806,9 +1806,10 @@ To reference a computed column, use a separate block or `let` binding.
 
 When the schema of a block's operand is **statically known and closed** (a
 `Table { ... }` literal, an exact `as`-ascribed expression — Section 3.6 — a
-typed reader, or a pipeline built on one), a reference to a column the operand
-does not provide is reported as a **compile-time (lowering) error** rather than
-a runtime one.
+typed reader, a `let`-bound table built from any of these, or a pipeline over
+one), a reference to a column the operand does not provide is reported as a
+**compile-time (lowering) error** rather than a runtime one. A `let`-bound
+table carries its schema into the statements that follow it.
 
 The **column-only** positions — `select`/`order`/`rename` targets, `by` group
 keys, and aggregate source columns — are always validated this way: a name there

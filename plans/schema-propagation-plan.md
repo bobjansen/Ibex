@@ -253,16 +253,24 @@ equivalents (or run the pass before fusion).
 - Removing the runtime `validate_table_type` path — it remains the fallback for
   `Unknown` and the implementation of the ascription check.
 
+7. **Schemas across `let` bindings.** — **DONE.** The REPL builds an exact
+   (closed) `ir::SchemaInfo` from each in-scope table in the runtime registry
+   (`table_schema_info` in repl.cpp) and passes them via
+   `LowerContext::source_schemas`. The `Lowerer` overlays these binding schemas
+   on the declared reader schemas (`Lowerer::source_schemas()`, bindings shadow
+   readers) and uses the combined env in both `lower_ascribe` and the
+   `check_column_refs` pass. A reference to a column a let-bound table lacks is
+   now a lower-time error (was runtime). Tested in test_repl; demo/schema
+   updated to the natural let-based flow.
+
 ## Follow-ups (post-merge candidates)
 
-- **Schemas across `let` bindings.** Today a schema flows through a single
-  pipeline expression but not across `let`: a let-bound table is re-read as an
-  opaque `ScanNode` in later statements, so references fall back to runtime
-  validation. Carrying each binding's inferred schema into the `SourceSchemas`
-  env (keyed by the binding name) would make static checking span statements —
-  the natural next increment, and the one the `demo/schema` demo motivates.
 - **Named schema aliases** (`type X = { ... }`) to avoid repeating column lists.
 - **More operators** (`melt`/`cov`/`corr`/`resample`) modelled in `infer_schema`.
+- **Compile-path binding schemas.** Whole-program `lower()` does not yet build
+  binding schemas across its own `let` statements (only the REPL/script path
+  does); wiring the same env there would extend cross-`let` checks to
+  `ibex_compile`.
 
 ## Open Questions
 

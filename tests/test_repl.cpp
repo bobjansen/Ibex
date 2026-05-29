@@ -585,6 +585,22 @@ TEST_CASE("REPL allows an update expression referencing an in-scope scalar", "[r
                                        registry));
 }
 
+// A let-bound table carries its (exact) schema into later statements, so a
+// reference to a column it does not have is caught at lower time.
+TEST_CASE("REPL checks references to a let-bound table's schema", "[repl][schema]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script(
+        "let trades = Table { symbol = [\"A\"], price = [1.0] };\ntrades[select { prize }];",
+        registry));
+}
+
+TEST_CASE("REPL accepts a valid reference to a let-bound table", "[repl][schema]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script(
+        "let trades = Table { symbol = [\"A\"], price = [1.0] };\ntrades[select { symbol }];",
+        registry));
+}
+
 TEST_CASE("REPL tuple let binding: bound columns usable in expressions") {
     ibex::runtime::ExternRegistry registry;
 

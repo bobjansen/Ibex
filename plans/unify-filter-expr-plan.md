@@ -98,6 +98,11 @@ Then:
 ## Staging
 
 1. Add comparison / logical / null-test nodes to `ir::Expr` + `expr_type` (Bool).
+   — **DONE.** `ir::Expr` gains `CompareExpr` (reusing `CompareOp`, moved above
+   `Expr`), `LogicalExpr` (`LogicalOp` And/Or/Not), and `IsNullExpr`
+   (`negated` = IS NOT NULL); the schema pass's `expr_type` types all three as
+   `Bool`. Purely additive — nothing constructs them yet, so no behaviour change
+   (full suite unchanged). Tested in test_ir_schema.
 2. Port the interpreter's vectorised filter evaluator to `ir::Expr`; benchmark.
 3. Migrate `FilterNode` / join / fused nodes + builder/clone; lower the `filter`
    clause through `lower_expr_to_ir`.

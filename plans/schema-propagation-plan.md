@@ -202,6 +202,18 @@ equivalents (or run the pass before fusion).
    The `as` ascription is the supported way to assert a schema statically in the
    meantime.
 
+5. **Clause-level column-reference validation.** — **DONE.**
+   `ir::check_column_refs` (src/ir/schema.cpp) walks the lowered IR and, where
+   the input schema is `Known`, rejects references to absent columns in the
+   unambiguously column-only positions: `select`/`order`/`rename` targets, `by`
+   group keys, and aggregate source columns. Wired into `lower()` (before the
+   optimizer fuses nodes) and `lower_expr()` (the REPL path). Deliberately skips
+   `filter` and computed `select`/`update` expressions, where a bare name can be
+   a bound scalar (the interpreter resolves column-or-scalar there), and skips
+   `Count`/computed-input aggregates — so the pass never false-positives.
+   `Unknown` inputs fall back to runtime validation. Documented in SPEC §6.6;
+   tested in test_lower.
+
 ## Non-Goals (initial waves)
 
 - Inferring schemas through `dcast`/`transpose`/`matmul` without an ascription.

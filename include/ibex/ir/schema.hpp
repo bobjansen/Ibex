@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ibex::ir {
@@ -52,13 +53,24 @@ using SourceSchemas = std::unordered_map<std::string, SchemaInfo>;
 [[nodiscard]] auto infer_schema(const Node& node, const SourceSchemas& sources = {}) -> SchemaInfo;
 
 /// Validate the column references in `node` (and its subtree) against the
-/// statically inferred input schemas. Only the unambiguously column-only
-/// positions are checked — `select`/`order`/`rename` targets, `by` group keys,
-/// and aggregate source columns — and only where the input schema is `Known`;
-/// `filter` and computed expressions are skipped because a bare name there may
-/// resolve to a bound scalar. Returns an error message for the first reference
-/// that the input provably lacks, or `nullopt` if none is found.
-[[nodiscard]] auto check_column_refs(const Node& node, const SourceSchemas& sources = {})
-    -> std::optional<std::string>;
+/// statically inferred input schemas, where the input schema is `Known`.
+///
+/// The unambiguously column-only positions — `select`/`order`/`rename` targets,
+/// `by` group keys, and aggregate source columns — are always checked: a name
+/// there can only be a column.
+///
+/// When `check_expressions` is true, `filter` predicates and computed
+/// `select`/`update` expressions are also checked. A bare name in those
+/// positions resolves to a column *or* a lexical binding, so `lexical_names`
+/// must list every in-scope binding name; a reference is only flagged when it is
+/// in neither the input schema nor `lexical_names`. Pass `check_expressions`
+/// only when `lexical_names` is complete (e.g. the REPL's bindings); a superset
+/// is safe (it can only under-report), an incomplete set is not.
+///
+/// Returns an error message for the first provably-absent reference, or
+/// `nullopt`.
+[[nodiscard]] auto check_column_refs(const Node& node, const SourceSchemas& sources = {},
+                                     const std::unordered_set<std::string>& lexical_names = {},
+                                     bool check_expressions = false) -> std::optional<std::string>;
 
 }  // namespace ibex::ir

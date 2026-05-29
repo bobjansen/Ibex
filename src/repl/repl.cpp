@@ -2409,6 +2409,27 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             context.sink_externs.insert(name);
         }
     }
+    // Supply every in-scope binding name so the lowerer can statically validate
+    // column references in filter/computed expressions without false positives.
+    // A superset is safe; under-inclusion is not, so include all registries.
+    for (const auto& entry : scalars) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : columns) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : models) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : functions) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : compile_time_lists) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : tables) {
+        context.lexical_names.insert(entry.first);
+    }
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {
         return std::unexpected(lowered.error().message);

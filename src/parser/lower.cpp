@@ -3465,7 +3465,10 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
                     context.sink_externs, context.table_extern_decls);
     auto lowered = lowerer.lower_expression(expr);
     if (lowered.has_value()) {
-        if (auto err = ir::check_column_refs(*lowered.value())) {
+        // The REPL supplies the complete set of in-scope lexical names, so
+        // filter/computed-expression references can be checked too.
+        if (auto err = ir::check_column_refs(*lowered.value(), {}, context.lexical_names,
+                                             /*check_expressions=*/true)) {
             return std::unexpected(LowerError{.message = *err});
         }
     }

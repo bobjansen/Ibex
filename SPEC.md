@@ -597,9 +597,13 @@ A table expression may be ascribed a schema with the postfix `as` operator:
 
 ```
 <table_expr> as DataFrame<{ field: Type, ... }>
+<table_expr> as { field: Type, ... }              (* shorthand for the above *)
 ```
 
-The ascribed type must be a `DataFrame` or `TimeFrame` type. The ascription is a
+The ascribed type must be a `DataFrame` or `TimeFrame` type. As a shorthand, a
+bare schema after `as` — `expr as { ... }` — is sugar for
+`expr as DataFrame<{ ... }>` (the wildcard `*` is allowed in it too). Use the
+explicit `TimeFrame<{ ... }>` form to ascribe a TimeFrame. The ascription is a
 **runtime-checked identity**: the table is validated against the named schema
 and then passed through unchanged. The schema is **exact (closed) by default** —
 every listed column must be present with a matching type, *and* the table must

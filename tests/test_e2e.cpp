@@ -127,6 +127,33 @@ TEST_CASE("E2E: schema ascription rejects a wrong-type column at run time", "[e2
     CHECK(err.find("wrong type") != std::string::npos);
 }
 
+TEST_CASE("E2E: scalar UDF is inlined in a select expression", "[e2e][udf]") {
+    auto out =
+        run("fn adjust(p: Float64) -> Float64 { p * 1.01; }\n"
+            "Table { price = [100.0, 200.0] }[select { adj = adjust(price) }];",
+            {});
+    CHECK(col_dbl(out, "adj") == std::vector<double>{101.0, 202.0});
+}
+
+TEST_CASE("E2E: scalar UDF inside an aggregate argument", "[e2e][udf]") {
+    auto out =
+        run("fn adjust(p: Float64) -> Float64 { p * 1.01; }\n"
+            "Table { sym = [\"A\", \"A\", \"B\"], price = [100.0, 200.0, 50.0] }"
+            "[select { sym, avg_adj = mean(adjust(price)) }, by sym, order { sym asc }];",
+            {});
+    // group A: mean(101, 202) = 151.5; group B: 50.5
+    CHECK(col_dbl(out, "avg_adj") == std::vector<double>{151.5, 50.5});
+}
+
+TEST_CASE("E2E: nested scalar UDF calls inline", "[e2e][udf]") {
+    auto out =
+        run("fn inc(x: Int) -> Int { x + 1; }\n"
+            "fn dbl(x: Int) -> Int { x * 2; }\n"
+            "Table { a = [1, 2] }[select { y = dbl(inc(a)) }];",
+            {});
+    CHECK(col_i64(out, "y") == std::vector<std::int64_t>{4, 6});
+}
+
 TEST_CASE("E2E: filter with equality", "[e2e]") {
     auto tables = make_trades();
     auto out = run("trades[filter price == 20];", tables);

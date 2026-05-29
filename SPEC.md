@@ -2235,8 +2235,15 @@ Functions may return scalars, tables, or columns; the return expression must
 match the declared return type.
 
 Function calls inside DataFrame clause expressions are resolved against
-built-ins or extern functions. User-defined functions are evaluated at the
-statement level in the REPL/runtime.
+built-ins or extern functions. A call to a **scalar** user function in a
+`select` / `update` computed expression (including inside an aggregate argument,
+e.g. `mean(adjust(price))`) is **inlined** at lowering time: its body replaces
+the call with the parameters substituted by the argument expressions. Only
+single-expression bodies inline, and recursion is rejected; a non-scalar
+function, or one with a multi-statement body, used this way is a compile-time
+error. (Inlining does not yet apply inside `filter` predicates, which use a
+restricted expression sublanguage.) User-defined functions are otherwise
+evaluated at the statement level in the REPL/runtime.
 
 Call sites may use positional arguments, named arguments, or a mix where all
 positional arguments come first:

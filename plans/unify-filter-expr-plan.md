@@ -113,6 +113,19 @@ Then:
   built once, not twice (the reason to do this before aggregate-udf stage 3).
 - A single column-reference validation, type-inference, and codegen path for all
   expressions.
+- **Boolean masks as first-class column values.** Once a predicate is a
+  boolean-typed `ir::Expr`, a boolean expression can be computed and *stored*
+  like any other column, and a stored boolean column can be applied as a
+  predicate:
+
+  ```ibex
+  let mask = trades[update { keep = price > 100 && symbol == "AAPL" }];
+  mask[filter keep];   // apply the named mask
+  ```
+
+  The split representation makes this awkward today — a predicate can't be named
+  or stored. This is a concrete, user-visible win, and it motivates resolving
+  the "booleans in value position" question (below) toward **allowing** it.
 - Less code, fewer parallel representations to keep in sync.
 
 ## Non-Goals
@@ -127,11 +140,15 @@ Then:
 - **Node shape:** distinct `CompareExpr` / `LogicalExpr` / null-test nodes vs.
   folding comparisons into a generalised binary node with a `Bool` result.
   Recommend distinct nodes — clearer, and they type and evaluate cleanly.
-- **Booleans in value position:** once predicates are `ir::Expr`, a boolean
-  expression becomes expressible in `select`/`update` (e.g.
-  `select { flag = a > b }`, producing a `Column<Bool>`). That's arguably a
-  feature (the column type already exists) — decide whether to allow and spec
-  it, or keep boolean expressions restricted to predicate position initially.
+- **Booleans in value position — leaning yes.** Once predicates are `ir::Expr`,
+  a boolean expression is expressible in `select`/`update` (e.g.
+  `select { flag = a > b }`, producing a `Column<Bool>`). `Column<Bool>` already
+  exists, and the storable-mask use-case above is a real motivation, so the plan
+  is to **allow** it and spec it (a stage-6 deliverable), rather than restrict
+  booleans to predicate position. Sub-decisions: does `filter <bool col>` accept
+  a bare boolean column as the predicate (it should — it's just a boolean
+  `ir::Expr` that is a `ColumnRef`), and how does this interact with the
+  column-or-scalar resolution already in predicates.
 - **`rank` / `RankExpr`** appears only in value position today; confirm it stays
   out of predicate contexts (or define behaviour) under the unified IR.
 

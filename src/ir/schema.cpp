@@ -88,6 +88,11 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
     if (const auto* lit = std::get_if<Literal>(&expr.node)) {
         return literal_type(*lit);
     }
+    if (std::holds_alternative<CompareExpr>(expr.node) ||
+        std::holds_alternative<LogicalExpr>(expr.node) ||
+        std::holds_alternative<IsNullExpr>(expr.node)) {
+        return ColumnType::Bool;  // boolean-valued expressions
+    }
     if (const auto* bin = std::get_if<BinaryExpr>(&expr.node)) {
         const auto left = expr_type(*bin->left, input);
         const auto right = expr_type(*bin->right, input);

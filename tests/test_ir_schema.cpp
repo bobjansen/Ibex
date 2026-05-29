@@ -239,6 +239,34 @@ TEST_CASE("schema: resample over a time-indexed input is closed", "[ir][schema]"
     REQUIRE(s.time_index() == "ts");
 }
 
+TEST_CASE("schema: comparison/logical/null-test expressions type as Bool", "[ir][schema]") {
+    auto col = [](std::string name) {
+        return std::make_shared<ibex::ir::Expr>(
+            ibex::ir::Expr{.node = ibex::ir::ColumnRef{.name = std::move(name)}});
+    };
+    std::vector<ibex::ir::FieldSpec> fields;
+    fields.push_back(
+        {.alias = "gt",
+         .expr = ibex::ir::Expr{.node = ibex::ir::CompareExpr{.op = ibex::ir::CompareOp::Gt,
+                                                              .left = col("a"),
+                                                              .right = col("b")}}});
+    fields.push_back(
+        {.alias = "both",
+         .expr = ibex::ir::Expr{.node = ibex::ir::LogicalExpr{.op = ibex::ir::LogicalOp::And,
+                                                              .left = col("a"),
+                                                              .right = col("b")}}});
+    fields.push_back({.alias = "present",
+                      .expr = ibex::ir::Expr{
+                          .node = ibex::ir::IsNullExpr{.operand = col("a"), .negated = true}}});
+    ibex::ir::UpdateNode update(ibex::ir::NodeId{2}, std::move(fields));
+    update.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));
+    auto s = ibex::ir::infer_schema(update, base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(type_of(s, "gt") == ColumnType::Bool);
+    REQUIRE(type_of(s, "both") == ColumnType::Bool);
+    REQUIRE(type_of(s, "present") == ColumnType::Bool);
+}
+
 TEST_CASE("schema: an unmodelled operator falls back to unknown", "[ir][schema]") {
     ibex::ir::TransposeNode transpose(ibex::ir::NodeId{2});
     transpose.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));

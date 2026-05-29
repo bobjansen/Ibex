@@ -823,13 +823,15 @@ class Lowerer {
         std::unordered_set<std::string> initial_table_externs = {},
         std::unordered_set<std::string> initial_sink_externs = {},
         std::unordered_map<std::string, const ExternDecl*> initial_table_extern_decls = {},
-        ir::SourceSchemas initial_source_schemas = {})
+        ir::SourceSchemas initial_source_schemas = {},
+        std::unordered_map<std::string, const FunctionDecl*> initial_functions = {})
         : bindings_(bindings),
           compile_time_lists_(std::move(initial_compile_time_lists)),
           table_externs_(std::move(initial_table_externs)),
           sink_externs_(std::move(initial_sink_externs)),
           table_extern_decls_(std::move(initial_table_extern_decls)),
-          binding_schemas_(std::move(initial_source_schemas)) {}
+          binding_schemas_(std::move(initial_source_schemas)),
+          functions_(std::move(initial_functions)) {}
 
     [[nodiscard]] auto table_extern_decls() const
         -> const std::unordered_map<std::string, const ExternDecl*>& {
@@ -881,7 +883,8 @@ class Lowerer {
                 }
                 continue;
             }
-            if (std::holds_alternative<FunctionDecl>(stmt)) {
+            if (const auto* fn = std::get_if<FunctionDecl>(&stmt)) {
+                functions_.insert_or_assign(fn->name, fn);
                 continue;
             }
             if (std::holds_alternative<ImportDecl>(stmt)) {
@@ -2224,8 +2227,80 @@ class Lowerer {
         return keys;
     }
 
+    /// Inline a call to a scalar user function into a clause expression: bind
+    /// its parameters to the (lowered) argument expressions and lower its body
+    /// with those substitutions in scope. Only single-expression bodies inline;
+    /// recursion is rejected.
+    auto inline_scalar_udf(const FunctionDecl& fn, const CallExpr& call)
+        -> std::expected<ir::Expr, LowerError> {
+        if (fn.return_type.kind != Type::Kind::Scalar) {
+            return std::unexpected(LowerError{
+                .message = "function '" + fn.name +
+                           "' does not return a scalar and cannot be used in this expression"});
+        }
+        if (fn.body.size() != 1 || !std::holds_alternative<ExprStmt>(fn.body.front())) {
+            return std::unexpected(LowerError{
+                .message = "scalar function '" + fn.name +
+                           "' cannot be used in a clause expression: only single-expression "
+                           "bodies are inlined"});
+        }
+        if (call.args.size() > fn.params.size()) {
+            return std::unexpected(LowerError{.message = fn.name + ": too many arguments"});
+        }
+        // Bind arguments: positional, then named, then defaults.
+        std::vector<const Expr*> bound(fn.params.size(), nullptr);
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            bound[i] = call.args[i].get();
+        }
+        for (const auto& narg : call.named_args) {
+            const auto param = std::find_if(fn.params.begin(), fn.params.end(),
+                                            [&](const Param& p) { return p.name == narg.name; });
+            if (param == fn.params.end()) {
+                return std::unexpected(LowerError{
+                    .message = fn.name + ": unknown named argument '" + narg.name + "'"});
+            }
+            const auto pos = static_cast<std::size_t>(std::distance(fn.params.begin(), param));
+            if (bound[pos] != nullptr) {
+                return std::unexpected(LowerError{
+                    .message = fn.name + ": duplicate argument for '" + narg.name + "'"});
+            }
+            bound[pos] = narg.value.get();
+        }
+        std::unordered_map<std::string, ir::Expr> scope;
+        for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            const Expr* arg = bound[i] != nullptr ? bound[i] : fn.params[i].default_value.get();
+            if (arg == nullptr) {
+                return std::unexpected(LowerError{.message = fn.name + ": missing argument '" +
+                                                             fn.params[i].name + "'"});
+            }
+            auto lowered = lower_expr_to_ir(*arg);  // lowered in the current scope
+            if (!lowered.has_value()) {
+                return std::unexpected(lowered.error());
+            }
+            scope.insert_or_assign(fn.params[i].name, std::move(lowered.value()));
+        }
+        if (!inlining_active_.insert(fn.name).second) {
+            return std::unexpected(LowerError{.message = "recursive scalar function '" + fn.name +
+                                                         "' cannot be inlined in a clause "
+                                                         "expression"});
+        }
+        inline_scopes_.push_back(std::move(scope));
+        auto result = lower_expr_to_ir(*std::get<ExprStmt>(fn.body.front()).expr);
+        inline_scopes_.pop_back();
+        inlining_active_.erase(fn.name);
+        return result;
+    }
+
     auto lower_expr_to_ir(const Expr& expr) -> std::expected<ir::Expr, LowerError> {
         if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+            // Inside an inlined scalar UDF body, a parameter name resolves to the
+            // (already-lowered) argument expression rather than a column.
+            if (!inline_scopes_.empty()) {
+                const auto& scope = inline_scopes_.back();
+                if (auto it = scope.find(ident->name); it != scope.end()) {
+                    return it->second;
+                }
+            }
             return ir::Expr{.node = ir::ColumnRef{.name = ident->name}};
         }
         if (const auto* literal = std::get_if<LiteralExpr>(&expr.node)) {
@@ -2250,6 +2325,11 @@ class Lowerer {
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
         }
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            // A call to a scalar user function is inlined: its body replaces the
+            // call, with parameters substituted by the argument expressions.
+            if (auto it = functions_.find(call->callee); it != functions_.end()) {
+                return inline_scalar_udf(*it->second, *call);
+            }
             ir::CallExpr lowered_call;
             lowered_call.callee = call->callee;
             lowered_call.args.reserve(call->args.size());
@@ -3494,6 +3574,12 @@ class Lowerer {
     std::unordered_set<std::string> sink_externs_;
     std::unordered_map<std::string, const ExternDecl*> table_extern_decls_;
     ir::SourceSchemas binding_schemas_;
+    std::unordered_map<std::string, const FunctionDecl*> functions_;
+    // Scratch for inlining scalar UDF calls in clause expressions: a stack of
+    // parameter substitutions (top = innermost inlined body) and a guard set to
+    // reject recursive inlining.
+    std::vector<std::unordered_map<std::string, ir::Expr>> inline_scopes_;
+    std::unordered_set<std::string> inlining_active_;
 };
 
 }  // namespace
@@ -3526,7 +3612,8 @@ auto lower(const Program& program) -> LowerResult {
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,
-                    context.sink_externs, context.table_extern_decls, context.source_schemas);
+                    context.sink_externs, context.table_extern_decls, context.source_schemas,
+                    context.functions);
     auto lowered = lowerer.lower_expression(expr);
     if (lowered.has_value()) {
         // The REPL supplies the complete set of in-scope lexical names and the

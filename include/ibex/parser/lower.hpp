@@ -41,6 +41,11 @@ struct LowerContext {
     /// into the current expression's static checks. Populated by the REPL from
     /// the runtime tables registry; entries are exact (closed) schemas.
     ir::SourceSchemas source_schemas;
+    /// Scalar user-function declarations, keyed by name. Calls to these inside
+    /// clause expressions are inlined during lowering. Populated by the REPL
+    /// from its function registry; the whole-program `lower()` collects them
+    /// from the program's `fn` statements.
+    std::unordered_map<std::string, const FunctionDecl*> functions;
 };
 
 /// Lower a parsed Program into an IR node tree.

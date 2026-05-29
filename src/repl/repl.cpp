@@ -2473,6 +2473,10 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     for (const auto& [name, table] : tables) {
         context.source_schemas.insert_or_assign(name, table_schema_info(table));
     }
+    // Scalar user functions are inlined when called inside clause expressions.
+    for (const auto& [name, decl] : functions) {
+        context.functions.insert_or_assign(name, &decl);
+    }
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {
         return std::unexpected(lowered.error().message);

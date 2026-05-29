@@ -1136,6 +1136,44 @@ auto column_type_matches(const runtime::ColumnValue& col, parser::ScalarType exp
     return false;
 }
 
+/// IR column type of a runtime column, for building static schemas from
+/// concrete tables. Categorical columns report as String; anything unrecognised
+/// is left untyped (nullopt) — the column is still known to exist.
+auto column_ir_type(const runtime::ColumnValue& col) -> std::optional<ir::ColumnType> {
+    if (std::holds_alternative<Column<std::int64_t>>(col)) {
+        return ir::ColumnType::Int64;
+    }
+    if (std::holds_alternative<Column<double>>(col)) {
+        return ir::ColumnType::Float64;
+    }
+    if (std::holds_alternative<Column<bool>>(col)) {
+        return ir::ColumnType::Bool;
+    }
+    if (std::holds_alternative<Column<std::string>>(col) ||
+        std::holds_alternative<Column<Categorical>>(col)) {
+        return ir::ColumnType::String;
+    }
+    if (std::holds_alternative<Column<Date>>(col)) {
+        return ir::ColumnType::Date;
+    }
+    if (std::holds_alternative<Column<Timestamp>>(col)) {
+        return ir::ColumnType::Timestamp;
+    }
+    return std::nullopt;
+}
+
+/// Exact (closed) schema of a concrete table — used to carry let-bound table
+/// schemas into the static checks of later statements.
+auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
+    std::vector<ir::SchemaField> fields;
+    fields.reserve(table.columns.size());
+    for (const auto& entry : table.columns) {
+        fields.push_back(
+            ir::SchemaField{.name = entry.name, .type = column_ir_type(*entry.column)});
+    }
+    return ir::SchemaInfo::known(std::move(fields), /*open=*/false);
+}
+
 /// Validates that `column` satisfies the scalar element type declared in `type`.
 /// Returns nullopt on success, or an error message on failure.
 auto validate_column_type(const runtime::ColumnValue& column, const parser::Type& type)
@@ -2429,6 +2467,11 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     }
     for (const auto& entry : tables) {
         context.lexical_names.insert(entry.first);
+    }
+    // Carry the exact schema of each in-scope table binding into the lowerer so
+    // references to a let-bound table are checked statically in this expression.
+    for (const auto& [name, table] : tables) {
+        context.source_schemas.insert_or_assign(name, table_schema_info(table));
     }
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {

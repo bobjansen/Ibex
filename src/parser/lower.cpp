@@ -822,16 +822,28 @@ class Lowerer {
         std::unordered_map<std::string, std::vector<std::string>> initial_compile_time_lists = {},
         std::unordered_set<std::string> initial_table_externs = {},
         std::unordered_set<std::string> initial_sink_externs = {},
-        std::unordered_map<std::string, const ExternDecl*> initial_table_extern_decls = {})
+        std::unordered_map<std::string, const ExternDecl*> initial_table_extern_decls = {},
+        ir::SourceSchemas initial_source_schemas = {})
         : bindings_(bindings),
           compile_time_lists_(std::move(initial_compile_time_lists)),
           table_externs_(std::move(initial_table_externs)),
           sink_externs_(std::move(initial_sink_externs)),
-          table_extern_decls_(std::move(initial_table_extern_decls)) {}
+          table_extern_decls_(std::move(initial_table_extern_decls)),
+          binding_schemas_(std::move(initial_source_schemas)) {}
 
     [[nodiscard]] auto table_extern_decls() const
         -> const std::unordered_map<std::string, const ExternDecl*>& {
         return table_extern_decls_;
+    }
+
+    /// The source-schema env for static checks: declared reader return schemas
+    /// overlaid with in-scope table-binding schemas (bindings shadow readers).
+    [[nodiscard]] auto source_schemas() const -> ir::SourceSchemas {
+        ir::SourceSchemas sources = build_source_schemas(table_extern_decls_);
+        for (const auto& [name, schema] : binding_schemas_) {
+            sources.insert_or_assign(name, schema);
+        }
+        return sources;
     }
 
     auto lower_program(const Program& program) -> LowerResult {
@@ -996,8 +1008,7 @@ class Lowerer {
         // the input provably cannot satisfy is a lower-time error. When the
         // input is Unknown (e.g. an I/O source) or open, the check is deferred to
         // the runtime validation in the interpreter.
-        const ir::SchemaInfo input =
-            ir::infer_schema(*base.value(), build_source_schemas(table_extern_decls_));
+        const ir::SchemaInfo input = ir::infer_schema(*base.value(), source_schemas());
         if (input.is_known() && !input.is_open()) {
             for (const auto& field : fields) {
                 const auto* have = input.find(field.name);
@@ -3482,6 +3493,7 @@ class Lowerer {
     std::unordered_set<std::string> table_externs_;
     std::unordered_set<std::string> sink_externs_;
     std::unordered_map<std::string, const ExternDecl*> table_extern_decls_;
+    ir::SourceSchemas binding_schemas_;
 };
 
 }  // namespace
@@ -3514,13 +3526,13 @@ auto lower(const Program& program) -> LowerResult {
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,
-                    context.sink_externs, context.table_extern_decls);
+                    context.sink_externs, context.table_extern_decls, context.source_schemas);
     auto lowered = lowerer.lower_expression(expr);
     if (lowered.has_value()) {
-        // The REPL supplies the complete set of in-scope lexical names, so
-        // filter/computed-expression references can be checked too.
-        if (auto err = ir::check_column_refs(*lowered.value(),
-                                             build_source_schemas(context.table_extern_decls),
+        // The REPL supplies the complete set of in-scope lexical names and the
+        // schemas of in-scope table bindings, so filter/computed-expression
+        // references and references to let-bound tables can be checked too.
+        if (auto err = ir::check_column_refs(*lowered.value(), lowerer.source_schemas(),
                                              context.lexical_names,
                                              /*check_expressions=*/true)) {
             return std::unexpected(LowerError{.message = *err});

@@ -342,12 +342,101 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // Exposes child column names as a single String column named "name".
             return SchemaInfo::known({SchemaField{.name = "name", .type = ColumnType::String}});
 
-        // Data-dependent output columns or not yet modelled: Unknown is sound.
-        case NodeKind::Resample:
-        case NodeKind::Melt:
-        case NodeKind::Dcast:
+        case NodeKind::Melt: {
+            // Output: the id columns (types from input), then `variable: String`
+            // and `value` (the common type of the melted measure columns, when
+            // statically determinable). The column set is fixed -> closed.
+            const auto& melt = static_cast<const MeltNode&>(node);
+            const SchemaInfo input = child_schema(node, sources);
+            std::vector<SchemaField> out;
+            for (const auto& id : melt.id_columns()) {
+                std::optional<ColumnType> type;
+                if (const auto* field = input.find(id)) {
+                    type = field->type;
+                }
+                out.push_back(SchemaField{.name = id, .type = type});
+            }
+            out.push_back(SchemaField{.name = "variable", .type = ColumnType::String});
+            std::optional<ColumnType> value_type;
+            if (input.is_known()) {
+                std::vector<std::string> measures(melt.measure_columns().begin(),
+                                                  melt.measure_columns().end());
+                if (measures.empty()) {  // empty list melts every non-id column
+                    for (const auto& field : input.fields()) {
+                        const bool is_id =
+                            std::any_of(melt.id_columns().begin(), melt.id_columns().end(),
+                                        [&](const std::string& n) { return n == field.name; });
+                        if (!is_id) {
+                            measures.push_back(field.name);
+                        }
+                    }
+                }
+                bool consistent = !measures.empty();
+                for (std::size_t i = 0; i < measures.size(); ++i) {
+                    const auto* field = input.find(measures[i]);
+                    const std::optional<ColumnType> t = field ? field->type : std::nullopt;
+                    if (i == 0) {
+                        value_type = t;
+                    } else if (value_type != t) {
+                        consistent = false;
+                        break;
+                    }
+                }
+                if (!consistent) {
+                    value_type = std::nullopt;
+                }
+            }
+            out.push_back(SchemaField{.name = "value", .type = value_type});
+            return SchemaInfo::known(std::move(out));
+        }
+
         case NodeKind::Cov:
-        case NodeKind::Corr:
+        case NodeKind::Corr: {
+            // Output: a leading `column: String` then one `Float64` column per
+            // numeric input column. Determinable only from a fully-typed closed
+            // input (we must know exactly which columns are numeric).
+            const SchemaInfo input = child_schema(node, sources);
+            if (!input.is_known() || input.is_open()) {
+                return SchemaInfo::unknown();
+            }
+            std::vector<SchemaField> out;
+            out.push_back(SchemaField{.name = "column", .type = ColumnType::String});
+            for (const auto& field : input.fields()) {
+                if (!field.type.has_value()) {
+                    return SchemaInfo::unknown();  // can't tell if this column is numeric
+                }
+                if (is_numeric(*field.type)) {
+                    out.push_back(SchemaField{.name = field.name, .type = ColumnType::Float64});
+                }
+            }
+            return SchemaInfo::known(std::move(out));
+        }
+
+        case NodeKind::Resample: {
+            // Output: a time-bucket column (Timestamp, named after the input's
+            // time index) + group keys + one column per aggregate. The bucket
+            // column's name is the input's time index, which is not part of the
+            // static schema, so the result is OPEN (its full column set is not
+            // statically pinned down).
+            const auto& rs = static_cast<const ResampleNode&>(node);
+            const SchemaInfo input = child_schema(node, sources);
+            std::vector<SchemaField> out;
+            for (const auto& key : rs.group_by()) {
+                std::optional<ColumnType> type;
+                if (const auto* field = input.find(key.name)) {
+                    type = field->type;
+                }
+                out.push_back(SchemaField{.name = key.name, .type = type});
+            }
+            for (const auto& spec : rs.aggregations()) {
+                out.push_back(
+                    SchemaField{.name = spec.alias, .type = agg_result_type(spec, input)});
+            }
+            return SchemaInfo::known(std::move(out), /*open=*/true);
+        }
+
+        // Data-dependent output columns or not yet modelled: Unknown is sound.
+        case NodeKind::Dcast:
         case NodeKind::Transpose:
         case NodeKind::Matmul:
         case NodeKind::Model:

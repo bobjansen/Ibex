@@ -253,6 +253,17 @@ equivalents (or run the pass before fusion).
 - Removing the runtime `validate_table_type` path — it remains the fallback for
   `Unknown` and the implementation of the ascription check.
 
+## Follow-ups (post-merge candidates)
+
+- **Schemas across `let` bindings.** Today a schema flows through a single
+  pipeline expression but not across `let`: a let-bound table is re-read as an
+  opaque `ScanNode` in later statements, so references fall back to runtime
+  validation. Carrying each binding's inferred schema into the `SourceSchemas`
+  env (keyed by the binding name) would make static checking span statements —
+  the natural next increment, and the one the `demo/schema` demo motivates.
+- **Named schema aliases** (`type X = { ... }`) to avoid repeating column lists.
+- **More operators** (`melt`/`cov`/`corr`/`resample`) modelled in `infer_schema`.
+
 ## Open Questions
 
 - Store `SchemaInfo` on the node, or in a side table keyed by `NodeId`? Side

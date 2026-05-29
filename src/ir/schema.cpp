@@ -359,4 +359,106 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
     return SchemaInfo::unknown();
 }
 
+namespace {
+
+auto missing_column(std::string_view clause, const std::string& name) -> std::string {
+    return std::string(clause) + ": column '" + name + "' not found in input";
+}
+
+}  // namespace
+
+auto check_column_refs(const Node& node, const SourceSchemas& sources)
+    -> std::optional<std::string> {
+    if (node.kind() == NodeKind::Program) {
+        const auto& program = static_cast<const ProgramNode&>(node);
+        for (const auto& pre : program.preamble()) {
+            if (auto err = check_column_refs(*pre, sources)) {
+                return err;
+            }
+        }
+        return check_column_refs(program.main_node(), sources);
+    }
+
+    for (const auto& child : node.children()) {
+        if (auto err = check_column_refs(*child, sources)) {
+            return err;
+        }
+    }
+
+    // Input schema of a single-input operator. Checks run only when it is Known.
+    const SchemaInfo input = node.children().empty()
+                                 ? SchemaInfo::unknown()
+                                 : infer_schema(*node.children().front(), sources);
+    if (!input.is_known()) {
+        return std::nullopt;
+    }
+
+    switch (node.kind()) {
+        case NodeKind::Project:
+            for (const auto& ref : static_cast<const ProjectNode&>(node).columns()) {
+                if (input.find(ref.name) == nullptr) {
+                    return missing_column("select", ref.name);
+                }
+            }
+            break;
+        case NodeKind::Order:
+            for (const auto& key : static_cast<const OrderNode&>(node).keys()) {
+                if (input.find(key.name) == nullptr) {
+                    return missing_column("order", key.name);
+                }
+            }
+            break;
+        case NodeKind::Rename:
+            for (const auto& spec : static_cast<const RenameNode&>(node).renames()) {
+                if (input.find(spec.old_name) == nullptr) {
+                    return missing_column("rename", spec.old_name);
+                }
+            }
+            break;
+        case NodeKind::Aggregate: {
+            const auto& agg = static_cast<const AggregateNode&>(node);
+            for (const auto& key : agg.group_by()) {
+                if (input.find(key.name) == nullptr) {
+                    return missing_column("by", key.name);
+                }
+            }
+            for (const auto& spec : agg.aggregations()) {
+                // Count takes no source column; computed inputs are materialised
+                // upstream and may legitimately be absent from this input.
+                if (spec.func == AggFunc::Count || spec.column.name.empty()) {
+                    continue;
+                }
+                if (input.find(spec.column.name) == nullptr) {
+                    return missing_column("aggregate", spec.column.name);
+                }
+            }
+            break;
+        }
+        case NodeKind::Head:
+            for (const auto& ref : static_cast<const HeadNode&>(node).group_by()) {
+                if (input.find(ref.name) == nullptr) {
+                    return missing_column("by", ref.name);
+                }
+            }
+            break;
+        case NodeKind::Tail:
+            for (const auto& ref : static_cast<const TailNode&>(node).group_by()) {
+                if (input.find(ref.name) == nullptr) {
+                    return missing_column("by", ref.name);
+                }
+            }
+            break;
+        case NodeKind::Update:
+            for (const auto& ref : static_cast<const UpdateNode&>(node).group_by()) {
+                if (input.find(ref.name) == nullptr) {
+                    return missing_column("by", ref.name);
+                }
+            }
+            break;
+        default:
+            break;
+    }
+    return std::nullopt;
+}
+
 }  // namespace ibex::ir

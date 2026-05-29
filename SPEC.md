@@ -1772,6 +1772,19 @@ trades[select { x = price * 2, y = x + 1 }]  // ERROR: 'x' not in scope
 
 To reference a computed column, use a separate block or `let` binding.
 
+### 6.6 Static Validation of Column References
+
+When the schema of a block's operand is **statically known** (a `Table { ... }`
+literal, an `as`-ascribed expression — Section 3.6 — or a pipeline built on
+one), a reference to a column the operand does not provide is reported as a
+**compile-time (lowering) error** rather than a runtime one. This applies to the
+column-only clause positions: `select`/`order`/`rename` targets, `by` group
+keys, and aggregate source columns. `filter` and computed `select`/`update`
+expressions are not statically rejected this way, because a bare identifier
+there may resolve to a lexical (scalar) binding rather than a column. When the
+operand's schema is not statically known (e.g. an I/O source without an
+ascription), these references are validated at run time as before.
+
 ---
 
 ## 7. Aggregation Rules

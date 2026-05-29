@@ -3447,6 +3447,11 @@ auto lower(const Program& program) -> LowerResult {
     if (!lowered.has_value()) {
         return lowered;
     }
+    // Validate column references against statically known schemas before the
+    // optimizer fuses nodes (the pass understands the un-fused operators).
+    if (auto err = ir::check_column_refs(*lowered.value())) {
+        return std::unexpected(LowerError{.message = *err});
+    }
 
     const auto optimization_context = build_optimization_context(*effects);
     ir::OptimizationStats optimization_stats;
@@ -3458,7 +3463,13 @@ auto lower(const Program& program) -> LowerResult {
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
     Lowerer lowerer(&context.bindings, context.compile_time_lists, context.table_externs,
                     context.sink_externs, context.table_extern_decls);
-    return lowerer.lower_expression(expr);
+    auto lowered = lowerer.lower_expression(expr);
+    if (lowered.has_value()) {
+        if (auto err = ir::check_column_refs(*lowered.value())) {
+            return std::unexpected(LowerError{.message = *err});
+        }
+    }
+    return lowered;
 }
 
 }  // namespace ibex::parser

@@ -420,6 +420,26 @@ TEST_CASE("Lower rejects an impossible ascription over a known input") {
     }
 }
 
+TEST_CASE("Lower rejects missing column references over a known schema") {
+    // Column-only clause positions are validated at lower time when the input
+    // schema is statically known (here, a Table literal).
+    auto rejects = [](const char* src, const char* needle) {
+        auto program = require_parse(src);
+        auto result = parser::lower(program);
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find(needle) != std::string::npos);
+    };
+    rejects("Table { a = [1] }[select { b }];", "b");
+    rejects("Table { a = [1] }[order { b }];", "b");
+    rejects("Table { a = [1] }[rename { x = b }];", "b");
+    rejects("Table { a = [1] }[select { a }, order { b }];", "b");
+
+    SECTION("valid references lower cleanly") {
+        auto program = require_parse("Table { a = [1], b = [2] }[select { a }, order { a }];");
+        REQUIRE(parser::lower(program).has_value());
+    }
+}
+
 TEST_CASE("Lower rename with multiple renames") {
     auto program = require_parse("df[rename { cost = price, amount = qty }];");
     auto result = parser::lower(program);

@@ -365,22 +365,73 @@ auto missing_column(std::string_view clause, const std::string& name) -> std::st
     return std::string(clause) + ": column '" + name + "' not found in input";
 }
 
+// Collect the column names referenced by a filter predicate. Function callees
+// (FilterCall) are not columns and are skipped; only FilterColumn names count.
+void collect_filter_columns(const FilterExpr& expr, std::vector<std::string>& out) {
+    std::visit(
+        [&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, FilterColumn>) {
+                out.push_back(node.name);
+            } else if constexpr (std::is_same_v<T, FilterArith> || std::is_same_v<T, FilterCmp> ||
+                                 std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
+                collect_filter_columns(*node.left, out);
+                collect_filter_columns(*node.right, out);
+            } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
+                                 std::is_same_v<T, FilterIsNotNull>) {
+                collect_filter_columns(*node.operand, out);
+            } else if constexpr (std::is_same_v<T, FilterCall>) {
+                for (const auto& arg : node.args) {
+                    collect_filter_columns(*arg, out);
+                }
+            }
+        },
+        expr.node);
+}
+
+// Collect the column names referenced by a computed-field expression.
+void collect_expr_columns(const Expr& expr, std::vector<std::string>& out) {
+    std::visit(
+        [&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ColumnRef>) {
+                out.push_back(node.name);
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                collect_expr_columns(*node.left, out);
+                collect_expr_columns(*node.right, out);
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                for (const auto& arg : node.args) {
+                    collect_expr_columns(*arg, out);
+                }
+                for (const auto& named : node.named_args) {
+                    collect_expr_columns(*named.value, out);
+                }
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                for (const auto& key : node.order_keys) {
+                    out.push_back(key.name);
+                }
+            }
+        },
+        expr.node);
+}
+
 }  // namespace
 
-auto check_column_refs(const Node& node, const SourceSchemas& sources)
+auto check_column_refs(const Node& node, const SourceSchemas& sources,
+                       const std::unordered_set<std::string>& lexical_names, bool check_expressions)
     -> std::optional<std::string> {
     if (node.kind() == NodeKind::Program) {
         const auto& program = static_cast<const ProgramNode&>(node);
         for (const auto& pre : program.preamble()) {
-            if (auto err = check_column_refs(*pre, sources)) {
+            if (auto err = check_column_refs(*pre, sources, lexical_names, check_expressions)) {
                 return err;
             }
         }
-        return check_column_refs(program.main_node(), sources);
+        return check_column_refs(program.main_node(), sources, lexical_names, check_expressions);
     }
 
     for (const auto& child : node.children()) {
-        if (auto err = check_column_refs(*child, sources)) {
+        if (auto err = check_column_refs(*child, sources, lexical_names, check_expressions)) {
             return err;
         }
     }
@@ -391,6 +442,33 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources)
                                  : infer_schema(*node.children().front(), sources);
     if (!input.is_known()) {
         return std::nullopt;
+    }
+
+    // A name in an expression position is valid if it is a column of the input
+    // or any in-scope lexical binding (scalar etc.).
+    auto resolvable = [&](const std::string& name) {
+        return input.find(name) != nullptr || lexical_names.contains(name);
+    };
+
+    if (check_expressions && node.kind() == NodeKind::Filter) {
+        std::vector<std::string> refs;
+        collect_filter_columns(static_cast<const FilterNode&>(node).predicate(), refs);
+        for (const auto& name : refs) {
+            if (!resolvable(name)) {
+                return missing_column("filter", name);
+            }
+        }
+    }
+    if (check_expressions && node.kind() == NodeKind::Update) {
+        std::vector<std::string> refs;
+        for (const auto& field : static_cast<const UpdateNode&>(node).fields()) {
+            collect_expr_columns(field.expr, refs);
+        }
+        for (const auto& name : refs) {
+            if (!resolvable(name)) {
+                return missing_column("update", name);
+            }
+        }
     }
 
     switch (node.kind()) {

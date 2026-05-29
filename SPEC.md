@@ -643,9 +643,9 @@ as the reader's exact output schema (add `*` if the reader may yield more
 columns), so a call like `read_typed(...)[select { typo }]` is checked
 statically against the declared columns.
 
-> Note: the runtime check is enforced on the interpreter/REPL execution path.
-> Generated C++ (the `ibex_compile` path) currently treats the ascription as a
-> transparent identity and does not yet re-validate at run time.
+The runtime check is enforced on both execution paths: the interpreter/REPL and
+generated C++ (the `ibex_compile` path emits a validating `ibex::ops::ascribe`
+call).
 
 ---
 

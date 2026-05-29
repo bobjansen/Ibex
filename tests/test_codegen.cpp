@@ -558,3 +558,28 @@ TEST_CASE("emitter: escape quotes in extern call arg", "[codegen]") {
     auto out = emit_to_string(*root);
     CHECK(contains(out, R"(path/with \"quotes\".csv)"));
 }
+
+// --- Schema ascription --------------------------------------------------------
+
+TEST_CASE("emitter: ascription emits a validating ops::ascribe call", "[codegen]") {
+    ir::Builder b;
+    auto asc = b.ascribe({ir::SchemaField{.name = "a", .type = ir::ColumnType::Int64},
+                          ir::SchemaField{.name = "b", .type = ir::ColumnType::Float64}},
+                         /*open=*/false);
+    asc->add_child(make_source(b, "iris.csv"));
+    auto out = emit_to_string(*asc);
+    CHECK(contains(out, "ibex::ops::ascribe("));
+    CHECK(contains(out, R"(ibex::ir::SchemaField{"a", ibex::ir::ColumnType::Int64})"));
+    CHECK(contains(out, "ibex::ir::ColumnType::Float64"));
+    CHECK(contains(out, ", false)"));  // exact (forbids extras)
+}
+
+TEST_CASE("emitter: wildcard ascription emits open=true", "[codegen]") {
+    ir::Builder b;
+    auto asc = b.ascribe({ir::SchemaField{.name = "a", .type = ir::ColumnType::Int64}},
+                         /*open=*/true);
+    asc->add_child(make_source(b, "iris.csv"));
+    auto out = emit_to_string(*asc);
+    CHECK(contains(out, "ibex::ops::ascribe("));
+    CHECK(contains(out, ", true)"));  // wildcard (allows extras)
+}

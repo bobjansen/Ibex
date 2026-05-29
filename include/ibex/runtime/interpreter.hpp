@@ -231,7 +231,7 @@ class ExternRegistry;
 
 [[nodiscard]] auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
                                const std::vector<std::string>& keys,
-                               const ir::FilterExpr* predicate = nullptr,
+                               const ir::Expr* predicate = nullptr,
                                const ScalarRegistry* scalars = nullptr)
     -> std::expected<Table, std::string>;
 

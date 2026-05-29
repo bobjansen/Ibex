@@ -497,40 +497,25 @@ auto missing_column(std::string_view clause, const std::string& name) -> std::st
     return std::string(clause) + ": column '" + name + "' not found in input";
 }
 
-// Collect the column names referenced by a filter predicate. Function callees
-// (FilterCall) are not columns and are skipped; only FilterColumn names count.
-void collect_filter_columns(const FilterExpr& expr, std::vector<std::string>& out) {
-    std::visit(
-        [&](const auto& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, FilterColumn>) {
-                out.push_back(node.name);
-            } else if constexpr (std::is_same_v<T, FilterArith> || std::is_same_v<T, FilterCmp> ||
-                                 std::is_same_v<T, FilterAnd> || std::is_same_v<T, FilterOr>) {
-                collect_filter_columns(*node.left, out);
-                collect_filter_columns(*node.right, out);
-            } else if constexpr (std::is_same_v<T, FilterNot> || std::is_same_v<T, FilterIsNull> ||
-                                 std::is_same_v<T, FilterIsNotNull>) {
-                collect_filter_columns(*node.operand, out);
-            } else if constexpr (std::is_same_v<T, FilterCall>) {
-                for (const auto& arg : node.args) {
-                    collect_filter_columns(*arg, out);
-                }
-            }
-        },
-        expr.node);
-}
-
-// Collect the column names referenced by a computed-field expression.
+// Collect the column names referenced by an expression (value or predicate).
+// Function callees and bound scalars are filtered out by the caller against the
+// schema / lexical bindings; here we just gather every ColumnRef name.
 void collect_expr_columns(const Expr& expr, std::vector<std::string>& out) {
     std::visit(
         [&](const auto& node) {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ColumnRef>) {
                 out.push_back(node.name);
-            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
                 collect_expr_columns(*node.left, out);
                 collect_expr_columns(*node.right, out);
+            } else if constexpr (std::is_same_v<T, LogicalExpr>) {
+                collect_expr_columns(*node.left, out);
+                if (node.right) {  // null for unary Not
+                    collect_expr_columns(*node.right, out);
+                }
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                collect_expr_columns(*node.operand, out);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 for (const auto& arg : node.args) {
                     collect_expr_columns(*arg, out);
@@ -586,7 +571,7 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
 
     if (check_expressions && node.kind() == NodeKind::Filter) {
         std::vector<std::string> refs;
-        collect_filter_columns(static_cast<const FilterNode&>(node).predicate(), refs);
+        collect_expr_columns(static_cast<const FilterNode&>(node).predicate(), refs);
         for (const auto& name : refs) {
             if (!resolvable(name)) {
                 return missing_column("filter", name);

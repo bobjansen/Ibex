@@ -35,9 +35,9 @@ TEST_CASE("Lower filter and select to IR") {
     REQUIRE(fp->columns()[0].name == "price");
 
     // Predicate is a FilterCmp with a FilterColumn on the left referencing "price".
-    const auto* cmp = std::get_if<ibex::ir::FilterCmp>(&fp->predicate().node);
+    const auto* cmp = std::get_if<ibex::ir::CompareExpr>(&fp->predicate().node);
     REQUIRE(cmp != nullptr);
-    const auto* col = std::get_if<ibex::ir::FilterColumn>(&cmp->left->node);
+    const auto* col = std::get_if<ibex::ir::ColumnRef>(&cmp->left->node);
     REQUIRE(col != nullptr);
     REQUIRE(col->name == "price");
 

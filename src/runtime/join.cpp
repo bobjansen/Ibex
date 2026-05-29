@@ -145,7 +145,7 @@ auto asof_not_timeframe_error(const Table& left, const Table& right) -> std::str
 }  // namespace
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
-                     const std::vector<std::string>& keys, const ir::FilterExpr* predicate,
+                     const std::vector<std::string>& keys, const ir::Expr* predicate,
                      const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator)
     -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {

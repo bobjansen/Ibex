@@ -28,30 +28,27 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.
 
-[[nodiscard]] auto filter(const runtime::Table& t, ir::FilterExprPtr pred) -> runtime::Table;
+[[nodiscard]] auto filter(const runtime::Table& t, ir::Expr pred) -> runtime::Table;
 
-// ─── FilterExpr builders ──────────────────────────────────────────────────────
-//  Convenience factories for constructing filter expression trees in emitted
-//  and test code.  Each returns a heap-allocated FilterExprPtr (unique_ptr).
+// ─── Predicate builders ───────────────────────────────────────────────────────
+//  Convenience factories for constructing boolean predicate expressions
+//  (`ir::Expr`) in emitted and test code.
 
-[[nodiscard]] auto filter_col(std::string name) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_int(std::int64_t v) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_dbl(double v) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_bool(bool v) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_str(std::string v) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_date(Date v) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_timestamp(Timestamp v) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_arith(ir::ArithmeticOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
-    -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_call(std::string callee, std::vector<ir::FilterExprPtr> args)
-    -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::FilterExprPtr l, ir::FilterExprPtr r)
-    -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_and(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_or(ir::FilterExprPtr l, ir::FilterExprPtr r) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_not(ir::FilterExprPtr operand) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_is_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr;
-[[nodiscard]] auto filter_is_not_null(ir::FilterExprPtr operand) -> ir::FilterExprPtr;
+[[nodiscard]] auto filter_col(std::string name) -> ir::Expr;
+[[nodiscard]] auto filter_int(std::int64_t v) -> ir::Expr;
+[[nodiscard]] auto filter_dbl(double v) -> ir::Expr;
+[[nodiscard]] auto filter_bool(bool v) -> ir::Expr;
+[[nodiscard]] auto filter_str(std::string v) -> ir::Expr;
+[[nodiscard]] auto filter_date(Date v) -> ir::Expr;
+[[nodiscard]] auto filter_timestamp(Timestamp v) -> ir::Expr;
+[[nodiscard]] auto filter_arith(ir::ArithmeticOp op, ir::Expr l, ir::Expr r) -> ir::Expr;
+[[nodiscard]] auto filter_call(std::string callee, std::vector<ir::Expr> args) -> ir::Expr;
+[[nodiscard]] auto filter_cmp(ir::CompareOp op, ir::Expr l, ir::Expr r) -> ir::Expr;
+[[nodiscard]] auto filter_and(ir::Expr l, ir::Expr r) -> ir::Expr;
+[[nodiscard]] auto filter_or(ir::Expr l, ir::Expr r) -> ir::Expr;
+[[nodiscard]] auto filter_not(ir::Expr operand) -> ir::Expr;
+[[nodiscard]] auto filter_is_null(ir::Expr operand) -> ir::Expr;
+[[nodiscard]] auto filter_is_not_null(ir::Expr operand) -> ir::Expr;
 
 [[nodiscard]] auto project(const runtime::Table& t, const std::vector<std::string>& col_names)
     -> runtime::Table;
@@ -159,7 +156,7 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 
 [[nodiscard]] auto join_with_predicate(const runtime::Table& left, const runtime::Table& right,
                                        ir::JoinKind kind, const std::vector<std::string>& keys,
-                                       ir::FilterExprPtr predicate) -> runtime::Table;
+                                       ir::Expr predicate) -> runtime::Table;
 
 void print(const runtime::Table& t, std::ostream& out = std::cout);
 

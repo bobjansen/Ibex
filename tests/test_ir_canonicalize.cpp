@@ -13,14 +13,12 @@ namespace {
 auto make_filter(ir::NodeId id) -> ir::NodePtr {
     // Use a non-trivial predicate (`x == 1`) so canonicalize R17 doesn't
     // simplify the Filter away — these tests want the structural Filter node.
-    auto col =
-        std::make_unique<ir::FilterExpr>(ir::FilterExpr{.node = ir::FilterColumn{.name = "x"}});
-    auto lit = std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{.node = ir::FilterLiteral{.value = std::int64_t{1}}});
-    auto pred = std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        .node = ir::FilterCmp{
-            .op = ir::CompareOp::Eq, .left = std::move(col), .right = std::move(lit)}});
-    return std::make_unique<ir::FilterNode>(id, std::move(pred));
+    auto col = std::make_shared<ir::Expr>(ir::Expr{.node = ir::ColumnRef{.name = "x"}});
+    auto lit = std::make_shared<ir::Expr>(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}});
+    auto pred = std::make_shared<ir::Expr>(
+        ir::Expr{.node = ir::CompareExpr{
+                     .op = ir::CompareOp::Eq, .left = std::move(col), .right = std::move(lit)}});
+    return std::make_unique<ir::FilterNode>(id, std::move(*pred));
 }
 
 auto make_order(ir::NodeId id, std::vector<ir::OrderKey> keys) -> ir::NodePtr {
@@ -222,14 +220,13 @@ namespace {
 
 auto make_filter_cmp_col(ir::NodeId id, std::string col_name, std::int64_t threshold)
     -> ir::NodePtr {
-    auto left = std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{.node = ir::FilterColumn{.name = std::move(col_name)}});
-    auto right = std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{.node = ir::FilterLiteral{.value = threshold}});
-    auto cmp = std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        .node = ir::FilterCmp{
-            .op = ir::CompareOp::Lt, .left = std::move(left), .right = std::move(right)}});
-    return std::make_unique<ir::FilterNode>(id, std::move(cmp));
+    auto left =
+        std::make_shared<ir::Expr>(ir::Expr{.node = ir::ColumnRef{.name = std::move(col_name)}});
+    auto right = std::make_shared<ir::Expr>(ir::Expr{.node = ir::Literal{.value = threshold}});
+    auto cmp = std::make_shared<ir::Expr>(
+        ir::Expr{.node = ir::CompareExpr{
+                     .op = ir::CompareOp::Lt, .left = std::move(left), .right = std::move(right)}});
+    return std::make_unique<ir::FilterNode>(id, std::move(*cmp));
 }
 
 }  // namespace
@@ -274,8 +271,8 @@ TEST_CASE("canonicalize R11: Filter(Rename(x)) bubbles Rename up with remapped p
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
     // The predicate's column ref should now reference the pre-rename name "k".
     const auto& filter = static_cast<const ir::FilterNode&>(*out->children().front());
-    const auto& cmp = std::get<ir::FilterCmp>(filter.predicate().node);
-    const auto& col = std::get<ir::FilterColumn>(cmp.left->node);
+    const auto& cmp = std::get<ir::CompareExpr>(filter.predicate().node);
+    const auto& col = std::get<ir::ColumnRef>(cmp.left->node);
     REQUIRE(col.name == "k");
 }
 
@@ -337,14 +334,13 @@ TEST_CASE("canonicalize R14: Tail(Tail(x)) collapses to tighter bound", "[ir][ca
 namespace {
 
 auto make_filter_eq_const(ir::NodeId id, std::string col_name, std::int64_t value) -> ir::NodePtr {
-    auto left = std::make_unique<ir::FilterExpr>(
-        ir::FilterExpr{.node = ir::FilterColumn{.name = std::move(col_name)}});
-    auto right =
-        std::make_unique<ir::FilterExpr>(ir::FilterExpr{.node = ir::FilterLiteral{.value = value}});
-    auto eq = std::make_unique<ir::FilterExpr>(ir::FilterExpr{
-        .node = ir::FilterCmp{
-            .op = ir::CompareOp::Eq, .left = std::move(left), .right = std::move(right)}});
-    return std::make_unique<ir::FilterNode>(id, std::move(eq));
+    auto left =
+        std::make_shared<ir::Expr>(ir::Expr{.node = ir::ColumnRef{.name = std::move(col_name)}});
+    auto right = std::make_shared<ir::Expr>(ir::Expr{.node = ir::Literal{.value = value}});
+    auto eq = std::make_shared<ir::Expr>(
+        ir::Expr{.node = ir::CompareExpr{
+                     .op = ir::CompareOp::Eq, .left = std::move(left), .right = std::move(right)}});
+    return std::make_unique<ir::FilterNode>(id, std::move(*eq));
 }
 
 }  // namespace
@@ -390,24 +386,24 @@ TEST_CASE("canonicalize composes R3, R11, R1: Filter(Order(Rename(x)))", "[ir][c
 
 namespace {
 
-auto fexpr(ir::FilterExpr e) -> ir::FilterExprPtr {
-    return std::make_unique<ir::FilterExpr>(std::move(e));
+auto fexpr(ir::Expr e) -> ir::ExprPtr {
+    return std::make_shared<ir::Expr>(std::move(e));
 }
 
-auto blit(bool b) -> ir::FilterExprPtr {
-    return fexpr({.node = ir::FilterLiteral{.value = b}});
+auto blit(bool b) -> ir::ExprPtr {
+    return fexpr({.node = ir::Literal{.value = b}});
 }
 
-auto ilit(std::int64_t v) -> ir::FilterExprPtr {
-    return fexpr({.node = ir::FilterLiteral{.value = v}});
+auto ilit(std::int64_t v) -> ir::ExprPtr {
+    return fexpr({.node = ir::Literal{.value = v}});
 }
 
-auto col_ref(std::string name) -> ir::FilterExprPtr {
-    return fexpr({.node = ir::FilterColumn{.name = std::move(name)}});
+auto col_ref(std::string name) -> ir::ExprPtr {
+    return fexpr({.node = ir::ColumnRef{.name = std::move(name)}});
 }
 
-auto make_filter_with(ir::NodeId id, ir::FilterExprPtr pred) -> ir::NodePtr {
-    return std::make_unique<ir::FilterNode>(id, std::move(pred));
+auto make_filter_with(ir::NodeId id, ir::ExprPtr pred) -> ir::NodePtr {
+    return std::make_unique<ir::FilterNode>(id, std::move(*pred));
 }
 
 }  // namespace
@@ -430,21 +426,26 @@ TEST_CASE("canonicalize R17: Filter(false) becomes Head(0)", "[ir][canonicalize]
 TEST_CASE("canonicalize R17: x AND true -> x; NOT NOT x -> x", "[ir][canonicalize]") {
     // (col == 5) AND true  →  col == 5
     auto eq = fexpr(
-        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(5)}});
-    auto pred = fexpr({.node = ir::FilterAnd{.left = std::move(eq), .right = blit(true)}});
+        {.node = ir::CompareExpr{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(5)}});
+    auto pred = fexpr({.node = ir::LogicalExpr{
+                           .op = ir::LogicalOp::And, .left = std::move(eq), .right = blit(true)}});
     auto tree = with_child(make_filter_with({1}, std::move(pred)), make_scan({2}, "t"));
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Filter);
     const auto& f = static_cast<const ir::FilterNode&>(*out);
-    const auto* cmp = std::get_if<ir::FilterCmp>(&f.predicate().node);
+    const auto* cmp = std::get_if<ir::CompareExpr>(&f.predicate().node);
     REQUIRE(cmp != nullptr);
     REQUIRE(cmp->op == ir::CompareOp::Eq);
 
     // NOT NOT (col == 5)  →  col == 5
     auto eq2 = fexpr(
-        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(5)}});
-    auto nn = fexpr({.node = ir::FilterNot{
-                         .operand = fexpr({.node = ir::FilterNot{.operand = std::move(eq2)}})}});
+        {.node = ir::CompareExpr{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(5)}});
+    auto nn = fexpr(
+        {.node = ir::LogicalExpr{.op = ir::LogicalOp::Not,
+                                 .left = fexpr({.node = ir::LogicalExpr{.op = ir::LogicalOp::Not,
+                                                                        .left = std::move(eq2),
+                                                                        .right = nullptr}}),
+                                 .right = nullptr}});
     auto tree2 = with_child(make_filter_with({3}, std::move(nn)), make_scan({4}, "t"));
     auto out2 = ir::canonicalize(std::move(tree2));
     REQUIRE(out2->kind() == ir::NodeKind::Filter);
@@ -452,8 +453,8 @@ TEST_CASE("canonicalize R17: x AND true -> x; NOT NOT x -> x", "[ir][canonicaliz
 
 TEST_CASE("canonicalize R17: literal-only comparison folds to bool", "[ir][canonicalize]") {
     // 5 == 5 → true → Filter dropped
-    auto pred =
-        fexpr({.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = ilit(5), .right = ilit(5)}});
+    auto pred = fexpr(
+        {.node = ir::CompareExpr{.op = ir::CompareOp::Eq, .left = ilit(5), .right = ilit(5)}});
     auto tree = with_child(make_filter_with({1}, std::move(pred)), make_scan({2}, "t"));
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Scan);
@@ -462,17 +463,17 @@ TEST_CASE("canonicalize R17: literal-only comparison folds to bool", "[ir][canon
 TEST_CASE("canonicalize R17: arithmetic on literals folds", "[ir][canonicalize]") {
     // (col == 2 + 3) → (col == 5), still a non-trivial Filter.
     auto add = fexpr(
-        {.node = ir::FilterArith{.op = ir::ArithmeticOp::Add, .left = ilit(2), .right = ilit(3)}});
+        {.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Add, .left = ilit(2), .right = ilit(3)}});
     auto pred =
-        fexpr({.node = ir::FilterCmp{
+        fexpr({.node = ir::CompareExpr{
                    .op = ir::CompareOp::Eq, .left = col_ref("c"), .right = std::move(add)}});
     auto tree = with_child(make_filter_with({1}, std::move(pred)), make_scan({2}, "t"));
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Filter);
     const auto& f = static_cast<const ir::FilterNode&>(*out);
-    const auto* cmp = std::get_if<ir::FilterCmp>(&f.predicate().node);
+    const auto* cmp = std::get_if<ir::CompareExpr>(&f.predicate().node);
     REQUIRE(cmp != nullptr);
-    const auto* lit = std::get_if<ir::FilterLiteral>(&cmp->right->node);
+    const auto* lit = std::get_if<ir::Literal>(&cmp->right->node);
     REQUIRE(lit != nullptr);
     REQUIRE(std::get<std::int64_t>(lit->value) == 5);
 }
@@ -509,9 +510,9 @@ TEST_CASE("canonicalize R16: Tail(Order(x)) fuses to TopK(Last) preserving group
 
 TEST_CASE("canonicalize R19: adjacent Filters merge into Filter(AND)", "[ir][canonicalize]") {
     auto p_outer = fexpr(
-        {.node = ir::FilterCmp{.op = ir::CompareOp::Gt, .left = col_ref("a"), .right = ilit(0)}});
-    auto p_inner = fexpr(
-        {.node = ir::FilterCmp{.op = ir::CompareOp::Lt, .left = col_ref("b"), .right = ilit(10)}});
+        {.node = ir::CompareExpr{.op = ir::CompareOp::Gt, .left = col_ref("a"), .right = ilit(0)}});
+    auto p_inner = fexpr({.node = ir::CompareExpr{
+                              .op = ir::CompareOp::Lt, .left = col_ref("b"), .right = ilit(10)}});
     auto tree =
         with_child(make_filter_with({1}, std::move(p_outer)),
                    with_child(make_filter_with({2}, std::move(p_inner)), make_scan({3}, "t")));
@@ -519,7 +520,9 @@ TEST_CASE("canonicalize R19: adjacent Filters merge into Filter(AND)", "[ir][can
     REQUIRE(out->kind() == ir::NodeKind::Filter);
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
     const auto& f = static_cast<const ir::FilterNode&>(*out);
-    REQUIRE(std::holds_alternative<ir::FilterAnd>(f.predicate().node));
+    const auto* logical = std::get_if<ir::LogicalExpr>(&f.predicate().node);
+    REQUIRE(logical != nullptr);
+    REQUIRE(logical->op == ir::LogicalOp::And);
 }
 
 namespace {
@@ -540,7 +543,7 @@ TEST_CASE("canonicalize R18: Filter on group_by column pushes below Aggregate",
           "[ir][canonicalize]") {
     // Filter(g == 1, Aggregate(group_by=[g], [sum(x) as s], scan))
     auto pred = fexpr(
-        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("g"), .right = ilit(1)}});
+        {.node = ir::CompareExpr{.op = ir::CompareOp::Eq, .left = col_ref("g"), .right = ilit(1)}});
     std::vector<ir::AggSpec> aggs;
     aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
                                .column = ir::ColumnRef{.name = "x", .source = {0}},
@@ -562,7 +565,7 @@ TEST_CASE("canonicalize R18: Filter on agg alias stays above Aggregate (HAVING-s
           "[ir][canonicalize]") {
     // Filter(s > 5, Aggregate(group_by=[g], [sum(x) as s], scan))
     auto pred = fexpr(
-        {.node = ir::FilterCmp{.op = ir::CompareOp::Gt, .left = col_ref("s"), .right = ilit(5)}});
+        {.node = ir::CompareExpr{.op = ir::CompareOp::Gt, .left = col_ref("s"), .right = ilit(5)}});
     std::vector<ir::AggSpec> aggs;
     aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
                                .column = ir::ColumnRef{.name = "x", .source = {0}},
@@ -579,7 +582,7 @@ TEST_CASE("canonicalize R18: Filter does not push past Aggregate with empty grou
           "[ir][canonicalize]") {
     // Filter(c == 1, Aggregate(group_by=[], [sum(x) as s], scan))
     auto pred = fexpr(
-        {.node = ir::FilterCmp{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(1)}});
+        {.node = ir::CompareExpr{.op = ir::CompareOp::Eq, .left = col_ref("c"), .right = ilit(1)}});
     std::vector<ir::AggSpec> aggs;
     aggs.push_back(ir::AggSpec{.func = ir::AggFunc::Sum,
                                .column = ir::ColumnRef{.name = "x", .source = {0}},

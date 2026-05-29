@@ -765,16 +765,29 @@ class Parser {
                 continue;
             }
             if (match(TokenKind::KeywordAs)) {
-                auto type = parse_type();
-                if (!type.has_value()) {
-                    return nullptr;
-                }
-                if (type->kind != Type::Kind::DataFrame && type->kind != Type::Kind::TimeFrame) {
-                    return fail_expr(previous(),
-                                     "'as' ascription requires a DataFrame or TimeFrame type");
+                Type type;
+                if (check(TokenKind::LBrace)) {
+                    // Sugar: `expr as { fields }` desugars to
+                    // `expr as DataFrame<{ fields }>`.
+                    auto schema = parse_schema_type();
+                    if (!schema.has_value()) {
+                        return nullptr;
+                    }
+                    type = Type{.kind = Type::Kind::DataFrame, .arg = std::move(*schema)};
+                } else {
+                    auto parsed = parse_type();
+                    if (!parsed.has_value()) {
+                        return nullptr;
+                    }
+                    if (parsed->kind != Type::Kind::DataFrame &&
+                        parsed->kind != Type::Kind::TimeFrame) {
+                        return fail_expr(previous(),
+                                         "'as' ascription requires a DataFrame or TimeFrame type");
+                    }
+                    type = std::move(*parsed);
                 }
                 auto ascribe = std::make_unique<Expr>();
-                ascribe->node = AscribeExpr{.base = std::move(expr), .type = std::move(*type)};
+                ascribe->node = AscribeExpr{.base = std::move(expr), .type = std::move(type)};
                 expr = std::move(ascribe);
                 continue;
             }

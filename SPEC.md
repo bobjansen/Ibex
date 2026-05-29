@@ -1804,10 +1804,11 @@ To reference a computed column, use a separate block or `let` binding.
 
 ### 6.6 Static Validation of Column References
 
-When the schema of a block's operand is **statically known** (a `Table { ... }`
-literal, an `as`-ascribed expression — Section 3.6 — or a pipeline built on
-one), a reference to a column the operand does not provide is reported as a
-**compile-time (lowering) error** rather than a runtime one.
+When the schema of a block's operand is **statically known and closed** (a
+`Table { ... }` literal, an exact `as`-ascribed expression — Section 3.6 — a
+typed reader, or a pipeline built on one), a reference to a column the operand
+does not provide is reported as a **compile-time (lowering) error** rather than
+a runtime one.
 
 The **column-only** positions — `select`/`order`/`rename` targets, `by` group
 keys, and aggregate source columns — are always validated this way: a name there
@@ -1821,7 +1822,9 @@ column of the operand nor any in-scope binding. A reference that resolves to a
 binding (e.g. `filter price > threshold`) is accepted.
 
 When the operand's schema is not statically known (e.g. an I/O source without an
-ascription), all of these references are validated at run time as before.
+ascription), or is **open** (a `*` wildcard schema, which permits unlisted
+columns), these references are validated at run time as before — an absent name
+is not provably missing when extra columns may exist.
 
 ---
 

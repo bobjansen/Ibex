@@ -2526,7 +2526,7 @@ The bundled I/O plugins are:
 |--------|--------|--------|--------|
 | `csv`  | `read_csv(path)` | `write_csv(df, path)` | RFC 4180 CSV, optional custom delimiter, optional no-header mode |
 | `json` | `read_json(path)` | `write_json(df, path)` | JSON array-of-objects / JSON-Lines |
-| `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet |
+| `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet; local files and `s3://` object reads via Arrow |
 
 A common example using the bundled CSV plugin:
 
@@ -2544,6 +2544,17 @@ let iris = read_csv("iris.csv");
 
 `read_csv` infers column types from the input file (Int64, Float64, or String
 per column). The resulting schema is implementation-defined.
+
+The bundled Parquet plugin accepts local file paths and S3 object URIs in
+`read_parquet`. S3 credentials and profiles are resolved by the AWS SDK through
+the usual environment, config-file, and instance-metadata mechanisms; URI query
+parameters such as `region` and `endpoint_override` are passed to Arrow's S3
+filesystem.
+
+```
+import "parquet";
+let prices = read_parquet("s3://market-data/prices.parquet?region=us-east-1");
+```
 
 The bundled CSV plugin also supports:
 

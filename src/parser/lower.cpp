@@ -2624,8 +2624,33 @@ class Lowerer {
                         inlining_active_.erase(call->callee);
                         return result;
                     }
-                    return std::unexpected(
-                        LowerError{.message = "unknown aggregate function: " + call->callee});
+                    // Generic scalar call wrapping aggregate result(s): lower
+                    // each argument in agg-expression context (so any nested
+                    // aggregate calls reduce to AggSpec column refs) and emit
+                    // the call as a post-aggregate scalar expression in the
+                    // trailing update.
+                    ir::CallExpr lowered_call;
+                    lowered_call.callee = call->callee;
+                    lowered_call.args.reserve(call->args.size());
+                    for (const auto& arg : call->args) {
+                        auto lowered_arg = lower_agg_expr(*arg);
+                        if (!lowered_arg.has_value()) {
+                            return std::unexpected(lowered_arg.error());
+                        }
+                        lowered_call.args.push_back(
+                            ir::make_expr_ptr(std::move(lowered_arg.value())));
+                    }
+                    lowered_call.named_args.reserve(call->named_args.size());
+                    for (const auto& narg : call->named_args) {
+                        auto lowered_val = lower_agg_expr(*narg.value);
+                        if (!lowered_val.has_value()) {
+                            return std::unexpected(lowered_val.error());
+                        }
+                        lowered_call.named_args.push_back(ir::NamedArg{
+                            .name = narg.name,
+                            .value = ir::make_expr_ptr(std::move(lowered_val.value()))});
+                    }
+                    return ir::Expr{.node = std::move(lowered_call)};
                 }
                 std::string alias = make_temp();
                 if (call->callee == "count") {
@@ -2906,13 +2931,13 @@ class Lowerer {
         return node;
     }
 
-    /// If `name` is a user function whose parameters are all `Series<T>`, whose
-    /// return type is a scalar, whose body is inlinable (zero or more `let`
-    /// bindings followed by a single expression), and whose trailing
-    /// expression contains at least one built-in aggregate call, returns the
-    /// trailing expression. This is the inference rule that distinguishes an
-    /// aggregate UDF from an ordinary scalar UDF; see
-    /// `plans/aggregate-udf-plan.md`.
+    /// If `name` is a user function with at least one `Series<T>` parameter
+    /// (any other parameters must be scalar), whose return type is a scalar,
+    /// whose body is inlinable (zero or more `let` bindings followed by a
+    /// single expression), and whose trailing expression (or any `let` rhs)
+    /// contains at least one built-in aggregate call, returns the trailing
+    /// expression. This is the inference rule that distinguishes an aggregate
+    /// UDF from an ordinary scalar UDF; see `plans/aggregate-udf-plan.md`.
     auto aggregate_udf_body(const std::string& name) const -> const Expr* {
         auto it = functions_.find(name);
         if (it == functions_.end()) {
@@ -2925,10 +2950,16 @@ class Lowerer {
         if (fn.params.empty()) {
             return nullptr;
         }
+        bool has_series = false;
         for (const auto& p : fn.params) {
-            if (p.type.kind != Type::Kind::Series) {
+            if (p.type.kind == Type::Kind::Series) {
+                has_series = true;
+            } else if (p.type.kind != Type::Kind::Scalar) {
                 return nullptr;
             }
+        }
+        if (!has_series) {
+            return nullptr;
         }
         auto shape = inlinable_body_shape(fn);
         if (!shape.has_value()) {

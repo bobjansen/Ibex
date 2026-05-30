@@ -448,6 +448,11 @@ prices[
 <span class="kw">let</span> n = <span class="fn-name">write_csv</span>(active, <span class="str">"out/active.csv"</span>);
 <span class="fn-name">write_json</span>(active, <span class="str">"out/active.json"</span>);
 <span class="fn-name">write_parquet</span>(active, <span class="str">"out/active.parquet"</span>);</code></pre>
+          <p>
+            The bundled Parquet plugin also reads directly from S3-compatible
+            object storage with the same <code>read_parquet(path)</code> call:
+            <code>read_parquet("s3://market-data/prices.parquet?region=us-east-1")</code>.
+          </p>
         </div>
       </div>
 

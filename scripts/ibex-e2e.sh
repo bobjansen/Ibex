@@ -61,14 +61,12 @@ fi
 
 if [[ "$SKIP_REPL" == false ]]; then
     echo "▸ building csv plugin"
-    mkdir -p "$BUILD_DIR/libraries"
-    BUILD_DIR="$BUILD_DIR" "$IBEX_ROOT/scripts/ibex-plugin-build.sh" \
-        "$IBEX_ROOT/libraries/csv.cpp" -o "$BUILD_DIR/libraries/csv.so"
+    cmake --build "$BUILD_DIR" --parallel --target ibex_csv_plugin
 
     echo "▸ REPL smoke (csv plugin)"
     repl_out="$(mktemp)"
     printf ":load tests/data/iris.ibex\n:quit\n" \
-        | IBEX_LIBRARY_PATH="$BUILD_DIR/libraries" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+        | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
     if rg -n "error:" "$repl_out" >/dev/null; then
         cat "$repl_out" >&2
         rm -f "$repl_out"

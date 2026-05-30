@@ -36,7 +36,7 @@ option(IBEX_BUILD_ADBC "Build the bundled ADBC plugin" OFF)
 option(IBEX_BUILD_KAFKA "Build the bundled Kafka plugin" OFF)
 option(IBEX_KAFKA_VENDOR_AVROCPP "Vendor Apache Avro C++ for Kafka schema-registry decoding" ON)
 set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
-    "Directory for bundled Ibex plugins (csv/gen_tf_data)")
+    "Directory for bundled Ibex plugins")
 
 # Include CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

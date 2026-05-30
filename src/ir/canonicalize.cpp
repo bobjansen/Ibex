@@ -778,8 +778,8 @@ auto try_filter_merge(NodePtr node) -> TryResult {
     Expr p1 = outer.take_predicate();
     Expr p2 = inner.take_predicate();
     Expr combined{.node = LogicalExpr{.op = LogicalOp::And,
-                                      .left = std::make_shared<Expr>(std::move(p1)),
-                                      .right = std::make_shared<Expr>(std::move(p2))}};
+                                      .left = make_expr_ptr(std::move(p1)),
+                                      .right = make_expr_ptr(std::move(p2))}};
     const auto outer_id = node->id();
     NodePtr outer_owned = std::move(node);
     NodePtr inner_owned = take_unique_child(*outer_owned);

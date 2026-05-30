@@ -1,3 +1,5 @@
+find_package(CURL REQUIRED)
+
 add_executable(ibex_repl_bin ibex_repl.cpp)
 
 set_target_properties(ibex_repl_bin PROPERTIES
@@ -33,6 +35,7 @@ target_link_libraries(ibex_bench
         CLI11::CLI11
         fmt::fmt
         fast_float
+        CURL::libcurl
 )
 
 # zorro.hpp (included via rng.hpp) uses compile-time SIMD dispatch.
@@ -132,6 +135,7 @@ target_link_libraries(ibex_bench_csv_read
         Ibex::CompilerOptions
         CLI11::CLI11
         fast_float
+        CURL::libcurl
 )
 
 if(TARGET Ibex::Sanitizers)

@@ -222,12 +222,18 @@ Two coordinated changes are needed:
 
 ### F3 — multi-statement bodies (`let` first, then control flow)
 
-**Status:** today only single-expression bodies inline (both scalar and agg).
-
-Tier 1 — **`let` bodies**: `let x = expr; final_expr`. Fold by extending the
-inline scope with the let bindings (the substitution helper already exists;
-just thread additional name → expr entries). Small change, useful for any
-non-trivial UDF.
+Tier 1 — **`let` bodies** — **DONE.** Bodies of the shape
+`let x = expr; ...; final_expr` (any number of lets followed by a single
+trailing expression) now inline in both scalar and aggregate UDF positions.
+A shared `inlinable_body_shape` helper recognises the shape;
+`inline_scalar_udf` extends the IR-level inline scope with each let's
+lowered RHS in order; `inline_agg_udf_body` folds let RHSes through the
+AST-level substitution map and the final expression substitutes once at the
+end. Aggregate-UDF inference looks at both let RHSes and the trailing
+expression for built-in aggregate calls, and `expr_contains_builtin_aggregate`
+propagates "is aggregate" through agg-UDF calls so a body like
+`let total = sum(p); total;` routes through the aggregate path even though
+the trailing expression itself has no aggregate call. SPEC §10 updated.
 
 Tier 2 — **value-returning control flow** (`if cond then a else b`). Needs a
 value-level conditional IR node, which we don't have today. Could be lowered
@@ -253,9 +259,8 @@ Defer indefinitely; revisit only if a concrete use case appears.
 - Does an `agg fn` compose inside another aggregate or only at the top of a
   `select`/`by`? (Recommend: only as a top-level aggregate in `select`, like
   built-ins.)
-- Sequencing of F1/F2/F3: F1 is done. F3 tier 1 (let bodies) is the
-  smallest remaining improvement; F2 (mixed scalar + Series params with
-  scalar post-agg ops) is medium. Suggest F3.1 → F2.
+- Sequencing of F1/F2/F3: F1 and F3.1 are done. F2 (mixed scalar + Series
+  params with scalar post-agg ops) is the remaining follow-up.
 
 ## Related
 

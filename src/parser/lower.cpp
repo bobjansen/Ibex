@@ -2094,6 +2094,36 @@ class Lowerer {
         return keys;
     }
 
+    /// Shape recognised by the UDF inliner: zero or more `let` bindings
+    /// followed by a single trailing expression. Returned when the body
+    /// matches; nullopt for anything else (multi-statement, tuple destructure,
+    /// expression-then-let, etc.). Lets are inlined by folding into the
+    /// substitution scope so the trailing expression sees `let`-bound names.
+    struct InlinableBodyShape {
+        std::vector<const LetStmt*> lets;
+        const Expr* final_expr;
+    };
+    static auto inlinable_body_shape(const FunctionDecl& fn) -> std::optional<InlinableBodyShape> {
+        if (fn.body.empty()) {
+            return std::nullopt;
+        }
+        const auto* tail = std::get_if<ExprStmt>(&fn.body.back());
+        if (tail == nullptr || tail->expr == nullptr) {
+            return std::nullopt;
+        }
+        InlinableBodyShape out;
+        out.lets.reserve(fn.body.size() - 1);
+        for (std::size_t i = 0; i + 1 < fn.body.size(); ++i) {
+            const auto* lp = std::get_if<LetStmt>(&fn.body[i]);
+            if (lp == nullptr || lp->value == nullptr) {
+                return std::nullopt;
+            }
+            out.lets.push_back(lp);
+        }
+        out.final_expr = tail->expr.get();
+        return out;
+    }
+
     /// Inline an aggregate UDF call at the AST level: returns a clone of the
     /// function body with each parameter IdentifierExpr substituted by the
     /// matching argument expression. The caller re-lowers the result inside
@@ -2102,10 +2132,16 @@ class Lowerer {
     /// Parameter binding mirrors `inline_scalar_udf` (positional, then named,
     /// then defaults). The recursion guard is managed by the caller so this
     /// helper has no side effects on `inlining_active_`.
-    auto inline_agg_udf_body(const CallExpr& call, const Expr& body)
-        -> std::expected<ExprPtr, LowerError> {
+    auto inline_agg_udf_body(const CallExpr& call) -> std::expected<ExprPtr, LowerError> {
         auto it = functions_.find(call.callee);
         const FunctionDecl& fn = *it->second;
+        auto body_shape = inlinable_body_shape(fn);
+        if (!body_shape.has_value()) {
+            return std::unexpected(
+                LowerError{.message = "aggregate function '" + fn.name +
+                                      "' cannot be inlined: only single-expression or "
+                                      "let-prefixed bodies are inlined"});
+        }
         if (call.args.size() > fn.params.size()) {
             return std::unexpected(LowerError{.message = fn.name + ": too many arguments"});
         }
@@ -2136,7 +2172,18 @@ class Lowerer {
             }
             subs.emplace(fn.params[i].name, arg);
         }
-        return substitute_params(body, subs);
+        // Fold let bindings into the substitution map. Each let's rhs is
+        // substituted through the current subs (params + earlier lets), and
+        // the resulting cloned expression is owned in `let_storage` so the
+        // raw pointer in `subs` stays valid through the final substitution.
+        std::vector<ExprPtr> let_storage;
+        let_storage.reserve(body_shape->lets.size());
+        for (const auto* let : body_shape->lets) {
+            auto rhs_sub = substitute_params(*let->value, subs);
+            let_storage.push_back(std::move(rhs_sub));
+            subs.insert_or_assign(let->name, let_storage.back().get());
+        }
+        return substitute_params(*body_shape->final_expr, subs);
     }
 
     /// Inline a call to a scalar user function into a clause expression: bind
@@ -2150,11 +2197,15 @@ class Lowerer {
                 .message = "function '" + fn.name +
                            "' does not return a scalar and cannot be used in this expression"});
         }
-        if (fn.body.size() != 1 || !std::holds_alternative<ExprStmt>(fn.body.front())) {
+        // Accept bodies of the shape: zero or more `let` bindings followed by a
+        // single trailing expression. Other shapes (multiple expressions, tuple
+        // destructuring, control flow) are not yet inlinable.
+        auto body_shape = inlinable_body_shape(fn);
+        if (!body_shape.has_value()) {
             return std::unexpected(LowerError{
                 .message = "scalar function '" + fn.name +
                            "' cannot be used in a clause expression: only single-expression "
-                           "bodies are inlined"});
+                           "or let-prefixed bodies are inlined"});
         }
         if (call.args.size() > fn.params.size()) {
             return std::unexpected(LowerError{.message = fn.name + ": too many arguments"});
@@ -2197,7 +2248,19 @@ class Lowerer {
                                                          "expression"});
         }
         inline_scopes_.push_back(std::move(scope));
-        auto result = lower_expr_to_ir(*std::get<ExprStmt>(fn.body.front()).expr);
+        // Fold any `let x = rhs;` bindings into the inline scope before
+        // lowering the trailing expression. Each `rhs` is lowered against the
+        // scope built up so far, so later lets and the body see the bindings.
+        for (const auto* let : body_shape->lets) {
+            auto lowered_rhs = lower_expr_to_ir(*let->value);
+            if (!lowered_rhs.has_value()) {
+                inline_scopes_.pop_back();
+                inlining_active_.erase(fn.name);
+                return std::unexpected(lowered_rhs.error());
+            }
+            inline_scopes_.back().insert_or_assign(let->name, std::move(lowered_rhs.value()));
+        }
+        auto result = lower_expr_to_ir(*body_shape->final_expr);
         inline_scopes_.pop_back();
         inlining_active_.erase(fn.name);
         return result;
@@ -2553,7 +2616,8 @@ class Lowerer {
                                 LowerError{.message = "recursive aggregate function '" +
                                                       call->callee + "' cannot be inlined"});
                         }
-                        auto inlined = inline_agg_udf_body(*call, *body);
+                        auto inlined = inline_agg_udf_body(*call);
+                        (void)body;
                         if (!inlined.has_value()) {
                             inlining_active_.erase(call->callee);
                             return std::unexpected(inlined.error());
@@ -2845,10 +2909,12 @@ class Lowerer {
     }
 
     /// If `name` is a user function whose parameters are all `Series<T>`, whose
-    /// return type is a scalar, whose body is a single expression, and whose
-    /// body contains at least one built-in aggregate call, returns the body
-    /// expression. This is the inference rule that distinguishes an aggregate
-    /// UDF from an ordinary scalar UDF; see `plans/aggregate-udf-plan.md`.
+    /// return type is a scalar, whose body is inlinable (zero or more `let`
+    /// bindings followed by a single expression), and whose trailing
+    /// expression contains at least one built-in aggregate call, returns the
+    /// trailing expression. This is the inference rule that distinguishes an
+    /// aggregate UDF from an ordinary scalar UDF; see
+    /// `plans/aggregate-udf-plan.md`.
     auto aggregate_udf_body(const std::string& name) const -> const Expr* {
         auto it = functions_.find(name);
         if (it == functions_.end()) {
@@ -2856,9 +2922,6 @@ class Lowerer {
         }
         const FunctionDecl& fn = *it->second;
         if (fn.return_type.kind != Type::Kind::Scalar) {
-            return nullptr;
-        }
-        if (fn.body.size() != 1 || !std::holds_alternative<ExprStmt>(fn.body.front())) {
             return nullptr;
         }
         if (fn.params.empty()) {
@@ -2869,11 +2932,19 @@ class Lowerer {
                 return nullptr;
             }
         }
-        const Expr& body = *std::get<ExprStmt>(fn.body.front()).expr;
-        if (!expr_contains_builtin_aggregate(body)) {
+        auto shape = inlinable_body_shape(fn);
+        if (!shape.has_value()) {
             return nullptr;
         }
-        return &body;
+        // The aggregate may live in a `let` rhs (e.g. `let total = sum(p)`)
+        // rather than the trailing expression, so check both.
+        const bool let_has_agg = std::ranges::any_of(shape->lets, [&](const LetStmt* l) {
+            return expr_contains_builtin_aggregate(*l->value);
+        });
+        if (!let_has_agg && !expr_contains_builtin_aggregate(*shape->final_expr)) {
+            return nullptr;
+        }
+        return shape->final_expr;
     }
 
     auto expr_contains_builtin_aggregate(const Expr& expr) const -> bool {
@@ -2881,8 +2952,12 @@ class Lowerer {
             if (parse_agg_func(call->callee).has_value()) {
                 return true;
             }
-            if (const Expr* body = aggregate_udf_body(call->callee)) {
-                return expr_contains_builtin_aggregate(*body);
+            // A call to a UDF recognised as an aggregate UDF should propagate
+            // "contains aggregate" to its callers (otherwise a body shaped
+            // like `let total = sum(p); total;` would not be detected because
+            // the trailing expression itself has no aggregate call).
+            if (aggregate_udf_body(call->callee) != nullptr) {
+                return true;
             }
             return std::ranges::any_of(
                 call->args, [&](const auto& arg) { return expr_contains_builtin_aggregate(*arg); });

@@ -185,6 +185,7 @@ auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept 
 #endif
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
                              Column<bool>::word_type* dst_words, std::size_t& out_bit) noexcept
     -> void {
@@ -1314,18 +1315,29 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                         if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
                                       std::is_same_v<ColT, Column<std::string>>) {
                             result.reserve(n);
-                            for (std::size_t row = 0; row < n; ++row) {
+                            auto push_default = [&] {
                                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                                    result.push_back(is_lag
-                                                         ? (row >= offset ? col[row - offset]
-                                                                          : std::string_view{})
-                                                         : (row + offset < n ? col[row + offset]
-                                                                             : std::string_view{}));
+                                    result.push_back(std::string_view{});
                                 } else {
                                     using ValueT = typename ColT::value_type;
-                                    result.push_back(
-                                        is_lag ? (row >= offset ? col[row - offset] : ValueT{})
-                                               : (row + offset < n ? col[row + offset] : ValueT{}));
+                                    result.push_back(ValueT{});
+                                }
+                            };
+                            if (is_lag) {
+                                for (std::size_t row = 0; row < n; ++row) {
+                                    if (row < offset) {
+                                        push_default();
+                                    } else {
+                                        result.push_back(col[row - offset]);
+                                    }
+                                }
+                            } else {
+                                for (std::size_t row = 0; row < n; ++row) {
+                                    if (row + offset >= n) {
+                                        push_default();
+                                    } else {
+                                        result.push_back(col[row + offset]);
+                                    }
                                 }
                             }
                         } else {
@@ -1857,7 +1869,7 @@ inline void agg_update_moments(AggSlot& slot, double x) {
     const double delta_n2 = delta_n * delta_n;
     const double term1 = delta * delta_n * n1;
     slot.double_value += delta_n;
-    slot.m4 += term1 * delta_n2 * ((n * n) - (3.0 * n) + 3.0) + (6.0 * delta_n2 * slot.m2) -
+    slot.m4 += (term1 * delta_n2 * ((n * n) - (3.0 * n) + 3.0)) + (6.0 * delta_n2 * slot.m2) -
                (4.0 * delta_n * slot.m3);
     slot.m3 += (term1 * delta_n * (n - 2.0)) - (3.0 * delta_n * slot.m2);
     slot.m2 += term1;
@@ -1987,7 +1999,7 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
 
 template <typename Idx>
 auto gather_rows(const Table& input, const std::vector<Idx>& idx,
-                 std::optional<std::vector<ir::OrderKey>> ordering = std::nullopt) -> Table {
+                 const std::vector<ir::OrderKey>* ordering = nullptr) -> Table {
     const std::size_t rows = idx.size();
     Table output;
     output.columns.reserve(input.columns.size());
@@ -2007,7 +2019,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
                     const auto* src_off = src.offsets_data();
                     const auto* src_char = src.chars_data();
                     for (std::size_t pos = 0; pos < rows; ++pos) {
-                        std::size_t si = static_cast<std::size_t>(idx[pos]);
+                        auto si = static_cast<std::size_t>(idx[pos]);
                         total_chars += src_off[si + 1] - src_off[si];
                     }
                     ColT dst;
@@ -2017,7 +2029,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
                     dst_off[0] = 0;
                     std::uint32_t cur = 0;
                     for (std::size_t pos = 0; pos < rows; ++pos) {
-                        std::size_t si = static_cast<std::size_t>(idx[pos]);
+                        auto si = static_cast<std::size_t>(idx[pos]);
                         std::uint32_t len = src_off[si + 1] - src_off[si];
                         std::memcpy(dst_char + cur, src_char + src_off[si], len);
                         cur += len;
@@ -2048,7 +2060,12 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
             output.columns.back().validity = std::move(dst_bm);
         }
     }
-    output.ordering = ordering.has_value() ? std::move(*ordering) : input.ordering;
+
+    if (ordering != nullptr) {
+        output.ordering = *ordering;
+    } else {
+        output.ordering = input.ordering;
+    }
     output.time_index = input.time_index;
     normalize_time_index(output);
     return output;
@@ -2194,11 +2211,11 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
     enum class FlatKind : std::uint8_t { I64, F64, Str };
     struct FlatKey {
-        FlatKind kind;
+        FlatKind kind = FlatKind::I64;
         std::vector<std::uint64_t> u64;  // Int / Date.days / Timestamp.nanos, sign-flipped
         std::vector<double> f64;
         std::vector<std::string_view> str;  // views into original column storage
-        bool ascending;
+        bool ascending = true;
     };
 
     std::vector<FlatKey> flat_keys;
@@ -2259,7 +2276,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
-                return gather_rows(input, idx, resolved_keys);
+                return gather_rows(input, idx, &resolved_keys);
             },
             sort_result);
     }
@@ -2297,7 +2314,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), 0);
     std::stable_sort(idx.begin(), idx.end(), compare_row);
-    return gather_rows(input, idx, std::move(resolved_keys));
+    return gather_rows(input, idx, &resolved_keys);
 }
 
 auto head_table(const Table& input, std::size_t count, const std::vector<ir::ColumnRef>& group_by)
@@ -2795,6 +2812,7 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
     return std::nullopt;
 }
 
+// NOLINTNEXTLINE(readability-function-size)
 auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
                      const std::vector<ir::AggSpec>& aggregations)
     -> std::expected<Table, std::string> {
@@ -4244,8 +4262,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             const std::uint32_t s1 = kacc[1].stride;
             std::uint32_t* const cell_to_gid_data = cell_to_gid.data();
             for (std::size_t row = 0; row < rows; ++row) {
-                const std::uint32_t cell = static_cast<std::uint32_t>(k0[row]) * s0 +
-                                           static_cast<std::uint32_t>(k1[row]) * s1;
+                const std::uint32_t cell = (static_cast<std::uint32_t>(k0[row]) * s0) +
+                                           (static_cast<std::uint32_t>(k1[row]) * s1);
                 std::uint32_t gid = cell_to_gid_data[cell];
                 if (gid == std::numeric_limits<std::uint32_t>::max()) {
                     gid = n_groups_m++;
@@ -4434,10 +4452,8 @@ auto expr_contains_aggregate_call(const ir::Expr& expr) -> bool {
                 }
                 return std::ranges::any_of(
                     node.args, [](const auto& arg) { return expr_contains_aggregate_call(*arg); });
-            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                return expr_contains_aggregate_call(*node.left) ||
-                       expr_contains_aggregate_call(*node.right);
-            } else if constexpr (std::is_same_v<T, ir::CompareExpr>) {
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                 std::is_same_v<T, ir::CompareExpr>) {
                 return expr_contains_aggregate_call(*node.left) ||
                        expr_contains_aggregate_call(*node.right);
             } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
@@ -5343,7 +5359,7 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
     if (!src) {
         return std::unexpected(fname + ": unknown column '" + col_ref->name + "'");
     }
-    std::size_t n = static_cast<std::size_t>(*offset_val);
+    auto n = static_cast<std::size_t>(*offset_val);
     std::size_t rows = input.rows();
     LagLeadResult result;
     result.column = std::visit(
@@ -5354,14 +5370,29 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
                           std::is_same_v<ColT, Column<std::string>>) {
                 // Categorical/string: element-wise fallback (no plain memcpy).
                 out.reserve(rows);
-                for (std::size_t i = 0; i < rows; ++i) {
+                auto push_default = [&] {
                     if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                        out.push_back(is_lag ? (i >= n ? col[i - n] : std::string_view{})
-                                             : (i + n < rows ? col[i + n] : std::string_view{}));
+                        out.push_back(std::string_view{});
                     } else {
                         using T = typename ColT::value_type;
-                        out.push_back(is_lag ? (i >= n ? col[i - n] : T{})
-                                             : (i + n < rows ? col[i + n] : T{}));
+                        out.push_back(T{});
+                    }
+                };
+                if (is_lag) {
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        if (i < n) {
+                            push_default();
+                        } else {
+                            out.push_back(col[i - n]);
+                        }
+                    }
+                } else {
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        if (i + n >= rows) {
+                            push_default();
+                        } else {
+                            out.push_back(col[i + n]);
+                        }
                     }
                 }
             } else {
@@ -6705,10 +6736,15 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 continue;
             }
             if (is_fill_func(call->callee)) {
-                std::expected<FillResult, std::string> res =
-                    call->callee == "fill_null"      ? eval_fill_null(*call, output)
-                    : call->callee == "fill_forward" ? eval_fill_forward(*call, output)
-                                                     : eval_fill_backward(*call, output);
+                auto res = [&]() -> std::expected<FillResult, std::string> {
+                    if (call->callee == "fill_null") {
+                        return eval_fill_null(*call, output);
+                    }
+                    if (call->callee == "fill_forward") {
+                        return eval_fill_forward(*call, output);
+                    }
+                    return eval_fill_backward(*call, output);
+                }();
                 if (!res)
                     return std::unexpected(res.error());
                 if (res->validity)
@@ -7056,10 +7092,15 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 continue;
             }
             if (is_fill_func(call->callee)) {
-                std::expected<FillResult, std::string> res =
-                    call->callee == "fill_null"      ? eval_fill_null(*call, output)
-                    : call->callee == "fill_forward" ? eval_fill_forward(*call, output)
-                                                     : eval_fill_backward(*call, output);
+                auto res = [&]() -> std::expected<FillResult, std::string> {
+                    if (call->callee == "fill_null") {
+                        return eval_fill_null(*call, output);
+                    }
+                    if (call->callee == "fill_forward") {
+                        return eval_fill_forward(*call, output);
+                    }
+                    return eval_fill_backward(*call, output);
+                }();
                 if (!res)
                     return std::unexpected(res.error());
                 if (res->validity)
@@ -9039,16 +9080,13 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     }
 
     auto is_null_row_for_keys = [&](std::size_t row) -> bool {
-        for (const auto& key : resolved_keys) {
-            if (key.entry->validity.has_value() && !(*key.entry->validity)[row]) {
-                return true;
-            }
-        }
-        return false;
+        return std::ranges::any_of(resolved_keys, [row](const auto& key) {
+            return key.entry->validity.has_value() && !(*key.entry->validity)[row];
+        });
     };
 
     auto same_group = [&](std::size_t lhs, std::size_t rhs) -> bool {
-        for (const auto* entry : group_entries) {
+        auto entry_matches = [&](const ColumnEntry* entry) -> bool {
             if (entry->validity.has_value()) {
                 const bool lv = (*entry->validity)[lhs];
                 const bool rv = (*entry->validity)[rhs];
@@ -9056,15 +9094,15 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                     return false;
                 }
                 if (!lv) {
-                    continue;
+                    return true;
                 }
             }
-            if (compare_scalar_for_order(scalar_at_for_order(*entry->column, lhs),
-                                         scalar_at_for_order(*entry->column, rhs)) != 0) {
-                return false;
-            }
-        }
-        return true;
+
+            return compare_scalar_for_order(scalar_at_for_order(*entry->column, lhs),
+                                            scalar_at_for_order(*entry->column, rhs)) == 0;
+        };
+
+        return std::ranges::all_of(group_entries, entry_matches);
     };
 
     auto compare_rows = [&](std::size_t lhs, std::size_t rhs) -> bool {
@@ -9098,13 +9136,10 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         if (lhs_null || rhs_null) {
             return lhs_null == rhs_null;
         }
-        for (const auto& key : resolved_keys) {
-            if (compare_scalar_for_order(scalar_at_for_order(*key.entry->column, lhs),
-                                         scalar_at_for_order(*key.entry->column, rhs)) != 0) {
-                return false;
-            }
-        }
-        return true;
+        return std::ranges::all_of(resolved_keys, [lhs, rhs](const auto& key) {
+            return compare_scalar_for_order(scalar_at_for_order(*key.entry->column, lhs),
+                                            scalar_at_for_order(*key.entry->column, rhs)) == 0;
+        });
     };
 
     std::vector<std::size_t> idx(rows);
@@ -9112,6 +9147,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
         if (!group_entries.empty()) {
             const bool same = same_group(lhs, rhs);
+            // NOLINTNEXTLINE(readability-suspicious-call-argument)
             const bool reverse_same = same_group(rhs, lhs);
             if (!same || !reverse_same) {
                 for (const auto* entry : group_entries) {
@@ -9784,7 +9820,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
 
 class ChunkedOrderedLimitOperator final : public Operator {
    public:
-    enum class KeepMode { First, Last };
+    enum class KeepMode : std::uint8_t { First, Last };
 
     ChunkedOrderedLimitOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys,
                                 std::size_t count, const std::vector<ir::ColumnRef>* group_by,
@@ -9843,7 +9879,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
         std::vector<Entry> heap;
     };
 
-    auto snapshot_row(const Table& chunk, std::size_t row) const -> RowSnapshot {
+    static auto snapshot_row(const Table& chunk, std::size_t row) -> RowSnapshot {
         RowSnapshot snapshot;
         snapshot.values.reserve(chunk.columns.size());
         snapshot.valid.reserve(chunk.columns.size());
@@ -9868,6 +9904,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
 
     auto entry_preferred(const Entry& lhs, const Entry& rhs) const -> bool {
         return keep_mode_ == KeepMode::First ? row_comes_first(lhs, rhs)
+                                             // NOLINTNEXTLINE(readability-suspicious-call-argument)
                                              : row_comes_first(rhs, lhs);
     }
 
@@ -10560,7 +10597,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
    private:
-    enum class Mode { Stream, Swapped };
+    enum class Mode : std::uint8_t { Stream, Swapped };
 
     static constexpr std::size_t kNil = std::numeric_limits<std::size_t>::max();
     // Build-on-right is preferred when right is small enough that probing
@@ -11235,6 +11272,7 @@ class ChunkedAggregateOperator final : public Operator {
         return process_rows_generic(group_entries, agg_entries, rows);
     }
 
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_str(const std::vector<const ColumnEntry*>& group_entries,
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -11286,6 +11324,7 @@ class ChunkedAggregateOperator final : public Operator {
         return gid;
     }
 
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_cat(const std::vector<const ColumnEntry*>& group_entries,
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -11443,6 +11482,7 @@ class ChunkedAggregateOperator final : public Operator {
         return std::nullopt;
     }
 
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_generic(const std::vector<const ColumnEntry*>& group_entries,
                               const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -11975,13 +12015,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 return false;
             }
         }
-        for (const auto& g : *group_by_) {
+        return std::ranges::all_of(*group_by_, [&chunk](const auto& g) {
             const ColumnEntry* entry = find_entry(chunk, g.name);
-            if (entry == nullptr || entry->validity.has_value()) {
-                return false;
-            }
-        }
-        return true;
+            return entry != nullptr && !entry->validity.has_value();
+        });
     }
 
     static auto find_entry(const Chunk& chunk, const std::string& name) -> const ColumnEntry* {
@@ -12201,14 +12238,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
             col);
     }
 
-    auto cells_equal(const std::vector<const ColumnValue*>& key_cols, std::size_t a,
-                     std::size_t b) const -> bool {
-        for (const auto* col : key_cols) {
-            if (!cell_equal(*col, a, b)) {
-                return false;
-            }
-        }
-        return true;
+    [[nodiscard]] static auto cells_equal(const std::vector<const ColumnValue*>& key_cols,
+                                          std::size_t a, std::size_t b) -> bool {
+        return std::ranges::all_of(key_cols,
+                                   [a, b](const auto* col) { return cell_equal(*col, a, b); });
     }
 
     // Accumulate the contiguous row range [start, end) — all one group — into
@@ -12523,6 +12556,7 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
         if (node->kind() != ir::NodeKind::ExternCall) {
             return std::unexpected("program preamble only supports extern calls");
         }
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& ec = static_cast<const ir::ExternCallNode&>(*node);
         auto result = invoke_extern_call(ec, scalars, externs);
         if (!result.has_value()) {

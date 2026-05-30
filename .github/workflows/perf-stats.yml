@@ -7,8 +7,9 @@ name: perf-stats
 # README baseline, which was measured on a fixed machine) are not meaningful
 # here. Instead we build BOTH the base ref and the PR/HEAD on the SAME runner
 # and report the per-query speedup *ratio* — that cancels the runner's absolute
-# speed and measures only the effect of the change. Even ratios wobble on
-# shared hardware, so treat anything within ~±10% as noise.
+# speed and measures only the effect of the change. Shared-runner jitter is
+# accounted for per-query: each row gets a `verdict` of regression/improvement/
+# noise based on whether |delta_ms| exceeds 1.5 × max(base_iqr, target_iqr).
 #
 # Triggers are deliberately conservative (manual, opt-in label, weekly) to
 # respect free-tier minutes — it builds the bench tool twice.
@@ -48,7 +49,9 @@ jobs:
       - name: Generate benchmark data
         # gen_data.py needs numpy + pandas; uv provisions them ephemerally so we
         # don't depend on the runner's system Python having them installed.
-        run: uv run --with numpy --with pandas benchmarking/data/gen_data.py --rows 1000000
+        # 4M rows pushes most per-query timings above ~20ms so transient stalls
+        # on shared CI hardware are amortized across more work.
+        run: uv run --with numpy --with pandas benchmarking/data/gen_data.py --rows 4000000
 
       - name: Determine base ref
         id: base
@@ -72,7 +75,7 @@ jobs:
             --base "${{ steps.base.outputs.ref }}" \
             --target WORKTREE \
             --ibex-suite core,multi,rng,filter \
-            --warmup 2 --iters 8 --repeats 2 \
+            --warmup 3 --iters 12 --repeats 4 \
             2>&1 | tee perf_compare.txt || true
 
       - name: Publish summary
@@ -81,8 +84,9 @@ jobs:
           {
             echo "### Perf A/B — ratio vs \`${{ steps.base.outputs.ref }}\` (same runner)"
             echo ""
-            echo "Informational only — never gates. \`speedup_x\` > 1.0 = faster;"
-            echo "treat anything within ~±10% as runner noise."
+            echo "Informational only — never gates. \`speedup_x\` > 1.0 = faster."
+            echo "\`verdict\` flags regression/improvement only when |delta_ms| exceeds"
+            echo "1.5 × max(base_iqr_ms, target_iqr_ms); otherwise \`noise\`."
             echo ""
             echo '```'
             # The summary table is the tail of the comparison output.

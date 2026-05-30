@@ -373,7 +373,7 @@ auto asof_join(const runtime::Table& left, const runtime::Table& right,
 }
 
 auto join_with_predicate(const runtime::Table& left, const runtime::Table& right, ir::JoinKind kind,
-                         const std::vector<std::string>& keys, ir::Expr predicate)
+                         const std::vector<std::string>& keys, const ir::Expr& predicate)
     -> runtime::Table {
     auto result = runtime::join_tables(left, right, kind, keys, &predicate, g_scalars);
     if (!result) {

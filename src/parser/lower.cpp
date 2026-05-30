@@ -2317,9 +2317,9 @@ class Lowerer {
                 if (!operand.has_value()) {
                     return std::unexpected(operand.error());
                 }
-                return ir::Expr{.node = ir::IsNullExpr{.operand = std::make_shared<ir::Expr>(
-                                                           std::move(operand.value())),
-                                                       .negated = call->callee == "is_not_null"}};
+                return ir::Expr{
+                    .node = ir::IsNullExpr{.operand = ir::make_expr_ptr(std::move(operand.value())),
+                                           .negated = call->callee == "is_not_null"}};
             }
             ir::CallExpr lowered_call;
             lowered_call.callee = call->callee;
@@ -2329,8 +2329,7 @@ class Lowerer {
                 if (!lowered_arg.has_value()) {
                     return std::unexpected(lowered_arg.error());
                 }
-                lowered_call.args.push_back(
-                    std::make_shared<ir::Expr>(std::move(lowered_arg.value())));
+                lowered_call.args.push_back(ir::make_expr_ptr(std::move(lowered_arg.value())));
             }
             lowered_call.named_args.reserve(call->named_args.size());
             for (const auto& narg : call->named_args) {
@@ -2339,8 +2338,7 @@ class Lowerer {
                     return std::unexpected(lowered_val.error());
                 }
                 lowered_call.named_args.push_back(ir::NamedArg{
-                    .name = narg.name,
-                    .value = std::make_shared<ir::Expr>(std::move(lowered_val.value()))});
+                    .name = narg.name, .value = ir::make_expr_ptr(std::move(lowered_val.value()))});
             }
             return ir::Expr{.node = std::move(lowered_call)};
         }
@@ -2473,8 +2471,8 @@ class Lowerer {
             if (!right.has_value()) {
                 return std::unexpected(right.error());
             }
-            auto lhs = std::make_shared<ir::Expr>(std::move(left.value()));
-            auto rhs = std::make_shared<ir::Expr>(std::move(right.value()));
+            auto lhs = ir::make_expr_ptr(std::move(left.value()));
+            auto rhs = ir::make_expr_ptr(std::move(right.value()));
             if (is_compare_op(binary->op)) {
                 return ir::Expr{.node = ir::CompareExpr{
                                     .op = to_compare_op(binary->op), .left = lhs, .right = rhs}};
@@ -2498,7 +2496,7 @@ class Lowerer {
             if (!operand.has_value()) {
                 return std::unexpected(operand.error());
             }
-            auto operand_ptr = std::make_shared<ir::Expr>(std::move(operand.value()));
+            auto operand_ptr = ir::make_expr_ptr(std::move(operand.value()));
             if (unary->op == UnaryOp::Not) {
                 return ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::Not,
                                                         .left = operand_ptr,
@@ -2742,8 +2740,8 @@ class Lowerer {
                 }
                 ir::BinaryExpr bin{
                     .op = op.value(),
-                    .left = std::make_shared<ir::Expr>(std::move(left.value())),
-                    .right = std::make_shared<ir::Expr>(std::move(right.value())),
+                    .left = ir::make_expr_ptr(std::move(left.value())),
+                    .right = ir::make_expr_ptr(std::move(right.value())),
                 };
                 return ir::Expr{.node = std::move(bin)};
             }

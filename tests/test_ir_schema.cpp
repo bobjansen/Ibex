@@ -241,7 +241,7 @@ TEST_CASE("schema: resample over a time-indexed input is closed", "[ir][schema]"
 
 TEST_CASE("schema: comparison/logical/null-test expressions type as Bool", "[ir][schema]") {
     auto col = [](std::string name) {
-        return std::make_shared<ibex::ir::Expr>(
+        return ibex::ir::make_expr_ptr(
             ibex::ir::Expr{.node = ibex::ir::ColumnRef{.name = std::move(name)}});
     };
     std::vector<ibex::ir::FieldSpec> fields;

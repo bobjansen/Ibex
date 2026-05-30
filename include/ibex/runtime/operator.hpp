@@ -47,7 +47,7 @@ struct Chunk {
 
     [[nodiscard]] auto mutable_column(std::size_t pos) -> ColumnValue& {
         auto& column = columns.at(pos).column;
-        if (!column.unique()) {
+        if (column.use_count() != 1) {
             column = std::make_shared<ColumnValue>(*column);
         }
         return *column;

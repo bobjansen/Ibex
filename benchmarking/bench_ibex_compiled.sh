@@ -60,6 +60,9 @@ while [[ $# -gt 0 ]]; do
         --warmup)      WARMUP="$2";      shift 2 ;;
         --iters)       ITERS="$2";       shift 2 ;;
         --out)         OUT="$2";         shift 2 ;;
+        # Accepted-but-ignored: scale_suite passes these to every backend so a
+        # uniform driver works; the compiled path doesn't run those shapes.
+        --reshape-rows|--tf-rows) shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done

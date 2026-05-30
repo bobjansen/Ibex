@@ -38,18 +38,30 @@ cmake -B /ibex/build-release -G Ninja \
 ninja -C /ibex/build-release
 
 # ── Run benchmark suite ───────────────────────────────────────────────────────
+# IBEX_BOTH_THREADING=1: keep the single-threaded (-st) variants for engines
+# that have them (polars-st, duckdb-st, datafusion-st, clickhouse-st), and
+# include pandas + dplyr. This produces a CSV with cells for every engine in
+# both parallelism modes (where the engine supports both) — the reviewer's
+# "apples-to-apples plus best-effort" pair in one launch.
 cd /ibex/benchmarking
+EXTRA_SKIPS=(--skip-ibex-compiled)
+if [[ "${IBEX_BOTH_THREADING:-0}" != "1" ]]; then
+    EXTRA_SKIPS+=(--skip-pandas --skip-dplyr
+                  --skip-duckdb-st --skip-datafusion-st --skip-clickhouse-st)
+fi
+
+TF_ROWS_ARG=()
+if [[ -n "${IBEX_TF_ROWS:-}" ]]; then
+    TF_ROWS_ARG=(--tf-rows "${IBEX_TF_ROWS}")
+fi
+
 IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
     bash run_scale_suite.sh \
         --sizes "${IBEX_SIZES}" \
         --warmup "${IBEX_WARMUP}" \
         --iters "${IBEX_ITERS}" \
-        --skip-ibex-compiled \
-        --skip-pandas \
-        --skip-dplyr \
-        --skip-duckdb-st \
-        --skip-datafusion-st \
-        --skip-clickhouse-st
+        "${TF_ROWS_ARG[@]}" \
+        "${EXTRA_SKIPS[@]}"
 
 # ── Upload results ────────────────────────────────────────────────────────────
 aws s3 cp results/scales.csv \

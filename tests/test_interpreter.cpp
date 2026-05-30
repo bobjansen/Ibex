@@ -101,6 +101,23 @@ class VectorSource final : public runtime::Operator {
 
 }  // namespace
 
+TEST_CASE("Table mutable_column detaches shared column storage", "[runtime][table]") {
+    auto shared = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{1, 2});
+
+    runtime::Table left;
+    left.add_column_shared("x", shared);
+    runtime::Table right;
+    right.add_column_shared("x", shared);
+
+    auto& left_col = std::get<Column<std::int64_t>>(left.mutable_column(0));
+    left_col.push_back(3);
+
+    const auto& right_col = std::get<Column<std::int64_t>>(*right.columns[0].column);
+    REQUIRE(right_col.size() == 2);
+    REQUIRE(std::get<Column<std::int64_t>>(*left.columns[0].column).size() == 3);
+    REQUIRE(left.columns[0].column.get() != right.columns[0].column.get());
+}
+
 TEST_CASE("Interpret filter + select") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{10, 20, 30});

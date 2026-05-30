@@ -27,6 +27,32 @@ struct Chunk {
     std::optional<std::vector<ir::OrderKey>> ordering;
     std::optional<std::string> time_index;
 
+    void add_column(std::string name, ColumnValue column,
+                    std::optional<ValidityBitmap> validity = std::nullopt) {
+        columns.push_back(ColumnEntry{.name = std::move(name),
+                                      .column = std::make_shared<ColumnValue>(std::move(column)),
+                                      .validity = std::move(validity)});
+    }
+
+    void replace_column(std::size_t pos, ColumnValue column) {
+        columns.at(pos).column = std::make_shared<ColumnValue>(std::move(column));
+    }
+
+    void replace_column(std::size_t pos, ColumnValue column,
+                        std::optional<ValidityBitmap> validity) {
+        auto& entry = columns.at(pos);
+        entry.column = std::make_shared<ColumnValue>(std::move(column));
+        entry.validity = std::move(validity);
+    }
+
+    [[nodiscard]] auto mutable_column(std::size_t pos) -> ColumnValue& {
+        auto& column = columns.at(pos).column;
+        if (!column.unique()) {
+            column = std::make_shared<ColumnValue>(*column);
+        }
+        return *column;
+    }
+
     [[nodiscard]] auto rows() const noexcept -> std::size_t {
         if (columns.empty()) {
             return 0;
@@ -145,6 +171,7 @@ class MaterializeOperator {
             }
 
             for (std::size_t i = 0; i < n_cols; ++i) {
+                auto& dst_col = result.mutable_column(i);
                 std::visit(
                     [&](auto& dst) {
                         using Col = std::decay_t<decltype(dst)>;
@@ -160,7 +187,7 @@ class MaterializeOperator {
                             }
                         }
                     },
-                    *result.columns[i].column);
+                    dst_col);
             }
             // `chunk` goes out of scope here, releasing its memory before
             // the next `child_->next()` call.

@@ -264,8 +264,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
     auto materialize_left_identity = [&](const std::vector<std::size_t>& right_idx) {
         for (std::size_t c = 0; c < left.columns.size(); ++c) {
-            *output.columns[c].column = *left.columns[c].column;
-            output.columns[c].validity = left.columns[c].validity;
+            output.replace_column(c, *left.columns[c].column, left.columns[c].validity);
         }
 
         if (!right_out.empty()) {
@@ -276,15 +275,15 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
             if (!has_right_nulls) {
                 for (const auto& item : right_out) {
-                    *output.columns[item.out_index].column =
-                        gather_column(*item.column, right_idx.data(), right_idx.size());
+                    output.replace_column(
+                        item.out_index,
+                        gather_column(*item.column, right_idx.data(), right_idx.size()));
                 }
             } else {
                 for (const auto& item : right_out) {
                     auto [col_out, validity] = gather_column_with_nulls(
                         *item.column, right_idx.data(), right_idx.size(), kNull);
-                    *output.columns[item.out_index].column = std::move(col_out);
-                    output.columns[item.out_index].validity = std::move(validity);
+                    output.replace_column(item.out_index, std::move(col_out), std::move(validity));
                 }
             }
         }
@@ -311,8 +310,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         if (!has_left_nulls) {
             for (std::size_t c = 0; c < left.columns.size(); ++c) {
-                *output.columns[c].column =
-                    gather_column(*left.columns[c].column, left_idx.data(), total);
+                output.replace_column(
+                    c, gather_column(*left.columns[c].column, left_idx.data(), total));
             }
         } else {
             // Build a "safe" index: null positions get row 0 (overwritten below).
@@ -343,12 +342,11 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                             append_value(out_col, *right_key_col, key_right_idx[i]);
                         }
                     }
-                    *output.columns[c].column = std::move(out_col);
+                    output.replace_column(c, std::move(out_col));
                 } else {
                     auto [col_out, validity] = gather_column_with_nulls(
                         *left.columns[c].column, left_idx.data(), total, kNull);
-                    *output.columns[c].column = std::move(col_out);
-                    output.columns[c].validity = std::move(validity);
+                    output.replace_column(c, std::move(col_out), std::move(validity));
                 }
             }
         }
@@ -364,15 +362,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
             if (!has_right_nulls) {
                 for (const auto& item : right_out) {
-                    *output.columns[item.out_index].column =
-                        gather_column(*item.column, right_idx.data(), total);
+                    output.replace_column(item.out_index,
+                                          gather_column(*item.column, right_idx.data(), total));
                 }
             } else {
                 for (const auto& item : right_out) {
                     auto [col_out, validity] =
                         gather_column_with_nulls(*item.column, right_idx.data(), total, kNull);
-                    *output.columns[item.out_index].column = std::move(col_out);
-                    output.columns[item.out_index].validity = std::move(validity);
+                    output.replace_column(item.out_index, std::move(col_out), std::move(validity));
                 }
             }
         }

@@ -269,6 +269,15 @@ aggregate_median() {
             '
         done
     } | sort -t$'\t' -k1,1 -k2,2 -k3,3g | awk -F'\t' '
+        function quantile(key, p,    m, pos, lo, frac) {
+            m = n[key]
+            if (m <= 1) return vals[key, 1]
+            pos = 1 + (m - 1) * p
+            lo = int(pos)
+            frac = pos - lo
+            if (lo >= m) return vals[key, m]
+            return vals[key, lo] + frac * (vals[key, lo + 1] - vals[key, lo])
+        }
         {
             key = $1 "\t" $2
             vals[key, ++n[key]] = $3 + 0.0
@@ -276,18 +285,12 @@ aggregate_median() {
         }
         END {
             OFS = "\t"
-            print "framework", "query", "median_ms", "min_ms", "max_ms", "rows", "samples"
+            print "framework", "query", "median_ms", "iqr_ms", "rows", "samples"
             for (k in n) {
-                m = n[k]
-                if (m % 2 == 1) {
-                    med = vals[k, (m + 1) / 2]
-                } else {
-                    med = (vals[k, m / 2] + vals[k, (m / 2) + 1]) / 2.0
-                }
-                minv = vals[k, 1]
-                maxv = vals[k, m]
+                med = quantile(k, 0.5)
+                iqr = quantile(k, 0.75) - quantile(k, 0.25)
                 split(k, p, "\t")
-                printf "%s\t%s\t%.4f\t%.4f\t%.4f\t%s\t%d\n", p[1], p[2], med, minv, maxv, rows[k], m
+                printf "%s\t%s\t%.4f\t%.4f\t%s\t%d\n", p[1], p[2], med, iqr, rows[k], n[k]
             }
         }
     ' | sort -t$'\t' -k1,1 -k2,2 > "$out_tsv"
@@ -341,26 +344,30 @@ fi
 run_repeated_bench_and_aggregate "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_TSV" "$BASE_LOG"
 run_repeated_bench_and_aggregate "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_TSV" "$TARGET_LOG"
 
-awk -F'\t' '
+# Verdict rule: flag a per-query delta only if its magnitude exceeds NOISE_K
+# times the larger of the two sides' IQRs. Otherwise treat as noise.
+NOISE_K="${NOISE_K:-1.5}"
+
+awk -F'\t' -v noise_k="$NOISE_K" '
     NR == FNR {
         if (FNR == 1) next
         key = $1 "\t" $2
         base[key] = $3 + 0.0
-        base_rng[key] = ($5 + 0.0) - ($4 + 0.0)
-        rows[key] = $6
-        base_n[key] = $7 + 0
+        base_iqr[key] = $4 + 0.0
+        rows[key] = $5
+        base_n[key] = $6 + 0
         next
     }
     FNR == 1 { next }
     {
         key = $1 "\t" $2
         tgt[key] = $3 + 0.0
-        tgt_rng[key] = ($5 + 0.0) - ($4 + 0.0)
-        tgt_n[key] = $7 + 0
+        tgt_iqr[key] = $4 + 0.0
+        tgt_n[key] = $6 + 0
     }
     END {
         OFS = "\t"
-        print "framework", "query", "base_ms", "target_ms", "delta_ms", "delta_pct", "speedup_x", "base_range_ms", "target_range_ms", "base_samples", "target_samples", "rows"
+        print "framework", "query", "base_ms", "target_ms", "delta_ms", "delta_pct", "speedup_x", "base_iqr_ms", "target_iqr_ms", "verdict", "base_samples", "target_samples", "rows"
         for (k in base) {
             if (!(k in tgt)) continue
             b = base[k]
@@ -370,11 +377,18 @@ awk -F'\t' '
             sp = (t != 0.0) ? (b / t) : 0.0
             split(k, p, "\t")
             r = (k in rows) ? rows[k] : ""
-            br = (k in base_rng) ? base_rng[k] : 0.0
-            tr = (k in tgt_rng) ? tgt_rng[k] : 0.0
+            bi = (k in base_iqr) ? base_iqr[k] : 0.0
+            ti = (k in tgt_iqr) ? tgt_iqr[k] : 0.0
             bn = (k in base_n) ? base_n[k] : 0
             tn = (k in tgt_n) ? tgt_n[k] : 0
-            print p[1], p[2], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.3f", sp), sprintf("%.4f", br), sprintf("%.4f", tr), bn, tn, r
+            noise = bi; if (ti > noise) noise = ti
+            ad = d; if (ad < 0) ad = -ad
+            if (ad > noise_k * noise) {
+                verdict = (d > 0) ? "regression" : "improvement"
+            } else {
+                verdict = "noise"
+            }
+            print p[1], p[2], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.3f", sp), sprintf("%.4f", bi), sprintf("%.4f", ti), verdict, bn, tn, r
         }
     }
 ' "$BASE_TSV" "$TARGET_TSV" | sort -t$'\t' -k1,1 -k2,2 > "$REPORT_TSV"

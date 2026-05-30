@@ -33,8 +33,15 @@ iters           <- as.integer(parse_arg("--iters",  "5"))
 out_path        <- parse_arg("--out", "results/r.tsv")
 fill_rows       <- as.integer(parse_arg("--fill-rows", "4000000"))
 reshape_rows    <- as.integer(parse_arg("--reshape-rows", "100000"))
+tf_rows         <- as.integer(parse_arg("--tf-rows",    "1000000"))
 skip_data_table <- parse_flag("--skip-data-table")
 skip_dplyr      <- parse_flag("--skip-dplyr")
+
+# Honor the cross-engine single-threaded mode set by run_all.sh.
+if (nzchar(Sys.getenv("IBEX_BENCH_SINGLE_THREADED"))) {
+    suppressMessages(library(data.table))
+    setDTthreads(1L)
+}
 
 if (skip_data_table && skip_dplyr) {
     stop("both --skip-data-table and --skip-dplyr are set")
@@ -476,6 +483,87 @@ if (!is.null(csv_lookup_path)) {
         bench("dplyr", "fill_backward",
             function() tb_fill |> tidyr::fill(val, .direction = "up") |>
                 rename(v2 = val))
+    }
+}
+
+# ── TimeFrame rolling + asof ──────────────────────────────────────────────────
+# Data: 1s-spaced timestamps, sawtooth price (matches bench_python tf shape).
+# data.table rolling uses frollmean / frollsum (row-based; 60 rows == 1m here).
+# Asof join uses data.table's roll-join: quotes[trades, ..., roll = TRUE].
+# dplyr/slider's slide_period_mean is the time-aware analogue.
+
+if (tf_rows > 0) {
+    message(sprintf("\nbuilding tf data (%d rows, 1s spacing)...", tf_rows))
+    ts_vec    <- as.POSIXct(seq.int(0L, tf_rows - 1L), origin = "1970-01-01", tz = "UTC")
+    price_vec <- 100.0 + (seq.int(0L, tf_rows - 1L) %% 100L)
+
+    if (!skip_data_table) {
+        dt_tf <- data.table(ts = ts_vec, price = price_vec)
+        message("\n=== data.table (tf rolling) ===")
+        bench("data.table", "tf_rolling_count_1m",
+            function() dt_tf[, c := frollsum(rep(1.0, .N), 60L)][])
+        bench("data.table", "tf_rolling_sum_1m",
+            function() dt_tf[, s := frollsum(price, 60L)][])
+        bench("data.table", "tf_rolling_mean_5m",
+            function() dt_tf[, m := frollmean(price, 300L)][])
+        # frollapply is generic but ~100× slower than the optimized fns.
+        bench("data.table", "tf_rolling_median_1m",
+            function() dt_tf[, med := frollapply(price, 60L, median)][])
+        bench("data.table", "tf_rolling_std_1m",
+            function() dt_tf[, s := frollapply(price, 60L, sd)][])
+        # data.table has no time-aware EWMA; skip (the slot will be blank).
+        bench("data.table", "tf_resample_1m_ohlc",
+            function() dt_tf[, .(open = data.table::first(price),
+                                  high = max(price),
+                                  low  = min(price),
+                                  close = data.table::last(price)),
+                              by = .(bucket = lubridate::floor_date(ts, "minute"))])
+
+        message("\n=== data.table (tf asof) ===")
+        set.seed(42L)
+        sample_idx <- sort(sample.int(tf_rows, size = tf_rows %/% 10L))
+        trades_dt  <- data.table(
+            ts  = as.POSIXct(sample_idx - 1L, origin = "1970-01-01", tz = "UTC") +
+                  runif(length(sample_idx), 0, 0.999),
+            qty = sample.int(99L, length(sample_idx), replace = TRUE))
+        quotes_dt  <- data.table(ts = ts_vec, bid = 99.0 + (price_vec - 100.0) * 0.01)
+        setkey(quotes_dt, ts)
+        setkey(trades_dt, ts)
+        bench("data.table", "tf_asof_join",
+            function() quotes_dt[trades_dt, .(ts, qty, bid),
+                                  on = "ts", roll = TRUE])
+    }
+
+    if (!skip_dplyr) {
+        library(slider)
+        tb_tf <- tibble::tibble(ts = ts_vec, price = price_vec)
+        message("\n=== dplyr (tf rolling) ===")
+        bench("dplyr", "tf_rolling_count_1m",
+            function() tb_tf |> mutate(c = slide_index_dbl(price, ts,
+                                                            ~ length(.x),
+                                                            .before = lubridate::seconds(60))))
+        bench("dplyr", "tf_rolling_sum_1m",
+            function() tb_tf |> mutate(s = slide_index_sum(price, ts,
+                                                            before = lubridate::seconds(60))))
+        bench("dplyr", "tf_rolling_mean_5m",
+            function() tb_tf |> mutate(m = slide_index_mean(price, ts,
+                                                            before = lubridate::seconds(300))))
+        # Median / std via slide_index_dbl + a closure (slower path).
+        bench("dplyr", "tf_rolling_median_1m",
+            function() tb_tf |> mutate(med = slide_index_dbl(price, ts, median,
+                                                              .before = lubridate::seconds(60))))
+        bench("dplyr", "tf_rolling_std_1m",
+            function() tb_tf |> mutate(s = slide_index_dbl(price, ts, sd,
+                                                            .before = lubridate::seconds(60))))
+        bench("dplyr", "tf_resample_1m_ohlc",
+            function() tb_tf |>
+                mutate(bucket = lubridate::floor_date(ts, "minute")) |>
+                group_by(bucket) |>
+                summarise(open  = dplyr::first(price),
+                          high  = max(price),
+                          low   = min(price),
+                          close = dplyr::last(price),
+                          .groups = "drop"))
     }
 }
 

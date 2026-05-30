@@ -60,12 +60,16 @@ QUERY_ORDER = [
     "fill_null",
     "fill_forward",
     "fill_backward",
-    # time-series (ibex only)
+    # time-series (cross-engine: ibex, pandas, polars, duckdb, data.table, dplyr)
     "tf_lag1",
     "tf_rolling_count_1m",
-    "tf_rolling_mean_5m",
     "tf_rolling_sum_1m",
+    "tf_rolling_mean_5m",
+    "tf_rolling_median_1m",
+    "tf_rolling_std_1m",
+    "tf_rolling_ewma_1m",
     "tf_resample_1m_ohlc",
+    "tf_asof_join",
 ]
 
 QUERY_LABEL = {
@@ -98,9 +102,13 @@ QUERY_LABEL = {
     "fill_backward": "fill backward (NOCB)",
     "tf_lag1": "tf lag-1",
     "tf_rolling_count_1m": "tf rolling count 1m",
-    "tf_rolling_mean_5m": "tf rolling mean 5m",
     "tf_rolling_sum_1m": "tf rolling sum 1m",
+    "tf_rolling_mean_5m": "tf rolling mean 5m",
+    "tf_rolling_median_1m": "tf rolling median 1m",
+    "tf_rolling_std_1m": "tf rolling std 1m",
+    "tf_rolling_ewma_1m": "tf rolling EWMA 1m",
     "tf_resample_1m_ohlc": "tf resample 1m OHLC",
+    "tf_asof_join": "tf as-of join (10% sampled)",
 }
 
 
@@ -112,6 +120,11 @@ def load(paths):
     for p in paths:
         with open(p, newline="") as f:
             for row in csv.DictReader(f, delimiter="\t"):
+                # Skip rows from older TSV formats that lack the framework
+                # column (e.g. legacy ibex_v2.tsv / regression sweeps), or
+                # transient header-only files.
+                if "framework" not in row or row["framework"] is None:
+                    continue
                 fw = row["framework"]
                 query = row["query"]
                 try:

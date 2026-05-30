@@ -764,22 +764,18 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     *out_ << "    {\n";
                     *out_ << "        auto& __sub = " << sub_var << ";\n";
                     *out_ << "        if (__sub.columns.size() == 1) {\n";
-                    *out_ << "            auto __entry = __sub.columns[0];\n";
-                    *out_ << "            __entry.name = \"" << cname << "\";\n";
-                    *out_ << "            " << var << ".index[\"" << cname << "\"] = " << var
-                          << ".columns.size();\n";
-                    *out_ << "            " << var << ".columns.push_back(std::move(__entry));\n";
+                    *out_ << "            const auto& __entry = __sub.columns[0];\n";
+                    *out_ << "            " << var << ".add_column_shared(\"" << cname
+                          << "\", __entry.column, __entry.validity);\n";
                     *out_ << "        } else {\n";
                     *out_ << "            auto __it = __sub.index.find(\"" << cname << "\");\n";
                     *out_ << "            if (__it == __sub.index.end())\n";
                     *out_
                         << "                throw std::runtime_error(\"Table constructor: column '"
                         << cname << "' not found in expression result\");\n";
-                    *out_ << "            auto __entry = __sub.columns[__it->second];\n";
-                    *out_ << "            __entry.name = \"" << cname << "\";\n";
-                    *out_ << "            " << var << ".index[\"" << cname << "\"] = " << var
-                          << ".columns.size();\n";
-                    *out_ << "            " << var << ".columns.push_back(std::move(__entry));\n";
+                    *out_ << "            const auto& __entry = __sub.columns[__it->second];\n";
+                    *out_ << "            " << var << ".add_column_shared(\"" << cname
+                          << "\", __entry.column, __entry.validity);\n";
                     *out_ << "        }\n";
                     *out_ << "    }\n";
                     continue;

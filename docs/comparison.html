@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Side-by-side comparison with Pandas, Polars, DuckDB, and R</title>
+  <meta name="description" content="Five small data tasks in Ibex, Pandas, Polars, DuckDB SQL, and R — on the same public NYC taxi dataset, with all snippets runnable from a REPL." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <style>
+    /* Inline tweaks for collapsible language alternatives. */
+    details.lang {
+      margin: 0.75rem 0 0;
+      border: 1px solid var(--card-border, #2a2f3a);
+      border-radius: 8px;
+      background: var(--card-bg, rgba(255,255,255,0.02));
+    }
+    details.lang > summary {
+      cursor: pointer;
+      padding: 0.6rem 0.9rem;
+      font-family: "Space Grotesk", sans-serif;
+      font-weight: 500;
+      list-style: none;
+      user-select: none;
+    }
+    details.lang > summary::-webkit-details-marker { display: none; }
+    details.lang > summary::before {
+      content: "\25B6"; /* right triangle */
+      display: inline-block;
+      width: 1em;
+      margin-right: 0.25rem;
+      transition: transform 0.15s;
+    }
+    details.lang[open] > summary::before { transform: rotate(90deg); }
+    details.lang > pre { margin: 0 0.9rem 0.9rem; }
+    .label-pill {
+      display: inline-block;
+      padding: 0.1rem 0.55rem;
+      margin-right: 0.4rem;
+      border-radius: 999px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      vertical-align: middle;
+    }
+    .pill-ibex   { background: #2a5b9a; color: #fff; }
+    .pill-pandas { background: #314b69; color: #c8e6ff; }
+    .heads-up {
+      padding: 0.9rem 1rem;
+      margin: 1rem 0 0;
+      border-left: 3px solid #f0a500;
+      background: rgba(240, 165, 0, 0.08);
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Docs</a>
+      <a class="nav-link" href="./io.html">I/O</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link active" href="./comparison.html">Comparison</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">Side-by-side</p>
+    <h1>Five small tasks, five languages</h1>
+    <p class="lead">
+      The same five data-shape questions, asked of the same dataset, in
+      <strong>Ibex</strong>, <strong>Pandas</strong>, <strong>Polars</strong>,
+      <strong>DuckDB SQL</strong>, and <strong>R</strong>. No installation
+      beyond each language's own runtime &mdash; every snippet pulls the data
+      straight from a public HTTPS URL, so you can paste any block into a REPL
+      and see the result immediately.
+    </p>
+    <div class="cta-row">
+      <a class="button primary" href="./index.html">Back to docs</a>
+      <a class="button" href="./io.html">I/O guide</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Setup</p>
+    <h2>The dataset and how to read the snippets</h2>
+    <article class="card">
+      <p>
+        January 2024 yellow-cab trips from the NYC Taxi &amp; Limousine
+        Commission &mdash; about 3 million rows, 50&nbsp;MB Parquet, served as
+        a public ZSTD-compressed file from cloudfront. The zone lookup is a
+        separate CSV from the same host.
+      </p>
+<pre><code>https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet
+https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv</code></pre>
+      <p>
+        Each task shows <span class="label-pill pill-ibex">Ibex</span>
+        first, then the <span class="label-pill pill-pandas">Pandas</span>
+        equivalent inline. The Polars, DuckDB, and R versions are tucked into
+        collapsible sections &mdash; click to expand. Every snippet is a leaf
+        expression, written for an interactive REPL where the trailing value
+        auto-prints (Ibex <code>;</code>, Python's <code>&gt;&gt;&gt;</code>,
+        the DuckDB CLI, R's <code>&gt;</code>). All Ibex outputs shown below
+        are real &mdash; captured from running the same script against the
+        live URL.
+      </p>
+      <div class="heads-up">
+        <strong>Heads up &mdash; Pandas + CloudFront.</strong> CloudFront
+        occasionally returns HTTP&nbsp;403 to Python's default
+        <code>urllib</code> user-agent after many requests in a row. If
+        <code>pd.read_parquet(URL)</code> fails with a 403, either download
+        the file once with <code>curl -A 'Mozilla/5.0' &hellip;</code> and
+        point <code>pd.read_parquet</code> at the local copy, or use
+        <code>pyarrow.parquet.read_table(URL).to_pandas()</code> which uses
+        Arrow's HTTP client. Polars (via <code>object_store</code>), DuckDB
+        (via its <code>httpfs</code> extension), and Ibex (via libcurl) don't
+        hit this.
+      </div>
+    </article>
+  </section>
+
+  <!-- ============================== TASK 1 ============================== -->
+  <section class="section">
+    <p class="section-label">Task 1</p>
+    <h2>Trip count and average fare by pickup hour</h2>
+    <p class="section-sub">
+      How does the city's taxi load vary across the 24 hours of the day?
+    </p>
+
+    <article class="card">
+      <h3><span class="label-pill pill-ibex">Ibex</span></h3>
+<pre><code>import "parquet";
+
+let trips = read_parquet(
+  "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet");
+
+trips[head 5];
+
+trips[select { trips = count(), avg_fare = mean(fare_amount) },
+      by { hour = hour(tpep_pickup_datetime) },
+      order { hour asc }];</code></pre>
+<pre><code>rows: 24
++------+--------+----------+
+| hour | trips  | avg_fare |
++------+--------+----------+
+| 0    |  79094 | 19.20266 |
+| 1    |  53627 | 17.52730 |
+| 2    |  37517 | 16.48288 |
+| 3    |  24811 | 18.15013 |
+| 4    |  16742 | 22.51865 |
+| 5    |  18764 | 26.61992 |
+| 6    |  41429 | 21.65040 |
+| 7    |  83719 | 18.53918 |
+| 8    | 117209 | 17.65468 |
+| 9    | 128970 | 17.70842 |
++------+--------+----------+
+... (14 more rows)</code></pre>
+    </article>
+
+    <article class="card">
+      <h3><span class="label-pill pill-pandas">Pandas</span></h3>
+<pre><code>import pandas as pd
+
+trips = pd.read_parquet(
+    "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet")
+
+print(trips.head())
+
+(trips.assign(hour=trips["tpep_pickup_datetime"].dt.hour)
+      .groupby("hour", as_index=False)
+      .agg(trips=("tpep_pickup_datetime", "size"),
+           avg_fare=("fare_amount", "mean"))
+      .sort_values("hour"))</code></pre>
+    </article>
+
+    <details class="lang">
+      <summary>Polars</summary>
+<pre><code>import polars as pl
+
+trips = pl.scan_parquet(
+    "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet")
+
+(trips.group_by(hour=pl.col("tpep_pickup_datetime").dt.hour())
+      .agg(trips=pl.len(), avg_fare=pl.col("fare_amount").mean())
+      .sort("hour")
+      .collect())</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>DuckDB SQL</summary>
+<pre><code>INSTALL httpfs; LOAD httpfs;
+
+SELECT hour(tpep_pickup_datetime) AS hour,
+       count(*)                   AS trips,
+       avg(fare_amount)           AS avg_fare
+FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet'
+GROUP BY hour
+ORDER BY hour;</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>R (arrow + dplyr)</summary>
+<pre><code># R's arrow reads naive Parquet timestamps as UTC and lubridate's hour()
+# returns the hour in the system-local timezone &mdash; pin to UTC first so
+# hour() matches the values stored in the file.
+Sys.setenv(TZ = "UTC")
+library(arrow); library(dplyr); library(lubridate)
+
+trips &lt;- read_parquet(
+  "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet")
+
+trips |&gt;
+  mutate(hour = hour(tpep_pickup_datetime)) |&gt;
+  group_by(hour) |&gt;
+  summarise(trips = n(), avg_fare = mean(fare_amount)) |&gt;
+  arrange(hour)</code></pre>
+    </details>
+  </section>
+
+  <!-- ============================== TASK 2a ============================= -->
+  <section class="section">
+    <p class="section-label">Task 2a</p>
+    <h2>Top 10 pickup zones by revenue</h2>
+    <p class="section-sub">Which pickup zones brought in the most fare revenue?</p>
+
+    <article class="card">
+      <h3><span class="label-pill pill-ibex">Ibex</span></h3>
+<pre><code>let zones = trips[select { revenue = sum(total_amount), n = count() },
+                  by PULocationID];
+
+zones[order { revenue desc }, head 10];</code></pre>
+<pre><code>rows: 10
++--------------+------------+--------+
+| PULocationID | revenue    | n      |
++--------------+------------+--------+
+| 132          | 1.112193e7 | 145240 |   &larr; JFK Airport
+| 138          | 5820970    |  89533 |   &larr; LaGuardia
+| 161          | 3369045    | 143471 |   &larr; Midtown Center
+| 230          | 2793052    | 106324 |
+| 237          | 2776195    | 142708 |
+| 236          | 2729559    | 136465 |
+| 186          | 2471024    | 104523 |
+| 162          | 2441728    | 106717 |
+| 142          | 2185566    | 104080 |
+| 163          | 1980377    |  85692 |
++--------------+------------+--------+</code></pre>
+    </article>
+
+    <article class="card">
+      <h3><span class="label-pill pill-pandas">Pandas</span></h3>
+<pre><code>(trips.groupby("PULocationID", as_index=False)
+      .agg(revenue=("total_amount", "sum"), n=("total_amount", "size"))
+      .sort_values("revenue", ascending=False)
+      .head(10))</code></pre>
+    </article>
+
+    <details class="lang">
+      <summary>Polars</summary>
+<pre><code>(trips.group_by("PULocationID")
+      .agg(revenue=pl.col("total_amount").sum(), n=pl.len())
+      .sort("revenue", descending=True)
+      .head(10)
+      .collect())</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>DuckDB SQL</summary>
+<pre><code>SELECT PULocationID,
+       sum(total_amount) AS revenue,
+       count(*)          AS n
+FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet'
+GROUP BY PULocationID
+ORDER BY revenue DESC
+LIMIT 10;</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>R (arrow + dplyr)</summary>
+<pre><code>trips |&gt;
+  group_by(PULocationID) |&gt;
+  summarise(revenue = sum(total_amount), n = n()) |&gt;
+  arrange(desc(revenue)) |&gt;
+  head(10)</code></pre>
+    </details>
+  </section>
+
+  <!-- ============================== TASK 2b ============================= -->
+  <section class="section">
+    <p class="section-label">Task 2b</p>
+    <h2>Top 3 busiest hours <em>per zone</em></h2>
+    <p class="section-sub">
+      Same idea, but with the twist every analyst eventually hits: <em>top-N
+      inside each group</em>. SQL needs a window function; Pandas pushes you
+      into <code>groupby().apply(lambda x: x.nlargest(...))</code>; Ibex says
+      <code>head 3, by zone</code>.
+    </p>
+
+    <article class="card">
+      <h3><span class="label-pill pill-ibex">Ibex</span></h3>
+<pre><code>let by_zh = trips[select { n = count() },
+                  by { zone = PULocationID,
+                       h    = hour(tpep_pickup_datetime) }];
+
+by_zh[order { n desc }, head 3, by zone];</code></pre>
+<pre><code>rows: ~780  (3 per zone &times; 261 zones)
++------+----+-----+
+| zone | h  | n   |
++------+----+-----+
+|  1   | 17 |  37 |
+|  1   | 14 |  35 |
+|  1   | 15 |  33 |
+|  2   |  5 |   1 |
+|  2   | 22 |   1 |
+|  2   | 23 |   1 |
+|  3   |  6 |  10 |
+|  3   | 12 |   9 |
+|  3   |  8 |   9 |
+...</code></pre>
+    </article>
+
+    <article class="card">
+      <h3><span class="label-pill pill-pandas">Pandas</span></h3>
+<pre><code>by_zh = (trips.assign(h=trips["tpep_pickup_datetime"].dt.hour)
+              .groupby(["PULocationID", "h"], as_index=False)
+              .size().rename(columns={"size": "n",
+                                       "PULocationID": "zone"}))
+
+(by_zh.sort_values("n", ascending=False)
+      .groupby("zone", as_index=False)
+      .head(3))</code></pre>
+    </article>
+
+    <details class="lang">
+      <summary>Polars</summary>
+<pre><code>(trips.group_by(zone="PULocationID",
+                h=pl.col("tpep_pickup_datetime").dt.hour())
+      .agg(n=pl.len())
+      .sort("n", descending=True)
+      .group_by("zone").head(3)
+      .collect())</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>DuckDB SQL</summary>
+<pre><code>WITH counted AS (
+  SELECT PULocationID AS zone,
+         hour(tpep_pickup_datetime) AS h,
+         count(*) AS n,
+         row_number() OVER (PARTITION BY PULocationID
+                            ORDER BY count(*) DESC) AS rk
+  FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet'
+  GROUP BY zone, h
+)
+SELECT zone, h, n FROM counted WHERE rk &lt;= 3;</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>R (arrow + dplyr)</summary>
+<pre><code>Sys.setenv(TZ = "UTC")   # see Task 1 R note
+
+trips |&gt;
+  mutate(h = hour(tpep_pickup_datetime), zone = PULocationID) |&gt;
+  count(zone, h, name = "n") |&gt;
+  group_by(zone) |&gt;
+  slice_max(n, n = 3, with_ties = FALSE)</code></pre>
+    </details>
+  </section>
+
+  <!-- ============================== TASK 3 ============================== -->
+  <section class="section">
+    <p class="section-label">Task 3</p>
+    <h2>Rolling 1-hour average fare at JFK pickups</h2>
+    <p class="section-sub">
+      For every JFK pickup, what was the average fare and trip count in the
+      previous hour? This is the canonical streaming-window shape &mdash; Ibex
+      needs the table promoted to a <code>TimeFrame</code>, then a
+      <code>window</code> clause does the rest.
+    </p>
+
+    <article class="card">
+      <h3><span class="label-pill pill-ibex">Ibex</span></h3>
+<pre><code>let jfk     = trips[filter PULocationID == 132];
+let jfk_ts  = as_timeframe(jfk, "tpep_pickup_datetime");
+
+let smoothed = jfk_ts[window 1h,
+                      update { rolling_avg_fare = rolling_mean(fare_amount),
+                               rolling_trips    = rolling_count() }];
+
+smoothed[select { tpep_pickup_datetime, fare_amount,
+                  rolling_avg_fare, rolling_trips },
+         head 10];</code></pre>
+<pre><code>rows: 10
++-------------------------------+-------------+------------------+---------------+
+| tpep_pickup_datetime          | fare_amount | rolling_avg_fare | rolling_trips |
++-------------------------------+-------------+------------------+---------------+
+| 2024-01-01 00:00:05.000000000 | 70.0        | 70.00000         | 1             |
+| 2024-01-01 00:00:25.000000000 | 70.0        | 70.00000         | 2             |
+| 2024-01-01 00:00:26.000000000 | 51.3        | 63.76667         | 3             |
+| 2024-01-01 00:00:36.000000000 | 26.1        | 54.35000         | 4             |
+| 2024-01-01 00:00:44.000000000 | 68.1        | 57.10000         | 5             |
+| 2024-01-01 00:01:37.000000000 | 99.6        | 64.18333         | 6             |
+| 2024-01-01 00:02:22.000000000 | 70.0        | 65.01429         | 7             |
+| 2024-01-01 00:02:27.000000000 | 10.0        | 58.13750         | 8             |
+| 2024-01-01 00:03:19.000000000 | 70.0        | 59.45556         | 9             |
+| 2024-01-01 00:03:51.000000000 | 33.1        | 56.82000         | 10            |
++-------------------------------+-------------+------------------+---------------+</code></pre>
+    </article>
+
+    <article class="card">
+      <h3><span class="label-pill pill-pandas">Pandas</span></h3>
+<pre><code>jfk = (trips[trips["PULocationID"] == 132]
+       .sort_values("tpep_pickup_datetime")
+       .set_index("tpep_pickup_datetime"))
+
+roll = jfk["fare_amount"].rolling("1h")
+jfk = jfk.assign(rolling_avg_fare=roll.mean(),
+                 rolling_trips=roll.count())
+
+jfk[["fare_amount", "rolling_avg_fare", "rolling_trips"]].head(10)</code></pre>
+    </article>
+
+    <details class="lang">
+      <summary>Polars</summary>
+<pre><code>(trips.filter(pl.col("PULocationID") == 132)
+      .sort("tpep_pickup_datetime")
+      .with_columns(
+          rolling_avg_fare=pl.col("fare_amount")
+              .rolling_mean_by("tpep_pickup_datetime", window_size="1h"),
+          # No `rolling_count_by` in Polars &mdash; sum a column of 1s instead.
+          rolling_trips=pl.col("fare_amount").is_not_null().cast(pl.Int64)
+              .rolling_sum_by("tpep_pickup_datetime", window_size="1h"),
+      )
+      .head(10)
+      .collect())</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>DuckDB SQL</summary>
+<pre><code>SELECT tpep_pickup_datetime, fare_amount,
+       avg(fare_amount) OVER w AS rolling_avg_fare,
+       count(*)         OVER w AS rolling_trips
+FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet'
+WHERE PULocationID = 132
+WINDOW w AS (ORDER BY tpep_pickup_datetime
+             RANGE BETWEEN INTERVAL 1 HOUR PRECEDING AND CURRENT ROW)
+ORDER BY tpep_pickup_datetime
+LIMIT 10;</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>R (arrow + dplyr + slider)</summary>
+<pre><code>Sys.setenv(TZ = "UTC")   # see Task 1 R note
+library(slider); library(lubridate)
+
+trips |&gt;
+  filter(PULocationID == 132) |&gt;
+  arrange(tpep_pickup_datetime) |&gt;
+  mutate(rolling_avg_fare = slide_index_mean(fare_amount, tpep_pickup_datetime,
+                                             before = hours(1)),
+         rolling_trips    = slide_index_dbl(fare_amount, tpep_pickup_datetime,
+                                            ~ length(.x), .before = hours(1))) |&gt;
+  head(10)</code></pre>
+    </details>
+  </section>
+
+  <!-- ============================== TASK 4 ============================== -->
+  <section class="section">
+    <p class="section-label">Task 4</p>
+    <h2>Outlier-trimmed average tip rate by hour</h2>
+    <p class="section-sub">
+      A naive <code>mean(tip_amount / fare_amount)</code> is a mess: zero-fare
+      rows give infinite ratios, refunds give negatives, and the occasional
+      5000% tip (probably a typo) swamps the mean. Strip those first, then
+      average per pickup hour.
+    </p>
+
+    <article class="card">
+      <h3><span class="label-pill pill-ibex">Ibex</span></h3>
+<pre><code>let clean = trips[filter fare_amount &gt; 5.0
+                      &amp;&amp; tip_amount  &gt;= 0.0
+                      &amp;&amp; tip_amount  &lt;  fare_amount];
+
+clean[select { n = count(),
+               avg_tip_rate = mean(tip_amount / fare_amount) },
+      by { hour = hour(tpep_pickup_datetime) },
+      order { hour asc }];</code></pre>
+<pre><code>rows: 24
++------+--------+--------------+
+| hour | n      | avg_tip_rate |
++------+--------+--------------+
+|  0   |  75951 | 0.1922065    |
+|  1   |  51345 | 0.1882492    |
+|  2   |  35676 | 0.1882201    |
+|  3   |  23479 | 0.1773079    |
+|  4   |  15749 | 0.1531954    |
+|  5   |  17893 | 0.1585829    |
+|  6   |  39982 | 0.1642494    |
+|  7   |  81288 | 0.1864541    |
+|  8   | 113806 | 0.1926733    |
+|  9   | 125007 | 0.1959586    |
++------+--------+--------------+
+... (14 more rows)</code></pre>
+    </article>
+
+    <article class="card">
+      <h3><span class="label-pill pill-pandas">Pandas</span></h3>
+<pre><code>clean = trips[(trips["fare_amount"] &gt; 5) &amp;
+              (trips["tip_amount"]  &gt;= 0) &amp;
+              (trips["tip_amount"]  &lt;  trips["fare_amount"])].copy()
+
+clean["tip_rate"] = clean["tip_amount"] / clean["fare_amount"]
+clean["hour"]     = clean["tpep_pickup_datetime"].dt.hour
+
+(clean.groupby("hour", as_index=False)
+      .agg(n=("tip_rate", "size"), avg_tip_rate=("tip_rate", "mean"))
+      .sort_values("hour"))</code></pre>
+    </article>
+
+    <details class="lang">
+      <summary>Polars</summary>
+<pre><code>(trips.filter((pl.col("fare_amount") &gt; 5) &amp;
+              (pl.col("tip_amount")  &gt;= 0) &amp;
+              (pl.col("tip_amount")  &lt;  pl.col("fare_amount")))
+      .group_by(hour=pl.col("tpep_pickup_datetime").dt.hour())
+      .agg(n=pl.len(),
+           avg_tip_rate=(pl.col("tip_amount") / pl.col("fare_amount")).mean())
+      .sort("hour")
+      .collect())</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>DuckDB SQL</summary>
+<pre><code>SELECT hour(tpep_pickup_datetime)        AS hour,
+       count(*)                           AS n,
+       avg(tip_amount / fare_amount)      AS avg_tip_rate
+FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet'
+WHERE fare_amount &gt; 5
+  AND tip_amount  &gt;= 0
+  AND tip_amount  &lt;  fare_amount
+GROUP BY hour
+ORDER BY hour;</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>R (arrow + dplyr)</summary>
+<pre><code>Sys.setenv(TZ = "UTC")   # see Task 1 R note
+
+trips |&gt;
+  filter(fare_amount &gt; 5, tip_amount &gt;= 0, tip_amount &lt; fare_amount) |&gt;
+  mutate(hour     = hour(tpep_pickup_datetime),
+         tip_rate = tip_amount / fare_amount) |&gt;
+  group_by(hour) |&gt;
+  summarise(n = n(), avg_tip_rate = mean(tip_rate)) |&gt;
+  arrange(hour)</code></pre>
+    </details>
+  </section>
+
+  <!-- ============================== TASK 5 ============================== -->
+  <section class="section">
+    <p class="section-label">Task 5</p>
+    <h2>Revenue by borough (join + group)</h2>
+    <p class="section-sub">
+      Locations are encoded as integer zone IDs; borough names live in a
+      second file. Join the two and roll up to borough level.
+    </p>
+
+    <article class="card">
+      <h3><span class="label-pill pill-ibex">Ibex</span></h3>
+<pre><code>import "csv";
+
+let zones  = read_csv(
+  "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv");
+
+let joined = trips join zones on PULocationID == LocationID;
+
+joined[select { revenue = sum(total_amount), n = count() },
+       by Borough,
+       order { revenue desc }];</code></pre>
+<pre><code>rows: 8
++-----------------+------------+---------+
+| Borough         | revenue    | n       |
++-----------------+------------+---------+
+| "Manhattan"     | 5.924753e7 | 2646948 |
+| "Queens"        | 1.863979e7 |  273128 |
+| "Brooklyn"      |   828808.4 |   25258 |
+| "Unknown"       |   304152.4 |   10360 |
+| "Bronx"         |   246496.4 |    6905 |
+| "N/A"           |   154900.9 |    1658 |
+| "EWR"           |    30738.0 |     295 |
+| "Staten Island" |     3966.4 |      72 |
++-----------------+------------+---------+</code></pre>
+    </article>
+
+    <article class="card">
+      <h3><span class="label-pill pill-pandas">Pandas</span></h3>
+<pre><code># keep_default_na=False so the literal string "N/A" (a real Borough value)
+# isn't silently turned into a NaN and dropped at groupby time.
+zones = pd.read_csv(
+    "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv",
+    keep_default_na=False)
+
+joined = trips.merge(zones, left_on="PULocationID", right_on="LocationID",
+                     how="inner")
+
+(joined.groupby("Borough", as_index=False)
+       .agg(revenue=("total_amount", "sum"), n=("total_amount", "size"))
+       .sort_values("revenue", ascending=False))</code></pre>
+    </article>
+
+    <details class="lang">
+      <summary>Polars</summary>
+<pre><code>zones = pl.scan_csv(
+    "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv")
+
+(trips.join(zones, left_on="PULocationID", right_on="LocationID")
+      .group_by("Borough")
+      .agg(revenue=pl.col("total_amount").sum(), n=pl.len())
+      .sort("revenue", descending=True)
+      .collect())</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>DuckDB SQL</summary>
+<pre><code>SELECT z.Borough,
+       sum(t.total_amount) AS revenue,
+       count(*)            AS n
+FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet' t
+JOIN read_csv_auto('https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv') z
+  ON t.PULocationID = z.LocationID
+GROUP BY z.Borough
+ORDER BY revenue DESC;</code></pre>
+    </details>
+
+    <details class="lang">
+      <summary>R (arrow + dplyr)</summary>
+<pre><code>zones &lt;- read_csv_arrow(
+  "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv")
+
+trips |&gt;
+  inner_join(zones, by = c("PULocationID" = "LocationID")) |&gt;
+  group_by(Borough) |&gt;
+  summarise(revenue = sum(total_amount), n = n()) |&gt;
+  arrange(desc(revenue))</code></pre>
+    </details>
+  </section>
+
+  <!-- =============================== TRY IT ============================= -->
+  <section class="section">
+    <p class="section-label">Try it</p>
+    <h2>Run any of this locally</h2>
+    <article class="card">
+      <p>
+        Ibex needs only a build of the REPL and its parquet/csv plugins:
+      </p>
+<pre><code>cmake -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --target ibex ibex_parquet_plugin ibex_csv_plugin
+IBEX_LIBRARY_PATH=build-release/tools ./build-release/tools/ibex</code></pre>
+      <p>
+        Paste any of the Ibex blocks above. Everything else (the Parquet file,
+        the zone lookup CSV) is fetched over HTTPS &mdash; no AWS credentials,
+        no environment setup, no Docker.
+      </p>
+      <p>
+        The other languages each take their normal install
+        (<code>pip install pandas pyarrow polars duckdb</code>,
+        <code>install.packages(c("arrow", "dplyr", "lubridate", "slider"))</code>);
+        the snippets above are otherwise self-contained too.
+      </p>
+    </article>
+  </section>
+
+</main>
+</body>
+</html>

@@ -174,6 +174,41 @@ TEST_CASE("E2E: aggregate UDF with by groups", "[e2e][udf]") {
     CHECK(wavg[1] == Catch::Approx(3.8));
 }
 
+TEST_CASE("E2E: scalar UDF with let bindings inlines", "[e2e][udf]") {
+    auto out =
+        run("fn norm_price(p: Float64, base: Float64) -> Float64 {\n"
+            "  let diff = p - base;\n"
+            "  let scale = 100.0;\n"
+            "  diff * scale;\n"
+            "}\n"
+            "Table { price = [101.0, 102.0, 99.0] }"
+            "[select { delta = norm_price(price, 100.0) }];",
+            {});
+    const auto delta = col_dbl(out, "delta");
+    REQUIRE(delta.size() == 3);
+    CHECK(delta[0] == Catch::Approx(100.0));
+    CHECK(delta[1] == Catch::Approx(200.0));
+    CHECK(delta[2] == Catch::Approx(-100.0));
+}
+
+TEST_CASE("E2E: aggregate UDF with let-folded body computes per group", "[e2e][udf]") {
+    auto out =
+        run("fn wm_pct(p: Series<Float64>, w: Series<Float64>) -> Float64 {\n"
+            "  let num = sum(p * w);\n"
+            "  let den = sum(w);\n"
+            "  100.0 * num / den;\n"
+            "}\n"
+            "Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"
+            "        price = [1.0, 2.0, 3.0, 4.0],\n"
+            "        qty = [1.0, 3.0, 2.0, 8.0] }"
+            "[select { wp = wm_pct(price, qty) }, by sym, order { sym asc }];",
+            {});
+    const auto wp = col_dbl(out, "wp");
+    REQUIRE(wp.size() == 2);
+    CHECK(wp[0] == Catch::Approx(175.0));  // A: 100 * 7 / 4
+    CHECK(wp[1] == Catch::Approx(380.0));  // B: 100 * 38 / 10
+}
+
 TEST_CASE("E2E: update + by broadcasts a compound aggregate expression", "[e2e][update_by]") {
     auto out =
         run("Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"

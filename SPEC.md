@@ -2239,9 +2239,13 @@ built-ins or extern functions. A call to a **scalar** user function in a
 `select` / `update` computed expression (including inside an aggregate argument,
 e.g. `mean(adjust(price))`) is **inlined** at lowering time: its body replaces
 the call with the parameters substituted by the argument expressions. Only
-single-expression bodies inline, and recursion is rejected; a non-scalar
-function, or one with a multi-statement body, used this way is a compile-time
-error. Inlining also applies inside `filter` predicates: the filter expression
+A body of the shape `let x = expr; ...; final_expr` (any number of `let`
+bindings followed by a single trailing expression) is folded inline: each
+`let`'s right-hand side is substituted through the bindings built up so far,
+and the trailing expression sees the parameter and let bindings as if it
+were a single fused expression. Other body shapes (multiple expressions,
+tuple destructuring, control flow) and recursion remain compile-time
+errors; a non-scalar function used in this position is also an error. Inlining also applies inside `filter` predicates: the filter expression
 language is the same `ir::Expr` used by `select`/`update`, so any inlinable
 scalar UDF works in a predicate too. User-defined functions are otherwise
 evaluated at the statement level in the REPL/runtime.

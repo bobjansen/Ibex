@@ -617,9 +617,9 @@ TEST_CASE("REPL rejects a recursive scalar UDF in a clause expression", "[repl][
         "fn f(x: Int) -> Int { f(x); }\nTable { a = [1] }[select { y = f(a) }];", registry));
 }
 
-TEST_CASE("REPL rejects a multi-statement scalar UDF in a clause expression", "[repl][udf]") {
+TEST_CASE("REPL inlines a let-prefixed scalar UDF in a clause expression", "[repl][udf]") {
     ibex::runtime::ExternRegistry registry;
-    REQUIRE_FALSE(ibex::repl::execute_script(
+    REQUIRE(ibex::repl::execute_script(
         "fn g(x: Int) -> Int { let y = x; y; }\nTable { a = [1] }[select { y = g(a) }];",
         registry));
 }

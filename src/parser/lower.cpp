@@ -306,6 +306,55 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
         expr.node);
 }
 
+/// Clone `expr` while substituting any IdentifierExpr whose name appears in
+/// `subs` with a clone of the bound replacement. Used to inline an aggregate
+/// UDF body's parameter references with the call's argument expressions.
+auto substitute_params(const Expr& expr, const std::unordered_map<std::string, const Expr*>& subs)
+    -> ExprPtr {
+    return std::visit(
+        [&](const auto& node) -> ExprPtr {
+            using T = std::decay_t<decltype(node)>;
+            auto out = std::make_unique<Expr>();
+            if constexpr (std::is_same_v<T, IdentifierExpr>) {
+                if (auto it = subs.find(node.name); it != subs.end()) {
+                    return clone_expr(*it->second);
+                }
+                out->node = node;
+            } else if constexpr (std::is_same_v<T, LiteralExpr>) {
+                out->node = node;
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                CallExpr call{.callee = node.callee, .args = {}, .named_args = {}};
+                call.args.reserve(node.args.size());
+                for (const auto& arg : node.args) {
+                    call.args.push_back(substitute_params(*arg, subs));
+                }
+                call.named_args.reserve(node.named_args.size());
+                for (const auto& named : node.named_args) {
+                    call.named_args.push_back(NamedArg{
+                        .name = named.name, .value = substitute_params(*named.value, subs)});
+                }
+                out->node = std::move(call);
+            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                out->node = UnaryExpr{.op = node.op, .expr = substitute_params(*node.expr, subs)};
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                out->node = BinaryExpr{
+                    .op = node.op,
+                    .left = substitute_params(*node.left, subs),
+                    .right = substitute_params(*node.right, subs),
+                };
+            } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                out->node = GroupExpr{.expr = substitute_params(*node.expr, subs)};
+            } else {
+                // Other expression shapes don't appear inside scalar/aggregate
+                // UDF bodies in the supported single-expression form; fall back
+                // to a plain deep clone to keep the substitution total.
+                return clone_expr(expr);
+            }
+            return out;
+        },
+        expr.node);
+}
+
 auto extract_string_list(const Expr& expr) -> std::optional<std::vector<std::string>> {
     const auto* array = std::get_if<ArrayLiteralExpr>(&expr.node);
     if (array == nullptr) {
@@ -2045,6 +2094,51 @@ class Lowerer {
         return keys;
     }
 
+    /// Inline an aggregate UDF call at the AST level: returns a clone of the
+    /// function body with each parameter IdentifierExpr substituted by the
+    /// matching argument expression. The caller re-lowers the result inside
+    /// `lower_agg_expr`, so the body's built-in aggregate calls reduce to
+    /// regular `AggSpec`s through the same machinery as inline aggregates.
+    /// Parameter binding mirrors `inline_scalar_udf` (positional, then named,
+    /// then defaults). The recursion guard is managed by the caller so this
+    /// helper has no side effects on `inlining_active_`.
+    auto inline_agg_udf_body(const CallExpr& call, const Expr& body)
+        -> std::expected<ExprPtr, LowerError> {
+        auto it = functions_.find(call.callee);
+        const FunctionDecl& fn = *it->second;
+        if (call.args.size() > fn.params.size()) {
+            return std::unexpected(LowerError{.message = fn.name + ": too many arguments"});
+        }
+        std::vector<const Expr*> bound(fn.params.size(), nullptr);
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            bound[i] = call.args[i].get();
+        }
+        for (const auto& narg : call.named_args) {
+            const auto param = std::find_if(fn.params.begin(), fn.params.end(),
+                                            [&](const Param& p) { return p.name == narg.name; });
+            if (param == fn.params.end()) {
+                return std::unexpected(LowerError{
+                    .message = fn.name + ": unknown named argument '" + narg.name + "'"});
+            }
+            const auto pos = static_cast<std::size_t>(std::distance(fn.params.begin(), param));
+            if (bound[pos] != nullptr) {
+                return std::unexpected(LowerError{
+                    .message = fn.name + ": duplicate argument for '" + narg.name + "'"});
+            }
+            bound[pos] = narg.value.get();
+        }
+        std::unordered_map<std::string, const Expr*> subs;
+        for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            const Expr* arg = bound[i] != nullptr ? bound[i] : fn.params[i].default_value.get();
+            if (arg == nullptr) {
+                return std::unexpected(LowerError{.message = fn.name + ": missing argument '" +
+                                                             fn.params[i].name + "'"});
+            }
+            subs.emplace(fn.params[i].name, arg);
+        }
+        return substitute_params(body, subs);
+    }
+
     /// Inline a call to a scalar user function into a clause expression: bind
     /// its parameters to the (lowered) argument expressions and lower its body
     /// with those substitutions in scope. Only single-expression bodies inline;
@@ -2398,23 +2492,8 @@ class Lowerer {
             return nullptr;
         };
 
-        std::function<bool(const Expr&)> expr_contains_aggregate;
-        expr_contains_aggregate = [&](const Expr& expr) -> bool {
-            if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
-                if (parse_agg_func(call->callee).has_value()) {
-                    return true;
-                }
-                return std::ranges::any_of(
-                    call->args, [&](const auto& arg) { return expr_contains_aggregate(*arg); });
-            }
-            if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
-                return expr_contains_aggregate(*binary->left) ||
-                       expr_contains_aggregate(*binary->right);
-            }
-            if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
-                return expr_contains_aggregate(*group->expr);
-            }
-            return false;
+        auto expr_contains_aggregate = [this](const Expr& expr) -> bool {
+            return expr_contains_builtin_aggregate(expr);
         };
 
         auto lower_agg_arg = [&](const Expr& expr) -> std::expected<std::string, LowerError> {
@@ -2463,6 +2542,26 @@ class Lowerer {
             if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
                 auto func = parse_agg_func(call->callee);
                 if (!func.has_value()) {
+                    // Aggregate UDF: inline the body with parameters substituted
+                    // by the argument expressions, then re-lower in this same
+                    // aggregate-expression context. The inlined body's built-in
+                    // aggregate calls (sum, mean, ...) are handled by the
+                    // recursive descent below.
+                    if (const Expr* body = aggregate_udf_body(call->callee)) {
+                        if (!inlining_active_.insert(call->callee).second) {
+                            return std::unexpected(
+                                LowerError{.message = "recursive aggregate function '" +
+                                                      call->callee + "' cannot be inlined"});
+                        }
+                        auto inlined = inline_agg_udf_body(*call, *body);
+                        if (!inlined.has_value()) {
+                            inlining_active_.erase(call->callee);
+                            return std::unexpected(inlined.error());
+                        }
+                        auto result = lower_agg_expr(*inlined.value());
+                        inlining_active_.erase(call->callee);
+                        return result;
+                    }
                     return std::unexpected(
                         LowerError{.message = "unknown aggregate function: " + call->callee});
                 }
@@ -2745,27 +2844,65 @@ class Lowerer {
         return node;
     }
 
-    static auto select_has_aggregate(const std::vector<Field>& fields) -> bool {
-        std::function<bool(const Expr&)> has_agg;
-        has_agg = [&](const Expr& expr) -> bool {
-            if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
-                if (parse_agg_func(call->callee).has_value()) {
-                    return true;
-                }
-                return std::ranges::any_of(call->args,
-                                           [&](const auto& arg) { return has_agg(*arg); });
+    /// If `name` is a user function whose parameters are all `Series<T>`, whose
+    /// return type is a scalar, whose body is a single expression, and whose
+    /// body contains at least one built-in aggregate call, returns the body
+    /// expression. This is the inference rule that distinguishes an aggregate
+    /// UDF from an ordinary scalar UDF; see `plans/aggregate-udf-plan.md`.
+    auto aggregate_udf_body(const std::string& name) const -> const Expr* {
+        auto it = functions_.find(name);
+        if (it == functions_.end()) {
+            return nullptr;
+        }
+        const FunctionDecl& fn = *it->second;
+        if (fn.return_type.kind != Type::Kind::Scalar) {
+            return nullptr;
+        }
+        if (fn.body.size() != 1 || !std::holds_alternative<ExprStmt>(fn.body.front())) {
+            return nullptr;
+        }
+        if (fn.params.empty()) {
+            return nullptr;
+        }
+        for (const auto& p : fn.params) {
+            if (p.type.kind != Type::Kind::Series) {
+                return nullptr;
             }
-            if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
-                return has_agg(*binary->left) || has_agg(*binary->right);
-            }
-            if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
-                return has_agg(*group->expr);
-            }
-            return false;
-        };
+        }
+        const Expr& body = *std::get<ExprStmt>(fn.body.front()).expr;
+        if (!expr_contains_builtin_aggregate(body)) {
+            return nullptr;
+        }
+        return &body;
+    }
 
+    auto expr_contains_builtin_aggregate(const Expr& expr) const -> bool {
+        if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            if (parse_agg_func(call->callee).has_value()) {
+                return true;
+            }
+            if (const Expr* body = aggregate_udf_body(call->callee)) {
+                return expr_contains_builtin_aggregate(*body);
+            }
+            return std::ranges::any_of(
+                call->args, [&](const auto& arg) { return expr_contains_builtin_aggregate(*arg); });
+        }
+        if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+            return expr_contains_builtin_aggregate(*binary->left) ||
+                   expr_contains_builtin_aggregate(*binary->right);
+        }
+        if (const auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+            return expr_contains_builtin_aggregate(*unary->expr);
+        }
+        if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+            return expr_contains_builtin_aggregate(*group->expr);
+        }
+        return false;
+    }
+
+    auto select_has_aggregate(const std::vector<Field>& fields) const -> bool {
         return std::ranges::any_of(fields, [&](const auto& field) {
-            return field.expr != nullptr && has_agg(*field.expr);
+            return field.expr != nullptr && expr_contains_builtin_aggregate(*field.expr);
         });
     }
 
@@ -2789,23 +2926,8 @@ class Lowerer {
             return nullptr;
         };
 
-        std::function<bool(const Expr&)> expr_contains_aggregate;
-        expr_contains_aggregate = [&](const Expr& expr) -> bool {
-            if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
-                if (parse_agg_func(call->callee).has_value()) {
-                    return true;
-                }
-                return std::ranges::any_of(
-                    call->args, [&](const auto& arg) { return expr_contains_aggregate(*arg); });
-            }
-            if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
-                return expr_contains_aggregate(*binary->left) ||
-                       expr_contains_aggregate(*binary->right);
-            }
-            if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
-                return expr_contains_aggregate(*group->expr);
-            }
-            return false;
+        auto expr_contains_aggregate = [this](const Expr& expr) -> bool {
+            return expr_contains_builtin_aggregate(expr);
         };
 
         auto lower_agg_arg = [&](const Expr& expr) -> std::expected<std::string, LowerError> {

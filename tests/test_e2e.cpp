@@ -145,6 +145,35 @@ TEST_CASE("E2E: scalar UDF inside an aggregate argument", "[e2e][udf]") {
     CHECK(col_dbl(out, "avg_adj") == std::vector<double>{151.5, 50.5});
 }
 
+TEST_CASE("E2E: aggregate UDF inferred from Series<T> params", "[e2e][udf]") {
+    auto out =
+        run("fn weighted_mean(p: Series<Float64>, w: Series<Float64>) -> Float64 {\n"
+            "  sum(p * w) / sum(w);\n"
+            "}\n"
+            "Table { price = [1.0, 2.0, 3.0], qty = [0.1, 0.2, 0.7] }"
+            "[select { wavg = weighted_mean(price, qty) }];",
+            {});
+    const auto wavg = col_dbl(out, "wavg");
+    REQUIRE(wavg.size() == 1);
+    CHECK(wavg[0] == Catch::Approx(2.6));
+}
+
+TEST_CASE("E2E: aggregate UDF with by groups", "[e2e][udf]") {
+    auto out =
+        run("fn weighted_mean(p: Series<Float64>, w: Series<Float64>) -> Float64 {\n"
+            "  sum(p * w) / sum(w);\n"
+            "}\n"
+            "Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"
+            "        price = [1.0, 2.0, 3.0, 4.0],\n"
+            "        qty = [1.0, 3.0, 2.0, 8.0] }"
+            "[select { wavg = weighted_mean(price, qty) }, by sym, order { sym asc }];",
+            {});
+    const auto wavg = col_dbl(out, "wavg");
+    REQUIRE(wavg.size() == 2);
+    CHECK(wavg[0] == Catch::Approx(1.75));
+    CHECK(wavg[1] == Catch::Approx(3.8));
+}
+
 TEST_CASE("E2E: nested scalar UDF calls inline", "[e2e][udf]") {
     auto out =
         run("fn inc(x: Int) -> Int { x + 1; }\n"

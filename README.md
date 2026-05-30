@@ -859,17 +859,19 @@ it looks for `csv.so` in the plugin search path and calls its
 |--------|-----------|--------|
 | `csv`  | `read_csv`, `write_csv` | RFC 4180 CSV with type inference |
 | `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |
-| `parquet` | `read_parquet`, `write_parquet` | Apache Parquet via Arrow, including `s3://` reads |
+| `parquet` | `read_parquet`, `write_parquet` | Apache Parquet, including HTTPS and `s3://` reads |
 | `adbc` | `read_adbc` | Optional ADBC/Arrow driver-manager source plugin |
 | `kafka` | `kafka_recv`, `kafka_recv_avro`, `kafka_send` | Optional Kafka streaming plugin for JSON and Schema-Registry-backed Avro |
 | `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
 
-Parquet reads can target S3-compatible object storage through Arrow's
-filesystem layer. Credentials come from the standard AWS SDK chain, and URI
-query parameters can set options such as `region` or `endpoint_override`:
+Parquet reads can target public HTTPS URLs, presigned URLs, and S3-compatible
+object storage. HTTPS URLs require no client cloud setup. S3 credentials come
+from the standard AWS SDK chain, and URI query parameters can set options such
+as `region` or `endpoint_override`:
 
 ```
 import "parquet";
+let public_prices = read_parquet("https://data.example.com/prices.parquet");
 let prices = read_parquet("s3://market-data/prices.parquet?region=us-east-1");
 ```
 

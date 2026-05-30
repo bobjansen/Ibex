@@ -216,7 +216,9 @@ configure_and_build() {
         -G Ninja \
         -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_BUILD_TYPE=Release \
-        -DIBEX_ENABLE_MARCH_NATIVE=ON >"$log_file" 2>&1; then
+        -DIBEX_ENABLE_MARCH_NATIVE=ON \
+        -DIBEX_BUILD_PARQUET=OFF \
+        -DIBEX_BUILD_PYTHON_BRIDGE=OFF >"$log_file" 2>&1; then
         cat "$log_file" >&2
         return 1
     fi

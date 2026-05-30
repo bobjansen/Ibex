@@ -14,6 +14,7 @@
 // Compile with: -I$(IBEX_ROOT)/libraries
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <arrow/api.h>
@@ -315,35 +316,22 @@ inline void append_string_column(const std::shared_ptr<arrow::ChunkedArray>& chu
 }
 
 inline void append_date32_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
-                                 std::vector<std::string>& out) {
-    arrow::internal::StringFormatter<arrow::Date32Type> formatter;
+                                 std::vector<ibex::Date>& out) {
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::DATE32) {
             throw std::runtime_error("read_parquet: unsupported date32 column type");
         }
         auto arr = std::static_pointer_cast<arrow::Date32Array>(chunk);
         for (int64_t i = 0; i < arr->length(); ++i) {
-            if (arr->IsNull(i)) {
-                out.emplace_back();
-                continue;
-            }
-            std::string value;
-            auto append = [&value](std::string_view sv) -> arrow::Status {
-                value.append(sv);
-                return arrow::Status::OK();
-            };
-            auto st = formatter(arr->Value(i), append);
-            if (!st.ok()) {
-                throw std::runtime_error("read_parquet: failed to format date32 value");
-            }
-            out.emplace_back(std::move(value));
+            out.push_back(arr->IsNull(i) ? ibex::Date{0} : ibex::Date{arr->Value(i)});
         }
     }
 }
 
 inline void append_date64_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
-                                 std::vector<std::string>& out) {
-    arrow::internal::StringFormatter<arrow::Date64Type> formatter;
+                                 std::vector<ibex::Date>& out) {
+    // Arrow DATE64: int64 milliseconds since epoch, always a multiple of 86_400_000.
+    constexpr std::int64_t kMillisPerDay = 86'400'000;
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::DATE64) {
             throw std::runtime_error("read_parquet: unsupported date64 column type");
@@ -351,47 +339,42 @@ inline void append_date64_column(const std::shared_ptr<arrow::ChunkedArray>& chu
         auto arr = std::static_pointer_cast<arrow::Date64Array>(chunk);
         for (int64_t i = 0; i < arr->length(); ++i) {
             if (arr->IsNull(i)) {
-                out.emplace_back();
-                continue;
+                out.push_back(ibex::Date{0});
+            } else {
+                out.push_back(ibex::Date{static_cast<std::int32_t>(arr->Value(i) / kMillisPerDay)});
             }
-            std::string value;
-            auto append = [&value](std::string_view sv) -> arrow::Status {
-                value.append(sv);
-                return arrow::Status::OK();
-            };
-            auto st = formatter(arr->Value(i), append);
-            if (!st.ok()) {
-                throw std::runtime_error("read_parquet: failed to format date64 value");
-            }
-            out.emplace_back(std::move(value));
         }
     }
 }
 
 inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
                                     const std::shared_ptr<arrow::DataType>& type,
-                                    std::vector<std::string>& out) {
-    arrow::internal::StringFormatter<arrow::TimestampType> formatter(type.get());
+                                    std::vector<ibex::Timestamp>& out) {
+    // Scale Arrow timestamp units to nanoseconds (Ibex's storage unit).
+    const auto unit = std::static_pointer_cast<arrow::TimestampType>(type)->unit();
+    std::int64_t scale = 1;
+    switch (unit) {
+        case arrow::TimeUnit::SECOND:
+            scale = 1'000'000'000;
+            break;
+        case arrow::TimeUnit::MILLI:
+            scale = 1'000'000;
+            break;
+        case arrow::TimeUnit::MICRO:
+            scale = 1'000;
+            break;
+        case arrow::TimeUnit::NANO:
+            scale = 1;
+            break;
+    }
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::TIMESTAMP) {
             throw std::runtime_error("read_parquet: unsupported timestamp column type");
         }
         auto arr = std::static_pointer_cast<arrow::TimestampArray>(chunk);
         for (int64_t i = 0; i < arr->length(); ++i) {
-            if (arr->IsNull(i)) {
-                out.emplace_back();
-                continue;
-            }
-            std::string value;
-            auto append = [&value](std::string_view sv) -> arrow::Status {
-                value.append(sv);
-                return arrow::Status::OK();
-            };
-            auto st = formatter(arr->Value(i), append);
-            if (!st.ok()) {
-                throw std::runtime_error("read_parquet: failed to format timestamp value");
-            }
-            out.emplace_back(std::move(value));
+            out.push_back(arr->IsNull(i) ? ibex::Timestamp{0}
+                                         : ibex::Timestamp{arr->Value(i) * scale});
         }
     }
 }
@@ -452,24 +435,24 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
                 break;
             }
             case arrow::Type::DATE32: {
-                std::vector<std::string> values;
+                std::vector<ibex::Date> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_date32_column(col, values);
-                out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
+                out.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
                 break;
             }
             case arrow::Type::DATE64: {
-                std::vector<std::string> values;
+                std::vector<ibex::Date> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_date64_column(col, values);
-                out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
+                out.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
                 break;
             }
             case arrow::Type::TIMESTAMP: {
-                std::vector<std::string> values;
+                std::vector<ibex::Timestamp> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_timestamp_column(col, col->type(), values);
-                out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
+                out.add_column(field->name(), ibex::Column<ibex::Timestamp>{std::move(values)});
                 break;
             }
             default:

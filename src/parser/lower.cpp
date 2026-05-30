@@ -1645,7 +1645,7 @@ class Lowerer {
                 return std::unexpected(duration.error());
             std::vector<ir::ColumnRef> extra_group_by;
             if (state.by) {
-                auto keys = lower_group_by(*state.by);
+                auto keys = lower_group_by_bare_only(*state.by, "resample");
                 if (!keys.has_value())
                     return std::unexpected(keys.error());
                 extra_group_by = std::move(keys.value());
@@ -1735,7 +1735,7 @@ class Lowerer {
         if (state.head) {
             std::vector<ir::ColumnRef> head_group_by;
             if (state.by != nullptr) {
-                auto group_by_result = lower_group_by(*state.by);
+                auto group_by_result = lower_group_by_bare_only(*state.by, "head");
                 if (!group_by_result.has_value()) {
                     return std::unexpected(group_by_result.error());
                 }
@@ -1753,7 +1753,7 @@ class Lowerer {
         if (state.tail) {
             std::vector<ir::ColumnRef> tail_group_by;
             if (state.by != nullptr) {
-                auto group_by_result = lower_group_by(*state.by);
+                auto group_by_result = lower_group_by_bare_only(*state.by, "tail");
                 if (!group_by_result.has_value()) {
                     return std::unexpected(group_by_result.error());
                 }
@@ -2022,7 +2022,7 @@ class Lowerer {
         }
         std::vector<ir::ColumnRef> group_by;
         if (by != nullptr) {
-            auto keys = lower_group_by(*by);
+            auto keys = lower_group_by_bare_only(*by, "update");
             if (!keys.has_value()) {
                 return std::unexpected(keys.error());
             }
@@ -2518,12 +2518,14 @@ class Lowerer {
     auto lower_aggregate(const ByClause* by, const std::vector<Field>& select_fields,
                          ir::NodePtr child) -> std::expected<ir::NodePtr, LowerError> {
         std::vector<ir::ColumnRef> group_by;
+        std::vector<ir::FieldSpec> preagg_updates;
         if (by != nullptr) {
             auto group_by_result = lower_group_by(*by);
             if (!group_by_result.has_value()) {
                 return std::unexpected(group_by_result.error());
             }
-            group_by = std::move(group_by_result.value());
+            group_by = std::move(group_by_result->keys);
+            preagg_updates = std::move(group_by_result->preagg_updates);
         }
 
         std::unordered_map<std::string, bool> group_keys;
@@ -2532,7 +2534,6 @@ class Lowerer {
         }
 
         std::vector<ir::AggSpec> aggs;
-        std::vector<ir::FieldSpec> preagg_updates;
         std::vector<ir::FieldSpec> updates;
         std::vector<std::string> final_columns;
         std::unordered_map<std::string, bool> temp_columns;
@@ -3148,17 +3149,49 @@ class Lowerer {
         return lowered;
     }
 
-    static auto lower_group_by(const ByClause& by)
-        -> std::expected<std::vector<ir::ColumnRef>, LowerError> {
-        std::vector<ir::ColumnRef> group_by;
+    struct LoweredGroupBy {
+        std::vector<ir::ColumnRef> keys;
+        std::vector<ir::FieldSpec> preagg_updates;
+    };
+
+    /// Lower a `by { ... }` clause. Bare keys (`by x`) become `ColumnRef`s.
+    /// Computed keys (`by { hour = hour(ts) }`) lower the expression and
+    /// emit a `FieldSpec` in `preagg_updates`; the caller is responsible for
+    /// materializing those as an `update` node upstream of the aggregate /
+    /// grouping operator. Callers that don't yet support pre-update injection
+    /// should call `lower_group_by_bare_only` instead.
+    auto lower_group_by(const ByClause& by) -> std::expected<LoweredGroupBy, LowerError> {
+        LoweredGroupBy out;
+        out.keys.reserve(by.keys.size());
         for (const auto& field : by.keys) {
             if (field.expr != nullptr) {
-                return std::unexpected(
-                    LowerError{.message = "computed group keys not supported yet"});
+                auto lowered = lower_expr_to_ir(*field.expr);
+                if (!lowered.has_value()) {
+                    return std::unexpected(lowered.error());
+                }
+                out.preagg_updates.push_back(
+                    ir::FieldSpec{.alias = field.name, .expr = std::move(lowered.value())});
             }
-            group_by.push_back(ir::ColumnRef{.name = field.name});
+            out.keys.push_back(ir::ColumnRef{.name = field.name});
         }
-        return group_by;
+        return out;
+    }
+
+    /// Wrapper for call sites that don't yet support pre-update injection:
+    /// rejects computed keys with a workaround hint and returns bare names.
+    auto lower_group_by_bare_only(const ByClause& by, std::string_view context)
+        -> std::expected<std::vector<ir::ColumnRef>, LowerError> {
+        auto lowered = lower_group_by(by);
+        if (!lowered.has_value()) {
+            return std::unexpected(lowered.error());
+        }
+        if (!lowered->preagg_updates.empty()) {
+            return std::unexpected(
+                LowerError{.message = std::string{"computed group keys are not yet supported in "} +
+                                      std::string{context} +
+                                      "; materialize the key with [update { name = expr }] first"});
+        }
+        return std::move(lowered->keys);
     }
 
     static auto lower_literal(const LiteralExpr& literal)

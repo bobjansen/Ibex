@@ -357,8 +357,16 @@ TEST_CASE("Lower order to IR") {
     REQUIRE(scan != nullptr);
 }
 
-TEST_CASE("Lowering rejects computed group keys") {
-    auto program = require_parse("df[by { yr = year(ts) }];");
+TEST_CASE("Lowering accepts computed group keys in select+by aggregate") {
+    auto program = require_parse("df[select { n = count() }, by { yr = year(ts) }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("Lowering rejects computed group keys in contexts without pre-update support") {
+    // head/tail/update/resample don't yet inject the pre-update needed to
+    // materialize a computed key. The error message hints at the workaround.
+    auto program = require_parse("df[head 5, by { yr = year(ts) }];");
     auto result = parser::lower(program);
     REQUIRE_FALSE(result.has_value());
 }

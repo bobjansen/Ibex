@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -4762,6 +4763,24 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             return std::unexpected(call->callee + ": argument must be numeric");
         }
+        if (call->callee == "year" || call->callee == "month" || call->callee == "day" ||
+            call->callee == "hour" || call->callee == "minute" || call->callee == "second") {
+            if (call->args.size() != 1) {
+                return std::unexpected(call->callee + ": expected 1 argument");
+            }
+            auto arg_type = infer_expr_type(*call->args[0], input, scalars, externs);
+            if (!arg_type) {
+                return arg_type;
+            }
+            const bool date_ok =
+                (call->callee == "year" || call->callee == "month" || call->callee == "day");
+            if (arg_type.value() == ExprType::Timestamp ||
+                (date_ok && arg_type.value() == ExprType::Date)) {
+                return ExprType::Int;
+            }
+            return std::unexpected(call->callee + (date_ok ? ": argument must be Date or Timestamp"
+                                                           : ": argument must be Timestamp"));
+        }
         // Null-fill functions (fill_null / fill_forward / fill_backward)
         if (is_fill_func(call->callee)) {
             if (call->args.empty()) {
@@ -5097,6 +5116,53 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 return std::log(x);
             }
             return std::exp(x);
+        }
+        if (call->callee == "year" || call->callee == "month" || call->callee == "day" ||
+            call->callee == "hour" || call->callee == "minute" || call->callee == "second") {
+            if (call->args.size() != 1) {
+                return std::unexpected(call->callee + ": expected 1 argument");
+            }
+            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
+            if (!arg) {
+                return arg;
+            }
+            using namespace std::chrono;
+            if (const auto* dv = std::get_if<Date>(&arg.value())) {
+                year_month_day ymd{sys_days{days{dv->days}}};
+                if (call->callee == "year") {
+                    return static_cast<std::int64_t>(static_cast<int>(ymd.year()));
+                }
+                if (call->callee == "month") {
+                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()));
+                }
+                if (call->callee == "day") {
+                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()));
+                }
+                return std::unexpected(call->callee + ": argument must be Timestamp");
+            }
+            if (const auto* tv = std::get_if<Timestamp>(&arg.value())) {
+                sys_time<nanoseconds> tp{nanoseconds{tv->nanos}};
+                auto day_pt = floor<days>(tp);
+                year_month_day ymd{day_pt};
+                hh_mm_ss<nanoseconds> hms{tp - day_pt};
+                if (call->callee == "year") {
+                    return static_cast<std::int64_t>(static_cast<int>(ymd.year()));
+                }
+                if (call->callee == "month") {
+                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()));
+                }
+                if (call->callee == "day") {
+                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()));
+                }
+                if (call->callee == "hour") {
+                    return static_cast<std::int64_t>(hms.hours().count());
+                }
+                if (call->callee == "minute") {
+                    return static_cast<std::int64_t>(hms.minutes().count());
+                }
+                return static_cast<std::int64_t>(hms.seconds().count());
+            }
+            return std::unexpected(call->callee + ": argument must be Date or Timestamp");
         }
         if (call->callee == "pmin" || call->callee == "pmax") {
             if (call->args.size() < 2) {

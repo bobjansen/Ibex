@@ -281,7 +281,7 @@ TEST_CASE("emitter: window node - rolling sum", "[codegen]") {
     ir::Builder b;
     // tf[window 1m, update { s = rolling_sum(price) }]
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
-    auto price_arg = std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{.name = "price"}});
+    auto price_arg = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "price"}});
     auto upd = b.update(
         {ir::FieldSpec{.alias = "s",
                        .expr = ir::Expr{ir::CallExpr{
@@ -301,7 +301,7 @@ TEST_CASE("emitter: window node - rolling sum", "[codegen]") {
 TEST_CASE("emitter: window node - multiple rolling ops", "[codegen]") {
     ir::Builder b;
     constexpr std::int64_t min5_ns = 300LL * 1'000'000'000LL;
-    auto price_arg = std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{.name = "price"}});
+    auto price_arg = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "price"}});
     auto upd = b.update({
         ir::FieldSpec{.alias = "s",
                       .expr = ir::Expr{ir::CallExpr{
@@ -328,13 +328,12 @@ TEST_CASE("emitter: update node - simple expression", "[codegen]") {
 
     // mid = (bid + ask) / 2.0
     ir::FieldSpec field{
-        "mid",
-        ir::Expr{ir::BinaryExpr{
-            ir::ArithmeticOp::Div,
-            std::make_shared<ir::Expr>(ir::Expr{ir::BinaryExpr{
-                ir::ArithmeticOp::Add, std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{"bid"}}),
-                std::make_shared<ir::Expr>(ir::Expr{ir::ColumnRef{"ask"}})}}),
-            std::make_shared<ir::Expr>(ir::Expr{ir::Literal{2.0}})}}};
+        "mid", ir::Expr{ir::BinaryExpr{
+                   ir::ArithmeticOp::Div,
+                   ir::make_expr_ptr(ir::Expr{ir::BinaryExpr{
+                       ir::ArithmeticOp::Add, ir::make_expr_ptr(ir::Expr{ir::ColumnRef{"bid"}}),
+                       ir::make_expr_ptr(ir::Expr{ir::ColumnRef{"ask"}})}}),
+                   ir::make_expr_ptr(ir::Expr{ir::Literal{2.0}})}}};
 
     auto upd = b.update({std::move(field)});
     upd->add_child(make_source(b, "trades.csv"));
@@ -396,10 +395,10 @@ TEST_CASE("emitter: call expression preserves named args", "[codegen]") {
     ir::Builder b;
     ir::CallExpr rep_call{
         .callee = "rep",
-        .args = {std::make_shared<ir::Expr>(ir::Expr{ir::Literal{std::int64_t{7}}})},
+        .args = {ir::make_expr_ptr(ir::Expr{ir::Literal{std::int64_t{7}}})},
         .named_args = {ir::NamedArg{
             .name = "times",
-            .value = std::make_shared<ir::Expr>(ir::Expr{ir::Literal{std::int64_t{3}}}),
+            .value = ir::make_expr_ptr(ir::Expr{ir::Literal{std::int64_t{3}}}),
         }},
     };
     auto upd =

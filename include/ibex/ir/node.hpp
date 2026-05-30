@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -35,7 +36,49 @@ struct ColumnRef {
 
 /// Expression node for computed fields.
 struct Expr;
-using ExprPtr = std::shared_ptr<Expr>;
+
+/// Owning pointer for recursive IR expressions.
+///
+/// Copies deep-copy the pointed-to expression, so copying an `Expr` preserves
+/// value semantics instead of creating shared mutable subtrees.
+class ExprPtr {
+   public:
+    ExprPtr();
+    ExprPtr(std::nullptr_t) noexcept;
+    ~ExprPtr();
+    explicit ExprPtr(std::unique_ptr<Expr> ptr) noexcept;
+    explicit ExprPtr(Expr expr);
+
+    ExprPtr(const ExprPtr& other);
+    auto operator=(const ExprPtr& other) -> ExprPtr&;
+    ExprPtr(ExprPtr&&) noexcept;
+    auto operator=(ExprPtr&&) noexcept -> ExprPtr&;
+
+    [[nodiscard]] auto get() noexcept -> Expr* { return ptr_.get(); }
+    [[nodiscard]] auto get() const noexcept -> const Expr* { return ptr_.get(); }
+    [[nodiscard]] explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+    [[nodiscard]] auto operator*() noexcept -> Expr& { return *ptr_; }
+    [[nodiscard]] auto operator*() const noexcept -> const Expr& { return *ptr_; }
+    [[nodiscard]] auto operator->() noexcept -> Expr* { return ptr_.get(); }
+    [[nodiscard]] auto operator->() const noexcept -> const Expr* { return ptr_.get(); }
+
+    [[nodiscard]] friend auto operator==(const ExprPtr& ptr, std::nullptr_t) noexcept -> bool {
+        return ptr.ptr_ == nullptr;
+    }
+    [[nodiscard]] friend auto operator==(std::nullptr_t, const ExprPtr& ptr) noexcept -> bool {
+        return ptr.ptr_ == nullptr;
+    }
+    [[nodiscard]] friend auto operator!=(const ExprPtr& ptr, std::nullptr_t) noexcept -> bool {
+        return ptr.ptr_ != nullptr;
+    }
+    [[nodiscard]] friend auto operator!=(std::nullptr_t, const ExprPtr& ptr) noexcept -> bool {
+        return ptr.ptr_ != nullptr;
+    }
+
+   private:
+    std::unique_ptr<Expr> ptr_;
+};
 
 struct Literal {
     std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> value;
@@ -136,6 +179,34 @@ struct Expr {
                  IsNullExpr>
         node;
 };
+
+inline ExprPtr::ExprPtr() = default;
+
+inline ExprPtr::ExprPtr(std::nullptr_t) noexcept {}
+
+inline ExprPtr::~ExprPtr() = default;
+
+inline ExprPtr::ExprPtr(std::unique_ptr<Expr> ptr) noexcept : ptr_(std::move(ptr)) {}
+
+inline ExprPtr::ExprPtr(Expr expr) : ptr_(std::make_unique<Expr>(std::move(expr))) {}
+
+inline ExprPtr::ExprPtr(const ExprPtr& other)
+    : ptr_(other.ptr_ ? std::make_unique<Expr>(*other.ptr_) : nullptr) {}
+
+inline ExprPtr::ExprPtr(ExprPtr&&) noexcept = default;
+
+inline auto ExprPtr::operator=(const ExprPtr& other) -> ExprPtr& {
+    if (this != &other) {
+        ptr_ = other.ptr_ ? std::make_unique<Expr>(*other.ptr_) : nullptr;
+    }
+    return *this;
+}
+
+inline auto ExprPtr::operator=(ExprPtr&&) noexcept -> ExprPtr& = default;
+
+[[nodiscard]] inline auto make_expr_ptr(Expr expr) -> ExprPtr {
+    return ExprPtr{std::move(expr)};
+}
 
 /// A computed field: an alias mapped to an expression (represented as
 /// a small expression tree).

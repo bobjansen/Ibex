@@ -13,12 +13,12 @@ namespace {
 auto make_filter(ir::NodeId id) -> ir::NodePtr {
     // Use a non-trivial predicate (`x == 1`) so canonicalize R17 doesn't
     // simplify the Filter away — these tests want the structural Filter node.
-    auto col = std::make_shared<ir::Expr>(ir::Expr{.node = ir::ColumnRef{.name = "x"}});
-    auto lit = std::make_shared<ir::Expr>(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}});
-    auto pred = std::make_shared<ir::Expr>(
+    auto col = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "x"}});
+    auto lit = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}});
+    auto pred =
         ir::Expr{.node = ir::CompareExpr{
-                     .op = ir::CompareOp::Eq, .left = std::move(col), .right = std::move(lit)}});
-    return std::make_unique<ir::FilterNode>(id, std::move(*pred));
+                     .op = ir::CompareOp::Eq, .left = std::move(col), .right = std::move(lit)}};
+    return std::make_unique<ir::FilterNode>(id, std::move(pred));
 }
 
 auto make_order(ir::NodeId id, std::vector<ir::OrderKey> keys) -> ir::NodePtr {
@@ -139,7 +139,7 @@ auto make_update_row_local(ir::NodeId id, std::string alias, std::string col_ref
 
 auto make_update_rolling(ir::NodeId id, std::string alias, std::string col_ref) -> ir::NodePtr {
     std::vector<ir::FieldSpec> fields;
-    auto col_arg = std::make_shared<ir::Expr>(
+    auto col_arg = ir::make_expr_ptr(
         ir::Expr{.node = ir::ColumnRef{.name = std::move(col_ref), .source = {0}}});
     ir::CallExpr call{.callee = "rolling_sum", .args = {std::move(col_arg)}, .named_args = {}};
     fields.push_back(
@@ -220,13 +220,12 @@ namespace {
 
 auto make_filter_cmp_col(ir::NodeId id, std::string col_name, std::int64_t threshold)
     -> ir::NodePtr {
-    auto left =
-        std::make_shared<ir::Expr>(ir::Expr{.node = ir::ColumnRef{.name = std::move(col_name)}});
-    auto right = std::make_shared<ir::Expr>(ir::Expr{.node = ir::Literal{.value = threshold}});
-    auto cmp = std::make_shared<ir::Expr>(
+    auto left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = std::move(col_name)}});
+    auto right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = threshold}});
+    auto cmp =
         ir::Expr{.node = ir::CompareExpr{
-                     .op = ir::CompareOp::Lt, .left = std::move(left), .right = std::move(right)}});
-    return std::make_unique<ir::FilterNode>(id, std::move(*cmp));
+                     .op = ir::CompareOp::Lt, .left = std::move(left), .right = std::move(right)}};
+    return std::make_unique<ir::FilterNode>(id, std::move(cmp));
 }
 
 }  // namespace
@@ -334,13 +333,12 @@ TEST_CASE("canonicalize R14: Tail(Tail(x)) collapses to tighter bound", "[ir][ca
 namespace {
 
 auto make_filter_eq_const(ir::NodeId id, std::string col_name, std::int64_t value) -> ir::NodePtr {
-    auto left =
-        std::make_shared<ir::Expr>(ir::Expr{.node = ir::ColumnRef{.name = std::move(col_name)}});
-    auto right = std::make_shared<ir::Expr>(ir::Expr{.node = ir::Literal{.value = value}});
-    auto eq = std::make_shared<ir::Expr>(
+    auto left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = std::move(col_name)}});
+    auto right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = value}});
+    auto eq =
         ir::Expr{.node = ir::CompareExpr{
-                     .op = ir::CompareOp::Eq, .left = std::move(left), .right = std::move(right)}});
-    return std::make_unique<ir::FilterNode>(id, std::move(*eq));
+                     .op = ir::CompareOp::Eq, .left = std::move(left), .right = std::move(right)}};
+    return std::make_unique<ir::FilterNode>(id, std::move(eq));
 }
 
 }  // namespace
@@ -387,7 +385,7 @@ TEST_CASE("canonicalize composes R3, R11, R1: Filter(Order(Rename(x)))", "[ir][c
 namespace {
 
 auto fexpr(ir::Expr e) -> ir::ExprPtr {
-    return std::make_shared<ir::Expr>(std::move(e));
+    return ir::make_expr_ptr(std::move(e));
 }
 
 auto blit(bool b) -> ir::ExprPtr {

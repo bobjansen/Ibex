@@ -417,8 +417,8 @@ auto timestamp_lit(Timestamp v) -> ir::Expr {
 auto binop(ir::ArithmeticOp op, ir::Expr lhs, ir::Expr rhs) -> ir::Expr {
     return ir::Expr{ir::BinaryExpr{
         .op = op,
-        .left = std::make_shared<ir::Expr>(std::move(lhs)),
-        .right = std::make_shared<ir::Expr>(std::move(rhs)),
+        .left = ir::make_expr_ptr(std::move(lhs)),
+        .right = ir::make_expr_ptr(std::move(rhs)),
     }};
 }
 
@@ -428,13 +428,12 @@ auto fn_call(std::string callee, std::vector<ir::Expr> args, std::vector<NamedAr
     call.callee = std::move(callee);
     call.args.reserve(args.size());
     for (auto& arg : args) {
-        call.args.push_back(std::make_shared<ir::Expr>(std::move(arg)));
+        call.args.push_back(ir::make_expr_ptr(std::move(arg)));
     }
     call.named_args.reserve(named_args.size());
     for (auto& narg : named_args) {
-        call.named_args.push_back(
-            ir::NamedArg{.name = std::move(narg.name),
-                         .value = std::make_shared<ir::Expr>(std::move(narg.value))});
+        call.named_args.push_back(ir::NamedArg{.name = std::move(narg.name),
+                                               .value = ir::make_expr_ptr(std::move(narg.value))});
     }
     return ir::Expr{std::move(call)};
 }
@@ -453,7 +452,7 @@ auto rank_expr(std::vector<ir::OrderKey> order_keys, ir::RankMethod method,
 
 namespace {
 auto mk_expr(ir::Expr e) -> ir::ExprPtr {
-    return std::make_shared<ir::Expr>(std::move(e));
+    return ir::make_expr_ptr(std::move(e));
 }
 auto lit_expr(std::variant<std::int64_t, double, bool, std::string, Date, Timestamp> v)
     -> ir::Expr {

@@ -41,6 +41,26 @@ TEST_CASE("FilterNode stores predicate", "[ir][filter]") {
     REQUIRE(col->name == "volume");
 }
 
+TEST_CASE("Expr copies deep-copy child expressions", "[ir][expr]") {
+    ibex::ir::Expr original{
+        .node = ibex::ir::CompareExpr{.op = ibex::ir::CompareOp::Eq,
+                                      .left = ibex::ir::make_expr_ptr(
+                                          ibex::ir::Expr{.node = ibex::ir::ColumnRef{.name = "a"}}),
+                                      .right = ibex::ir::make_expr_ptr(ibex::ir::Expr{
+                                          .node = ibex::ir::Literal{.value = std::int64_t{1}}})}};
+    ibex::ir::Expr copied = original;
+
+    auto& original_cmp = std::get<ibex::ir::CompareExpr>(original.node);
+    auto& copied_cmp = std::get<ibex::ir::CompareExpr>(copied.node);
+    REQUIRE(original_cmp.left.get() != copied_cmp.left.get());
+
+    auto& original_col = std::get<ibex::ir::ColumnRef>(original_cmp.left->node);
+    original_col.name = "mutated";
+
+    const auto& copied_col = std::get<ibex::ir::ColumnRef>(copied_cmp.left->node);
+    REQUIRE(copied_col.name == "a");
+}
+
 TEST_CASE("ProjectNode stores column list", "[ir][project]") {
     ibex::ir::Builder builder;
 

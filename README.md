@@ -740,7 +740,7 @@ ibex/
 │   ├── runtime/           Extern function registry, execution engine
 │   └── repl/              Interactive REPL session
 ├── src/                   Implementation files (mirrors include/)
-├── libraries/             Bundled plugin sources (csv.hpp, csv.cpp → csv.so)
+├── libs/                  Bundled plugin sources (csv.hpp, csv.cpp -> csv.so)
 ├── scripts/               Helper shell scripts (build, run, plugin-build)
 ├── tests/                 Catch2 unit tests
 ├── tools/                 CLI binaries (REPL, compiler, benchmark)

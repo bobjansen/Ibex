@@ -1,3 +1,5 @@
+find_package(CURL REQUIRED)
+
 add_library(ibex_csv_plugin SHARED csv.cpp)
 
 set_target_properties(ibex_csv_plugin PROPERTIES
@@ -18,6 +20,7 @@ target_link_libraries(ibex_csv_plugin
         Ibex::runtime
         Ibex::CompilerOptions
         fast_float
+        CURL::libcurl
 )
 
 if(TARGET Ibex::Sanitizers)

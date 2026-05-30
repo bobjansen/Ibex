@@ -45,6 +45,8 @@ if(NOT WIN32)
     )
 endif()
 
+find_package(CURL REQUIRED)
+
 target_link_libraries(ibex_tests
     PRIVATE
         Ibex::core
@@ -59,6 +61,7 @@ target_link_libraries(ibex_tests
         ibex_test_warning_suppressions
         nlohmann_json::nlohmann_json
         fast_float
+        CURL::libcurl
 )
 if(TARGET avrocpp_s)
     target_link_libraries(ibex_tests PRIVATE avrocpp_s)

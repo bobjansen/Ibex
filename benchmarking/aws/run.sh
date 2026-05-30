@@ -33,6 +33,8 @@ INSTANCE_TYPE="c7i.xlarge"
 SIZES="1M,2M,4M,8M,16M"
 WARMUP=1
 ITERS=5
+TF_ROWS=""
+BOTH_THREADING=0
 KEY_NAME=""
 
 while [[ $# -gt 0 ]]; do
@@ -40,6 +42,8 @@ while [[ $# -gt 0 ]]; do
         --sizes)   SIZES="$2";         shift 2 ;;
         --warmup)  WARMUP="$2";        shift 2 ;;
         --iters)   ITERS="$2";         shift 2 ;;
+        --tf-rows) TF_ROWS="$2";       shift 2 ;;
+        --both-threading) BOTH_THREADING=1; shift ;;
         --type)    INSTANCE_TYPE="$2"; shift 2 ;;
         --key)     KEY_NAME="$2";      shift 2 ;;
         --region)  REGION="$2";        shift 2 ;;
@@ -97,6 +101,8 @@ IBEX_REGION="${REGION}" \\
 IBEX_SIZES="${SIZES}" \\
 IBEX_WARMUP="${WARMUP}" \\
 IBEX_ITERS="${ITERS}" \\
+IBEX_TF_ROWS="${TF_ROWS}" \\
+IBEX_BOTH_THREADING="${BOTH_THREADING}" \\
   bash /ibex/benchmarking/aws/bootstrap.sh
 EOF
 )

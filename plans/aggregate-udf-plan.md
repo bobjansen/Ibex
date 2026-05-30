@@ -135,24 +135,45 @@ vectorising/compiling it is a later optimisation.)
    (`mean(adjust(price))` works — stage 2 below). Tested in test_e2e/test_repl;
    SPEC §10 updated.
 
-   *Not yet:* `filter` predicates use a separate, restricted `FilterExpr`
-   sublanguage (a `static` lowering path), so scalar UDFs aren't inlined there
-   yet — deferred follow-up.
+   *Was deferred:* filter predicates. After the `FilterExpr` → `ir::Expr`
+   unification (`plans/unify-filter-expr-plan.md` complete) filter predicates
+   lower through the same `lower_expr_to_ir`, so scalar-UDF inlining works in
+   filter for free. Verified: `Table{x=[1,2,3,4]}[filter over_threshold(x)]`
+   with `fn over_threshold(x: Int64) -> Bool { x > 2; }` evaluates correctly.
 2. **Feature 1 in aggregate args** — **DONE** (folded into stage 1 via the
    existing computed-arg materialisation; `mean(adjust(price)) by sym` verified
    in test_e2e).
-   **Sequencing:** stages 3+ are gated on `plans/unify-filter-expr-plan.md`.
-   Aggregate / scalar UDFs will be usable in predicates too, so the
-   `FilterExpr` → `ir::Expr` unification lands first; the richer aggregate-UDF
-   machinery is then built once on the unified expression IR rather than twice.
 
-3. **`agg fn` syntax + declaration** (parser/AST) and the aggregate IR
-   representation (`AggUdfSpec` / variant, multi-column args).
-4. **Interpreter per-group evaluation** (bind slices → evaluate body → scalar).
-5. **Semantics** (null / empty-group / order) + **return typing** + schema-pass
-   integration.
-6. **Chunked path** — UDF aggregates as a materialising breaker.
-7. **Codegen** for UDF aggregates.
+3. **`agg fn` via inference + AST body inlining (Feature 2)** — chosen
+   approach: no new keyword. A `fn` whose parameters are all `Series<T>` and
+   whose body contains aggregate calls is an **aggregate UDF**. At lowering
+   time the call is treated like a scalar UDF call *but inlined at the AST
+   level* before the aggregate detector runs: `weighted_mean(price, qty)` with
+   body `sum(p*w) / sum(w)` substitutes `p`/`w` and produces
+   `sum(price*qty) / sum(qty)`, which the existing select-aggregate machinery
+   already lowers (two `AggSpec`s + an arithmetic `update`/project of the temp
+   aliases). Because the body's aggregates become plain built-ins, **no new IR
+   node, no `AggUdfSpec`, no per-group interpreter path, no schema-pass
+   change** are needed. Return type flows from the body's existing inference.
+
+   Constraints: body must reduce to a single expression composed of built-in
+   aggregate calls and arithmetic over them (mirrors the scalar-UDF
+   single-expression-body rule). Recursion is rejected as it is for scalar
+   UDFs. A Series-param fn whose body is purely scalar (no aggregates) still
+   inlines via the scalar path — the rule selects the aggregate path only when
+   the body actually contains an aggregate.
+
+4. **Chunked path** — once `agg fn` lands, the existing chunked planner picks
+   it up unchanged (the lowered body is plain built-in aggregates), so the
+   "materialising breaker" caveat from earlier drafts no longer applies for
+   inlinable bodies.
+5. **Codegen** — same: the emitter sees only built-in `AggSpec`s after
+   inlining, so existing codegen handles `agg fn` for free.
+6. **Future (deferred)**: bodies with non-aggregate Series operations that
+   aren't reducible to "arithmetic of aggregates" (e.g. an `agg fn` that
+   wants to call a custom non-built-in reduction). These would need the
+   richer `AggUdfSpec` + per-group interpreter path described in earlier
+   drafts of this plan.
 
 ## Non-Goals (initial waves)
 

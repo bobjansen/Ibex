@@ -89,7 +89,11 @@ echo ""
 # hardcoded values so the instance needs no extra configuration.
 USER_DATA=$(cat <<EOF
 #!/bin/bash
-exec > /var/log/ibex-bench.log 2>&1
+# Stream to both /var/log/ibex-bench.log (full log for SSH users) AND the
+# kernel/serial console (visible via \`aws ec2 get-console-output\` without
+# SSH). Buffer overflow on the console is fine — we keep the file as
+# the authoritative log.
+exec > >(stdbuf -oL tee -a /var/log/ibex-bench.log > /dev/console) 2>&1
 set -x
 apt-get update -qq
 apt-get install -y git
@@ -120,6 +124,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --iam-instance-profile "Name=ibex-bench" \
     --security-group-ids "$SG_ID" \
     --user-data "$USER_DATA" \
+    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":60,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
     --tag-specifications \
         "ResourceType=instance,Tags=[{Key=Name,Value=ibex-bench},{Key=Commit,Value=${COMMIT:0:8}}]" \
     "${KEY_ARGS[@]}" \

@@ -12,6 +12,10 @@
 
 set -euo pipefail
 
+# Print disk usage at the top so out-of-space failures are obvious from the
+# console without having to SSH in.
+df -h / || true
+
 # ── System deps ───────────────────────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq

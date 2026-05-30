@@ -433,6 +433,9 @@ def main():
         help="Row count for in-memory fill benchmarks (default: 4000000)",
     )
     ap.add_argument(
+        "--tf-rows", type=int, default=0, help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
         "--reshape-rows",
         type=int,
         default=100_000,

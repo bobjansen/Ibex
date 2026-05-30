@@ -174,6 +174,41 @@ TEST_CASE("E2E: aggregate UDF with by groups", "[e2e][udf]") {
     CHECK(wavg[1] == Catch::Approx(3.8));
 }
 
+TEST_CASE("E2E: update + by broadcasts a compound aggregate expression", "[e2e][update_by]") {
+    auto out =
+        run("Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"
+            "        price = [1.0, 2.0, 3.0, 4.0],\n"
+            "        qty = [1.0, 3.0, 2.0, 8.0] }"
+            "[update { wavg = sum(price * qty) / sum(qty) }, by sym, order { sym asc }];",
+            {});
+    const auto wavg = col_dbl(out, "wavg");
+    REQUIRE(wavg.size() == 4);
+    // A: (1*1 + 2*3) / (1+3) = 7/4 = 1.75 (broadcast to both A rows)
+    CHECK(wavg[0] == Catch::Approx(1.75));
+    CHECK(wavg[1] == Catch::Approx(1.75));
+    // B: (3*2 + 4*8) / (2+8) = 38/10 = 3.8 (broadcast to both B rows)
+    CHECK(wavg[2] == Catch::Approx(3.8));
+    CHECK(wavg[3] == Catch::Approx(3.8));
+}
+
+TEST_CASE("E2E: aggregate UDF in update + by broadcasts per group", "[e2e][udf][update_by]") {
+    auto out =
+        run("fn weighted_mean(p: Series<Float64>, w: Series<Float64>) -> Float64 {\n"
+            "  sum(p * w) / sum(w);\n"
+            "}\n"
+            "Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"
+            "        price = [1.0, 2.0, 3.0, 4.0],\n"
+            "        qty = [1.0, 3.0, 2.0, 8.0] }"
+            "[update { wavg = weighted_mean(price, qty) }, by sym, order { sym asc }];",
+            {});
+    const auto wavg = col_dbl(out, "wavg");
+    REQUIRE(wavg.size() == 4);
+    CHECK(wavg[0] == Catch::Approx(1.75));
+    CHECK(wavg[1] == Catch::Approx(1.75));
+    CHECK(wavg[2] == Catch::Approx(3.8));
+    CHECK(wavg[3] == Catch::Approx(3.8));
+}
+
 TEST_CASE("E2E: nested scalar UDF calls inline", "[e2e][udf]") {
     auto out =
         run("fn inc(x: Int) -> Int { x + 1; }\n"

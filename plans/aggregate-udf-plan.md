@@ -175,25 +175,96 @@ vectorising/compiling it is a later optimisation.)
    richer `AggUdfSpec` + per-group interpreter path described in earlier
    drafts of this plan.
 
+## Follow-ups (raised after stage 3 landed)
+
+These extend the agg-UDF surface area. None are required for the basic
+`weighted_mean(price, qty)` case to work, but each unblocks a natural
+ergonomic that users will reach for.
+
+### F1 — `update { agg(...) }, by` broadcasting
+
+**Status:** not yet supported, for built-ins or UDFs.
+
+Today `update { avg = mean(p) }, by sym` works (single bare aggregate; the
+runtime evaluator special-cases it), but any compound aggregate expression
+fails:
+
+```
+update { wavg = sum(p * w) / sum(w) }, by sym   -- error: unknown function in expression: sum
+```
+
+`lower_update` currently emits a single `UpdateNode` whose expression goes
+through `lower_expr_to_ir`, and the runtime's value-expression evaluator only
+recognises a bare top-level aggregate call. To get broadcasting for compound
+aggregates (and therefore for agg-UDFs, which inline to compound aggregates),
+`update by` needs to mirror `lower_aggregate`'s materialisation strategy: per
+field that contains aggregates, lower it through `lower_agg_expr` to produce
+pre-update temps + per-group `AggSpec`s + a post-aggregate arithmetic `update`
+of the temp aliases, then broadcast the per-group scalars back onto the input
+rows (a left join on the group keys, or a new "broadcast aggregate" IR node
+that the interpreter can fuse).
+
+Once this lands, the agg-UDF inlining path immediately covers `update by`
+with no extra work — the inlined body is just a compound aggregate
+expression.
+
+### F2 — mixed scalar + Series parameters
+
+**Status:** inference rule today requires *all* params to be `Series<T>`.
+
+Use case: `fn wm_floored(p: Series<Float64>, w: Series<Float64>, floor: Float64) -> Float64 { pmax(sum(p*w)/sum(w), floor); }`.
+
+Two coordinated changes are needed:
+
+1. Relax `aggregate_udf_body`'s inference to accept *at least one* `Series<T>`
+   parameter plus any number of scalar parameters (return type still scalar,
+   body still contains at least one built-in aggregate). The scalar args
+   substitute into the body just like a scalar UDF.
+2. Extend `lower_agg_expr` to handle generic scalar function calls applied to
+   aggregate results, e.g. `pmax(<agg_result>, <scalar>)`. Today
+   `lower_agg_expr` only knows built-in aggs, binary ops, and UDF inlining;
+   it rejects other call forms with "unknown aggregate function". The
+   extension would lower each arg in agg-expr context, then emit the call as
+   a post-aggregate scalar expression in the trailing `update`.
+
+(2) is the load-bearing change; (1) alone produces confusing errors.
+
+### F3 — multi-statement bodies (`let` first, then control flow)
+
+**Status:** today only single-expression bodies inline (both scalar and agg).
+
+Tier 1 — **`let` bodies**: `let x = expr; final_expr`. Fold by extending the
+inline scope with the let bindings (the substitution helper already exists;
+just thread additional name → expr entries). Small change, useful for any
+non-trivial UDF.
+
+Tier 2 — **value-returning control flow** (`if cond then a else b`). Needs a
+value-level conditional IR node, which we don't have today. Could be lowered
+to arithmetic on bool masks, but that's a separate language design call.
+
+Tier 3 — **stateful / effectful bodies**. Inlining doesn't apply; would
+require approach (B) (runtime callback) and an AST evaluator hook.
+Defer indefinitely; revisit only if a concrete use case appears.
+
 ## Non-Goals (initial waves)
 
 - Incremental / streaming aggregate UDFs.
 - `agg fn` bodies that cannot reduce to a scalar expression (multi-statement /
-  stateful) — handled later if needed.
+  stateful) — F3 tier 1 (`let`) is in scope; tiers 2/3 are not.
 - Window / rolling UDFs (a separate feature).
 - Approach (B) runtime callback — only if inlining proves insufficient.
 
 ## Open Questions
 
-- Declaration syntax: `agg fn name(...)` vs `fn name(...) agg` vs an attribute.
 - Empty-group result: null, error, or a body-defined default?
-- Inlining scalar UDFs with `let` bodies — fold the lets into the expression, or
-  defer those bodies to a later stage?
 - Per-group body interpretation cost — acceptable for v1; what's the
   optimisation path (vectorise, or compile the body once and apply per group)?
 - Does an `agg fn` compose inside another aggregate or only at the top of a
   `select`/`by`? (Recommend: only as a top-level aggregate in `select`, like
   built-ins.)
+- Sequencing of F1/F2/F3: F1 has the largest user-visible payoff (a real gap
+  today, not just for UDFs); F3 tier 1 is the smallest concrete improvement;
+  F2 is medium. Suggest F1 → F3.1 → F2.
 
 ## Related
 

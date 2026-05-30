@@ -119,7 +119,7 @@ else
     SG_ID=$(aws ec2 create-security-group \
         --region "$REGION" \
         --group-name "$SG_NAME" \
-        --description "ibex benchmark instances — outbound only" \
+        --description "ibex benchmark instances - outbound only" \
         --query "GroupId" --output text)
     # Remove default allow-all-outbound rule and replace with HTTPS + HTTP only
     # (actually outbound-all is fine and simpler; no inbound rules means deny-all inbound)

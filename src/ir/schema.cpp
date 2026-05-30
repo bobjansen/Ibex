@@ -410,10 +410,14 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 bool consistent = !measures.empty();
                 for (std::size_t i = 0; i < measures.size(); ++i) {
                     const auto* field = input.find(measures[i]);
-                    const std::optional<ColumnType> t = field ? field->type : std::nullopt;
+                    std::optional<ColumnType> t = std::nullopt;
+                    if (field) {
+                        t = field->type;
+                    }
                     if (i == 0) {
                         value_type = t;
-                    } else if (value_type != t) {
+                    } else if (value_type.has_value() != t.has_value() ||
+                               (value_type.has_value() && *value_type != *t)) {
                         consistent = false;
                         break;
                     }

@@ -1989,7 +1989,7 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
             continue;
         }
         for (std::size_t col = 0; col < input.columns.size(); ++col) {
-            append_value(*output.columns[col].column, *input.columns[col].column, row);
+            append_value(output.mutable_column(col), *input.columns[col].column, row);
         }
     }
     output.ordering.reset();
@@ -6300,10 +6300,8 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
     for (auto v : i64_col)
         ts_out.push_back(Timestamp{v});
 
-    out.columns[pos].name = ts_name;
-    out.columns[pos].column = std::make_shared<ColumnValue>(std::move(ts_out));
-    out.index.erase(it);
-    out.index[ts_name] = pos;
+    out.rename_column(pos, ts_name);
+    out.replace_column(pos, ColumnValue{std::move(ts_out)});
     out.time_index = ts_name;
 
     return out;
@@ -7781,8 +7779,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     ts_col.push_back(Timestamp{v});
                 auto idx_it = t.index.find(atf.column());
                 if (idx_it != t.index.end()) {
-                    t.columns[idx_it->second].column =
-                        std::make_shared<ColumnValue>(std::move(ts_col));
+                    t.replace_column(idx_it->second, ColumnValue{std::move(ts_col)});
                     col = t.find(atf.column());
                 }
             }
@@ -8015,11 +8012,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     return {};
                 if (dst.columns.empty()) {
                     for (const auto& entry : src.columns) {
-                        dst.columns.push_back(ColumnEntry{
-                            .name = entry.name,
-                            .column = std::make_shared<ColumnValue>(make_empty_like(*entry.column)),
-                            .validity = std::nullopt});
-                        dst.index[entry.name] = dst.columns.size() - 1;
+                        dst.add_column(entry.name, make_empty_like(*entry.column));
                     }
                     dst.time_index = src.time_index;
                     dst.ordering = src.ordering;
@@ -8029,12 +8022,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         if (col >= dst.columns.size()) {
                             return std::unexpected("stream: source schema changed mid-stream");
                         }
-                        append_value(*dst.columns[col].column, *src.columns[col].column, row);
+                        auto& dst_col = dst.mutable_column(col);
+                        append_value(dst_col, *src.columns[col].column, row);
                         bool null = is_null(src.columns[col], row);
                         if (null) {
                             if (!dst.columns[col].validity.has_value()) {
                                 dst.columns[col].validity =
-                                    ValidityBitmap(column_size(*dst.columns[col].column) - 1, true);
+                                    ValidityBitmap(column_size(dst_col) - 1, true);
                             }
                             dst.columns[col].validity->push_back(false);
                         } else if (dst.columns[col].validity.has_value()) {
@@ -8049,12 +8043,9 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             auto slice_row = [&](const Table& src, std::size_t r) -> Table {
                 Table out;
                 for (const auto& entry : src.columns) {
-                    out.columns.push_back(ColumnEntry{
-                        .name = entry.name,
-                        .column = std::make_shared<ColumnValue>(make_empty_like(*entry.column)),
-                        .validity = std::nullopt});
-                    out.index[entry.name] = out.columns.size() - 1;
-                    append_value(*out.columns.back().column, *entry.column, r);
+                    out.add_column(entry.name, make_empty_like(*entry.column));
+                    const std::size_t out_pos = out.columns.size() - 1;
+                    append_value(out.mutable_column(out_pos), *entry.column, r);
                     if (is_null(entry, r)) {
                         out.columns.back().validity = ValidityBitmap{false};
                     }
@@ -8419,6 +8410,36 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
                                   .validity = std::move(validity)});
     index[columns.back().name] = pos;
 }
+
+void Table::replace_column(std::size_t pos, ColumnValue column) {
+    auto& entry = columns.at(pos);
+    entry.column = std::make_shared<ColumnValue>(std::move(column));
+}
+
+void Table::replace_column(std::size_t pos, ColumnValue column,
+                           std::optional<ValidityBitmap> validity) {
+    auto& entry = columns.at(pos);
+    entry.column = std::make_shared<ColumnValue>(std::move(column));
+    entry.validity = std::move(validity);
+}
+
+void Table::rename_column(std::size_t pos, std::string name) {
+    auto& entry = columns.at(pos);
+    if (auto it = index.find(entry.name); it != index.end() && it->second == pos) {
+        index.erase(it);
+    }
+    entry.name = std::move(name);
+    index[entry.name] = pos;
+}
+
+auto Table::mutable_column(std::size_t pos) -> ColumnValue& {
+    auto& column = columns.at(pos).column;
+    if (!column.unique()) {
+        column = std::make_shared<ColumnValue>(*column);
+    }
+    return *column;
+}
+
 void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> column,
                               std::optional<ValidityBitmap> validity) {
     if (auto it = index.find(name); it != index.end()) {
@@ -8733,6 +8754,7 @@ class ChunkedFilterTailOperator final : public Operator {
                 if (src_t.columns[i].column->index() != out.columns[i].column->index()) {
                     return std::unexpected("tail: chunk schema mismatch (column type)");
                 }
+                auto& dst_col = out.mutable_column(i);
                 std::visit(
                     [&](auto& dst) {
                         using Col = std::decay_t<decltype(dst)>;
@@ -8748,7 +8770,7 @@ class ChunkedFilterTailOperator final : public Operator {
                             }
                         }
                     },
-                    *out.columns[i].column);
+                    dst_col);
             }
             buffered_.pop_front();
         }
@@ -9544,6 +9566,7 @@ class ChunkedOrderOperator final : public Operator {
                 if (chunk.columns[i].column->index() != out.columns[i].column->index()) {
                     return std::unexpected("order: chunk schema mismatch (column type)");
                 }
+                auto& dst_col = out.mutable_column(i);
                 std::visit(
                     [&](auto& dst) {
                         using Col = std::decay_t<decltype(dst)>;
@@ -9559,7 +9582,7 @@ class ChunkedOrderOperator final : public Operator {
                             }
                         }
                     },
-                    *out.columns[i].column);
+                    dst_col);
             }
         }
         return {};
@@ -9673,7 +9696,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
                 for (auto v : ints) {
                     ts_col.push_back(Timestamp{v});
                 }
-                chunk.columns[col_idx].column = std::make_shared<ColumnValue>(std::move(ts_col));
+                chunk.replace_column(col_idx, ColumnValue{std::move(ts_col)});
             }
 
             if (still_sorted_) {
@@ -9720,6 +9743,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
                 if (chunk.columns[i].column->index() != concat.columns[i].column->index()) {
                     return std::unexpected("as_timeframe: chunk schema mismatch (column type)");
                 }
+                auto& dst_col = concat.mutable_column(i);
                 std::visit(
                     [&](auto& dst) {
                         using Col = std::decay_t<decltype(dst)>;
@@ -9735,7 +9759,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
                             }
                         }
                     },
-                    *concat.columns[i].column);
+                    dst_col);
             }
         }
         buffered_.clear();
@@ -10068,11 +10092,11 @@ class ChunkedOrderedLimitOperator final : public Operator {
         Table out = empty_template_.value_or(Table{});
         for (const auto& entry : winners) {
             for (std::size_t col = 0; col < out.columns.size(); ++col) {
-                append_scalar(*out.columns[col].column, entry.row.values[col]);
+                auto& out_col = out.mutable_column(col);
+                append_scalar(out_col, entry.row.values[col]);
                 if (entry.row.valid[col] == 0U) {
                     if (!out.columns[col].validity.has_value()) {
-                        out.columns[col].validity =
-                            ValidityBitmap(column_size(*out.columns[col].column) - 1, true);
+                        out.columns[col].validity = ValidityBitmap(column_size(out_col) - 1, true);
                     }
                     out.columns[col].validity->push_back(false);
                 } else if (out.columns[col].validity.has_value()) {
@@ -11015,12 +11039,8 @@ class ChunkedInnerJoinOperator final : public Operator {
         Table left_copy;
         left_copy.columns.reserve(left_table_->columns.size());
         for (const auto& c : left_table_->columns) {
-            ColumnEntry e;
-            e.name = c.name;
-            e.column = std::make_shared<ColumnValue>(*c.column);
-            e.validity = c.validity;
-            left_copy.columns.push_back(std::move(e));
-            left_copy.index[left_copy.columns.back().name] = left_copy.columns.size() - 1;
+            left_copy.add_column(c.name, *c.column);
+            left_copy.columns.back().validity = c.validity;
         }
         return assemble_output(std::move(left_copy), li.data(), ri.data(), li.size());
     }
@@ -11662,10 +11682,7 @@ class ChunkedAggregateOperator final : public Operator {
         }
 
         for (std::size_t i = 0; i < group_by_->size(); ++i) {
-            ColumnEntry entry;
-            entry.name = (*group_by_)[i].name;
-            entry.column = std::make_shared<ColumnValue>(make_empty_like(group_templates_[i]));
-            out.columns.push_back(std::move(entry));
+            out.add_column((*group_by_)[i].name, make_empty_like(group_templates_[i]));
         }
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             const auto& agg = (*aggregations_)[i];
@@ -11693,14 +11710,11 @@ class ChunkedAggregateOperator final : public Operator {
                     return std::unexpected(
                         "ChunkedAggregateOperator: unsupported agg in build_output");
             }
-            ColumnEntry entry;
-            entry.name = agg.alias;
-            entry.column = std::make_shared<ColumnValue>(std::move(column));
-            out.columns.push_back(std::move(entry));
+            out.add_column(agg.alias, std::move(column));
         }
 
         for (std::size_t i = 0; i < out.columns.size(); ++i) {
-            std::visit([&](auto& c) { c.reserve(n_groups_); }, *out.columns[i].column);
+            std::visit([&](auto& c) { c.reserve(n_groups_); }, out.mutable_column(i));
         }
 
         std::vector<ValidityBitmap> agg_validity(aggregations_->size());
@@ -11717,26 +11731,26 @@ class ChunkedAggregateOperator final : public Operator {
             if (cat_fast_path_) {
                 const bool single_key = group_by_->size() == 1;
                 if (single_key) {
-                    auto& cat_col = std::get<Column<Categorical>>(*out.columns[0].column);
+                    auto& cat_col = std::get<Column<Categorical>>(out.mutable_column(0));
                     cat_col.push_code(cat_order_[g]);
                 } else {
                     const std::size_t n_keys = group_by_->size();
                     for (std::size_t ci = 0; ci < n_keys; ++ci) {
-                        auto& cat_col = std::get<Column<Categorical>>(*out.columns[ci].column);
+                        auto& cat_col = std::get<Column<Categorical>>(out.mutable_column(ci));
                         cat_col.push_code(multi_cat_codes_flat_[(g * n_keys) + ci]);
                     }
                 }
             } else if (str_fast_path_) {
-                auto& str_col = std::get<Column<std::string>>(*out.columns[0].column);
+                auto& str_col = std::get<Column<std::string>>(out.mutable_column(0));
                 str_col.push_back(str_order_[g]);
             } else {
                 const Key& key = group_order_[g];
                 for (std::size_t ci = 0; ci < key.values.size(); ++ci) {
-                    append_scalar(*out.columns[ci].column, key.values[ci]);
+                    append_scalar(out.mutable_column(ci), key.values[ci]);
                 }
             }
             for (std::size_t i = 0; i < aggregations_->size(); ++i) {
-                auto& column = *out.columns[group_by_->size() + i].column;
+                auto& column = out.mutable_column(group_by_->size() + i);
                 const AggSlot& slot = fs[(g * n_aggs_) + i];
                 if (track_validity[i] != 0U) {
                     agg_validity[i].push_back(chunked_agg_valid(plan_[i].func, slot));

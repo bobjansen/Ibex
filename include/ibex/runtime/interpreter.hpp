@@ -183,6 +183,17 @@ struct Table {
     void add_column(std::string name, ColumnValue column);
     /// Add a column with an explicit validity bitmap (true = valid, false = null).
     void add_column(std::string name, ColumnValue column, ValidityBitmap validity);
+    /// Replace the storage for an existing column, preserving its name and validity.
+    /// This keeps copy-on-write explicit: callers reseat the column handle rather
+    /// than mutating a potentially shared ColumnValue in place.
+    void replace_column(std::size_t pos, ColumnValue column);
+    /// Replace the storage and validity for an existing column.
+    void replace_column(std::size_t pos, ColumnValue column,
+                        std::optional<ValidityBitmap> validity);
+    /// Rename an existing column and keep the index map in sync.
+    void rename_column(std::size_t pos, std::string name);
+    /// Return a mutable column after detaching shared storage if necessary.
+    [[nodiscard]] auto mutable_column(std::size_t pos) -> ColumnValue&;
     /// Share an existing column without copying its data. Safe under the
     /// copy-on-write invariant: shared columns are never mutated in place —
     /// any modification reseats a fresh shared_ptr (see add_column above).

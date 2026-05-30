@@ -564,8 +564,8 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
     }
 
     for (std::size_t ci = 0; ci < src.columns.size() && ci < dst.columns.size(); ++ci) {
-        const std::size_t prev_size =
-            std::visit([](const auto& c) { return c.size(); }, *dst.columns[ci].column);
+        auto& dst_col = dst.mutable_column(ci);
+        const std::size_t prev_size = std::visit([](const auto& c) { return c.size(); }, dst_col);
 
         std::visit(
             [&](auto& dc) {
@@ -574,7 +574,7 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
                 if (sc)
                     dc.push_back((*sc)[row]);
             },
-            *dst.columns[ci].column);
+            dst_col);
 
         const bool null = runtime::is_null(src.columns[ci], row);
         if (null) {

@@ -513,31 +513,27 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
         ibex::runtime::Chunk chunk;
         chunk.columns.reserve(n_cols);
         for (std::size_t c = 0; c < n_cols; ++c) {
-            ibex::runtime::ColumnEntry entry;
-            entry.name = col_names_[c];
+            ibex::runtime::ColumnValue column;
             switch (col_kinds_[c]) {
                 case CsvColumnKind::Int:
-                    entry.column =
-                        std::make_shared<ibex::runtime::ColumnValue>(std::move(int_cols[c]));
+                    column = std::move(int_cols[c]);
                     break;
                 case CsvColumnKind::Double:
-                    entry.column =
-                        std::make_shared<ibex::runtime::ColumnValue>(std::move(double_cols[c]));
+                    column = std::move(double_cols[c]);
                     break;
                 case CsvColumnKind::String:
-                    entry.column =
-                        std::make_shared<ibex::runtime::ColumnValue>(std::move(string_cols[c]));
+                    column = std::move(string_cols[c]);
                     break;
                 case CsvColumnKind::Categorical: {
                     ibex::Column<ibex::Categorical> col{shared_dicts_[c], shared_indices_[c],
                                                         std::move(cat_codes[c])};
-                    entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(col));
+                    column = std::move(col);
                     break;
                 }
                 case CsvColumnKind::Infer:
                     break;
             }
-            chunk.columns.push_back(std::move(entry));
+            chunk.add_column(col_names_[c], std::move(column));
         }
         total_rows_ += rows_read;
         return std::optional<ibex::runtime::Chunk>{std::move(chunk)};

@@ -181,32 +181,23 @@ These extend the agg-UDF surface area. None are required for the basic
 `weighted_mean(price, qty)` case to work, but each unblocks a natural
 ergonomic that users will reach for.
 
-### F1 — `update { agg(...) }, by` broadcasting
+### F1 — `update { agg(...) }, by` broadcasting — **DONE**
 
-**Status:** not yet supported, for built-ins or UDFs.
+`update { wavg = sum(p*w) / sum(w) }, by sym` (and agg-UDFs that inline to
+that shape) now broadcast a per-group scalar across each group's rows. The
+fix was at the runtime layer rather than the IR/lowering layer: extend
+`broadcast_aggregate_column` (runtime) to recognise compound aggregate
+expressions (any expression that contains an aggregate call), evaluate
+each aggregate sub-call against the per-group slice via `aggregate_table`
+(materialising the arg as a temp column when it isn't a bare ColumnRef),
+compose intermediate results via the existing column arithmetic on 1-row
+columns (so int/double promotion matches the column path), and broadcast
+the final scalar to the group's rows.
 
-Today `update { avg = mean(p) }, by sym` works (single bare aggregate; the
-runtime evaluator special-cases it), but any compound aggregate expression
-fails:
-
-```
-update { wavg = sum(p * w) / sum(w) }, by sym   -- error: unknown function in expression: sum
-```
-
-`lower_update` currently emits a single `UpdateNode` whose expression goes
-through `lower_expr_to_ir`, and the runtime's value-expression evaluator only
-recognises a bare top-level aggregate call. To get broadcasting for compound
-aggregates (and therefore for agg-UDFs, which inline to compound aggregates),
-`update by` needs to mirror `lower_aggregate`'s materialisation strategy: per
-field that contains aggregates, lower it through `lower_agg_expr` to produce
-pre-update temps + per-group `AggSpec`s + a post-aggregate arithmetic `update`
-of the temp aliases, then broadcast the per-group scalars back onto the input
-rows (a left join on the group keys, or a new "broadcast aggregate" IR node
-that the interpreter can fuse).
-
-Once this lands, the agg-UDF inlining path immediately covers `update by`
-with no extra work — the inlined body is just a compound aggregate
-expression.
+No new IR node, no `lower_update` change — the existing per-group slice
+loop in `grouped_update_table` already handles broadcasting, this just
+extends what it recognises as "broadcast-able". `e2e/[update_by]` covers
+both the inline compound aggregate and the agg-UDF cases.
 
 ### F2 — mixed scalar + Series parameters
 
@@ -262,9 +253,9 @@ Defer indefinitely; revisit only if a concrete use case appears.
 - Does an `agg fn` compose inside another aggregate or only at the top of a
   `select`/`by`? (Recommend: only as a top-level aggregate in `select`, like
   built-ins.)
-- Sequencing of F1/F2/F3: F1 has the largest user-visible payoff (a real gap
-  today, not just for UDFs); F3 tier 1 is the smallest concrete improvement;
-  F2 is medium. Suggest F1 → F3.1 → F2.
+- Sequencing of F1/F2/F3: F1 is done. F3 tier 1 (let bodies) is the
+  smallest remaining improvement; F2 (mixed scalar + Series params with
+  scalar post-agg ops) is medium. Suggest F3.1 → F2.
 
 ## Related
 

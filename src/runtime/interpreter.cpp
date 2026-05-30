@@ -4420,37 +4420,229 @@ struct BroadcastAggregateColumn {
     std::optional<ValidityBitmap> validity;
 };
 
-auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field)
+/// True iff `expr` mentions at least one built-in aggregate function call.
+/// Used by `update + by` to decide whether to broadcast the field as a
+/// per-group scalar (compound aggregate expression) or fall through to the
+/// per-row value-expression evaluator.
+auto expr_contains_aggregate_call(const ir::Expr& expr) -> bool {
+    return std::visit(
+        [](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                if (parse_aggregate_func(node.callee).has_value()) {
+                    return true;
+                }
+                return std::ranges::any_of(
+                    node.args, [](const auto& arg) { return expr_contains_aggregate_call(*arg); });
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
+                return expr_contains_aggregate_call(*node.left) ||
+                       expr_contains_aggregate_call(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::CompareExpr>) {
+                return expr_contains_aggregate_call(*node.left) ||
+                       expr_contains_aggregate_call(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                if (expr_contains_aggregate_call(*node.left)) {
+                    return true;
+                }
+                return node.right && expr_contains_aggregate_call(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return expr_contains_aggregate_call(*node.operand);
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
+
+/// Evaluate a compound aggregate expression to a single scalar. Each
+/// aggregate sub-call is computed against the (per-group) `input`; other
+/// nodes compose via the existing column-arithmetic helpers on 1-row
+/// columns so int/double promotion matches the column path. Bare
+/// ColumnRefs resolve only against `scalars` — a column reference outside
+/// an aggregate would not collapse to a per-group scalar.
+auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
+    -> std::expected<ScalarValue, std::string> {
+    return std::visit(
+        [&](const auto& node) -> std::expected<ScalarValue, std::string> {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::Literal>) {
+                return std::visit([](const auto& v) -> ScalarValue { return v; }, node.value);
+            } else if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                if (scalars != nullptr) {
+                    auto it = scalars->find(node.name);
+                    if (it != scalars->end()) {
+                        return it->second;
+                    }
+                }
+                return std::unexpected("update + by: non-aggregate column '" + node.name +
+                                       "' in aggregate-broadcast field expression");
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
+                auto lhs = eval_aggregate_scalar(*node.left, input, scalars);
+                if (!lhs) {
+                    return std::unexpected(lhs.error());
+                }
+                auto rhs = eval_aggregate_scalar(*node.right, input, scalars);
+                if (!rhs) {
+                    return std::unexpected(rhs.error());
+                }
+                ColumnValue lhs_col = broadcast_scalar_column(*lhs, 1);
+                ColumnValue rhs_col = broadcast_scalar_column(*rhs, 1);
+                auto result = arith_vec(node.op, lhs_col, rhs_col, 1);
+                if (!result) {
+                    return std::unexpected(result.error());
+                }
+                return scalar_from_column(*result, 0);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                auto func = parse_aggregate_func(node.callee);
+                if (!func.has_value()) {
+                    return std::unexpected("update + by: non-aggregate function '" + node.callee +
+                                           "' in aggregate-broadcast field expression");
+                }
+                // count() takes no arguments.
+                if (node.callee == "count") {
+                    ir::AggSpec spec{.func = *func,
+                                     .column = ir::ColumnRef{.name = ""},
+                                     .alias = "__agg_broadcast"};
+                    auto agg =
+                        aggregate_table(input, {}, std::vector<ir::AggSpec>{std::move(spec)});
+                    if (!agg) {
+                        return std::unexpected(agg.error());
+                    }
+                    const auto* entry = agg->find_entry("__agg_broadcast");
+                    return scalar_from_column(*entry->column, 0);
+                }
+                if (node.args.empty()) {
+                    return std::unexpected(node.callee + "(): expected column argument");
+                }
+                // ewma(col, alpha) / quantile(col, p) carry a literal numeric param.
+                double param = 0.0;
+                const bool has_param = node.callee == "ewma" || node.callee == "quantile";
+                if (has_param) {
+                    if (node.args.size() != 2) {
+                        return std::unexpected(node.callee + "(): expected two arguments");
+                    }
+                    const auto* lit = std::get_if<ir::Literal>(&node.args[1]->node);
+                    if (lit == nullptr) {
+                        return std::unexpected(node.callee +
+                                               "(): second argument must be a numeric literal");
+                    }
+                    if (const auto* dv = std::get_if<double>(&lit->value)) {
+                        param = *dv;
+                    } else if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                        param = static_cast<double>(*iv);
+                    } else {
+                        return std::unexpected(node.callee +
+                                               "(): second argument must be a numeric literal");
+                    }
+                } else if (node.args.size() != 1) {
+                    return std::unexpected("aggregate functions take one argument");
+                }
+                // If the aggregate's first arg is a bare column we aggregate it
+                // directly; otherwise materialise the computed arg as a temp
+                // column appended to a shallow copy of the input (columns are
+                // shared_ptr-backed, so the copy is cheap).
+                const auto* col_ref = std::get_if<ir::ColumnRef>(&node.args[0]->node);
+                Table working;
+                const Table* effective_input = &input;
+                std::string agg_col_name;
+                if (col_ref != nullptr) {
+                    agg_col_name = col_ref->name;
+                } else {
+                    auto col_result = eval_value_vec(*node.args[0], input, scalars, input.rows());
+                    if (!col_result) {
+                        return std::unexpected(col_result.error());
+                    }
+                    working = input;
+                    agg_col_name = "__agg_broadcast_arg";
+                    while (working.find(agg_col_name) != nullptr) {
+                        agg_col_name += "_";
+                    }
+                    ColumnValue materialised = std::visit(
+                        [](auto& d) -> ColumnValue {
+                            using D = std::decay_t<decltype(d)>;
+                            if constexpr (std::is_same_v<D, const ColumnValue*>) {
+                                return *d;
+                            } else {
+                                return std::move(d);
+                            }
+                        },
+                        col_result->data);
+                    working.add_column(agg_col_name, std::move(materialised));
+                    effective_input = &working;
+                }
+                ir::AggSpec spec{
+                    .func = *func,
+                    .column = ir::ColumnRef{.name = agg_col_name},
+                    .alias = "__agg_broadcast",
+                    .param = param,
+                };
+                auto agg = aggregate_table(*effective_input, {},
+                                           std::vector<ir::AggSpec>{std::move(spec)});
+                if (!agg) {
+                    return std::unexpected(agg.error());
+                }
+                const auto* entry = agg->find_entry("__agg_broadcast");
+                if (entry == nullptr || entry->column == nullptr ||
+                    column_size(*entry->column) != 1) {
+                    return std::unexpected(
+                        "update + by: internal error computing aggregate broadcast");
+                }
+                return scalar_from_column(*entry->column, 0);
+            } else {
+                return std::unexpected(
+                    "update + by: unsupported expression shape in aggregate-broadcast field");
+            }
+        },
+        expr.node);
+}
+
+auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field,
+                                const ScalarRegistry* scalars)
     -> std::expected<std::optional<BroadcastAggregateColumn>, std::string> {
-    const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
-    if (call == nullptr) {
+    // Fast path: bare aggregate call (e.g. `mean(p)`). Preserves null
+    // propagation from the aggregate-table machinery.
+    if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
+        auto spec = aggregate_call_to_spec(*call, field.alias);
+        if (!spec) {
+            return std::unexpected(spec.error());
+        }
+        if (spec->has_value()) {
+            auto aggregated =
+                aggregate_table(input, {}, std::vector<ir::AggSpec>{std::move(**spec)});
+            if (!aggregated) {
+                return std::unexpected(aggregated.error());
+            }
+            const auto* entry = aggregated->find_entry(field.alias);
+            if (entry == nullptr || entry->column == nullptr || column_size(*entry->column) != 1) {
+                return std::unexpected("grouped update aggregate produced invalid result: " +
+                                       field.alias);
+            }
+            auto scalar = scalar_from_column(*entry->column, 0);
+            BroadcastAggregateColumn result{
+                .column = broadcast_scalar_column(scalar, input.rows()),
+                .validity = std::nullopt,
+            };
+            if (entry->validity.has_value() && !(*entry->validity)[0]) {
+                result.validity = ValidityBitmap(input.rows(), false);
+            }
+            return std::optional<BroadcastAggregateColumn>{std::move(result)};
+        }
+    }
+    // Compound path: expression contains aggregate calls but isn't itself a
+    // bare aggregate call (e.g. `sum(p*w) / sum(w)`, or any aggregate-UDF
+    // body that has inlined to such a shape). Evaluate to a single scalar
+    // then broadcast over the group's rows.
+    if (!expr_contains_aggregate_call(field.expr)) {
         return std::optional<BroadcastAggregateColumn>{};
     }
-    auto spec = aggregate_call_to_spec(*call, field.alias);
-    if (!spec) {
-        return std::unexpected(spec.error());
+    auto scalar = eval_aggregate_scalar(field.expr, input, scalars);
+    if (!scalar) {
+        return std::unexpected(scalar.error());
     }
-    if (!spec->has_value()) {
-        return std::optional<BroadcastAggregateColumn>{};
-    }
-
-    auto aggregated = aggregate_table(input, {}, std::vector<ir::AggSpec>{std::move(**spec)});
-    if (!aggregated) {
-        return std::unexpected(aggregated.error());
-    }
-    const auto* entry = aggregated->find_entry(field.alias);
-    if (entry == nullptr || entry->column == nullptr || column_size(*entry->column) != 1) {
-        return std::unexpected("grouped update aggregate produced invalid result: " + field.alias);
-    }
-
-    auto scalar = scalar_from_column(*entry->column, 0);
     BroadcastAggregateColumn result{
-        .column = broadcast_scalar_column(scalar, input.rows()),
+        .column = broadcast_scalar_column(*scalar, input.rows()),
         .validity = std::nullopt,
     };
-    if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        result.validity = ValidityBitmap(input.rows(), false);
-    }
     return std::optional<BroadcastAggregateColumn>{std::move(result)};
 }
 
@@ -7132,7 +7324,7 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         };
 
         for (const auto& field : fields) {
-            auto aggregate = broadcast_aggregate_column(sub, field);
+            auto aggregate = broadcast_aggregate_column(sub, field, scalars);
             if (!aggregate) {
                 return std::unexpected(aggregate.error());
             }

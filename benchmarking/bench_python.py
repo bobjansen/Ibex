@@ -875,6 +875,159 @@ def bench_polars_events(csv_events_path, warmup, iters):
     return rows
 
 
+def bench_pandas_tf(n_rows, warmup, iters):
+    """TimeFrame rolling + resample. Data mirrors ibex_bench's TF generator:
+       1s-spaced UTC Timestamps, sawtooth price = 100.0 + (i % 100)."""
+    print("pandas: building tf data...", file=sys.stderr, flush=True)
+    ts = pd.to_datetime(np.arange(n_rows), unit="s")
+    price = 100.0 + (np.arange(n_rows) % 100).astype(float)
+    df = pd.DataFrame({"ts": ts, "price": price}).set_index("ts")
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = len(result)
+        print(
+            f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            ("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+        )
+
+    run("tf_rolling_count_1m", lambda: df["price"].rolling("60s").count())
+    run("tf_rolling_sum_1m",   lambda: df["price"].rolling("60s").sum())
+    run("tf_rolling_mean_5m",  lambda: df["price"].rolling("300s").mean())
+    run("tf_rolling_median_1m",lambda: df["price"].rolling("60s").median())
+    run("tf_rolling_std_1m",   lambda: df["price"].rolling("60s").std())
+    # Pandas has no time-aware EWM with a window cap — use the standard
+    # exponentially-weighted moving average (no window-length truncation).
+    # Same alpha (0.1) as the ibex_bench query.
+    run("tf_rolling_ewma_1m",  lambda: df["price"].ewm(alpha=0.1, adjust=False).mean())
+    run("tf_resample_1m_ohlc",
+        lambda: df["price"].resample("60s").agg(["first", "max", "min", "last"]))
+    return rows
+
+
+def bench_polars_tf(n_rows, warmup, iters):
+    """TimeFrame rolling + resample (Polars eager)."""
+    print("polars: building tf data...", file=sys.stderr, flush=True)
+    ts = pd.to_datetime(np.arange(n_rows), unit="s")
+    price = 100.0 + (np.arange(n_rows) % 100).astype(float)
+    df = pl.DataFrame({"ts": ts, "price": price})
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = len(result)
+        print(
+            f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            ("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+        )
+
+    run("tf_rolling_count_1m",
+        lambda: df.rolling(index_column="ts", period="60s").agg(c=pl.len()))
+    run("tf_rolling_sum_1m",
+        lambda: df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").sum()))
+    run("tf_rolling_mean_5m",
+        lambda: df.rolling(index_column="ts", period="5m").agg(m=pl.col("price").mean()))
+    run("tf_rolling_median_1m",
+        lambda: df.rolling(index_column="ts", period="60s").agg(med=pl.col("price").median()))
+    run("tf_rolling_std_1m",
+        lambda: df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").std()))
+    run("tf_rolling_ewma_1m",
+        lambda: df.with_columns(pl.col("price").ewm_mean(alpha=0.1, adjust=False).alias("e")))
+    run("tf_resample_1m_ohlc",
+        lambda: df.group_by_dynamic("ts", every="60s").agg(
+            open=pl.col("price").first(), high=pl.col("price").max(),
+            low=pl.col("price").min(),  close=pl.col("price").last()))
+    return rows
+
+
+def bench_pandas_asof(n_rows, warmup, iters):
+    """Tf as-of join: trades (left) joined to quotes (right) on time."""
+    print("pandas: building asof data...", file=sys.stderr, flush=True)
+    # Quotes: 1s-spaced, full resolution
+    quotes = pd.DataFrame({
+        "ts": pd.to_datetime(np.arange(n_rows), unit="s").astype("datetime64[ns]"),
+        "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
+    }).sort_values("ts")
+    # Trades: 10% sampled, jittered timestamps
+    rng = np.random.default_rng(42)
+    sample = np.sort(rng.choice(n_rows, size=n_rows // 10, replace=False))
+    trades = pd.DataFrame({
+        "ts": (pd.to_datetime(sample, unit="s")
+                + pd.to_timedelta(rng.integers(0, 999, len(sample)), unit="ms")
+              ).astype("datetime64[ns]"),
+        "qty": rng.integers(1, 100, len(sample)),
+    }).sort_values("ts")
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = len(result)
+        print(
+            f"  pandas/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            ("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+        )
+
+    run("tf_asof_join", lambda: pd.merge_asof(trades, quotes, on="ts", direction="backward"))
+    return rows
+
+
+def bench_polars_asof(n_rows, warmup, iters):
+    """Tf as-of join (Polars eager)."""
+    print("polars: building asof data...", file=sys.stderr, flush=True)
+    quotes = pl.DataFrame({
+        "ts": pd.to_datetime(np.arange(n_rows), unit="s"),
+        "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
+    }).sort("ts")
+    rng = np.random.default_rng(42)
+    sample = np.sort(rng.choice(n_rows, size=n_rows // 10, replace=False))
+    trades = pl.DataFrame({
+        "ts": pd.to_datetime(sample, unit="s") + pd.to_timedelta(rng.integers(0, 999, len(sample)), unit="ms"),
+        "qty": rng.integers(1, 100, len(sample)),
+    }).sort("ts")
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = len(result)
+        print(
+            f"  polars/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            ("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+        )
+
+    run("tf_asof_join",
+        lambda: trades.join_asof(quotes, on="ts", strategy="backward"))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Path to prices.csv")
@@ -904,6 +1057,12 @@ def main():
         type=int,
         default=100_000,
         help="Row count for synthetic reshape benchmarks (default: 100000)",
+    )
+    ap.add_argument(
+        "--tf-rows",
+        type=int,
+        default=1_000_000,
+        help="Row count for TimeFrame rolling/resample/asof benchmarks (default: 1000000)",
     )
     args = ap.parse_args()
 
@@ -950,6 +1109,13 @@ def main():
         all_rows += bench_pandas_fill(args.fill_rows, args.warmup, args.iters)
     if not args.skip_polars:
         all_rows += bench_polars_fill(args.fill_rows, args.warmup, args.iters)
+    if args.tf_rows > 0:
+        if not args.skip_pandas:
+            all_rows += bench_pandas_tf(args.tf_rows, args.warmup, args.iters)
+            all_rows += bench_pandas_asof(args.tf_rows, args.warmup, args.iters)
+        if not args.skip_polars:
+            all_rows += bench_polars_tf(args.tf_rows, args.warmup, args.iters)
+            all_rows += bench_polars_asof(args.tf_rows, args.warmup, args.iters)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

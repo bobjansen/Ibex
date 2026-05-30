@@ -29,7 +29,7 @@ CONFIG_FILE="$SCRIPT_DIR/.config"
 
 # ── Defaults (override via env or args) ───────────────────────────────────────
 REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="c6i.xlarge"
+INSTANCE_TYPE="c7i.xlarge"
 SIZES="1M,2M,4M,8M,16M"
 WARMUP=1
 ITERS=5

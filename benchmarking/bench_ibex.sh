@@ -45,6 +45,7 @@ SUITE=""
 MERGE_VALIDITY_ROWS=""
 RNG_MICRO_ROWS=""
 RESHAPE_ROWS=""
+TF_ROWS="1000000"
 MODE="memory"
 OUT="$SCRIPT_DIR/results/ibex.tsv"
 
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
         --rng-micro-rows) RNG_MICRO_ROWS="$2"; shift 2 ;;
         --reshape-rows) RESHAPE_ROWS="$2"; shift 2 ;;
+        --tf-rows)     TF_ROWS="$2";     shift 2 ;;
         --mode)        MODE="$2";        shift 2 ;;
         --out)         OUT="$2";         shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
@@ -111,6 +113,7 @@ BENCH_ARGS=(
 [[ -n "$MERGE_VALIDITY_ROWS" ]] && BENCH_ARGS+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
 [[ -n "$RNG_MICRO_ROWS" ]] && BENCH_ARGS+=(--rng-micro-rows "$RNG_MICRO_ROWS")
 [[ -n "$RESHAPE_ROWS" ]] && BENCH_ARGS+=(--reshape-rows "$RESHAPE_ROWS")
+[[ -n "$TF_ROWS" ]] && BENCH_ARGS+=(--timeframe-rows "$TF_ROWS")
 [[ -f "$CSV_MULTI" ]]   && BENCH_ARGS+=(--csv-multi   "$CSV_MULTI")
 [[ -f "$CSV_TRADES" ]]  && BENCH_ARGS+=(--csv-trades  "$CSV_TRADES")
 [[ -f "$CSV_EVENTS" ]]  && BENCH_ARGS+=(--csv-events  "$CSV_EVENTS")

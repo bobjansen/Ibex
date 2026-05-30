@@ -424,6 +424,103 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
     return rows
 
 
+def bench_duckdb_tf(n_rows, warmup, iters, con):
+    """TimeFrame rolling + resample. Same shape as bench_python tf_data."""
+    print("duckdb: building tf data...", file=sys.stderr, flush=True)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE tf_data AS
+        SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND AS ts,
+               100.0 + (i % 100) AS price
+        FROM generate_series(0, {n_rows - 1}) t(i)
+    """)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = len(next(iter(result.values())))
+        print(
+            f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr, flush=True,
+        )
+        rows.append(("duckdb", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
+                     f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
+
+    # All rolling queries use a range-based time window aligned with the ibex
+    # `window 1m` / `window 5m` semantics (inclusive on both ends).
+    def w(period):
+        return (
+            f"OVER (ORDER BY ts RANGE BETWEEN INTERVAL {period} PRECEDING "
+            f"AND CURRENT ROW)"
+        )
+
+    run("tf_rolling_count_1m",
+        lambda: con.sql(f"SELECT count(*) {w('60 SECONDS')} AS c FROM tf_data").fetchnumpy())
+    run("tf_rolling_sum_1m",
+        lambda: con.sql(f"SELECT sum(price) {w('60 SECONDS')} AS s FROM tf_data").fetchnumpy())
+    run("tf_rolling_mean_5m",
+        lambda: con.sql(f"SELECT avg(price) {w('300 SECONDS')} AS m FROM tf_data").fetchnumpy())
+    run("tf_rolling_median_1m",
+        lambda: con.sql(f"SELECT median(price) {w('60 SECONDS')} AS med FROM tf_data").fetchnumpy())
+    run("tf_rolling_std_1m",
+        lambda: con.sql(f"SELECT stddev_samp(price) {w('60 SECONDS')} AS s FROM tf_data").fetchnumpy())
+    # DuckDB has no built-in time-aware EWMA. Skip — leave the cell empty so
+    # the page surfaces that rather than printing a misleading number.
+    run("tf_resample_1m_ohlc",
+        lambda: con.sql(
+            "SELECT time_bucket(INTERVAL 60 SECONDS, ts) AS bucket, "
+            "       first(price ORDER BY ts) AS open, "
+            "       max(price) AS high, min(price) AS low, "
+            "       last(price ORDER BY ts) AS close "
+            "FROM tf_data GROUP BY bucket ORDER BY bucket"
+        ).fetchnumpy())
+    return rows
+
+
+def bench_duckdb_asof(n_rows, warmup, iters, con):
+    """Tf as-of join: trades (~10%) joined to quotes (1s) on ts (backward)."""
+    print("duckdb: building asof data...", file=sys.stderr, flush=True)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE quotes AS
+        SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND AS ts,
+               99.0 + (i % 100) * 0.01 AS bid
+        FROM generate_series(0, {n_rows - 1}) t(i)
+        ORDER BY ts;
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE trades AS
+        WITH sampled AS (
+            SELECT i FROM generate_series(0, {n_rows - 1}) t(i)
+            USING SAMPLE 10 PERCENT (reservoir, 42)
+        )
+        SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND
+                 + INTERVAL ((hash(i) % 999)) MILLISECOND AS ts,
+               1 + (hash(i) % 99) AS qty
+        FROM sampled ORDER BY ts;
+    """)
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = len(next(iter(result.values())))
+        print(
+            f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr, flush=True,
+        )
+        rows.append(("duckdb", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
+                     f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n))
+
+    run("tf_asof_join",
+        lambda: con.sql(
+            "SELECT t.ts, t.qty, q.bid "
+            "FROM trades t ASOF LEFT JOIN quotes q ON t.ts >= q.ts"
+        ).fetchnumpy())
+    return rows
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
@@ -455,6 +552,12 @@ def main():
         default=100_000,
         help="Row count for synthetic reshape benchmarks (default: 100000)",
     )
+    ap.add_argument(
+        "--tf-rows",
+        type=int,
+        default=1_000_000,
+        help="Row count for TimeFrame rolling/resample/asof benchmarks (default: 1000000)",
+    )
     args = ap.parse_args()
 
     con = duckdb.connect()
@@ -476,6 +579,9 @@ def main():
             args.csv, args.csv_lookup, args.warmup, args.iters, con
         )
     all_rows += bench_duckdb_fill(args.fill_rows, args.warmup, args.iters, con)
+    if args.tf_rows > 0:
+        all_rows += bench_duckdb_tf(args.tf_rows, args.warmup, args.iters, con)
+        all_rows += bench_duckdb_asof(args.tf_rows, args.warmup, args.iters, con)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

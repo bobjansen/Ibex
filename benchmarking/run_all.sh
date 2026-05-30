@@ -24,6 +24,8 @@ fi
 
 WARMUP=1
 ITERS=5
+TF_ROWS=1000000
+SINGLE_THREADED=0
 SKIP_IBEX=0
 SKIP_IBEX_COMPILED=0
 SKIP_PYTHON=0
@@ -39,6 +41,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --warmup)      WARMUP="$2";   shift 2 ;;
         --iters)       ITERS="$2";    shift 2 ;;
+        --tf-rows)     TF_ROWS="$2";  shift 2 ;;
+        --single-threaded) SINGLE_THREADED=1; shift ;;
         --skip-ibex)   SKIP_IBEX=1;   shift   ;;
         --skip-ibex-compiled) SKIP_IBEX_COMPILED=1; shift ;;
         --skip-python) SKIP_PYTHON=1; shift   ;;
@@ -52,6 +56,25 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# Single-threaded mode: cap each engine to one thread for apples-to-apples
+# numbers, since Ibex's interpreter is itself single-threaded today. We export
+# the env vars *and* pass per-engine flags where they exist (e.g. DuckDB takes
+# --threads explicitly). data.table is capped via its own setDTthreads(1)
+# inside bench_r.R when this env var is set.
+if [[ $SINGLE_THREADED -eq 1 ]]; then
+    export POLARS_MAX_THREADS=1
+    export OMP_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export NUMEXPR_NUM_THREADS=1
+    export IBEX_BENCH_SINGLE_THREADED=1  # data.table reads this
+    DUCKDB_EXTRA_ARGS=(--threads 1)
+    echo "single-threaded mode: POLARS_MAX_THREADS=1, OMP_NUM_THREADS=1, DUCKDB threads=1, data.table threads=1"
+    echo ""
+else
+    DUCKDB_EXTRA_ARGS=()
+fi
 
 DATA="$SCRIPT_DIR/data"
 CSV="$DATA/prices.csv"
@@ -73,7 +96,7 @@ if [[ $SKIP_IBEX -eq 0 ]]; then
         bash "$SCRIPT_DIR/bench_ibex.sh" \
             --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
             --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
-            --warmup "$WARMUP" --iters "$ITERS" \
+            --warmup "$WARMUP" --iters "$ITERS" --tf-rows "$TF_ROWS" \
             --out "$RESULTS/ibex.tsv"
     echo ""
 fi
@@ -100,7 +123,7 @@ if [[ $SKIP_PYTHON -eq 0 ]]; then
     uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
-        --warmup "$WARMUP" --iters "$ITERS" \
+        --warmup "$WARMUP" --iters "$ITERS" --tf-rows "$TF_ROWS" \
         --out "$RESULTS/python.tsv" \
         "${PY_ARGS[@]}"
     echo ""
@@ -116,7 +139,7 @@ if [[ $SKIP_R -eq 0 ]]; then
     Rscript "$SCRIPT_DIR/bench_r.R" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
-        --warmup "$WARMUP" --iters "$ITERS" \
+        --warmup "$WARMUP" --iters "$ITERS" --tf-rows "$TF_ROWS" \
         --out "$RESULTS/r.tsv" \
         "${R_ARGS[@]}"
     echo ""
@@ -128,8 +151,9 @@ if [[ $SKIP_DUCKDB -eq 0 ]]; then
     uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
         --csv "$CSV" --csv-multi "$CSV_MULTI" --csv-trades "$CSV_TRADES" \
         --csv-events "$CSV_EVENTS" --csv-lookup "$CSV_LOOKUP" \
-        --warmup "$WARMUP" --iters "$ITERS" \
-        --out "$RESULTS/duckdb.tsv"
+        --warmup "$WARMUP" --iters "$ITERS" --tf-rows "$TF_ROWS" \
+        --out "$RESULTS/duckdb.tsv" \
+        "${DUCKDB_EXTRA_ARGS[@]}"
     echo ""
 fi
 

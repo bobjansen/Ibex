@@ -100,6 +100,12 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parquet.ibex" -o "$out_cpp"
     rg -n "read_parquet\\(\\\"data/flights-1m.parquet\\\"\\)" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
+
+    echo "▸ transpile (parquet s3)"
+    out_cpp="$(mktemp --suffix=.cpp)"
+    "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parquet_s3.ibex" -o "$out_cpp"
+    rg -n "read_parquet\\(\\\"s3://market-data/flights-1m.parquet\\?region=us-east-1\\\"\\)" "$out_cpp" >/dev/null
+    rm -f "$out_cpp"
 fi
 
 echo "✓ e2e checks passed"

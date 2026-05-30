@@ -14,7 +14,6 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
-#include <cfenv>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -491,18 +490,18 @@ auto should_record_history(std::string_view line) -> bool {
 }
 
 auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
-    char* raw = ::readline(prompt.c_str());
+    std::unique_ptr<char, decltype(&std::free)> raw{::readline(prompt.c_str()), &std::free};
     if (raw == nullptr) {
         return false;
     }
-    out.assign(raw);
+
+    out.assign(raw.get());
     if (should_record_history(out)) {
         HIST_ENTRY* previous = history_length > 0 ? ::history_get(history_length) : nullptr;
         if (previous == nullptr || previous->line == nullptr || out != previous->line) {
-            ::add_history(raw);
+            ::add_history(raw.get());
         }
     }
-    std::free(raw);
     return true;
 }
 #else
@@ -1611,14 +1610,14 @@ auto column_bytes(const runtime::ColumnEntry& entry) -> std::size_t {
         [](const auto& col) -> std::size_t {
             using ColType = std::decay_t<decltype(col)>;
             if constexpr (std::is_same_v<ColType, Column<std::string>>) {
-                return col.size() * sizeof(std::uint32_t)  // offsets
+                return (col.size() * sizeof(std::uint32_t))  // offsets
                        + (col.size() == 0 ? 0 : col.offsets_data()[col.size()]);
             } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
                 std::size_t dict_chars = 0;
                 for (const auto& s : col.dictionary()) {
                     dict_chars += s.size();
                 }
-                return col.size() * sizeof(Column<Categorical>::code_type) + dict_chars;
+                return (col.size() * sizeof(Column<Categorical>::code_type)) + dict_chars;
             } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
                 return (col.size() + 7) / 8;
             } else {
@@ -1786,7 +1785,7 @@ void print_elapsed(std::chrono::steady_clock::duration elapsed) {
         fmt::print("time: {} us\n", micros);
         return;
     }
-    if (micros < 1000 * 1000) {
+    if (micros < 1000L * 1000L) {
         fmt::print("time: {:.3f} ms\n", static_cast<double>(micros) / 1000.0);
         return;
     }

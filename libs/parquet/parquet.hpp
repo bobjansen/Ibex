@@ -4,6 +4,7 @@
 // Reading:
 //   extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 //   let df = read_parquet("data/myfile.parquet");
+//   let public = read_parquet("https://data.example.com/myfile.parquet");
 //   let remote = read_parquet("s3://bucket/path/myfile.parquet?region=us-east-1");
 //
 // Writing:
@@ -19,7 +20,11 @@
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/io/api.h>
 #include <arrow/util/formatting.h>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <curl/curl.h>
 #include <filesystem>
 #include <memory>
 #include <parquet/arrow/reader.h>
@@ -27,6 +32,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -35,9 +42,135 @@ inline auto is_s3_uri(std::string_view path) -> bool {
     return path.starts_with("s3://");
 }
 
+inline auto is_https_uri(std::string_view path) -> bool {
+    return path.starts_with("https://");
+}
+
+inline void close_and_remove_temp(int fd, const std::string& path) {
+    if (fd >= 0) {
+        (void)::close(fd);
+    }
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+inline auto make_temp_parquet_file() -> std::pair<int, std::string> {
+    std::error_code ec;
+    auto temp_dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        throw std::runtime_error("read_parquet: failed to locate temp directory: " + ec.message());
+    }
+
+    auto pattern = (temp_dir / "ibex-parquet-XXXXXX").string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+
+    int fd = ::mkstemp(buffer.data());
+    if (fd < 0) {
+        throw std::runtime_error("read_parquet: failed to create temp file: " +
+                                 std::string(std::strerror(errno)));
+    }
+    return {fd, std::string(buffer.data())};
+}
+
+inline auto write_http_chunk(char* ptr, std::size_t size, std::size_t nmemb, void* userdata)
+    -> std::size_t {
+    if (size != 0 && nmemb > static_cast<std::size_t>(-1) / size) {
+        return 0;
+    }
+
+    const auto total = size * nmemb;
+    const char* data = ptr;
+    auto* fd = static_cast<int*>(userdata);
+    std::size_t written = 0;
+    while (written < total) {
+        const auto n = ::write(*fd, data + written, total - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return 0;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    return total;
+}
+
+inline auto download_https_to_temp(std::string_view url) -> std::string {
+    static const bool curl_initialized = [] {
+        return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    }();
+    if (!curl_initialized) {
+        throw std::runtime_error("read_parquet: failed to initialize HTTPS client");
+    }
+
+    auto [fd, temp_path] = make_temp_parquet_file();
+    CURL* curl = curl_easy_init();
+    if (curl == nullptr) {
+        close_and_remove_temp(fd, temp_path);
+        throw std::runtime_error("read_parquet: failed to create HTTPS client");
+    }
+
+    std::string url_string{url};
+    char error_buffer[CURL_ERROR_SIZE] = {};
+    curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fd);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ibex-parquet/1");
+    if (const char* ca_info = std::getenv("CURL_CA_BUNDLE");
+        ca_info != nullptr && ca_info[0] != '\0') {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_info);
+    } else if (const char* ssl_cert_file = std::getenv("SSL_CERT_FILE");
+               ssl_cert_file != nullptr && ssl_cert_file[0] != '\0') {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ssl_cert_file);
+    }
+
+    const CURLcode rc = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_cleanup(curl);
+
+    const int close_result = ::close(fd);
+    fd = -1;
+
+    if (rc != CURLE_OK) {
+        close_and_remove_temp(fd, temp_path);
+        std::string detail = error_buffer[0] != '\0' ? error_buffer : curl_easy_strerror(rc);
+        throw std::runtime_error("read_parquet: failed to download '" + url_string + "' (" +
+                                 detail + ", HTTP " + std::to_string(response_code) + ")");
+    }
+    if (close_result != 0) {
+        close_and_remove_temp(fd, temp_path);
+        throw std::runtime_error("read_parquet: failed to finish temp download for '" + url_string +
+                                 "': " + std::strerror(errno));
+    }
+
+    return temp_path;
+}
+
 inline auto open_parquet_input(std::string_view path)
     -> std::shared_ptr<arrow::io::RandomAccessFile> {
     std::string path_string{path};
+    if (is_https_uri(path)) {
+        auto temp_path = download_https_to_temp(path);
+        auto input_result = arrow::io::ReadableFile::Open(temp_path);
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        if (!input_result.ok()) {
+            throw std::runtime_error("read_parquet: failed to open downloaded '" + path_string +
+                                     "' (" + input_result.status().ToString() + ")");
+        }
+        return input_result.ValueOrDie();
+    }
+
     if (is_s3_uri(path)) {
         std::string object_path;
         auto fs_result = arrow::fs::FileSystemFromUri(path_string, &object_path);

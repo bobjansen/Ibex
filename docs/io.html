@@ -96,6 +96,7 @@
 
 <span class="kw">let</span> trades = <span class="fn-name">read_csv</span>(<span class="str">"data/trades.csv"</span>);
 <span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
+<span class="kw">let</span> public_prices = <span class="fn-name">read_parquet</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
 <span class="kw">let</span> cloud_prices = <span class="fn-name">read_parquet</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);
 <span class="kw">let</span> db_prices = <span class="fn-name">read_adbc</span>(<span class="str">"/path/to/libadbc_driver_sqlite.so"</span>,
                                <span class="str">"data/prices.sqlite"</span>,
@@ -346,11 +347,13 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
         <p>
           Parquet is the cleaner choice when you control the data pipeline and
           want strong type preservation, compact files, faster reloads than CSV,
-          and the same reader for disk or S3-compatible object storage.
+          and the same reader for disk, public HTTPS URLs, presigned URLs, or
+          S3-compatible object storage.
         </p>
 <pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 
 <span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
+<span class="kw">let</span> public_prices = <span class="fn-name">read_parquet</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
 <span class="kw">let</span> cloud = <span class="fn-name">read_parquet</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);</code></pre>
       </article>
       <article class="card" style="margin-top:1rem;">

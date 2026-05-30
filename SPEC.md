@@ -2241,9 +2241,32 @@ e.g. `mean(adjust(price))`) is **inlined** at lowering time: its body replaces
 the call with the parameters substituted by the argument expressions. Only
 single-expression bodies inline, and recursion is rejected; a non-scalar
 function, or one with a multi-statement body, used this way is a compile-time
-error. (Inlining does not yet apply inside `filter` predicates, which use a
-restricted expression sublanguage.) User-defined functions are otherwise
+error. Inlining also applies inside `filter` predicates: the filter expression
+language is the same `ir::Expr` used by `select`/`update`, so any inlinable
+scalar UDF works in a predicate too. User-defined functions are otherwise
 evaluated at the statement level in the REPL/runtime.
+
+A scalar UDF whose parameters are **all `Series<T>`** and whose body contains
+a built-in aggregate call is treated as an **aggregate UDF**. When called in
+a `select` aggregate position (with or without `by`), the body is inlined at
+the AST level — parameters are substituted with the argument expressions —
+and the body's built-in aggregate calls (`sum`, `mean`, ...) lower through
+the same machinery as inline aggregates. The classic example:
+
+```
+fn weighted_mean(p: Series<Float64>, w: Series<Float64>) -> Float64 {
+    sum(p * w) / sum(w);
+}
+
+trades[select { wavg = weighted_mean(price, qty) }, by symbol];
+```
+
+The aggregate-UDF inference is implicit (no `agg fn` keyword): the lowerer
+selects the aggregate path only when the body actually contains an aggregate.
+A Series-parameter UDF with a purely scalar body still inlines via the
+ordinary scalar-UDF path. Aggregate UDFs are not allowed inside `update` or
+`filter` (using one there raises the same "aggregate function not allowed
+here" diagnostic as an inline `sum(...)` would).
 
 Call sites may use positional arguments, named arguments, or a mix where all
 positional arguments come first:

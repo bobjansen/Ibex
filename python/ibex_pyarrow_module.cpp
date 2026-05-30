@@ -455,6 +455,22 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         auto runtime_registry = merge_registries(session.tables, extra_tables);
         auto runtime_scalars = merge_scalars({}, extra_scalars);
 
+        // Surface every in-scope binding to the lowerer so static checks on
+        // filter/computed expressions don't misread a bound scalar (e.g. a
+        // pandas-supplied date) as a missing column. A superset is safe.
+        for (const auto& entry : runtime_registry) {
+            context.lexical_names.insert(entry.first);
+        }
+        for (const auto& entry : runtime_scalars) {
+            context.lexical_names.insert(entry.first);
+        }
+        for (const auto& name : session.table_externs) {
+            context.lexical_names.insert(name);
+        }
+        for (const auto& name : session.sink_externs) {
+            context.lexical_names.insert(name);
+        }
+
         if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
             auto lowered = ibex::parser::lower_expr(*let_stmt->value, context);
             if (!lowered.has_value()) {

@@ -365,13 +365,10 @@ jfk[["fare_amount", "rolling_avg_fare", "rolling_trips"]].head(10)
 ```python
 (trips.filter(pl.col("PULocationID") == 132)
       .sort("tpep_pickup_datetime")
-      .with_columns(
-          rolling_avg_fare=pl.col("fare_amount")
-              .rolling_mean_by("tpep_pickup_datetime", window_size="1h"),
-          # No `rolling_count_by` in Polars — sum a column of 1s instead.
-          rolling_trips=pl.col("fare_amount").is_not_null().cast(pl.Int64)
-              .rolling_sum_by("tpep_pickup_datetime", window_size="1h"),
-      )
+      .rolling(index_column="tpep_pickup_datetime", period="1h")
+      .agg(fare_amount=pl.col("fare_amount").last(),
+           rolling_avg_fare=pl.col("fare_amount").mean(),
+           rolling_trips=pl.len())
       .head(10)
       .collect())
 ```

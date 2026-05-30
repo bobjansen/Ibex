@@ -209,6 +209,53 @@ TEST_CASE("E2E: aggregate UDF with let-folded body computes per group", "[e2e][u
     CHECK(wp[1] == Catch::Approx(380.0));  // B: 100 * 38 / 10
 }
 
+TEST_CASE("E2E: timestamp accessors year/month/day/hour/minute/second", "[e2e][time]") {
+    auto out =
+        run("Table { ts = [ts\"2024-01-15T03:04:05\", ts\"2024-07-04T12:30:45\"] }"
+            "[select { y = year(ts), mo = month(ts), d = day(ts),"
+            "          h = hour(ts), mi = minute(ts), s = second(ts) }];",
+            {});
+    const auto y = col_i64(out, "y");
+    const auto mo = col_i64(out, "mo");
+    const auto d = col_i64(out, "d");
+    const auto h = col_i64(out, "h");
+    const auto mi = col_i64(out, "mi");
+    const auto s = col_i64(out, "s");
+    REQUIRE(y.size() == 2);
+    CHECK(y == std::vector<std::int64_t>{2024, 2024});
+    CHECK(mo == std::vector<std::int64_t>{1, 7});
+    CHECK(d == std::vector<std::int64_t>{15, 4});
+    CHECK(h == std::vector<std::int64_t>{3, 12});
+    CHECK(mi == std::vector<std::int64_t>{4, 30});
+    CHECK(s == std::vector<std::int64_t>{5, 45});
+}
+
+TEST_CASE("E2E: hour() inside computed group key", "[e2e][time][groupby]") {
+    auto out =
+        run("Table { ts = [ts\"2024-01-01T09:15:00\", ts\"2024-01-01T09:45:00\","
+            "              ts\"2024-01-01T10:05:00\"],"
+            "        v = [1.0, 3.0, 5.0] }"
+            "[select { n = count(), avg_v = mean(v) },"
+            " by { h = hour(ts) }, order { h asc }];",
+            {});
+    REQUIRE(col_i64(out, "h").size() == 2);
+    CHECK(col_i64(out, "h") == std::vector<std::int64_t>{9, 10});
+    CHECK(col_dbl(out, "avg_v")[0] == Catch::Approx(2.0));
+    CHECK(col_dbl(out, "avg_v")[1] == Catch::Approx(5.0));
+}
+
+TEST_CASE("E2E: computed group key from arithmetic expression", "[e2e][groupby]") {
+    auto out =
+        run("Table { x = [1, 1, 2, 2, 3, 3], y = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0] }"
+            "[select { avg_y = mean(y) }, by { bucket = x * 10 }, order { bucket asc }];",
+            {});
+    const auto avg = col_dbl(out, "avg_y");
+    REQUIRE(avg.size() == 3);
+    CHECK(avg[0] == Catch::Approx(15.0));
+    CHECK(avg[1] == Catch::Approx(35.0));
+    CHECK(avg[2] == Catch::Approx(55.0));
+}
+
 TEST_CASE("E2E: scalar fn wrapping aggregate result in select", "[e2e][udf]") {
     // Inline use: pmax(sum(p*w)/sum(w), 0.0) — the trailing scalar call wraps
     // the aggregate expression and must lower as a post-aggregate update.

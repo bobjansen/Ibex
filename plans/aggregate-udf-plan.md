@@ -199,26 +199,26 @@ loop in `grouped_update_table` already handles broadcasting, this just
 extends what it recognises as "broadcast-able". `e2e/[update_by]` covers
 both the inline compound aggregate and the agg-UDF cases.
 
-### F2 — mixed scalar + Series parameters
+### F2 — mixed scalar + Series parameters — **DONE**
 
-**Status:** inference rule today requires *all* params to be `Series<T>`.
+`fn wm_floored(p: Series<Float64>, w: Series<Float64>, floor: Float64) -> Float64 { pmax(sum(p*w)/sum(w), floor); }`
+now works in `select`/`update` contexts.
 
-Use case: `fn wm_floored(p: Series<Float64>, w: Series<Float64>, floor: Float64) -> Float64 { pmax(sum(p*w)/sum(w), floor); }`.
+Two coordinated changes landed in `lower.cpp`:
 
-Two coordinated changes are needed:
+1. `aggregate_udf_body` accepts *at least one* `Series<T>` parameter plus any
+   number of scalar parameters (return type still scalar, body still contains
+   at least one built-in aggregate). Scalar args substitute into the body via
+   the existing `inline_agg_udf_body` AST substitution path.
+2. `lower_agg_expr`'s `CallExpr` arm gained a generic-scalar-call fallback:
+   if the callee is not a built-in aggregate and not an aggregate UDF, lower
+   each argument in agg-expression context (so nested aggregate calls reduce
+   to `AggSpec` temp column refs) and emit an `ir::CallExpr`, which the
+   trailing `update` evaluates as a post-aggregate scalar expression. Named
+   args are forwarded through the same path.
 
-1. Relax `aggregate_udf_body`'s inference to accept *at least one* `Series<T>`
-   parameter plus any number of scalar parameters (return type still scalar,
-   body still contains at least one built-in aggregate). The scalar args
-   substitute into the body just like a scalar UDF.
-2. Extend `lower_agg_expr` to handle generic scalar function calls applied to
-   aggregate results, e.g. `pmax(<agg_result>, <scalar>)`. Today
-   `lower_agg_expr` only knows built-in aggs, binary ops, and UDF inlining;
-   it rejects other call forms with "unknown aggregate function". The
-   extension would lower each arg in agg-expr context, then emit the call as
-   a post-aggregate scalar expression in the trailing `update`.
-
-(2) is the load-bearing change; (1) alone produces confusing errors.
+Tested in `test_e2e` with both the inline form (`pmax(sum(p*q)/sum(q), 2.0)`)
+and the UDF form (`wm_floored(price, qty, 2.0)`), each grouped by `sym`.
 
 ### F3 — multi-statement bodies (`let` first, then control flow)
 
@@ -235,19 +235,51 @@ propagates "is aggregate" through agg-UDF calls so a body like
 `let total = sum(p); total;` routes through the aggregate path even though
 the trailing expression itself has no aggregate call. SPEC §10 updated.
 
-Tier 2 — **value-returning control flow** (`if cond then a else b`). Needs a
-value-level conditional IR node, which we don't have today. Could be lowered
-to arithmetic on bool masks, but that's a separate language design call.
+Tier 2 — **value-selecting control flow** (`if cond then a else b`,
+`case`/`switch`). **Not in scope for this plan, but not ruled out as a
+language feature.** Pure value-selection (the SQL `CASE WHEN` shape) is
+expressible as a vectorizable built-in (e.g. `where(cond, a, b)`) rather
+than as language-level control flow inside a UDF body. Whether to expose it
+as a built-in, as a restricted expression form, or not at all is a separate
+language design call — see the framing note below.
 
-Tier 3 — **stateful / effectful bodies**. Inlining doesn't apply; would
-require approach (B) (runtime callback) and an AST evaluator hook.
-Defer indefinitely; revisit only if a concrete use case appears.
+Tier 3 — **statement-level / effectful control flow** (loops, early return,
+mutation, recursion, anything that can run arbitrary code in one branch and
+terminate or diverge in another) is **out of scope by design**. See the
+framing note below.
+
+**Framing note (why "no control flow" in Ibex proper):** the load-bearing
+reason is *not* vectorization — element-wise conditionals vectorize fine
+(SQL `CASE WHEN`, Polars `when/then/otherwise`, NumPy `where` all do this).
+The real reasons are:
+
+1. **Pure-expression relational DSL.** Ibex is a query language, not a host
+   language. Keeping bodies to expressions (plus `let`) makes them map
+   cleanly to SQL/relational algebra, to pushdown into ADBC backends, and to
+   the codegen path. Statement-level control flow doesn't translate.
+2. **Laziness, fusion, planning.** Pure expressions reorder, fuse, and
+   pushdown without semantic checks. Effectful control flow blocks all of
+   that.
+3. **Bounded power on purpose.** Too much expressive power is a footgun for
+   users: the moment UDF bodies can loop, mutate, or call out arbitrarily,
+   the planner can't reason about them, the user writes row-at-a-time code
+   that defeats the columnar model, and the cost model goes opaque. The
+   restricted surface is a feature.
+
+So the spectrum is: **pure value-selection** (vectorizable, relational-friendly
+— possible as a built-in) → **simple multi-way value selection**
+(`case`/`switch` over a value — also vectorizable, but adds language surface)
+→ **arbitrary statement-level / effectful control flow** (breaks all three
+properties above — firmly out).
 
 ## Non-Goals (initial waves)
 
 - Incremental / streaming aggregate UDFs.
 - `agg fn` bodies that cannot reduce to a scalar expression (multi-statement /
-  stateful) — F3 tier 1 (`let`) is in scope; tiers 2/3 are not.
+  stateful) — F3 tier 1 (`let`) is in scope; tier 2 (value-selecting control
+  flow) is not in this plan but may land as a `where`-style built-in later;
+  tier 3 (statement-level / effectful control flow) is out of scope by design
+  — Ibex is a pure-expression relational DSL.
 - Window / rolling UDFs (a separate feature).
 - Approach (B) runtime callback — only if inlining proves insufficient.
 
@@ -259,8 +291,10 @@ Defer indefinitely; revisit only if a concrete use case appears.
 - Does an `agg fn` compose inside another aggregate or only at the top of a
   `select`/`by`? (Recommend: only as a top-level aggregate in `select`, like
   built-ins.)
-- Sequencing of F1/F2/F3: F1 and F3.1 are done. F2 (mixed scalar + Series
-  params with scalar post-agg ops) is the remaining follow-up.
+- Sequencing of F1/F2/F3: F1, F2, and F3.1 are done. F3.2 (value-selecting
+  control flow) is deferred and would land as a `where`-style built-in, not
+  as in-body `if`/`else`. F3.3 (statement-level / effectful control flow) is
+  out of scope by design — Ibex is a pure-expression relational DSL.
 
 ## Related
 

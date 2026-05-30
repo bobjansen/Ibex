@@ -209,6 +209,40 @@ TEST_CASE("E2E: aggregate UDF with let-folded body computes per group", "[e2e][u
     CHECK(wp[1] == Catch::Approx(380.0));  // B: 100 * 38 / 10
 }
 
+TEST_CASE("E2E: scalar fn wrapping aggregate result in select", "[e2e][udf]") {
+    // Inline use: pmax(sum(p*w)/sum(w), 0.0) — the trailing scalar call wraps
+    // the aggregate expression and must lower as a post-aggregate update.
+    auto out =
+        run("Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"
+            "        price = [1.0, 2.0, 3.0, 4.0],\n"
+            "        qty = [1.0, 3.0, 2.0, 8.0] }"
+            "[select { wavg = pmax(sum(price * qty) / sum(qty), 2.0) },"
+            " by sym, order { sym asc }];",
+            {});
+    const auto wavg = col_dbl(out, "wavg");
+    REQUIRE(wavg.size() == 2);
+    CHECK(wavg[0] == Catch::Approx(2.0));  // A: max(1.75, 2.0) = 2.0
+    CHECK(wavg[1] == Catch::Approx(3.8));  // B: max(3.8, 2.0)  = 3.8
+}
+
+TEST_CASE("E2E: aggregate UDF with mixed Series and scalar params", "[e2e][udf]") {
+    auto out =
+        run("fn wm_floored(p: Series<Float64>, w: Series<Float64>, floor: Float64)"
+            " -> Float64 {\n"
+            "  pmax(sum(p * w) / sum(w), floor);\n"
+            "}\n"
+            "Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"
+            "        price = [1.0, 2.0, 3.0, 4.0],\n"
+            "        qty = [1.0, 3.0, 2.0, 8.0] }"
+            "[select { wf = wm_floored(price, qty, 2.0) },"
+            " by sym, order { sym asc }];",
+            {});
+    const auto wf = col_dbl(out, "wf");
+    REQUIRE(wf.size() == 2);
+    CHECK(wf[0] == Catch::Approx(2.0));
+    CHECK(wf[1] == Catch::Approx(3.8));
+}
+
 TEST_CASE("E2E: update + by broadcasts a compound aggregate expression", "[e2e][update_by]") {
     auto out =
         run("Table { sym = [\"A\", \"A\", \"B\", \"B\"],\n"

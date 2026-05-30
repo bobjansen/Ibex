@@ -4,6 +4,7 @@
 // Reading:
 //   extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 //   let df = read_parquet("data/myfile.parquet");
+//   let remote = read_parquet("s3://bucket/path/myfile.parquet?region=us-east-1");
 //
 // Writing:
 //   extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
@@ -15,6 +16,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <arrow/api.h>
+#include <arrow/filesystem/filesystem.h>
 #include <arrow/io/api.h>
 #include <arrow/util/formatting.h>
 #include <cstdint>
@@ -28,6 +30,47 @@
 #include <vector>
 
 namespace {
+
+inline auto is_s3_uri(std::string_view path) -> bool {
+    return path.starts_with("s3://");
+}
+
+inline auto open_parquet_input(std::string_view path)
+    -> std::shared_ptr<arrow::io::RandomAccessFile> {
+    std::string path_string{path};
+    if (is_s3_uri(path)) {
+        std::string object_path;
+        auto fs_result = arrow::fs::FileSystemFromUri(path_string, &object_path);
+        if (!fs_result.ok()) {
+            throw std::runtime_error("read_parquet: failed to resolve object storage path '" +
+                                     path_string + "' (" + fs_result.status().ToString() + ")");
+        }
+
+        auto input_result = fs_result.ValueOrDie()->OpenInputFile(object_path);
+        if (!input_result.ok()) {
+            throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
+                                     input_result.status().ToString() + ")");
+        }
+        return input_result.ValueOrDie();
+    }
+
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path_string, ec);
+    if (ec) {
+        throw std::runtime_error("read_parquet: failed to inspect path '" + path_string +
+                                 "': " + ec.message());
+    }
+    if (!exists) {
+        throw std::runtime_error("read_parquet: file not found: '" + path_string + "'");
+    }
+
+    auto input_result = arrow::io::ReadableFile::Open(path_string);
+    if (!input_result.ok()) {
+        throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
+                                 input_result.status().ToString() + ")");
+    }
+    return input_result.ValueOrDie();
+}
 
 inline void append_int_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
                               std::vector<std::int64_t>& out) {
@@ -224,24 +267,9 @@ inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& 
 
 inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
     std::string path_string{path};
-    std::error_code ec;
-    const bool exists = std::filesystem::exists(path_string, ec);
-    if (ec) {
-        throw std::runtime_error("read_parquet: failed to inspect path '" + path_string +
-                                 "': " + ec.message());
-    }
-    if (!exists) {
-        throw std::runtime_error("read_parquet: file not found: '" + path_string + "'");
-    }
+    auto input = open_parquet_input(path);
 
-    auto input_result = arrow::io::ReadableFile::Open(path_string);
-    if (!input_result.ok()) {
-        throw std::runtime_error("read_parquet: failed to open '" + path_string + "' (" +
-                                 input_result.status().ToString() + ")");
-    }
-
-    auto reader_result =
-        parquet::arrow::OpenFile(input_result.ValueOrDie(), arrow::default_memory_pool());
+    auto reader_result = parquet::arrow::OpenFile(std::move(input), arrow::default_memory_pool());
     if (!reader_result.ok()) {
         throw std::runtime_error("read_parquet: failed to read: " + path_string + " (" +
                                  reader_result.status().ToString() + ")");

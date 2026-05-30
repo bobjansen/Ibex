@@ -1,0 +1,4 @@
+import "parquet";
+
+let prices = read_parquet("s3://market-data/prices.parquet?region=us-east-1");
+prices[select total = count()];

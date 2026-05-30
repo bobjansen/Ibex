@@ -23,6 +23,7 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 endif()
 
 include(FetchContent)
+find_package(CURL REQUIRED)
 
 if(IBEX_PARQUET_STANDALONE)
     if(NOT DEFINED IBEX_ROOT)
@@ -192,7 +193,7 @@ else()
 endif()
 
 if(TARGET arrow_shared AND TARGET parquet_shared)
-    target_link_libraries(ibex_parquet_plugin PRIVATE arrow_shared parquet_shared)
+    target_link_libraries(ibex_parquet_plugin PRIVATE arrow_shared parquet_shared CURL::libcurl)
     set(_ibex_arrow_rpath "$<TARGET_FILE_DIR:arrow_shared>;$<TARGET_FILE_DIR:parquet_shared>")
     if(TARGET arrow_ipc_shared)
         target_link_libraries(ibex_parquet_plugin PRIVATE arrow_ipc_shared)

@@ -29,10 +29,13 @@
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <curl/curl.h>
 #include <deque>
 #include <fast_float/fast_float.h>
 #include <filesystem>
@@ -44,6 +47,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -554,9 +558,165 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
 
 }  // namespace
 
+namespace {
+
+inline auto is_https_uri(std::string_view path) -> bool {
+    return path.starts_with("https://") || path.starts_with("http://");
+}
+
+inline auto write_http_chunk_csv(char* ptr, std::size_t size, std::size_t nmemb, void* userdata)
+    -> std::size_t {
+    if (size != 0 && nmemb > static_cast<std::size_t>(-1) / size) {
+        return 0;
+    }
+    const auto total = size * nmemb;
+    auto* fd = static_cast<int*>(userdata);
+    std::size_t written = 0;
+    while (written < total) {
+        const auto n = ::write(*fd, ptr + written, total - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return 0;
+        }
+        if (n == 0) {
+            return 0;
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    return total;
+}
+
+/// Download `url` to a fresh temp file and return its path. Caller owns the
+/// file and is responsible for removing it. Mirrors the parquet plugin's
+/// helper; if this gets a third caller, factor into a shared httpfs header.
+inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
+    static const bool curl_initialized = [] {
+        return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+    }();
+    if (!curl_initialized) {
+        throw std::runtime_error("read_csv: failed to initialize HTTPS client");
+    }
+
+    std::error_code ec;
+    auto temp_dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        throw std::runtime_error("read_csv: failed to locate temp directory: " + ec.message());
+    }
+    auto pattern = (temp_dir / "ibex-csv-XXXXXX").string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    int fd = ::mkstemp(buffer.data());
+    if (fd < 0) {
+        throw std::runtime_error("read_csv: failed to create temp file: " +
+                                 std::string(std::strerror(errno)));
+    }
+    std::string temp_path(buffer.data());
+
+    auto cleanup = [&] {
+        if (fd >= 0) {
+            (void)::close(fd);
+        }
+        std::error_code rm_ec;
+        std::filesystem::remove(temp_path, rm_ec);
+    };
+
+    CURL* curl = curl_easy_init();
+    if (curl == nullptr) {
+        cleanup();
+        throw std::runtime_error("read_csv: failed to create HTTPS client");
+    }
+
+    std::string url_string{url};
+    std::array<char, CURL_ERROR_SIZE> error_buffer{};
+    curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk_csv);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fd);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ibex-csv/1");
+    if (const char* ca_info = std::getenv("CURL_CA_BUNDLE");
+        ca_info != nullptr && ca_info[0] != '\0') {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ca_info);
+    } else if (const char* ssl_cert_file = std::getenv("SSL_CERT_FILE");
+               ssl_cert_file != nullptr && ssl_cert_file[0] != '\0') {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, ssl_cert_file);
+    }
+
+    const CURLcode rc = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_cleanup(curl);
+
+    const int close_result = ::close(fd);
+    fd = -1;
+
+    if (rc != CURLE_OK) {
+        cleanup();
+        const std::string detail =
+            error_buffer[0] != '\0' ? error_buffer.data() : curl_easy_strerror(rc);
+        throw std::runtime_error("read_csv: failed to download '" + url_string + "' (" + detail +
+                                 ", HTTP " + std::to_string(response_code) + ")");
+    }
+    if (close_result != 0) {
+        cleanup();
+        throw std::runtime_error("read_csv: failed to finish temp download for '" + url_string +
+                                 "': " + std::strerror(errno));
+    }
+    return temp_path;
+}
+
+struct CsvLocalPath {
+    std::string path;
+    bool is_temp = false;
+    ~CsvLocalPath() {
+        if (is_temp) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+    CsvLocalPath() = default;
+    CsvLocalPath(const CsvLocalPath&) = delete;
+    auto operator=(const CsvLocalPath&) -> CsvLocalPath& = delete;
+    CsvLocalPath(CsvLocalPath&& other) noexcept
+        : path(std::move(other.path)), is_temp(other.is_temp) {
+        other.is_temp = false;
+    }
+    auto operator=(CsvLocalPath&& other) noexcept -> CsvLocalPath& {
+        if (this != &other) {
+            if (is_temp) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+            path = std::move(other.path);
+            is_temp = other.is_temp;
+            other.is_temp = false;
+        }
+        return *this;
+    }
+};
+
+inline auto resolve_csv_path(std::string_view path) -> CsvLocalPath {
+    CsvLocalPath out;
+    if (is_https_uri(path)) {
+        out.path = csv_download_https_to_temp(path);
+        out.is_temp = true;
+        return out;
+    }
+    out.path.assign(path);
+    return out;
+}
+
+}  // namespace
+
 inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& options)
     -> ibex::runtime::Table {
-    const std::string path_string(path);
+    auto local = resolve_csv_path(path);
+    const std::string path_string = local.path;
     std::error_code ec;
     const bool exists = std::filesystem::exists(path_string, ec);
     if (ec) {
@@ -564,7 +724,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                                  "': " + ec.message());
     }
     if (!exists) {
-        throw std::runtime_error("read_csv: file not found: '" + path_string + "'");
+        throw std::runtime_error("read_csv: file not found: '" + std::string{path} + "'");
     }
 
     CsvSource source(path_string);

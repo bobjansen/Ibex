@@ -156,7 +156,7 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 
 [[nodiscard]] auto join_with_predicate(const runtime::Table& left, const runtime::Table& right,
                                        ir::JoinKind kind, const std::vector<std::string>& keys,
-                                       ir::Expr predicate) -> runtime::Table;
+                                       const ir::Expr& predicate) -> runtime::Table;
 
 void print(const runtime::Table& t, std::ostream& out = std::cout);
 

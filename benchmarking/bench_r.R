@@ -108,6 +108,26 @@ bench <- function(framework, name, fn) {
     )
 }
 
+# ── Cost-capped bench ─────────────────────────────────────────────────────────
+# A few rolling ops are O(n*window) and scale linearly with rows: data.table's
+# frollapply(median/sd) and dplyr's slide_index_dbl() with a closure. At large
+# sizes a single such cell takes minutes * (warmup+iters) and dominates the whole
+# run (and slows local iteration). Skip a query when its projected total
+# wall-clock exceeds the budget. per_row_us is an empirical per-row cost; see the
+# call sites. The skip is logged so the blank cell is explained, not silent.
+COST_BUDGET_MS <- 120000  # 2 minutes total (across warmup + iters)
+bench_capped <- function(framework, name, fn, per_row_us, n) {
+    est_ms <- n * per_row_us / 1000 * (warmup + iters)
+    if (est_ms > COST_BUDGET_MS) {
+        message(sprintf(
+            "  %s/%s: SKIPPED — projected %.0fs > %.0fs budget (%d rows, %d runs)",
+            framework, name, est_ms / 1000, COST_BUDGET_MS / 1000,
+            n, warmup + iters))
+        return(invisible())
+    }
+    bench(framework, name, fn)
+}
+
 # ── Load single-key data ──────────────────────────────────────────────────────
 dt <- NULL
 tb <- NULL
@@ -506,11 +526,15 @@ if (tf_rows > 0) {
             function() dt_tf[, s := frollsum(price, 60L)][])
         bench("data.table", "tf_rolling_mean_5m",
             function() dt_tf[, m := frollmean(price, 300L)][])
-        # frollapply is generic but ~100× slower than the optimized fns.
-        bench("data.table", "tf_rolling_median_1m",
-            function() dt_tf[, med := frollapply(price, 60L, median)][])
-        bench("data.table", "tf_rolling_std_1m",
-            function() dt_tf[, s := frollapply(price, 60L, sd)][])
+        # frollapply is generic but ~100× slower than the optimized fns and
+        # scales O(n*window); cost-cap so large sizes don't dominate the run.
+        # Empirical on c7i.xlarge: ~18us/row (median), ~7us/row (sd).
+        bench_capped("data.table", "tf_rolling_median_1m",
+            function() dt_tf[, med := frollapply(price, 60L, median)][],
+            per_row_us = 18, n = tf_rows)
+        bench_capped("data.table", "tf_rolling_std_1m",
+            function() dt_tf[, s := frollapply(price, 60L, sd)][],
+            per_row_us = 7, n = tf_rows)
         # data.table has no time-aware EWMA; skip (the slot will be blank).
         bench("data.table", "tf_resample_1m_ohlc",
             function() dt_tf[, .(open = data.table::first(price),
@@ -548,13 +572,17 @@ if (tf_rows > 0) {
         bench("dplyr", "tf_rolling_mean_5m",
             function() tb_tf |> mutate(m = slide_index_mean(price, ts,
                                                             before = lubridate::seconds(300))))
-        # Median / std via slide_index_dbl + a closure (slower path).
-        bench("dplyr", "tf_rolling_median_1m",
+        # Median / std via slide_index_dbl + a closure (slow O(n*window) path);
+        # cost-cap as for data.table. Per-row cost is a conservative estimate
+        # (slide_index_dbl(closure) is comparable-or-slower than frollapply).
+        bench_capped("dplyr", "tf_rolling_median_1m",
             function() tb_tf |> mutate(med = slide_index_dbl(price, ts, median,
-                                                              .before = lubridate::seconds(60))))
-        bench("dplyr", "tf_rolling_std_1m",
+                                                              .before = lubridate::seconds(60))),
+            per_row_us = 20, n = tf_rows)
+        bench_capped("dplyr", "tf_rolling_std_1m",
             function() tb_tf |> mutate(s = slide_index_dbl(price, ts, sd,
-                                                            .before = lubridate::seconds(60))))
+                                                            .before = lubridate::seconds(60))),
+            per_row_us = 20, n = tf_rows)
         bench("dplyr", "tf_resample_1m_ohlc",
             function() tb_tf |>
                 mutate(bucket = lubridate::floor_date(ts, "minute")) |>

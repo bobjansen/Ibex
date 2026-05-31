@@ -8,7 +8,7 @@
 #   --sizes  1M,2M,4M,8M,16M   (default)
 #   --warmup N                  warmup iterations  (default: 1)
 #   --iters  N                  timed iterations   (default: 5)
-#   --type   INSTANCE_TYPE      EC2 instance type  (default: c6i.xlarge)
+#   --type   INSTANCE_TYPE      EC2 instance type  (default: r7i.2xlarge)
 #   --key    KEY_PAIR_NAME      EC2 key pair for SSH debugging (optional)
 #   --region AWS_REGION         override region
 #   --on-demand                 use an on-demand instance instead of spot
@@ -19,7 +19,8 @@
 #   S3_BUCKET   — bucket name (loaded from .config if not set)
 #   AWS_REGION  — region      (loaded from .config if not set)
 #
-# Estimated cost: ~$0.05 for a full 1M–16M run on c6i.xlarge spot
+# Estimated cost: a full 1M–16M run on r7i.2xlarge (~$0.53/hr on-demand) is well
+# under $1; spot is cheaper but risks capacity reclaim on long runs.
 
 set -euo pipefail
 
@@ -32,7 +33,10 @@ CONFIG_FILE="$SCRIPT_DIR/.config"
 
 # ── Defaults (override via env or args) ───────────────────────────────────────
 REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="c7i.xlarge"
+# r7i.2xlarge: 8 vCPU (faster parallel build) + 64GB RAM (headroom for the
+# in-memory reshape benchmark, which needs ~28GB at 16M). Same Sapphire Rapids
+# CPU as c7i, so per-core timings stay comparable; run every size on one box.
+INSTANCE_TYPE="r7i.2xlarge"
 SIZES="1M,2M,4M,8M,16M"
 WARMUP=1
 ITERS=5

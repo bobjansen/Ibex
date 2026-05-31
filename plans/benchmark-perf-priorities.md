@@ -73,7 +73,25 @@ green (884 cases).
 > math). Now both are O(n); the cell is a fair speed comparison but not an
 > identical-result one — worth a footnote on the web page.
 
-## P2 — `tf_asof_join` (confirmed under jemalloc) — NEXT
+## Validation run `20260531T165259` (021971f, full 1M–16M, on-demand)
+
+All three landed steps confirmed on AWS @16M:
+- **P1 ewma**: 1347 → **107 ms** (12.6×), now 1.4× vs polars (was 18.5×).
+- **P2 asof (time-only)**: 262 → **114 ms** (2.3×), ~1.7–2× vs polars-st (was 6.3×).
+- **P0**: cheap ops flat at ~1–1.6 ns/row, no cliff (jemalloc active).
+
+New genuine targets at 16M (lazy-eval clickhouse cells excluded — ibex is on par
+with the real materializing engines on melt/update/fill/filter):
+- **P-next: `tf_asof_join_by_symbol` — 4.5× vs data.table** (ibex 1040 vs 232;
+  polars 275). The grouped asof path is now ibex's slowest-relative cell. It
+  builds a `Key` (heap `vector<ScalarValue>`) + hash per right row over the whole
+  right table, then per-left lookups — sort/factorize-by-symbol-code and bucketed
+  merge would remove the hashing. data.table's keyed roll join is nearly as fast
+  as its time-only (232 vs 247), so the headroom is large.
+- `tf_resample_1m_ohlc` 3.9× vs polars; `filter_events` 3.6× vs polars
+  (filter+gather); `dcast` ~2–3×, `ohlc_by_symbol` ~2.6× — moderate.
+
+## P2 — `tf_asof_join` (time-only) — DONE
 
 Re-measured on the jemalloc run `20260531T155759` @16M: ibex **262 ms vs
 polars-st 41 / polars 54 = ~5–6×**. data.table 237 ≈ ibex; duckdb 521 slower.

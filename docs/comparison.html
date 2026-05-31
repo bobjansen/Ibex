@@ -115,6 +115,15 @@ https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv</code></pre>
         live URL.
       </p>
       <div class="heads-up">
+        <strong>Ibex setup.</strong> The Ibex snippets use
+        <code>import "parquet"</code> and <code>import "csv"</code>, so the REPL
+        must be able to find the bundled plugins. After a release build, start
+        it with
+        <code>./build-release/tools/ibex --plugin-path ./build-release/tools</code>.
+        Without that plugin path, <code>read_parquet</code> and
+        <code>read_csv</code> are not registered.
+      </div>
+      <div class="heads-up">
         <strong>Heads up &mdash; Pandas + CloudFront.</strong> CloudFront
         occasionally returns HTTP&nbsp;403 to Python's default
         <code>urllib</code> user-agent after many requests in a row. If

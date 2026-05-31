@@ -48,19 +48,32 @@ cheap op.
 **Result.** jemalloc ~0.9 ns/row > mallopt-on-glibc ~1.4 ns/row > glibc ~3.5 ns/row.
 Cliff closed. Confirm on the next AWS run (bench will now show the jemalloc numbers).
 
-## P1 — `tf_rolling_ewma_1m` rewrite (worst single ratio)
+## P1 — `tf_rolling_ewma_1m`: O(n) rewrite — DONE
 
 Linear scaling (exp 1.03) but **18.5× slower than polars** (1618ms vs 88ms at
 16M). Pure algorithm, not allocation — the P0 fix won't touch it. Single worst
 ratio in the suite. Investigate the interpreter/codegen path for ewma; expect a
 per-element recurrence that isn't vectorized or is re-deriving weights per row.
 
+**DONE** (commit ba985af). The windowed `rolling_ewma` was O(n·w) — it restarted
+the recurrence and rescanned the whole window per row. Replaced with a one-pass
+O(n) sliding form: `result[i] = α·R_i + (1−α)·β^(i−lo)·col[lo]`, R maintained by
+add-right / drop-left, `beta_pow` caching β^k. Algebraically identical (Approx,
+both window tests pass), **~15× faster** locally under jemalloc (1543ms → 104ms at
+16M), now on par with polars `ewm_mean` (~87ms) vs ~18× behind before. Full suite
+green (884 cases).
+
 > **Re-scope after P0.** The allocator fix (run `20260531T142434`, glibc+mallopt
 > at 16M) revealed that several "algorithmic" losses were mostly *allocation*:
 > `melt_wide_to_long` 1.9× faster, `tf_asof_join` 1.8× faster, just from mallopt.
-> `tf_rolling_ewma_1m` moved only 1.14× — it is the one genuinely algorithm-bound
-> target. So ewma is the real P1; asof/reshape drop in priority and should be
-> re-measured under jemalloc before any code work.
+> `tf_rolling_ewma_1m` moved only 1.14× — it was the one genuinely algorithm-bound
+> target (now fixed above). asof/reshape drop in priority; re-measure under
+> jemalloc before any code work.
+>
+> Bench-semantics caveat: ibex's `rolling_ewma` is *time-windowed* (restart per
+> window), polars' `ewm_mean(adjust=False)` is *full-series* (O(n), different
+> math). Now both are O(n); the cell is a fair speed comparison but not an
+> identical-result one — worth a footnote on the web page.
 
 ## P2 — `tf_asof_join` (re-measure under jemalloc first)
 

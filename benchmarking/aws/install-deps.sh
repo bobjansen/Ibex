@@ -2,7 +2,7 @@
 # install-deps.sh — install all benchmark dependencies on Ubuntu 22.04/24.04.
 #
 # This script installs everything needed to run the full benchmark suite:
-#   - C++ toolchain (clang-18, cmake, ninja) for building ibex
+#   - C++ toolchain (current stable Clang from apt.llvm.org, cmake, ninja)
 #   - Python 3.11+ with uv (manages numpy, pandas, polars, duckdb)
 #   - R with data.table and dplyr/tidyr
 #   - jemalloc for ibex page-retention optimization
@@ -43,18 +43,26 @@ echo "━━━ System packages ━━━"
 apt-get update -qq
 
 # ── C++ toolchain ────────────────────────────────────────────────────────────
+# Noble's apt only ships clang-18 (reports __cpp_concepts=201907L, forcing the
+# libstdc++ <expected> workaround). Pull a current stable Clang from
+# apt.llvm.org so benchmark builds use a modern compiler. Bump CLANG_VERSION to
+# re-baseline; must match bootstrap.sh.
+CLANG_VERSION=21
 apt-get install -y --no-install-recommends \
-    clang-18 cmake ninja-build \
-    libjemalloc-dev \
-    git curl unzip ca-certificates
+    cmake ninja-build \
+    libjemalloc-dev libcurl4-openssl-dev \
+    git curl unzip ca-certificates \
+    wget gnupg lsb-release software-properties-common
 
-# Ensure clang-18 is the default if no unversioned clang exists
-if ! command -v clang++ &>/dev/null; then
-    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100
-    update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-18   100
-fi
+curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+chmod +x /tmp/llvm.sh
+/tmp/llvm.sh "${CLANG_VERSION}"
 
-echo "✓ C++ toolchain: $(clang++-18 --version | head -1)"
+# Make the freshly installed Clang the unversioned default.
+update-alternatives --install /usr/bin/clang++ clang++ "/usr/bin/clang++-${CLANG_VERSION}" 100
+update-alternatives --install /usr/bin/clang   clang   "/usr/bin/clang-${CLANG_VERSION}"   100
+
+echo "✓ C++ toolchain: $(clang++ --version | head -1)"
 echo "✓ CMake: $(cmake --version | head -1)"
 echo "✓ Ninja: $(ninja --version)"
 echo ""
@@ -109,7 +117,7 @@ echo "━━━ Done ━━━"
 echo ""
 echo "Next steps:"
 echo "  1. Build ibex (release):"
-echo "     cmake -B build-release -G Ninja -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_BUILD_TYPE=Release"
+echo "     cmake -B build-release -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release"
 echo "     ninja -C build-release"
 echo ""
 echo "  2. Run benchmarks:"

@@ -572,6 +572,9 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
 
 def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
     """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
+    if reshape_rows <= 0:
+        print("pandas: reshape skipped (disabled for this size)", file=sys.stderr, flush=True)
+        return []
     n_day = 400
     print(f"pandas: building synthetic wide table ({reshape_rows} rows)...", file=sys.stderr, flush=True)
     rows = []
@@ -640,6 +643,9 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
 
 def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
     """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
+    if reshape_rows <= 0:
+        print("polars: reshape skipped (disabled for this size)", file=sys.stderr, flush=True)
+        return []
     n_day = 400
     print(f"polars: building synthetic wide table ({reshape_rows} rows)...", file=sys.stderr, flush=True)
     rows = []

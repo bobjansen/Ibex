@@ -269,7 +269,11 @@ if (!is.null(csv_multi_path)) {
 
 # ── Reshape benchmarks (melt / dcast) ─────────────────────────────────────────
 # Synthetic wide OHLC table with configurable row count and 4 measure columns.
-{
+# reshape_rows <= 0 disables these (the suite sets it to 0 above its memory
+# budget — the in-memory wide table is the bench's biggest RAM consumer).
+if (reshape_rows <= 0) {
+    message("R: reshape skipped (disabled for this size)")
+} else {
     n_day <- 400L
     idx  <- seq_len(reshape_rows) - 1L
     sym_idx <- idx %/% n_day

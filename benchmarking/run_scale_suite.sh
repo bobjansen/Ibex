@@ -37,6 +37,11 @@ TF_ROWS_OVERRIDE=""
 # skips reshape (blank cell) instead of OOM-killing the run. Default fits the
 # 64GB r7i.2xlarge with margin; raise it on a bigger box or override via env.
 RESHAPE_MAX_ROWS="${RESHAPE_MAX_ROWS:-20000000}"
+# SQLite is 10-1000x slower than the columnar engines (seconds/query at 8M),
+# so it dominates wall-clock at scale while adding little beyond a slow-baseline
+# data point. Run it only up to this size (gives a 1M/2M/4M scaling trend) and
+# skip it above; override via env to include or exclude more.
+SQLITE_MAX_ROWS="${SQLITE_MAX_ROWS:-4000000}"
 SKIP_IBEX=0
 SKIP_IBEX_COMPILED=0
 SKIP_PYTHON=0
@@ -479,15 +484,19 @@ for rows in "${SIZES[@]}"; do
     fi
 
     if [[ $SKIP_SQLITE -eq 0 ]]; then
-        echo "  → sqlite"
-        uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_sqlite.py" \
-            --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-            --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
-            --fill-rows "$rows" \
-            --warmup "$WARMUP" --iters "$ITERS" \
-            --out "$size_result_dir/sqlite.tsv"
-        append_tagged_results "$rows" "$size_result_dir/sqlite.tsv"
+        if (( rows > SQLITE_MAX_ROWS )); then
+            echo "  (sqlite skipped: ${rows} > SQLITE_MAX_ROWS=${SQLITE_MAX_ROWS} — too slow at this size)"
+        else
+            echo "  → sqlite"
+            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_sqlite.py" \
+                --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --fill-rows "$rows" \
+                --warmup "$WARMUP" --iters "$ITERS" \
+                --out "$size_result_dir/sqlite.tsv"
+            append_tagged_results "$rows" "$size_result_dir/sqlite.tsv"
+        fi
     fi
 
     if [[ $KEEP_DATA -eq 0 ]]; then

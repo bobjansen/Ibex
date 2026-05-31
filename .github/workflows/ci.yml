@@ -113,7 +113,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build
+          sudo apt-get install -y clang-18 cmake ninja-build libcurl4-openssl-dev
 
       - name: Configure (mirrors the release toolchain)
         run: |

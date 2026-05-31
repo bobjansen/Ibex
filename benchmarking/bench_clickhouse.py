@@ -226,6 +226,9 @@ def bench_clickhouse_null(csv_path, csv_lookup_path, warmup, iters, sess):
 
 def bench_clickhouse_reshape(warmup, iters, reshape_rows, sess):
     """Melt (wide->long) and dcast (long->wide) on a synthetic OHLC table."""
+    if reshape_rows <= 0:
+        print("clickhouse: reshape skipped (disabled for this size)", file=sys.stderr, flush=True)
+        return []
     n_day = 400
     print(
         f"clickhouse: building synthetic wide table ({reshape_rows} rows)...",

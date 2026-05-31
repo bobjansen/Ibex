@@ -242,6 +242,9 @@ def bench_duckdb_null(csv_path, csv_lookup_path, warmup, iters, con):
 
 def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
     """Melt (wide->long) and dcast (long->wide) on a synthetic OHLC table."""
+    if reshape_rows <= 0:
+        print("duckdb: reshape skipped (disabled for this size)", file=sys.stderr, flush=True)
+        return []
     n_day = 400
     print(
         f"duckdb: building synthetic wide table ({reshape_rows} rows)...",

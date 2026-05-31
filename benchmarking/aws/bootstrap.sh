@@ -86,6 +86,30 @@ if [[ -n "${IBEX_TF_ROWS:-}" ]]; then
     TF_ROWS_ARG=(--tf-rows "${IBEX_TF_ROWS}")
 fi
 
+# ── Upload results + self-terminate on ANY exit ───────────────────────────────
+# scales.csv is written incrementally (header at start, then per-size/per-engine
+# appends), so uploading on EXIT preserves completed sizes even when a later size
+# fails (e.g. an OOM at 16M) instead of discarding the whole run. The trap also
+# guarantees the instance shuts down rather than idling after a failed suite —
+# the explicit shutdown is otherwise skipped under `set -e`.
+finish() {
+    local code=$?
+    local csv=/ibex/benchmarking/results/scales.csv
+    if [[ -f "$csv" ]]; then
+        if aws s3 cp "$csv" \
+            "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" \
+            --region "${IBEX_REGION}"; then
+            echo "Results uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (suite exit ${code})"
+        else
+            echo "WARNING: result upload failed (suite exit ${code})"
+        fi
+    else
+        echo "No results to upload (suite exit ${code})"
+    fi
+    shutdown -h now
+}
+trap finish EXIT
+
 IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
     bash run_scale_suite.sh \
         --sizes "${IBEX_SIZES}" \
@@ -94,12 +118,4 @@ IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
         "${TF_ROWS_ARG[@]}" \
         "${EXTRA_SKIPS[@]}"
 
-# ── Upload results ────────────────────────────────────────────────────────────
-aws s3 cp results/scales.csv \
-    "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" \
-    --region "${IBEX_REGION}"
-
-echo "Results uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}"
-
-# Self-terminate (--instance-initiated-shutdown-behavior terminate was set at launch)
-shutdown -h now
+# Result upload and self-termination are handled by the EXIT trap above.

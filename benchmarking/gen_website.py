@@ -212,12 +212,18 @@ HTML_TEMPLATE = """<!doctype html>
     <div class="tablewrap"><table class="bench" id="tbl"></table></div>
 
     <p class="bench-note" style="margin-top:1rem">
-      <strong>Caveats.</strong> A few cells are not apples-to-apples:
-      ClickHouse and DataFusion evaluate lazily, so their <code>melt</code> and
-      some filter cells stream rather than materialise; <code>tf rolling EWMA</code>
-      is time-windowed in Ibex versus full-series in Polars. <code>SQLite</code>
-      and the data.table <code>rolling median/std</code> cells are pinned from an
-      earlier run (they are stable and dominate wall-clock).
+      <strong>Threads.</strong> Ibex runs on a single core. Polars, DuckDB,
+      DataFusion and ClickHouse use all 8 — so they win the parallelisable cells
+      on core count, not per-core work. For a same-core comparison read Ibex
+      against <code>polars-st</code> (Polars pinned to one thread); Ibex is faster
+      on the large majority of queries there.
+    </p>
+    <p class="bench-note">
+      <strong>Caveats.</strong> Every engine now materialises its full result.
+      <code>tf rolling EWMA</code> is time-windowed in Ibex versus full-series in
+      Polars (both O(n), different maths). <code>SQLite</code> and the data.table
+      <code>rolling median/std</code> cells are pinned from an earlier run (they
+      are stable and dominate wall-clock).
     </p>
     <p class="bench-note" id="meta"></p>
   </section>

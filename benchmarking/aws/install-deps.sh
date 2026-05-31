@@ -50,7 +50,7 @@ apt-get update -qq
 CLANG_VERSION=21
 apt-get install -y --no-install-recommends \
     ninja-build \
-    libjemalloc-dev libcurl4-openssl-dev libssl-dev \
+    libjemalloc-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
     git curl unzip ca-certificates \
     wget gnupg lsb-release software-properties-common
 
@@ -77,7 +77,7 @@ echo ""
 
 # ── Python + uv ──────────────────────────────────────────────────────────────
 echo "━━━ Python ━━━"
-apt-get install -y --no-install-recommends python3 python3-venv
+apt-get install -y --no-install-recommends python3 python3-venv python3-dev
 
 if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh

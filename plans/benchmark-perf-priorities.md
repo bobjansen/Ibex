@@ -50,10 +50,8 @@ Cliff closed. Confirm on the next AWS run (bench will now show the jemalloc numb
 
 ## P1 — `tf_rolling_ewma_1m`: O(n) rewrite — DONE
 
-Linear scaling (exp 1.03) but **18.5× slower than polars** (1618ms vs 88ms at
-16M). Pure algorithm, not allocation — the P0 fix won't touch it. Single worst
-ratio in the suite. Investigate the interpreter/codegen path for ewma; expect a
-per-element recurrence that isn't vectorized or is re-deriving weights per row.
+Was **18.5× slower than polars** (1618ms vs 88ms at 16M) — pure algorithm, not
+allocation (the P0 fix moved it only 1.14×), the single worst ratio in the suite.
 
 **DONE** (commit ba985af). The windowed `rolling_ewma` was O(n·w) — it restarted
 the recurrence and rescanned the whole window per row. Replaced with a one-pass

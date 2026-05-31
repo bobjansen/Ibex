@@ -88,8 +88,15 @@ single-threaded **polars-st @16M, ibex is faster in 37/41 queries.** The 3–4×
 "filter gaps" were purely parallelism (ibex beats polars-st on every filter; the
 gap is only to 8-core polars). Genuine single-thread algorithmic gaps remaining,
 in order:
-- **`tf_resample_1m_ohlc` — 3.5× vs polars-st** (ibex 373 vs 107). The clear #1
-  next target.
+- **`tf_resample_1m_ohlc` — DONE (commit af823e1).** Was 3.5× vs polars-st (373 vs
+  107). resample ran the generic row-wise `aggregate_table` (64M branchy slot
+  updates); added a vectorized fast path that reduces each contiguous bucket slice
+  with tight auto-vectorising loops (first/last/min/max/sum/mean/count, bucket-only,
+  numeric, non-null; generic fallback otherwise). **~3.7× faster** (273→74ms at 16M
+  locally), projecting to ~parity with polars-st. Bonus: while here, found the int64
+  single-key `aggregate_table` path lacks the sorted-run shortcut the categorical/
+  string paths have and over-reserves `rows`/`rows*n_aggs` — a latent cleanup, but
+  the dedicated resample path sidesteps it.
 - `tf_asof_join` (time-only) 2.2× vs polars-st (114 vs 53) — some headroom left
   in the merge/materialise.
 - `tf_rolling_ewma_1m` 1.4×, `fill_null` 1.4× — minor.

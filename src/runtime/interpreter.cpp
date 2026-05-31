@@ -6082,27 +6082,40 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_std: column must be numeric (Int or Float)");
                 } else {
+                    // O(n) sliding window. The TimeFrame is sorted ascending, so
+                    // `lo` is monotonic: each row is added once on the right and
+                    // dropped once on the left. We maintain running (mean, m2)
+                    // with Welford add and its exact inverse for removal, which
+                    // matches the from-scratch Welford result the old O(n*w) loop
+                    // produced — but in a single pass instead of one per row.
                     Column<double> result;
                     result.resize(rows);
+                    double mean = 0.0;
+                    double m2 = 0.0;
+                    std::size_t cnt = 0;
+                    std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
-                        std::size_t n = i - lo + 1;
-                        if (n < 2) {
-                            result[i] = 0.0;
-                            continue;
+                        // Add col[i] on the right (standard Welford).
+                        double x = static_cast<double>(col[i]);
+                        ++cnt;
+                        double delta = x - mean;
+                        mean += delta / static_cast<double>(cnt);
+                        m2 += delta * (x - mean);
+                        // Drop rows that have aged out on the left (inverse Welford).
+                        std::int64_t threshold = time_vals[i] - dur_val;
+                        while (lo < i && time_vals[lo] < threshold) {
+                            double y = static_cast<double>(col[lo]);
+                            double mean_old = mean;
+                            --cnt;
+                            mean = ((static_cast<double>(cnt) + 1.0) * mean_old - y) /
+                                   static_cast<double>(cnt);
+                            m2 -= (y - mean_old) * (y - mean);
+                            ++lo;
                         }
-                        // Welford's online algorithm over the window.
-                        double mean = 0.0;
-                        double m2 = 0.0;
-                        std::int64_t cnt = 0;
-                        for (std::size_t j = lo; j <= i; ++j) {
-                            double x = static_cast<double>(col[j]);
-                            ++cnt;
-                            double delta = x - mean;
-                            mean += delta / static_cast<double>(cnt);
-                            m2 += delta * (x - mean);
-                        }
-                        result[i] = std::sqrt(m2 / static_cast<double>(n - 1));
+                        std::size_t n = i - lo + 1;  // == cnt
+                        // Clamp away tiny negative m2 from floating-point drift.
+                        result[i] =
+                            n < 2 ? 0.0 : std::sqrt(std::max(0.0, m2) / static_cast<double>(n - 1));
                     }
                     return result;
                 }

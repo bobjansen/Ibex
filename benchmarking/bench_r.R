@@ -8,7 +8,7 @@
 #   Rscript bench_r.R --csv data/prices.csv [--csv-multi data/prices_multi.csv]
 #                     [--warmup 1] [--iters 5] [--out results/r.tsv]
 #                     [--reshape-rows 100000] [--fill-rows 4000000]
-#                     [--skip-data-table] [--skip-dplyr]
+#                     [--skip-data-table] [--skip-dplyr] [--skip-frollapply]
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 args <- commandArgs(trailingOnly = TRUE)
@@ -36,6 +36,10 @@ reshape_rows    <- as.integer(parse_arg("--reshape-rows", "100000"))
 tf_rows         <- as.integer(parse_arg("--tf-rows",    "1000000"))
 skip_data_table <- parse_flag("--skip-data-table")
 skip_dplyr      <- parse_flag("--skip-dplyr")
+# frollapply(median/sd) is O(n*window): the two biggest single cells in the whole
+# suite. Their numbers are stable across ibex iterations, so they are pinned
+# (reused on the web page) and skipped by default from run_scale_suite.sh.
+skip_frollapply <- parse_flag("--skip-frollapply")
 
 # Honor the cross-engine single-threaded mode set by run_all.sh.
 if (nzchar(Sys.getenv("IBEX_BENCH_SINGLE_THREADED"))) {
@@ -117,6 +121,13 @@ bench <- function(framework, name, fn) {
 # call sites. The skip is logged so the blank cell is explained, not silent.
 COST_BUDGET_MS <- 120000  # 2 minutes total (across warmup + iters)
 bench_capped <- function(framework, name, fn, per_row_us, n) {
+    # Pinned by default: these frollapply/slide cells are stable and dominate
+    # wall-clock, so the suite reuses stored numbers unless --with-frollapply.
+    if (skip_frollapply) {
+        message(sprintf("  %s/%s: SKIPPED — pinned (pass --with-frollapply to run)",
+            framework, name))
+        return(invisible())
+    }
     est_ms <- n * per_row_us / 1000 * (warmup + iters)
     if (est_ms > COST_BUDGET_MS) {
         message(sprintf(

@@ -964,9 +964,14 @@ def bench_polars_tf(n_rows, warmup, iters):
 def bench_pandas_asof(n_rows, warmup, iters):
     """Tf as-of join: trades (left) joined to quotes (right) on time."""
     print("pandas: building asof data...", file=sys.stderr, flush=True)
+    # 100 symbols partition both sides (quote i and any trade derived from it
+    # share symbol i % 100), so the by-symbol asof has same-symbol candidates.
+    n_sym = 100
+    sym_cats = [f"SYM{i}" for i in range(n_sym)]
     # Quotes: 1s-spaced, full resolution
     quotes = pd.DataFrame({
         "ts": pd.to_datetime(np.arange(n_rows), unit="s").astype("datetime64[ns]"),
+        "symbol": pd.Categorical.from_codes(np.arange(n_rows) % n_sym, categories=sym_cats),
         "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
     }).sort_values("ts")
     # Trades: 10% sampled, jittered timestamps
@@ -976,6 +981,7 @@ def bench_pandas_asof(n_rows, warmup, iters):
         "ts": (pd.to_datetime(sample, unit="s")
                 + pd.to_timedelta(rng.integers(0, 999, len(sample)), unit="ms")
               ).astype("datetime64[ns]"),
+        "symbol": pd.Categorical.from_codes(sample % n_sym, categories=sym_cats),
         "qty": rng.integers(1, 100, len(sample)),
     }).sort_values("ts")
     rows = []
@@ -996,22 +1002,28 @@ def bench_pandas_asof(n_rows, warmup, iters):
         )
 
     run("tf_asof_join", lambda: pd.merge_asof(trades, quotes, on="ts", direction="backward"))
+    run("tf_asof_join_by_symbol",
+        lambda: pd.merge_asof(trades, quotes, on="ts", by="symbol", direction="backward"))
     return rows
 
 
 def bench_polars_asof(n_rows, warmup, iters):
     """Tf as-of join (Polars eager)."""
     print("polars: building asof data...", file=sys.stderr, flush=True)
+    # 100 symbols partition both sides (see pandas asof note).
+    n_sym = 100
     quotes = pl.DataFrame({
         "ts": pd.to_datetime(np.arange(n_rows), unit="s"),
+        "symbol": np.arange(n_rows) % n_sym,
         "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
-    }).sort("ts")
+    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts")
     rng = np.random.default_rng(42)
     sample = np.sort(rng.choice(n_rows, size=n_rows // 10, replace=False))
     trades = pl.DataFrame({
         "ts": pd.to_datetime(sample, unit="s") + pd.to_timedelta(rng.integers(0, 999, len(sample)), unit="ms"),
+        "symbol": sample % n_sym,
         "qty": rng.integers(1, 100, len(sample)),
-    }).sort("ts")
+    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts")
     rows = []
 
     def run(name, fn):
@@ -1031,6 +1043,8 @@ def bench_polars_asof(n_rows, warmup, iters):
 
     run("tf_asof_join",
         lambda: trades.join_asof(quotes, on="ts", strategy="backward"))
+    run("tf_asof_join_by_symbol",
+        lambda: trades.join_asof(quotes, on="ts", by="symbol", strategy="backward"))
     return rows
 
 

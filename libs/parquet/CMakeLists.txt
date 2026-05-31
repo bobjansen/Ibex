@@ -89,7 +89,12 @@ set(ARROW_BUILD_UTILITIES OFF CACHE BOOL "" FORCE)
 set(ARROW_FILESYSTEM ON CACHE BOOL "" FORCE)
 set(ARROW_PARQUET ON CACHE BOOL "" FORCE)
 set(ARROW_IPC ON CACHE BOOL "" FORCE)
-set(ARROW_S3 ON CACHE BOOL "" FORCE)
+# S3 filesystem support drags in the entire bundled AWS SDK (aws-lc, aws-c-*),
+# a large from-source compile that needs libssl-dev. Real ibex builds keep it
+# (default ON); the benchmark harness has no use for S3 reads and disables it
+# via -DIBEX_PARQUET_S3=OFF to cut build time.
+option(IBEX_PARQUET_S3 "Build the Parquet/Arrow stack with S3 filesystem support" ON)
+set(ARROW_S3 ${IBEX_PARQUET_S3} CACHE BOOL "" FORCE)
 set(ARROW_S3_MODULE OFF CACHE BOOL "" FORCE)
 set(ARROW_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)
 set(ARROW_RUNTIME_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)

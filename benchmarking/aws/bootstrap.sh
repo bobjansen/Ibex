@@ -63,6 +63,7 @@ export PATH="/root/.local/bin:$PATH"
 cmake -B /ibex/build-release -G Ninja \
     -DCMAKE_C_COMPILER="clang-${CLANG_VERSION}" \
     -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
+    -DIBEX_PARQUET_S3=OFF \
     -DCMAKE_BUILD_TYPE=Release \
     -S /ibex
 ninja -C /ibex/build-release

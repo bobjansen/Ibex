@@ -1,4 +1,7 @@
-find_package(CURL REQUIRED)
+# CURL powers optional HTTPS support in read_csv. It's not available on every
+# CI runner (Windows, the minimal clang-werror box), so treat it as optional:
+# build the plugin without HTTPS when it's missing rather than failing configure.
+find_package(CURL)
 
 add_library(ibex_csv_plugin SHARED csv.cpp)
 
@@ -20,8 +23,14 @@ target_link_libraries(ibex_csv_plugin
         Ibex::runtime
         Ibex::CompilerOptions
         fast_float
-        CURL::libcurl
 )
+
+if(CURL_FOUND)
+    target_link_libraries(ibex_csv_plugin PRIVATE CURL::libcurl)
+    target_compile_definitions(ibex_csv_plugin PRIVATE IBEX_CSV_HAVE_CURL)
+else()
+    message(STATUS "CURL not found: building csv plugin without HTTPS read_csv support")
+endif()
 
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_csv_plugin PRIVATE Ibex::Sanitizers)

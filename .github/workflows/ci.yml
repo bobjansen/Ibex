@@ -69,10 +69,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # libcurl powers HTTPS read_csv. Use the static-md triplet so curl links
+      # statically into the csv plugin (no libcurl.dll to put on PATH for the
+      # tests) while the CRT stays dynamic (/MD), matching the rest of the build.
+      # The default ssl feature resolves to Schannel here, so no OpenSSL build.
+      - name: Install libcurl (vcpkg)
+        run: vcpkg install curl:x64-windows-static-md
+
       - name: Configure
         run: |
           cmake -B build `
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             -DIBEX_WARNINGS_AS_ERRORS=ON `
             -DIBEX_BUILD_TESTS=ON `
             -DIBEX_BUILD_TOOLS=ON `

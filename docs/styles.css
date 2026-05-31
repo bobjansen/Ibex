@@ -177,6 +177,35 @@ h3 {
   color: #fff;
 }
 
+/* ── Audience ───────────────────────────────────────────────────────────── */
+
+.audience-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1.2rem;
+}
+
+.audience-card {
+  background:
+    linear-gradient(180deg, rgba(255, 250, 240, 0.98), rgba(255, 246, 232, 0.98));
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 1.25rem;
+}
+
+.audience-card h3 {
+  font-size: 1.05rem;
+  margin-top: 0.1rem;
+}
+
+.audience-card p {
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.65;
+  margin: 0.45rem 0 0;
+}
+
 /* ── Cards & grid ────────────────────────────────────────────────────────── */
 
 .grid-2 {
@@ -464,7 +493,8 @@ table.bench {
   }
 
   .grid-2,
-  .grid-3 {
+  .grid-3,
+  .audience-grid {
     grid-template-columns: 1fr;
   }
 

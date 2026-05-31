@@ -21,6 +21,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y \
     clang-18 cmake ninja-build \
+    libcurl4-openssl-dev \
     r-base r-cran-data.table r-cran-optparse \
     python3 curl unzip
 

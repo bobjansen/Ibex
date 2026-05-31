@@ -20,10 +20,10 @@ df -h / || true
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y \
-    ninja-build \
-    libcurl4-openssl-dev libssl-dev \
+    git ninja-build \
+    libcurl4-openssl-dev libssl-dev zlib1g-dev \
     r-base r-cran-data.table r-cran-optparse \
-    python3 curl unzip \
+    python3 python3-dev curl unzip \
     wget gnupg lsb-release software-properties-common ca-certificates
 
 # ── Modern CMake ──────────────────────────────────────────────────────────────

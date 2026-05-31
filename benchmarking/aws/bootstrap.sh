@@ -20,11 +20,22 @@ df -h / || true
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y \
-    cmake ninja-build \
+    ninja-build \
     libcurl4-openssl-dev \
     r-base r-cran-data.table r-cran-optparse \
     python3 curl unzip \
     wget gnupg lsb-release software-properties-common ca-certificates
+
+# ── Modern CMake ──────────────────────────────────────────────────────────────
+# Noble's apt only ships CMake 3.28, on which Arrow 22's ThirdpartyToolchain
+# mis-resolves thirdparty/versions.txt → empty Boost SHA256 → configure fails.
+# Install the official Kitware binary, pinned to match the known-good local
+# version. Bump CMAKE_VERSION to re-baseline (must match install-deps.sh).
+CMAKE_VERSION=3.31.6
+curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" -o /tmp/cmake.tar.gz
+tar -xzf /tmp/cmake.tar.gz -C /opt
+export PATH="/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin:$PATH"
+cmake --version | head -1    # record exact CMake in the bench log
 
 # ── Modern Clang ──────────────────────────────────────────────────────────────
 # Ubuntu Noble's apt only ships clang-18, which reports __cpp_concepts=201907L

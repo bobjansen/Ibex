@@ -21,10 +21,19 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y \
     git ninja-build \
+    libjemalloc-dev \
     libcurl4-openssl-dev libssl-dev zlib1g-dev \
     r-base r-cran-data.table r-cran-optparse \
     python3 python3-dev curl unzip \
     wget gnupg lsb-release software-properties-common ca-certificates
+
+# jemalloc is ibex's intended allocator: with malloc_conf="dirty_decay_ms:-1"
+# (set in tools/ibex_bench.cpp) it retains freed column buffers so warm
+# iterations reuse already-faulted pages. Without it ibex_bench links glibc
+# malloc, whose 32MB mmap threshold munmaps every column >4M float64 rows on
+# free and re-faults it next iteration — a ~5x cliff at 4M->8M that is a
+# measurement artifact of the box's allocator, not ibex. find_library in
+# tools/CMakeLists.txt picks up the libjemalloc.so symlink from libjemalloc-dev.
 
 # ── Modern CMake ──────────────────────────────────────────────────────────────
 # Noble's apt only ships CMake 3.28, on which Arrow 22's ThirdpartyToolchain

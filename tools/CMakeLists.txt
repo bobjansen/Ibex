@@ -61,6 +61,15 @@ find_library(JEMALLOC_LIB
 )
 if(JEMALLOC_LIB)
     target_link_libraries(ibex_bench PRIVATE ${JEMALLOC_LIB})
+    message(STATUS "ibex_bench: linking jemalloc (${JEMALLOC_LIB})")
+else()
+    # Loud in the build log so a benchmark box silently falling back to glibc
+    # malloc (and its 32MB mmap-threshold page-fault cliff above 4M rows) is
+    # caught — install libjemalloc-dev. The runtime's mallopt() fallback
+    # mitigates glibc, but jemalloc is the intended config for credible numbers.
+    message(WARNING "ibex_bench: jemalloc NOT found — using glibc malloc; "
+                    "benchmark numbers above ~4M rows will show a page-fault cliff. "
+                    "Install libjemalloc-dev for the intended allocator.")
 endif()
 
 if(TARGET Ibex::Sanitizers)

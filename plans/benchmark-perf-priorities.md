@@ -7,52 +7,46 @@ Standing: ibex is the fastest framework in 103 of the cells measured and lands
 within 2× of the best in ~70% of them (median rank 2). The work below is about
 the cells where it *doesn't*, plus trimming the suite so reruns are cheap.
 
-## P0 — Allocation / page-fault cliff (systemic, highest ROI)
+## P0 — Allocation / page-fault cliff — RESOLVED (was a benchmark-env bug)
 
-**Symptom.** The cheapest O(n) ops scale *worst*. Fitting an exponent to
-1M→16M (16× data) gives:
-
-| query | scaling exp | should be |
-|---|---|---|
-| cumsum_price | 1.60 | 1.0 |
-| update_price_x2 | 1.58 | 1.0 |
-| rand_uniform | 1.53 | 1.0 |
-| fill_backward | 1.51 | 1.0 |
-| tf_lag1 | 1.48 | 1.0 |
-| filter_simple | 1.42 | 1.0 |
-
-Per-row throughput is a **step function, not gradual cache decay**:
+**Symptom.** The cheapest O(n) ops scaled *worst* (1M→16M exponent ~1.4–1.6 for
+cumsum/update/rand_uniform/fill_*/tf_lag1 vs the expected 1.0), as a clean step:
 
 ```
 cumsum_price [ibex]: 1M 0.7ns  2M 0.6ns  4M 0.7ns  | 8M 3.3ns  16M 3.5ns
                                     ~5x cliff at 4M->8M ^
-polars (contrast):   1M 5.2ns  2M 4.6ns  4M 4.3ns    8M 4.3ns  16M 4.2ns  (flat)
 ```
 
-ibex runs at ~0.7 ns/row up to 4M, jumps ~5–10× to ~3.5 ns/row, then is flat
-again. A float64 column crosses **~32 MB at 4M rows** — exactly glibc's
-`DEFAULT_MMAP_THRESHOLD_MAX`. Above it, freed buffers are returned to the OS and
-each result column is a fresh `mmap`, so every first-touch write takes a
-zero-fill minor page fault (~3 ns/row). Ops that allocate multiple/wider buffers
-(e.g. `fill_backward`) hit the cliff one scale earlier (2M→4M). Polars is flat
-because Arrow pools its buffers. Same mechanism the interpreter rolling notes
-already document, now visible suite-wide.
+**Root cause (confirmed three ways).** The AWS box was **not using jemalloc**.
+`benchmarking/aws/bootstrap.sh` installed its deps inline and never called
+`install-deps.sh`, so `libjemalloc-dev` was absent, `find_library()` failed, and
+`ibex_bench` linked **glibc malloc**. glibc mmaps every allocation above its
+32 MB `DEFAULT_MMAP_THRESHOLD_MAX` (= 4M float64 rows) and munmaps on free, so
+each warm iteration re-faults every page of a >32 MB column. Local builds *do*
+link jemalloc (`malloc_conf="dirty_decay_ms:-1"` in `tools/ibex_bench.cpp`),
+which retains freed pages → flat at every scale, which is why it never reproduced
+locally. The 4M→8M step lands exactly on the glibc threshold — a fingerprint
+jemalloc lacks. Not an ibex inefficiency.
 
-**Why it matters.** ibex is *fastest of all frameworks* below the cliff; above
-it the lead collapses to "merely competitive" on ~15 queries. Fixing this is one
-change that lifts a large fraction of the suite at the scales that matter most.
+Evidence: forcing local jemalloc to drop retention
+(`MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0,retain:false`) reproduced 3.3 ns/row;
+a local glibc rebuild reproduced the cliff (1.2→3.9 ns/row) and `mallopt` flattened
+it (→1.3 ns/row); AWS run `20260531T142434` (glibc + mallopt) gave 2–2.8× on every
+cheap op.
 
-**Approach (cheap → real fix).**
-1. `mallopt(M_TRIM_THRESHOLD / M_MMAP_THRESHOLD, …)` so freed large buffers stay
-   resident and get recycled (faulted once). Quick experiment to confirm the
-   diagnosis end-to-end.
-2. Column-buffer arena / free-list pool keyed by size class (the real fix,
-   mirrors Arrow's memory pool). Reuse result-column allocations across ops.
-3. Optional: huge pages / explicit pre-fault for the largest columns.
+**Fix (landed).**
+- `mallopt(M_MMAP_MAX=0, M_TRIM_THRESHOLD=-1)` once at first `interpret()`, glibc
+  only, opt-out `IBEX_NO_MALLOC_TUNING` (commit 8646231). Protects the glibc-only
+  user tools (repl/eval/compile) that don't link jemalloc → ~1.4 ns/row.
+- `libjemalloc-dev` added to `bootstrap.sh`; CMake now logs found/missing
+  (commit 133d8ca). Bench now measures the intended allocator → ~0.9 ns/row.
+- Accepted caveat: `M_TRIM_THRESHOLD=-1` never returns memory to the OS, so a
+  long-running glibc REPL session retains RSS. Acceptable for ibex's batch-y
+  workloads; opt-out flag exists. (Future option: link jemalloc into all tools
+  and drop the glibc tuning.)
 
-**Validation.** Re-run the cheap-op subset (cumsum, update, rand_uniform,
-filter_simple, fill_*, tf_lag1, tf_rolling_sum) at 8M/16M; target flat ns/row
-matching the sub-4M figures.
+**Result.** jemalloc ~0.9 ns/row > mallopt-on-glibc ~1.4 ns/row > glibc ~3.5 ns/row.
+Cliff closed. Confirm on the next AWS run (bench will now show the jemalloc numbers).
 
 ## P1 — `tf_rolling_ewma_1m` rewrite (worst single ratio)
 
@@ -61,17 +55,24 @@ Linear scaling (exp 1.03) but **18.5× slower than polars** (1618ms vs 88ms at
 ratio in the suite. Investigate the interpreter/codegen path for ewma; expect a
 per-element recurrence that isn't vectorized or is re-deriving weights per row.
 
-## P2 — `tf_asof_join` (slow *and* superlinear)
+> **Re-scope after P0.** The allocator fix (run `20260531T142434`, glibc+mallopt
+> at 16M) revealed that several "algorithmic" losses were mostly *allocation*:
+> `melt_wide_to_long` 1.9× faster, `tf_asof_join` 1.8× faster, just from mallopt.
+> `tf_rolling_ewma_1m` moved only 1.14× — it is the one genuinely algorithm-bound
+> target. So ewma is the real P1; asof/reshape drop in priority and should be
+> re-measured under jemalloc before any code work.
 
-495ms vs polars-st 45ms = **11×**, and exp 1.25 so it degrades on top of being
-slow. Both an algorithmic and a scaling problem — worth profiling after P0 to
-separate the allocation component from the join logic.
+## P2 — `tf_asof_join` (re-measure under jemalloc first)
+
+Was 495ms vs polars-st 45ms = 11× under glibc, but ~1.8× of that was allocation
+(now ~281ms with mallopt). Re-measure under jemalloc; if a real gap remains it's
+the join logic (exp was 1.25). Lower priority than ewma.
 
 ## P3 — Reshape constant factor (lower priority)
 
-`melt_wide_to_long` 47× vs clickhouse, `dcast_long_to_wide` 5× vs clickhouse,
-both ~linear (exp ~1.05). Inherently heavy ops; constant-factor slow rather than
-broken. Defer until P0–P2 land.
+`melt_wide_to_long` and `dcast_long_to_wide` were allocation-heavy (melt 1.9×
+from mallopt alone). Re-measure under jemalloc; `dcast` barely moved (1.01×) so
+that one is genuine constant-factor work. Defer until P1 lands.
 
 ## Confirmed strengths (protect against regressions)
 

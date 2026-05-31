@@ -73,6 +73,31 @@ green (884 cases).
 > math). Now both are O(n); the cell is a fair speed comparison but not an
 > identical-result one — worth a footnote on the web page.
 
+## Validation run `20260531T192851` (81f9836, full 1M–16M) — current standing
+
+Grouped-asof and ClickHouse-materialisation both confirmed @16M:
+- **`tf_asof_join_by_symbol` 1040 → 405 ms (2.57×)** — ibex 405 vs data.table 224 /
+  polars 258 (~1.7× behind, was 4.5×); beats polars-st (501) and duckdb (616).
+- **ClickHouse now materialises**: filter_simple 19→81, filter_arith 27→118,
+  melt 21→64, update 5→15; aggregations unchanged (mean_by_symbol 50→52). The
+  filter cells were the FORMAT-Null artifact — ibex (63) now *beats* ClickHouse on
+  filter_simple.
+
+**The headline framing (same-core).** Ibex is single-threaded. Versus
+single-threaded **polars-st @16M, ibex is faster in 37/41 queries.** The 3–4×
+"filter gaps" were purely parallelism (ibex beats polars-st on every filter; the
+gap is only to 8-core polars). Genuine single-thread algorithmic gaps remaining,
+in order:
+- **`tf_resample_1m_ohlc` — 3.5× vs polars-st** (ibex 373 vs 107). The clear #1
+  next target.
+- `tf_asof_join` (time-only) 2.2× vs polars-st (114 vs 53) — some headroom left
+  in the merge/materialise.
+- `tf_rolling_ewma_1m` 1.4×, `fill_null` 1.4× — minor.
+Everything else: ibex is fastest single-thread. Multi-thread parallelism is a
+separate roadmap item ([[project_execution_roadmap]]), not an algorithmic fix.
+
+Website refreshed (`docs/benchmarks.html`) with a threads/same-core note.
+
 ## Validation run `20260531T165259` (021971f, full 1M–16M, on-demand)
 
 All three landed steps confirmed on AWS @16M:

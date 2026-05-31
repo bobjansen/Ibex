@@ -16,6 +16,7 @@
 #include <ctime>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -27,6 +28,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef __GLIBC__
+#include <malloc.h>  // mallopt
+#endif
+
 #include "join_internal.hpp"
 #include "model_internal.hpp"
 #include "reshape_internal.hpp"
@@ -35,6 +40,30 @@
 namespace ibex::runtime {
 
 namespace {
+
+// Process-wide allocator tuning to flatten the large-buffer page-fault cliff.
+//
+// Every result column is backed by std::vector<T>, so any column above glibc's
+// dynamic mmap threshold (grows up to 32 MB = 4M float64 rows) is served by a
+// fresh mmap and munmapped on free. The next same-size allocation re-mmaps and
+// re-faults every 4 KB page on first touch — a ~5x throughput cliff once columns
+// cross ~32 MB (see plans/benchmark-perf-priorities.md, P0). Serving large
+// allocations from the main arena and never trimming the heap top lets freed
+// buffers recycle already-faulted pages across the warmup/timed iterations.
+// glibc-only; a no-op elsewhere. Opt out via IBEX_NO_MALLOC_TUNING.
+void tune_allocator_once() {
+#ifdef __GLIBC__
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        if (const char* off = std::getenv("IBEX_NO_MALLOC_TUNING");
+            off != nullptr && off[0] != '\0' && off[0] != '0') {
+            return;
+        }
+        mallopt(M_MMAP_MAX, 0);         // large allocs from sbrk arena, not mmap
+        mallopt(M_TRIM_THRESHOLD, -1);  // keep freed buffers resident for reuse
+    });
+#endif
+}
 
 auto invoke_extern_call(const ir::ExternCallNode& ec, const ScalarRegistry* scalars,
                         const ExternRegistry* externs) -> std::expected<ExternValue, std::string>;
@@ -13285,6 +13314,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
                const ExternRegistry* externs, ModelResult* model_out)
     -> std::expected<Table, std::string> {
+    tune_allocator_once();
     auto op = build_operator(node, registry, scalars, externs, model_out);
     if (!op.has_value()) {
         return std::unexpected(std::move(op.error()));

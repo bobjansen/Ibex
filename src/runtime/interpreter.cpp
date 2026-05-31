@@ -6392,8 +6392,151 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
     if (dur_ns <= 0)
         return std::unexpected("resample: duration must be positive");
 
-    // Build bucket column: floor(ts.nanos / dur_ns) * dur_ns
     const auto rows = input.rows();
+    const auto bucket_of = [&](std::size_t i) -> std::int64_t {
+        const std::int64_t nanos = (*ts_col)[i].nanos;
+        std::int64_t q = nanos / dur_ns;
+        if (nanos < 0 && nanos % dur_ns != 0)
+            --q;  // floor for negative timestamps
+        return q * dur_ns;
+    };
+
+    // Fast vectorised path: bucket-only grouping with simple numeric reducers
+    // over non-null Int/Float columns. The time index is sorted, so each bucket
+    // is a contiguous slice and per-bucket first/last/min/max/sum/mean/count
+    // reduce with tight (auto-vectorising) loops — far cheaper than the generic
+    // row-wise aggregate. Falls through for extra group-by, complex aggregates
+    // (median/stddev/...), nullable inputs, or non-numeric columns.
+    auto simple_resample = [&]() -> std::optional<std::expected<Table, std::string>> {
+        if (!extra_group_by.empty() || rows == 0) {
+            return std::nullopt;
+        }
+        for (const auto& agg : aggregations) {
+            switch (agg.func) {
+                case ir::AggFunc::Sum:
+                case ir::AggFunc::Mean:
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max:
+                case ir::AggFunc::Count:
+                case ir::AggFunc::First:
+                case ir::AggFunc::Last:
+                    break;
+                default:
+                    return std::nullopt;  // complex aggregate -> generic path
+            }
+            if (agg.func == ir::AggFunc::Count) {
+                continue;
+            }
+            const auto* entry = input.find_entry(agg.column.name);
+            if (entry == nullptr || entry->validity.has_value()) {
+                return std::nullopt;  // missing or nullable -> generic path
+            }
+            const ColumnValue& cv = *entry->column;
+            if (!std::holds_alternative<Column<std::int64_t>>(cv) &&
+                !std::holds_alternative<Column<double>>(cv)) {
+                return std::nullopt;  // non-numeric -> generic path
+            }
+        }
+
+        // Bucket boundaries: starts[g] is the first row of bucket g; the trailing
+        // sentinel `rows` closes the last bucket.
+        std::vector<std::size_t> starts;
+        std::vector<std::int64_t> bvals;
+        starts.reserve(1024);
+        bvals.reserve(1024);
+        std::int64_t prev = 0;
+        for (std::size_t i = 0; i < rows; ++i) {
+            std::int64_t b = bucket_of(i);
+            if (i == 0 || b != prev) {
+                starts.push_back(i);
+                bvals.push_back(b);
+                prev = b;
+            }
+        }
+        const std::size_t ng = bvals.size();
+        starts.push_back(rows);
+
+        Table out;
+        Column<Timestamp> ts_out;
+        ts_out.reserve(ng);
+        for (std::int64_t b : bvals)
+            ts_out.push_back(Timestamp{b});
+        out.add_column(ts_name, std::move(ts_out));
+
+        for (const auto& agg : aggregations) {
+            if (agg.func == ir::AggFunc::Count) {
+                Column<std::int64_t> c;
+                c.reserve(ng);
+                for (std::size_t g = 0; g < ng; ++g)
+                    c.push_back(static_cast<std::int64_t>(starts[g + 1] - starts[g]));
+                out.add_column(agg.alias, std::move(c));
+                continue;
+            }
+            const ColumnValue& cv = *input.find_entry(agg.column.name)->column;
+            std::visit(
+                [&](const auto& src) {
+                    using T = typename std::decay_t<decltype(src)>::value_type;
+                    if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
+                        const bool to_double = (agg.func == ir::AggFunc::Mean);
+                        if (to_double) {
+                            Column<double> c;
+                            c.reserve(ng);
+                            for (std::size_t g = 0; g < ng; ++g) {
+                                const std::size_t lo = starts[g];
+                                const std::size_t hi = starts[g + 1];
+                                double acc = 0.0;
+                                for (std::size_t j = lo; j < hi; ++j)
+                                    acc += static_cast<double>(src[j]);
+                                c.push_back(acc / static_cast<double>(hi - lo));
+                            }
+                            out.add_column(agg.alias, std::move(c));
+                        } else {
+                            Column<T> c;
+                            c.reserve(ng);
+                            for (std::size_t g = 0; g < ng; ++g) {
+                                const std::size_t lo = starts[g];
+                                const std::size_t hi = starts[g + 1];
+                                T v = src[lo];
+                                switch (agg.func) {
+                                    case ir::AggFunc::First:
+                                        break;
+                                    case ir::AggFunc::Last:
+                                        v = src[hi - 1];
+                                        break;
+                                    case ir::AggFunc::Min:
+                                        for (std::size_t j = lo + 1; j < hi; ++j)
+                                            v = std::min(v, src[j]);
+                                        break;
+                                    case ir::AggFunc::Max:
+                                        for (std::size_t j = lo + 1; j < hi; ++j)
+                                            v = std::max(v, src[j]);
+                                        break;
+                                    case ir::AggFunc::Sum: {
+                                        T s = T{};
+                                        for (std::size_t j = lo; j < hi; ++j)
+                                            s += src[j];
+                                        v = s;
+                                        break;
+                                    }
+                                    default:
+                                        break;
+                                }
+                                c.push_back(v);
+                            }
+                            out.add_column(agg.alias, std::move(c));
+                        }
+                    }
+                },
+                cv);
+        }
+        out.time_index = ts_name;
+        return std::expected<Table, std::string>{std::move(out)};
+    };
+    if (auto fast = simple_resample(); fast.has_value()) {
+        return std::move(*fast);
+    }
+
+    // Build bucket column: floor(ts.nanos / dur_ns) * dur_ns
     Column<std::int64_t> bucket_col;
     bucket_col.reserve(rows);
     for (std::size_t i = 0; i < rows; ++i) {

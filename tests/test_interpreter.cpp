@@ -2096,6 +2096,39 @@ TEST_CASE("resample basic OHLC - 3 two-minute buckets") {
     REQUIRE(closes[2] == 60.0);
 }
 
+TEST_CASE("resample count/sum/mean (fast path, numeric reducers)") {
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0 * min_ns), ts_from_nanos(1 * min_ns),
+                                             ts_from_nanos(2 * min_ns), ts_from_nanos(3 * min_ns),
+                                             ts_from_nanos(4 * min_ns)});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0, 50.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("tf", table);
+
+    // 2-minute buckets: [0,1]->{10,20}, [2,3]->{30,40}, [4]->{50}
+    auto ir =
+        require_ir(R"(tf[resample 2m, select { n = count(), s = sum(price), m = mean(price) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto& n = std::get<Column<std::int64_t>>(*result->find("n"));
+    const auto& s = std::get<Column<double>>(*result->find("s"));
+    const auto& m = std::get<Column<double>>(*result->find("m"));
+    CHECK(n[0] == 2);
+    CHECK(n[1] == 2);
+    CHECK(n[2] == 1);
+    CHECK(s[0] == 30.0);
+    CHECK(s[1] == 70.0);
+    CHECK(s[2] == 50.0);
+    CHECK(m[0] == 15.0);
+    CHECK(m[1] == 35.0);
+    CHECK(m[2] == 50.0);
+}
+
 TEST_CASE("resample with by - one bucket per (bucket, symbol)") {
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
     runtime::Table table;

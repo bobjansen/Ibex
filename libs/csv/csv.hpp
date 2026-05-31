@@ -33,14 +33,18 @@
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef IBEX_CSV_HAVE_CURL
 #include <curl/curl.h>
+#endif
 #include <deque>
 #include <fast_float/fast_float.h>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -564,28 +568,34 @@ inline auto is_https_uri(std::string_view path) -> bool {
     return path.starts_with("https://") || path.starts_with("http://");
 }
 
+#ifdef IBEX_CSV_HAVE_CURL
 inline auto write_http_chunk_csv(char* ptr, std::size_t size, std::size_t nmemb, void* userdata)
     -> std::size_t {
     if (size != 0 && nmemb > static_cast<std::size_t>(-1) / size) {
         return 0;
     }
-    const auto total = size * nmemb;
-    auto* fd = static_cast<int*>(userdata);
-    std::size_t written = 0;
-    while (written < total) {
-        const auto n = ::write(*fd, ptr + written, total - written);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return 0;
+    auto* fp = static_cast<std::FILE*>(userdata);
+    // Element size 1 so the return value is the byte count curl compares
+    // against `size * nmemb`; a short write signals failure and aborts.
+    return std::fwrite(ptr, 1, size * nmemb, fp);
+}
+
+/// Open a uniquely-named temp file under `dir` and return it together with its
+/// path. Portable replacement for POSIX mkstemp: the C11 "x" mode makes the
+/// open fail if the candidate already exists, so the random name + retry loop
+/// is race-free. "b" keeps curl's bytes verbatim on Windows.
+inline auto csv_open_unique_temp(const std::filesystem::path& dir, std::string& out_path)
+    -> std::FILE* {
+    std::random_device rd;
+    std::mt19937_64 rng(rd());
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        auto candidate = (dir / ("ibex-csv-" + std::to_string(rng()) + ".tmp")).string();
+        if (std::FILE* fp = std::fopen(candidate.c_str(), "wbx"); fp != nullptr) {
+            out_path = std::move(candidate);
+            return fp;
         }
-        if (n == 0) {
-            return 0;
-        }
-        written += static_cast<std::size_t>(n);
     }
-    return total;
+    return nullptr;
 }
 
 /// Download `url` to a fresh temp file and return its path. Caller owns the
@@ -604,19 +614,18 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
     if (ec) {
         throw std::runtime_error("read_csv: failed to locate temp directory: " + ec.message());
     }
-    auto pattern = (temp_dir / "ibex-csv-XXXXXX").string();
-    std::vector<char> buffer(pattern.begin(), pattern.end());
-    buffer.push_back('\0');
-    int fd = ::mkstemp(buffer.data());
-    if (fd < 0) {
-        throw std::runtime_error("read_csv: failed to create temp file: " +
-                                 std::string(std::strerror(errno)));
-    }
-    std::string temp_path(buffer.data());
 
+    std::string temp_path;
+    std::FILE* fp = csv_open_unique_temp(temp_dir, temp_path);
+    if (fp == nullptr) {
+        throw std::runtime_error("read_csv: failed to create temp file in " + temp_dir.string());
+    }
+
+    bool fp_open = true;
     auto cleanup = [&] {
-        if (fd >= 0) {
-            (void)::close(fd);
+        if (fp_open) {
+            (void)std::fclose(fp);
+            fp_open = false;
         }
         std::error_code rm_ec;
         std::filesystem::remove(temp_path, rm_ec);
@@ -633,12 +642,15 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
     curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk_csv);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fd);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "ibex-csv/1");
+    // With the Schannel backend (the default on Windows) curl validates against
+    // the system certificate store, so these overrides are only consulted when
+    // the caller explicitly points at a bundle.
     if (const char* ca_info = std::getenv("CURL_CA_BUNDLE");
         ca_info != nullptr && ca_info[0] != '\0') {
         curl_easy_setopt(curl, CURLOPT_CAINFO, ca_info);
@@ -652,23 +664,28 @@ inline auto csv_download_https_to_temp(std::string_view url) -> std::string {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
     curl_easy_cleanup(curl);
 
-    const int close_result = ::close(fd);
-    fd = -1;
+    // fclose flushes any buffered bytes; a non-zero result means the download
+    // didn't fully land on disk.
+    const int close_result = std::fclose(fp);
+    fp_open = false;
 
     if (rc != CURLE_OK) {
-        cleanup();
+        std::error_code rm_ec;
+        std::filesystem::remove(temp_path, rm_ec);
         const std::string detail =
             error_buffer[0] != '\0' ? error_buffer.data() : curl_easy_strerror(rc);
         throw std::runtime_error("read_csv: failed to download '" + url_string + "' (" + detail +
                                  ", HTTP " + std::to_string(response_code) + ")");
     }
     if (close_result != 0) {
-        cleanup();
+        std::error_code rm_ec;
+        std::filesystem::remove(temp_path, rm_ec);
         throw std::runtime_error("read_csv: failed to finish temp download for '" + url_string +
-                                 "': " + std::strerror(errno));
+                                 "'");
     }
     return temp_path;
 }
+#endif  // IBEX_CSV_HAVE_CURL
 
 struct CsvLocalPath {
     std::string path;
@@ -703,9 +720,14 @@ struct CsvLocalPath {
 inline auto resolve_csv_path(std::string_view path) -> CsvLocalPath {
     CsvLocalPath out;
     if (is_https_uri(path)) {
+#ifdef IBEX_CSV_HAVE_CURL
         out.path = csv_download_https_to_temp(path);
         out.is_temp = true;
         return out;
+#else
+        throw std::runtime_error(
+            "read_csv: HTTPS URLs are not supported in this build (compiled without libcurl)");
+#endif
     }
     out.path.assign(path);
     return out;

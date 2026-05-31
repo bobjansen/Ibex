@@ -1,4 +1,14 @@
 #pragma once
+// On Windows, keep the SDK's min/max macros from breaking fast_float's
+// use of std::numeric_limits<T>::max().
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#endif
 // Ibex CSV library — RFC 4180 compliant CSV reading and writing.
 //
 // Reading:

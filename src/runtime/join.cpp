@@ -911,46 +911,64 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             right_eq_keys.push_back(right_keys[i]);
         }
 
-        std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
-        right_groups.reserve(n_right);
-        for (std::size_t r = 0; r < n_right; ++r) {
-            Key group;
-            group.values.reserve(right_eq_keys.size());
-            for (const auto* col : right_eq_keys) {
-                group.values.push_back(scalar_from_column(*col, r));
-            }
-            right_groups[group].push_back(r);
-        }
-
-        std::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
-        right_pos.reserve(right_groups.size());
-
         std::vector<std::size_t> left_idx(n_left);
         std::vector<std::size_t> right_idx(n_left);
-        for (std::size_t l = 0; l < n_left; ++l) {
-            left_idx[l] = l;
 
-            Key group;
-            group.values.reserve(left_eq_keys.size());
-            for (const auto* col : left_eq_keys) {
-                group.values.push_back(scalar_from_column(*col, l));
+        if (left_eq_keys.empty()) {
+            // Time-only asof (the canonical case): with no equality keys every
+            // right row is a candidate, so a single two-pointer merge over the
+            // already-sorted time arrays finds the latest right row at-or-before
+            // each left time in O(n_left + n_right). Skips the per-row Key
+            // construction + hashing that otherwise builds one giant group over
+            // the entire right table and dominates the cost for large rights.
+            std::size_t pos = 0;  // # right rows with time <= current left time
+            for (std::size_t l = 0; l < n_left; ++l) {
+                left_idx[l] = l;
+                while (pos < n_right && right_times[pos] <= left_times[l]) {
+                    ++pos;
+                }
+                right_idx[l] = (pos == 0) ? kNull : pos - 1;
+            }
+        } else {
+            std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
+            right_groups.reserve(n_right);
+            for (std::size_t r = 0; r < n_right; ++r) {
+                Key group;
+                group.values.reserve(right_eq_keys.size());
+                for (const auto* col : right_eq_keys) {
+                    group.values.push_back(scalar_from_column(*col, r));
+                }
+                right_groups[group].push_back(r);
             }
 
-            auto it = right_groups.find(group);
-            if (it == right_groups.end()) {
-                right_idx[l] = kNull;
-                continue;
-            }
+            std::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
+            right_pos.reserve(right_groups.size());
 
-            auto [pos_it, inserted] = right_pos.try_emplace(group, 0);
-            (void)inserted;
-            std::size_t& pos = pos_it->second;
-            const auto& rows = it->second;
-            while (pos < rows.size() && right_times[rows[pos]] <= left_times[l]) {
-                ++pos;
-            }
+            for (std::size_t l = 0; l < n_left; ++l) {
+                left_idx[l] = l;
 
-            right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
+                Key group;
+                group.values.reserve(left_eq_keys.size());
+                for (const auto* col : left_eq_keys) {
+                    group.values.push_back(scalar_from_column(*col, l));
+                }
+
+                auto it = right_groups.find(group);
+                if (it == right_groups.end()) {
+                    right_idx[l] = kNull;
+                    continue;
+                }
+
+                auto [pos_it, inserted] = right_pos.try_emplace(group, 0);
+                (void)inserted;
+                std::size_t& pos = pos_it->second;
+                const auto& rows = it->second;
+                while (pos < rows.size() && right_times[rows[pos]] <= left_times[l]) {
+                    ++pos;
+                }
+
+                right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
+            }
         }
 
         static const std::vector<std::size_t> empty_key_idx;

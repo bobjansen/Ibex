@@ -43,6 +43,21 @@ def _count_rows(sess, sql):
     return int(res.data().strip())
 
 
+_SINK = "_bench_sink"
+
+
+def _materialize(sess, sql):
+    """Execute the query and materialise its full result into an in-memory table.
+
+    Unlike `FORMAT Null` (which streams rows through a sink and discards them in
+    bounded blocks), CREATE ... AS builds the whole result in ClickHouse's native
+    columnar memory — so output-heavy queries (melt/dcast/wide filters) pay the
+    same allocate+write cost ibex/polars/duckdb/datafusion do when they return a
+    result. Aggregations stay cheap because their result is small. CREATE OR
+    REPLACE drops the previous result first, so peak memory is one result."""
+    sess.query(f"CREATE OR REPLACE TABLE {_SINK} ENGINE = Memory AS {sql}")
+
+
 # ── Benchmark suites ──────────────────────────────────────────────────────────
 
 
@@ -55,7 +70,7 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         n = _count_rows(sess, sql)
 
         def fn():
-            sess.query(sql, "Null")
+            _materialize(sess, sql)
 
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
             fn, warmup, iters
@@ -180,7 +195,7 @@ def bench_clickhouse_null(csv_path, csv_lookup_path, warmup, iters, sess):
         n = _count_rows(sess, sql)
 
         def fn():
-            sess.query(sql, "Null")
+            _materialize(sess, sql)
 
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
             fn, warmup, iters
@@ -241,7 +256,7 @@ def bench_clickhouse_reshape(warmup, iters, reshape_rows, sess):
         n = _count_rows(sess, sql)
 
         def fn():
-            sess.query(sql, "Null")
+            _materialize(sess, sql)
 
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
             fn, warmup, iters
@@ -323,7 +338,7 @@ def bench_clickhouse_events(csv_events_path, warmup, iters, sess):
         n = _count_rows(sess, sql)
 
         def fn():
-            sess.query(sql, "Null")
+            _materialize(sess, sql)
 
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
             fn, warmup, iters
@@ -379,7 +394,7 @@ def bench_clickhouse_fill(n_rows, warmup, iters, sess):
         n = _count_rows(sess, sql)
 
         def fn():
-            sess.query(sql, "Null")
+            _materialize(sess, sql)
 
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
             fn, warmup, iters

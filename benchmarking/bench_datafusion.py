@@ -267,6 +267,9 @@ def bench_datafusion_null(csv_path, csv_lookup_path, warmup, iters, ctx):
 
 def bench_datafusion_reshape(warmup, iters, reshape_rows, ctx):
     """Melt (wide->long) and dcast (long->wide) on a synthetic OHLC table."""
+    if reshape_rows <= 0:
+        print("datafusion: reshape skipped (disabled for this size)", file=sys.stderr, flush=True)
+        return []
     n_day = 400
     print(
         f"datafusion: building synthetic wide table ({reshape_rows} rows)...",

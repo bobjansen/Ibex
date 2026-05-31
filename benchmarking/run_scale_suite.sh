@@ -31,6 +31,12 @@ fi
 WARMUP=1
 ITERS=5
 TF_ROWS_OVERRIDE=""
+# The reshape benchmarks build an in-memory wide table sized to the dataset —
+# the bench's biggest RAM consumer (sqlite's :memory: variant needs ~1.8GB per
+# 1M rows). Above this many rows the suite passes --reshape-rows 0 so each engine
+# skips reshape (blank cell) instead of OOM-killing the run. Default fits the
+# 64GB r7i.2xlarge with margin; raise it on a bigger box or override via env.
+RESHAPE_MAX_ROWS="${RESHAPE_MAX_ROWS:-20000000}"
 SKIP_IBEX=0
 SKIP_IBEX_COMPILED=0
 SKIP_PYTHON=0
@@ -295,6 +301,14 @@ for rows in "${SIZES[@]}"; do
     mkdir -p "$size_result_dir"
 
     echo "━━━ Dataset: ${rows} rows ━━━"
+
+    # Cap the memory-heavy reshape benchmark: pass 0 (= skip) above the budget.
+    RESHAPE_ROWS="$rows"
+    if (( rows > RESHAPE_MAX_ROWS )); then
+        RESHAPE_ROWS=0
+        echo "  (reshape skipped: ${rows} > RESHAPE_MAX_ROWS=${RESHAPE_MAX_ROWS})"
+    fi
+
     uv run --project "$IBEX_ROOT" "$GEN_DATA" "$size_data_dir" --rows "$rows"
 
     csv="$size_data_dir/prices.csv"
@@ -335,7 +349,7 @@ for rows in "${SIZES[@]}"; do
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-            --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+            --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/python.tsv" \
@@ -349,7 +363,7 @@ for rows in "${SIZES[@]}"; do
             POLARS_MAX_THREADS=1 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-                --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --skip-pandas \
@@ -369,7 +383,7 @@ for rows in "${SIZES[@]}"; do
         Rscript "$SCRIPT_DIR/bench_r.R" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-            --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+            --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/r.tsv" \
@@ -382,7 +396,7 @@ for rows in "${SIZES[@]}"; do
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-            --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+            --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/duckdb.tsv"
@@ -395,7 +409,7 @@ for rows in "${SIZES[@]}"; do
             uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-                --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --threads 1 \
@@ -411,7 +425,7 @@ for rows in "${SIZES[@]}"; do
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-            --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+            --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/datafusion.tsv"
@@ -424,7 +438,7 @@ for rows in "${SIZES[@]}"; do
             uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-                --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --threads 1 \
@@ -440,7 +454,7 @@ for rows in "${SIZES[@]}"; do
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-            --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+            --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/clickhouse.tsv"
@@ -453,7 +467,7 @@ for rows in "${SIZES[@]}"; do
             uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-                --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --threads 1 \
@@ -469,7 +483,7 @@ for rows in "${SIZES[@]}"; do
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_sqlite.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-            --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+            --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/sqlite.tsv"

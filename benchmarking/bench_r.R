@@ -561,16 +561,28 @@ if (tf_rows > 0) {
         message("\n=== data.table (tf asof) ===")
         set.seed(42L)
         sample_idx <- sort(sample.int(tf_rows, size = tf_rows %/% 10L))
+        # 100 symbols partition both sides (quote i and trades derived from it
+        # share symbol i %% 100), for the by-symbol roll join below.
+        q_symbol <- paste0("SYM", (seq_len(tf_rows) - 1L) %% 100L)
+        t_symbol <- paste0("SYM", (sample_idx - 1L) %% 100L)
         trades_dt  <- data.table(
             ts  = as.POSIXct(sample_idx - 1L, origin = "1970-01-01", tz = "UTC") +
                   runif(length(sample_idx), 0, 0.999),
+            symbol = t_symbol,
             qty = sample.int(99L, length(sample_idx), replace = TRUE))
-        quotes_dt  <- data.table(ts = ts_vec, bid = 99.0 + (price_vec - 100.0) * 0.01)
+        quotes_dt  <- data.table(ts = ts_vec, symbol = q_symbol,
+                                 bid = 99.0 + (price_vec - 100.0) * 0.01)
         setkey(quotes_dt, ts)
         setkey(trades_dt, ts)
         bench("data.table", "tf_asof_join",
             function() quotes_dt[trades_dt, .(ts, qty, bid),
                                   on = "ts", roll = TRUE])
+        # by-symbol: roll on ts within each symbol (ts is the last on-key).
+        setkey(quotes_dt, symbol, ts)
+        setkey(trades_dt, symbol, ts)
+        bench("data.table", "tf_asof_join_by_symbol",
+            function() quotes_dt[trades_dt, .(ts, qty, bid),
+                                  on = .(symbol, ts), roll = TRUE])
     }
 
     if (!skip_dplyr) {

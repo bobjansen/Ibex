@@ -20,10 +20,23 @@ df -h / || true
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y \
-    clang-18 cmake ninja-build \
+    cmake ninja-build \
     libcurl4-openssl-dev \
     r-base r-cran-data.table r-cran-optparse \
-    python3 curl unzip
+    python3 curl unzip \
+    wget gnupg lsb-release software-properties-common ca-certificates
+
+# ── Modern Clang ──────────────────────────────────────────────────────────────
+# Ubuntu Noble's apt only ships clang-18, which reports __cpp_concepts=201907L
+# and forces the libstdc++ <expected> workaround in CompilerOptions.cmake. For
+# credible performance numbers we build with a current stable Clang from
+# apt.llvm.org instead of relying on that macro override. Bump CLANG_VERSION to
+# re-baseline the bench compiler.
+CLANG_VERSION=21
+curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+chmod +x /tmp/llvm.sh
+/tmp/llvm.sh "${CLANG_VERSION}"
+"clang++-${CLANG_VERSION}" --version    # record exact compiler in the bench log
 
 # AWS CLI v2 (for s3 cp to upload results)
 curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
@@ -37,7 +50,7 @@ export PATH="/root/.local/bin:$PATH"
 
 # ── Build ibex (release) ──────────────────────────────────────────────────────
 cmake -B /ibex/build-release -G Ninja \
-    -DCMAKE_CXX_COMPILER=clang-18 \
+    -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
     -DCMAKE_BUILD_TYPE=Release \
     -S /ibex
 ninja -C /ibex/build-release

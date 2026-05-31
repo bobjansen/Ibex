@@ -234,6 +234,58 @@ TEST_CASE("join: asof join matches latest right row at-or-before left time", "[j
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{50, 200, 250});
 }
 
+TEST_CASE("join: asof join time-only key (no equality keys)", "[join][asof]") {
+    // Exercises the no-equality-key fast path: only the time index is joined on.
+    runtime::Table lhs;
+    lhs.add_column("ts",
+                   Column<Timestamp>{Timestamp{10}, Timestamp{20}, Timestamp{30}, Timestamp{40}});
+    lhs.add_column("lval", Column<std::int64_t>{1, 2, 3, 4});
+    lhs.time_index = "ts";
+
+    runtime::Table rhs;
+    // Right times: 5, 20, 25 — note row at 40 has no right strictly... at-or-before.
+    rhs.add_column("ts", Column<Timestamp>{Timestamp{5}, Timestamp{20}, Timestamp{25}});
+    rhs.add_column("rval", Column<std::int64_t>{50, 200, 250});
+    rhs.time_index = "ts";
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs asof join rhs on ts;", tables);
+
+    CHECK(out.rows() == 4);
+    REQUIRE(out.time_index.has_value());
+    CHECK(*out.time_index == "ts");
+    CHECK(col_ts_nanos(out, "ts") == std::vector<std::int64_t>{10, 20, 30, 40});
+    // ts=10 -> latest right <=10 is 5 (50); ts=20 -> 20 (200);
+    // ts=30 -> 25 (250); ts=40 -> 25 (250).
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{50, 200, 250, 250});
+}
+
+TEST_CASE("join: asof join time-only key, left before all right rows fills default",
+          "[join][asof]") {
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{100}});
+    lhs.add_column("lval", Column<std::int64_t>{7, 8});
+    lhs.time_index = "ts";
+
+    runtime::Table rhs;
+    rhs.add_column("ts", Column<Timestamp>{Timestamp{50}});
+    rhs.add_column("rval", Column<std::int64_t>{99});
+    rhs.time_index = "ts";
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs asof join rhs on ts;", tables);
+
+    CHECK(out.rows() == 2);
+    // ts=1 has no right at-or-before -> default 0; ts=100 -> 50 (99).
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 99});
+}
+
 TEST_CASE("join: asof join preserves left rows and fills right defaults", "[join]") {
     runtime::Table lhs;
     lhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{2}});

@@ -98,7 +98,14 @@ set -x
 apt-get update -qq
 apt-get install -y git
 git clone "${REPO_URL}" /ibex
-cd /ibex && git checkout "${COMMIT}"
+cd /ibex
+# Fail loudly if the commit isn't on origin (e.g. forgot to push) instead of
+# silently building stale origin/HEAD — user-data has no top-level set -e.
+git checkout "${COMMIT}" || {
+    echo "FATAL: commit ${COMMIT} not found on origin — did you 'git push'?"
+    shutdown -h now
+    exit 1
+}
 IBEX_S3_BUCKET="${S3_BUCKET}" \\
 IBEX_RESULT_KEY="${RESULT_KEY}" \\
 IBEX_REGION="${REGION}" \\

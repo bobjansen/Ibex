@@ -61,6 +61,7 @@ export PATH="/root/.local/bin:$PATH"
 
 # ── Build ibex (release) ──────────────────────────────────────────────────────
 cmake -B /ibex/build-release -G Ninja \
+    -DCMAKE_C_COMPILER="clang-${CLANG_VERSION}" \
     -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
     -DCMAKE_BUILD_TYPE=Release \
     -S /ibex

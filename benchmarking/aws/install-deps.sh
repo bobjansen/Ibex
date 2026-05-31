@@ -49,10 +49,18 @@ apt-get update -qq
 # re-baseline; must match bootstrap.sh.
 CLANG_VERSION=21
 apt-get install -y --no-install-recommends \
-    cmake ninja-build \
+    ninja-build \
     libjemalloc-dev libcurl4-openssl-dev \
     git curl unzip ca-certificates \
     wget gnupg lsb-release software-properties-common
+
+# Noble's apt CMake is 3.28, on which Arrow 22's from-source build fails
+# (mis-resolved versions.txt → empty Boost SHA256). Install the official
+# Kitware binary, pinned to match bootstrap.sh.
+CMAKE_VERSION=3.31.6
+curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" -o /tmp/cmake.tar.gz
+tar -xzf /tmp/cmake.tar.gz -C /opt
+update-alternatives --install /usr/bin/cmake cmake "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" 100
 
 curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
 chmod +x /tmp/llvm.sh

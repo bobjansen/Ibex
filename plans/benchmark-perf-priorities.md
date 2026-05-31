@@ -73,17 +73,29 @@ green (884 cases).
 > math). Now both are O(n); the cell is a fair speed comparison but not an
 > identical-result one — worth a footnote on the web page.
 
-## P2 — `tf_asof_join` (re-measure under jemalloc first)
+## P2 — `tf_asof_join` (confirmed under jemalloc) — NEXT
 
-Was 495ms vs polars-st 45ms = 11× under glibc, but ~1.8× of that was allocation
-(now ~281ms with mallopt). Re-measure under jemalloc; if a real gap remains it's
-the join logic (exp was 1.25). Lower priority than ewma.
+Re-measured on the jemalloc run `20260531T155759` @16M: ibex **262 ms vs
+polars-st 41 / polars 54 = ~5–6×**. data.table 237 ≈ ibex; duckdb 521 slower.
+Allocation accounted for ~1.9× of the old glibc number (495→262); the remaining
+~6× is genuine join logic (out rows 1.6M). This is the real next target.
 
-## P3 — Reshape constant factor (lower priority)
+## P3 — `ohlc_by_symbol` (emerged under jemalloc)
 
-`melt_wide_to_long` and `dcast_long_to_wide` were allocation-heavy (melt 1.9×
-from mallopt alone). Re-measure under jemalloc; `dcast` barely moved (1.01×) so
-that one is genuine constant-factor work. Defer until P1 lands.
+jemalloc @16M: ibex **172 ms vs clickhouse 62 / datafusion 72 / polars 73 =
+~2.6×** (252 groups, 4 aggregates each). Slowest of the columnar engines except
+polars-st. Genuine grouped-aggregation gap, moderate.
+
+## Resolved / non-issues under jemalloc
+
+- **melt_wide_to_long — NOT a gap.** ibex 448 ms vs polars 402 / polars-st 466 /
+  data.table 1081 (all materializing 64M rows). The clickhouse (20 ms) and
+  datafusion (90 ms) cells are lazy/streamed, not real materialization — the
+  earlier "47× / 22×" was apples-to-oranges. ibex is competitive. Web-page note:
+  prefer polars as the melt reference, not clickhouse.
+- **dcast_long_to_wide** — ibex 2948 ms (jemalloc nearly halved the glibc 5460),
+  vs datafusion 1219 / duckdb 2267 = ~2.4×, beats polars/data.table. Mid-pack;
+  low priority constant-factor work.
 
 ## Confirmed strengths (protect against regressions)
 

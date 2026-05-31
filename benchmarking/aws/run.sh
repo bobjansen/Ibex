@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — launch a spot EC2 instance, run the scale benchmark suite, download results.
+# run.sh — launch an EC2 instance (spot by default), run the scale benchmark suite, download results.
 #
 # Usage:
 #   ./benchmarking/aws/run.sh [options]
@@ -11,6 +11,9 @@
 #   --type   INSTANCE_TYPE      EC2 instance type  (default: c6i.xlarge)
 #   --key    KEY_PAIR_NAME      EC2 key pair for SSH debugging (optional)
 #   --region AWS_REGION         override region
+#   --on-demand                 use an on-demand instance instead of spot
+#                               (no capacity-reclaim risk; recommended for long
+#                                full-suite runs that can't afford to be killed)
 #
 # Environment:
 #   S3_BUCKET   — bucket name (loaded from .config if not set)
@@ -36,6 +39,7 @@ ITERS=5
 TF_ROWS=""
 BOTH_THREADING=0
 KEY_NAME=""
+ON_DEMAND=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --type)    INSTANCE_TYPE="$2"; shift 2 ;;
         --key)     KEY_NAME="$2";      shift 2 ;;
         --region)  REGION="$2";        shift 2 ;;
+        --on-demand) ON_DEMAND=1;      shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -80,7 +85,7 @@ SG_ID=$(aws ec2 describe-security-groups \
 echo "Commit : ${COMMIT:0:8} ($BRANCH)"
 echo "Sizes  : $SIZES"
 echo "AMI    : $AMI"
-echo "Type   : $INSTANCE_TYPE (spot)"
+echo "Type   : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || echo spot))"
 echo "Bucket : s3://$S3_BUCKET"
 echo ""
 
@@ -118,15 +123,23 @@ IBEX_BOTH_THREADING="${BOTH_THREADING}" \\
 EOF
 )
 
-# ── Launch spot instance ──────────────────────────────────────────────────────
+# ── Launch instance ───────────────────────────────────────────────────────────
 KEY_ARGS=()
 [[ -n "$KEY_NAME" ]] && KEY_ARGS=(--key-name "$KEY_NAME")
+
+# Spot by default (cheapest); --on-demand trades cost for no capacity-reclaim
+# risk, which matters for long full-suite runs that can't afford to be killed
+# near the end.
+MARKET_ARGS=()
+if [[ "$ON_DEMAND" -eq 0 ]]; then
+    MARKET_ARGS=(--instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}')
+fi
 
 INSTANCE_ID=$(aws ec2 run-instances \
     --region "$REGION" \
     --instance-type "$INSTANCE_TYPE" \
     --image-id "$AMI" \
-    --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' \
+    "${MARKET_ARGS[@]}" \
     --instance-initiated-shutdown-behavior terminate \
     --iam-instance-profile "Name=ibex-bench" \
     --security-group-ids "$SG_ID" \

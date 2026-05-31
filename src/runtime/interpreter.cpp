@@ -6176,14 +6176,37 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_ewma: column must be numeric (Int or Float)");
                 } else {
+                    // O(n) sliding window. The TimeFrame is sorted ascending, so
+                    // `lo` is monotonic: each row enters once on the right and is
+                    // dropped once on the left. The windowed EWMA restarts at each
+                    // window's first element (the seed), which expands to
+                    //   result[i] = alpha*R_i + (1-alpha)*beta^(i-lo)*col[lo]
+                    // with R_i = sum_{j=lo..i} beta^(i-j)*col[j], maintained as
+                    //   add right:  R = beta*R + col[i]
+                    //   drop left:  R -= beta^(i-lo)*col[lo]
+                    // reproducing the from-scratch O(n*w) recurrence in one pass.
+                    // beta_pow caches beta^k (k bounded by the window width).
+                    const double beta = 1.0 - alpha;
                     Column<double> result;
                     result.resize(rows);
+                    std::vector<double> beta_pow{1.0};  // beta_pow[k] == beta^k
+                    beta_pow.reserve(64);
+                    auto bpow = [&](std::size_t k) -> double {
+                        while (beta_pow.size() <= k)
+                            beta_pow.push_back(beta_pow.back() * beta);
+                        return beta_pow[k];
+                    };
+                    double r = 0.0;
+                    std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
-                        double ewma = static_cast<double>(col[lo]);
-                        for (std::size_t j = lo + 1; j <= i; ++j)
-                            ewma = (alpha * static_cast<double>(col[j])) + ((1.0 - alpha) * ewma);
-                        result[i] = ewma;
+                        r = (beta * r) + static_cast<double>(col[i]);  // add col[i] at weight 1
+                        std::int64_t threshold = time_vals[i] - dur_val;
+                        while (lo < i && time_vals[lo] < threshold) {
+                            r -= bpow(i - lo) * static_cast<double>(col[lo]);
+                            ++lo;
+                        }
+                        result[i] = (alpha * r) +
+                                    ((1.0 - alpha) * bpow(i - lo) * static_cast<double>(col[lo]));
                     }
                     return result;
                 }

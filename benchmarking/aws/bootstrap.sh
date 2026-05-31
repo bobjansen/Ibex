@@ -21,7 +21,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y \
     ninja-build \
-    libcurl4-openssl-dev \
+    libcurl4-openssl-dev libssl-dev \
     r-base r-cran-data.table r-cran-optparse \
     python3 curl unzip \
     wget gnupg lsb-release software-properties-common ca-certificates

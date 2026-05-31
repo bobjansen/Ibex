@@ -70,6 +70,7 @@ QUERY_ORDER = [
     "tf_rolling_ewma_1m",
     "tf_resample_1m_ohlc",
     "tf_asof_join",
+    "tf_asof_join_by_symbol",
 ]
 
 QUERY_LABEL = {
@@ -109,6 +110,7 @@ QUERY_LABEL = {
     "tf_rolling_ewma_1m": "tf rolling EWMA 1m",
     "tf_resample_1m_ohlc": "tf resample 1m OHLC",
     "tf_asof_join": "tf as-of join (10% sampled)",
+    "tf_asof_join_by_symbol": "tf as-of join by symbol (10% sampled)",
 }
 
 

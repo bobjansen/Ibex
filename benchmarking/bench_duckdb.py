@@ -487,6 +487,7 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
     con.execute(f"""
         CREATE OR REPLACE TABLE quotes AS
         SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND AS ts,
+               'SYM' || (i % 100) AS symbol,
                99.0 + (i % 100) * 0.01 AS bid
         FROM generate_series(0, {n_rows - 1}) t(i)
         ORDER BY ts;
@@ -499,6 +500,7 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
         )
         SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND
                  + INTERVAL ((hash(i) % 999)) MILLISECOND AS ts,
+               'SYM' || (i % 100) AS symbol,
                1 + (hash(i) % 99) AS qty
         FROM sampled ORDER BY ts;
     """)
@@ -520,6 +522,12 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
         lambda: con.sql(
             "SELECT t.ts, t.qty, q.bid "
             "FROM trades t ASOF LEFT JOIN quotes q ON t.ts >= q.ts"
+        ).fetchnumpy())
+    run("tf_asof_join_by_symbol",
+        lambda: con.sql(
+            "SELECT t.ts, t.qty, q.bid "
+            "FROM trades t ASOF LEFT JOIN quotes q "
+            "ON t.symbol = q.symbol AND t.ts >= q.ts"
         ).fetchnumpy())
     return rows
 

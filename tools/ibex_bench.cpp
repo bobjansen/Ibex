@@ -2034,6 +2034,74 @@ int main(int argc, char** argv) {
             status =
                 run_benchmark(asof_query, asof_tables, warmup_iters, iters, saved_include_parse);
         }
+
+        // As-of join with an extra equality key (symbol): exercises the grouped
+        // asof path (one per-symbol merge), versus the time-only join above which
+        // takes the single-merge fast path. ~100 symbols partition both sides;
+        // each trade matches the latest same-symbol quote at or before its time.
+        // Cross-engine mirrors live in bench_python / bench_duckdb / bench_r.
+        if (status == 0) {
+            constexpr std::size_t kAsofSymbols = 100;
+            std::vector<std::string> sym_names;
+            sym_names.reserve(kAsofSymbols);
+            for (std::size_t s = 0; s < kAsofSymbols; ++s) {
+                sym_names.push_back("SYM" + std::to_string(s));
+            }
+
+            ibex::Column<ibex::Timestamp> q_ts;
+            ibex::Column<std::string> q_sym;
+            ibex::Column<double> q_bid;
+            q_ts.reserve(timeframe_rows);
+            q_bid.reserve(timeframe_rows);
+            for (std::size_t i = 0; i < timeframe_rows; ++i) {
+                q_ts.push_back(ibex::Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL});
+                q_sym.push_back(sym_names[i % kAsofSymbols]);
+                q_bid.push_back(99.0 + static_cast<double>(i % 100) * 0.01);
+            }
+            ibex::runtime::Table quotes_table;
+            quotes_table.add_column("ts", std::move(q_ts));
+            quotes_table.add_column("symbol", std::move(q_sym));
+            quotes_table.add_column("bid", std::move(q_bid));
+
+            // Trades: deterministic 10% sample, carrying the symbol of the quote
+            // index they derive from so every trade has same-symbol candidates.
+            std::vector<std::size_t> trade_idx;
+            trade_idx.reserve(timeframe_rows / 10);
+            std::mt19937_64 rng{42};
+            for (std::size_t i = 0; i < timeframe_rows; ++i) {
+                if ((rng() % 10ULL) == 0ULL) {
+                    trade_idx.push_back(i);
+                }
+            }
+            std::sort(trade_idx.begin(), trade_idx.end());
+
+            ibex::Column<ibex::Timestamp> t_ts;
+            ibex::Column<std::string> t_sym;
+            ibex::Column<std::int64_t> t_qty;
+            t_ts.reserve(trade_idx.size());
+            t_qty.reserve(trade_idx.size());
+            for (auto i : trade_idx) {
+                const auto jitter_ms = static_cast<std::int64_t>(rng() % 1000ULL);
+                t_ts.push_back(ibex::Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL +
+                                               jitter_ms * 1'000'000LL});
+                t_sym.push_back(sym_names[i % kAsofSymbols]);
+                t_qty.push_back(static_cast<std::int64_t>(rng() % 99ULL) + 1);
+            }
+            ibex::runtime::Table trades_table;
+            trades_table.add_column("ts", std::move(t_ts));
+            trades_table.add_column("symbol", std::move(t_sym));
+            trades_table.add_column("qty", std::move(t_qty));
+
+            ibex::runtime::TableRegistry asof_tables;
+            asof_tables.emplace("quotes_tf", std::move(quotes_table));
+            asof_tables.emplace("trades_tf", std::move(trades_table));
+
+            BenchQuery asof_by_symbol{
+                "tf_asof_join_by_symbol",
+                R"(as_timeframe(trades_tf, "ts") asof join as_timeframe(quotes_tf, "ts") on {ts, symbol})"};
+            status = run_benchmark(asof_by_symbol, asof_tables, warmup_iters, iters,
+                                   saved_include_parse);
+        }
     }
 
     // Bool-column benchmarks: isolate projection/gather/sort/group patterns on

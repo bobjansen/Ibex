@@ -8,13 +8,25 @@
 #   ./run_scale_suite.sh [--sizes 1M,2M,4M,...,64M] [--warmup N] [--iters N]
 #                        [--skip-ibex] [--skip-ibex-compiled]
 #                        [--skip-python] [--skip-r]
-#                        [--skip-duckdb] [--skip-duckdb-st]
+#                        [--skip-duckdb] [--skip-duckdb-st] [--duckdb-all-sizes]
 #                        [--skip-datafusion] [--skip-datafusion-st]
 #                        [--skip-clickhouse] [--skip-clickhouse-st]
-#                        [--skip-sqlite]
+#                        [--skip-sqlite] [--with-sqlite]
+#                        [--with-frollapply]
 #                        [--skip-pandas] [--skip-dplyr] [--skip-polars-st]
 #                        [--keep-data]
 #                        [--to-readme] [--to-readme-rows N] [--to-readme-out path]
+#
+# Trimmed-by-default frameworks (see plans/benchmark-perf-priorities.md): the
+# suite skips work that never changes the competitive picture but dominates
+# wall-clock, so reruns stay cheap. The web page reuses pinned numbers for these.
+#   - sqlite: never within 2x of the best engine and the slowest by far — skipped
+#     by default. Pass --with-sqlite to regenerate its (stable) baseline numbers.
+#   - duckdb: 0 wins and tracks the other columnar engines, so it runs only at a
+#     representative scale subset (DUCKDB_SCALES). Pass --duckdb-all-sizes for all.
+#   - data.table/dplyr frollapply (tf_rolling_median_1m, tf_rolling_std_1m):
+#     O(n*window) and the two biggest single cells in the run — skipped by
+#     default. Pass --with-frollapply to include them.
 
 set -euo pipefail
 
@@ -39,9 +51,14 @@ TF_ROWS_OVERRIDE=""
 RESHAPE_MAX_ROWS="${RESHAPE_MAX_ROWS:-20000000}"
 # SQLite is 10-1000x slower than the columnar engines (seconds/query at 8M),
 # so it dominates wall-clock at scale while adding little beyond a slow-baseline
-# data point. Run it only up to this size (gives a 1M/2M/4M scaling trend) and
-# skip it above; override via env to include or exclude more.
+# data point. When run (--with-sqlite), cap it at this size (gives a 1M/2M/4M
+# scaling trend) and skip it above; override via env to include or exclude more.
 SQLITE_MAX_ROWS="${SQLITE_MAX_ROWS:-4000000}"
+# duckdb is never the fastest engine in this suite (0 wins) and closely tracks
+# the other columnar engines, so running it at every scale costs wall-clock
+# without adding signal. Run it only at this representative subset; set
+# DUCKDB_SCALES="" (or pass --duckdb-all-sizes) to run every size.
+DUCKDB_SCALES="${DUCKDB_SCALES:-1000000,4000000,16000000}"
 SKIP_IBEX=0
 SKIP_IBEX_COMPILED=0
 SKIP_PYTHON=0
@@ -55,7 +72,11 @@ SKIP_DATAFUSION=0
 SKIP_DATAFUSION_ST=0
 SKIP_CLICKHOUSE=0
 SKIP_CLICKHOUSE_ST=0
-SKIP_SQLITE=0
+# sqlite and the data.table/dplyr frollapply cells are pinned (reused on the web
+# page), so they are off by default — see the header. Opt back in with the flags.
+SKIP_SQLITE=1
+SKIP_FROLLAPPLY=1
+DUCKDB_ALL_SIZES=0
 KEEP_DATA=0
 TO_README=0
 TO_README_ROWS=4000000
@@ -63,6 +84,17 @@ TO_README_OUT=""
 
 # 1M .. 64M (powers of two)
 SIZES=(1000000 2000000 4000000 8000000 16000000 32000000 64000000)
+
+in_csv_list() {
+    # in_csv_list <needle> <comma,separated,list> — exact-match membership test.
+    local needle="$1" list="$2" item
+    local -a arr
+    IFS=',' read -r -a arr <<< "$list"
+    for item in "${arr[@]}"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
 
 parse_size_token() {
     local tok="$1"
@@ -118,6 +150,9 @@ while [[ $# -gt 0 ]]; do
         --skip-clickhouse) SKIP_CLICKHOUSE=1; shift ;;
         --skip-clickhouse-st) SKIP_CLICKHOUSE_ST=1; shift ;;
         --skip-sqlite) SKIP_SQLITE=1; shift ;;
+        --with-sqlite) SKIP_SQLITE=0; shift ;;
+        --duckdb-all-sizes) DUCKDB_ALL_SIZES=1; shift ;;
+        --with-frollapply) SKIP_FROLLAPPLY=0; shift ;;
         --keep-data)   KEEP_DATA=1; shift ;;
         --to-readme|--to_readme) TO_README=1; shift ;;
         --to-readme-rows|--to_readme_rows)
@@ -385,6 +420,9 @@ for rows in "${SIZES[@]}"; do
         if [[ $SKIP_DPLYR -eq 1 ]]; then
             r_args+=(--skip-dplyr)
         fi
+        if [[ $SKIP_FROLLAPPLY -eq 1 ]]; then
+            r_args+=(--skip-frollapply)
+        fi
         Rscript "$SCRIPT_DIR/bench_r.R" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
@@ -396,7 +434,15 @@ for rows in "${SIZES[@]}"; do
         append_tagged_results "$rows" "$size_result_dir/r.tsv"
     fi
 
-    if [[ $SKIP_DUCKDB -eq 0 ]]; then
+    run_duckdb=1
+    if [[ $SKIP_DUCKDB -eq 1 ]]; then
+        run_duckdb=0
+    elif [[ $DUCKDB_ALL_SIZES -eq 0 && -n "$DUCKDB_SCALES" ]] \
+            && ! in_csv_list "$rows" "$DUCKDB_SCALES"; then
+        run_duckdb=0
+        echo "  (duckdb skipped: ${rows} not in DUCKDB_SCALES=${DUCKDB_SCALES})"
+    fi
+    if [[ $run_duckdb -eq 1 ]]; then
         echo "  → duckdb"
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \

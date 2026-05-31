@@ -50,7 +50,7 @@ apt-get update -qq
 CLANG_VERSION=21
 apt-get install -y --no-install-recommends \
     ninja-build \
-    libjemalloc-dev libcurl4-openssl-dev \
+    libjemalloc-dev libcurl4-openssl-dev libssl-dev \
     git curl unzip ca-certificates \
     wget gnupg lsb-release software-properties-common
 

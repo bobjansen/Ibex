@@ -4,8 +4,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include "join_internal.hpp"
@@ -913,6 +916,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         std::vector<std::size_t> left_idx(n_left);
         std::vector<std::size_t> right_idx(n_left);
+        bool grouped_done = false;
 
         if (left_eq_keys.empty()) {
             // Time-only asof (the canonical case): with no equality keys every
@@ -929,7 +933,61 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
                 right_idx[l] = (pos == 0) ? kNull : pos - 1;
             }
-        } else {
+            grouped_done = true;
+        } else if (left_eq_keys.size() == 1) {
+            // Single equality key (the common asof-by case, e.g. by symbol):
+            // factorise the key column into dense codes by hashing its native
+            // values into a small dictionary (one entry per distinct key), bucket
+            // the right rows by code in ascending-time order, then two-pointer
+            // merge per bucket. No per-row Key/ScalarValue heap allocation or
+            // string copy — just value hashing into a dictionary sized to the key
+            // cardinality, and one cursor per group instead of a second hash map.
+            // Falls through to the generic path for key column types without a
+            // usable hash (Timestamp/Date) or a left/right column type mismatch.
+            const ColumnValue& rcol = *right_eq_keys[0];
+            const ColumnValue& lcol = *left_eq_keys[0];
+            std::visit(
+                [&](const auto& rc) {
+                    using ColT = std::decay_t<decltype(rc)>;
+                    using KeyV = std::decay_t<decltype(rc[std::size_t{0}])>;
+                    if constexpr (std::is_same_v<KeyV, std::string_view> ||
+                                  std::is_arithmetic_v<KeyV>) {
+                        const auto* lcp = std::get_if<ColT>(&lcol);
+                        if (lcp == nullptr) {
+                            return;  // left/right key types differ -> generic path
+                        }
+                        const auto& lc = *lcp;
+                        std::unordered_map<KeyV, std::size_t> dict;
+                        std::vector<std::vector<std::size_t>> buckets;
+                        for (std::size_t r = 0; r < n_right; ++r) {
+                            auto [it, inserted] = dict.try_emplace(rc[r], buckets.size());
+                            if (inserted) {
+                                buckets.emplace_back();
+                            }
+                            buckets[it->second].push_back(r);
+                        }
+                        std::vector<std::size_t> cursor(buckets.size(), 0);
+                        for (std::size_t l = 0; l < n_left; ++l) {
+                            left_idx[l] = l;
+                            auto it = dict.find(lc[l]);
+                            if (it == dict.end()) {
+                                right_idx[l] = kNull;
+                                continue;
+                            }
+                            const auto& rows = buckets[it->second];
+                            std::size_t& pos = cursor[it->second];
+                            while (pos < rows.size() && right_times[rows[pos]] <= left_times[l]) {
+                                ++pos;
+                            }
+                            right_idx[l] = (pos == 0) ? kNull : rows[pos - 1];
+                        }
+                        grouped_done = true;
+                    }
+                },
+                rcol);
+        }
+
+        if (!grouped_done) {
             std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
             right_groups.reserve(n_right);
             for (std::size_t r = 0; r < n_right; ++r) {

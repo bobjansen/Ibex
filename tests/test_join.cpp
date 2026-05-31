@@ -286,6 +286,34 @@ TEST_CASE("join: asof join time-only key, left before all right rows fills defau
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 99});
 }
 
+TEST_CASE("join: asof join two equality keys (generic grouped path)", "[join][asof]") {
+    // Two equality keys (symbol + venue) exercise the generic multi-key path,
+    // not the single-key fast path. venue must discriminate the match.
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<Timestamp>{Timestamp{10}, Timestamp{20}, Timestamp{30}});
+    lhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
+    lhs.add_column("venue", Column<std::string>{"X", "Y", "X"});
+    lhs.add_column("lval", Column<std::int64_t>{1, 2, 3});
+    lhs.time_index = "ts";
+
+    runtime::Table rhs;
+    rhs.add_column("ts", Column<Timestamp>{Timestamp{5}, Timestamp{8}, Timestamp{20}});
+    rhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
+    rhs.add_column("venue", Column<std::string>{"X", "Y", "X"});
+    rhs.add_column("rval", Column<std::int64_t>{50, 80, 200});
+    rhs.time_index = "ts";
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs asof join rhs on {ts, symbol, venue};", tables);
+
+    CHECK(out.rows() == 3);
+    // (10,A,X)->X@5=50; (20,A,Y)->Y@8=80; (30,A,X)->X@20=200 (not Y).
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{50, 80, 200});
+}
+
 TEST_CASE("join: asof join preserves left rows and fills right defaults", "[join]") {
     runtime::Table lhs;
     lhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{2}});

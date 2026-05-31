@@ -168,6 +168,27 @@ while true; do
         break
     fi
 
+    # Detect a dead instance (spot interruption, failed bootstrap, OOM shutdown)
+    # so we fail fast instead of waiting out the full 2h timeout for a result
+    # that will never arrive. Checked every ~2.5 min to keep API calls light.
+    if (( DOTS % 5 == 0 )); then
+        STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)
+        if [[ "$STATE" == "terminated" || "$STATE" == "shutting-down" ]]; then
+            # Race: the instance may have uploaded results just before self-
+            # terminating, so re-check S3 once before giving up.
+            if aws s3 ls "s3://${S3_BUCKET}/${RESULT_KEY}" --region "$REGION" &>/dev/null; then
+                echo ""
+                break
+            fi
+            echo ""
+            echo "Instance $INSTANCE_ID is '$STATE' without producing a result —"
+            echo "likely a spot interruption or a failed bootstrap. Check the console:"
+            echo "  aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --latest --output text"
+            exit 1
+        fi
+    fi
+
     # Print a dot every 30s, newline every 20 dots
     printf "."
     DOTS=$(( DOTS + 1 ))

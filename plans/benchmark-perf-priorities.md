@@ -82,12 +82,14 @@ All three landed steps confirmed on AWS @16M:
 
 New genuine targets at 16M (lazy-eval clickhouse cells excluded — ibex is on par
 with the real materializing engines on melt/update/fill/filter):
-- **P-next: `tf_asof_join_by_symbol` — 4.5× vs data.table** (ibex 1040 vs 232;
-  polars 275). The grouped asof path is now ibex's slowest-relative cell. It
-  builds a `Key` (heap `vector<ScalarValue>`) + hash per right row over the whole
-  right table, then per-left lookups — sort/factorize-by-symbol-code and bucketed
-  merge would remove the hashing. data.table's keyed roll join is nearly as fast
-  as its time-only (232 vs 247), so the headroom is large.
+- **`tf_asof_join_by_symbol` — DONE (commit 91c7be4)**. Was 4.5× vs data.table
+  (ibex 1040 vs 232; polars 275). Added a single-key factorization fast path
+  (hash native key values into a small dictionary, bucket right rows by code,
+  per-bucket two-pointer merge — no per-row Key/ScalarValue heap alloc, one cursor
+  per group). **~2.3× faster** (914→398ms at 16M locally), projecting to ~460ms on
+  AWS — from 4.5× to ~2× behind data.table. Further headroom: hash Categorical by
+  code instead of string. Generic multi-key path retained as fallback (now
+  covered by a new 2-eq-key test).
 - `tf_resample_1m_ohlc` 3.9× vs polars; `filter_events` 3.6× vs polars
   (filter+gather); `dcast` ~2–3×, `ohlc_by_symbol` ~2.6× — moderate.
 

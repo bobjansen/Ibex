@@ -32,12 +32,12 @@
   <section class="hero">
     <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
     <p class="eyebrow">Ibex</p>
-    <h1>The DataFrame language for teams that outgrow notebooks.</h1>
+    <h1>Fast, typed language for table&nbsp;pipelines</h1>
     <p class="lead">
-      Ibex gives quant, analytics, and data-engineering code a compact typed
-      language for table pipelines. Write the work once, run it interactively,
-      embed it in Python or R notebooks, or compile it to standalone C++23 when
-      the same logic needs to ship. The sweet spot is repeated feature
+      Ibex is a compact, statically typed language for quant, analytics, and
+      data-engineering pipelines over columnar data. Write and explore in an
+      interactive REPL, then compile the exact same code to standalone C++23
+      when it ships &mdash; no rewrite. The sweet spot is repeated feature
       engineering, grouped aggregation, joins, reshaping, and time-series work
       where correctness and latency both matter.
     </p>
@@ -56,7 +56,7 @@
   <!-- Audience -->
   <section class="section">
     <p class="section-label">Why?</p>
-    <h2>Ibex is focused solely on tabular data.</h2>
+    <h2>Ibex is focused solely on tabular data</h2>
     <p class="section-sub">
       Ibex only knows tables, this made it possible to create a new language
       in which it is possible to write concise, performant code easy to read
@@ -96,10 +96,10 @@
   <!-- Feature cards -->
   <section class="section">
     <p class="section-label">Why it works</p>
-    <h2>Small language, serious execution model.</h2>
+    <h2>Interactive, typed, compiled</h2>
     <p class="section-sub">
-      Ibex keeps the user-facing surface narrow while the runtime and codegen
-      specialize for columnar work.
+      Explore in a REPL, lean on static types to catch shape and type errors
+      before anything runs, and compile the same script to C++23 when it ships.
     </p>
     <div class="grid-3 feature-grid">
       <article class="card">
@@ -136,28 +136,6 @@
         </p>
       </article>
       <article class="card">
-        <h3>Effect annotations</h3>
-        <p>
-          Optional <code>effects { ... }</code> annotations on <code>fn</code> and
-          <code>extern fn</code> let Ibex check side-effect assumptions early.
-          Extern parameters can also declare call semantics with
-          <code>const</code>, <code>mutable</code>, or <code>consume</code>.
-          Table-valued parameters may also declare minimum required columns with
-          types such as <code>DataFrame&lt;{ salary: Int64 }&gt;</code>; extra
-          columns are still allowed.
-          A first conservative optimizer pass can now elide unused pure
-          top-level calls; richer effect-driven rewrites are planned.
-        </p>
-      </article>
-      <article class="card">
-        <h3>Named call arguments</h3>
-        <p>
-          Function calls support strict named arguments and trailing default
-          parameters, so I/O-heavy APIs can stay readable:
-          <code>read_csv("ticks.csv", has_header = false)</code>.
-        </p>
-      </article>
-      <article class="card">
         <h3>Strict type system</h3>
         <p>
           No implicit <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
@@ -168,50 +146,14 @@
         </p>
       </article>
       <article class="card">
-        <h3>Scalar Limits</h3>
+        <h3>Python &amp; R notebooks</h3>
         <p>
-          <code>head</code> and <code>tail</code> accept integer scalar
-          expressions, not just literals, so reusable helpers can write
-          <code>head n</code> and <code>tail n</code> directly.
-        </p>
-      </article>
-      <article class="card">
-        <h3>Grouped Rank</h3>
-        <p>
-          <code>rank(score, method = dense, ascending = false)</code> handles
-          grouped top-k and leaderboard patterns directly inside
-          <code>update</code>, with an explicit
-          <code>rank(order { ... })</code> form for multi-key tie-breaking.
-        </p>
-      </article>
-      <article class="card">
-        <h3>Vectorized RNG</h3>
-        <p>
-          Eight built-in <code>rand_*</code> functions &mdash; covering normal,
-          uniform, gamma, exponential, Bernoulli, Poisson, Student-t, and integer
-          distributions &mdash; generate one draw per row in a single vectorized
-          pass with no locking between threads.
-        </p>
-      </article>
-      <article class="card">
-        <h3>Notebook-ready</h3>
-        <p>
-          Load <code>ibex_ipython</code> in IPython or Jupyter, bind pandas or
-          Arrow tables and Python scalars into Ibex with <code>%%ibex</code>,
-          and hand the result straight back to <code>pyarrow</code>, pandas, or
-          matplotlib for inspection and plotting. Notebook cells keep Ibex
-          table bindings alive until you explicitly clear them with
-          <code>%ibexreset</code>.
-        </p>
-      </article>
-      <article class="card">
-        <h3>R and ggplot2</h3>
-        <p>
-          The experimental <code>ribex</code> package runs Ibex from pure R,
-          returns a <code>data.frame</code> by default for immediate
-          <code>ggplot2</code> use, and can keep Ibex table bindings alive
-          across calls with a persistent session. Lower-level
-          <code>nanoarrow</code> output is available when you want it.
+          Drive Ibex from a notebook: the <code>ibex_ipython</code> extension
+          binds pandas or Arrow tables into <code>%%ibex</code> cells and hands
+          results back to pandas, <code>pyarrow</code>, or matplotlib; the
+          <code>ribex</code> package runs Ibex from pure R and returns a
+          <code>data.frame</code> ready for <code>ggplot2</code>. Both keep table
+          bindings alive across cells.
         </p>
       </article>
     </div>
@@ -219,7 +161,7 @@
 
   <section class="section">
     <p class="section-label">Notebook integration</p>
-    <h2>Run Ibex inside Python or R notebook workflows.</h2>
+    <h2>Run Ibex inside Python or R notebook workflows</h2>
     <p class="section-sub">Keep heavy table manipulation in Ibex, then plot and explore the result with the surrounding language ecosystem.</p>
 
     <div class="tour">
@@ -432,7 +374,7 @@ generated[<span class="kw">filter</span> name != <span class="str">"row_id"</spa
   <!-- Language tour -->
   <section class="section">
     <p class="section-label">Language tour</p>
-    <h2>Everything you need, nothing you don&rsquo;t.</h2>
+    <h2>Everything you need, nothing you don&rsquo;t</h2>
     <p class="section-sub">A complete analytical pipeline in a handful of composable clauses.</p>
 
     <div class="tour">
@@ -1528,7 +1470,7 @@ Stream {
   <!-- Performance -->
   <section class="section">
     <p class="section-label">Performance</p>
-    <h2>Single-core speed that stays visible at scale.</h2>
+    <h2>Single-core speed that stays visible at scale</h2>
     <p class="section-sub">
       Latest AWS run, 2026-05-31, on r7i.2xlarge Sapphire Rapids hardware.
       Ibex is single-threaded; Polars, DuckDB, DataFusion, and ClickHouse use
@@ -1677,7 +1619,7 @@ Stream {
   <!-- Editor support -->
   <section class="section">
     <p class="section-label">Editor support</p>
-    <h2>Syntax highlighting for VS Code.</h2>
+    <h2>Syntax highlighting for VS Code</h2>
     <p class="section-sub">
       A TextMate grammar covering keywords, types, built-in functions, duration
       literals, backtick-quoted column names, and comments.
@@ -1702,7 +1644,7 @@ Stream {
   <!-- Get started -->
   <section class="section" id="get-started">
     <p class="section-label">Get started</p>
-    <h2>Build, run, explore.</h2>
+    <h2>Build, run, explore</h2>
     <p class="section-sub">Requirements: Clang 17+, CMake 3.26+, Ninja.</p>
 
     <div class="steps">

@@ -186,8 +186,14 @@ RESULT_ROOT="$SCRIPT_DIR/results/scales"
 COMBINED_TSV="$SCRIPT_DIR/results/scales.tsv"
 COMBINED_CSV="$SCRIPT_DIR/results/scales.csv"
 GEN_DATA="$SCRIPT_DIR/data/gen_data.py"
+# Carry-forward skip set. A harness cuts a cell whose warm iteration exceeds the
+# per-iteration budget and emits a sentinel row (avg_ms < 0); we record that
+# "framework|query" here and feed the accumulated set back via IBEX_SKIP_CELLS so
+# every LARGER size skips it outright — no ever-slower warm iteration is re-paid.
+SKIP_FILE="$SCRIPT_DIR/results/skip_cells.txt"
 
 mkdir -p "$DATA_ROOT" "$RESULT_ROOT" "$(dirname "$COMBINED_TSV")"
+: > "$SKIP_FILE"
 
 printf "dataset_rows\tframework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\tpeak_rss_mb\n" > "$COMBINED_TSV"
 printf "dataset_rows,framework,query,avg_ms,min_ms,max_ms,stddev_ms,p95_ms,p99_ms,rows,peak_rss_mb\n" > "$COMBINED_CSV"
@@ -198,10 +204,13 @@ append_tagged_results() {
     if [[ ! -f "$file_path" ]]; then
         return 0
     fi
-    tail -n +2 "$file_path" | awk -v n="$dataset_rows" '
-        BEGIN { OFS="\t" }
+    # Rows with avg_ms < 0 ($3) are cut/skipped cells: record the cell into the
+    # carry-forward skip set and drop it from the combined output (blank on page).
+    tail -n +2 "$file_path" | awk -v n="$dataset_rows" -v sf="$SKIP_FILE" '
+        BEGIN { FS="\t"; OFS="\t" }
         {
             sub(/\r$/, "", $0)
+            if (($3 + 0) < 0) { print $1 "|" $2 >> sf; next }
             print n, $0
         }
     ' >> "$COMBINED_TSV"
@@ -209,6 +218,7 @@ append_tagged_results() {
         BEGIN { FS="\t"; OFS="," }
         {
             sub(/\r$/, "", $0)
+            if (($3 + 0) < 0) next
             print n, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
         }
     ' >> "$COMBINED_CSV"
@@ -347,6 +357,13 @@ for rows in "${SIZES[@]}"; do
 
     echo "━━━ Dataset: ${rows} rows ━━━"
 
+    # Carry forward cells cut at any smaller size: harnesses read IBEX_SKIP_CELLS
+    # and skip these outright (no warm iteration). Empty on the first size.
+    export IBEX_SKIP_CELLS="$(sort -u "$SKIP_FILE" | paste -sd, -)"
+    if [[ -n "$IBEX_SKIP_CELLS" ]]; then
+        echo "  (carrying forward $(sort -u "$SKIP_FILE" | grep -c .) cut cell(s) from smaller sizes)"
+    fi
+
     # Cap the memory-heavy reshape benchmark: pass 0 (= skip) above the budget.
     RESHAPE_ROWS="$rows"
     if (( rows > RESHAPE_MAX_ROWS )); then
@@ -405,7 +422,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → polars (single thread)"
             polars_st_raw="$size_result_dir/polars_st_raw.tsv"
             polars_st_tsv="$size_result_dir/polars_st.tsv"
-            POLARS_MAX_THREADS=1 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
+            POLARS_MAX_THREADS=1 IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
@@ -462,7 +479,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → duckdb (single thread)"
             duckdb_st_raw="$size_result_dir/duckdb_st_raw.tsv"
             duckdb_st_tsv="$size_result_dir/duckdb_st.tsv"
-            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
+            IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
@@ -491,7 +508,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → datafusion (single thread)"
             datafusion_st_raw="$size_result_dir/datafusion_st_raw.tsv"
             datafusion_st_tsv="$size_result_dir/datafusion_st.tsv"
-            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
+            IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
@@ -520,7 +537,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → clickhouse (single thread)"
             clickhouse_st_raw="$size_result_dir/clickhouse_st_raw.tsv"
             clickhouse_st_tsv="$size_result_dir/clickhouse_st.tsv"
-            uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
+            IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \

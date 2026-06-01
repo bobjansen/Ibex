@@ -928,6 +928,7 @@ def bench_pandas_tf(n_rows, warmup, iters):
              f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
+    run("tf_lag1",             lambda: df["price"].shift(1))
     run("tf_rolling_count_1m", lambda: df["price"].rolling("60s").count())
     run("tf_rolling_sum_1m",   lambda: df["price"].rolling("60s").sum())
     run("tf_rolling_mean_5m",  lambda: df["price"].rolling("300s").mean())
@@ -965,6 +966,8 @@ def bench_polars_tf(n_rows, warmup, iters):
              f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
+    run("tf_lag1",
+        lambda: df.with_columns(pl.col("price").shift(1).alias("prev")))
     run("tf_rolling_count_1m",
         lambda: df.rolling(index_column="ts", period="60s").agg(c=pl.len()))
     run("tf_rolling_sum_1m",

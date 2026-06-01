@@ -562,6 +562,8 @@ if (tf_rows > 0) {
     if (!skip_data_table) {
         dt_tf <- data.table(ts = ts_vec, price = price_vec)
         message("\n=== data.table (tf rolling) ===")
+        bench("data.table", "tf_lag1",
+            function() dt_tf[, prev := shift(price, 1L)][])
         bench("data.table", "tf_rolling_count_1m",
             function() dt_tf[, c := frollsum(rep(1.0, .N), 60L)][])
         bench("data.table", "tf_rolling_sum_1m",
@@ -616,6 +618,8 @@ if (tf_rows > 0) {
         library(slider)
         tb_tf <- tibble::tibble(ts = ts_vec, price = price_vec)
         message("\n=== dplyr (tf rolling) ===")
+        bench("dplyr", "tf_lag1",
+            function() tb_tf |> mutate(prev = lag(price, 1L)))
         bench("dplyr", "tf_rolling_count_1m",
             function() tb_tf |> mutate(c = slide_index_dbl(price, ts,
                                                             ~ length(.x),

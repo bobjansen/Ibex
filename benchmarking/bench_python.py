@@ -25,7 +25,7 @@ import pandas as pd
 import polars as pl
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS
+from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, cut_row
 
 
 # ── Timing helper ─────────────────────────────────────────────────────────────
@@ -71,11 +71,16 @@ def timer(fn, warmup: int, iters: int):
 
 
 def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
+    _fw = "pandas"
     print("pandas: loading...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_path)
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -203,11 +208,16 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
 
 def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
+    _fw = "polars"
     print("polars: loading...", file=sys.stderr, flush=True)
     df = pl.read_csv(csv_path)
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -354,11 +364,16 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 # "I have a CSV on disk and I want this answer" workflow. Pair with the
 # eager `bench_polars` for the "data is already in memory" baseline.
 def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
+    _fw = "polars"
     print("polars-lazy: warming OS page cache...", file=sys.stderr, flush=True)
     pl.scan_csv(csv_path).collect()  # prime the page cache once
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -500,6 +515,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
 
 def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
+    _fw = "pandas"
     """Left join producing ~50% null right-column values."""
     print("pandas: loading for null bench...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_path)
@@ -510,6 +526,10 @@ def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -548,6 +568,7 @@ def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
 
 
 def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
+    _fw = "polars"
     """Left join producing ~50% null right-column values."""
     print("polars: loading for null bench...", file=sys.stderr, flush=True)
     df = pl.read_csv(csv_path)
@@ -558,6 +579,10 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -594,6 +619,7 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
 
 
 def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
+    _fw = "pandas"
     """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
     if reshape_rows <= 0:
         print("pandas: reshape skipped (disabled for this size)", file=sys.stderr, flush=True)
@@ -603,6 +629,10 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -666,6 +696,7 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
 
 
 def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
+    _fw = "polars"
     """Melt (wide→long) and dcast (long→wide) on a synthetic OHLC table."""
     if reshape_rows <= 0:
         print("polars: reshape skipped (disabled for this size)", file=sys.stderr, flush=True)
@@ -675,6 +706,10 @@ def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -734,6 +769,7 @@ def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
 
 
 def bench_pandas_fill(n_rows, warmup, iters):
+    _fw = "pandas"
     """fill_null, fill_forward (LOCF), fill_backward (NOCB) on 50% null numeric data."""
     print("pandas: building fill data...", file=sys.stderr, flush=True)
     vals = np.where(
@@ -745,6 +781,10 @@ def bench_pandas_fill(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -776,6 +816,7 @@ def bench_pandas_fill(n_rows, warmup, iters):
 
 
 def bench_polars_fill(n_rows, warmup, iters):
+    _fw = "polars"
     """fill_null, fill_forward (LOCF), fill_backward (NOCB) on 50% null numeric data."""
     print("polars: building fill data...", file=sys.stderr, flush=True)
     vals = np.where(
@@ -789,6 +830,10 @@ def bench_polars_fill(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -829,11 +874,16 @@ def bench_polars_fill(n_rows, warmup, iters):
 
 
 def bench_pandas_events(csv_events_path, warmup, iters):
+    _fw = "pandas"
     print("pandas: loading events...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_events_path)
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -871,11 +921,16 @@ def bench_pandas_events(csv_events_path, warmup, iters):
 
 
 def bench_polars_events(csv_events_path, warmup, iters):
+    _fw = "polars"
     print("polars: loading events...", file=sys.stderr, flush=True)
     df = pl.read_csv(csv_events_path)
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -911,6 +966,7 @@ def bench_polars_events(csv_events_path, warmup, iters):
 
 
 def bench_pandas_tf(n_rows, warmup, iters):
+    _fw = "pandas"
     """TimeFrame rolling + resample. Data mirrors ibex_bench's TF generator:
        1s-spaced UTC Timestamps, sawtooth price = 100.0 + (i % 100)."""
     print("pandas: building tf data...", file=sys.stderr, flush=True)
@@ -920,6 +976,10 @@ def bench_pandas_tf(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -950,6 +1010,7 @@ def bench_pandas_tf(n_rows, warmup, iters):
 
 
 def bench_polars_tf(n_rows, warmup, iters):
+    _fw = "polars"
     """TimeFrame rolling + resample (Polars eager)."""
     print("polars: building tf data...", file=sys.stderr, flush=True)
     ts = pd.to_datetime(np.arange(n_rows), unit="s")
@@ -958,6 +1019,10 @@ def bench_polars_tf(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -994,6 +1059,7 @@ def bench_polars_tf(n_rows, warmup, iters):
 
 
 def bench_pandas_asof(n_rows, warmup, iters):
+    _fw = "pandas"
     """Tf as-of join: trades (left) joined to quotes (right) on time."""
     print("pandas: building asof data...", file=sys.stderr, flush=True)
     # 100 symbols partition both sides (quote i and any trade derived from it
@@ -1019,6 +1085,10 @@ def bench_pandas_asof(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -1040,6 +1110,7 @@ def bench_pandas_asof(n_rows, warmup, iters):
 
 
 def bench_polars_asof(n_rows, warmup, iters):
+    _fw = "polars"
     """Tf as-of join (Polars eager)."""
     print("polars: building asof data...", file=sys.stderr, flush=True)
     # 100 symbols partition both sides (see pandas asof note).
@@ -1059,6 +1130,10 @@ def bench_polars_asof(n_rows, warmup, iters):
     rows = []
 
     def run(name, fn):
+        if should_skip(_fw, name):
+            print(f"  {_fw}/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row(_fw, name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -1187,8 +1262,7 @@ def main():
                 "peak_rss_mb",
             ]
         )
-        # Drop cells cut by the per-iteration cutoff (sentinel avg_ms < 0).
-        w.writerows([r for r in all_rows if float(r[2]) >= 0])
+        w.writerows(all_rows)
     print(f"results written to {out}", file=sys.stderr)
 
 

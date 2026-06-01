@@ -19,9 +19,34 @@ _SUPPORTED = sys.platform.startswith("linux")
 
 # Dynamic per-cell cutoff: if a single (warmup) iteration of a query exceeds this
 # many milliseconds, the harness cuts the cell — it skips the remaining measured
-# iterations and drops the row, so one pathologically slow op (common at the
-# largest scales) can't dominate the run's wall-clock. Override via env.
+# iterations and emits a sentinel row (avg_ms < 0) the suite drops, so one
+# pathologically slow op (common at the largest scales) can't dominate the run's
+# wall-clock. Override via env.
 CELL_CUTOFF_MS = float(os.environ.get("IBEX_CELL_CUTOFF_MS", "120000"))  # 2 min
+
+# Carry-forward skip set: cells cut at a smaller scale (the suite passes them back
+# via IBEX_SKIP_CELLS as comma-separated "framework|query"). A cell in this set is
+# skipped outright — no warm iteration at all — so a cell that blew the budget at,
+# say, 2M is never even attempted (and re-paid as an ever-slower warm iteration) at
+# 4M/8M/.../50M. IBEX_FW_SUFFIX lets a single-thread (-st) invocation, whose rows
+# are tagged with the base framework then renamed by the suite, match its public
+# name (e.g. internal "polars" + "-st" -> "polars-st").
+_FW_SUFFIX = os.environ.get("IBEX_FW_SUFFIX", "")
+_SKIP_CELLS = frozenset(
+    tok for tok in os.environ.get("IBEX_SKIP_CELLS", "").split(",") if tok
+)
+
+
+def should_skip(framework: str, query: str) -> bool:
+    """True if this (framework, query) cell was cut at a smaller scale."""
+    return f"{framework}{_FW_SUFFIX}|{query}" in _SKIP_CELLS
+
+
+def cut_row(framework: str, query: str, peak_mb: float = 0.0):
+    """A sentinel result row (avg_ms < 0) marking a cut/skipped cell. The suite
+    records it into the carry-forward set and drops it from the combined output."""
+    return (framework, query, "-1.000", "-1.000", "-1.000", "0.000", "-1.000",
+            "-1.000", 0, f"{peak_mb:.1f}")
 
 
 def reset_peak_rss() -> None:

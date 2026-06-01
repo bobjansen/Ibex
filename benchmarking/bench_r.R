@@ -133,7 +133,26 @@ timer <- function(fn) {
 
 results <- list()
 
+# Carry-forward skip: cells cut at a smaller scale (passed back by the suite via
+# IBEX_SKIP_CELLS as "framework|query") are skipped outright — see bench_mem.py.
+fw_suffix  <- Sys.getenv("IBEX_FW_SUFFIX", "")
+skip_cells <- Filter(nzchar, strsplit(Sys.getenv("IBEX_SKIP_CELLS", ""), ",")[[1]])
+should_skip <- function(framework, name) {
+    paste0(framework, fw_suffix, "|", name) %in% skip_cells
+}
+cut_row_df <- function(framework, name) {
+    data.frame(framework = framework, query = name,
+               avg_ms = "-1.000", min_ms = "-1.000", max_ms = "-1.000",
+               stddev_ms = "0.000", p95_ms = "-1.000", p99_ms = "-1.000",
+               rows = 0L, peak_rss_mb = "0.0", stringsAsFactors = FALSE)
+}
+
 bench <- function(framework, name, fn) {
+    if (should_skip(framework, name)) {
+        message(sprintf("  %s/%s: SKIPPED (cut at a smaller scale)", framework, name))
+        results[[length(results) + 1]] <<- cut_row_df(framework, name)
+        return(invisible())
+    }
     r <- timer(fn)
     message(sprintf("  %s/%s: avg_ms=%.3f, stddev_ms=%.3f, p99_ms=%.3f, rows=%d",
                     framework, name, r$avg_ms, r$stddev_ms, r$p99_ms, r$nrow))
@@ -685,7 +704,7 @@ if (length(results) == 0) {
 } else {
     out_df <- do.call(rbind, results)
 }
-# Drop cells cut by the per-iteration cutoff (sentinel avg_ms < 0).
-out_df <- out_df[as.numeric(out_df$avg_ms) >= 0, , drop = FALSE]
+# Sentinel rows (avg_ms < 0) for cut/skipped cells are kept here so the suite can
+# detect them, record the carry-forward skip, and drop them from the combined CSV.
 write.table(out_df, out_path, sep = "\t", row.names = FALSE, quote = FALSE)
 message(sprintf("\nresults written to %s", out_path))

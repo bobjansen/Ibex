@@ -25,6 +25,7 @@ apt-get install -y \
     libcurl4-openssl-dev libssl-dev zlib1g-dev \
     r-base r-cran-data.table r-cran-optparse \
     python3 python3-dev curl unzip \
+    time \
     wget gnupg lsb-release software-properties-common ca-certificates
 
 # jemalloc is ibex's intended allocator: with malloc_conf="dirty_decay_ms:-1"

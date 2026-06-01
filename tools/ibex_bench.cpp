@@ -23,7 +23,9 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <csv.hpp>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <random>
@@ -945,6 +947,46 @@ auto compute_stats(std::vector<double> times) -> BenchStats {
     return {total, avg, mn, mx, stddev, percentile(0.95), percentile(0.99)};
 }
 
+// Reset the kernel's peak-RSS counter (VmHWM) so the next peak_rss_mb() read
+// reflects only the work done since this call. Writing "5" to clear_refs clears
+// the per-process peak. Linux-only; a no-op where /proc/self/clear_refs is
+// unavailable (the subsequent peak read then reports the lifetime peak).
+void reset_peak_rss() {
+    if (std::FILE* f = std::fopen("/proc/self/clear_refs", "w")) {
+        std::fputs("5\n", f);
+        std::fclose(f);
+    }
+}
+
+// Read VmHWM (peak resident set size) from /proc/self/status, in MiB.
+// Returns 0.0 where unavailable.
+auto peak_rss_mb() -> double {
+    std::ifstream status("/proc/self/status");
+    std::string key;
+    while (status >> key) {
+        if (key == "VmHWM:") {
+            long kb = 0;
+            status >> kb;
+            return static_cast<double>(kb) / 1024.0;
+        }
+        status.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+    return 0.0;
+}
+
+// Print one benchmark result line in the key=value format that bench_ibex.sh
+// parses into a TSV row. peak_rss_mb is the absolute VmHWM during the measured
+// iterations (reset via reset_peak_rss() just before the timed loop).
+void print_bench_line(std::string_view name, std::size_t iters, const BenchStats& s,
+                      std::size_t rows, double peak_mb) {
+    fmt::print(
+        "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
+        "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}, "
+        "peak_rss_mb={:.1f}\n",
+        name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms, s.p99_ms,
+        rows, peak_mb);
+}
+
 volatile std::uint64_t g_bench_sink = 0;
 
 template <typename Fn>
@@ -969,6 +1011,7 @@ auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
         }
     }
 
+    reset_peak_rss();
     std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
         auto t0 = std::chrono::steady_clock::now();
@@ -979,13 +1022,10 @@ auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
         times[i] =
             std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
     }
+    double peak_mb = peak_rss_mb();
 
     auto s = compute_stats(std::move(times));
-    fmt::print(
-        "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
-        "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
-        bench_name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
-        s.p99_ms, rows);
+    print_bench_line(bench_name, iters, s, rows, peak_mb);
     return 0;
 }
 
@@ -1001,6 +1041,7 @@ auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
         run_and_touch();
     }
 
+    reset_peak_rss();
     std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
         auto t0 = std::chrono::steady_clock::now();
@@ -1009,13 +1050,10 @@ auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
         times[i] =
             std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
     }
+    double peak_mb = peak_rss_mb();
 
     auto s = compute_stats(std::move(times));
-    fmt::print(
-        "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
-        "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
-        bench_name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
-        s.p99_ms, rows);
+    print_bench_line(bench_name, iters, s, rows, peak_mb);
     return 0;
 }
 
@@ -1071,6 +1109,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
             }
         }
         std::size_t last_rows = 0;
+        reset_peak_rss();
         std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
             auto t0 = std::chrono::steady_clock::now();
@@ -1082,12 +1121,9 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
                 std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0)
                     .count();
         }
+        double peak_mb = peak_rss_mb();
         auto s = compute_stats(std::move(times));
-        fmt::print(
-            "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
-            "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
-            query.name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
-            s.p99_ms, last_rows);
+        print_bench_line(query.name, iters, s, last_rows, peak_mb);
         return 0;
     }
 
@@ -1113,6 +1149,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         }
 
         std::size_t last_rows = 0;
+        reset_peak_rss();
         std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
             auto t0 = std::chrono::steady_clock::now();
@@ -1127,12 +1164,9 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
                 std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0)
                     .count();
         }
+        double peak_mb = peak_rss_mb();
         auto s = compute_stats(std::move(times));
-        fmt::print(
-            "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
-            "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
-            query.name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
-            s.p99_ms, last_rows);
+        print_bench_line(query.name, iters, s, last_rows, peak_mb);
 
         return 0;
     }
@@ -1165,6 +1199,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
     }
 
     std::size_t last_rows = 0;
+    reset_peak_rss();
     std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
         auto t0 = std::chrono::steady_clock::now();
@@ -1175,12 +1210,9 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         times[i] =
             std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
     }
+    double peak_mb = peak_rss_mb();
     auto s = compute_stats(std::move(times));
-    fmt::print(
-        "bench {}: iters={}, total_ms={:.3f}, avg_ms={:.3f}, min_ms={:.3f}, "
-        "max_ms={:.3f}, stddev_ms={:.3f}, p95_ms={:.3f}, p99_ms={:.3f}, rows={}\n",
-        query.name, iters, s.total_ms, s.avg_ms, s.min_ms, s.max_ms, s.stddev_ms, s.p95_ms,
-        s.p99_ms, last_rows);
+    print_bench_line(query.name, iters, s, last_rows, peak_mb);
 
     return 0;
 }

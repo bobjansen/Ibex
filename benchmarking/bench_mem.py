@@ -10,11 +10,18 @@ read VmHWM from /proc/self/status afterwards. On platforms without these
 /proc files (macOS, Windows) reset_peak_rss() is a no-op and peak_rss_mb()
 returns 0.0, so harnesses degrade to a blank memory cell rather than failing.
 """
+import os
 import sys
 
 _CLEAR_REFS = "/proc/self/clear_refs"
 _STATUS = "/proc/self/status"
 _SUPPORTED = sys.platform.startswith("linux")
+
+# Dynamic per-cell cutoff: if a single (warmup) iteration of a query exceeds this
+# many milliseconds, the harness cuts the cell — it skips the remaining measured
+# iterations and drops the row, so one pathologically slow op (common at the
+# largest scales) can't dominate the run's wall-clock. Override via env.
+CELL_CUTOFF_MS = float(os.environ.get("IBEX_CELL_CUTOFF_MS", "120000"))  # 2 min
 
 
 def reset_peak_rss() -> None:

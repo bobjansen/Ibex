@@ -22,7 +22,7 @@ _SUPPORTED = sys.platform.startswith("linux")
 # iterations and emits a sentinel row (avg_ms < 0) the suite drops, so one
 # pathologically slow op (common at the largest scales) can't dominate the run's
 # wall-clock. Override via env.
-CELL_CUTOFF_MS = float(os.environ.get("IBEX_CELL_CUTOFF_MS", "120000"))  # 2 min
+CELL_CUTOFF_MS = float(os.environ.get("IBEX_CELL_CUTOFF_MS", "60000"))  # 1 min
 
 # Carry-forward skip set: cells cut at a smaller scale (the suite passes them back
 # via IBEX_SKIP_CELLS as comma-separated "framework|query"). A cell in this set is

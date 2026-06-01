@@ -391,6 +391,19 @@ governs validation where a declared schema meets actual data (Sections 3.6 and
 { a: Int64, * }    // open: at least column a, extras allowed
 ```
 
+The `*` is **anonymous**: the extra columns it permits are not part of the
+static schema and therefore cannot be referenced by name downstream. A column
+covered only by `*` is indistinguishable, to the type checker, from a column
+that is absent — both are simply "not in the schema." This is what keeps column
+access sound: every statically nameable column traces back to an assertion (a
+reader return schema, an ascription, or a literal) that guarantees its presence
+and type at runtime, so a name reference can never fault. To *use* an extra
+column you must assert it (e.g. re-ascribe a wider schema, Section 3.6); the
+assertion is what pays for the runtime guarantee. Consequently, passing a value
+of type `{ a, * }` to a context requiring column `c` is a type error even when
+`c` happens to be present in the underlying data — the type system cannot
+distinguish a present-but-unlisted `c` from an absent one, and must reject both.
+
 ### 3.4 Local Type Inference and Annotation Validation
 
 `let` bindings may omit the type annotation. When omitted, the binding type is

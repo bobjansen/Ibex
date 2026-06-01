@@ -25,7 +25,7 @@ import pandas as pd
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS
+from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, cut_row
 
 # Absolute peak RSS (MiB) measured during the most recent timer() call.
 LAST_PEAK_RSS_MB = 0.0
@@ -78,6 +78,10 @@ def bench_sqlite_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
     rows = []
 
     def run(name, fn):
+        if should_skip("sqlite", name):
+            print(f"  sqlite/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("sqlite", name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -188,6 +192,10 @@ def bench_sqlite_null(csv_path, csv_lookup_path, warmup, iters, con):
     rows = []
 
     def run(name, fn):
+        if should_skip("sqlite", name):
+            print(f"  sqlite/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("sqlite", name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -256,6 +264,10 @@ def bench_sqlite_reshape(warmup, iters, reshape_rows, con):
     rows = []
 
     def run(name, fn):
+        if should_skip("sqlite", name):
+            print(f"  sqlite/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("sqlite", name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -348,6 +360,10 @@ def bench_sqlite_events(csv_events_path, warmup, iters, con):
     rows = []
 
     def run(name, fn):
+        if should_skip("sqlite", name):
+            print(f"  sqlite/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("sqlite", name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -401,6 +417,10 @@ def bench_sqlite_fill(n_rows, warmup, iters, con):
     rows = []
 
     def run(name, fn):
+        if should_skip("sqlite", name):
+            print(f"  sqlite/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("sqlite", name))
+            return
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
@@ -500,8 +520,7 @@ def main():
                 "peak_rss_mb",
             ]
         )
-        # Drop cells cut by the per-iteration cutoff (sentinel avg_ms < 0).
-        w.writerows([r for r in all_rows if float(r[2]) >= 0])
+        w.writerows(all_rows)
     print(f"results written to {out}", file=sys.stderr)
 
 

@@ -17,7 +17,7 @@ from chdb.session import Session
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS
+from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, cut_row
 
 # Absolute peak RSS (MiB) measured during the most recent timer() call.
 LAST_PEAK_RSS_MB = 0.0
@@ -84,6 +84,10 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     rows = []
 
     def run(name, sql):
+        if should_skip("clickhouse", name):
+            print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("clickhouse", name))
+            return
         n = _count_rows(sess, sql)
 
         def fn():
@@ -210,6 +214,10 @@ def bench_clickhouse_null(csv_path, csv_lookup_path, warmup, iters, sess):
     rows = []
 
     def run(name, sql):
+        if should_skip("clickhouse", name):
+            print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("clickhouse", name))
+            return
         n = _count_rows(sess, sql)
 
         def fn():
@@ -272,6 +280,10 @@ def bench_clickhouse_reshape(warmup, iters, reshape_rows, sess):
     rows = []
 
     def run(name, sql):
+        if should_skip("clickhouse", name):
+            print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("clickhouse", name))
+            return
         n = _count_rows(sess, sql)
 
         def fn():
@@ -355,6 +367,10 @@ def bench_clickhouse_events(csv_events_path, warmup, iters, sess):
     rows = []
 
     def run(name, sql):
+        if should_skip("clickhouse", name):
+            print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("clickhouse", name))
+            return
         n = _count_rows(sess, sql)
 
         def fn():
@@ -415,6 +431,10 @@ def bench_clickhouse_fill(n_rows, warmup, iters, sess):
     rows = []
 
     def run(name, sql):
+        if should_skip("clickhouse", name):
+            print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("clickhouse", name))
+            return
         n = _count_rows(sess, sql)
 
         def fn():
@@ -480,6 +500,10 @@ def bench_clickhouse_tf(n_rows, warmup, iters, sess):
     rows = []
 
     def run(name, sql):
+        if should_skip("clickhouse", name):
+            print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("clickhouse", name))
+            return
         n = _count_rows(sess, sql)
 
         def fn():
@@ -557,6 +581,10 @@ def bench_clickhouse_asof(n_rows, warmup, iters, sess):
     rows = []
 
     def run(name, sql):
+        if should_skip("clickhouse", name):
+            print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
+            rows.append(cut_row("clickhouse", name))
+            return
         n = _count_rows(sess, sql)
 
         def fn():
@@ -659,8 +687,7 @@ def main():
                 "peak_rss_mb",
             ]
         )
-        # Drop cells cut by the per-iteration cutoff (sentinel avg_ms < 0).
-        w.writerows([r for r in all_rows if float(r[2]) >= 0])
+        w.writerows(all_rows)
     print(f"results written to {out}", file=sys.stderr)
 
 

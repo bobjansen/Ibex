@@ -24,19 +24,31 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from bench_mem import reset_peak_rss, peak_rss_mb
+
 
 # ── Timing helper ─────────────────────────────────────────────────────────────
 
+# Absolute peak RSS (MiB) measured during the most recent timer() call. timer()
+# resets the kernel peak counter after warmup and reads it after the measured
+# iterations; run() helpers read this when appending the peak_rss_mb column.
+LAST_PEAK_RSS_MB = 0.0
+
 
 def timer(fn, warmup: int, iters: int):
-    """Warmup then time fn(). Returns (avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, last_result)."""
+    """Warmup then time fn(). Returns (avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, last_result).
+    Side effect: sets module global LAST_PEAK_RSS_MB to the peak RSS during the measured iterations."""
+    global LAST_PEAK_RSS_MB
     for _ in range(warmup):
         result = fn()
+    reset_peak_rss()
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
         result = fn()
         times.append((time.perf_counter() - t0) * 1000)
+    LAST_PEAK_RSS_MB = peak_rss_mb()
     t = np.array(times)
     return (
         float(np.mean(t)),
@@ -78,6 +90,7 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -209,6 +222,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -359,6 +373,7 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -509,6 +524,7 @@ def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -556,6 +572,7 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -600,6 +617,7 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -671,6 +689,7 @@ def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -740,6 +759,7 @@ def bench_pandas_fill(n_rows, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -783,6 +803,7 @@ def bench_polars_fill(n_rows, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -827,6 +848,7 @@ def bench_pandas_events(csv_events_path, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -868,6 +890,7 @@ def bench_polars_events(csv_events_path, warmup, iters):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -902,7 +925,7 @@ def bench_pandas_tf(n_rows, warmup, iters):
         )
         rows.append(
             ("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
-             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
     run("tf_rolling_count_1m", lambda: df["price"].rolling("60s").count())
@@ -939,7 +962,7 @@ def bench_polars_tf(n_rows, warmup, iters):
         )
         rows.append(
             ("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
-             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
     run("tf_rolling_count_1m",
@@ -998,7 +1021,7 @@ def bench_pandas_asof(n_rows, warmup, iters):
         )
         rows.append(
             ("pandas", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
-             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
     run("tf_asof_join", lambda: pd.merge_asof(trades, quotes, on="ts", direction="backward"))
@@ -1038,7 +1061,7 @@ def bench_polars_asof(n_rows, warmup, iters):
         )
         rows.append(
             ("polars", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
-             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n)
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
     run("tf_asof_join",
@@ -1152,6 +1175,7 @@ def main():
                 "p95_ms",
                 "p99_ms",
                 "rows",
+                "peak_rss_mb",
             ]
         )
         w.writerows(all_rows)

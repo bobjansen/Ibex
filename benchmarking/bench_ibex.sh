@@ -128,24 +128,25 @@ echo "$raw" >&2
 #           min_ms=2.1, max_ms=3.0, stddev_ms=0.2, p95_ms=2.9, p99_ms=3.0, rows=252
 # Output: ibex<TAB>mean_by_symbol<TAB>2.469<TAB>2.1<TAB>3.0<TAB>0.2<TAB>2.9<TAB>3.0<TAB>252
 {
-    printf "framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\n"
+    printf "framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\tpeak_rss_mb\n"
     echo "$raw" | awk '
     /^bench / {
         name = $2; sub(/:$/, "", name)
-        avg_ms = ""; min_ms = ""; max_ms = ""; stddev_ms = ""; p95_ms = ""; p99_ms = ""; rows = ""
+        avg_ms = ""; min_ms = ""; max_ms = ""; stddev_ms = ""; p95_ms = ""; p99_ms = ""; rows = ""; peak_rss_mb = ""
         for (i = 3; i <= NF; i++) {
             v = $i; sub(/,$/, "", v)
-            if (v ~ /^avg_ms=/)    { split(v, a, "="); avg_ms    = a[2] }
-            if (v ~ /^min_ms=/)    { split(v, a, "="); min_ms    = a[2] }
-            if (v ~ /^max_ms=/)    { split(v, a, "="); max_ms    = a[2] }
-            if (v ~ /^stddev_ms=/) { split(v, a, "="); stddev_ms = a[2] }
-            if (v ~ /^p95_ms=/)    { split(v, a, "="); p95_ms    = a[2] }
-            if (v ~ /^p99_ms=/)    { split(v, a, "="); p99_ms    = a[2] }
-            if (v ~ /^rows=/)      { split(v, a, "="); rows      = a[2] }
+            if (v ~ /^avg_ms=/)      { split(v, a, "="); avg_ms      = a[2] }
+            if (v ~ /^min_ms=/)      { split(v, a, "="); min_ms      = a[2] }
+            if (v ~ /^max_ms=/)      { split(v, a, "="); max_ms      = a[2] }
+            if (v ~ /^stddev_ms=/)   { split(v, a, "="); stddev_ms   = a[2] }
+            if (v ~ /^p95_ms=/)      { split(v, a, "="); p95_ms      = a[2] }
+            if (v ~ /^p99_ms=/)      { split(v, a, "="); p99_ms      = a[2] }
+            if (v ~ /^rows=/)        { split(v, a, "="); rows        = a[2] }
+            if (v ~ /^peak_rss_mb=/) { split(v, a, "="); peak_rss_mb = a[2] }
         }
         fw = (name ~ /^parse_/) ? "ibex+parse" : "'"$FW_TAG"'"
         q  = name; sub(/^parse_/, "", q)
-        print fw "\t" q "\t" avg_ms "\t" min_ms "\t" max_ms "\t" stddev_ms "\t" p95_ms "\t" p99_ms "\t" rows
+        print fw "\t" q "\t" avg_ms "\t" min_ms "\t" max_ms "\t" stddev_ms "\t" p95_ms "\t" p99_ms "\t" rows "\t" peak_rss_mb
     }'
 } > "$OUT"
 

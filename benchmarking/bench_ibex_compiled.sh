@@ -20,6 +20,13 @@ IBEX_COMPILE="$BUILD_DIR/tools/ibex_compile"
 CXX="${CXX:-clang++}"
 CXXFLAGS="${CXXFLAGS:-}"
 
+# Each compiled query runs as its own process, so peak RSS is captured with GNU
+# time (the `time` apt package). When it is unavailable the peak cell is "-".
+GNU_TIME=""
+if [[ -x /usr/bin/time ]]; then
+    GNU_TIME="/usr/bin/time"
+fi
+
 lld_ok=0
 if "$CXX" -fuse-ld=lld -Wl,--version -x c++ - -o /tmp/ibex_lld_test </dev/null \
     >/dev/null 2>&1; then
@@ -141,11 +148,23 @@ EOF
 }
 
 time_bin() {
+    # Run the compiled binary once and echo "<avg_ms>\t<peak_rss_mb>".
+    # The binary prints "avg_ms=X.XXX" to stderr (timing is internal); when GNU
+    # time is available its -v report (also on stderr) carries the peak RSS.
     local bin="$1"
-    # The binary prints "avg_ms=X.XXX" to stderr (timing is internal).
-    local stderr_out
-    stderr_out="$("$bin" 2>&1 >/dev/null)"
-    echo "$stderr_out" | grep -oP 'avg_ms=\K[0-9.]+' | head -1
+    local out avg peak peak_kb
+    if [[ -n "$GNU_TIME" ]]; then
+        out="$("$GNU_TIME" -v "$bin" 2>&1 >/dev/null)"
+    else
+        out="$("$bin" 2>&1 >/dev/null)"
+    fi
+    avg="$(echo "$out" | grep -oP 'avg_ms=\K[0-9.]+' | head -1)"
+    peak="-"
+    if [[ -n "$GNU_TIME" ]]; then
+        peak_kb="$(echo "$out" | grep -oP 'Maximum resident set size \(kbytes\): \K[0-9]+' | head -1)"
+        [[ -n "$peak_kb" ]] && peak="$(awk -v k="$peak_kb" 'BEGIN{printf "%.1f", k/1024.0}')"
+    fi
+    printf '%s\t%s\n' "$avg" "$peak"
 }
 
 declare -a NAMES
@@ -162,14 +181,14 @@ QUERIES+=("prices[update {price_x2 = price * 2}]")
 
 echo "=== ibex (compiled) ===" >&2
 {
-    printf "framework\tquery\tavg_ms\trows\n"
+    printf "framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\tpeak_rss_mb\n"
     for i in "${!NAMES[@]}"; do
         name="${NAMES[$i]}"
         query="${QUERIES[$i]}"
         bin_path="$(compile_query "$name" "$query")"
-        avg_ms="$(time_bin "$bin_path")"
-        printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
-        printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
+        IFS=$'\t' read -r avg_ms peak_mb < <(time_bin "$bin_path")
+        printf "ibex-compiled\t%s\t%s\t-\t-\t-\t-\t-\t-\t%s\n" "$name" "$avg_ms" "$peak_mb"
+        printf "  %s: avg_ms=%s peak_rss_mb=%s\n" "$name" "$avg_ms" "$peak_mb" >&2
     done
 
     if [[ -f "$CSV_MULTI" ]]; then
@@ -189,9 +208,9 @@ echo "=== ibex (compiled) ===" >&2
             name="${MULTI_NAMES[$i]}"
             query="${MULTI_QUERIES[$i]}"
             bin_path="$(compile_query "$name" "$query" "prices_multi" "$CSV_MULTI")"
-            avg_ms="$(time_bin "$bin_path")"
-            printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
-            printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
+            IFS=$'\t' read -r avg_ms peak_mb < <(time_bin "$bin_path")
+            printf "ibex-compiled\t%s\t%s\t-\t-\t-\t-\t-\t-\t%s\n" "$name" "$avg_ms" "$peak_mb"
+            printf "  %s: avg_ms=%s peak_rss_mb=%s\n" "$name" "$avg_ms" "$peak_mb" >&2
         done
     fi
 
@@ -215,9 +234,9 @@ echo "=== ibex (compiled) ===" >&2
             name="${FILTER_NAMES[$i]}"
             query="${FILTER_QUERIES[$i]}"
             bin_path="$(compile_query "$name" "$query" "trades" "$CSV_TRADES")"
-            avg_ms="$(time_bin "$bin_path")"
-            printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
-            printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
+            IFS=$'\t' read -r avg_ms peak_mb < <(time_bin "$bin_path")
+            printf "ibex-compiled\t%s\t%s\t-\t-\t-\t-\t-\t-\t%s\n" "$name" "$avg_ms" "$peak_mb"
+            printf "  %s: avg_ms=%s peak_rss_mb=%s\n" "$name" "$avg_ms" "$peak_mb" >&2
         done
     fi
 
@@ -235,9 +254,9 @@ echo "=== ibex (compiled) ===" >&2
             name="${EVENTS_NAMES[$i]}"
             query="${EVENTS_QUERIES[$i]}"
             bin_path="$(compile_query "$name" "$query" "events" "$CSV_EVENTS")"
-            avg_ms="$(time_bin "$bin_path")"
-            printf "ibex-compiled\t%s\t%s\t-\n" "$name" "$avg_ms"
-            printf "  %s: avg_ms=%s\n" "$name" "$avg_ms" >&2
+            IFS=$'\t' read -r avg_ms peak_mb < <(time_bin "$bin_path")
+            printf "ibex-compiled\t%s\t%s\t-\t-\t-\t-\t-\t-\t%s\n" "$name" "$avg_ms" "$peak_mb"
+            printf "  %s: avg_ms=%s peak_rss_mb=%s\n" "$name" "$avg_ms" "$peak_mb" >&2
         done
     fi
 } > "$OUT"

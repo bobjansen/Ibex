@@ -67,8 +67,32 @@ suppressPackageStartupMessages({
 # correction during a long benchmark run can step the clock backward, producing
 # a negative elapsed time.  Retry any such measurement up to 5 times before
 # clamping to 0 as a last resort.
+# ── Peak-RSS measurement (Linux only) ─────────────────────────────────────────
+# Absolute peak RSS (VmHWM) during a query's measured iterations, in MiB.
+# Writing "5" to /proc/self/clear_refs resets the kernel's per-process peak;
+# we reset after warmup and read VmHWM after the measured loop. On platforms
+# without these /proc files the functions degrade to a no-op / 0.0.
+reset_peak_rss <- function() {
+    tryCatch({
+        con <- file("/proc/self/clear_refs", "w")
+        writeLines("5", con)
+        close(con)
+    }, error = function(e) invisible(NULL))
+}
+
+peak_rss_mb <- function() {
+    tryCatch({
+        lines <- readLines("/proc/self/status")
+        hwm   <- grep("^VmHWM:", lines, value = TRUE)
+        if (length(hwm) == 0) return(0.0)
+        kb <- as.numeric(strsplit(trimws(sub("VmHWM:", "", hwm[1])), "\\s+")[[1]][1])
+        kb / 1024.0
+    }, error = function(e) 0.0)
+}
+
 timer <- function(fn) {
     for (i in seq_len(warmup)) fn()
+    reset_peak_rss()
     times <- numeric(iters)
     r <- NULL
     for (i in seq_len(iters)) {
@@ -81,6 +105,7 @@ timer <- function(fn) {
         }
         times[i] <- max(elapsed, 0)
     }
+    peak_mb <- peak_rss_mb()
     list(
         avg_ms    = mean(times),
         min_ms    = min(times),
@@ -88,7 +113,8 @@ timer <- function(fn) {
         stddev_ms = if (iters > 1) sd(times) else 0.0,
         p95_ms    = as.numeric(quantile(times, 0.95)),
         p99_ms    = as.numeric(quantile(times, 0.99)),
-        nrow      = nrow(r)
+        nrow      = nrow(r),
+        peak_rss_mb = peak_mb
     )
 }
 
@@ -108,6 +134,7 @@ bench <- function(framework, name, fn) {
         p95_ms    = sprintf("%.3f", r$p95_ms),
         p99_ms    = sprintf("%.3f", r$p99_ms),
         rows      = r$nrow,
+        peak_rss_mb = sprintf("%.1f", r$peak_rss_mb),
         stringsAsFactors = FALSE
     )
 }
@@ -635,6 +662,7 @@ if (length(results) == 0) {
         p95_ms    = character(),
         p99_ms    = character(),
         rows      = integer(),
+        peak_rss_mb = character(),
         stringsAsFactors = FALSE
     )
 } else {

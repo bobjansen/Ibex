@@ -5,7 +5,7 @@
 #   ./benchmarking/aws/run.sh [options]
 #
 # Options:
-#   --sizes  1M,2M,4M,8M,16M   (default)
+#   --sizes  1M,2M,4M,8M,16M,32M,50M   (default)
 #   --warmup N                  warmup iterations  (default: 1)
 #   --iters  N                  timed iterations   (default: 5)
 #   --type   INSTANCE_TYPE      EC2 instance type  (default: r7i.2xlarge)
@@ -37,7 +37,7 @@ REGION="${AWS_REGION:-us-east-1}"
 # in-memory reshape benchmark, which needs ~28GB at 16M). Same Sapphire Rapids
 # CPU as c7i, so per-core timings stay comparable; run every size on one box.
 INSTANCE_TYPE="r7i.2xlarge"
-SIZES="1M,2M,4M,8M,16M"
+SIZES="1M,2M,4M,8M,16M,32M,50M"
 WARMUP=1
 ITERS=5
 TF_ROWS=""

@@ -25,7 +25,7 @@ import pandas as pd
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from bench_mem import reset_peak_rss, peak_rss_mb
+from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS
 
 # Absolute peak RSS (MiB) measured during the most recent timer() call.
 LAST_PEAK_RSS_MB = 0.0
@@ -36,7 +36,13 @@ def timer(fn, warmup: int, iters: int):
     Side effect: sets module global LAST_PEAK_RSS_MB to peak RSS during the measured iterations."""
     global LAST_PEAK_RSS_MB
     for _ in range(warmup):
+        _t0 = time.perf_counter()
         result = fn()
+        if (time.perf_counter() - _t0) * 1000 > CELL_CUTOFF_MS:
+            # Over the per-iteration budget: cut this cell. The sentinel
+            # avg_ms < 0 is dropped by the writer (blank on the page).
+            LAST_PEAK_RSS_MB = 0.0
+            return (-1.0, -1.0, -1.0, 0.0, -1.0, -1.0, result)
     reset_peak_rss()
     times = []
     for _ in range(iters):
@@ -494,7 +500,8 @@ def main():
                 "peak_rss_mb",
             ]
         )
-        w.writerows(all_rows)
+        # Drop cells cut by the per-iteration cutoff (sentinel avg_ms < 0).
+        w.writerows([r for r in all_rows if float(r[2]) >= 0])
     print(f"results written to {out}", file=sys.stderr)
 
 

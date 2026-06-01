@@ -90,11 +90,24 @@ peak_rss_mb <- function() {
     }, error = function(e) 0.0)
 }
 
+# Dynamic per-cell cutoff: a single (warmup) iteration over this many ms cuts the
+# cell — the rest of the iterations are skipped and a sentinel (avg_ms = -1) row
+# is dropped by the writer, so one pathologically slow op can't dominate the run.
+cell_cutoff_ms <- as.numeric(Sys.getenv("IBEX_CELL_CUTOFF_MS", "120000"))
+
 timer <- function(fn) {
-    for (i in seq_len(warmup)) fn()
+    r <- NULL
+    for (i in seq_len(warmup)) {
+        t0 <- proc.time()[["elapsed"]]
+        r  <- fn()
+        if ((proc.time()[["elapsed"]] - t0) * 1000 > cell_cutoff_ms) {
+            return(list(avg_ms = -1, min_ms = -1, max_ms = -1, stddev_ms = 0,
+                        p95_ms = -1, p99_ms = -1,
+                        nrow = if (is.null(r)) 0L else nrow(r), peak_rss_mb = 0))
+        }
+    }
     reset_peak_rss()
     times <- numeric(iters)
-    r <- NULL
     for (i in seq_len(iters)) {
         elapsed <- -1
         for (attempt in seq_len(5L)) {
@@ -672,5 +685,7 @@ if (length(results) == 0) {
 } else {
     out_df <- do.call(rbind, results)
 }
+# Drop cells cut by the per-iteration cutoff (sentinel avg_ms < 0).
+out_df <- out_df[as.numeric(out_df$avg_ms) >= 0, , drop = FALSE]
 write.table(out_df, out_path, sep = "\t", row.names = FALSE, quote = FALSE)
 message(sprintf("\nresults written to %s", out_path))

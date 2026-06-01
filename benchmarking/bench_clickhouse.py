@@ -16,15 +16,26 @@ from chdb.session import Session
 # ── Timing helper ─────────────────────────────────────────────────────────────
 
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from bench_mem import reset_peak_rss, peak_rss_mb
+
+# Absolute peak RSS (MiB) measured during the most recent timer() call.
+LAST_PEAK_RSS_MB = 0.0
+
+
 def timer(fn, warmup: int, iters: int):
-    """Warmup then time fn(). Returns (avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, last_result)."""
+    """Warmup then time fn(). Returns (avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, last_result).
+    Side effect: sets module global LAST_PEAK_RSS_MB to peak RSS during the measured iterations."""
+    global LAST_PEAK_RSS_MB
     for _ in range(warmup):
         result = fn()
+    reset_peak_rss()
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
         result = fn()
         times.append((time.perf_counter() - t0) * 1000)
+    LAST_PEAK_RSS_MB = peak_rss_mb()
     t = np.array(times)
     return (
         float(np.mean(t)),
@@ -91,6 +102,7 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -216,6 +228,7 @@ def bench_clickhouse_null(csv_path, csv_lookup_path, warmup, iters, sess):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -277,6 +290,7 @@ def bench_clickhouse_reshape(warmup, iters, reshape_rows, sess):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -359,6 +373,7 @@ def bench_clickhouse_events(csv_events_path, warmup, iters, sess):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -415,6 +430,7 @@ def bench_clickhouse_fill(n_rows, warmup, iters, sess):
                 f"{p95_ms:.3f}",
                 f"{p99_ms:.3f}",
                 n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
             )
         )
 
@@ -496,6 +512,7 @@ def main():
                 "p95_ms",
                 "p99_ms",
                 "rows",
+                "peak_rss_mb",
             ]
         )
         w.writerows(all_rows)

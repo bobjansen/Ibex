@@ -51,7 +51,7 @@ CLANG_VERSION=21
 apt-get install -y --no-install-recommends \
     ninja-build \
     libjemalloc-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
-    git curl unzip ca-certificates \
+    git curl unzip ca-certificates time \
     wget gnupg lsb-release software-properties-common
 
 # Noble's apt CMake is 3.28, on which Arrow 22's from-source build fails

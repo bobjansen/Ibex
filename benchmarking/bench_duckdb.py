@@ -474,6 +474,8 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
             f"AND CURRENT ROW)"
         )
 
+    run("tf_lag1",
+        lambda: con.sql("SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data").fetchnumpy())
     run("tf_rolling_count_1m",
         lambda: con.sql(f"SELECT count(*) {w('60 SECONDS')} AS c FROM tf_data").fetchnumpy())
     run("tf_rolling_sum_1m",

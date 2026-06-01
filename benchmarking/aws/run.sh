@@ -162,12 +162,15 @@ if [[ -n "$KEY_NAME" ]]; then
     echo "          (get IP: aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
 fi
 echo ""
+PARTIAL_KEY="${RESULT_KEY%scales.csv}scales.partial.csv"
 echo "Waiting for s3://${S3_BUCKET}/${RESULT_KEY} ..."
-echo "(this typically takes 45–60 min)"
+echo "(45 min for a 1M–16M run; a full 1M–50M sweep can take several hours)"
+echo "Live partial progress (completed sizes, refreshed ~60s):"
+echo "  aws s3 cp s3://${S3_BUCKET}/${PARTIAL_KEY} - --region ${REGION} | column -t -s,"
 echo ""
 
 # ── Poll S3 ───────────────────────────────────────────────────────────────────
-TIMEOUT=7200  # 2 hours
+TIMEOUT=21600  # 6 hours — a full 1M–50M sweep with all engines can run this long
 START=$(date +%s)
 DOTS=0
 
@@ -175,7 +178,7 @@ while true; do
     NOW=$(date +%s)
     if (( NOW - START > TIMEOUT )); then
         echo ""
-        echo "Timed out after 2h. Check instance logs:"
+        echo "Timed out after 6h. Check instance logs:"
         echo "  aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --output text"
         exit 1
     fi

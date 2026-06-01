@@ -391,7 +391,10 @@ def bench_clickhouse_events(csv_events_path, warmup, iters, sess):
 
 
 def bench_clickhouse_fill(n_rows, warmup, iters, sess):
-    """fill_null on 50% null numeric data. fill_forward/backward skipped (no IGNORE NULLS)."""
+    """fill_null, fill_forward (LOCF) and fill_backward on 50% null numeric data.
+    Forward/backward use last_value/first_value with IGNORE NULLS over an
+    unbounded frame — ClickHouse evaluates these in a single pass (O(n) and fast
+    at scale, unlike DataFusion's quadratic IGNORE NULLS)."""
     print("clickhouse: building fill data...", file=sys.stderr, flush=True)
     sess.query(f"""
         CREATE OR REPLACE TABLE fill_data ENGINE = Memory AS
@@ -438,6 +441,138 @@ def bench_clickhouse_fill(n_rows, warmup, iters, sess):
         "fill_null",
         "SELECT coalesce(val, 0.0) AS v2 FROM fill_data",
     )
+    run(
+        "fill_forward",
+        "SELECT last_value(val) IGNORE NULLS OVER "
+        "(ORDER BY _rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM fill_data",
+    )
+    run(
+        "fill_backward",
+        "SELECT first_value(val) IGNORE NULLS OVER "
+        "(ORDER BY _rowid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS v FROM fill_data",
+    )
+    return rows
+
+
+def bench_clickhouse_tf(n_rows, warmup, iters, sess):
+    """TimeFrame rolling + lag + resample via ClickHouse window functions.
+
+    ClickHouse window frames take only numeric (row) offsets, not RANGE INTERVAL.
+    The tf data is 1s-spaced, so the time window [t-Ns, t] (inclusive, as duckdb's
+    RANGE BETWEEN INTERVAL N SECONDS and DataFusion use) is exactly N+1 rows:
+    `ROWS BETWEEN N PRECEDING AND CURRENT ROW`. For this regular series that is
+    identical to those engines' time-range windows (verified: same rolling sums).
+    EWMA is omitted: ClickHouse's exponentialMovingAverage uses a different
+    (time-decay) parameterisation than the alpha=0.1 form, so it is not comparable.
+    """
+    print("clickhouse: building tf data...", file=sys.stderr, flush=True)
+    sess.query(f"""
+        CREATE OR REPLACE TABLE tf_data ENGINE = Memory AS
+        SELECT toDateTime(number) AS ts, 100.0 + (number % 100) AS price
+        FROM numbers({n_rows})
+    """)
+    rows = []
+
+    def run(name, sql):
+        n = _count_rows(sess, sql)
+
+        def fn():
+            _materialize(sess, sql)
+
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+            fn, warmup, iters
+        )
+        print(
+            f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            (
+                "clickhouse",
+                name,
+                f"{avg_ms:.3f}",
+                f"{min_ms:.3f}",
+                f"{max_ms:.3f}",
+                f"{stddev_ms:.3f}",
+                f"{p95_ms:.3f}",
+                f"{p99_ms:.3f}",
+                n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
+            )
+        )
+
+    # Window [t-Ns, t] inclusive == N+1 rows on the 1s series: 60s -> 60 PRECEDING,
+    # 5m -> 300 PRECEDING.
+    def w(rows_back):
+        return f"OVER (ORDER BY ts ROWS BETWEEN {rows_back} PRECEDING AND CURRENT ROW)"
+
+    run("tf_lag1",
+        f"SELECT lagInFrame(price, 1) {w(1)} AS prev FROM tf_data")
+    run("tf_rolling_count_1m",
+        f"SELECT count(*) {w(60)} AS c FROM tf_data")
+    run("tf_rolling_sum_1m",
+        f"SELECT sum(price) {w(60)} AS s FROM tf_data")
+    run("tf_rolling_mean_5m",
+        f"SELECT avg(price) {w(300)} AS m FROM tf_data")
+    run("tf_rolling_median_1m",
+        f"SELECT median(price) {w(60)} AS med FROM tf_data")
+    run("tf_rolling_std_1m",
+        f"SELECT stddevSamp(price) {w(60)} AS s FROM tf_data")
+    run("tf_resample_1m_ohlc",
+        "SELECT toStartOfInterval(ts, INTERVAL 60 SECOND) AS bucket, "
+        "       argMin(price, ts) AS open, max(price) AS high, "
+        "       min(price) AS low, argMax(price, ts) AS close "
+        "FROM tf_data GROUP BY bucket ORDER BY bucket")
+    return rows
+
+
+def bench_clickhouse_asof(n_rows, warmup, iters, sess):
+    """tf_asof_join_by_symbol via ClickHouse's native ASOF JOIN. The keyless
+    tf_asof_join is left out: chdb's ASOF JOIN requires at least one equi-join
+    column, so a symbol-less variant would need a synthetic constant key."""
+    print("clickhouse: building asof data...", file=sys.stderr, flush=True)
+    # Quotes: 1s-spaced, 100 symbols. Trades: ~10% sample, sub-second offset so
+    # each trade falls between quote ticks (mirrors the duckdb/polars asof setup).
+    sess.query(f"""
+        CREATE OR REPLACE TABLE quotes ENGINE = Memory AS
+        SELECT toDateTime64(number, 3) AS ts,
+               'SYM' || toString(number % 100) AS symbol,
+               99.0 + (number % 100) * 0.01 AS bid
+        FROM numbers({n_rows})
+    """)
+    sess.query(f"""
+        CREATE OR REPLACE TABLE trades ENGINE = Memory AS
+        SELECT toDateTime64(number + (cityHash64(number) % 1000) / 1000.0, 3) AS ts,
+               'SYM' || toString(number % 100) AS symbol,
+               1 + (cityHash64(number) % 99) AS qty
+        FROM numbers({n_rows}) WHERE number % 10 = 0
+    """)
+    rows = []
+
+    def run(name, sql):
+        n = _count_rows(sess, sql)
+
+        def fn():
+            _materialize(sess, sql)
+
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+            fn, warmup, iters
+        )
+        print(
+            f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            ("clickhouse", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
+             f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
+        )
+
+    run("tf_asof_join_by_symbol",
+        "SELECT t.ts AS ts, t.qty AS qty, q.bid AS bid "
+        "FROM trades AS t ASOF LEFT JOIN quotes AS q "
+        "ON t.symbol = q.symbol AND t.ts >= q.ts")
     return rows
 
 
@@ -496,6 +631,9 @@ def main():
             args.csv, args.csv_lookup, args.warmup, args.iters, sess
         )
     all_rows += bench_clickhouse_fill(args.fill_rows, args.warmup, args.iters, sess)
+    if args.tf_rows > 0:
+        all_rows += bench_clickhouse_tf(args.tf_rows, args.warmup, args.iters, sess)
+        all_rows += bench_clickhouse_asof(args.tf_rows, args.warmup, args.iters, sess)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

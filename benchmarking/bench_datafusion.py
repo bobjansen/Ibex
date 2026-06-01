@@ -470,8 +470,79 @@ def bench_datafusion_fill(n_rows, warmup, iters, ctx):
             "SELECT COALESCE(val, 0.0) AS v2 FROM fill_data"
         ).collect(),
     )
-    # fill_forward / fill_backward skipped: DataFusion's LAST_VALUE(IGNORE NULLS)
-    # over an unbounded preceding frame is O(n²) and hangs on large tables.
+    # fill_forward / fill_backward skipped: DataFusion *supports* LAST_VALUE(... )
+    # IGNORE NULLS, but over an unbounded preceding frame it is O(n²) — measured
+    # not to finish even at 1M rows in 150s — so it is genuinely impractical here,
+    # unlike ClickHouse which evaluates the same pattern in a single O(n) pass.
+    return rows
+
+
+def bench_datafusion_tf(n_rows, warmup, iters, ctx):
+    """TimeFrame lag + rolling + resample. DataFusion supports time RANGE window
+    frames (RANGE BETWEEN INTERVAL ... PRECEDING), so the rolling windows are true
+    time windows — apples-to-apples with ibex/duckdb/polars. resample uses
+    date_bin(). Left unimplemented: as-of join (no native DataFusion asof) and
+    time-windowed EWMA (no native function — would need a UDF)."""
+    print("datafusion: building tf data...", file=sys.stderr, flush=True)
+    idx = np.arange(n_rows)
+    ts = pa.array(idx.astype("datetime64[s]"), type=pa.timestamp("s"))
+    price = pa.array(100.0 + (idx % 100).astype(float), type=pa.float64())
+    table = pa.table({"ts": ts, "price": price})
+    ctx.register_record_batches("tf_data", [table.to_batches()])
+    rows = []
+
+    def run(name, fn):
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
+            fn, warmup, iters
+        )
+        n = batch_row_count(result)
+        print(
+            f"  datafusion/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
+            file=sys.stderr,
+            flush=True,
+        )
+        rows.append(
+            (
+                "datafusion",
+                name,
+                f"{avg_ms:.3f}",
+                f"{min_ms:.3f}",
+                f"{max_ms:.3f}",
+                f"{stddev_ms:.3f}",
+                f"{p95_ms:.3f}",
+                f"{p99_ms:.3f}",
+                n,
+                f"{LAST_PEAK_RSS_MB:.1f}",
+            )
+        )
+
+    # Time-range frame: 1m / 5m windows over the timestamp, inclusive of the
+    # current row (matches the other engines' window semantics).
+    def w(period):
+        return (
+            f"OVER (ORDER BY ts RANGE BETWEEN INTERVAL '{period}' PRECEDING "
+            f"AND CURRENT ROW)"
+        )
+
+    run("tf_lag1",
+        lambda: ctx.sql(
+            "SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data").collect())
+    run("tf_rolling_count_1m",
+        lambda: ctx.sql(f"SELECT count(*) {w('60 seconds')} AS c FROM tf_data").collect())
+    run("tf_rolling_sum_1m",
+        lambda: ctx.sql(f"SELECT sum(price) {w('60 seconds')} AS s FROM tf_data").collect())
+    run("tf_rolling_mean_5m",
+        lambda: ctx.sql(f"SELECT avg(price) {w('300 seconds')} AS m FROM tf_data").collect())
+    run("tf_rolling_median_1m",
+        lambda: ctx.sql(f"SELECT median(price) {w('60 seconds')} AS med FROM tf_data").collect())
+    run("tf_rolling_std_1m",
+        lambda: ctx.sql(f"SELECT stddev_samp(price) {w('60 seconds')} AS s FROM tf_data").collect())
+    run("tf_resample_1m_ohlc",
+        lambda: ctx.sql(
+            "SELECT date_bin(INTERVAL '60 seconds', ts) AS bucket, "
+            "       first_value(price ORDER BY ts) AS open, max(price) AS high, "
+            "       min(price) AS low, last_value(price ORDER BY ts) AS close "
+            "FROM tf_data GROUP BY bucket ORDER BY bucket").collect())
     return rows
 
 
@@ -532,6 +603,8 @@ def main():
             args.csv, args.csv_lookup, args.warmup, args.iters, ctx
         )
     all_rows += bench_datafusion_fill(args.fill_rows, args.warmup, args.iters, ctx)
+    if args.tf_rows > 0:
+        all_rows += bench_datafusion_tf(args.tf_rows, args.warmup, args.iters, ctx)
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

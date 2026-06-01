@@ -111,11 +111,17 @@ fi
 # fails (e.g. an OOM at 16M) instead of discarding the whole run. The trap also
 # guarantees the instance shuts down rather than idling after a failed suite —
 # the explicit shutdown is otherwise skipped under `set -e`.
+CSV=/ibex/benchmarking/results/scales.csv
+# Live progress goes to a separate "partial" key so it never looks like the
+# final result: run.sh waits on scales.csv (the completion signal), while a
+# multi-hour run can be inspected mid-flight via scales.partial.csv.
+PARTIAL_KEY="${IBEX_RESULT_KEY%scales.csv}scales.partial.csv"
+
 finish() {
     local code=$?
-    local csv=/ibex/benchmarking/results/scales.csv
-    if [[ -f "$csv" ]]; then
-        if aws s3 cp "$csv" \
+    [[ -n "${UPLOADER_PID:-}" ]] && kill "${UPLOADER_PID}" 2>/dev/null || true
+    if [[ -f "$CSV" ]]; then
+        if aws s3 cp "$CSV" \
             "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" \
             --region "${IBEX_REGION}"; then
             echo "Results uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (suite exit ${code})"
@@ -128,6 +134,16 @@ finish() {
     shutdown -h now
 }
 trap finish EXIT
+
+# Periodic partial-result uploader: sync the in-progress scales.csv every 60s so
+# completed sizes are visible long before the whole 1M-50M sweep finishes. Runs in
+# the background; the EXIT trap kills it and does the authoritative final upload.
+( while sleep 60; do
+      [[ -f "$CSV" ]] && aws s3 cp "$CSV" \
+          "s3://${IBEX_S3_BUCKET}/${PARTIAL_KEY}" \
+          --region "${IBEX_REGION}" --only-show-errors || true
+  done ) &
+UPLOADER_PID=$!
 
 IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
     bash run_scale_suite.sh \

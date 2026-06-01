@@ -2,7 +2,10 @@
 # run_scale_suite.sh — run benchmark suite across multiple dataset sizes.
 #
 # Default sizes:
-#   1M, 2M, 4M, 8M, 16M, 32M, 64M rows
+#   1M, 2M, 4M, 8M, 16M, 32M, 50M rows
+# Per-cell cutoff: any query whose single warm iteration exceeds
+# IBEX_CELL_CUTOFF_MS (default 120000 = 2 min) is dropped by its harness, so a
+# pathologically slow cell at the largest sizes can't dominate wall-clock.
 #
 # Usage:
 #   ./run_scale_suite.sh [--sizes 1M,2M,4M,...,64M] [--warmup N] [--iters N]
@@ -82,8 +85,10 @@ TO_README=0
 TO_README_ROWS=4000000
 TO_README_OUT=""
 
-# 1M .. 64M (powers of two)
-SIZES=(1000000 2000000 4000000 8000000 16000000 32000000 64000000)
+# Default scales: 1M .. 50M. Cells whose single warm iteration exceeds the
+# per-cell cutoff (IBEX_CELL_CUTOFF_MS, default 2 min) are dropped by each
+# harness, so the large sizes stay bounded.
+SIZES=(1000000 2000000 4000000 8000000 16000000 32000000 50000000)
 
 in_csv_list() {
     # in_csv_list <needle> <comma,separated,list> — exact-match membership test.

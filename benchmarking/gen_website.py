@@ -56,7 +56,12 @@ SKIP_FRAMEWORKS = {"ibex+parse", "ibex-compiled"}
 
 def load(paths: list[Path]):
     # cells[scale][query][framework] = avg_ms ; later paths override.
+    # mem[scale][query][framework]   = peak_rss_mb (absolute peak RSS, MiB).
+    # peak_rss_mb is optional: older CSVs predate the column, and a <=0 value
+    # means the harness couldn't measure it (non-Linux) — both are left absent.
     cells: dict[int, dict[str, dict[str, float]]] = defaultdict(
+        lambda: defaultdict(dict))
+    mem: dict[int, dict[str, dict[str, float]]] = defaultdict(
         lambda: defaultdict(dict))
     for p in paths:
         with p.open(newline="") as f:
@@ -70,7 +75,13 @@ def load(paths: list[Path]):
                 if fw in SKIP_FRAMEWORKS:
                     continue
                 cells[n][r["query"]][fw] = ms
-    return cells
+                try:
+                    mb = float(r.get("peak_rss_mb", ""))
+                except (TypeError, ValueError):
+                    mb = 0.0
+                if mb > 0:
+                    mem[n][r["query"]][fw] = mb
+    return cells, mem
 
 
 def commit_from_names(paths: list[Path]) -> str:
@@ -81,7 +92,7 @@ def commit_from_names(paths: list[Path]) -> str:
     return "unknown"
 
 
-def build_payload(cells, paths, commit=None):
+def build_payload(cells, mem, paths, commit=None):
     scales = sorted(cells)
     # queries present anywhere, ordered by curated category then QUERY_ORDER.
     present = {q for n in cells for q in cells[n]}
@@ -105,12 +116,16 @@ def build_payload(cells, paths, commit=None):
     data = {
         str(n): {q: cells[n][q] for q in cells[n]} for n in scales
     }
+    mem_data = {
+        str(n): {q: mem[n][q] for q in mem[n]} for n in scales if n in mem
+    }
     return {
         "scales": scales,
         "frameworks": frameworks,
         "queries": [{"id": q, "label": lbl, "category": cat}
                     for q, lbl, cat in ordered_queries],
         "data": data,
+        "mem": mem_data,
         "meta": {
             "generated": _dt.datetime.now(_dt.timezone.utc)
                 .strftime("%Y-%m-%d %H:%M UTC"),
@@ -196,9 +211,10 @@ HTML_TEMPLATE = """<!doctype html>
     <p class="section-label">Results</p>
     <h2>Per-query timings</h2>
     <p class="section-sub">
-      Pick a row count and a metric. Each row is colour-scaled green&rarr;red by
-      slowdown versus the fastest engine in that row, and the fastest cell is
-      outlined. Hover any cell for the exact time.
+      Pick a row count and a metric. Each row is colour-scaled green&rarr;red
+      against the best engine in that row &mdash; fastest for time, lightest for
+      memory &mdash; and the best cell is outlined. Hover any cell for the exact
+      time and peak memory.
     </p>
 
     <div class="bench-controls">
@@ -206,6 +222,8 @@ HTML_TEMPLATE = """<!doctype html>
       <div class="grp"><span class="lbl">Show</span>
         <button class="opt" id="m-ms">Time (ms)</button>
         <button class="opt" id="m-ratio">&times; fastest</button>
+        <button class="opt" id="m-mem">Memory (MB)</button>
+        <button class="opt" id="m-memratio">&times; least mem</button>
       </div>
     </div>
 
@@ -217,6 +235,13 @@ HTML_TEMPLATE = """<!doctype html>
       on core count, not per-core work. For a same-core comparison read Ibex
       against <code>polars-st</code> (Polars pinned to one thread); Ibex is faster
       on the large majority of queries there.
+    </p>
+    <p class="bench-note">
+      <strong>Memory.</strong> The memory metrics show absolute peak resident set
+      size (RSS) during a query's timed iterations &mdash; the footprint to run
+      the op, including the already-resident input table &mdash; measured per
+      process from the kernel's high-water mark. Multi-threaded engines trade
+      memory for the parallel speed-ups noted above.
     </p>
     <p class="bench-note">
       <strong>Caveats.</strong> Every engine now materialises its full result.
@@ -240,6 +265,11 @@ function fmt(ms) {
   if (ms < 1000) return ms.toFixed(1) + " ms";
   return (ms / 1000).toFixed(2) + " s";
 }
+function fmtMem(mb) {
+  if (mb < 10) return mb.toFixed(1) + " MB";
+  if (mb < 1024) return mb.toFixed(0) + " MB";
+  return (mb / 1024).toFixed(2) + " GB";
+}
 function heat(ratio) {
   // ratio >= 1; 1x = pale green, >=8x = pale red, log-scaled (light theme).
   const t = Math.min(1, Math.log(ratio) / Math.log(8));
@@ -249,7 +279,15 @@ function heat(ratio) {
 }
 
 function render() {
-  const P = PAYLOAD, rows = P.data[state.scale] || {}, fws = P.frameworks;
+  const P = PAYLOAD;
+  const useMem = state.metric === "mem" || state.metric === "memratio";
+  const useRatio = state.metric === "ratio" || state.metric === "memratio";
+  const src = (useMem ? (P.mem || {}) : P.data)[state.scale] || {};
+  const tsrc = P.data[state.scale] || {};                  // times for tooltips
+  const msrc = (P.mem || {})[state.scale] || {};           // memory for tooltips
+  const unit = useMem ? "MB" : "ms";
+  const best_lbl = useMem ? "lightest" : "fastest";
+  const fws = P.frameworks;
   let h = "<thead><tr><th class='qcol'>query</th>";
   for (const fw of fws)
     h += `<th class='${fw === "ibex" ? "ibex" : ""}'>${fw}</th>`;
@@ -257,7 +295,7 @@ function render() {
 
   let lastCat = null;
   for (const q of P.queries) {
-    const cell = rows[q.id] || {};
+    const cell = src[q.id] || {};
     const vals = fws.map(fw => cell[fw]).filter(v => v != null);
     if (!vals.length) continue;
     if (q.category !== lastCat) {
@@ -265,6 +303,7 @@ function render() {
          + `<td colspan='${fws.length}'></td></tr>`;
       lastCat = q.category;
     }
+    const tcell = tsrc[q.id] || {}, mcell = msrc[q.id] || {};
     const best = Math.min(...vals);
     h += `<tr><td class='qcol'>${q.label}</td>`;
     for (const fw of fws) {
@@ -272,10 +311,15 @@ function render() {
       const ic = fw === "ibex" ? " ibex-col" : "";
       if (v == null) { h += `<td class='na${ic}'>&ndash;</td>`; continue; }
       const ratio = v / best, isBest = v === best;
-      const txt = state.metric === "ratio"
-        ? (isBest ? "1.0\\u00d7" : ratio.toFixed(1) + "\\u00d7") : fmt(v);
+      const txt = useRatio
+        ? (isBest ? "1.0\\u00d7" : ratio.toFixed(1) + "\\u00d7")
+        : (useMem ? fmtMem(v) : fmt(v));
+      const tms = tcell[fw], tmb = mcell[fw];
+      const tip = `${fw}: ` + (tms != null ? `${tms.toFixed(3)} ms` : "\\u2013")
+                + (tmb != null ? `, ${tmb.toFixed(1)} MB peak` : "")
+                + ` (${ratio.toFixed(2)}\\u00d7 ${best_lbl})`;
       h += `<td class='cell${isBest ? " best" : ""}${ic}' style='background:${heat(ratio)}' `
-         + `title='${fw}: ${v.toFixed(3)} ms (${ratio.toFixed(2)}\\u00d7 fastest)'>${txt}</td>`;
+         + `title='${tip}'>${txt}</td>`;
     }
     h += "</tr>";
   }
@@ -284,8 +328,11 @@ function render() {
 
 function setMetric(m) {
   state.metric = m;
-  document.getElementById("m-ms").classList.toggle("on", m === "ms");
-  document.getElementById("m-ratio").classList.toggle("on", m === "ratio");
+  for (const [id, key] of [["m-ms","ms"],["m-ratio","ratio"],
+                           ["m-mem","mem"],["m-memratio","memratio"]]) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle("on", m === key);
+  }
   render();
 }
 function setScale(s) {
@@ -308,6 +355,15 @@ function setScale(s) {
     b.onclick = () => setScale(b.dataset.s));
   document.getElementById("m-ms").onclick = () => setMetric("ms");
   document.getElementById("m-ratio").onclick = () => setMetric("ratio");
+  // Memory views only make sense when at least one cell carries peak RSS.
+  const hasMem = Object.values(P.mem || {}).some(s => Object.keys(s).length);
+  if (hasMem) {
+    document.getElementById("m-mem").onclick = () => setMetric("mem");
+    document.getElementById("m-memratio").onclick = () => setMetric("memratio");
+  } else {
+    document.getElementById("m-mem").remove();
+    document.getElementById("m-memratio").remove();
+  }
   const commitBit = (P.meta.commit && P.meta.commit !== "unknown")
     ? `&middot; commit <code>${P.meta.commit}</code> ` : "";
   document.getElementById("meta").innerHTML =
@@ -336,11 +392,11 @@ def main(argv=None):
             print(f"error: {p} not found", file=sys.stderr)
             return 1
 
-    cells = load(args.csv)
+    cells, mem = load(args.csv)
     if not cells:
         print("error: no data loaded", file=sys.stderr)
         return 1
-    payload = build_payload(cells, args.csv, commit=args.commit)
+    payload = build_payload(cells, mem, args.csv, commit=args.commit)
 
     out_html = HTML_TEMPLATE.replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
     args.out.parent.mkdir(parents=True, exist_ok=True)

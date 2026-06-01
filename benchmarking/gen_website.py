@@ -2,13 +2,14 @@
 """Generate a self-contained benchmark website from result CSV(s).
 
 Usage:
-  python3 gen_website.py results/<old-full>.csv results/<latest>.csv
+  python3 gen_website.py results/<latest>.csv
   # -> writes docs/benchmarks.html (page on the Ibex docs site)
 
-Multiple CSVs are merged in order; later files override earlier ones per
-(scale, query, framework) cell. Feed an older full run first to backfill pinned
-cells (sqlite, the data.table frollapply rows) the trimmed default run skips,
-then the latest run to take the current ibex/competitor numbers.
+Each AWS run now produces a complete, self-contained CSV (see
+benchmarking/aws/bootstrap.sh), so the page is generated from that one run — no
+backfilling from older results. Multiple CSVs are still merged in order (later
+files override earlier per (scale, query, framework) cell) if you ever need to
+splice runs, but the default workflow passes a single latest CSV.
 
 The output is a single HTML file (data embedded as JSON, vanilla JS) — open it
 directly or publish it (e.g. GitHub Pages). Re-run after each AWS run to refresh.
@@ -140,8 +141,8 @@ HTML_TEMPLATE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ibex | Benchmarks vs Polars, DuckDB, ClickHouse, DataFusion, data.table, SQLite</title>
-  <meta name="description" content="Ibex benchmarked against Polars, DuckDB, ClickHouse, DataFusion, data.table and SQLite across columnar DataFrame queries from 1M to 16M rows." />
+  <title>Ibex | Benchmarks vs Polars, DuckDB, ClickHouse, DataFusion, data.table</title>
+  <meta name="description" content="Ibex benchmarked against Polars, DuckDB, ClickHouse, DataFusion and data.table across columnar DataFrame queries from 1M to 16M rows." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -199,10 +200,9 @@ HTML_TEMPLATE = """<!doctype html>
     <h1>How fast is Ibex?</h1>
     <p class="lead">
       Ibex against <strong>Polars</strong>, <strong>DuckDB</strong>,
-      <strong>ClickHouse</strong>, <strong>DataFusion</strong>,
-      <strong>data.table</strong> and <strong>SQLite</strong> on the same
-      columnar queries, from 1M to 16M rows. Times are the mean of timed
-      iterations; lower is better.
+      <strong>ClickHouse</strong>, <strong>DataFusion</strong> and
+      <strong>data.table</strong> on the same columnar queries, from 1M to 16M
+      rows. Times are the mean of timed iterations; lower is better.
     </p>
     <div class="stats" id="stats"></div>
   </section>
@@ -246,9 +246,9 @@ HTML_TEMPLATE = """<!doctype html>
     <p class="bench-note">
       <strong>Caveats.</strong> Every engine now materialises its full result.
       <code>tf rolling EWMA</code> is time-windowed in Ibex versus full-series in
-      Polars (both O(n), different maths). <code>SQLite</code> and the data.table
-      <code>rolling median/std</code> cells are pinned from an earlier run (they
-      are stable and dominate wall-clock).
+      Polars (both O(n), different maths). Each page is generated from a single
+      run; <code>SQLite</code> and the data.table <code>rolling median/std</code>
+      cells are omitted (they dominate wall-clock and add no competitive signal).
     </p>
     <p class="bench-note" id="meta"></p>
   </section>

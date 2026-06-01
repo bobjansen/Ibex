@@ -79,16 +79,25 @@ cmake -B /ibex/build-release -G Ninja \
 ninja -C /ibex/build-release
 
 # ── Run benchmark suite ───────────────────────────────────────────────────────
-# IBEX_BOTH_THREADING=1: keep the single-threaded (-st) variants for engines
-# that have them (polars-st, duckdb-st, datafusion-st, clickhouse-st), and
-# include pandas + dplyr. This produces a CSV with cells for every engine in
-# both parallelism modes (where the engine supports both) — the reviewer's
-# "apples-to-apples plus best-effort" pair in one launch.
+# Each launch produces a complete, self-contained CSV — the website is generated
+# from this one run, never backfilled from an older CSV. So we run the full
+# multi-threaded engine set plus pandas + dplyr, and duckdb at every size.
+#
+# Kept off on purpose ("stuff we're never doing", not data we reuse):
+#   • ibex-compiled — slow to compile per query and hidden on the page.
+#   • sqlite + data.table/dplyr frollapply (rolling median/std) — suite defaults
+#     leave these off; they dominate wall-clock and add no competitive signal.
+#   • single-thread duckdb/datafusion/clickhouse (-st) variants — unless
+#     IBEX_BOTH_THREADING=1, which adds them for a same-core comparison.
+# (polars-st always runs — it's the headline single-core baseline.)
+#
+# The hard *size* caps still apply within the engines that do run: reshape above
+# RESHAPE_MAX_ROWS and sqlite above SQLITE_MAX_ROWS are skipped (blank cells, not
+# stale numbers) — see run_scale_suite.sh.
 cd /ibex/benchmarking
-EXTRA_SKIPS=(--skip-ibex-compiled)
+SUITE_ARGS=(--skip-ibex-compiled --duckdb-all-sizes)
 if [[ "${IBEX_BOTH_THREADING:-0}" != "1" ]]; then
-    EXTRA_SKIPS+=(--skip-pandas --skip-dplyr
-                  --skip-duckdb-st --skip-datafusion-st --skip-clickhouse-st)
+    SUITE_ARGS+=(--skip-duckdb-st --skip-datafusion-st --skip-clickhouse-st)
 fi
 
 TF_ROWS_ARG=()
@@ -126,6 +135,6 @@ IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
         --warmup "${IBEX_WARMUP}" \
         --iters "${IBEX_ITERS}" \
         "${TF_ROWS_ARG[@]}" \
-        "${EXTRA_SKIPS[@]}"
+        "${SUITE_ARGS[@]}"
 
 # Result upload and self-termination are handled by the EXIT trap above.

@@ -93,7 +93,7 @@ peak_rss_mb <- function() {
 # Dynamic per-cell cutoff: a single (warmup) iteration over this many ms cuts the
 # cell — the rest of the iterations are skipped and a sentinel (avg_ms = -1) row
 # is dropped by the writer, so one pathologically slow op can't dominate the run.
-cell_cutoff_ms <- as.numeric(Sys.getenv("IBEX_CELL_CUTOFF_MS", "60000"))
+cell_cutoff_ms <- as.numeric(Sys.getenv("IBEX_CELL_CUTOFF_MS", "30000"))
 
 timer <- function(fn) {
     r <- NULL

@@ -268,11 +268,9 @@ HTML_TEMPLATE = """<!doctype html>
       cells are omitted (they dominate wall-clock and add no competitive signal).
     </p>
     <p class="bench-note">
-      <strong>See for yourself.</strong> Every query's exact code, in every
-      engine, is on the <a href="./methodology.html">Methodology &amp; code</a>
-      page &mdash; auto-extracted from the harness source, so it's provably what
-      ran. If a competitor query looks sub-optimal, that page also shows how to
-      reproduce the whole run and how to send a fix.
+      <strong>The code behind these numbers.</strong> Every query's exact code, in
+      every engine, is on the <a href="./methodology.html">Methodology &amp;
+      code</a> page. Directly extracted from the harness source.
     </p>
     <p class="bench-note" id="meta"></p>
   </section>
@@ -413,8 +411,8 @@ CODE_PAGE_TEMPLATE = """<!doctype html>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./styles.css" />
   <style>
-    .codewrap { display: grid; grid-template-columns: 220px 1fr; gap: 1.4rem;
-      align-items: start; }
+    .codewrap { display: grid; grid-template-columns: 220px minmax(0, 1fr);
+      gap: 1.4rem; align-items: start; }
     .qrail { border: 1px solid var(--line); border-radius: 12px; background: var(--paper);
       max-height: 70vh; overflow-y: auto; padding: 0.5rem; position: sticky; top: 1rem; }
     .qrail .cat { color: var(--accent); font-weight: 700; font-size: 0.72rem;
@@ -470,11 +468,9 @@ CODE_PAGE_TEMPLATE = """<!doctype html>
     <p class="eyebrow">Methodology &amp; code</p>
     <h1>How the benchmark works</h1>
     <p class="lead">
-      The fair criticism of any vendor benchmark is &ldquo;you hobbled my
-      engine.&rdquo; So this page does two things: it shows you how to run the
-      whole suite yourself, and it shows the <strong>exact code every engine
-      runs</strong> for every query &mdash; extracted straight from the harness
-      source, so what you read here is provably what executed.
+      Everything behind the benchmark numbers is here: how to run the full suite
+      yourself, and the <strong>exact code each engine runs</strong> for every
+      query. The code is extracted directly from the harness source.
     </p>
   </section>
 
@@ -501,11 +497,11 @@ python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
     </p>
     <pre>./benchmarking/aws/run.sh --on-demand   # provisions, runs 1M&ndash;50M, uploads, shuts down</pre>
     <div class="callout">
-      <strong>Think we mis-coded your engine?</strong> The query below it is right
-      there &mdash; open a PR against
+      <strong>Know a faster way to write one of these queries?</strong> Open a PR
+      against
       <a id="repo-link" href="#" target="_blank" rel="noopener">the benchmark harness</a>
-      with a faster formulation and we'll re-run and update the numbers. The point
-      is the comparison, not the scoreboard.
+      and the numbers get re-run and updated. Improvements to any engine's queries
+      are welcome, the aim is an accurate comparison.
     </div>
   </section>
 

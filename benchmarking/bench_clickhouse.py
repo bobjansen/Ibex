@@ -474,8 +474,12 @@ def bench_clickhouse_fill(n_rows, warmup, iters, sess):
     )
     run(
         "fill_backward",
-        "SELECT first_value(val) IGNORE NULLS OVER "
-        "(ORDER BY _rowid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS v FROM fill_data",
+        # Equivalent to first_value IGNORE NULLS over an unbounded *following* frame,
+        # but ClickHouse evaluates that O(n^2) (72s at 32M). Reversing the order
+        # (DESC) turns it into the same single-pass O(n) form fill_forward uses
+        # (~0.65s at 16M, 24x faster) — verified identical results.
+        "SELECT last_value(val) IGNORE NULLS OVER "
+        "(ORDER BY _rowid DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM fill_data",
     )
     return rows
 

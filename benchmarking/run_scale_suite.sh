@@ -4,9 +4,9 @@
 # Default sizes:
 #   1M, 2M, 4M, 8M, 16M, 32M, 50M rows
 # Per-cell cutoff: any query whose single warm iteration exceeds
-# IBEX_CELL_CUTOFF_MS (default 60000 = 1 min) is dropped by its harness, so a
+# IBEX_CELL_CUTOFF_MS (default 30000 = 30s) is dropped by its harness, so a
 # pathologically slow cell at the largest sizes can't dominate wall-clock.
-# (ibex's slowest cell is well under a second even at 50M, so 1 min never touches
+# (ibex's slowest cell is well under a second even at 50M, so 30s never touches
 # it — it only trims the slow competitor cells sooner.)
 #
 # Usage:
@@ -47,6 +47,18 @@ fi
 
 WARMUP=1
 ITERS=5
+# Above LARGE_ITERS_ROWS, drop to ITERS_LARGE measured iterations: the slow
+# large-size cells have negligible variance, so 5 reps just burns wall-clock
+# (warmup stays 1).
+LARGE_ITERS_ROWS="${LARGE_ITERS_ROWS:-16000000}"
+ITERS_LARGE="${ITERS_LARGE:-2}"
+# Proactively cap the pathological O(n*window) rolling cells (datafusion's
+# RANGE-window functions, dplyr's slide_index) above TF_ROLLING_MAX_ROWS: they
+# are ~1000x slower than the fast engines and add no competitive signal at
+# scale, so skip them outright (reusing the carry-forward IBEX_SKIP_CELLS path)
+# rather than pay even one warm iteration. The 30s cutoff catches anything else.
+TF_ROLLING_MAX_ROWS="${TF_ROLLING_MAX_ROWS:-16000000}"
+TF_ROLLING_SLOW_CELLS="datafusion|tf_rolling_count_1m,datafusion|tf_rolling_sum_1m,datafusion|tf_rolling_mean_5m,datafusion|tf_rolling_median_1m,datafusion|tf_rolling_std_1m,dplyr|tf_rolling_count_1m,dplyr|tf_rolling_sum_1m,dplyr|tf_rolling_mean_5m,dplyr|tf_resample_1m_ohlc"
 TF_ROWS_OVERRIDE=""
 # The reshape benchmarks build an in-memory wide table sized to the dataset —
 # the bench's biggest RAM consumer (sqlite's :memory: variant needs ~1.8GB per
@@ -88,7 +100,7 @@ TO_README_ROWS=4000000
 TO_README_OUT=""
 
 # Default scales: 1M .. 50M. Cells whose single warm iteration exceeds the
-# per-cell cutoff (IBEX_CELL_CUTOFF_MS, default 1 min) are dropped by each
+# per-cell cutoff (IBEX_CELL_CUTOFF_MS, default 30s) are dropped by each
 # harness, so the large sizes stay bounded.
 SIZES=(1000000 2000000 4000000 8000000 16000000 32000000 50000000)
 
@@ -372,6 +384,18 @@ for rows in "${SIZES[@]}"; do
     if [[ -n "$IBEX_SKIP_CELLS" ]]; then
         echo "  (carrying forward $(sort -u "$SKIP_FILE" | grep -c .) cut cell(s) from smaller sizes)"
     fi
+    # Proactive cap: add the pathological rolling cells to the skip set above the cap.
+    if (( rows > TF_ROLLING_MAX_ROWS )); then
+        IBEX_SKIP_CELLS="${IBEX_SKIP_CELLS:+$IBEX_SKIP_CELLS,}$TF_ROLLING_SLOW_CELLS"
+        export IBEX_SKIP_CELLS
+        echo "  (capping datafusion/dplyr rolling above ${TF_ROLLING_MAX_ROWS} rows)"
+    fi
+    # Fewer measured iterations at large sizes (negligible variance there).
+    EFF_ITERS="$ITERS"
+    if (( rows > LARGE_ITERS_ROWS && ITERS_LARGE < ITERS )); then
+        EFF_ITERS="$ITERS_LARGE"
+        echo "  (reduced iters=${EFF_ITERS} for ${rows} > LARGE_ITERS_ROWS=${LARGE_ITERS_ROWS})"
+    fi
 
     # Cap the memory-heavy reshape benchmark: pass 0 (= skip) above the budget.
     RESHAPE_ROWS="$rows"
@@ -395,7 +419,7 @@ for rows in "${SIZES[@]}"; do
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
-                --warmup "$WARMUP" --iters "$ITERS" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --out "$size_result_dir/ibex.tsv" || engine_failed "ibex"
         append_tagged_results "$rows" "$size_result_dir/ibex.tsv"
     fi
@@ -406,7 +430,7 @@ for rows in "${SIZES[@]}"; do
             bash "$SCRIPT_DIR/bench_ibex_compiled.sh" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" \
-                --warmup "$WARMUP" --iters "$ITERS" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --out "$size_result_dir/ibex_compiled.tsv" || engine_failed "ibex-compiled"
         append_tagged_results "$rows" "$size_result_dir/ibex_compiled.tsv"
     fi
@@ -422,7 +446,7 @@ for rows in "${SIZES[@]}"; do
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
-            --warmup "$WARMUP" --iters "$ITERS" \
+            --warmup "$WARMUP" --iters "$EFF_ITERS" \
             --out "$size_result_dir/python.tsv" \
             "${py_args[@]}" || engine_failed "python"
         append_tagged_results "$rows" "$size_result_dir/python.tsv"
@@ -436,7 +460,7 @@ for rows in "${SIZES[@]}"; do
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
-                --warmup "$WARMUP" --iters "$ITERS" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --skip-pandas \
                 --out "$polars_st_raw" || { engine_failed "polars-st"; : > "$polars_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1="polars-st"; print }' \
@@ -459,7 +483,7 @@ for rows in "${SIZES[@]}"; do
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
-            --warmup "$WARMUP" --iters "$ITERS" \
+            --warmup "$WARMUP" --iters "$EFF_ITERS" \
             --out "$size_result_dir/r.tsv" \
             "${r_args[@]}" || engine_failed "R"
         append_tagged_results "$rows" "$size_result_dir/r.tsv"
@@ -480,7 +504,7 @@ for rows in "${SIZES[@]}"; do
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
-            --warmup "$WARMUP" --iters "$ITERS" \
+            --warmup "$WARMUP" --iters "$EFF_ITERS" \
             --out "$size_result_dir/duckdb.tsv" || engine_failed "duckdb"
         append_tagged_results "$rows" "$size_result_dir/duckdb.tsv"
 
@@ -493,7 +517,7 @@ for rows in "${SIZES[@]}"; do
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
-                --warmup "$WARMUP" --iters "$ITERS" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --threads 1 \
                 --out "$duckdb_st_raw" || { engine_failed "duckdb-st"; : > "$duckdb_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "duckdb") $1="duckdb-st"; print }' \
@@ -509,7 +533,7 @@ for rows in "${SIZES[@]}"; do
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
-            --warmup "$WARMUP" --iters "$ITERS" \
+            --warmup "$WARMUP" --iters "$EFF_ITERS" \
             --out "$size_result_dir/datafusion.tsv" || engine_failed "datafusion"
         append_tagged_results "$rows" "$size_result_dir/datafusion.tsv"
 
@@ -522,7 +546,7 @@ for rows in "${SIZES[@]}"; do
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
-                --warmup "$WARMUP" --iters "$ITERS" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --threads 1 \
                 --out "$datafusion_st_raw" || { engine_failed "datafusion-st"; : > "$datafusion_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "datafusion") $1="datafusion-st"; print }' \
@@ -538,7 +562,7 @@ for rows in "${SIZES[@]}"; do
             --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
-            --warmup "$WARMUP" --iters "$ITERS" \
+            --warmup "$WARMUP" --iters "$EFF_ITERS" \
             --out "$size_result_dir/clickhouse.tsv" || engine_failed "clickhouse"
         append_tagged_results "$rows" "$size_result_dir/clickhouse.tsv"
 
@@ -551,7 +575,7 @@ for rows in "${SIZES[@]}"; do
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
-                --warmup "$WARMUP" --iters "$ITERS" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --threads 1 \
                 --out "$clickhouse_st_raw" || { engine_failed "clickhouse-st"; : > "$clickhouse_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "clickhouse") $1="clickhouse-st"; print }' \
@@ -570,7 +594,7 @@ for rows in "${SIZES[@]}"; do
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
-                --warmup "$WARMUP" --iters "$ITERS" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --out "$size_result_dir/sqlite.tsv" || engine_failed "sqlite"
             append_tagged_results "$rows" "$size_result_dir/sqlite.tsv"
         fi

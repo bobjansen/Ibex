@@ -49,7 +49,7 @@
     <div class="cta-row">
       <a class="button primary" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">View on GitHub</a>
       <a class="button" href="./cheatsheet.html">Open cheat sheet</a>
-      <a class="button" href="#get-started">Get started &darr;</a>
+      <a class="button" href="./getting-started.html">Get started</a>
     </div>
   </section>
 
@@ -1639,79 +1639,6 @@ Stream {
     <p style="margin-top: 0.8rem; color: var(--muted); font-size: 0.91rem;">
       Fully restart VS Code after copying. <code>.ibex</code> files are highlighted automatically.
     </p>
-  </section>
-
-  <!-- Get started -->
-  <section class="section" id="get-started">
-    <p class="section-label">Get started</p>
-    <h2>Build, run, explore</h2>
-    <p class="section-sub">Requirements: Clang 17+, CMake 3.26+, Ninja.</p>
-
-    <div class="steps">
-
-      <div>
-        <p class="step-label">1 &mdash; Clone and build</p>
-<pre><code><span class="cm"># Debug build (ASan + UBSan)</span>
-cmake -B build -G Ninja \
-  -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DIBEX_ENABLE_SANITIZERS=ON
-cmake --build build
-
-<span class="cm"># Release build</span>
-cmake -B build-release -G Ninja \
-  -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release</code></pre>
-      </div>
-
-      <div>
-        <p class="step-label">2 &mdash; Run the test suite</p>
-<pre><code>ctest --test-dir build --output-on-failure</code></pre>
-      </div>
-
-      <div>
-        <p class="step-label">3 &mdash; Start the REPL</p>
-<pre><code>./build-release/tools/ibex --plugin-path ./build-release/tools</code></pre>
-        <div class="card" style="margin-top: 0.7rem;">
-          <table class="repl-table">
-            <tbody>
-              <tr><td><code>:load examples/quant.ibex</code></td><td>Load and execute an .ibex script</td></tr>
-              <tr><td><code>:comments [on|off]</code></td><td>Toggle printing script comments during <code>:load</code></td></tr>
-              <tr><td><code>:help</code></td><td>Show REPL commands</td></tr>
-              <tr><td><code>:tables</code></td><td>List all bound table names</td></tr>
-              <tr><td><code>:functions</code></td><td>List user and extern function signatures</td></tr>
-              <tr><td><code>:imports</code></td><td>List imported libraries and extern origins</td></tr>
-              <tr><td><code>:schema &lt;table&gt;</code></td><td>Column names and types</td></tr>
-              <tr><td><code>:head &lt;table&gt; [n]</code></td><td>First n rows (default&nbsp;10)</td></tr>
-              <tr><td><code>:describe &lt;table&gt;</code></td><td>Schema + first n rows</td></tr>
-              <tr><td><code>:doc &lt;name&gt;</code></td><td>Docs or signatures for bindings and built-ins</td></tr>
-              <tr><td><code>:source &lt;fn&gt;</code></td><td>Source for a user-defined function</td></tr>
-            </tbody>
-          </table>
-          <p style="margin-top: 0.7rem;">
-            Readline builds complete REPL commands, <code>:load</code> paths,
-            bindings, functions, and columns inside <code>table[...]</code>
-            expressions. They also persist command history to
-            <code>~/.ibex_history</code>; use
-            <code>--history-file &lt;path&gt;</code> or <code>--no-history</code>
-            to override it.
-          </p>
-        </div>
-      </div>
-
-      <div>
-        <p class="step-label">4 &mdash; Compile a script to C++</p>
-<pre><code><span class="cm"># Transpile, compile, and run in one step</span>
-scripts/ibex-run.sh examples/quant.ibex
-
-<span class="cm"># Or transpile only</span>
-scripts/ibex-build.sh examples/quant.ibex -o quant</code></pre>
-      </div>
-
-    </div>
   </section>
 
   <!-- Footer -->

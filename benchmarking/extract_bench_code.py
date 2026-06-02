@@ -170,9 +170,63 @@ def _resolve_calls(code: str, helpers: dict[str, tuple[str, str]]) -> str:
     return pat.sub(sub, code)
 
 
-def _extract_python(rel: str, prefixes: tuple[str, ...]) -> dict[str, str]:
+_SQL_KEYWORDS = [  # break before these clause keywords; longest match first
+    "UNION ALL", "UNION", "GROUP BY", "ORDER BY", "ASOF LEFT JOIN", "ASOF JOIN",
+    "LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "CROSS JOIN", "JOIN",
+    "WHERE", "HAVING", "LIMIT", "FROM", "SELECT",
+]
+
+
+def _format_sql(sql: str) -> str:
+    """Put each major SQL clause on its own line so wide one-liners (e.g. the
+    UNION-ALL melt, or rolling-window OVER queries) read cleanly and don't force
+    the page wide. Breaks only at top-level (paren depth 0) keywords, so window
+    and sub-query clauses stay intact, and never inside string literals."""
+    s = " ".join(sql.split())
+    out: list[str] = []
+    i, n, depth = 0, len(s), 0
+    instr: str | None = None
+    while i < n:
+        c = s[i]
+        if instr is not None:
+            out.append(c)
+            if c == instr:
+                instr = None
+            i += 1
+            continue
+        if c in "'\"":
+            instr = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        if depth == 0 and (i == 0 or s[i - 1] == " "):
+            matched = None
+            for kw in _SQL_KEYWORDS:
+                end = i + len(kw)
+                if s.startswith(kw, i) and (end >= n or not (s[end].isalnum() or s[end] == "_")):
+                    matched = kw
+                    break
+            if matched is not None:
+                if out:  # not the leading keyword
+                    if out[-1] == " ":
+                        out.pop()
+                    out.append("\n")
+                out.append(matched)  # emit the whole keyword so inner words
+                i += len(matched)    # (LEFT/JOIN, BY) aren't re-broken
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out).strip()
+
+
+def _extract_python(rel: str, prefixes: tuple[str, ...], sql: bool = False) -> dict[str, str]:
     """Return {query_name: code} for run("name", payload) calls inside any
-    top-level function whose name starts with one of `prefixes`."""
+    top-level function whose name starts with one of `prefixes`. `sql=True` (for
+    engines whose payload is bare SQL text) pretty-prints the SQL across clauses."""
     src = _read(rel)
     tree = ast.parse(src)
     helpers = _window_helpers(tree)
@@ -184,6 +238,13 @@ def _extract_python(rel: str, prefixes: tuple[str, ...]) -> dict[str, str]:
             continue
         if not any(fn.name.startswith(p) for p in prefixes):
             continue
+        # Local `name = <expr>` bindings, so a run("q", some_sql_var) call shows
+        # the value rather than the variable name (e.g. clickhouse's melt_sql).
+        assigns: dict[str, ast.expr] = {}
+        for n_ in ast.walk(fn):
+            if (isinstance(n_, ast.Assign) and len(n_.targets) == 1
+                    and isinstance(n_.targets[0], ast.Name)):
+                assigns[n_.targets[0].id] = n_.value
         for node in ast.walk(fn):
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id == "run" and len(node.args) >= 2):
@@ -193,6 +254,8 @@ def _extract_python(rel: str, prefixes: tuple[str, ...]) -> dict[str, str]:
                 continue
             name = name_node.value
             payload = node.args[1]
+            if isinstance(payload, ast.Name) and payload.id in assigns:
+                payload = assigns[payload.id]
             # clickhouse passes SQL directly as a string / f-string -> render the
             # SQL text itself (resolving window helpers), not the f"..." wrapper.
             if isinstance(payload, ast.Constant) and isinstance(payload.value, str):
@@ -203,6 +266,8 @@ def _extract_python(rel: str, prefixes: tuple[str, ...]) -> dict[str, str]:
                 seg = ast.get_source_segment(src, payload) or ""
                 code = _lambda_body(seg) if isinstance(payload, ast.Lambda) else seg.strip()
             code = _resolve_calls(_normalize(code), helpers)
+            if sql:
+                code = _format_sql(code)
             # last writer wins is fine: a query is defined once per engine.
             out.setdefault(name, code)
     return out
@@ -328,7 +393,10 @@ def extract_all() -> dict[str, dict[str, str]]:
         put(q, "ibex", code)
         put(q, "ibex+parse", code)
     for eng, (rel, prefixes) in PY_ENGINES.items():
-        for q, code in _extract_python(rel, prefixes).items():
+        # clickhouse's run() payload is bare SQL text; pretty-print it across
+        # clauses. duckdb/datafusion wrap SQL in con.sql(...)/ctx.sql(...) Python,
+        # so leave those verbatim (the page scrolls long lines rather than mangle).
+        for q, code in _extract_python(rel, prefixes, sql=(eng == "clickhouse")).items():
             put(q, eng, code)
             if eng == "polars":
                 put(q, "polars-st", code)

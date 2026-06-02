@@ -570,10 +570,10 @@ rows, with peak-memory) live on the
 [benchmarks page](https://bobjansen.github.io/Ibex/benchmarks.html), and the
 exact code every engine runs for every query is on the
 [methodology page](https://bobjansen.github.io/Ibex/methodology.html) —
-auto-extracted from the harness source, so what's shown is provably what ran.
+extracted from the harness source, so what's shown matches what ran.
 
 Every competing engine is a stock install (PyPI / CRAN) and the whole suite is
-one script, so a skeptic can re-run it end-to-end:
+one script, so anyone can re-run it end-to-end:
 
 ```bash
 benchmarking/run_scale_suite.sh --warmup 1 --iters 3   # -> benchmarking/results/scales.csv
@@ -581,10 +581,10 @@ benchmarking/run_scale_suite.sh --warmup 1 --iters 3   # -> benchmarking/results
 ./benchmarking/aws/run.sh --on-demand
 ```
 
-If a competitor query looks sub-optimal, that's a bug we want to fix:
-**open a PR against [`benchmarking/`](benchmarking/) with a faster formulation
-and we'll re-run and update the numbers.** The goal is an honest comparison, not
-a scoreboard.
+Know a faster way to write one of these queries? **Open a PR against
+[`benchmarking/`](benchmarking/) and the numbers get re-run and updated.**
+Improvements to any engine's queries are welcome — the aim is an accurate
+comparison.
 
 ---
 

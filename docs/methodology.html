@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Benchmark methodology &amp; per-engine code</title>
+  <meta name="description" content="How the Ibex benchmark works: reproduce it in one command, and read the exact code every engine runs for every query — auto-extracted from the harness source." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <style>
+    .codewrap { display: grid; grid-template-columns: 220px 1fr; gap: 1.4rem;
+      align-items: start; }
+    .qrail { border: 1px solid var(--line); border-radius: 12px; background: var(--paper);
+      max-height: 70vh; overflow-y: auto; padding: 0.5rem; position: sticky; top: 1rem; }
+    .qrail .cat { color: var(--accent); font-weight: 700; font-size: 0.72rem;
+      text-transform: uppercase; letter-spacing: 0.04em; margin: 0.7rem 0.4rem 0.2rem; }
+    .qrail button { display: block; width: 100%; text-align: left; border: none;
+      background: none; font-family: inherit; font-size: 0.86rem; color: var(--ink);
+      padding: 0.32rem 0.5rem; border-radius: 7px; cursor: pointer; }
+    .qrail button:hover { background: rgba(10,127,121,0.08); }
+    .qrail button.on { background: var(--accent); color: #fff; font-weight: 600; }
+    .codepane h3 { margin: 0 0 0.2rem; font-size: 1.25rem; }
+    .codepane .qmeta { color: var(--muted); font-size: 0.85rem; margin: 0 0 1.1rem; }
+    .engblock { margin: 0 0 1.1rem; }
+    .engblock .ehead { display: flex; align-items: baseline; gap: 0.6rem;
+      margin: 0 0 0.3rem; }
+    .engblock .ename { font-weight: 700; font-size: 0.95rem; }
+    .engblock.ibex .ename { color: var(--accent); }
+    .engblock .esrc { font-size: 0.76rem; color: var(--muted); }
+    .engblock .esrc a { color: var(--muted); }
+    .engblock pre { margin: 0; padding: 0.8rem 1rem; border-radius: 10px;
+      border: 1px solid var(--line); background: #0f1b1a; color: #d7e6e3;
+      overflow-x: auto; font-family: "JetBrains Mono", monospace; font-size: 0.83rem;
+      line-height: 1.5; white-space: pre; }
+    .engblock.ibex pre { border-color: var(--accent);
+      box-shadow: inset 3px 0 0 var(--accent); }
+    .engblock .na { color: var(--muted); font-style: italic; font-size: 0.86rem;
+      padding: 0.3rem 0; }
+    .repro code, .repro pre { font-family: "JetBrains Mono", monospace; }
+    .repro pre { background: #0f1b1a; color: #d7e6e3; padding: 0.9rem 1.1rem;
+      border-radius: 10px; overflow-x: auto; font-size: 0.84rem; line-height: 1.6; }
+    .callout { border-left: 3px solid var(--accent); background: rgba(10,127,121,0.06);
+      padding: 0.8rem 1.1rem; border-radius: 0 10px 10px 0; margin: 1.2rem 0; }
+    @media (max-width: 760px) { .codewrap { grid-template-columns: 1fr; }
+      .qrail { position: static; max-height: none; } }
+  </style>
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Docs</a>
+      <a class="nav-link" href="./io.html">I/O</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="./comparison.html">Comparison</a>
+      <a class="nav-link active" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <p class="eyebrow">Methodology &amp; code</p>
+    <h1>How the benchmark works</h1>
+    <p class="lead">
+      The fair criticism of any vendor benchmark is &ldquo;you hobbled my
+      engine.&rdquo; So this page does two things: it shows you how to run the
+      whole suite yourself, and it shows the <strong>exact code every engine
+      runs</strong> for every query &mdash; extracted straight from the harness
+      source, so what you read here is provably what executed.
+    </p>
+  </section>
+
+  <section class="section repro">
+    <p class="section-label">Reproduce it</p>
+    <h2>Run it yourself</h2>
+    <p class="section-sub">
+      Every engine is a stock install &mdash; <code>polars</code>,
+      <code>duckdb</code>, <code>datafusion</code>, <code>chdb</code> (ClickHouse)
+      and <code>pandas</code> from PyPI; <code>data.table</code> and
+      <code>dplyr</code> from CRAN. The runner is one script; it generates the
+      synthetic data, runs all engines and writes a single CSV.
+    </p>
+    <pre># clone, build Ibex in release, then run the whole suite locally:
+benchmarking/run_scale_suite.sh --warmup 1 --iters 3
+# -&gt; benchmarking/results/scales.csv
+
+# render these pages from that CSV:
+python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
+    <p class="section-sub">
+      The published numbers come from a clean cloud box for isolation &mdash; an
+      AWS <strong>r7i.2xlarge</strong> (8 vCPU Sapphire Rapids, 64&nbsp;GB),
+      one command end-to-end:
+    </p>
+    <pre>./benchmarking/aws/run.sh --on-demand   # provisions, runs 1M&ndash;50M, uploads, shuts down</pre>
+    <div class="callout">
+      <strong>Think we mis-coded your engine?</strong> The query below it is right
+      there &mdash; open a PR against
+      <a id="repo-link" href="#" target="_blank" rel="noopener">the benchmark harness</a>
+      with a faster formulation and we'll re-run and update the numbers. The point
+      is the comparison, not the scoreboard.
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Transparency</p>
+    <h2>Exactly what each engine runs</h2>
+    <p class="section-sub">
+      Pick a query. Each engine's code is verbatim from the file linked beside it;
+      rolling-window frames are shown fully resolved (e.g. the
+      <code>RANGE BETWEEN INTERVAL</code> vs <code>ROWS</code> clause) so the
+      time-window comparison is auditable. <code>polars-st</code> runs identical
+      code to Polars with <code>POLARS_MAX_THREADS=1</code>; <code>ibex+parse</code>
+      is the same Ibex query timed with parsing included.
+    </p>
+    <div class="codewrap">
+      <div class="qrail" id="qrail"></div>
+      <div class="codepane" id="codepane"></div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+const CODE = {"queries":[{"id":"mean_by_symbol","label":"mean by symbol","category":"Group-by / aggregation"},{"id":"ohlc_by_symbol","label":"OHLC by symbol","category":"Group-by / aggregation"},{"id":"count_by_symbol_day","label":"count by symbol\u00d7day","category":"Group-by / aggregation"},{"id":"mean_by_symbol_day","label":"mean by symbol\u00d7day","category":"Group-by / aggregation"},{"id":"ohlc_by_symbol_day","label":"OHLC by symbol\u00d7day","category":"Group-by / aggregation"},{"id":"sum_by_user","label":"sum by user (100K str)","category":"Group-by / aggregation"},{"id":"update_price_x2","label":"update price\u00d72","category":"Column ops / update"},{"id":"cumsum_price","label":"cumsum price","category":"Column ops / update"},{"id":"cumprod_price","label":"cumprod price","category":"Column ops / update"},{"id":"rand_uniform","label":"rand uniform","category":"Column ops / update"},{"id":"rand_normal","label":"rand normal","category":"Column ops / update"},{"id":"rand_int","label":"rand int","category":"Column ops / update"},{"id":"rand_bernoulli","label":"rand bernoulli","category":"Column ops / update"},{"id":"filter_simple","label":"filter simple","category":"Filters"},{"id":"filter_and","label":"filter AND","category":"Filters"},{"id":"filter_arith","label":"filter arith","category":"Filters"},{"id":"filter_or","label":"filter OR","category":"Filters"},{"id":"filter_events","label":"filter events (str)","category":"Filters"},{"id":"null_left_join","label":"left join (50% null)","category":"Joins"},{"id":"null_semi_join","label":"semi join","category":"Joins"},{"id":"null_anti_join","label":"anti join","category":"Joins"},{"id":"null_cross_join_small","label":"cross join (2k\u00d764)","category":"Joins"},{"id":"melt_wide_to_long","label":"melt wide\u2192long","category":"Reshape"},{"id":"dcast_long_to_wide","label":"dcast long\u2192wide","category":"Reshape"},{"id":"fill_null","label":"fill null (const)","category":"Fill / null propagation"},{"id":"fill_forward","label":"fill forward (LOCF)","category":"Fill / null propagation"},{"id":"fill_backward","label":"fill backward (NOCB)","category":"Fill / null propagation"},{"id":"tf_lag1","label":"tf lag-1","category":"Time-series (TimeFrame)"},{"id":"tf_rolling_count_1m","label":"tf rolling count 1m","category":"Time-series (TimeFrame)"},{"id":"tf_rolling_sum_1m","label":"tf rolling sum 1m","category":"Time-series (TimeFrame)"},{"id":"tf_rolling_mean_5m","label":"tf rolling mean 5m","category":"Time-series (TimeFrame)"},{"id":"tf_rolling_median_1m","label":"tf rolling median 1m","category":"Time-series (TimeFrame)"},{"id":"tf_rolling_std_1m","label":"tf rolling std 1m","category":"Time-series (TimeFrame)"},{"id":"tf_rolling_ewma_1m","label":"tf rolling EWMA 1m","category":"Time-series (TimeFrame)"},{"id":"tf_resample_1m_ohlc","label":"tf resample 1m OHLC","category":"Time-series (TimeFrame)"},{"id":"tf_asof_join","label":"tf as-of join (10% sampled)","category":"Time-series (TimeFrame)"},{"id":"tf_asof_join_by_symbol","label":"tf as-of join by symbol (10% sampled)","category":"Time-series (TimeFrame)"}],"engines":[{"key":"ibex","label":"Ibex","lang":"ibex"},{"key":"polars","label":"Polars","lang":"python"},{"key":"duckdb","label":"DuckDB","lang":"sql"},{"key":"datafusion","label":"DataFusion","lang":"sql"},{"key":"clickhouse","label":"ClickHouse","lang":"sql"},{"key":"pandas","label":"pandas","lang":"python"},{"key":"data.table","label":"data.table","lang":"r"},{"key":"dplyr","label":"dplyr","lang":"r"}],"code":{"mean_by_symbol":{"ibex":"prices[select {avg_price = mean(price)}, by symbol]","polars":"df.group_by(\"symbol\").agg(pl.col(\"price\").mean().alias(\"avg_price\"))","duckdb":"con.sql(\n    \"SELECT symbol, AVG(price) AS avg_price FROM prices GROUP BY symbol\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT symbol, AVG(price) AS avg_price FROM prices GROUP BY symbol\"\n).collect()","clickhouse":"SELECT symbol, avg(price) AS avg_price FROM prices GROUP BY symbol","pandas":"df.groupby(\"symbol\", sort=False)\n.agg(avg_price=(\"price\", \"mean\"))\n.reset_index()","data.table":"dt[, .(avg_price = mean(price)), by = symbol]","dplyr":"tb |> group_by(symbol) |>\nsummarise(avg_price = mean(price), .groups = \"drop\")"},"ohlc_by_symbol":{"ibex":"prices[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by symbol]","polars":"df.group_by(\"symbol\").agg(\n    pl.col(\"price\").first().alias(\"open\"),\n    pl.col(\"price\").max().alias(\"high\"),\n    pl.col(\"price\").min().alias(\"low\"),\n    pl.col(\"price\").last().alias(\"last\"),\n)","duckdb":"con.sql(\n    \"SELECT symbol, \"\n    \"FIRST(price) AS open, MAX(price) AS high, \"\n    \"MIN(price) AS low, LAST(price) AS last \"\n    \"FROM prices GROUP BY symbol\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT symbol, \"\n    \"FIRST_VALUE(price) AS open, MAX(price) AS high, \"\n    \"MIN(price) AS low, LAST_VALUE(price) AS last \"\n    \"FROM prices GROUP BY symbol\"\n).collect()","clickhouse":"SELECT symbol, any(price) AS open, max(price) AS high, min(price) AS low, anyLast(price) AS last FROM prices GROUP BY symbol","pandas":"df.groupby(\"symbol\", sort=False)\n.agg(\n    open=(\"price\", \"first\"),\n    high=(\"price\", \"max\"),\n    low=(\"price\", \"min\"),\n    last=(\"price\", \"last\"),\n)\n.reset_index()","data.table":"dt[, .(open = data.table::first(price),\n    high = max(price),\n    low  = min(price),\n    last = data.table::last(price)),\nby = symbol]","dplyr":"tb |> group_by(symbol) |>\nsummarise(open = dplyr::first(price),\n          high = max(price),\n          low  = min(price),\n          last = dplyr::last(price),\n          .groups = \"drop\")"},"count_by_symbol_day":{"ibex":"prices_multi[select {n = count()}, by {symbol, day}]","polars":"dfm.group_by([\"symbol\", \"day\"]).agg(pl.len().alias(\"n\"))","duckdb":"con.sql(\n    \"SELECT symbol, day, COUNT(*) AS n \"\n    \"FROM prices_multi GROUP BY symbol, day\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT symbol, day, COUNT(*) AS n \"\n    \"FROM prices_multi GROUP BY symbol, day\"\n).collect()","clickhouse":"SELECT symbol, day, count() AS n FROM prices_multi GROUP BY symbol, day","pandas":"dfm.groupby([\"symbol\", \"day\"], sort=False)\n.size()\n.reset_index(name=\"n\")","data.table":"dtm[, .(n = .N), by = .(symbol, day)]","dplyr":"tbm |> group_by(symbol, day) |>\nsummarise(n = n(), .groups = \"drop\")"},"mean_by_symbol_day":{"ibex":"prices_multi[select {avg_price = mean(price)}, by {symbol, day}]","polars":"dfm.group_by([\"symbol\", \"day\"]).agg(\n    pl.col(\"price\").mean().alias(\"avg_price\")\n)","duckdb":"con.sql(\n    \"SELECT symbol, day, AVG(price) AS avg_price \"\n    \"FROM prices_multi GROUP BY symbol, day\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT symbol, day, AVG(price) AS avg_price \"\n    \"FROM prices_multi GROUP BY symbol, day\"\n).collect()","clickhouse":"SELECT symbol, day, avg(price) AS avg_price FROM prices_multi GROUP BY symbol, day","pandas":"dfm.groupby([\"symbol\", \"day\"], sort=False)\n.agg(avg_price=(\"price\", \"mean\"))\n.reset_index()","data.table":"dtm[, .(avg_price = mean(price)), by = .(symbol, day)]","dplyr":"tbm |> group_by(symbol, day) |>\nsummarise(avg_price = mean(price), .groups = \"drop\")"},"ohlc_by_symbol_day":{"ibex":"prices_multi[select {open = first(price), high = max(price), low = min(price), last = last(price)}, by {symbol, day}]","polars":"dfm.group_by([\"symbol\", \"day\"]).agg(\n    pl.col(\"price\").first().alias(\"open\"),\n    pl.col(\"price\").max().alias(\"high\"),\n    pl.col(\"price\").min().alias(\"low\"),\n    pl.col(\"price\").last().alias(\"last\"),\n)","duckdb":"con.sql(\n    \"SELECT symbol, day, \"\n    \"FIRST(price) AS open, MAX(price) AS high, \"\n    \"MIN(price) AS low, LAST(price) AS last \"\n    \"FROM prices_multi GROUP BY symbol, day\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT symbol, day, \"\n    \"FIRST_VALUE(price) AS open, MAX(price) AS high, \"\n    \"MIN(price) AS low, LAST_VALUE(price) AS last \"\n    \"FROM prices_multi GROUP BY symbol, day\"\n).collect()","clickhouse":"SELECT symbol, day, any(price) AS open, max(price) AS high, min(price) AS low, anyLast(price) AS last FROM prices_multi GROUP BY symbol, day","pandas":"dfm.groupby([\"symbol\", \"day\"], sort=False)\n.agg(\n    open=(\"price\", \"first\"),\n    high=(\"price\", \"max\"),\n    low=(\"price\", \"min\"),\n    last=(\"price\", \"last\"),\n)\n.reset_index()","data.table":"dtm[, .(open = data.table::first(price),\n    high = max(price),\n    low  = min(price),\n    last = data.table::last(price)),\nby = .(symbol, day)]","dplyr":"tbm |> group_by(symbol, day) |>\nsummarise(open = dplyr::first(price),\n          high = max(price),\n          low  = min(price),\n          last = dplyr::last(price),\n          .groups = \"drop\")"},"sum_by_user":{"ibex":"events[select {total = sum(amount)}, by user_id]","polars":"df.group_by(\"user_id\").agg(pl.col(\"amount\").sum().alias(\"total\"))","duckdb":"con.sql(\n    \"SELECT user_id, SUM(amount) AS total FROM events GROUP BY user_id\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT user_id, SUM(amount) AS total FROM events GROUP BY user_id\"\n).collect()","clickhouse":"SELECT user_id, sum(amount) AS total FROM events GROUP BY user_id","pandas":"df.groupby(\"user_id\", sort=False)\n.agg(total=(\"amount\", \"sum\"))\n.reset_index()","data.table":"dt_ev[, .(total = sum(amount)), by = user_id]","dplyr":"tb_ev |> group_by(user_id) |>\nsummarise(total = sum(amount), .groups = \"drop\")"},"update_price_x2":{"ibex":"prices[update {price_x2 = price * 2}]","polars":"df.with_columns((pl.col(\"price\") * 2).alias(\"price_x2\"))","duckdb":"con.sql(\n    \"SELECT *, price * 2 AS price_x2 FROM prices\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT *, price * 2 AS price_x2 FROM prices\"\n).collect()","clickhouse":"SELECT *, price * 2 AS price_x2 FROM prices","pandas":"df.assign(price_x2=df[\"price\"] * 2)","data.table":"{\n    copy_idx <<- copy_idx + 1\n    tmp <- copies[[copy_idx]]\n    tmp[, price_x2 := price * 2][]\n}","dplyr":"tb |> mutate(price_x2 = price * 2)"},"cumsum_price":{"ibex":"prices[update { cs = cumsum(price) }]","polars":"df.with_columns(pl.col(\"price\").cum_sum().alias(\"cs\"))","duckdb":"con.sql(\n    \"SELECT *, SUM(price) OVER (\"\n    \"ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\"\n    \") AS cs FROM prices\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT *, SUM(price) OVER (\"\n    \"ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\"\n    \") AS cs FROM prices\"\n).collect()","clickhouse":"SELECT *, sum(price) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs FROM prices","pandas":"df.assign(cs=df[\"price\"].cumsum())","data.table":"dt[, cs := cumsum(price)][]","dplyr":"tb |> mutate(cs = cumsum(price))"},"cumprod_price":{"ibex":"prices[update { cp = cumprod(price) }]","polars":"df.with_columns(pl.col(\"price\").cum_prod().alias(\"cp\"))","pandas":"df.assign(cp=df[\"price\"].cumprod())","data.table":"dt[, cp := cumprod(price)][]","dplyr":"tb |> mutate(cp = cumprod(price))"},"rand_uniform":{"ibex":"prices[update { r = rand_uniform(0.0, 1.0) }]","polars":"df.with_columns(pl.Series(\"r\", rng_gen.uniform(0.0, 1.0, len(df))))","duckdb":"con.sql(\n    \"SELECT *, random() AS r FROM prices\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT *, random() AS r FROM prices\"\n).collect()","clickhouse":"SELECT *, rand() / 4294967295.0 AS r FROM prices","pandas":"df.assign(r=rng_gen.uniform(0.0, 1.0, len(df)))","data.table":"dt[, r := runif(.N, 0.0, 1.0)][]","dplyr":"tb |> mutate(r = runif(n(), 0.0, 1.0))"},"rand_normal":{"ibex":"prices[update { n = rand_normal(0.0, 1.0) }]","polars":"df.with_columns(pl.Series(\"n\", rng_gen.standard_normal(len(df))))","pandas":"df.assign(n=rng_gen.standard_normal(len(df)))","data.table":"dt[, n := rnorm(.N, 0.0, 1.0)][]","dplyr":"tb |> mutate(n = rnorm(n(), 0.0, 1.0))"},"rand_int":{"ibex":"prices[update { r = rand_int(1, 100) }]","polars":"df.with_columns(pl.Series(\"r\", rng_gen.integers(1, 101, len(df))))","pandas":"df.assign(r=rng_gen.integers(1, 101, len(df)))","data.table":"dt[, r := sample.int(100L, .N, replace = TRUE)][]","dplyr":"tb |> mutate(r = sample.int(100L, n(), replace = TRUE))"},"rand_bernoulli":{"ibex":"prices[update { r = rand_bernoulli(0.3) }]","polars":"df.with_columns(pl.Series(\"r\", rng_gen.binomial(1, 0.3, len(df))))","pandas":"df.assign(r=rng_gen.binomial(1, 0.3, len(df)))","data.table":"dt[, r := rbinom(.N, 1L, 0.3)][]","dplyr":"tb |> mutate(r = rbinom(n(), 1L, 0.3))"},"filter_simple":{"ibex":"trades[filter price > 500.0]","polars":"dft.filter(pl.col(\"price\") > 500.0)","duckdb":"con.sql(\n    \"SELECT * FROM trades WHERE price > 500.0\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT * FROM trades WHERE price > 500.0\"\n).collect()","clickhouse":"SELECT * FROM trades WHERE price > 500.0","pandas":"dft[dft[\"price\"] > 500.0]","data.table":"dt_trades[price > 500.0]","dplyr":"tb_trades |> filter(price > 500.0)"},"filter_and":{"ibex":"trades[filter price > 500.0 && qty < 100]","polars":"dft.filter((pl.col(\"price\") > 500.0) & (pl.col(\"qty\") < 100))","duckdb":"con.sql(\n    \"SELECT * FROM trades WHERE price > 500.0 AND qty < 100\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT * FROM trades WHERE price > 500.0 AND qty < 100\"\n).collect()","clickhouse":"SELECT * FROM trades WHERE price > 500.0 AND qty < 100","pandas":"dft[(dft[\"price\"] > 500.0) & (dft[\"qty\"] < 100)]","data.table":"dt_trades[price > 500.0 & qty < 100]","dplyr":"tb_trades |> filter(price > 500.0, qty < 100)"},"filter_arith":{"ibex":"trades[filter price * qty > 50000.0]","polars":"dft.filter(pl.col(\"price\") * pl.col(\"qty\") > 50000.0)","duckdb":"con.sql(\n    \"SELECT * FROM trades WHERE price * qty > 50000.0\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT * FROM trades WHERE price * qty > 50000.0\"\n).collect()","clickhouse":"SELECT * FROM trades WHERE price * qty > 50000.0","pandas":"dft[dft[\"price\"] * dft[\"qty\"] > 50000.0]","data.table":"dt_trades[price * qty > 50000.0]","dplyr":"tb_trades |> filter(price * qty > 50000.0)"},"filter_or":{"ibex":"trades[filter price > 900.0 || qty < 10]","polars":"dft.filter((pl.col(\"price\") > 900.0) | (pl.col(\"qty\") < 10))","duckdb":"con.sql(\n    \"SELECT * FROM trades WHERE price > 900.0 OR qty < 10\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT * FROM trades WHERE price > 900.0 OR qty < 10\"\n).collect()","clickhouse":"SELECT * FROM trades WHERE price > 900.0 OR qty < 10","pandas":"dft[(dft[\"price\"] > 900.0) | (dft[\"qty\"] < 10)]","data.table":"dt_trades[price > 900.0 | qty < 10]","dplyr":"tb_trades |> filter(price > 900.0 | qty < 10)"},"filter_events":{"ibex":"events[filter amount > 500.0]","polars":"df.filter(pl.col(\"amount\") > 500.0)","duckdb":"con.sql(\n    \"SELECT * FROM events WHERE amount > 500.0\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT * FROM events WHERE amount > 500.0\"\n).collect()","clickhouse":"SELECT * FROM events WHERE amount > 500.0","pandas":"df[df[\"amount\"] > 500.0]","data.table":"dt_ev[amount > 500.0]","dplyr":"tb_ev |> filter(amount > 500.0)"},"null_left_join":{"ibex":"prices left join lookup on symbol","polars":"df.join(lookup, on=\"symbol\", how=\"left\")","duckdb":"con.sql(\n    \"SELECT * FROM prices LEFT JOIN lookup USING (symbol)\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT * FROM prices LEFT JOIN lookup USING (symbol)\"\n).collect()","clickhouse":"SELECT * FROM prices LEFT JOIN lookup USING (symbol)","pandas":"pd.merge(df, lookup, on=\"symbol\", how=\"left\")","data.table":"merge(dt, dt_lookup, by = \"symbol\", all.x = TRUE)","dplyr":"tb |> left_join(tb_lookup, by = \"symbol\")"},"null_semi_join":{"ibex":"prices semi join lookup on symbol","polars":"df.join(lookup_symbols, on=\"symbol\", how=\"semi\")","duckdb":"con.sql(\n    \"SELECT * FROM prices SEMI JOIN lookup_symbols USING (symbol)\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT p.* FROM prices p \"\n    \"WHERE EXISTS (SELECT 1 FROM lookup_symbols l WHERE l.symbol = p.symbol)\"\n).collect()","clickhouse":"SELECT * FROM prices LEFT SEMI JOIN lookup_symbols USING (symbol)","pandas":"pd.merge(df, lookup_symbols, on=\"symbol\", how=\"inner\")","data.table":"dt[symbol %chin% lookup_symbols]","dplyr":"tb |> semi_join(tb_lookup_symbols, by = \"symbol\")"},"null_anti_join":{"ibex":"prices anti join lookup on symbol","polars":"df.join(lookup_symbols, on=\"symbol\", how=\"anti\")","duckdb":"con.sql(\n    \"SELECT * FROM prices ANTI JOIN lookup_symbols USING (symbol)\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT p.* FROM prices p \"\n    \"WHERE NOT EXISTS (SELECT 1 FROM lookup_symbols l WHERE l.symbol = p.symbol)\"\n).collect()","clickhouse":"SELECT * FROM prices LEFT ANTI JOIN lookup_symbols USING (symbol)","pandas":"df[~df[\"symbol\"].isin(lookup_symbols[\"symbol\"])]","data.table":"dt[!symbol %chin% lookup_symbols]","dplyr":"tb |> anti_join(tb_lookup_symbols, by = \"symbol\")"},"null_cross_join_small":{"ibex":"prices_small cross join lookup_small","polars":"prices_small.join(lookup_small, how=\"cross\")","duckdb":"con.sql(\n    \"SELECT * FROM prices_small CROSS JOIN lookup_small\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT * FROM prices_small CROSS JOIN lookup_small\"\n).collect()","clickhouse":"SELECT * FROM prices_small CROSS JOIN lookup_small","pandas":"pd.merge(prices_small, lookup_small, how=\"cross\")","data.table":"merge(left_small, right_small, by = \"join_key\", allow.cartesian = TRUE)\n[, join_key := NULL][]","dplyr":"tibble::as_tibble(merge(tb_left_small, tb_right_small, by = NULL))"},"melt_wide_to_long":{"ibex":"wide[melt {symbol, day}]","polars":"wide.unpivot(\n    on=[\"open\", \"high\", \"low\", \"close\"], index=[\"symbol\", \"day\"]\n)","duckdb":"con.sql(\n    \"UNPIVOT wide ON open, high, low, close \"\n    \"INTO NAME variable VALUE value\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT symbol, day, 'open' AS variable, open AS value FROM wide \"\n    \"UNION ALL \"\n    \"SELECT symbol, day, 'high' AS variable, high AS value FROM wide \"\n    \"UNION ALL \"\n    \"SELECT symbol, day, 'low' AS variable, low AS value FROM wide \"\n    \"UNION ALL \"\n    \"SELECT symbol, day, 'close' AS variable, close AS value FROM wide\"\n).collect()","clickhouse":"melt_sql","pandas":"wide.melt(\n    id_vars=[\"symbol\", \"day\"], value_vars=[\"open\", \"high\", \"low\", \"close\"]\n)","data.table":"melt(wide_dt, id.vars = c(\"symbol\", \"day\"),\nmeasure.vars = c(\"open\", \"high\", \"low\", \"close\"))","dplyr":"wide_tb |> pivot_longer(cols = c(open, high, low, close),\nnames_to = \"variable\",\nvalues_to = \"value\")"},"dcast_long_to_wide":{"ibex":"long[dcast variable, select value, by {symbol, day}]","polars":"long.pivot(on=\"variable\", index=[\"symbol\", \"day\"], values=\"value\")","duckdb":"con.sql(\n    \"PIVOT long_tbl ON variable USING FIRST(value) \"\n    \"GROUP BY symbol, day\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT symbol, day, \"\n    \"MAX(CASE WHEN variable = 'open' THEN value END) AS open, \"\n    \"MAX(CASE WHEN variable = 'high' THEN value END) AS high, \"\n    \"MAX(CASE WHEN variable = 'low' THEN value END) AS low, \"\n    \"MAX(CASE WHEN variable = 'close' THEN value END) AS close \"\n    \"FROM long_tbl GROUP BY symbol, day\"\n).collect()","clickhouse":"SELECT symbol, day, anyIf(value, variable = 'open') AS open, anyIf(value, variable = 'high') AS high, anyIf(value, variable = 'low') AS low, anyIf(value, variable = 'close') AS close FROM long_tbl GROUP BY symbol, day","pandas":"long.pivot_table(\n    index=[\"symbol\", \"day\"], columns=\"variable\", values=\"value\", aggfunc=\"first\"\n).reset_index()","data.table":"dcast(long_dt, symbol + day ~ variable, value.var = \"value\")","dplyr":"long_tb |> pivot_wider(names_from = variable,\nvalues_from = value)"},"fill_null":{"ibex":"fill_data[update { v2 = fill_null(val, 0.0) }]","polars":"df_fill.with_columns(pl.col(\"val\").fill_null(0.0).alias(\"v2\"))","duckdb":"con.sql(\n    \"SELECT COALESCE(val, 0.0) AS v2 FROM fill_data\"\n).fetchnumpy()","datafusion":"ctx.sql(\n    \"SELECT COALESCE(val, 0.0) AS v2 FROM fill_data\"\n).collect()","clickhouse":"SELECT coalesce(val, 0.0) AS v2 FROM fill_data","pandas":"df_fill.assign(v2=df_fill[\"val\"].fillna(0.0))","data.table":"dt_fill[, v2 := nafill(val, fill = 0.0)][]","dplyr":"tb_fill |> mutate(v2 = tidyr::replace_na(val, 0.0))"},"fill_forward":{"ibex":"fill_data[update { v2 = fill_forward(val) }]","polars":"df_fill.with_columns(pl.col(\"val\").forward_fill().alias(\"v2\"))","duckdb":"con.sql(\n    \"SELECT LAST_VALUE(val IGNORE NULLS) OVER (\"\n    \"ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\"\n    \") AS v2 FROM fill_data\"\n).fetchnumpy()","clickhouse":"SELECT last_value(val) IGNORE NULLS OVER (ORDER BY _rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM fill_data","pandas":"df_fill.assign(v2=df_fill[\"val\"].ffill())","data.table":"dt_fill[, v2 := nafill(val, type = \"locf\")][]","dplyr":"tb_fill |> tidyr::fill(val, .direction = \"down\") |>\nrename(v2 = val)"},"fill_backward":{"ibex":"fill_data[update { v2 = fill_backward(val) }]","polars":"df_fill.with_columns(pl.col(\"val\").backward_fill().alias(\"v2\"))","duckdb":"con.sql(\n    \"SELECT FIRST_VALUE(val IGNORE NULLS) OVER (\"\n    \"ORDER BY rowid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING\"\n    \") AS v2 FROM fill_data\"\n).fetchnumpy()","clickhouse":"SELECT last_value(val) IGNORE NULLS OVER (ORDER BY _rowid DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS v FROM fill_data","pandas":"df_fill.assign(v2=df_fill[\"val\"].bfill())","data.table":"dt_fill[, v2 := nafill(val, type = \"nocb\")][]","dplyr":"tb_fill |> tidyr::fill(val, .direction = \"up\") |>\nrename(v2 = val)"},"tf_lag1":{"ibex":"as_timeframe(tf_data, \"ts\")[update { prev = lag(price, 1) }]","polars":"df.select(pl.col(\"price\").shift(1).alias(\"prev\")).rechunk()","duckdb":"con.sql(\"SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data\").fetchnumpy()","datafusion":"ctx.sql(\n\"SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data\").collect()","clickhouse":"SELECT lagInFrame(price, 1) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prev FROM tf_data","pandas":"df[\"price\"].shift(1)","data.table":"dt_tf[, prev := shift(price, 1L)][]","dplyr":"tb_tf |> mutate(prev = lag(price, 1L))"},"tf_rolling_count_1m":{"ibex":"as_timeframe(tf_data, \"ts\")[window 1m, update { c = rolling_count() }]","polars":"df.rolling(index_column=\"ts\", period=\"60s\").agg(c=pl.len())","duckdb":"con.sql(f\"SELECT count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 60 SECONDS PRECEDING AND CURRENT ROW) AS c FROM tf_data\").fetchnumpy()","datafusion":"ctx.sql(f\"SELECT count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '60 seconds' PRECEDING AND CURRENT ROW) AS c FROM tf_data\").collect()","clickhouse":"SELECT count(*) OVER (ORDER BY ts ROWS BETWEEN 60 PRECEDING AND CURRENT ROW) AS c FROM tf_data","pandas":"df[\"price\"].rolling(\"60s\").count()","data.table":"dt_tf[, c := frollsum(rep(1.0, .N), 60L)][]","dplyr":"tb_tf |> mutate(c = slide_index_dbl(price, ts,\n~ length(.x),\n.before = lubridate::seconds(60)))"},"tf_rolling_sum_1m":{"ibex":"as_timeframe(tf_data, \"ts\")[window 1m, update { s = rolling_sum(price) }]","polars":"df.rolling(index_column=\"ts\", period=\"60s\").agg(s=pl.col(\"price\").sum())","duckdb":"con.sql(f\"SELECT sum(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 60 SECONDS PRECEDING AND CURRENT ROW) AS s FROM tf_data\").fetchnumpy()","datafusion":"ctx.sql(f\"SELECT sum(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '60 seconds' PRECEDING AND CURRENT ROW) AS s FROM tf_data\").collect()","clickhouse":"SELECT sum(price) OVER (ORDER BY ts ROWS BETWEEN 60 PRECEDING AND CURRENT ROW) AS s FROM tf_data","pandas":"df[\"price\"].rolling(\"60s\").sum()","data.table":"dt_tf[, s := frollsum(price, 60L)][]","dplyr":"tb_tf |> mutate(s = slide_index_sum(price, ts,\nbefore = lubridate::seconds(60)))"},"tf_rolling_mean_5m":{"ibex":"as_timeframe(tf_data, \"ts\")[window 5m, update { m = rolling_mean(price) }]","polars":"df.rolling(index_column=\"ts\", period=\"5m\").agg(m=pl.col(\"price\").mean())","duckdb":"con.sql(f\"SELECT avg(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 300 SECONDS PRECEDING AND CURRENT ROW) AS m FROM tf_data\").fetchnumpy()","datafusion":"ctx.sql(f\"SELECT avg(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '300 seconds' PRECEDING AND CURRENT ROW) AS m FROM tf_data\").collect()","clickhouse":"SELECT avg(price) OVER (ORDER BY ts ROWS BETWEEN 300 PRECEDING AND CURRENT ROW) AS m FROM tf_data","pandas":"df[\"price\"].rolling(\"300s\").mean()","data.table":"dt_tf[, m := frollmean(price, 300L)][]","dplyr":"tb_tf |> mutate(m = slide_index_mean(price, ts,\nbefore = lubridate::seconds(300)))"},"tf_rolling_median_1m":{"ibex":"as_timeframe(tf_data, \"ts\")[window 1m, update { med = rolling_median(price) }]","polars":"df.rolling(index_column=\"ts\", period=\"60s\").agg(med=pl.col(\"price\").median())","duckdb":"con.sql(f\"SELECT median(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 60 SECONDS PRECEDING AND CURRENT ROW) AS med FROM tf_data\").fetchnumpy()","datafusion":"ctx.sql(f\"SELECT median(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '60 seconds' PRECEDING AND CURRENT ROW) AS med FROM tf_data\").collect()","clickhouse":"SELECT median(price) OVER (ORDER BY ts ROWS BETWEEN 60 PRECEDING AND CURRENT ROW) AS med FROM tf_data","pandas":"df[\"price\"].rolling(\"60s\").median()"},"tf_rolling_std_1m":{"ibex":"as_timeframe(tf_data, \"ts\")[window 1m, update { s = rolling_std(price) }]","polars":"df.rolling(index_column=\"ts\", period=\"60s\").agg(s=pl.col(\"price\").std())","duckdb":"con.sql(f\"SELECT stddev_samp(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 60 SECONDS PRECEDING AND CURRENT ROW) AS s FROM tf_data\").fetchnumpy()","datafusion":"ctx.sql(f\"SELECT stddev_samp(price) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '60 seconds' PRECEDING AND CURRENT ROW) AS s FROM tf_data\").collect()","clickhouse":"SELECT stddevSamp(price) OVER (ORDER BY ts ROWS BETWEEN 60 PRECEDING AND CURRENT ROW) AS s FROM tf_data","pandas":"df[\"price\"].rolling(\"60s\").std()"},"tf_rolling_ewma_1m":{"ibex":"as_timeframe(tf_data, \"ts\")[window 1m, update { e = rolling_ewma(price, 0.1) }]","polars":"df.with_columns(pl.col(\"price\").ewm_mean(alpha=0.1, adjust=False).alias(\"e\"))","pandas":"df[\"price\"].ewm(alpha=0.1, adjust=False).mean()"},"tf_resample_1m_ohlc":{"ibex":"as_timeframe(tf_data, \"ts\")[resample 1m, select { open = first(price), high = max(price), low = min(price), close = last(price) }]","polars":"df.group_by_dynamic(\"ts\", every=\"60s\").agg(\nopen=pl.col(\"price\").first(), high=pl.col(\"price\").max(),\nlow=pl.col(\"price\").min(),  close=pl.col(\"price\").last())","duckdb":"con.sql(\n    \"SELECT time_bucket(INTERVAL 60 SECONDS, ts) AS bucket, \"\n    \"       first(price ORDER BY ts) AS open, \"\n    \"       max(price) AS high, min(price) AS low, \"\n    \"       last(price ORDER BY ts) AS close \"\n    \"FROM tf_data GROUP BY bucket ORDER BY bucket\"\n).fetchnumpy()","datafusion":"ctx.sql(\n\"SELECT date_bin(INTERVAL '60 seconds', ts) AS bucket, \"\n\"       first_value(price ORDER BY ts) AS open, max(price) AS high, \"\n\"       min(price) AS low, last_value(price ORDER BY ts) AS close \"\n\"FROM tf_data GROUP BY bucket ORDER BY bucket\").collect()","clickhouse":"SELECT toStartOfInterval(ts, INTERVAL 60 SECOND) AS bucket,        argMin(price, ts) AS open, max(price) AS high,        min(price) AS low, argMax(price, ts) AS close FROM tf_data GROUP BY bucket ORDER BY bucket","pandas":"df[\"price\"].resample(\"60s\").agg([\"first\", \"max\", \"min\", \"last\"])","data.table":"dt_tf[, .(open = data.table::first(price),\n    high = max(price),\n    low  = min(price),\n    close = data.table::last(price)),\nby = .(bucket = lubridate::floor_date(ts, \"minute\"))]","dplyr":"tb_tf |>\nmutate(bucket = lubridate::floor_date(ts, \"minute\")) |>\ngroup_by(bucket) |>\nsummarise(open  = dplyr::first(price),\n          high  = max(price),\n          low   = min(price),\n          close = dplyr::last(price),\n          .groups = \"drop\")"},"tf_asof_join":{"ibex":"as_timeframe(trades_tf, \"ts\") asof join as_timeframe(quotes_tf, \"ts\") on ts","polars":"trades.join_asof(quotes, on=\"ts\", strategy=\"backward\")","duckdb":"con.sql(\n    \"SELECT t.ts, t.qty, q.bid \"\n    \"FROM trades t ASOF LEFT JOIN quotes q ON t.ts >= q.ts\"\n).fetchnumpy()","pandas":"pd.merge_asof(trades, quotes, on=\"ts\", direction=\"backward\")","data.table":"quotes_dt[trades_dt, .(ts, qty, bid),\non = \"ts\", roll = TRUE]"},"tf_asof_join_by_symbol":{"ibex":"as_timeframe(trades_tf, \"ts\") asof join as_timeframe(quotes_tf, \"ts\") on {ts, symbol}","polars":"trades.join_asof(quotes, on=\"ts\", by=\"symbol\", strategy=\"backward\")","duckdb":"con.sql(\n    \"SELECT t.ts, t.qty, q.bid \"\n    \"FROM trades t ASOF LEFT JOIN quotes q \"\n    \"ON t.symbol = q.symbol AND t.ts >= q.ts\"\n).fetchnumpy()","clickhouse":"SELECT t.ts AS ts, t.qty AS qty, q.bid AS bid FROM trades AS t ASOF LEFT JOIN quotes AS q ON t.symbol = q.symbol AND t.ts >= q.ts","pandas":"pd.merge_asof(trades, quotes, on=\"ts\", by=\"symbol\", direction=\"backward\")","data.table":"quotes_dt[trades_dt, .(ts, qty, bid),\non = .(symbol, ts), roll = TRUE]"}},"sources":{"ibex":"tools/ibex_bench.cpp","polars":"benchmarking/bench_python.py","duckdb":"benchmarking/bench_duckdb.py","datafusion":"benchmarking/bench_datafusion.py","clickhouse":"benchmarking/bench_clickhouse.py","pandas":"benchmarking/bench_python.py","data.table":"benchmarking/bench_r.R","dplyr":"benchmarking/bench_r.R"},"github":"https://github.com/bobjansen/Ibex/blob/main"};
+let current = null;
+
+function srcLink(eng) {
+  const path = CODE.sources[eng] || "";
+  return path ? `${CODE.github}/${path}` : null;
+}
+
+function selectQuery(q) {
+  current = q;
+  document.querySelectorAll("#qrail button").forEach(b =>
+    b.classList.toggle("on", b.dataset.q === q));
+  const meta = CODE.queries.find(x => x.id === q);
+  const code = CODE.code[q] || {};
+  const pane = document.getElementById("codepane");
+  pane.innerHTML = "";
+  const h3 = document.createElement("h3");
+  h3.textContent = meta ? meta.label : q;
+  const qm = document.createElement("p");
+  qm.className = "qmeta";
+  qm.textContent = `${meta ? meta.category : ""} \u00b7 query id: ${q}`;
+  pane.append(h3, qm);
+  for (const eng of CODE.engines) {
+    const block = document.createElement("div");
+    block.className = "engblock" + (eng.key === "ibex" ? " ibex" : "");
+    const head = document.createElement("div");
+    head.className = "ehead";
+    const name = document.createElement("span");
+    name.className = "ename";
+    name.textContent = eng.label;
+    head.appendChild(name);
+    const link = srcLink(eng.key);
+    if (link) {
+      const s = document.createElement("span");
+      s.className = "esrc";
+      s.innerHTML = `<a href="${link}" target="_blank" rel="noopener">source &#8599;</a>`;
+      head.appendChild(s);
+    }
+    block.appendChild(head);
+    if (code[eng.key] != null) {
+      const pre = document.createElement("pre");
+      pre.textContent = code[eng.key];
+      block.appendChild(pre);
+    } else {
+      const na = document.createElement("div");
+      na.className = "na";
+      na.textContent = "not benchmarked for this engine (capability gap or excluded at scale)";
+      block.appendChild(na);
+    }
+    pane.appendChild(block);
+  }
+}
+
+(function init() {
+  const repo = document.getElementById("repo-link");
+  if (repo) repo.href = CODE.github + "/benchmarking";
+  const rail = document.getElementById("qrail");
+  let lastCat = null;
+  for (const q of CODE.queries) {
+    if (q.category !== lastCat) {
+      const c = document.createElement("div");
+      c.className = "cat";
+      c.textContent = q.category;
+      rail.appendChild(c);
+      lastCat = q.category;
+    }
+    const b = document.createElement("button");
+    b.dataset.q = q.id;
+    b.textContent = q.label;
+    b.onclick = () => selectQuery(q.id);
+    rail.appendChild(b);
+  }
+  if (CODE.queries.length) selectQuery(CODE.queries[0].id);
+})();
+</script>
+</body>
+</html>

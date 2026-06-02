@@ -564,6 +564,30 @@ This keeps parallel queries lock-free and reproducible when reseeded.
 
 ## Benchmark
 
+**Reproducible and auditable by design.** The interactive results (Ibex vs
+Polars, DuckDB, ClickHouse, DataFusion, pandas, data.table and dplyr, 1M–50M
+rows, with peak-memory) live on the
+[benchmarks page](https://bobjansen.github.io/Ibex/benchmarks.html), and the
+exact code every engine runs for every query is on the
+[methodology page](https://bobjansen.github.io/Ibex/methodology.html) —
+auto-extracted from the harness source, so what's shown is provably what ran.
+
+Every competing engine is a stock install (PyPI / CRAN) and the whole suite is
+one script, so a skeptic can re-run it end-to-end:
+
+```bash
+benchmarking/run_scale_suite.sh --warmup 1 --iters 3   # -> benchmarking/results/scales.csv
+# the published numbers come from a clean AWS r7i.2xlarge box:
+./benchmarking/aws/run.sh --on-demand
+```
+
+If a competitor query looks sub-optimal, that's a bug we want to fix:
+**open a PR against [`benchmarking/`](benchmarking/) with a faster formulation
+and we'll re-run and update the numbers.** The goal is an honest comparison, not
+a scoreboard.
+
+---
+
 4 M rows, release build (`-O2`), 15 iterations, 2 warmup, WSL2 / clang++.
 
 | query                        |      ibex |   polars |    pandas | data.table |     dplyr |

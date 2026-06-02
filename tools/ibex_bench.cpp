@@ -1274,8 +1274,9 @@ int main(int argc, char** argv) {
            "Row count for in-memory TimeFrame benchmarks (lag, rolling_*). 0 = skip (default).")
         ->check(CLI::NonNegativeNumber);
     app.add_option("--reshape-rows", reshape_rows,
-                   "Row count for synthetic reshape benchmark table (default: 100000)")
-        ->check(CLI::PositiveNumber);
+                   "Row count for synthetic reshape benchmark table (default: 100000); "
+                   "0 skips the reshape benchmarks")
+        ->check(CLI::NonNegativeNumber);
     app.add_option("--merge-validity-rows", merge_validity_rows,
                    "Row count for merge_validity micro benchmark (default: 4000000)")
         ->check(CLI::PositiveNumber);
@@ -1687,8 +1688,10 @@ int main(int argc, char** argv) {
 
     // Reshape benchmarks: melt (wide→long) and dcast (long→wide).
     // Uses a synthetic wide OHLC table with configurable row count to exercise
-    // reshape paths at scale.
-    if (status == 0 && run_suite("reshape")) {
+    // reshape paths at scale. reshape_rows == 0 means "skip" — the scale suite
+    // passes 0 above its memory cap so reshape stays blank for *every* engine at
+    // the largest sizes (the in-memory wide table OOMs the box), ibex included.
+    if (status == 0 && run_suite("reshape") && reshape_rows > 0) {
         constexpr std::size_t reshape_n_days = 400;
         const std::size_t reshape_n_symbols = (reshape_rows + reshape_n_days - 1) / reshape_n_days;
 

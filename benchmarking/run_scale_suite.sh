@@ -394,7 +394,7 @@ for rows in "${SIZES[@]}"; do
             bash "$SCRIPT_DIR/bench_ibex.sh" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
-                --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --out "$size_result_dir/ibex.tsv" || engine_failed "ibex"
         append_tagged_results "$rows" "$size_result_dir/ibex.tsv"

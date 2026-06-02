@@ -1037,8 +1037,11 @@ def bench_polars_tf(n_rows, warmup, iters):
              f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
+    # .rechunk() forces the shifted column to materialize: polars' shift is a
+    # zero-copy offset view, so without it this measures ~nothing (flat 0.2ms at
+    # any size) instead of the real lag-column cost the other engines pay.
     run("tf_lag1",
-        lambda: df.with_columns(pl.col("price").shift(1).alias("prev")))
+        lambda: df.select(pl.col("price").shift(1).alias("prev")).rechunk())
     run("tf_rolling_count_1m",
         lambda: df.rolling(index_column="ts", period="60s").agg(c=pl.len()))
     run("tf_rolling_sum_1m",

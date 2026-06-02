@@ -17,7 +17,7 @@ from chdb.session import Session
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, cut_row
+from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, cut_row, run_phase
 
 # Absolute peak RSS (MiB) measured during the most recent timer() call.
 LAST_PEAK_RSS_MB = 0.0
@@ -649,25 +649,37 @@ def main():
     sess = Session()
     if args.threads > 0:
         sess.query(f"SET max_threads = {args.threads}")
+    # chdb holds every benchmark table in :memory:, so at the largest scales a
+    # heavy query (the asof join, a window over 50M rows) can exhaust RAM. Cap the
+    # per-query budget at ~85% of system memory so it raises a catchable
+    # "Memory limit exceeded" instead of getting OS-OOM-killed (uncatchable) —
+    # run_phase() then drops just that phase and keeps the rest.
+    try:
+        with open("/proc/meminfo") as mf:
+            mem_kb = int(next(l for l in mf if l.startswith("MemTotal:")).split()[1])
+        sess.query(f"SET max_memory_usage = {int(mem_kb * 1024 * 0.85)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"clickhouse: could not set max_memory_usage: {e}", file=sys.stderr)
 
     all_rows = []
-    all_rows += bench_clickhouse_core(
-        args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters, sess
-    )
+    all_rows += run_phase("core", lambda: bench_clickhouse_core(
+        args.csv, args.csv_multi, args.csv_trades, args.warmup, args.iters, sess))
     if args.csv_multi:
-        all_rows += bench_clickhouse_reshape(
-            args.warmup, args.iters, args.reshape_rows, sess
-        )
+        all_rows += run_phase("reshape", lambda: bench_clickhouse_reshape(
+            args.warmup, args.iters, args.reshape_rows, sess))
     if args.csv_events:
-        all_rows += bench_clickhouse_events(args.csv_events, args.warmup, args.iters, sess)
+        all_rows += run_phase("events", lambda: bench_clickhouse_events(
+            args.csv_events, args.warmup, args.iters, sess))
     if args.csv_lookup:
-        all_rows += bench_clickhouse_null(
-            args.csv, args.csv_lookup, args.warmup, args.iters, sess
-        )
-    all_rows += bench_clickhouse_fill(args.fill_rows, args.warmup, args.iters, sess)
+        all_rows += run_phase("null", lambda: bench_clickhouse_null(
+            args.csv, args.csv_lookup, args.warmup, args.iters, sess))
+    all_rows += run_phase("fill", lambda: bench_clickhouse_fill(
+        args.fill_rows, args.warmup, args.iters, sess))
     if args.tf_rows > 0:
-        all_rows += bench_clickhouse_tf(args.tf_rows, args.warmup, args.iters, sess)
-        all_rows += bench_clickhouse_asof(args.tf_rows, args.warmup, args.iters, sess)
+        all_rows += run_phase("tf", lambda: bench_clickhouse_tf(
+            args.tf_rows, args.warmup, args.iters, sess))
+        all_rows += run_phase("asof", lambda: bench_clickhouse_asof(
+            args.tf_rows, args.warmup, args.iters, sess))
 
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

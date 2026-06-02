@@ -49,6 +49,18 @@ def cut_row(framework: str, query: str, peak_mb: float = 0.0):
             "-1.000", 0, f"{peak_mb:.1f}")
 
 
+def run_phase(label, fn):
+    """Run a benchmark phase and return its rows; on any exception, log and return
+    [] so one crashing phase (e.g. a ClickHouse memory-limit error at 50M) doesn't
+    discard the engine's other phases. The caller still writes what completed."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 - a bench phase failing must not abort the rest
+        print(f"  PHASE FAILED ({label}): {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        return []
+
+
 def reset_peak_rss() -> None:
     """Reset the kernel peak-RSS counter so the next read reflects only work
     done since this call. No-op where /proc is unavailable."""

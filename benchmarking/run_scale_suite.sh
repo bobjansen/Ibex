@@ -226,6 +226,13 @@ append_tagged_results() {
     ' >> "$COMBINED_CSV"
 }
 
+# A benchmark engine crashing (e.g. an OS-OOM at the largest scale) must not
+# abort the whole sweep under `set -e`: log it and continue so the remaining
+# engines and sizes still run. The engine's cells are simply blank for this size.
+engine_failed() {
+    echo "  \u26a0 ${1} failed at ${rows} rows — continuing (cells blank for this size)" >&2
+}
+
 emit_readme_markdown() {
     local combined_tsv="$1"
     local out_path="$2"
@@ -389,7 +396,7 @@ for rows in "${SIZES[@]}"; do
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
                 --reshape-rows "$rows" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --warmup "$WARMUP" --iters "$ITERS" \
-                --out "$size_result_dir/ibex.tsv"
+                --out "$size_result_dir/ibex.tsv" || engine_failed "ibex"
         append_tagged_results "$rows" "$size_result_dir/ibex.tsv"
     fi
 
@@ -400,7 +407,7 @@ for rows in "${SIZES[@]}"; do
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" \
                 --warmup "$WARMUP" --iters "$ITERS" \
-                --out "$size_result_dir/ibex_compiled.tsv"
+                --out "$size_result_dir/ibex_compiled.tsv" || engine_failed "ibex-compiled"
         append_tagged_results "$rows" "$size_result_dir/ibex_compiled.tsv"
     fi
 
@@ -417,7 +424,7 @@ for rows in "${SIZES[@]}"; do
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/python.tsv" \
-            "${py_args[@]}"
+            "${py_args[@]}" || engine_failed "python"
         append_tagged_results "$rows" "$size_result_dir/python.tsv"
 
         if [[ $SKIP_POLARS_ST -eq 0 ]]; then
@@ -431,7 +438,7 @@ for rows in "${SIZES[@]}"; do
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --skip-pandas \
-                --out "$polars_st_raw"
+                --out "$polars_st_raw" || { engine_failed "polars-st"; : > "$polars_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "polars") $1="polars-st"; print }' \
                 "$polars_st_raw" > "$polars_st_tsv"
             append_tagged_results "$rows" "$polars_st_tsv"
@@ -454,7 +461,7 @@ for rows in "${SIZES[@]}"; do
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
             --out "$size_result_dir/r.tsv" \
-            "${r_args[@]}"
+            "${r_args[@]}" || engine_failed "R"
         append_tagged_results "$rows" "$size_result_dir/r.tsv"
     fi
 
@@ -474,7 +481,7 @@ for rows in "${SIZES[@]}"; do
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
-            --out "$size_result_dir/duckdb.tsv"
+            --out "$size_result_dir/duckdb.tsv" || engine_failed "duckdb"
         append_tagged_results "$rows" "$size_result_dir/duckdb.tsv"
 
         if [[ $SKIP_DUCKDB_ST -eq 0 ]]; then
@@ -488,7 +495,7 @@ for rows in "${SIZES[@]}"; do
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --threads 1 \
-                --out "$duckdb_st_raw"
+                --out "$duckdb_st_raw" || { engine_failed "duckdb-st"; : > "$duckdb_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "duckdb") $1="duckdb-st"; print }' \
                 "$duckdb_st_raw" > "$duckdb_st_tsv"
             append_tagged_results "$rows" "$duckdb_st_tsv"
@@ -503,7 +510,7 @@ for rows in "${SIZES[@]}"; do
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
-            --out "$size_result_dir/datafusion.tsv"
+            --out "$size_result_dir/datafusion.tsv" || engine_failed "datafusion"
         append_tagged_results "$rows" "$size_result_dir/datafusion.tsv"
 
         if [[ $SKIP_DATAFUSION_ST -eq 0 ]]; then
@@ -517,7 +524,7 @@ for rows in "${SIZES[@]}"; do
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --threads 1 \
-                --out "$datafusion_st_raw"
+                --out "$datafusion_st_raw" || { engine_failed "datafusion-st"; : > "$datafusion_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "datafusion") $1="datafusion-st"; print }' \
                 "$datafusion_st_raw" > "$datafusion_st_tsv"
             append_tagged_results "$rows" "$datafusion_st_tsv"
@@ -532,7 +539,7 @@ for rows in "${SIZES[@]}"; do
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$ITERS" \
-            --out "$size_result_dir/clickhouse.tsv"
+            --out "$size_result_dir/clickhouse.tsv" || engine_failed "clickhouse"
         append_tagged_results "$rows" "$size_result_dir/clickhouse.tsv"
 
         if [[ $SKIP_CLICKHOUSE_ST -eq 0 ]]; then
@@ -546,7 +553,7 @@ for rows in "${SIZES[@]}"; do
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --threads 1 \
-                --out "$clickhouse_st_raw"
+                --out "$clickhouse_st_raw" || { engine_failed "clickhouse-st"; : > "$clickhouse_st_raw"; }
             awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } { if ($1 == "clickhouse") $1="clickhouse-st"; print }' \
                 "$clickhouse_st_raw" > "$clickhouse_st_tsv"
             append_tagged_results "$rows" "$clickhouse_st_tsv"
@@ -564,7 +571,7 @@ for rows in "${SIZES[@]}"; do
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
-                --out "$size_result_dir/sqlite.tsv"
+                --out "$size_result_dir/sqlite.tsv" || engine_failed "sqlite"
             append_tagged_results "$rows" "$size_result_dir/sqlite.tsv"
         fi
     fi

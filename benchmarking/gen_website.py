@@ -27,6 +27,23 @@ from collections import defaultdict
 from pathlib import Path
 
 from print_table import FRAMEWORK_ORDER, QUERY_LABEL, QUERY_ORDER
+from extract_bench_code import extract_all, SOURCES
+
+GITHUB = "https://github.com/bobjansen/Ibex/blob/main"
+
+# Engines shown on the code page, in display order: (engine_key, label, lang).
+# polars-st and ibex+parse run byte-identical code to polars / ibex (only the
+# thread count / parse-timing differs), so they're annotated, not duplicated.
+CODE_ENGINES: list[tuple[str, str, str]] = [
+    ("ibex", "Ibex", "ibex"),
+    ("polars", "Polars", "python"),
+    ("duckdb", "DuckDB", "sql"),
+    ("datafusion", "DataFusion", "sql"),
+    ("clickhouse", "ClickHouse", "sql"),
+    ("pandas", "pandas", "python"),
+    ("data.table", "data.table", "r"),
+    ("dplyr", "dplyr", "r"),
+]
 
 # Curated category grouping (order matters; queries not listed fall to "Other").
 CATEGORIES: list[tuple[str, list[str]]] = [
@@ -250,6 +267,13 @@ HTML_TEMPLATE = """<!doctype html>
       run; <code>SQLite</code> and the data.table <code>rolling median/std</code>
       cells are omitted (they dominate wall-clock and add no competitive signal).
     </p>
+    <p class="bench-note">
+      <strong>See for yourself.</strong> Every query's exact code, in every
+      engine, is on the <a href="./methodology.html">Methodology &amp; code</a>
+      page &mdash; auto-extracted from the harness source, so it's provably what
+      ran. If a competitor query looks sub-optimal, that page also shows how to
+      reproduce the whole run and how to send a fix.
+    </p>
     <p class="bench-note" id="meta"></p>
   </section>
 
@@ -377,6 +401,244 @@ function setScale(s) {
 """
 
 
+CODE_PAGE_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Benchmark methodology &amp; per-engine code</title>
+  <meta name="description" content="How the Ibex benchmark works: reproduce it in one command, and read the exact code every engine runs for every query — auto-extracted from the harness source." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <style>
+    .codewrap { display: grid; grid-template-columns: 220px 1fr; gap: 1.4rem;
+      align-items: start; }
+    .qrail { border: 1px solid var(--line); border-radius: 12px; background: var(--paper);
+      max-height: 70vh; overflow-y: auto; padding: 0.5rem; position: sticky; top: 1rem; }
+    .qrail .cat { color: var(--accent); font-weight: 700; font-size: 0.72rem;
+      text-transform: uppercase; letter-spacing: 0.04em; margin: 0.7rem 0.4rem 0.2rem; }
+    .qrail button { display: block; width: 100%; text-align: left; border: none;
+      background: none; font-family: inherit; font-size: 0.86rem; color: var(--ink);
+      padding: 0.32rem 0.5rem; border-radius: 7px; cursor: pointer; }
+    .qrail button:hover { background: rgba(10,127,121,0.08); }
+    .qrail button.on { background: var(--accent); color: #fff; font-weight: 600; }
+    .codepane h3 { margin: 0 0 0.2rem; font-size: 1.25rem; }
+    .codepane .qmeta { color: var(--muted); font-size: 0.85rem; margin: 0 0 1.1rem; }
+    .engblock { margin: 0 0 1.1rem; }
+    .engblock .ehead { display: flex; align-items: baseline; gap: 0.6rem;
+      margin: 0 0 0.3rem; }
+    .engblock .ename { font-weight: 700; font-size: 0.95rem; }
+    .engblock.ibex .ename { color: var(--accent); }
+    .engblock .esrc { font-size: 0.76rem; color: var(--muted); }
+    .engblock .esrc a { color: var(--muted); }
+    .engblock pre { margin: 0; padding: 0.8rem 1rem; border-radius: 10px;
+      border: 1px solid var(--line); background: #0f1b1a; color: #d7e6e3;
+      overflow-x: auto; font-family: "JetBrains Mono", monospace; font-size: 0.83rem;
+      line-height: 1.5; white-space: pre; }
+    .engblock.ibex pre { border-color: var(--accent);
+      box-shadow: inset 3px 0 0 var(--accent); }
+    .engblock .na { color: var(--muted); font-style: italic; font-size: 0.86rem;
+      padding: 0.3rem 0; }
+    .repro code, .repro pre { font-family: "JetBrains Mono", monospace; }
+    .repro pre { background: #0f1b1a; color: #d7e6e3; padding: 0.9rem 1.1rem;
+      border-radius: 10px; overflow-x: auto; font-size: 0.84rem; line-height: 1.6; }
+    .callout { border-left: 3px solid var(--accent); background: rgba(10,127,121,0.06);
+      padding: 0.8rem 1.1rem; border-radius: 0 10px 10px 0; margin: 1.2rem 0; }
+    @media (max-width: 760px) { .codewrap { grid-template-columns: 1fr; }
+      .qrail { position: static; max-height: none; } }
+  </style>
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Docs</a>
+      <a class="nav-link" href="./io.html">I/O</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="./comparison.html">Comparison</a>
+      <a class="nav-link active" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <p class="eyebrow">Methodology &amp; code</p>
+    <h1>How the benchmark works</h1>
+    <p class="lead">
+      The fair criticism of any vendor benchmark is &ldquo;you hobbled my
+      engine.&rdquo; So this page does two things: it shows you how to run the
+      whole suite yourself, and it shows the <strong>exact code every engine
+      runs</strong> for every query &mdash; extracted straight from the harness
+      source, so what you read here is provably what executed.
+    </p>
+  </section>
+
+  <section class="section repro">
+    <p class="section-label">Reproduce it</p>
+    <h2>Run it yourself</h2>
+    <p class="section-sub">
+      Every engine is a stock install &mdash; <code>polars</code>,
+      <code>duckdb</code>, <code>datafusion</code>, <code>chdb</code> (ClickHouse)
+      and <code>pandas</code> from PyPI; <code>data.table</code> and
+      <code>dplyr</code> from CRAN. The runner is one script; it generates the
+      synthetic data, runs all engines and writes a single CSV.
+    </p>
+    <pre># clone, build Ibex in release, then run the whole suite locally:
+benchmarking/run_scale_suite.sh --warmup 1 --iters 3
+# -&gt; benchmarking/results/scales.csv
+
+# render these pages from that CSV:
+python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
+    <p class="section-sub">
+      The published numbers come from a clean cloud box for isolation &mdash; an
+      AWS <strong>r7i.2xlarge</strong> (8 vCPU Sapphire Rapids, 64&nbsp;GB),
+      one command end-to-end:
+    </p>
+    <pre>./benchmarking/aws/run.sh --on-demand   # provisions, runs 1M&ndash;50M, uploads, shuts down</pre>
+    <div class="callout">
+      <strong>Think we mis-coded your engine?</strong> The query below it is right
+      there &mdash; open a PR against
+      <a id="repo-link" href="#" target="_blank" rel="noopener">the benchmark harness</a>
+      with a faster formulation and we'll re-run and update the numbers. The point
+      is the comparison, not the scoreboard.
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Transparency</p>
+    <h2>Exactly what each engine runs</h2>
+    <p class="section-sub">
+      Pick a query. Each engine's code is verbatim from the file linked beside it;
+      rolling-window frames are shown fully resolved (e.g. the
+      <code>RANGE BETWEEN INTERVAL</code> vs <code>ROWS</code> clause) so the
+      time-window comparison is auditable. <code>polars-st</code> runs identical
+      code to Polars with <code>POLARS_MAX_THREADS=1</code>; <code>ibex+parse</code>
+      is the same Ibex query timed with parsing included.
+    </p>
+    <div class="codewrap">
+      <div class="qrail" id="qrail"></div>
+      <div class="codepane" id="codepane"></div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+const CODE = __CODE_PAYLOAD__;
+let current = null;
+
+function srcLink(eng) {
+  const path = CODE.sources[eng] || "";
+  return path ? `${CODE.github}/${path}` : null;
+}
+
+function selectQuery(q) {
+  current = q;
+  document.querySelectorAll("#qrail button").forEach(b =>
+    b.classList.toggle("on", b.dataset.q === q));
+  const meta = CODE.queries.find(x => x.id === q);
+  const code = CODE.code[q] || {};
+  const pane = document.getElementById("codepane");
+  pane.innerHTML = "";
+  const h3 = document.createElement("h3");
+  h3.textContent = meta ? meta.label : q;
+  const qm = document.createElement("p");
+  qm.className = "qmeta";
+  qm.textContent = `${meta ? meta.category : ""} \\u00b7 query id: ${q}`;
+  pane.append(h3, qm);
+  for (const eng of CODE.engines) {
+    const block = document.createElement("div");
+    block.className = "engblock" + (eng.key === "ibex" ? " ibex" : "");
+    const head = document.createElement("div");
+    head.className = "ehead";
+    const name = document.createElement("span");
+    name.className = "ename";
+    name.textContent = eng.label;
+    head.appendChild(name);
+    const link = srcLink(eng.key);
+    if (link) {
+      const s = document.createElement("span");
+      s.className = "esrc";
+      s.innerHTML = `<a href="${link}" target="_blank" rel="noopener">source &#8599;</a>`;
+      head.appendChild(s);
+    }
+    block.appendChild(head);
+    if (code[eng.key] != null) {
+      const pre = document.createElement("pre");
+      pre.textContent = code[eng.key];
+      block.appendChild(pre);
+    } else {
+      const na = document.createElement("div");
+      na.className = "na";
+      na.textContent = "not benchmarked for this engine (capability gap or excluded at scale)";
+      block.appendChild(na);
+    }
+    pane.appendChild(block);
+  }
+}
+
+(function init() {
+  const repo = document.getElementById("repo-link");
+  if (repo) repo.href = CODE.github + "/benchmarking";
+  const rail = document.getElementById("qrail");
+  let lastCat = null;
+  for (const q of CODE.queries) {
+    if (q.category !== lastCat) {
+      const c = document.createElement("div");
+      c.className = "cat";
+      c.textContent = q.category;
+      rail.appendChild(c);
+      lastCat = q.category;
+    }
+    const b = document.createElement("button");
+    b.dataset.q = q.id;
+    b.textContent = q.label;
+    b.onclick = () => selectQuery(q.id);
+    rail.appendChild(b);
+  }
+  if (CODE.queries.length) selectQuery(CODE.queries[0].id);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def build_code_payload(cells):
+    """{queries:[{id,label,category}], engines:[{key,label,lang}], code:{q:{eng:src}},
+    sources:{eng:path}} — only queries that were actually benchmarked, in the same
+    category order as the results table."""
+    by_q = extract_all()
+    present = {q for n in cells for q in cells[n]}
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for cat, qs in CATEGORIES:
+        for q in qs:
+            if q in present and q in by_q:
+                ordered.append({"id": q, "label": QUERY_LABEL.get(q, q), "category": cat})
+                seen.add(q)
+    for q in QUERY_ORDER:
+        if q in present and q in by_q and q not in seen:
+            ordered.append({"id": q, "label": QUERY_LABEL.get(q, q), "category": "Other"})
+            seen.add(q)
+
+    keys = [k for k, _, _ in CODE_ENGINES]
+    code = {o["id"]: {k: by_q[o["id"]][k] for k in keys if k in by_q[o["id"]]}
+            for o in ordered}
+    return {
+        "queries": ordered,
+        "engines": [{"key": k, "label": lbl, "lang": lang} for k, lbl, lang in CODE_ENGINES],
+        "code": code,
+        "sources": {k: SOURCES.get(k, "") for k in keys},
+        "github": GITHUB,
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("csv", nargs="+", type=Path, help="result CSV(s), merged in order")
@@ -403,6 +665,15 @@ def main(argv=None):
     args.out.write_text(out_html, encoding="utf-8")
     print(f"wrote {args.out}  ({len(payload['queries'])} queries, "
           f"{len(payload['frameworks'])} engines, scales {payload['scales']})")
+
+    # Companion methodology + per-engine code page (auto-extracted from sources).
+    code_payload = build_code_payload(cells)
+    code_html = CODE_PAGE_TEMPLATE.replace(
+        "__CODE_PAYLOAD__", json.dumps(code_payload, separators=(",", ":")))
+    code_out = args.out.parent / "methodology.html"
+    code_out.write_text(code_html, encoding="utf-8")
+    print(f"wrote {code_out}  ({len(code_payload['queries'])} queries x "
+          f"{len(code_payload['engines'])} engines)")
     return 0
 
 

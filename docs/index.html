@@ -32,24 +32,24 @@
   <section class="hero">
     <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
     <p class="eyebrow">Ibex</p>
-    <h1>Fast, typed language for table&nbsp;pipelines</h1>
+    <h1>Fast, typed query language for table&nbsp;pipelines</h1>
     <p class="lead">
-      Ibex is a compact, statically typed language for quant, analytics, and
-      data-engineering pipelines over columnar data. Write and explore in an
-      interactive REPL, then compile the exact same code to standalone C++23
-      when it ships &mdash; no rewrite. The sweet spot is repeated feature
-      engineering, grouped aggregation, joins, reshaping, and time-series work
-      where correctness and latency both matter.
+      Ibex is a compact, statically typed query language for quant, analytics,
+      and data-engineering pipelines over columnar data. Write and explore in
+      an interactive REPL, then compile the exact same code to standalone C++23
+      when it ships, no rewrite required. Designed for concise table and time
+      series manipulation without giving up performance.
     </p>
-    <div class="stats">
-      <span class="stat"><strong>37 / 41</strong> wins vs single-threaded Polars at 16M rows</span>
-      <span class="stat"><strong>22</strong> fastest queries at 16M rows despite one core</span>
-      <span class="stat"><strong>1M&ndash;16M</strong> row AWS benchmark suite</span>
-    </div>
+    <p class="lead" style="margin-top: 5px">
+      <strong>Never the slowest. Often the fastest. On a single core.</strong>
+      Across grouped aggregation, rolling time-series, and null-handling at 1M–50M
+      rows, Ibex is competitive with or faster than multithreaded Polars, DuckDB,
+      DataFusion, and ClickHouse. Using only one thread.
+    </p>
     <div class="cta-row">
       <a class="button primary" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">View on GitHub</a>
-      <a class="button" href="./cheatsheet.html">Open cheat sheet</a>
       <a class="button" href="./getting-started.html">Get started</a>
+      <a class="button" href="./benchmarks.html">Benchmarks</a>
     </div>
   </section>
 
@@ -58,9 +58,9 @@
     <p class="section-label">Why?</p>
     <h2>Ibex is focused solely on tabular data</h2>
     <p class="section-sub">
-      Ibex only knows tables, this made it possible to create a new language
-      in which it is possible to write concise, performant code easy to read
-      table manipulation.
+      Ibex only knows tables and scalars, this made it possible to create a new
+      language in which it is possible to write concise, performant code easy
+      to read table manipulation.
     </p>
     <div class="audience-grid">
       <article class="audience-card">
@@ -95,37 +95,51 @@
 
   <!-- Feature cards -->
   <section class="section">
-    <p class="section-label">Why it works</p>
+    <p class="section-label">Features</p>
     <h2>Interactive, typed, compiled</h2>
     <p class="section-sub">
-      Explore in a REPL, lean on static types to catch shape and type errors
+      Explore in a REPL, trust the static types to catch shape and type errors
       before anything runs, and compile the same script to C++23 when it ships.
     </p>
-    <div class="grid-3 feature-grid">
+    <div class="grid-3 audience-grid">
       <article class="card">
         <h3>Concise bracket syntax</h3>
         <p>
           Pipeline operations chain left-to-right inside <code>[ ]</code>, in the
-          order they execute. No SQL keywords, no user-defined macros, no implicit coercions.
-          Backtick-quoted names handle columns with dots or spaces.
+          order they execute. No wrapping every column in a function call, no
+          quoting names.
         </p>
+<pre><code>trades[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>,
+  <span class="kw">select</span> {
+    symbol,
+    vwap = <span class="fn-name">sum</span>(price * qty)
+         / <span class="fn-name">sum</span>(qty)
+  }, <span class="kw">by</span> symbol]</code></pre>
       </article>
       <article class="card">
-        <h3>Compile-time map</h3>
+        <h3>TimeFrames</h3>
         <p>
-          Braced <code>select</code> and <code>update</code> blocks can expand
-          whole families of generated fields at compile time with
-          <code>map</code>, <code>get(name)</code>, and interpolated backtick
-          aliases such as <code>`avg_${m}`</code>.
+          <code>as_timeframe</code> promotes a DataFrame to a time-indexed
+          structure. Rolling windows are convenient and blazingly fast.
         </p>
+<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks,
+                      <span class="str">"ts"</span>);
+tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">update</span> {
+  avg_5m = <span class="fn-name">rolling_mean</span>(px),
+  vol_5m = <span class="fn-name">rolling_sum</span>(qty)
+}]</code></pre>
       </article>
       <article class="card">
-        <h3>TimeFrame-aware</h3>
+        <h3>Grouped update</h3>
         <p>
-          <code>as_timeframe</code> promotes a DataFrame to a time-indexed structure
-          with O(n) sort detection. Rolling windows use a two-pointer O(n) scan with
-          a single result-column allocation per call — no copies, no heap churn.
+          <code>update</code> with <code>by</code> computes a value per group and
+          writes it back to every row, so group statistics sit alongside the
+          originals.
         </p>
+<pre><code>prices[<span class="kw">update</span> {
+  z = (price - <span class="fn-name">mean</span>(price))
+      / <span class="fn-name">std</span>(price)
+}, <span class="kw">by</span> symbol]</code></pre>
       </article>
       <article class="card">
         <h3>C++23 codegen</h3>
@@ -162,7 +176,9 @@
   <section class="section">
     <p class="section-label">Notebook integration</p>
     <h2>Run Ibex inside Python or R notebook workflows</h2>
-    <p class="section-sub">Keep heavy table manipulation in Ibex, then plot and explore the result with the surrounding language ecosystem.</p>
+    <p class="section-sub">Quickly switch between Python and Ibex cells in a
+    notebook. The results from Ibex can seamlessly be used by later cells in
+    the notebook.</p>
 
     <div class="tour">
       <div class="tour-item">

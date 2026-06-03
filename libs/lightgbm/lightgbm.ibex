@@ -1,0 +1,3 @@
+// LightGBM model plugin (links real Microsoft LightGBM).
+// Importing this file loads lightgbm.so and registers `model_lightgbm`,
+// reachable from the query language as `model { y ~ x, method = lightgbm }`.

@@ -9,8 +9,8 @@ params:
   max_date_id: 40
   sample_rows: 250000
   n_folds: 5
-  lightbm_iterations: 300
-  lightbm_learning_rate: 0.03
+  lightgbm_iterations: 300
+  lightgbm_learning_rate: 0.03
 ---
 
 ```{r setup, include=FALSE}
@@ -28,7 +28,7 @@ This R Markdown document translates the local Kaggle notebook
 
 - uses `ribex` to stage the Optiver CSV to Parquet once, then reuse Parquet on later runs
 - keeps the notebook's pairwise and triple-price imbalance features
-- fits the Ibex `lightbm` plugin on each fold
+- fits the Ibex `lightgbm` plugin on each fold
 - scores the held-out folds in R from the returned coefficient table
 
 The original Python notebook defaults to inference with pretrained models.
@@ -80,8 +80,8 @@ list(
   train_csv = train_csv,
   train_parquet = train_parquet,
   plugin_paths = plugin_paths,
-  lightbm_iterations = params$lightbm_iterations,
-  lightbm_learning_rate = params$lightbm_learning_rate
+  lightgbm_iterations = params$lightgbm_iterations,
+  lightgbm_learning_rate = params$lightgbm_learning_rate
 )
 ```
 
@@ -273,19 +273,19 @@ list(
 )
 ```
 
-## Train the Ibex LightBM Baseline
+## Train the Ibex LightGBM Baseline
 
 ```{r train-models}
 mae <- function(actual, predicted) {
   mean(abs(actual - predicted))
 }
 
-build_lightbm_query <- function(feature_cols) {
+build_lightgbm_query <- function(feature_cols) {
   feature_formula <- paste(feature_cols, collapse = " + ")
   paste(
-    'extern fn lightbm_version() -> DataFrame from "lightbm.hpp";',
+    'extern fn lightgbm_version() -> DataFrame from "lightgbm.hpp";',
     sprintf(
-      "train_fold[model { target ~ %s, method = lightbm, iterations = iterations, learning_rate = learning_rate }];",
+      "train_fold[model { target ~ %s, method = lightgbm, iterations = iterations, learning_rate = learning_rate }];",
       feature_formula
     )
   )
@@ -302,12 +302,12 @@ predict_from_coefficients <- function(coef_table, new_data, feature_cols) {
   intercept + as.numeric(as.matrix(new_data[, feature_cols, drop = FALSE]) %*% feature_beta)
 }
 
-fit_ibex_lightbm <- function(model_input_df, fold_id, n_folds, feature_cols, plugin_paths,
+fit_ibex_lightgbm <- function(model_input_df, fold_id, n_folds, feature_cols, plugin_paths,
                              iterations, learning_rate) {
   oof <- rep(NA_real_, nrow(model_input_df))
   coefficients <- vector("list", n_folds)
   sess <- create_session(plugin_paths = plugin_paths)
-  model_query <- build_lightbm_query(feature_cols)
+  model_query <- build_lightgbm_query(feature_cols)
 
   for (i in seq_len(n_folds) - 1L) {
     train_idx <- fold_id != i
@@ -334,21 +334,21 @@ fit_ibex_lightbm <- function(model_input_df, fold_id, n_folds, feature_cols, plu
   }
 
   list(
-    name = "ibex_lightbm",
+    name = "ibex_lightgbm",
     coefficients = coefficients,
     oof = oof,
     mae = mae(model_input_df$target, oof)
   )
 }
 
-model_result <- fit_ibex_lightbm(
+model_result <- fit_ibex_lightgbm(
   model_input_df = model_input_df,
   fold_id = fold_id,
   n_folds = params$n_folds,
   feature_cols = feature_cols,
   plugin_paths = plugin_paths,
-  iterations = params$lightbm_iterations,
-  learning_rate = params$lightbm_learning_rate
+  iterations = params$lightgbm_iterations,
+  learning_rate = params$lightgbm_learning_rate
 )
 
 metrics <- data.frame(model = model_result$name, mae = model_result$mae)
@@ -379,7 +379,7 @@ coef_plot <- ggplot(top_coefficients, aes(x = reorder(term, `abs(estimate)`), y 
   geom_col(fill = "#3b7ea1") +
   coord_flip() +
   labs(
-    title = "Top average absolute LightBM coefficients across folds",
+    title = "Top average absolute LightGBM coefficients across folds",
     x = NULL,
     y = "Mean |estimate|"
   ) +
@@ -396,7 +396,7 @@ scatter_plot <- ggplot(scatter_df, aes(actual, predicted)) +
   geom_point(alpha = 0.25, size = 0.7, color = "#1f4e5f") +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#b22222") +
   labs(
-    title = "Ibex LightBM predictions vs actual target",
+    title = "Ibex LightGBM predictions vs actual target",
     x = "Actual target",
     y = "Predicted target"
   ) +

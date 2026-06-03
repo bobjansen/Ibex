@@ -5808,7 +5808,7 @@ TEST_CASE("model: WLS with weights", "[model]") {
     REQUIRE(estimates[1] == Catch::Approx(2.0));
 }
 
-TEST_CASE("model: LightBM plugin method", "[model]") {
+TEST_CASE("model: LightGBM plugin method", "[model]") {
     runtime::Table t;
     t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
     t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
@@ -5818,53 +5818,7 @@ TEST_CASE("model: LightBM plugin method", "[model]") {
 
     runtime::ExternRegistry externs;
     externs.register_scalar_table_consumer(
-        "model_lightbm", runtime::ScalarKind::Int,
-        [](const runtime::Table& design_matrix,
-           const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
-            REQUIRE(args.size() == 5);
-            REQUIRE(std::get<std::string>(args[0]) == "__response");
-            REQUIRE(std::get<std::string>(args[1]) == "iterations");
-            REQUIRE(std::get<std::int64_t>(args[2]) == 250);
-            REQUIRE(std::get<std::string>(args[3]) == "learning_rate");
-            REQUIRE(std::get<double>(args[4]) == Catch::Approx(0.04));
-
-            const auto* x = std::get_if<Column<double>>(design_matrix.find("x"));
-            const auto* y = std::get_if<Column<double>>(design_matrix.find("__response"));
-            REQUIRE(x != nullptr);
-            REQUIRE(y != nullptr);
-            REQUIRE(x->size() == y->size());
-
-            runtime::Table out;
-            out.add_column("term", Column<std::string>{"(intercept)", "x"});
-            out.add_column("estimate", Column<double>{1.0, 2.0});
-            return runtime::ExternValue{std::move(out)};
-        });
-
-    auto ir =
-        require_ir("t[model { y ~ x, method = lightbm, iterations = 250, learning_rate = 0.04 }];");
-    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
-    REQUIRE(result.has_value());
-
-    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
-    REQUIRE(estimates[0] == Catch::Approx(1.0));
-    REQUIRE(estimates[1] == Catch::Approx(2.0));
-}
-
-TEST_CASE("model: LightBM plugin method accepts scalar bindings", "[model]") {
-    runtime::Table t;
-    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
-    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
-
-    runtime::TableRegistry registry;
-    registry.emplace("t", t);
-
-    runtime::ScalarRegistry scalars;
-    scalars.emplace("iterations", runtime::ScalarValue{std::int64_t{250}});
-    scalars.emplace("learning_rate", runtime::ScalarValue{0.04});
-
-    runtime::ExternRegistry externs;
-    externs.register_scalar_table_consumer(
-        "model_lightbm", runtime::ScalarKind::Int,
+        "model_lightgbm", runtime::ScalarKind::Int,
         [](const runtime::Table& design_matrix,
            const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
             REQUIRE(args.size() == 5);
@@ -5887,7 +5841,54 @@ TEST_CASE("model: LightBM plugin method accepts scalar bindings", "[model]") {
         });
 
     auto ir = require_ir(
-        "t[model { y ~ x, method = lightbm, iterations = iterations, learning_rate = learning_rate "
+        "t[model { y ~ x, method = lightgbm, iterations = 250, learning_rate = 0.04 }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
+    REQUIRE(estimates[0] == Catch::Approx(1.0));
+    REQUIRE(estimates[1] == Catch::Approx(2.0));
+}
+
+TEST_CASE("model: LightGBM plugin method accepts scalar bindings", "[model]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("iterations", runtime::ScalarValue{std::int64_t{250}});
+    scalars.emplace("learning_rate", runtime::ScalarValue{0.04});
+
+    runtime::ExternRegistry externs;
+    externs.register_scalar_table_consumer(
+        "model_lightgbm", runtime::ScalarKind::Int,
+        [](const runtime::Table& design_matrix,
+           const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            REQUIRE(args.size() == 5);
+            REQUIRE(std::get<std::string>(args[0]) == "__response");
+            REQUIRE(std::get<std::string>(args[1]) == "iterations");
+            REQUIRE(std::get<std::int64_t>(args[2]) == 250);
+            REQUIRE(std::get<std::string>(args[3]) == "learning_rate");
+            REQUIRE(std::get<double>(args[4]) == Catch::Approx(0.04));
+
+            const auto* x = std::get_if<Column<double>>(design_matrix.find("x"));
+            const auto* y = std::get_if<Column<double>>(design_matrix.find("__response"));
+            REQUIRE(x != nullptr);
+            REQUIRE(y != nullptr);
+            REQUIRE(x->size() == y->size());
+
+            runtime::Table out;
+            out.add_column("term", Column<std::string>{"(intercept)", "x"});
+            out.add_column("estimate", Column<double>{1.0, 2.0});
+            return runtime::ExternValue{std::move(out)};
+        });
+
+    auto ir = require_ir(
+        "t[model { y ~ x, method = lightgbm, iterations = iterations, learning_rate = "
+        "learning_rate "
         "}];");
     auto result = runtime::interpret(*ir, registry, &scalars, &externs);
     REQUIRE(result.has_value());
@@ -5897,7 +5898,7 @@ TEST_CASE("model: LightBM plugin method accepts scalar bindings", "[model]") {
     REQUIRE(estimates[1] == Catch::Approx(2.0));
 }
 
-TEST_CASE("model: LightBM method requires plugin import/registration", "[model]") {
+TEST_CASE("model: LightGBM method requires plugin import/registration", "[model]") {
     runtime::Table t;
     t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
     t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
@@ -5905,7 +5906,7 @@ TEST_CASE("model: LightBM method requires plugin import/registration", "[model]"
     runtime::TableRegistry registry;
     registry.emplace("t", t);
 
-    auto ir = require_ir("t[model { y ~ x, method = lightbm }];");
+    auto ir = require_ir("t[model { y ~ x, method = lightgbm }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("plugin") != std::string::npos);

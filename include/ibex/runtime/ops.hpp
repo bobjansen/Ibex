@@ -128,6 +128,7 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto model_summary(const runtime::ModelResult& m) -> runtime::Table;
 [[nodiscard]] auto model_fitted(const runtime::ModelResult& m) -> runtime::Table;
 [[nodiscard]] auto model_residuals(const runtime::ModelResult& m) -> runtime::Table;
+[[nodiscard]] auto model_importance(const runtime::ModelResult& m) -> runtime::Table;
 [[nodiscard]] auto model_r_squared(const runtime::ModelResult& m) -> double;
 
 [[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,

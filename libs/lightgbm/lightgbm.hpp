@@ -1,24 +1,9 @@
 #pragma once
 
-#include <ibex/runtime/interpreter.hpp>
-
-#include <cstdint>
-#include <string>
-
-namespace ibex::lightgbm {
-
-// Trains a real LightGBM gradient-boosted tree model on the design matrix
-// (every Float64 column except `response_col`, which is the label) and returns
-// a long-format wire table consumed by the interpreter's predictive-model path:
+// Real Microsoft LightGBM model plugin. Registers the "lightgbm" model method
+// (ExternRegistry::register_model) implementing fit + predict over a gradient-
+// boosted tree booster. The booster is kept alive in a self-freeing handle
+// (FittedModel::native) so model_predict can reuse it on new data.
 //
-//   kind : String   -- "fitted" or "importance"
-//   term : String   -- feature name (importance rows); "" for fitted rows
-//   value: Float64  -- prediction (fitted rows) / gain importance (importance rows)
-//
-// There are `n` rows with kind="fitted" (in-sample predictions, input order)
-// followed by `p` rows with kind="importance" (one per feature).
-auto fit(const runtime::Table& design_matrix, const std::string& response_col,
-         std::int64_t iterations, double learning_rate)
-    -> std::expected<runtime::Table, std::string>;
-
-}  // namespace ibex::lightgbm
+// All implementation lives in lightgbm.cpp; the plugin entry point is the
+// extern "C" ibex_register hook.

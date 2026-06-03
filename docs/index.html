@@ -1447,11 +1447,12 @@ Stream {
             <code>model_r_squared</code>. The <code>method&nbsp;=</code> parameter
             is optional and defaults to <code>ols</code>; it also supports
             built-ins (<code>ols</code>, <code>ridge</code>,
-            <code>wls</code>) plus plugin methods registered as
-            <code>model_&lt;method&gt;</code>. The bundled <code>lightgbm</code>
-            plugin links real Microsoft LightGBM and trains gradient-boosted
-            trees — use <code>model_fitted</code> for predictions and
-            <code>model_importance</code> for per-feature gains.
+            <code>wls</code>) plus plugin methods registered by name. The bundled
+            <code>lightgbm</code> plugin links real Microsoft LightGBM and trains
+            gradient-boosted trees — use <code>model_fitted</code> for in-sample
+            predictions, <code>model_importance</code> for per-feature gains, and
+            <code>model_predict(m,&nbsp;newdata)</code> to score new data by
+            reusing the trained model.
           </p>
         </div>
         <div class="tour-code">
@@ -1480,8 +1481,9 @@ Stream {
     iterations = <span class="num">300</span>,
     learning_rate = <span class="num">0.03</span>
 }];
-<span class="kw">let</span> preds = <span class="fn-name">model_fitted</span>(boosted);      <span class="cm">// predictions</span>
-<span class="kw">let</span> gains = <span class="fn-name">model_importance</span>(boosted);  <span class="cm">// term | gain</span></code></pre>
+<span class="kw">let</span> preds = <span class="fn-name">model_fitted</span>(boosted);      <span class="cm">// in-sample predictions</span>
+<span class="kw">let</span> gains = <span class="fn-name">model_importance</span>(boosted);  <span class="cm">// term | gain</span>
+<span class="kw">let</span> scored = <span class="fn-name">model_predict</span>(boosted, new_prices);  <span class="cm">// score new data</span></code></pre>
         </div>
       </div>
 

@@ -223,6 +223,10 @@ struct ModelResult {
     Table fitted_values;  ///< single column: fitted
     Table residuals;      ///< single column: residual
     Table importance;     ///< term | gain (tree models; empty otherwise)
+    /// Opaque, self-freeing handle to a plugin-owned native model (e.g. a
+    /// LightGBM booster), set by model plugins. Reused by model_predict; null
+    /// for built-in linear methods. See ExternRegistry::ModelOps.
+    std::shared_ptr<void> native;
     ir::ModelFormula formula;
     std::string method;
     double r_squared = 0.0;
@@ -240,6 +244,13 @@ class ExternRegistry;
                              const ScalarRegistry* scalars = nullptr,
                              const ExternRegistry* externs = nullptr,
                              ModelResult* model_out = nullptr) -> std::expected<Table, std::string>;
+
+/// Predicts on new data with a previously fitted plugin model, reusing its
+/// native handle. Rebuilds the design matrix from `newdata` using the model's
+/// stored formula. Returns a single-column "prediction" table.
+[[nodiscard]] auto predict_model(const ModelResult& model, const Table& newdata,
+                                 const ExternRegistry& externs)
+    -> std::expected<Table, std::string>;
 
 [[nodiscard]] auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
                                const std::vector<std::string>& keys,

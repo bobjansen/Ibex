@@ -5,9 +5,11 @@
 
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ibex::runtime {
@@ -64,6 +66,36 @@ using ExternChunkedTableFn =
 enum class ExternReturnKind : std::uint8_t {
     Scalar,
     Table,
+};
+
+/// A fitted model produced by a model plugin. `native` is an opaque,
+/// plugin-owned object (e.g. a LightGBM booster) wrapped in a shared_ptr whose
+/// deleter lives in the plugin, so it frees itself when the last reference
+/// drops. The runtime never links or dereferences the underlying type — it only
+/// stores the handle and hands it back to the plugin's `predict`.
+struct FittedModel {
+    std::shared_ptr<void> native;
+    Table fitted;      ///< single column "fitted": in-sample predictions, input order
+    Table importance;  ///< term | gain (may be empty)
+};
+
+/// Parsed model parameters handed to a model plugin's `fit`
+/// (e.g. {"iterations", 300}, {"learning_rate", 0.03}).
+using ModelParams = std::vector<std::pair<std::string, ScalarValue>>;
+
+/// A model method implemented by a plugin: train, then predict on new data.
+/// Registered by method name (the `method =` value), e.g. "lightgbm".
+struct ModelOps {
+    /// `design` holds the feature columns plus the response column named
+    /// `response_col` (all Float64). Returns the fitted model.
+    std::function<std::expected<FittedModel, std::string>(
+        const Table& design, const std::string& response_col, const ModelParams& params)>
+        fit;
+    /// `native` is the FittedModel::native handle; `design` holds the feature
+    /// columns in the same layout/order as training (no response column).
+    /// Returns a single-column "prediction" table.
+    std::function<std::expected<Table, std::string>(const void* native, const Table& design)>
+        predict;
 };
 
 struct ExternFunction {
@@ -154,8 +186,22 @@ class ExternRegistry {
     /// Number of registered functions.
     [[nodiscard]] auto size() const noexcept -> std::size_t { return registry_.size(); }
 
+    /// Register a model method (the `method =` value, e.g. "lightgbm").
+    void register_model(std::string name, ModelOps ops) {
+        models_.insert_or_assign(std::move(name), std::move(ops));
+    }
+
+    /// Look up a registered model method by name.
+    [[nodiscard]] auto find_model(const std::string& name) const -> const ModelOps* {
+        if (auto it = models_.find(name); it != models_.end()) {
+            return &it->second;
+        }
+        return nullptr;
+    }
+
    private:
     std::unordered_map<std::string, ExternFunction> registry_;
+    std::unordered_map<std::string, ModelOps> models_;
 };
 
 }  // namespace ibex::runtime

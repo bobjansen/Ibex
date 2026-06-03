@@ -5808,7 +5808,67 @@ TEST_CASE("model: WLS with weights", "[model]") {
     REQUIRE(estimates[1] == Catch::Approx(2.0));
 }
 
-TEST_CASE("model: LightGBM plugin method", "[model]") {
+namespace {
+// Shared mock of a model plugin registered via register_model. fit returns a
+// perfect in-sample fit plus a sentinel native handle; predict applies y = 2x+1
+// and asserts the handle round-tripped.
+auto register_mock_model(runtime::ExternRegistry& externs) -> void {
+    externs.register_model(
+        "lightgbm",
+        runtime::ModelOps{
+            .fit = [](const runtime::Table& design, const std::string& response_col,
+                      const runtime::ModelParams& params)
+                -> std::expected<runtime::FittedModel, std::string> {
+                auto find_param = [&](const std::string& key) -> const runtime::ScalarValue* {
+                    for (const auto& [k, v] : params) {
+                        if (k == key) {
+                            return &v;
+                        }
+                    }
+                    return nullptr;
+                };
+                REQUIRE(response_col == "__response");
+                REQUIRE(find_param("iterations") != nullptr);
+                REQUIRE(std::get<std::int64_t>(*find_param("iterations")) == 250);
+                REQUIRE(find_param("learning_rate") != nullptr);
+                REQUIRE(std::get<double>(*find_param("learning_rate")) == Catch::Approx(0.04));
+
+                const auto* x = std::get_if<Column<double>>(design.find("x"));
+                const auto* y = std::get_if<Column<double>>(design.find("__response"));
+                REQUIRE(x != nullptr);
+                REQUIRE(y != nullptr);
+                REQUIRE(x->size() == y->size());
+
+                runtime::Table fitted;
+                fitted.add_column("fitted", *y);  // perfect in-sample fit
+                runtime::Table importance;
+                importance.add_column("term", Column<std::string>{"(intercept)", "x"});
+                importance.add_column("gain", Column<double>{0.0, 42.0});
+                return runtime::FittedModel{
+                    .native = std::make_shared<int>(7),  // sentinel handle
+                    .fitted = std::move(fitted),
+                    .importance = std::move(importance),
+                };
+            },
+            .predict = [](const void* native, const runtime::Table& design)
+                -> std::expected<runtime::Table, std::string> {
+                REQUIRE(native != nullptr);
+                REQUIRE(*static_cast<const int*>(native) == 7);
+                const auto* x = std::get_if<Column<double>>(design.find("x"));
+                REQUIRE(x != nullptr);
+                Column<double> preds;
+                for (double v : *x) {
+                    preds.push_back((2.0 * v) + 1.0);
+                }
+                runtime::Table out;
+                out.add_column("prediction", std::move(preds));
+                return out;
+            },
+        });
+}
+}  // namespace
+
+TEST_CASE("model: LightGBM plugin fit, accessors, and predict", "[model]") {
     runtime::Table t;
     t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
     t.add_column("y", Column<double>{3.0, 5.0, 7.0, 9.0, 11.0});
@@ -5817,37 +5877,32 @@ TEST_CASE("model: LightGBM plugin method", "[model]") {
     registry.emplace("t", t);
 
     runtime::ExternRegistry externs;
-    externs.register_scalar_table_consumer(
-        "model_lightgbm", runtime::ScalarKind::Int,
-        [](const runtime::Table& design_matrix,
-           const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
-            REQUIRE(args.size() == 5);
-            REQUIRE(std::get<std::string>(args[0]) == "__response");
-            REQUIRE(std::get<std::string>(args[1]) == "iterations");
-            REQUIRE(std::get<std::int64_t>(args[2]) == 250);
-            REQUIRE(std::get<std::string>(args[3]) == "learning_rate");
-            REQUIRE(std::get<double>(args[4]) == Catch::Approx(0.04));
-
-            const auto* x = std::get_if<Column<double>>(design_matrix.find("x"));
-            const auto* y = std::get_if<Column<double>>(design_matrix.find("__response"));
-            REQUIRE(x != nullptr);
-            REQUIRE(y != nullptr);
-            REQUIRE(x->size() == y->size());
-
-            runtime::Table out;
-            out.add_column("term", Column<std::string>{"(intercept)", "x"});
-            out.add_column("estimate", Column<double>{1.0, 2.0});
-            return runtime::ExternValue{std::move(out)};
-        });
+    register_mock_model(externs);
 
     auto ir = require_ir(
         "t[model { y ~ x, method = lightgbm, iterations = 250, learning_rate = 0.04 }];");
-    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    runtime::ModelResult model;
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs, &model);
     REQUIRE(result.has_value());
 
-    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
-    REQUIRE(estimates[0] == Catch::Approx(1.0));
-    REQUIRE(estimates[1] == Catch::Approx(2.0));
+    // A tree model has no coefficients; the primary table is feature importance.
+    const auto& gain = std::get<Column<double>>(*result->find("gain"));
+    REQUIRE(gain[1] == Catch::Approx(42.0));
+
+    // ModelResult carries predictions, R², and the native handle.
+    const auto& fitted = std::get<Column<double>>(*model.fitted_values.find("fitted"));
+    REQUIRE(fitted[0] == Catch::Approx(3.0));
+    REQUIRE(model.r_squared == Catch::Approx(1.0));  // perfect in-sample fit
+    REQUIRE(model.native != nullptr);
+
+    // model_predict reuses the live native handle on new data.
+    runtime::Table nd;
+    nd.add_column("x", Column<double>{10.0, 20.0});
+    auto preds = runtime::predict_model(model, nd, externs);
+    REQUIRE(preds.has_value());
+    const auto& pcol = std::get<Column<double>>(*preds->find("prediction"));
+    REQUIRE(pcol[0] == Catch::Approx(21.0));
+    REQUIRE(pcol[1] == Catch::Approx(41.0));
 }
 
 TEST_CASE("model: LightGBM plugin method accepts scalar bindings", "[model]") {
@@ -5863,28 +5918,7 @@ TEST_CASE("model: LightGBM plugin method accepts scalar bindings", "[model]") {
     scalars.emplace("learning_rate", runtime::ScalarValue{0.04});
 
     runtime::ExternRegistry externs;
-    externs.register_scalar_table_consumer(
-        "model_lightgbm", runtime::ScalarKind::Int,
-        [](const runtime::Table& design_matrix,
-           const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
-            REQUIRE(args.size() == 5);
-            REQUIRE(std::get<std::string>(args[0]) == "__response");
-            REQUIRE(std::get<std::string>(args[1]) == "iterations");
-            REQUIRE(std::get<std::int64_t>(args[2]) == 250);
-            REQUIRE(std::get<std::string>(args[3]) == "learning_rate");
-            REQUIRE(std::get<double>(args[4]) == Catch::Approx(0.04));
-
-            const auto* x = std::get_if<Column<double>>(design_matrix.find("x"));
-            const auto* y = std::get_if<Column<double>>(design_matrix.find("__response"));
-            REQUIRE(x != nullptr);
-            REQUIRE(y != nullptr);
-            REQUIRE(x->size() == y->size());
-
-            runtime::Table out;
-            out.add_column("term", Column<std::string>{"(intercept)", "x"});
-            out.add_column("estimate", Column<double>{1.0, 2.0});
-            return runtime::ExternValue{std::move(out)};
-        });
+    register_mock_model(externs);
 
     auto ir = require_ir(
         "t[model { y ~ x, method = lightgbm, iterations = iterations, learning_rate = "
@@ -5893,9 +5927,8 @@ TEST_CASE("model: LightGBM plugin method accepts scalar bindings", "[model]") {
     auto result = runtime::interpret(*ir, registry, &scalars, &externs);
     REQUIRE(result.has_value());
 
-    const auto& estimates = std::get<Column<double>>(*result->find("estimate"));
-    REQUIRE(estimates[0] == Catch::Approx(1.0));
-    REQUIRE(estimates[1] == Catch::Approx(2.0));
+    const auto& gain = std::get<Column<double>>(*result->find("gain"));
+    REQUIRE(gain[1] == Catch::Approx(42.0));
 }
 
 TEST_CASE("model: LightGBM method requires plugin import/registration", "[model]") {

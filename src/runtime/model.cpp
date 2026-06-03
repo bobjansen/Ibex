@@ -462,6 +462,7 @@ auto build_model_result(const std::vector<std::string>& col_names,
         .fitted_values = std::move(fitted_table),
         .residuals = std::move(resid_table),
         .importance = {},  // linear model: no tree feature importances
+        .native = {},      // linear model: no plugin-owned native handle
         .formula = formula,
         .method = method,
         .r_squared = r2,
@@ -471,49 +472,22 @@ auto build_model_result(const std::vector<std::string>& col_names,
     };
 }
 
-// Builds a ModelResult from a predictive plugin's long-format wire table
-// (columns kind:String, term:String, value:Float64). Rows with kind="fitted"
-// carry per-row predictions; rows with kind="importance" carry per-feature
-// gains. Unlike build_model_result, predictions come straight from the plugin
-// (a tree model has no linear coefficients to reconstruct them from).
-auto build_plugin_model_result(const Table& wire, const std::vector<std::string>& col_names,
-                               const std::vector<double>& y, const ir::ModelFormula& formula,
-                               const std::string& method)
+// Assembles a ModelResult from a model plugin's FittedModel. The plugin returns
+// in-sample predictions, feature importances, and an opaque native handle; the
+// runtime derives residuals and R² from the predictions and the response. Unlike
+// build_model_result there is no linear-coefficient reconstruction — a tree model
+// has none, and predictions come straight from the trained model.
+auto assemble_plugin_model_result(FittedModel fitted, const std::vector<std::string>& col_names,
+                                  const std::vector<double>& y, const ir::ModelFormula& formula,
+                                  const std::string& method)
     -> std::expected<ModelResult, std::string> {
-    const auto* kind_col = std::get_if<Column<std::string>>(wire.find("kind"));
-    const auto* term_col = std::get_if<Column<std::string>>(wire.find("term"));
-    const auto* value_col = std::get_if<Column<double>>(wire.find("value"));
-    if (kind_col == nullptr || term_col == nullptr || value_col == nullptr) {
-        return std::unexpected(
-            "model (" + method +
-            "): predictive plugin result needs kind:String, term:String, value:Float64");
+    const auto* fitted_col = std::get_if<Column<double>>(fitted.fitted.find("fitted"));
+    if (fitted_col == nullptr) {
+        return std::unexpected("model (" + method +
+                               "): plugin fit() must return a 'fitted' Float64 column");
     }
-    const std::size_t m = kind_col->size();
-    if (term_col->size() != m || value_col->size() != m) {
-        return std::unexpected("model (" + method + "): plugin result columns length mismatch");
-    }
-
-    std::vector<double> fitted;
-    std::vector<std::string> imp_terms;
-    std::vector<double> imp_gain;
-    fitted.reserve(m);
-    imp_terms.reserve(col_names.size());
-    imp_gain.reserve(col_names.size());
-    for (std::size_t i = 0; i < m; ++i) {
-        const std::string_view kind = (*kind_col)[i];
-        if (kind == "fitted") {
-            fitted.push_back((*value_col)[i]);
-        } else if (kind == "importance") {
-            imp_terms.emplace_back((*term_col)[i]);
-            imp_gain.push_back((*value_col)[i]);
-        } else {
-            return std::unexpected("model (" + method + "): unknown plugin row kind '" +
-                                   std::string(kind) + "'");
-        }
-    }
-
     const std::size_t n = y.size();
-    if (fitted.size() != n) {
+    if (fitted_col->size() != n) {
         return std::unexpected("model (" + method +
                                "): plugin returned wrong number of fitted values");
     }
@@ -527,26 +501,22 @@ auto build_plugin_model_result(const Table& wire, const std::vector<std::string>
     double ss_tot = 0.0;
     double ss_res = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
-        resid[i] = y[i] - fitted[i];
+        resid[i] = y[i] - (*fitted_col)[i];
         ss_tot += (y[i] - y_mean) * (y[i] - y_mean);
         ss_res += resid[i] * resid[i];
     }
     const double r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
 
-    Table fitted_table;
-    fitted_table.add_column("fitted", Column<double>(fitted));
     Table resid_table;
     resid_table.add_column("residual", Column<double>(resid));
-    Table importance_table;
-    importance_table.add_column("term", Column<std::string>(imp_terms));
-    importance_table.add_column("gain", Column<double>(imp_gain));
 
     return ModelResult{
         .coefficients = {},  // tree model: no linear coefficients
         .summary = {},
-        .fitted_values = std::move(fitted_table),
+        .fitted_values = std::move(fitted.fitted),
         .residuals = std::move(resid_table),
-        .importance = std::move(importance_table),
+        .importance = std::move(fitted.importance),
+        .native = std::move(fitted.native),
         .formula = formula,
         .method = method,
         .r_squared = r2,
@@ -658,6 +628,44 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
         return std::unexpected(y.error());
     }
 
+    // Model plugins (e.g. lightgbm) own their fitted model and predict on new
+    // data. They are dispatched here, before the linear-only observation/param
+    // check and normal-equation setup below, which do not apply to them.
+    if (externs != nullptr) {
+        if (const auto* ops = externs->find_model(method)) {
+            if (!ops->fit) {
+                return std::unexpected("model: plugin method '" + method +
+                                       "' has no fit implementation");
+            }
+            Table design;
+            for (std::size_t j = 0; j < p; ++j) {
+                design.add_column(col_names[j], Column<double>(x[j]));
+            }
+            design.add_column("__response", Column<double>(y.value()));
+
+            ModelParams model_params;
+            model_params.reserve(params.size());
+            for (const auto& param : params) {
+                if (param.name == "method") {
+                    continue;
+                }
+                auto scalar = eval_model_param_scalar(param.value, scalars);
+                if (!scalar.has_value()) {
+                    return std::unexpected("model (" + method + "): parameter '" + param.name +
+                                           "': " + scalar.error());
+                }
+                model_params.emplace_back(param.name, std::move(*scalar));
+            }
+
+            auto fitted = ops->fit(design, "__response", model_params);
+            if (!fitted.has_value()) {
+                return std::unexpected("model (" + method + "): " + fitted.error());
+            }
+            return assemble_plugin_model_result(std::move(*fitted), col_names, y.value(), formula,
+                                                method);
+        }
+    }
+
     if (n <= p) {
         std::string message = "model: need more observations (";
         message += std::to_string(n);
@@ -749,119 +757,38 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
         return build_model_result(col_names, x, y.value(), beta.value(), formula, method);
     }
 
-    if (externs != nullptr) {
-        std::string fn_name = "model_";
-        fn_name += method;
-        const auto* fn = externs->find(fn_name);
-        if (fn != nullptr) {
-            if (!fn->first_arg_is_table || !fn->table_consumer_func) {
-                std::string message = "model: plugin method '";
-                message += fn_name;
-                message += "' must be registered as a table consumer";
-                return std::unexpected(std::move(message));
-            }
-
-            Table design_table;
-            for (std::size_t j = 0; j < p; ++j) {
-                design_table.add_column(col_names[j], Column<double>(x[j]));
-            }
-            design_table.add_column("__response", Column<double>(y.value()));
-
-            ExternArgs plugin_args;
-            plugin_args.emplace_back(ScalarValue{std::string("__response")});
-            for (const auto& param : params) {
-                if (param.name == "method") {
-                    continue;
-                }
-                plugin_args.emplace_back(ScalarValue{param.name});
-                auto scalar = eval_model_param_scalar(param.value, scalars);
-                if (scalar.has_value()) {
-                    plugin_args.emplace_back(std::move(*scalar));
-                } else if (const auto* ref = std::get_if<ir::ColumnRef>(&param.value.node)) {
-                    std::string column_ref = "column:";
-                    column_ref += ref->name;
-                    plugin_args.emplace_back(ScalarValue{std::move(column_ref)});
-                } else {
-                    std::string message = "model: plugin parameter '";
-                    message += param.name;
-                    message += "' must be a scalar, scalar binding, or column reference";
-                    return std::unexpected(std::move(message));
-                }
-            }
-
-            auto plugin_result = fn->table_consumer_func(design_table, plugin_args);
-            if (!plugin_result) {
-                std::string message = "model (";
-                message += method;
-                message += "): ";
-                message += plugin_result.error();
-                return std::unexpected(std::move(message));
-            }
-
-            const auto* coef_table = std::get_if<Table>(&plugin_result.value());
-            if (coef_table == nullptr) {
-                std::string message = "model (";
-                message += method;
-                message += "): plugin must return a coefficients table";
-                return std::unexpected(std::move(message));
-            }
-            // Predictive (tree) plugins return a long-format kind/term/value
-            // table carrying per-row predictions and per-feature importances.
-            if (coef_table->find("kind") != nullptr && coef_table->find("value") != nullptr) {
-                return build_plugin_model_result(*coef_table, col_names, y.value(), formula,
-                                                 method);
-            }
-            const auto* term_any = coef_table->find("term");
-            const auto* estimate_any = coef_table->find("estimate");
-            if (term_any == nullptr || estimate_any == nullptr) {
-                std::string message = "model (";
-                message += method;
-                message += "): coefficients table must include 'term' and 'estimate'";
-                return std::unexpected(std::move(message));
-            }
-            const auto* term_col = std::get_if<Column<std::string>>(term_any);
-            const auto* estimate_col = std::get_if<Column<double>>(estimate_any);
-            if (term_col == nullptr || estimate_col == nullptr) {
-                std::string message = "model (";
-                message += method;
-                message += "): coefficient columns must be term:String and estimate:Float64";
-                return std::unexpected(std::move(message));
-            }
-            if (term_col->size() != estimate_col->size()) {
-                std::string message = "model (";
-                message += method;
-                message += "): coefficients length mismatch";
-                return std::unexpected(std::move(message));
-            }
-
-            std::unordered_map<std::string, double> beta_by_term;
-            beta_by_term.reserve(term_col->size());
-            for (std::size_t i = 0; i < term_col->size(); ++i) {
-                beta_by_term.insert_or_assign(std::string((*term_col)[i]), (*estimate_col)[i]);
-            }
-
-            std::vector<double> beta;
-            beta.reserve(col_names.size());
-            for (const auto& name : col_names) {
-                auto it = beta_by_term.find(name);
-                if (it == beta_by_term.end()) {
-                    std::string message = "model (";
-                    message += method;
-                    message += "): missing coefficient for term '";
-                    message += name;
-                    message += "'";
-                    return std::unexpected(std::move(message));
-                }
-                beta.push_back(it->second);
-            }
-            return build_model_result(col_names, x, y.value(), beta, formula, method);
-        }
-    }
-
     std::string message = "model: unknown method '";
     message += method;
-    message += "' (supported built-ins: ols, ridge, wls; plugins: model_<method>)";
+    message +=
+        "' (built-ins: ols, ridge, wls; plugin methods are registered via register_model, "
+        "e.g. import \"lightgbm\")";
     return std::unexpected(std::move(message));
+}
+
+auto predict_model(const ModelResult& model, const Table& newdata, const ExternRegistry& externs)
+    -> std::expected<Table, std::string> {
+    const auto* ops = externs.find_model(model.method);
+    if (ops == nullptr || !ops->predict) {
+        return std::unexpected("model_predict: method '" + model.method +
+                               "' does not support prediction (not a plugin model)");
+    }
+    if (model.native == nullptr) {
+        return std::unexpected("model_predict: model has no trained handle to predict with");
+    }
+
+    // Rebuild the design matrix from new data using the SAME formula, so the
+    // feature columns line up with training (same order, intercept, encodings).
+    auto matrix = build_model_matrix(newdata, model.formula);
+    if (!matrix) {
+        return std::unexpected(matrix.error());
+    }
+    auto& [col_names, x] = matrix.value();
+
+    Table design;
+    for (std::size_t j = 0; j < col_names.size(); ++j) {
+        design.add_column(col_names[j], Column<double>(x[j]));
+    }
+    return ops->predict(model.native.get(), design);
 }
 
 }  // namespace ibex::runtime

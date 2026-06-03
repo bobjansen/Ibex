@@ -63,3 +63,6 @@ let m9 = prices[model {
 
 let lgbm_preds      = model_fitted(m9);      // in-sample predictions
 let lgbm_importance = model_importance(m9);  // term | gain
+
+// Predict on new data — reuses the trained booster (no refit).
+let scored = model_predict(m9, prices);      // prediction column

@@ -1593,35 +1593,38 @@ Accessor functions extract sub-tables from a `ModelResult`:
 |----------|---------|
 | `coef(m)` / `model_coef(m)` | `Table`: term, estimate (empty for tree models) |
 | `summary(m)` / `model_summary(m)` | `Table`: term, estimate, std_error, t_stat, p_value |
-| `fitted(m)` / `model_fitted(m)` | `Table`: fitted (predicted values) |
+| `fitted(m)` / `model_fitted(m)` | `Table`: fitted (in-sample predicted values) |
 | `residuals(m)` / `model_residuals(m)` | `Table`: residual (y − ŷ) |
 | `importance(m)` / `model_importance(m)` | `Table`: term, gain (tree models; empty otherwise) |
 | `r_squared(m)` / `model_r_squared(m)` | `Float64`: coefficient of determination |
+| `predict(m, newdata)` / `model_predict(m, newdata)` | `Table`: prediction (plugin models only) |
+
+`model_predict` reuses the model's trained native handle to score `newdata`. The
+design matrix is rebuilt from `newdata` with the model's stored formula, so the
+columns line up with training (same order, intercept, and encodings).
 
 #### Plugin Model Methods
 
-In addition to built-ins (`ols`, `ridge`, `wls`), the runtime resolves plugin
-methods by name using `model_<method>`.
+In addition to built-ins (`ols`, `ridge`, `wls`), plugins register model methods
+by name with `ExternRegistry::register_model("<method>", ModelOps{fit, predict})`.
+`method = lightgbm` resolves to the bundled `lightgbm` plugin, which trains a real
+Microsoft LightGBM gradient-boosted tree model (linked statically into the plugin)
+and supports `iterations` and `learning_rate` parameters.
 
-For example, `method = lightgbm` dispatches to `model_lightgbm`, provided by the
-bundled `lightgbm` plugin, which trains a real Microsoft LightGBM gradient-boosted
-tree model (linked statically into the plugin) and supports `iterations` and
-`learning_rate` parameters.
+Plugin model contract (`ModelOps`):
 
-Plugin invocation contract:
+- **fit** receives the design matrix (feature columns plus the response column,
+  named `"__response"`, all `Float64`) and the parsed model parameters as
+  `(name, value)` pairs (excluding `method`). It returns a `FittedModel`:
+  - `native` — an opaque, self-freeing handle to the plugin's trained model
+    (`shared_ptr<void>` whose deleter lives in the plugin). The runtime stores it
+    in the `ModelResult` and never dereferences it.
+  - `fitted` — a single `Float64` column `"fitted"` of in-sample predictions.
+  - `importance` — a `{term: String, gain: Float64}` table (may be empty).
+- **predict** receives the `native` handle and a design matrix of feature columns
+  (no response) and returns a single-column `"prediction"` table.
 
-- The first scalar arg is the response column name in the provided design matrix
-  (currently `"__response"`).
-- Remaining scalar args are passed as `(name, value)` pairs from model params
-  (excluding `method`), in source order.
-- The plugin must return a `Table` in one of two shapes:
-  - **Linear** — `{term: String, estimate: Float64}`. Treated as coefficients;
-    the runtime reconstructs fitted values, residuals, and R² as a linear model.
-  - **Predictive (tree)** — long format `{kind: String, term: String, value: Float64}`,
-    with `kind = "fitted"` rows carrying per-row predictions (input order) and
-    `kind = "importance"` rows carrying per-feature gains. The runtime stores the
-    predictions directly (no linear reconstruction) and exposes the gains via
-    `model_importance`.
+The runtime derives residuals and R² from the fitted values and the response.
 
 If no built-in or plugin method exists, model evaluation returns an unknown
 method error.

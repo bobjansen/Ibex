@@ -123,6 +123,7 @@ constexpr std::string_view kCompletionBuiltins[] = {
     "model_coef",
     "model_fitted",
     "model_importance",
+    "model_predict",
     "model_residuals",
     "model_r_squared",
     "model_summary",
@@ -1938,6 +1939,38 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string>;
 
+auto is_model_predict(std::string_view callee) -> bool {
+    return callee == "predict" || callee == "model_predict";
+}
+
+// model_predict(m, newdata): look up the model binding `m`, evaluate `newdata`
+// as a table, and predict by reusing the model's native handle.
+auto eval_model_predict(parser::CallExpr& call, runtime::TableRegistry& tables,
+                        runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                        ModelRegistry& models, const FunctionRegistry& functions,
+                        CompileTimeListRegistry& compile_time_lists,
+                        const ExternDeclRegistry& extern_decls,
+                        const runtime::ExternRegistry& externs)
+    -> std::expected<runtime::Table, std::string> {
+    if (call.args.size() != 2 || !call.named_args.empty()) {
+        return std::unexpected(call.callee + ": expected (model, newdata)");
+    }
+    const auto* ident = std::get_if<parser::IdentifierExpr>(&call.args[0]->node);
+    if (ident == nullptr) {
+        return std::unexpected(call.callee + ": first argument must be a model binding name");
+    }
+    auto it = models.find(ident->name);
+    if (it == models.end()) {
+        return std::unexpected(call.callee + ": unknown model binding '" + ident->name + "'");
+    }
+    auto newdata = eval_table_expr(*call.args[1], tables, scalars, columns, models, functions,
+                                   compile_time_lists, extern_decls, externs);
+    if (!newdata) {
+        return std::unexpected(newdata.error());
+    }
+    return runtime::predict_model(it->second, newdata.value(), externs);
+}
+
 auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
                      ModelRegistry& models, const FunctionRegistry& functions,
@@ -1970,6 +2003,14 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (is_model_table_accessor(call->callee)) {
             auto table = eval_model_table_accessor(*call, models);
+            if (!table) {
+                return std::unexpected(table.error());
+            }
+            return EvalValue{std::move(table.value())};
+        }
+        if (is_model_predict(call->callee)) {
+            auto table = eval_model_predict(*call, tables, scalars, columns, models, functions,
+                                            compile_time_lists, extern_decls, externs);
             if (!table) {
                 return std::unexpected(table.error());
             }
@@ -2409,6 +2450,10 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (is_model_table_accessor(call->callee)) {
             return eval_model_table_accessor(*call, models);
+        }
+        if (is_model_predict(call->callee)) {
+            return eval_model_predict(*call, tables, scalars, columns, models, functions,
+                                      compile_time_lists, extern_decls, externs);
         }
         if (functions.contains(call->callee)) {
             auto value = eval_function_call(*call, tables, scalars, columns, models, functions,

@@ -478,40 +478,44 @@ auto build_model_result(const std::vector<std::string>& col_names,
 // build_model_result there is no linear-coefficient reconstruction — a tree model
 // has none, and predictions come straight from the trained model.
 auto assemble_plugin_model_result(FittedModel fitted, const std::vector<std::string>& col_names,
-                                  const std::vector<double>& y, const ir::ModelFormula& formula,
-                                  const std::string& method)
+                                  const std::vector<double>& y, bool has_response,
+                                  const ir::ModelFormula& formula, const std::string& method)
     -> std::expected<ModelResult, std::string> {
     const auto* fitted_col = std::get_if<Column<double>>(fitted.fitted.find("fitted"));
     if (fitted_col == nullptr) {
         return std::unexpected("model (" + method +
                                "): plugin fit() must return a 'fitted' Float64 column");
     }
-    const std::size_t n = y.size();
-    if (fitted_col->size() != n) {
-        return std::unexpected("model (" + method +
-                               "): plugin returned wrong number of fitted values");
-    }
+    const std::size_t n = fitted_col->size();
 
-    std::vector<double> resid(n, 0.0);
-    double y_mean = 0.0;
-    for (double v : y) {
-        y_mean += v;
-    }
-    y_mean /= (n > 0) ? static_cast<double>(n) : 1.0;
-    double ss_tot = 0.0;
-    double ss_res = 0.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        resid[i] = y[i] - (*fitted_col)[i];
-        ss_tot += (y[i] - y_mean) * (y[i] - y_mean);
-        ss_res += resid[i] * resid[i];
-    }
-    const double r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
-
+    // Residuals and R² only make sense for supervised methods. Unsupervised
+    // methods (e.g. kmeans) leave them empty/zero.
     Table resid_table;
-    resid_table.add_column("residual", Column<double>(resid));
+    double r2 = 0.0;
+    if (has_response) {
+        if (y.size() != n) {
+            return std::unexpected("model (" + method +
+                                   "): plugin returned wrong number of fitted values");
+        }
+        std::vector<double> resid(n, 0.0);
+        double y_mean = 0.0;
+        for (double v : y) {
+            y_mean += v;
+        }
+        y_mean /= (n > 0) ? static_cast<double>(n) : 1.0;
+        double ss_tot = 0.0;
+        double ss_res = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            resid[i] = y[i] - (*fitted_col)[i];
+            ss_tot += (y[i] - y_mean) * (y[i] - y_mean);
+            ss_res += resid[i] * resid[i];
+        }
+        r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
+        resid_table.add_column("residual", Column<double>(resid));
+    }
 
     return ModelResult{
-        .coefficients = {},  // tree model: no linear coefficients
+        .coefficients = {},  // plugin model: no linear coefficients
         .summary = {},
         .fitted_values = std::move(fitted.fitted),
         .residuals = std::move(resid_table),
@@ -623,13 +627,20 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
     const std::size_t n = input.rows();
     const std::size_t p = col_names.size();
 
-    auto y = extract_response(input, formula.response);
-    if (!y) {
-        return std::unexpected(y.error());
+    // The response is optional: unsupervised methods (e.g. kmeans) are written
+    // `~ x1 + x2` with no response. Linear built-ins require one (checked below).
+    const bool has_response = !formula.response.empty();
+    std::optional<std::vector<double>> y;
+    if (has_response) {
+        auto response = extract_response(input, formula.response);
+        if (!response) {
+            return std::unexpected(response.error());
+        }
+        y = std::move(response.value());
     }
 
-    // Model plugins (e.g. lightgbm) own their fitted model and predict on new
-    // data. They are dispatched here, before the linear-only observation/param
+    // Model plugins (e.g. lightgbm, kmeans) own their fitted model and predict on
+    // new data. They are dispatched here, before the linear-only observation/param
     // check and normal-equation setup below, which do not apply to them.
     if (externs != nullptr) {
         if (const auto* ops = externs->find_model(method)) {
@@ -641,7 +652,9 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
             for (std::size_t j = 0; j < p; ++j) {
                 design.add_column(col_names[j], Column<double>(x[j]));
             }
-            design.add_column("__response", Column<double>(y.value()));
+            if (has_response) {
+                design.add_column("__response", Column<double>(*y));
+            }
 
             ModelParams model_params;
             model_params.reserve(params.size());
@@ -657,13 +670,22 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
                 model_params.emplace_back(param.name, std::move(*scalar));
             }
 
-            auto fitted = ops->fit(design, "__response", model_params);
+            auto fitted = ops->fit(design, has_response ? std::string("__response") : std::string(),
+                                   model_params);
             if (!fitted.has_value()) {
                 return std::unexpected("model (" + method + "): " + fitted.error());
             }
-            return assemble_plugin_model_result(std::move(*fitted), col_names, y.value(), formula,
-                                                method);
+            static const std::vector<double> kNoResponse;
+            return assemble_plugin_model_result(std::move(*fitted), col_names,
+                                                has_response ? *y : kNoResponse, has_response,
+                                                formula, method);
         }
+    }
+
+    if (!has_response) {
+        return std::unexpected("model: method '" + method +
+                               "' requires a response (write `y ~ ...`); only plugin methods "
+                               "support the response-less `~ ...` form");
     }
 
     if (n <= p) {

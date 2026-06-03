@@ -8539,11 +8539,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(result.error());
             }
             // Extract the primary table before potentially moving the whole
-            // result. Linear methods expose coefficients; tree-model plugins
-            // have none, so fall back to their feature-importance table.
-            Table primary = result.value().coefficients.columns.empty()
-                                ? result.value().importance
-                                : result.value().coefficients;
+            // result. Linear methods expose coefficients; tree models expose
+            // feature importance; unsupervised models (e.g. kmeans) have neither,
+            // so fall back to the per-row fitted output (e.g. cluster ids).
+            Table primary =
+                !result.value().coefficients.columns.empty() ? result.value().coefficients
+                : !result.value().importance.columns.empty() ? result.value().importance
+                                                             : result.value().fitted_values;
             if (model_out != nullptr) {
                 *model_out = std::move(result.value());
             }
@@ -13445,10 +13447,12 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));
         }
-        // Linear methods expose coefficients as the primary table; tree-model
-        // plugins have none, so fall back to their feature-importance table.
-        Table primary = result.value().coefficients.columns.empty() ? result.value().importance
-                                                                    : result.value().coefficients;
+        // Linear methods expose coefficients; tree models expose importance;
+        // unsupervised models (e.g. kmeans) have neither, so fall back to the
+        // per-row fitted output (e.g. cluster ids).
+        Table primary = !result.value().coefficients.columns.empty() ? result.value().coefficients
+                        : !result.value().importance.columns.empty() ? result.value().importance
+                                                                     : result.value().fitted_values;
         if (model_out != nullptr) {
             *model_out = std::move(result.value());
         }

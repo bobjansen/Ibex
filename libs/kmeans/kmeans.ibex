@@ -1,0 +1,4 @@
+// K-means clustering plugin (pure C++, no external dependency).
+// Importing this file loads kmeans.so and registers the "kmeans" model method,
+// reachable as: df[model { ~ x1 + x2, method = kmeans, k = 3 }].
+// model_fitted/the result give per-row cluster ids; model_predict assigns new rows.

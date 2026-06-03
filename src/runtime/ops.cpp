@@ -292,6 +292,9 @@ auto model_fitted(const runtime::ModelResult& m) -> runtime::Table {
 auto model_residuals(const runtime::ModelResult& m) -> runtime::Table {
     return m.residuals;
 }
+auto model_importance(const runtime::ModelResult& m) -> runtime::Table {
+    return m.importance;
+}
 auto model_r_squared(const runtime::ModelResult& m) -> double {
     return m.r_squared;
 }

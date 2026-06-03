@@ -1545,8 +1545,8 @@ The `model` clause fits a statistical model using an R-style formula syntax.
 df[model { response ~ predictors }]
 df[filter cond, model { y ~ x1 + x2, method = ridge, lambda = 0.1 }]
 df[model { y ~ x1 * x2, method = wls, weights = w }]
-import "lightbm";
-df[model { y ~ x1 + x2, method = lightbm, iterations = 300, learning_rate = 0.03 }]
+import "lightgbm";
+df[model { y ~ x1 + x2, method = lightgbm, iterations = 300, learning_rate = 0.03 }]
 df[model { y ~ . }]
 df[model { y ~ x - 1 }]
 ```
@@ -1582,16 +1582,20 @@ The `method` parameter is optional; when omitted, Ibex uses `ols`.
 
 The `model` clause produces a `ModelResult` — an opaque type wrapping the
 fitted model. When used as a `Table` (e.g. in `let m = df[model {...}]`),
-the coefficients table is returned with schema `{term: String, estimate: Float64}`.
+linear methods return the coefficients table with schema
+`{term: String, estimate: Float64}`. Tree-model plugins (e.g. `lightgbm`) have
+no linear coefficients, so they return the feature-importance table
+`{term: String, gain: Float64}` instead.
 
 Accessor functions extract sub-tables from a `ModelResult`:
 
 | Accessor | Returns |
 |----------|---------|
-| `coef(m)` / `model_coef(m)` | `Table`: term, estimate |
+| `coef(m)` / `model_coef(m)` | `Table`: term, estimate (empty for tree models) |
 | `summary(m)` / `model_summary(m)` | `Table`: term, estimate, std_error, t_stat, p_value |
 | `fitted(m)` / `model_fitted(m)` | `Table`: fitted (predicted values) |
 | `residuals(m)` / `model_residuals(m)` | `Table`: residual (y − ŷ) |
+| `importance(m)` / `model_importance(m)` | `Table`: term, gain (tree models; empty otherwise) |
 | `r_squared(m)` / `model_r_squared(m)` | `Float64`: coefficient of determination |
 
 #### Plugin Model Methods
@@ -1599,8 +1603,10 @@ Accessor functions extract sub-tables from a `ModelResult`:
 In addition to built-ins (`ols`, `ridge`, `wls`), the runtime resolves plugin
 methods by name using `model_<method>`.
 
-For example, `method = lightbm` dispatches to `model_lightbm` when a plugin
-registers that extern table-consumer function.
+For example, `method = lightgbm` dispatches to `model_lightgbm`, provided by the
+bundled `lightgbm` plugin, which trains a real Microsoft LightGBM gradient-boosted
+tree model (linked statically into the plugin) and supports `iterations` and
+`learning_rate` parameters.
 
 Plugin invocation contract:
 
@@ -1608,9 +1614,14 @@ Plugin invocation contract:
   (currently `"__response"`).
 - Remaining scalar args are passed as `(name, value)` pairs from model params
   (excluding `method`), in source order.
-- The plugin must return a `Table` with schema:
-  - `term: String`
-  - `estimate: Float64`
+- The plugin must return a `Table` in one of two shapes:
+  - **Linear** — `{term: String, estimate: Float64}`. Treated as coefficients;
+    the runtime reconstructs fitted values, residuals, and R² as a linear model.
+  - **Predictive (tree)** — long format `{kind: String, term: String, value: Float64}`,
+    with `kind = "fitted"` rows carrying per-row predictions (input order) and
+    `kind = "importance"` rows carrying per-feature gains. The runtime stores the
+    predictions directly (no linear reconstruction) and exposes the gains via
+    `model_importance`.
 
 If no built-in or plugin method exists, model evaluation returns an unknown
 method error.

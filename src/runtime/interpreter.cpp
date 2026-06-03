@@ -8538,12 +8538,16 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!result) {
                 return std::unexpected(result.error());
             }
-            // Extract coefficients before potentially moving the whole result.
-            Table coef = result.value().coefficients;
+            // Extract the primary table before potentially moving the whole
+            // result. Linear methods expose coefficients; tree-model plugins
+            // have none, so fall back to their feature-importance table.
+            Table primary = result.value().coefficients.columns.empty()
+                                ? result.value().importance
+                                : result.value().coefficients;
             if (model_out != nullptr) {
                 *model_out = std::move(result.value());
             }
-            return coef;
+            return primary;
         }
         case ir::NodeKind::Program: {
             const auto& program = static_cast<const ir::ProgramNode&>(node);
@@ -13441,11 +13445,14 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));
         }
-        Table coef = result.value().coefficients;
+        // Linear methods expose coefficients as the primary table; tree-model
+        // plugins have none, so fall back to their feature-importance table.
+        Table primary = result.value().coefficients.columns.empty() ? result.value().importance
+                                                                    : result.value().coefficients;
         if (model_out != nullptr) {
             *model_out = std::move(result.value());
         }
-        return std::make_unique<TableSourceOperator>(std::move(coef));
+        return std::make_unique<TableSourceOperator>(std::move(primary));
     }
 
     if (node.kind() == ir::NodeKind::Construct || node.kind() == ir::NodeKind::Stream) {

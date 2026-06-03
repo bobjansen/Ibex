@@ -122,6 +122,7 @@ constexpr std::string_view kCompletionBuiltins[] = {
     "min",
     "model_coef",
     "model_fitted",
+    "model_importance",
     "model_residuals",
     "model_r_squared",
     "model_summary",
@@ -1816,7 +1817,8 @@ auto has_model_result(const runtime::ModelResult& model) -> bool {
 auto is_model_table_accessor(std::string_view callee) -> bool {
     return callee == "coef" || callee == "model_coef" || callee == "summary" ||
            callee == "model_summary" || callee == "fitted" || callee == "model_fitted" ||
-           callee == "residuals" || callee == "model_residuals";
+           callee == "residuals" || callee == "model_residuals" || callee == "importance" ||
+           callee == "model_importance";
 }
 
 auto is_model_scalar_accessor(std::string_view callee) -> bool {
@@ -1896,6 +1898,9 @@ auto eval_model_table_accessor(const parser::CallExpr& call, const ModelRegistry
     }
     if (call.callee == "fitted" || call.callee == "model_fitted") {
         return model.value()->fitted_values;
+    }
+    if (call.callee == "importance" || call.callee == "model_importance") {
+        return model.value()->importance;
     }
     return model.value()->residuals;
 }

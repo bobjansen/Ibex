@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  Ibex Regression Demo  ·  Model Specification Syntax
 //
-//  Demonstrates OLS, ridge, WLS, and LightBM plugin regression using
+//  Demonstrates OLS, ridge, WLS, and LightGBM plugin regression using
 //  R-style formula syntax.
 //  Design matrix construction, categorical dummy encoding, and interaction
 //  terms are handled automatically by the model clause.
@@ -11,7 +11,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "csv";
-import "lightbm";
+import "lightgbm";
 
 let prices = read_csv("examples/data/ohlcv.csv");
 
@@ -50,10 +50,16 @@ let m7 = prices[model { close ~ open + volume, method = ridge, lambda = 0.1 }];
 let weighted = prices[update { w = 1.0 / volume }];
 let m8 = weighted[model { close ~ open + high + low, method = wls, weights = w }];
 
-// ── 9. LightBM plugin method — stagewise boosting-style fitter ──────────────
+// ── 9. LightGBM plugin method — real gradient-boosted trees ─────────────────
+//    Trains a Microsoft LightGBM model (linked via the plugin). Unlike the OLS
+//    family there are no linear coefficients; m9 is the per-feature gain
+//    importance table. Predictions and importances are available via accessors.
 let m9 = prices[model {
     close ~ open + high + low + volume,
-    method = lightbm,
+    method = lightgbm,
     iterations = 300,
     learning_rate = 0.03
 }];
+
+let lgbm_preds      = model_fitted(m9);      // in-sample predictions
+let lgbm_importance = model_importance(m9);  // term | gain

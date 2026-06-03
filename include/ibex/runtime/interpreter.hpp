@@ -218,10 +218,11 @@ using ScalarRegistry = std::unordered_map<std::string, ScalarValue>;
 /// Accessor functions (`coef`, `residuals`, `fitted`, `summary`) extract
 /// sub-tables; `predict` applies the stored formula to new data.
 struct ModelResult {
-    Table coefficients;   ///< term | estimate
+    Table coefficients;   ///< term | estimate (empty for non-linear plugins)
     Table summary;        ///< term | estimate | std_error | t_stat | p_value
     Table fitted_values;  ///< single column: fitted
     Table residuals;      ///< single column: residual
+    Table importance;     ///< term | gain (tree models; empty otherwise)
     ir::ModelFormula formula;
     std::string method;
     double r_squared = 0.0;

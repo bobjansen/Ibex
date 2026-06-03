@@ -461,12 +461,98 @@ auto build_model_result(const std::vector<std::string>& col_names,
         .summary = std::move(summary_table),
         .fitted_values = std::move(fitted_table),
         .residuals = std::move(resid_table),
+        .importance = {},  // linear model: no tree feature importances
         .formula = formula,
         .method = method,
         .r_squared = r2,
         .adj_r_squared = adj_r2,
         .n_obs = n,
         .n_params = p,
+    };
+}
+
+// Builds a ModelResult from a predictive plugin's long-format wire table
+// (columns kind:String, term:String, value:Float64). Rows with kind="fitted"
+// carry per-row predictions; rows with kind="importance" carry per-feature
+// gains. Unlike build_model_result, predictions come straight from the plugin
+// (a tree model has no linear coefficients to reconstruct them from).
+auto build_plugin_model_result(const Table& wire, const std::vector<std::string>& col_names,
+                               const std::vector<double>& y, const ir::ModelFormula& formula,
+                               const std::string& method)
+    -> std::expected<ModelResult, std::string> {
+    const auto* kind_col = std::get_if<Column<std::string>>(wire.find("kind"));
+    const auto* term_col = std::get_if<Column<std::string>>(wire.find("term"));
+    const auto* value_col = std::get_if<Column<double>>(wire.find("value"));
+    if (kind_col == nullptr || term_col == nullptr || value_col == nullptr) {
+        return std::unexpected(
+            "model (" + method +
+            "): predictive plugin result needs kind:String, term:String, value:Float64");
+    }
+    const std::size_t m = kind_col->size();
+    if (term_col->size() != m || value_col->size() != m) {
+        return std::unexpected("model (" + method + "): plugin result columns length mismatch");
+    }
+
+    std::vector<double> fitted;
+    std::vector<std::string> imp_terms;
+    std::vector<double> imp_gain;
+    fitted.reserve(m);
+    imp_terms.reserve(col_names.size());
+    imp_gain.reserve(col_names.size());
+    for (std::size_t i = 0; i < m; ++i) {
+        const std::string_view kind = (*kind_col)[i];
+        if (kind == "fitted") {
+            fitted.push_back((*value_col)[i]);
+        } else if (kind == "importance") {
+            imp_terms.emplace_back((*term_col)[i]);
+            imp_gain.push_back((*value_col)[i]);
+        } else {
+            return std::unexpected("model (" + method + "): unknown plugin row kind '" +
+                                   std::string(kind) + "'");
+        }
+    }
+
+    const std::size_t n = y.size();
+    if (fitted.size() != n) {
+        return std::unexpected("model (" + method +
+                               "): plugin returned wrong number of fitted values");
+    }
+
+    std::vector<double> resid(n, 0.0);
+    double y_mean = 0.0;
+    for (double v : y) {
+        y_mean += v;
+    }
+    y_mean /= (n > 0) ? static_cast<double>(n) : 1.0;
+    double ss_tot = 0.0;
+    double ss_res = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        resid[i] = y[i] - fitted[i];
+        ss_tot += (y[i] - y_mean) * (y[i] - y_mean);
+        ss_res += resid[i] * resid[i];
+    }
+    const double r2 = (ss_tot > 0.0) ? 1.0 - (ss_res / ss_tot) : 0.0;
+
+    Table fitted_table;
+    fitted_table.add_column("fitted", Column<double>(fitted));
+    Table resid_table;
+    resid_table.add_column("residual", Column<double>(resid));
+    Table importance_table;
+    importance_table.add_column("term", Column<std::string>(imp_terms));
+    importance_table.add_column("gain", Column<double>(imp_gain));
+
+    return ModelResult{
+        .coefficients = {},  // tree model: no linear coefficients
+        .summary = {},
+        .fitted_values = std::move(fitted_table),
+        .residuals = std::move(resid_table),
+        .importance = std::move(importance_table),
+        .formula = formula,
+        .method = method,
+        .r_squared = r2,
+        .adj_r_squared = 0.0,
+        .n_obs = n,
+        .n_params = col_names.size(),
     };
 }
 
@@ -718,6 +804,12 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
                 message += method;
                 message += "): plugin must return a coefficients table";
                 return std::unexpected(std::move(message));
+            }
+            // Predictive (tree) plugins return a long-format kind/term/value
+            // table carrying per-row predictions and per-feature importances.
+            if (coef_table->find("kind") != nullptr && coef_table->find("value") != nullptr) {
+                return build_plugin_model_result(*coef_table, col_names, y.value(), formula,
+                                                 method);
             }
             const auto* term_any = coef_table->find("term");
             const auto* estimate_any = coef_table->find("estimate");

@@ -1433,7 +1433,7 @@ Stream {
           <h3>R-style formula syntax for regression, built into the query bracket.</h3>
           <p>
             The <code>model</code> clause lets you fit OLS, ridge, WLS, or the
-            plugin-backed <code>lightbm</code> method
+            plugin-backed <code>lightgbm</code> method
             regressions with a familiar <code>y&nbsp;~&nbsp;x1&nbsp;+&nbsp;x2</code>
             formula. Ibex builds the design matrix automatically — numeric columns
             pass through, categorical columns are dummy-encoded, and interaction
@@ -1442,13 +1442,16 @@ Stream {
           <p>
             Results are accessed via S3-style accessor functions:
             <code>model_coef</code>, <code>model_summary</code>,
-            <code>model_fitted</code>, <code>model_residuals</code>, and
+            <code>model_fitted</code>, <code>model_residuals</code>,
+            <code>model_importance</code>, and
             <code>model_r_squared</code>. The <code>method&nbsp;=</code> parameter
             is optional and defaults to <code>ols</code>; it also supports
             built-ins (<code>ols</code>, <code>ridge</code>,
             <code>wls</code>) plus plugin methods registered as
-            <code>model_&lt;method&gt;</code> (for example
-            <code>model_lightbm</code>).
+            <code>model_&lt;method&gt;</code>. The bundled <code>lightgbm</code>
+            plugin links real Microsoft LightGBM and trains gradient-boosted
+            trees — use <code>model_fitted</code> for predictions and
+            <code>model_importance</code> for per-feature gains.
           </p>
         </div>
         <div class="tour-code">
@@ -1469,14 +1472,16 @@ Stream {
     lambda = <span class="num">0.1</span>
 }];
 
-<span class="cm">// LightBM plugin method (load plugin first)</span>
-<span class="kw">import</span> <span class="str">"lightbm"</span>;
+<span class="cm">// Real LightGBM gradient-boosted trees (load plugin first)</span>
+<span class="kw">import</span> <span class="str">"lightgbm"</span>;
 <span class="kw">let</span> boosted = prices[<span class="kw">model</span> {
     close ~ open + high + low + volume,
-    method = lightbm,
+    method = lightgbm,
     iterations = <span class="num">300</span>,
     learning_rate = <span class="num">0.03</span>
-}];</code></pre>
+}];
+<span class="kw">let</span> preds = <span class="fn-name">model_fitted</span>(boosted);      <span class="cm">// predictions</span>
+<span class="kw">let</span> gains = <span class="fn-name">model_importance</span>(boosted);  <span class="cm">// term | gain</span></code></pre>
         </div>
       </div>
 

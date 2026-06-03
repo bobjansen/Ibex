@@ -1428,13 +1428,16 @@ class Parser {
             return std::nullopt;
         }
 
-        // Parse the formula: response ~ rhs
+        // Parse the formula: `response ~ rhs`, or `~ rhs` for unsupervised
+        // methods (e.g. kmeans) that have no response.
         Formula formula;
-        auto response = consume_column_identifier("expected response column name");
-        if (!response.has_value()) {
-            return std::nullopt;
+        if (!check(TokenKind::Tilde)) {
+            auto response = consume_column_identifier("expected response column name");
+            if (!response.has_value()) {
+                return std::nullopt;
+            }
+            formula.response = std::move(*response);
         }
-        formula.response = std::move(*response);
         if (!consume(TokenKind::Tilde, "expected '~' after response variable")) {
             return std::nullopt;
         }

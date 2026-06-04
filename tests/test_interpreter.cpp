@@ -3688,6 +3688,68 @@ TEST_CASE("unary negation: literals, columns, and compound expressions", "[negat
     }
 }
 
+TEST_CASE("scalar registry: casts/ceil/floor/trunc/round in update", "[scalar_registry]") {
+    runtime::Table table;
+    table.add_column("f", Column<double>{1.4, 2.5, 3.6});
+    table.add_column("i", Column<std::int64_t>{1, 2, 3});
+    table.add_column("w", Column<double>{2.0, 4.0, 6.0});  // whole-valued
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "t[update { fi = Float64(i), iw = Int64(w), c = ceil(f), fl = floor(f), tr = trunc(f), "
+        "rn = round(f, nearest), rb = round(f, bankers) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& fi = std::get<Column<double>>(*result->find("fi"));
+    const auto& iw = std::get<Column<std::int64_t>>(*result->find("iw"));
+    const auto& c = std::get<Column<double>>(*result->find("c"));
+    const auto& fl = std::get<Column<double>>(*result->find("fl"));
+    const auto& tr = std::get<Column<double>>(*result->find("tr"));
+    const auto& rn = std::get<Column<std::int64_t>>(*result->find("rn"));
+    const auto& rb = std::get<Column<std::int64_t>>(*result->find("rb"));
+
+    CHECK(fi[0] == 1.0);
+    CHECK(iw[2] == 6);
+    CHECK(c[0] == 2.0);
+    CHECK(fl[2] == 3.0);
+    CHECK(tr[1] == 2.0);
+    CHECK(rn[1] == 3);  // 2.5 nearest, ties away from zero -> 3
+    CHECK(rb[1] == 2);  // 2.5 banker's, ties to even -> 2
+    CHECK(rn[2] == 4);  // 3.6 -> 4
+}
+
+TEST_CASE("scalar registry: Int cast of non-integer Float errors", "[scalar_registry]") {
+    runtime::Table table;
+    table.add_column("f", Column<double>{1.5, 2.5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { bad = Int64(f) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("cannot cast non-integer Float") != std::string::npos);
+}
+
+TEST_CASE("scalar registry: shared by filter predicates", "[scalar_registry]") {
+    runtime::Table table;
+    table.add_column("f", Column<double>{1.5, 2.5, 3.5});
+    table.add_column("w", Column<double>{2.0, 4.0, 6.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // Casts and round work in predicate position (same registry as update/select).
+    auto ir = require_ir("t[filter Int64(w) > 3 && round(f, nearest) > 2];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto& f = std::get<Column<double>>(*result->find("f"));
+    REQUIRE(f.size() == 2);
+    CHECK(f[0] == 2.5);
+    CHECK(f[1] == 3.5);
+}
+
 TEST_CASE("rand_int lo == hi always yields lo") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3});

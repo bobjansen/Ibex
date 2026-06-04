@@ -481,19 +481,24 @@ auto assemble_plugin_model_result(FittedModel fitted, const std::vector<std::str
                                   const std::vector<double>& y, bool has_response,
                                   const ir::ModelFormula& formula, const std::string& method)
     -> std::expected<ModelResult, std::string> {
-    const auto* fitted_col = std::get_if<Column<double>>(fitted.fitted.find("fitted"));
-    if (fitted_col == nullptr) {
-        return std::unexpected("model (" + method +
-                               "): plugin fit() must return a 'fitted' Float64 column");
-    }
-    const std::size_t n = fitted_col->size();
+    // The fitted output may be a single column (regression/cluster id) or
+    // several (e.g. a PCA projection), so size is taken from the table itself.
+    const std::size_t n = fitted.fitted.rows();
 
-    // Residuals and R² only make sense for supervised methods. Unsupervised
-    // methods (e.g. kmeans) leave them empty/zero.
+    // Residuals and R² only make sense for supervised methods. Unsupervised /
+    // transform methods (kmeans, pca) leave them empty/zero, and may return a
+    // multi-column fitted table. A supervised method must return a single
+    // 'fitted' Float64 column so residuals can be computed.
     Table resid_table;
     double r2 = 0.0;
     if (has_response) {
-        if (y.size() != n) {
+        const auto* fitted_col = std::get_if<Column<double>>(fitted.fitted.find("fitted"));
+        if (fitted_col == nullptr) {
+            return std::unexpected(
+                "model (" + method +
+                "): a supervised plugin must return a single 'fitted' Float64 column");
+        }
+        if (fitted_col->size() != y.size()) {
             return std::unexpected("model (" + method +
                                    "): plugin returned wrong number of fitted values");
         }
@@ -516,7 +521,7 @@ auto assemble_plugin_model_result(FittedModel fitted, const std::vector<std::str
 
     return ModelResult{
         .coefficients = {},  // plugin model: no linear coefficients
-        .summary = {},
+        .summary = std::move(fitted.summary),
         .fitted_values = std::move(fitted.fitted),
         .residuals = std::move(resid_table),
         .importance = std::move(fitted.importance),

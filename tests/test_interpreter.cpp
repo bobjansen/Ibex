@@ -5844,10 +5844,13 @@ auto register_mock_model(runtime::ExternRegistry& externs) -> void {
                 runtime::Table importance;
                 importance.add_column("term", Column<std::string>{"(intercept)", "x"});
                 importance.add_column("gain", Column<double>{0.0, 42.0});
+                runtime::Table summary;
+                summary.add_column("note", Column<std::string>{"mock"});
                 return runtime::FittedModel{
                     .native = std::make_shared<int>(7),  // sentinel handle
                     .fitted = std::move(fitted),
                     .importance = std::move(importance),
+                    .summary = std::move(summary),
                 };
             },
             .predict = [](const void* native, const runtime::Table& design)
@@ -5894,6 +5897,7 @@ TEST_CASE("model: LightGBM plugin fit, accessors, and predict", "[model]") {
     REQUIRE(fitted[0] == Catch::Approx(3.0));
     REQUIRE(model.r_squared == Catch::Approx(1.0));  // perfect in-sample fit
     REQUIRE(model.native != nullptr);
+    REQUIRE(model.summary.find("note") != nullptr);  // plugin summary slot flows through
 
     // model_predict reuses the live native handle on new data.
     runtime::Table nd;

@@ -197,6 +197,7 @@ auto fit_lightgbm(const runtime::Table& design_matrix, const std::string& respon
         .native = std::move(native),
         .fitted = std::move(fitted),
         .importance = std::move(importance_table),
+        .summary = {},  // gains already carry the per-feature summary
     };
 }
 

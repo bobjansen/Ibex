@@ -22,7 +22,8 @@ struct KMeansModel {
 };
 
 struct Design {
-    std::vector<double> data;  // n * p, row-major
+    std::vector<std::string> terms;  // feature names, length p
+    std::vector<double> data;        // n * p, row-major
     std::size_t n = 0;
     std::size_t p = 0;
 };
@@ -30,14 +31,16 @@ struct Design {
 auto build_design(const runtime::Table& table) -> std::expected<Design, std::string> {
     std::vector<const Column<double>*> cols;
     cols.reserve(table.columns.size());
+    Design out;
+    out.terms.reserve(table.columns.size());
     for (const auto& col : table.columns) {
         const auto* x = std::get_if<Column<double>>(col.column.get());
         if (x == nullptr) {
             return std::unexpected("feature column '" + col.name + "' must be Float64");
         }
+        out.terms.push_back(col.name);
         cols.push_back(x);
     }
-    Design out;
     out.p = cols.size();
     if (out.p == 0) {
         return std::unexpected("no feature columns");
@@ -173,10 +176,28 @@ auto fit_kmeans(const runtime::Table& design_matrix, const std::string& /*respon
     runtime::Table fitted;
     fitted.add_column("fitted", std::move(clusters));
 
+    // Summary: the centroids — one row per cluster, a column per feature.
+    runtime::Table summary;
+    Column<std::int64_t> cluster_ids;
+    cluster_ids.reserve(kk);
+    for (std::size_t c = 0; c < kk; ++c) {
+        cluster_ids.push_back(static_cast<std::int64_t>(c));
+    }
+    summary.add_column("cluster", std::move(cluster_ids));
+    for (std::size_t j = 0; j < p; ++j) {
+        Column<double> coord;
+        coord.reserve(kk);
+        for (std::size_t c = 0; c < kk; ++c) {
+            coord.push_back(model->centroids[(c * p) + j]);
+        }
+        summary.add_column(design->terms[j], std::move(coord));
+    }
+
     return runtime::FittedModel{
         .native = std::shared_ptr<void>(std::move(model)),
         .fitted = std::move(fitted),
         .importance = {},  // unsupervised: no feature importance
+        .summary = std::move(summary),
     };
 }
 

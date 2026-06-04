@@ -1,0 +1,66 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex RNG Demo  ·  Synthetic PCA (recover a known latent direction)
+//
+//  Generates correlated data from a single hidden factor plus one independent
+//  axis, using Ibex's vectorized RNG, then runs the PCA plugin and checks that
+//  the leading principal component lines up with the known factor direction.
+//
+//  Generative process — one latent factor t drives three correlated axes,
+//  while w is independent noise:
+//
+//      t ~ Normal(0, 4)                          (hidden factor)
+//
+//      x =  1.0·t + Normal(0, 0.3)
+//      y =  2.0·t + Normal(0, 0.3)               ← loadings ∝ (1, 2, −1.5)
+//      z = −1.5·t + Normal(0, 0.3)
+//      w =          Normal(0, 1.0)               (independent of t)
+//
+//  Almost all variance lives along the (1, 2, −1.5) direction, so PC1's
+//  loadings should be proportional to (1, 2, −1.5)/‖·‖ ≈ (0.37, 0.74, −0.55)
+//  on x/y/z with a near-zero loading on w. PC2 should pick up the independent
+//  w axis, and PC1's variance (eigenvalue) should dwarf PC2's.
+//
+//  NOTE: the REPL parses ONE statement per line, so each statement stays on a
+//  single line; a bare `name;` line prints that binding.
+//
+//  Run:  ./build-release/tools/ibex \
+//          --plugin-path build-release/tools \
+//          --import-path  build-release/tools  < examples/rng_pca.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "pca";
+
+seed_rng(8675309);
+
+// 1. N-row scaffold (widen the 4-row `trades` demo table).
+let scaffold = trades[select { row = rep(0, length_out=4000) }];
+
+// 2. Draw the latent factor, three small per-axis noises, and the independent
+//    axis w (each rand_* is the sole RHS of its binding).
+let draws = scaffold[update { t = rand_normal(0.0, 4.0), e1 = rand_normal(0.0, 0.3), e2 = rand_normal(0.0, 0.3), e3 = rand_normal(0.0, 0.3), w = rand_normal(0.0, 1.0) }];
+
+// 3. Build the correlated observed axes from the factor (pure column
+//    arithmetic; w is carried through unchanged). z's −1.5 slope is written as
+//    `e3 − 1.5·t` to keep the negative out of a literal position.
+let data = draws[update { x = t + e1, y = t * 2.0 + e2, z = e3 - t * 1.5 }];
+
+// 4. PCA keeping the top 2 components. The −1 drops the intercept; PCA centers
+//    internally, so a constant design column would be meaningless.
+let pc = data[model { ~ x + y + z + w - 1, method = pca, k = 2 }];
+
+// model_fitted gives per-row scores pc1, pc2; model_summary gives the loadings:
+// one row per component, one column per feature, plus the variance (eigenvalue).
+let scores = model_fitted(pc);
+let loadings = model_summary(pc);
+
+// 5. Project fresh points onto the trained components. The first probe loads
+//    heavily on the (x, y) factor axis → large PC1 score; the second is pure w
+//    → it shows up mainly on PC2. (Table literals take non-negative elements,
+//    so we keep the probe coordinates non-negative.)
+let probes = Table { x = [4.0, 0.0], y = [8.0, 0.0], z = [0.0, 0.0], w = [0.0, 5.0] };
+let probe_scores = model_predict(pc, probes);
+
+// 6. Show the recovery. component 1 variance ≫ component 2 variance; PC1
+//    loadings ∝ (1, 2, −1.5) on x/y/z with ~0 on w.
+loadings;
+probe_scores;

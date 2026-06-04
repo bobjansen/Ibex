@@ -1,0 +1,72 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex RNG Demo  ·  Synthetic K-Means Clustering (recover known blobs)
+//
+//  Generates three well-separated 2-D Gaussian blobs using Ibex's vectorized
+//  RNG, then runs the k-means plugin and checks that it recovers the blobs.
+//  Because we placed the cluster centers ourselves, the centroids in
+//  model_summary should land right on top of the true centers.
+//
+//  Generative process:
+//
+//      g ~ UniformInt{0, 1, 2}                    (latent cluster label)
+//
+//      center(g) = (0, 15)  if g = 0              ← cx = 12·g
+//                  (12,  0) if g = 1                 cy = 15·(g − 1)²
+//                  (24, 15) if g = 2
+//
+//      x = cx + Normal(0, 1)        y = cy + Normal(0, 1)
+//
+//  The cluster label `g` is turned into centers without any conditional: 12·g
+//  spaces the centers along x, and 15·(g−1)² lifts the outer two blobs above
+//  the middle one — a non-collinear triangle k-means can separate cleanly.
+//
+//  NOTE: the REPL parses ONE statement per line, so each statement stays on a
+//  single line; a bare `name;` line prints that binding.
+//
+//  Run:  ./build-release/tools/ibex \
+//          --plugin-path build-release/tools \
+//          --import-path  build-release/tools  < examples/rng_clustering.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "kmeans";
+
+seed_rng(31337);
+
+// 1. N-row scaffold (widen the 4-row `trades` demo table).
+let scaffold = trades[select { row = rep(0, length_out=3000) }];
+
+// 2. Draw the latent label and the per-axis Gaussian noise (each rand_* is the
+//    sole RHS of its binding).
+let draws = scaffold[update { g = rand_int(0, 2), nx = rand_normal(0.0, 1.0), ny = rand_normal(0.0, 1.0) }];
+
+// 3. Turn the label into blob centers (pure column arithmetic). gc = g − 1
+//    recenters the label to {−1, 0, 1}; squaring it lifts the outer blobs.
+//    g is Int64; multiplying by a float literal promotes the result to Float64.
+let centered = draws[update { cx = g * 12.0, gc = g * 1.0 - 1.0 }];
+let placed = centered[update { cy = gc * gc * 15.0 }];
+
+// 4. Scatter points around their centers.
+let pts = placed[update { x = cx + nx, y = cy + ny }];
+
+// 5. Order by x before fitting. The plugin seeds k-means from evenly-spaced
+//    rows; on randomly-ordered data those three seeds can fall in the same blob
+//    and Lloyd's iteration then converges to a poor local optimum. Sorting by x
+//    (blobs sit at x ≈ 0, 12, 24) spreads the seeds across the three blobs.
+let sorted = pts[order x];
+
+// 6. Cluster with k = 3. Unsupervised → response-less formula; the −1 drops the
+//    design-matrix intercept that a centered clustering does not need.
+let km = sorted[model { ~ x + y - 1, method = kmeans, k = 3 }];
+
+// model_fitted gives the per-row cluster id; model_summary gives the centroids.
+let assignments = model_fitted(km);
+let centroids = model_summary(km);
+
+// 7. Assign fresh points (one planted at each true center) to their cluster.
+let probes = Table { x = [0.0, 12.0, 24.0], y = [15.0, 0.0, 15.0] };
+let probe_clusters = model_predict(km, probes);
+
+// 8. Show the recovery. Centroids should match {(0,15), (12,0), (24,15)} up to
+//    a label permutation; each probe should map to its blob's cluster id.
+centroids;
+probe_clusters;

@@ -2706,8 +2706,13 @@ extern implementations. The recommended path for custom scalar logic is
 | `abs(x)`        | `Numeric -> Numeric`               |
 | `log(x)`        | `Numeric -> Float64`               |
 | `sqrt(x)`       | `Numeric -> Float64`               |
+| `exp(x)`        | `Numeric -> Float64`               |
+| `ceil(x)`       | `Numeric -> Numeric` (round up to an integral value, type preserved)   |
+| `floor(x)`      | `Numeric -> Numeric` (round down to an integral value, type preserved) |
+| `trunc(x)`      | `Numeric -> Numeric` (round toward zero, type preserved)               |
 | `pmin(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `pmax(x, y, ...)`| `Comparable{2+} -> Comparable`    |
+| `is_nan(x)`     | `Float64 -> Bool`                  |
 | `year(t)`       | `Date|Timestamp -> Int32`          |
 | `month(t)`      | `Date|Timestamp -> Int32`          |
 | `day(t)`        | `Date|Timestamp -> Int32`          |
@@ -2715,6 +2720,12 @@ extern implementations. The recommended path for custom scalar logic is
 | `minute(t)`     | `Timestamp -> Int32`               |
 | `second(t)`     | `Timestamp -> Int32`               |
 | `round(x, mode)`| `Float -> Int64`                   |
+
+These scalar functions, the cast constructors of Section 3.1.1
+(`Int64`/`Float64`/…), and `round` are row-wise: they may be used uniformly in
+`select`, `update` (plain and windowed), and `filter` predicates. `ceil`/
+`floor`/`trunc` keep the numeric type (an integral `Float64` stays `Float64`);
+use `round(x, ceil|floor|trunc)` for a `Float -> Int64` conversion.
 
 `round(x, mode)` converts a `Float64` scalar or `Series<Float64>` to `Int64` /
 `Series<Int64>`. The mode is a bare identifier (not a string):

@@ -68,5 +68,5 @@ let probe_clusters = model_predict(km, probes);
 
 // 8. Show the recovery. Centroids should match {(0,15), (12,0), (24,15)} up to
 //    a label permutation; each probe should map to its blob's cluster id.
-centroids;
-probe_clusters;
+print(centroids);
+print(probe_clusters);

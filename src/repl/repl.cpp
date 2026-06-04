@@ -789,6 +789,21 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
     runtime::format_table(table, std::cout, max_rows);
 }
 
+// Render any evaluated value (table, scalar, or column) to stdout using the
+// same formatting the REPL applies to a bare expression statement. Shared by
+// the top-level statement printer and the `print(...)` builtin.
+void render_eval_value(const EvalValue& value) {
+    if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
+        fmt::print("{}\n", format_scalar(*scalar));
+    } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value)) {
+        runtime::Table temp;
+        temp.add_column("column", *col);
+        print_table(temp);
+    } else {
+        print_table(std::get<runtime::Table>(value));
+    }
+}
+
 void print_tables(const runtime::TableRegistry& tables) {
     if (tables.empty()) {
         fmt::print("tables: <none>\n");
@@ -2070,6 +2085,20 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return std::unexpected("round(): cannot round a table");
         }
+        if (call->callee == "print") {
+            if (call->args.size() != 1 || !call->named_args.empty()) {
+                return std::unexpected("print: expected exactly one argument");
+            }
+            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, models,
+                                         functions, compile_time_lists, extern_decls, externs);
+            if (!inner) {
+                return std::unexpected(inner.error());
+            }
+            // Display as a side effect and pass the value through unchanged, so
+            // `print(x)` composes (e.g. `let y = print(x);` shows and binds).
+            render_eval_value(inner.value());
+            return inner;
+        }
         if (call->callee == "seed_rng") {
             if (call->args.size() != 1 || !call->named_args.empty()) {
                 return std::unexpected("seed_rng: expected exactly one argument (seed: Int)");
@@ -2454,6 +2483,19 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (is_model_predict(call->callee)) {
             return eval_model_predict(*call, tables, scalars, columns, models, functions,
                                       compile_time_lists, extern_decls, externs);
+        }
+        if (call->callee == "print") {
+            if (call->args.size() != 1 || !call->named_args.empty()) {
+                return std::unexpected("print: expected exactly one argument");
+            }
+            auto inner =
+                eval_table_expr(*call->args[0], tables, scalars, columns, models, functions,
+                                compile_time_lists, extern_decls, externs, model_out);
+            if (!inner) {
+                return std::unexpected(inner.error());
+            }
+            print_table(inner.value());
+            return inner;
         }
         if (functions.contains(call->callee)) {
             auto value = eval_function_call(*call, tables, scalars, columns, models, functions,
@@ -3195,14 +3237,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 fmt::print("error: {}\n", value.error());
                 return false;
             }
-            if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                fmt::print("{}\n", format_scalar(*scalar));
-            } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
-                runtime::Table temp;
-                temp.add_column("column", *col);
-                print_table(temp);
-            } else {
-                print_table(std::get<runtime::Table>(std::move(value.value())));
+            // A top-level `print(...)` already rendered its argument; rendering
+            // the passed-through return value here too would print it twice.
+            const auto* call = std::get_if<parser::CallExpr>(&expr_stmt.expr->node);
+            const bool already_printed = call != nullptr && call->callee == "print";
+            if (!already_printed) {
+                render_eval_value(value.value());
             }
         }
     }

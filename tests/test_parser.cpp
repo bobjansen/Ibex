@@ -870,7 +870,10 @@ TEST_CASE("Lexer error includes invalid numeric literal lexeme") {
 
 // --- Unary expressions ------------------------------------------------------
 
-TEST_CASE("Parse unary negation") {
+TEST_CASE("Parse unary negation of a literal folds to a negative literal") {
+    // Negating a numeric literal is folded at parse time into a negative
+    // literal, so it is first-class wherever a literal (not an expression) is
+    // required — Table constructor elements, RNG arguments, and so on.
     const char* source = "let x = -42;";
     auto result = parse(source);
     REQUIRE(result.has_value());
@@ -880,6 +883,29 @@ TEST_CASE("Parse unary negation") {
     REQUIRE(std::holds_alternative<LetStmt>(stmt));
     const auto& let_stmt = std::get<LetStmt>(stmt);
     const auto& expr = require_expr(let_stmt.value);
+    const auto* lit = std::get_if<LiteralExpr>(&expr.node);
+    REQUIRE(lit != nullptr);
+    const auto* iv = std::get_if<std::int64_t>(&lit->value);
+    REQUIRE(iv != nullptr);
+    REQUIRE(*iv == -42);
+
+    // A negative float literal folds the same way.
+    auto fresult = parse("let y = -3.5;");
+    REQUIRE(fresult.has_value());
+    const auto& fexpr = require_expr(std::get<LetStmt>(fresult->statements.front()).value);
+    const auto* flit = std::get_if<LiteralExpr>(&fexpr.node);
+    REQUIRE(flit != nullptr);
+    const auto* dv = std::get_if<double>(&flit->value);
+    REQUIRE(dv != nullptr);
+    REQUIRE(*dv == -3.5);
+}
+
+TEST_CASE("Parse unary negation of a non-literal stays a UnaryExpr") {
+    // Negating a column / identifier cannot be folded; it remains a UnaryExpr
+    // (lowered later as `0 - x`).
+    auto result = parse("let n = -x;");
+    REQUIRE(result.has_value());
+    const auto& expr = require_expr(std::get<LetStmt>(result->statements.front()).value);
     const auto* unary = std::get_if<UnaryExpr>(&expr.node);
     REQUIRE(unary != nullptr);
     REQUIRE(unary->op == UnaryOp::Negate);

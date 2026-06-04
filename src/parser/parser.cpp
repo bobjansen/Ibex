@@ -730,6 +730,21 @@ class Parser {
             if (!expr) {
                 return nullptr;
             }
+            // Fold negation of a numeric literal directly into a negative
+            // literal. This makes negative literals first-class wherever a
+            // literal (not a general expression) is required — Table
+            // constructor elements, RNG arguments, and so on — instead of
+            // leaving a UnaryExpr those contexts reject.
+            if (auto* lit = std::get_if<LiteralExpr>(&expr->node)) {
+                if (auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                    lit->value = -*iv;
+                    return expr;
+                }
+                if (auto* dv = std::get_if<double>(&lit->value)) {
+                    lit->value = -*dv;
+                    return expr;
+                }
+            }
             return make_unary(UnaryOp::Negate, std::move(expr));
         }
         if (match(TokenKind::Bang)) {

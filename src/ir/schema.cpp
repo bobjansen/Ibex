@@ -521,8 +521,15 @@ void collect_expr_columns(const Expr& expr, std::vector<std::string>& out) {
             } else if constexpr (std::is_same_v<T, IsNullExpr>) {
                 collect_expr_columns(*node.operand, out);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
-                for (const auto& arg : node.args) {
-                    collect_expr_columns(*arg, out);
+                // round(x, mode): the second argument is a bare mode identifier
+                // (nearest/bankers/floor/ceil/trunc), not a column reference, so
+                // it must not be validated against the input schema.
+                const bool round_mode = (node.callee == "round" && node.args.size() == 2);
+                for (std::size_t i = 0; i < node.args.size(); ++i) {
+                    if (round_mode && i == 1) {
+                        continue;
+                    }
+                    collect_expr_columns(*node.args[i], out);
                 }
                 for (const auto& named : node.named_args) {
                     collect_expr_columns(*named.value, out);

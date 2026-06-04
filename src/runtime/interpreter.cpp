@@ -1190,68 +1190,22 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
     }
 }
 
-auto eval_filter_int_scalar_arg(const ir::Expr& expr, const Table& table,
-                                const ScalarRegistry* scalars)
-    -> std::expected<std::int64_t, std::string> {
-    return std::visit(
-        [&](const auto& node) -> std::expected<std::int64_t, std::string> {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::Literal>) {
-                if (const auto* value = std::get_if<std::int64_t>(&node.value)) {
-                    return *value;
-                }
-                return std::unexpected("expected Int64 scalar argument");
-            } else if constexpr (std::is_same_v<T, ir::ColumnRef>) {
-                if (table.find(node.name) != nullptr) {
-                    return std::unexpected("expected scalar argument, got column '" + node.name +
-                                           "'");
-                }
-                if (scalars != nullptr) {
-                    auto it = scalars->find(node.name);
-                    if (it != scalars->end()) {
-                        if (const auto* value = std::get_if<std::int64_t>(&it->second)) {
-                            return *value;
-                        }
-                        return std::unexpected("scalar argument must be Int64: " + node.name);
-                    }
-                }
-                return std::unexpected("unknown scalar argument: " + node.name);
-            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                auto lhs = eval_filter_int_scalar_arg(*node.left, table, scalars);
-                if (!lhs) {
-                    return std::unexpected(lhs.error());
-                }
-                auto rhs = eval_filter_int_scalar_arg(*node.right, table, scalars);
-                if (!rhs) {
-                    return std::unexpected(rhs.error());
-                }
-                switch (node.op) {
-                    case ir::ArithmeticOp::Add:
-                        return *lhs + *rhs;
-                    case ir::ArithmeticOp::Sub:
-                        return *lhs - *rhs;
-                    case ir::ArithmeticOp::Mul:
-                        return *lhs * *rhs;
-                    case ir::ArithmeticOp::Div:
-                        if (*rhs == 0) {
-                            return std::unexpected("division by zero in scalar argument");
-                        }
-                        return *lhs / *rhs;
-                    case ir::ArithmeticOp::Mod:
-                        if (*rhs == 0) {
-                            return std::unexpected("modulo by zero in scalar argument");
-                        }
-                        return *lhs % *rhs;
-                }
-                // Unreachable for valid enum values, but MSVC (/WX) can't prove
-                // the switch is exhaustive and errors with C4715 otherwise.
-                return std::unexpected("unknown arithmetic operator in scalar argument");
-            } else {
-                return std::unexpected("expected scalar argument");
-            }
-        },
-        expr.node);
-}
+// Forward declarations: the vectorized predicate evaluator below dispatches the
+// same way the select/update field evaluator does, rather than reimplementing
+// functions. Row-wise calls go to evaluate_field_column (which consults the one
+// scalar-function registry: casts, ceil/floor/trunc, round, math, date parts,
+// pmin/pmax, is_nan); the column-level lag/lead go to eval_lag_lead_column (the
+// same helper select/update uses). Neither is duplicated here.
+struct LagLeadResult {
+    ColumnValue column;
+    std::optional<ValidityBitmap> validity;
+};
+auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
+                           const ExternRegistry* externs)
+    -> std::expected<ColumnValue, std::string>;
+auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,
+                          const ScalarRegistry* scalars, const ExternRegistry* externs)
+    -> std::expected<LagLeadResult, std::string>;
 
 // Evaluate a value sub-expression over all n rows, returning a column.
 // Returns a pointer into the table for simple column references (zero-copy),
@@ -1314,111 +1268,28 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 return res;
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 if (node.callee != "lag" && node.callee != "lead") {
-                    return std::unexpected("filter: unsupported function '" + node.callee + "'");
-                }
-                if (node.args.size() != 2) {
-                    return std::unexpected(node.callee + ": expected 2 arguments");
-                }
-                const auto* col_ref = std::get_if<ir::ColumnRef>(&node.args[0]->node);
-                if (col_ref == nullptr) {
-                    return std::unexpected(node.callee + ": first argument must be a column name");
-                }
-                auto offset_result = eval_filter_int_scalar_arg(*node.args[1], table, scalars);
-                if (!offset_result) {
-                    return std::unexpected(node.callee + ": " + offset_result.error());
-                }
-                if (*offset_result < 0) {
-                    return std::unexpected(
-                        node.callee + ": second argument must evaluate to a non-negative Int64");
-                }
-                const auto* source = table.find_entry(col_ref->name);
-                if (source == nullptr) {
-                    return std::unexpected(node.callee + ": unknown column '" + col_ref->name +
-                                           "'");
-                }
-                const bool is_lag = node.callee == "lag";
-                const std::size_t offset = static_cast<std::size_t>(*offset_result);
-                ColumnValue shifted = std::visit(
-                    [&](const auto& col) -> ColumnValue {
-                        using ColT = std::decay_t<decltype(col)>;
-                        ColT result;
-                        if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
-                                      std::is_same_v<ColT, Column<std::string>>) {
-                            result.reserve(n);
-                            auto push_default = [&] {
-                                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                                    result.push_back(std::string_view{});
-                                } else {
-                                    using ValueT = typename ColT::value_type;
-                                    result.push_back(ValueT{});
-                                }
-                            };
-                            if (is_lag) {
-                                for (std::size_t row = 0; row < n; ++row) {
-                                    if (row < offset) {
-                                        push_default();
-                                    } else {
-                                        result.push_back(col[row - offset]);
-                                    }
-                                }
-                            } else {
-                                for (std::size_t row = 0; row < n; ++row) {
-                                    if (row + offset >= n) {
-                                        push_default();
-                                    } else {
-                                        result.push_back(col[row + offset]);
-                                    }
-                                }
-                            }
-                        } else {
-                            using ValueT = typename ColT::value_type;
-                            result.resize(n);
-                            if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                                for (std::size_t row = 0; row < n; ++row) {
-                                    if (is_lag) {
-                                        if (row >= offset) {
-                                            result.set(row, col[row - offset]);
-                                        }
-                                    } else if (row + offset < n) {
-                                        result.set(row, col[row + offset]);
-                                    }
-                                }
-                            } else {
-                                if (is_lag) {
-                                    if (offset < n) {
-                                        std::memcpy(result.data() + offset, col.data(),
-                                                    (n - offset) * sizeof(ValueT));
-                                    }
-                                } else if (offset < n) {
-                                    std::memcpy(result.data(), col.data() + offset,
-                                                (n - offset) * sizeof(ValueT));
-                                }
-                            }
-                        }
-                        return result;
-                    },
-                    *source->column);
-
-                ColResult result{std::move(shifted)};
-                ValidityBitmap validity(n, false);
-                for (std::size_t row = 0; row < n; ++row) {
-                    std::optional<std::size_t> source_row;
-                    if (is_lag) {
-                        if (row >= offset) {
-                            source_row = row - offset;
-                        }
-                    } else if (row + offset < n) {
-                        source_row = row + offset;
+                    // Any other call: delegate to the row-wise field evaluator,
+                    // which dispatches through the shared scalar registry. Extern
+                    // scalar functions are not available in predicate position
+                    // (externs are not threaded into this vectorized evaluator).
+                    auto col = evaluate_field_column(expr, table, scalars, nullptr);
+                    if (!col) {
+                        return std::unexpected(col.error());
                     }
-                    if (!source_row.has_value()) {
-                        continue;
-                    }
-                    const bool source_valid =
-                        !source->validity.has_value() || (*source->validity)[*source_row];
-                    validity.set(row, source_valid);
+                    return ColResult{std::move(*col)};
                 }
-                result.owned_validity = std::move(validity);
-                return result;
+                // lag/lead are column-level shifts (each output row reads a
+                // different input row), so they cannot go through the row-wise
+                // registry. Delegate to the same helper select/update uses rather
+                // than reimplementing the shift here.
+                auto shifted =
+                    eval_lag_lead_column(node, table, node.callee == "lag", scalars, nullptr);
+                if (!shifted) {
+                    return std::unexpected(shifted.error());
+                }
+                ColResult res{std::move(shifted->column)};
+                res.owned_validity = std::move(shifted->validity);
+                return res;
             } else {
                 return std::unexpected("filter: not a value expression");
             }
@@ -4699,6 +4570,363 @@ constexpr auto rng_func_returns_int(std::string_view name) -> bool;
 constexpr auto is_fill_func(std::string_view name) -> bool;
 constexpr auto is_float_clean_func(std::string_view name) -> bool;
 
+// ── Row-wise scalar builtins: one source of truth ───────────────────────────
+//
+// A pure row-wise scalar function is a function of its already-evaluated
+// arguments — one value in each row maps to one value out. Both the
+// type-inference pass (`infer_expr_type`, which picks the output column type)
+// and the per-row evaluation pass (`eval_expr`, which computes each cell)
+// dispatch these functions through this single table. Previously each pass had
+// its own hand-maintained switch, so functions could drift out of sync — casts,
+// ceil/floor/trunc, and round were usable at the REPL top level but missing
+// from `update`/`select`. Registering once here keeps both passes in lockstep.
+//
+// Functions that need column-level context (fill_*, cum*, rolling_*, lag/lead,
+// RNG, rep, externs) or that are not pure functions of their evaluated
+// arguments (round's mode is a syntactic identifier; is_null is null-aware) are
+// handled outside this table, in the call sites below.
+
+auto expr_value_to_double(const ExprValue& v) -> std::optional<double> {
+    if (const auto* i = std::get_if<std::int64_t>(&v)) {
+        return static_cast<double>(*i);
+    }
+    if (const auto* d = std::get_if<double>(&v)) {
+        return *d;
+    }
+    return std::nullopt;
+}
+
+// Extract a calendar/clock field from a Date or Timestamp value.
+auto eval_date_part(std::string_view name, const ExprValue& v)
+    -> std::expected<ExprValue, std::string> {
+    using namespace std::chrono;
+    const bool date_ok = (name == "year" || name == "month" || name == "day");
+    if (const auto* dv = std::get_if<Date>(&v)) {
+        if (!date_ok) {
+            return std::unexpected(std::string(name) + ": argument must be Timestamp");
+        }
+        year_month_day ymd{sys_days{days{dv->days}}};
+        if (name == "year") {
+            return ExprValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
+        }
+        if (name == "month") {
+            return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()))};
+        }
+        return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()))};
+    }
+    if (const auto* tv = std::get_if<Timestamp>(&v)) {
+        sys_time<nanoseconds> tp{nanoseconds{tv->nanos}};
+        auto day_pt = floor<days>(tp);
+        year_month_day ymd{day_pt};
+        hh_mm_ss<nanoseconds> hms{tp - day_pt};
+        if (name == "year") {
+            return ExprValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
+        }
+        if (name == "month") {
+            return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()))};
+        }
+        if (name == "day") {
+            return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()))};
+        }
+        if (name == "hour") {
+            return ExprValue{static_cast<std::int64_t>(hms.hours().count())};
+        }
+        if (name == "minute") {
+            return ExprValue{static_cast<std::int64_t>(hms.minutes().count())};
+        }
+        return ExprValue{static_cast<std::int64_t>(hms.seconds().count())};
+    }
+    return std::unexpected(std::string(name) + ": argument must be Date or Timestamp");
+}
+
+struct ScalarBuiltin {
+    int min_args = 1;
+    int max_args = 1;  // -1 == variadic
+    std::expected<ExprType, std::string> (*infer)(std::string_view, const std::vector<ExprType>&);
+    std::expected<ExprValue, std::string> (*eval)(std::string_view, const std::vector<ExprValue>&);
+};
+
+const std::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtins() {
+    using IT = std::expected<ExprType, std::string>;
+    using IV = std::expected<ExprValue, std::string>;
+    static const std::unordered_map<std::string_view, ScalarBuiltin> table = [] {
+        std::unordered_map<std::string_view, ScalarBuiltin> m;
+
+        // abs: numeric -> same numeric type.
+        m.emplace("abs", ScalarBuiltin{1, 1,
+                                       [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                                           if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
+                                               return a[0];
+                                           }
+                                           return std::unexpected("abs: argument must be numeric");
+                                       },
+                                       [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                                           if (const auto* i = std::get_if<std::int64_t>(&a[0])) {
+                                               return ExprValue{std::int64_t{std::abs(*i)}};
+                                           }
+                                           if (const auto* d = std::get_if<double>(&a[0])) {
+                                               return ExprValue{std::abs(*d)};
+                                           }
+                                           return std::unexpected("abs: argument must be numeric");
+                                       }});
+
+        // sqrt / log / exp: numeric -> Float64.
+        const ScalarBuiltin transcendental{
+            1, 1,
+            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
+                    return ExprType::Double;
+                }
+                return std::unexpected(std::string(name) + ": argument must be numeric");
+            },
+            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+                auto x = expr_value_to_double(a[0]);
+                if (!x) {
+                    return std::unexpected(std::string(name) + ": argument must be numeric");
+                }
+                if (name == "sqrt") {
+                    return ExprValue{std::sqrt(*x)};
+                }
+                if (name == "log") {
+                    return ExprValue{std::log(*x)};
+                }
+                return ExprValue{std::exp(*x)};
+            }};
+        m.emplace("sqrt", transcendental);
+        m.emplace("log", transcendental);
+        m.emplace("exp", transcendental);
+
+        // ceil / floor / trunc: round to an integral value, preserving the
+        // numeric type (Int is already integral, so it passes through). Use
+        // round(x, ceil|floor|trunc) for a Float -> Int64 conversion.
+        const ScalarBuiltin integral{
+            1, 1,
+            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
+                    return a[0];
+                }
+                return std::unexpected(std::string(name) + ": argument must be numeric");
+            },
+            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+                if (std::holds_alternative<std::int64_t>(a[0])) {
+                    return a[0];
+                }
+                if (const auto* d = std::get_if<double>(&a[0])) {
+                    if (name == "ceil") {
+                        return ExprValue{std::ceil(*d)};
+                    }
+                    if (name == "floor") {
+                        return ExprValue{std::floor(*d)};
+                    }
+                    return ExprValue{std::trunc(*d)};
+                }
+                return std::unexpected(std::string(name) + ": argument must be numeric");
+            }};
+        m.emplace("ceil", integral);
+        m.emplace("floor", integral);
+        m.emplace("trunc", integral);
+
+        // Float64 / Float32: cast Int or Float to Float64.
+        const ScalarBuiltin to_float{
+            1, 1,
+            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
+                    return ExprType::Double;
+                }
+                return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Float");
+            },
+            [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                if (auto d = expr_value_to_double(a[0])) {
+                    return ExprValue{*d};
+                }
+                return std::unexpected("cast: cannot cast non-numeric to Float");
+            }};
+        m.emplace("Float64", to_float);
+        m.emplace("Float32", to_float);
+
+        // Int64 / Int32 / Int: cast Int or whole-valued Float to Int64.
+        const ScalarBuiltin to_int{
+            1, 1,
+            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
+                    return ExprType::Int;
+                }
+                return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
+            },
+            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+                if (const auto* i = std::get_if<std::int64_t>(&a[0])) {
+                    return ExprValue{*i};
+                }
+                if (const auto* d = std::get_if<double>(&a[0])) {
+                    if (*d != std::trunc(*d)) {
+                        return std::unexpected(std::string(name) +
+                                               "(): cannot cast non-integer Float to Int (use "
+                                               "floor(), ceil(), or round())");
+                    }
+                    return ExprValue{static_cast<std::int64_t>(*d)};
+                }
+                return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
+            }};
+        m.emplace("Int64", to_int);
+        m.emplace("Int32", to_int);
+        m.emplace("Int", to_int);
+
+        // year / month / day / hour / minute / second: Date|Timestamp -> Int.
+        const ScalarBuiltin date_part{
+            1, 1,
+            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                const bool date_ok = (name == "year" || name == "month" || name == "day");
+                if (a[0] == ExprType::Timestamp || (date_ok && a[0] == ExprType::Date)) {
+                    return ExprType::Int;
+                }
+                return std::unexpected(std::string(name) +
+                                       (date_ok ? ": argument must be Date or Timestamp"
+                                                : ": argument must be Timestamp"));
+            },
+            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+                return eval_date_part(name, a[0]);
+            }};
+        m.emplace("year", date_part);
+        m.emplace("month", date_part);
+        m.emplace("day", date_part);
+        m.emplace("hour", date_part);
+        m.emplace("minute", date_part);
+        m.emplace("second", date_part);
+
+        // is_nan: Float64 -> Bool.
+        m.emplace("is_nan",
+                  ScalarBuiltin{1, 1,
+                                [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                                    if (a[0] == ExprType::Double) {
+                                        return ExprType::Bool;
+                                    }
+                                    return std::unexpected("is_nan: argument must be Float64");
+                                },
+                                [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                                    if (const auto* d = std::get_if<double>(&a[0])) {
+                                        return ExprValue{std::isnan(*d)};
+                                    }
+                                    return std::unexpected("is_nan: argument must be Float64");
+                                }});
+
+        // pmin / pmax: 2+ comparable args of one type (Int/Float widen to Float).
+        const ScalarBuiltin pminmax{
+            2, -1,
+            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                std::optional<ExprType> result;
+                for (ExprType t : a) {
+                    if (!result) {
+                        result = t;
+                        continue;
+                    }
+                    if ((*result == ExprType::Int && t == ExprType::Double) ||
+                        (*result == ExprType::Double && t == ExprType::Int)) {
+                        result = ExprType::Double;
+                        continue;
+                    }
+                    if (*result != t) {
+                        return std::unexpected(
+                            std::string(name) +
+                            ": arguments must all be comparable and of one type");
+                    }
+                }
+                if (*result == ExprType::Bool) {
+                    return std::unexpected(std::string(name) +
+                                           ": Bool arguments are not supported");
+                }
+                return *result;
+            },
+            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+                const bool want_min = (name == "pmin");
+                auto better = [&](const ExprValue& cand,
+                                  const ExprValue& best) -> std::expected<bool, std::string> {
+                    auto num = [](const ExprValue& v) -> std::optional<double> {
+                        return expr_value_to_double(v);
+                    };
+                    if (auto c = num(cand)) {
+                        auto b = num(best);
+                        if (!b) {
+                            return std::unexpected(std::string(name) +
+                                                   ": arguments must all be comparable");
+                        }
+                        return want_min ? *c < *b : *c > *b;
+                    }
+                    if (std::holds_alternative<std::string>(cand) &&
+                        std::holds_alternative<std::string>(best)) {
+                        return want_min ? std::get<std::string>(cand) < std::get<std::string>(best)
+                                        : std::get<std::string>(cand) > std::get<std::string>(best);
+                    }
+                    if (std::holds_alternative<Date>(cand) && std::holds_alternative<Date>(best)) {
+                        return want_min ? std::get<Date>(cand) < std::get<Date>(best)
+                                        : std::get<Date>(cand) > std::get<Date>(best);
+                    }
+                    if (std::holds_alternative<Timestamp>(cand) &&
+                        std::holds_alternative<Timestamp>(best)) {
+                        return want_min ? std::get<Timestamp>(cand) < std::get<Timestamp>(best)
+                                        : std::get<Timestamp>(cand) > std::get<Timestamp>(best);
+                    }
+                    return std::unexpected(std::string(name) +
+                                           ": arguments must all be comparable and of one type");
+                };
+                ExprValue best = a[0];
+                if (std::holds_alternative<bool>(best)) {
+                    return std::unexpected(std::string(name) +
+                                           ": Bool arguments are not supported");
+                }
+                for (std::size_t i = 1; i < a.size(); ++i) {
+                    auto take = better(a[i], best);
+                    if (!take) {
+                        return std::unexpected(take.error());
+                    }
+                    if (*take) {
+                        best = a[i];
+                    }
+                }
+                return best;
+            }};
+        m.emplace("pmin", pminmax);
+        m.emplace("pmax", pminmax);
+
+        return m;
+    }();
+    return table;
+}
+
+// round(x, mode): mode is a bare identifier (lowered to a ColumnRef), so round
+// is dispatched separately from the value-based scalar registry above.
+auto valid_round_mode(std::string_view m) -> bool {
+    return m == "nearest" || m == "bankers" || m == "floor" || m == "ceil" || m == "trunc";
+}
+
+auto extract_ir_round_mode(const ir::Expr& arg) -> std::expected<std::string_view, std::string> {
+    if (const auto* ref = std::get_if<ir::ColumnRef>(&arg.node)) {
+        if (valid_round_mode(ref->name)) {
+            return std::string_view{ref->name};
+        }
+        return std::unexpected("round(): unknown mode '" + ref->name +
+                               "' (expected: nearest, bankers, floor, ceil, trunc)");
+    }
+    return std::unexpected(
+        "round(): second argument must be a bare mode identifier "
+        "(nearest, bankers, floor, ceil, trunc)");
+}
+
+auto apply_round(double v, std::string_view mode) -> std::int64_t {
+    if (mode == "nearest") {
+        return static_cast<std::int64_t>(std::llround(v));
+    }
+    if (mode == "bankers") {
+        return static_cast<std::int64_t>(std::llrint(v));  // FE_TONEAREST: ties to even
+    }
+    if (mode == "floor") {
+        return static_cast<std::int64_t>(std::floor(v));
+    }
+    if (mode == "ceil") {
+        return static_cast<std::int64_t>(std::ceil(v));
+    }
+    return static_cast<std::int64_t>(std::trunc(v));  // trunc
+}
+
 auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                      const ExternRegistry* externs) -> std::expected<ExprType, std::string> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
@@ -4766,49 +4994,43 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         return ExprType::Int;
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
-        if (call->callee == "abs") {
-            if (call->args.size() != 1) {
-                return std::unexpected("abs: expected 1 argument");
+        // Pure row-wise scalar builtins: single source of truth (see
+        // scalar_builtins()). Both this pass and eval_expr dispatch here.
+        if (auto it = scalar_builtins().find(call->callee); it != scalar_builtins().end()) {
+            const auto& fn = it->second;
+            const auto argc = static_cast<int>(call->args.size());
+            if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
+                return std::unexpected(std::string(call->callee) + ": wrong number of arguments");
             }
-            auto arg_type = infer_expr_type(*call->args[0], input, scalars, externs);
-            if (!arg_type) {
-                return arg_type;
+            std::vector<ExprType> arg_types;
+            arg_types.reserve(call->args.size());
+            for (const auto& arg : call->args) {
+                auto t = infer_expr_type(*arg, input, scalars, externs);
+                if (!t) {
+                    return t;
+                }
+                arg_types.push_back(*t);
             }
-            if (arg_type.value() == ExprType::Int || arg_type.value() == ExprType::Double) {
-                return arg_type.value();
-            }
-            return std::unexpected("abs: argument must be numeric");
+            return fn.infer(call->callee, arg_types);
         }
-        if (call->callee == "sqrt" || call->callee == "log" || call->callee == "exp") {
-            if (call->args.size() != 1) {
-                return std::unexpected(call->callee + ": expected 1 argument");
+        // round(x, mode): mode is a bare identifier, so it is dispatched apart
+        // from the value-based registry. Always yields Int64.
+        if (call->callee == "round") {
+            if (call->args.size() != 2) {
+                return std::unexpected("round: expected 2 arguments (value, mode)");
+            }
+            auto mode = extract_ir_round_mode(*call->args[1]);
+            if (!mode) {
+                return std::unexpected(mode.error());
             }
             auto arg_type = infer_expr_type(*call->args[0], input, scalars, externs);
             if (!arg_type) {
                 return arg_type;
             }
-            if (arg_type.value() == ExprType::Int || arg_type.value() == ExprType::Double) {
-                return ExprType::Double;
+            if (*arg_type != ExprType::Int && *arg_type != ExprType::Double) {
+                return std::unexpected("round: first argument must be numeric");
             }
-            return std::unexpected(call->callee + ": argument must be numeric");
-        }
-        if (call->callee == "year" || call->callee == "month" || call->callee == "day" ||
-            call->callee == "hour" || call->callee == "minute" || call->callee == "second") {
-            if (call->args.size() != 1) {
-                return std::unexpected(call->callee + ": expected 1 argument");
-            }
-            auto arg_type = infer_expr_type(*call->args[0], input, scalars, externs);
-            if (!arg_type) {
-                return arg_type;
-            }
-            const bool date_ok =
-                (call->callee == "year" || call->callee == "month" || call->callee == "day");
-            if (arg_type.value() == ExprType::Timestamp ||
-                (date_ok && arg_type.value() == ExprType::Date)) {
-                return ExprType::Int;
-            }
-            return std::unexpected(call->callee + (date_ok ? ": argument must be Date or Timestamp"
-                                                           : ": argument must be Timestamp"));
+            return ExprType::Int;
         }
         // Null-fill functions (fill_null / fill_forward / fill_backward)
         if (is_fill_func(call->callee)) {
@@ -4847,53 +5069,6 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 return std::unexpected(std::string(call->callee) + ": column must be Float64");
             }
             return ExprType::Double;
-        }
-        if (call->callee == "is_nan") {
-            if (call->args.size() != 1) {
-                return std::unexpected("is_nan: expected 1 argument");
-            }
-            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
-            if (!col_ref) {
-                return std::unexpected("is_nan: argument must be a column name");
-            }
-            const auto* source = input.find(col_ref->name);
-            if (!source) {
-                return std::unexpected("is_nan: unknown column '" + col_ref->name + "'");
-            }
-            auto kind = expr_type_for_column(*source);
-            if (kind != ExprType::Double) {
-                return std::unexpected("is_nan: column must be Float64");
-            }
-            return ExprType::Bool;
-        }
-        if (call->callee == "pmin" || call->callee == "pmax") {
-            if (call->args.size() < 2) {
-                return std::unexpected(call->callee + ": expected at least 2 arguments");
-            }
-            std::optional<ExprType> result_type;
-            for (const auto& arg : call->args) {
-                auto arg_type = infer_expr_type(*arg, input, scalars, externs);
-                if (!arg_type) {
-                    return arg_type;
-                }
-                if (!result_type.has_value()) {
-                    result_type = *arg_type;
-                    continue;
-                }
-                if ((*result_type == ExprType::Int && *arg_type == ExprType::Double) ||
-                    (*result_type == ExprType::Double && *arg_type == ExprType::Int)) {
-                    result_type = ExprType::Double;
-                    continue;
-                }
-                if (*result_type != *arg_type) {
-                    return std::unexpected(call->callee +
-                                           ": arguments must all be comparable and of one type");
-                }
-            }
-            if (*result_type == ExprType::Bool) {
-                return std::unexpected(call->callee + ": Bool arguments are not supported");
-            }
-            return *result_type;
         }
         // Cumulative functions (cumsum / cumprod)
         if (is_cum_func(call->callee)) {
@@ -5106,171 +5281,44 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         }
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
-        if (call->callee == "abs") {
-            if (call->args.size() != 1) {
-                return std::unexpected("abs: expected 1 argument");
+        // Pure row-wise scalar builtins: single source of truth (see
+        // scalar_builtins()). Both this pass and infer_expr_type dispatch here.
+        if (auto it = scalar_builtins().find(call->callee); it != scalar_builtins().end()) {
+            const auto& fn = it->second;
+            const auto argc = static_cast<int>(call->args.size());
+            if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
+                return std::unexpected(std::string(call->callee) + ": wrong number of arguments");
+            }
+            std::vector<ExprValue> arg_values;
+            arg_values.reserve(call->args.size());
+            for (const auto& arg : call->args) {
+                auto v = eval_expr(*arg, input, row, scalars, externs);
+                if (!v) {
+                    return v;
+                }
+                arg_values.push_back(std::move(*v));
+            }
+            return fn.eval(call->callee, arg_values);
+        }
+        // round(x, mode): mode is a bare identifier; dispatched apart from the
+        // value-based registry. Always yields Int64.
+        if (call->callee == "round") {
+            if (call->args.size() != 2) {
+                return std::unexpected("round: expected 2 arguments (value, mode)");
+            }
+            auto mode = extract_ir_round_mode(*call->args[1]);
+            if (!mode) {
+                return std::unexpected(mode.error());
             }
             auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
             if (!arg) {
                 return arg;
             }
-            if (const auto* value = std::get_if<std::int64_t>(&arg.value())) {
-                return std::int64_t{std::abs(*value)};
+            auto d = expr_value_to_double(arg.value());
+            if (!d) {
+                return std::unexpected("round: first argument must be numeric");
             }
-            if (const auto* value = std::get_if<double>(&arg.value())) {
-                return std::abs(*value);
-            }
-            return std::unexpected("abs: argument must be numeric");
-        }
-        if (call->callee == "sqrt" || call->callee == "log" || call->callee == "exp") {
-            if (call->args.size() != 1) {
-                return std::unexpected(call->callee + ": expected 1 argument");
-            }
-            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
-            if (!arg) {
-                return arg;
-            }
-            double x{};
-            if (const auto* iv = std::get_if<std::int64_t>(&arg.value())) {
-                x = static_cast<double>(*iv);
-            } else if (const auto* dv = std::get_if<double>(&arg.value())) {
-                x = *dv;
-            } else {
-                return std::unexpected(call->callee + ": argument must be numeric");
-            }
-            if (call->callee == "sqrt") {
-                return std::sqrt(x);
-            }
-            if (call->callee == "log") {
-                return std::log(x);
-            }
-            return std::exp(x);
-        }
-        if (call->callee == "year" || call->callee == "month" || call->callee == "day" ||
-            call->callee == "hour" || call->callee == "minute" || call->callee == "second") {
-            if (call->args.size() != 1) {
-                return std::unexpected(call->callee + ": expected 1 argument");
-            }
-            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
-            if (!arg) {
-                return arg;
-            }
-            using namespace std::chrono;
-            if (const auto* dv = std::get_if<Date>(&arg.value())) {
-                year_month_day ymd{sys_days{days{dv->days}}};
-                if (call->callee == "year") {
-                    return static_cast<std::int64_t>(static_cast<int>(ymd.year()));
-                }
-                if (call->callee == "month") {
-                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()));
-                }
-                if (call->callee == "day") {
-                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()));
-                }
-                return std::unexpected(call->callee + ": argument must be Timestamp");
-            }
-            if (const auto* tv = std::get_if<Timestamp>(&arg.value())) {
-                sys_time<nanoseconds> tp{nanoseconds{tv->nanos}};
-                auto day_pt = floor<days>(tp);
-                year_month_day ymd{day_pt};
-                hh_mm_ss<nanoseconds> hms{tp - day_pt};
-                if (call->callee == "year") {
-                    return static_cast<std::int64_t>(static_cast<int>(ymd.year()));
-                }
-                if (call->callee == "month") {
-                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.month()));
-                }
-                if (call->callee == "day") {
-                    return static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()));
-                }
-                if (call->callee == "hour") {
-                    return static_cast<std::int64_t>(hms.hours().count());
-                }
-                if (call->callee == "minute") {
-                    return static_cast<std::int64_t>(hms.minutes().count());
-                }
-                return static_cast<std::int64_t>(hms.seconds().count());
-            }
-            return std::unexpected(call->callee + ": argument must be Date or Timestamp");
-        }
-        if (call->callee == "pmin" || call->callee == "pmax") {
-            if (call->args.size() < 2) {
-                return std::unexpected(call->callee + ": expected at least 2 arguments");
-            }
-            auto compare = [&](const ExprValue& lhs,
-                               const ExprValue& rhs) -> std::expected<bool, std::string> {
-                if (std::holds_alternative<std::int64_t>(lhs) &&
-                    std::holds_alternative<std::int64_t>(rhs)) {
-                    return call->callee == "pmin"
-                               ? std::get<std::int64_t>(lhs) < std::get<std::int64_t>(rhs)
-                               : std::get<std::int64_t>(lhs) > std::get<std::int64_t>(rhs);
-                }
-                if ((std::holds_alternative<std::int64_t>(lhs) ||
-                     std::holds_alternative<double>(lhs)) &&
-                    (std::holds_alternative<std::int64_t>(rhs) ||
-                     std::holds_alternative<double>(rhs))) {
-                    double lhs_d = std::holds_alternative<double>(lhs)
-                                       ? std::get<double>(lhs)
-                                       : static_cast<double>(std::get<std::int64_t>(lhs));
-                    double rhs_d = std::holds_alternative<double>(rhs)
-                                       ? std::get<double>(rhs)
-                                       : static_cast<double>(std::get<std::int64_t>(rhs));
-                    return call->callee == "pmin" ? lhs_d < rhs_d : lhs_d > rhs_d;
-                }
-                if (std::holds_alternative<std::string>(lhs) &&
-                    std::holds_alternative<std::string>(rhs)) {
-                    return call->callee == "pmin"
-                               ? std::get<std::string>(lhs) < std::get<std::string>(rhs)
-                               : std::get<std::string>(lhs) > std::get<std::string>(rhs);
-                }
-                if (std::holds_alternative<Date>(lhs) && std::holds_alternative<Date>(rhs)) {
-                    return call->callee == "pmin" ? std::get<Date>(lhs) < std::get<Date>(rhs)
-                                                  : std::get<Date>(lhs) > std::get<Date>(rhs);
-                }
-                if (std::holds_alternative<Timestamp>(lhs) &&
-                    std::holds_alternative<Timestamp>(rhs)) {
-                    return call->callee == "pmin"
-                               ? std::get<Timestamp>(lhs) < std::get<Timestamp>(rhs)
-                               : std::get<Timestamp>(lhs) > std::get<Timestamp>(rhs);
-                }
-                return std::unexpected(call->callee +
-                                       ": arguments must all be comparable and of one type");
-            };
-
-            auto best = eval_expr(*call->args[0], input, row, scalars, externs);
-            if (!best) {
-                return best;
-            }
-            if (std::holds_alternative<bool>(best.value())) {
-                return std::unexpected(call->callee + ": Bool arguments are not supported");
-            }
-            for (std::size_t i = 1; i < call->args.size(); ++i) {
-                auto candidate = eval_expr(*call->args[i], input, row, scalars, externs);
-                if (!candidate) {
-                    return candidate;
-                }
-                auto take_candidate = compare(candidate.value(), best.value());
-                if (!take_candidate) {
-                    return std::unexpected(take_candidate.error());
-                }
-                if (*take_candidate) {
-                    best = std::move(candidate);
-                }
-            }
-            return best;
-        }
-        if (call->callee == "is_nan") {
-            if (call->args.size() != 1) {
-                return std::unexpected("is_nan: expected 1 argument");
-            }
-            auto arg = eval_expr(*call->args[0], input, row, scalars, externs);
-            if (!arg) {
-                return arg;
-            }
-            if (const auto* value = std::get_if<double>(&arg.value())) {
-                return static_cast<std::int64_t>(std::isnan(*value));
-            }
-            return std::unexpected("is_nan: argument must be Float64");
+            return ExprValue{apply_round(*d, *mode)};
         }
         if (externs == nullptr) {
             return std::unexpected("unknown function in expression: " + call->callee);
@@ -5425,11 +5473,7 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
 
 // Produce a shifted copy of a column: lag(col, n)[i] = col[i-n], lead(col, n)[i] = col[i+n].
 // Out-of-bounds entries are filled with type-appropriate zero/default values.
-struct LagLeadResult {
-    ColumnValue column;
-    std::optional<ValidityBitmap> validity;
-};
-
+// LagLeadResult is declared up top (before eval_value_vec, which also calls this).
 auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,
                           const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<LagLeadResult, std::string> {

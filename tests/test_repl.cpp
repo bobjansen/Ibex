@@ -60,6 +60,28 @@ TEST_CASE("REPL accepts scalar expression statements") {
     REQUIRE(ibex::repl::execute_script("1+1;", registry));
 }
 
+TEST_CASE("REPL print builtin displays tables, scalars, and columns", "[repl][print]") {
+    ibex::runtime::ExternRegistry registry;
+    // Table expression, scalar, and a column all render without error.
+    REQUIRE(ibex::repl::execute_script("print(trades);", registry));
+    REQUIRE(ibex::repl::execute_script("print(trades[select { n = count() }]);", registry));
+    REQUIRE(ibex::repl::execute_script("print(1 + 1);", registry));
+    REQUIRE(ibex::repl::execute_script("print(trades[select { price }]);", registry));
+}
+
+TEST_CASE("REPL print passes its argument through for binding", "[repl][print]") {
+    ibex::runtime::ExternRegistry registry;
+    // print(x) returns x, so it can be bound and used downstream.
+    REQUIRE(ibex::repl::execute_script(
+        "let m = print(trades[select { hi = max(price) }]); m[select { hi }];", registry));
+}
+
+TEST_CASE("REPL print rejects the wrong number of arguments", "[repl][print]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE_FALSE(ibex::repl::execute_script("print(trades, trades);", registry));
+    REQUIRE_FALSE(ibex::repl::execute_script("print();", registry));
+}
+
 TEST_CASE("REPL: integer literal widens to Float64 in let binding", "[repl][coerce]") {
     ibex::runtime::ExternRegistry registry;
     REQUIRE(ibex::repl::execute_script("let x: Float64 = 42; x + 0.5;", registry));

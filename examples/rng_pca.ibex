@@ -62,5 +62,5 @@ let probe_scores = model_predict(pc, probes);
 
 // 6. Show the recovery. component 1 variance ≫ component 2 variance; PC1
 //    loadings ∝ (1, 2, −1.5) on x/y/z with ~0 on w.
-loadings;
-probe_scores;
+print(loadings);
+print(probe_scores);

@@ -67,10 +67,11 @@ let holdout_raw = trades[select { row = rep(0, length_out=8) }][update { x1 = ra
 let holdout = holdout_raw[update { x2 = u2 - 2.0 }];
 let pred_gbm = model_predict(m_gbm, holdout);
 
-// 8. Show the recovery. A bare `name;` line prints the binding.
-ols_coef;
-ols_r2;
-ridge_coef;
-gbm_importance;
-gbm_r2;
-pred_gbm;
+// 8. Show the recovery. print(x) renders x and returns it; a bare `name;` line
+//    would display the same way.
+print(ols_coef);
+print(ols_r2);
+print(ridge_coef);
+print(gbm_importance);
+print(gbm_r2);
+print(pred_gbm);

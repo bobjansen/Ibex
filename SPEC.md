@@ -2684,11 +2684,16 @@ by its index column is a no-op (already sorted).
 ### 12.5 Display
 
 ```
-print(value: Any) -> ()
+print(value: Any) -> Any
 ```
 
-Outputs a human-readable representation of the value. In REPL mode, expression
-statements are implicitly printed without requiring `print`.
+Outputs a human-readable representation of the value (a table is rendered as a
+bordered grid, a scalar or column inline) using the same formatting the REPL
+applies to a bare expression statement, then returns the value unchanged. The
+pass-through return lets `print` be used inline — `let m = print(df[...]);`
+displays the table and binds it in one step. `print` takes exactly one
+argument. In REPL mode, a bare expression statement is implicitly printed
+without requiring `print`.
 
 ### 12.6 Scalar Functions
 

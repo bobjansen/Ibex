@@ -1,0 +1,76 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex RNG Demo  ·  Synthetic Linear Regression (recover known coefficients)
+//
+//  Generates data from a KNOWN linear model using Ibex's vectorized RNG, then
+//  fits OLS / ridge / LightGBM and checks that the estimators recover the
+//  generating coefficients. Because the data is synthetic, we know the ground
+//  truth and can eyeball the recovery.
+//
+//  Generative process (the "true" model):
+//
+//      y  =  3.0  +  2.0·x1  −  1.5·x2  +  0.5·x3  +  ε,    ε ~ Normal(0, 0.5)
+//
+//      x1 ~ Normal(0, 1)        x2 ~ Uniform(−2, 2)        x3 ~ Normal(0, 2)
+//
+//  NOTE: this file is fed to the REPL on stdin, which parses ONE statement per
+//  line — so each `let`/display statement is kept on a single line. A bare
+//  `name;` line prints that binding.
+//
+//  Run:  ./build-release/tools/ibex \
+//          --plugin-path build-release/tools \
+//          --import-path  build-release/tools  < examples/rng_regression.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "lightgbm";
+
+// Reproducible draws: seed the thread-local RNG so every run is identical.
+seed_rng(20240601);
+
+// 1. Bootstrap an N-row scaffold. RNG functions emit one value per row of the
+//    current table, so we first widen the 4-row `trades` demo table to N rows
+//    with rep(0, length_out=N).
+let scaffold = trades[select { row = rep(0, length_out=4000) }];
+
+// 2. Draw the independent predictors and the noise term. Each rand_* call is
+//    the sole right-hand side of its binding — RNG functions cannot be nested
+//    inside arithmetic (that is the separate step below). RNG arguments must be
+//    non-negative literals, so x2 ~ Uniform(−2, 2) is drawn on [0, 4) and
+//    shifted in step 3.
+let draws = scaffold[update { x1 = rand_normal(0.0, 1.0), u2 = rand_uniform(0.0, 4.0), x3 = rand_normal(0.0, 2.0), eps = rand_normal(0.0, 0.5) }];
+
+// 3. Center x2 onto [−2, 2), then assemble the response from the known
+//    coefficients (pure column arithmetic).
+let shifted = draws[update { x2 = u2 - 2.0 }];
+let data = shifted[update { y = 3.0 + 2.0 * x1 - 1.5 * x2 + 0.5 * x3 + eps }];
+
+// 4. Ordinary least squares — estimates should recover (3, 2, −1.5, 0.5).
+let m_ols = data[model { y ~ x1 + x2 + x3, method = ols }];
+let ols_coef = model_coef(m_ols);
+let ols_r2 = model_r_squared(m_ols);
+
+// 5. Ridge — L2 shrinkage; coefficients pulled slightly toward zero.
+let m_ridge = data[model { y ~ x1 + x2 + x3, method = ridge, lambda = 1.0 }];
+let ridge_coef = model_coef(m_ridge);
+
+// 6. LightGBM — gradient-boosted trees; no linear coefficients, but per-feature
+//    gain importance. x1 (slope 2.0) and x2 (slope −1.5) should dominate; x3
+//    (slope 0.5) contributes least.
+let m_gbm = data[model { y ~ x1 + x2 + x3, method = lightgbm, iterations = 200, learning_rate = 0.05 }];
+let gbm_importance = model_importance(m_gbm);
+let gbm_r2 = model_r_squared(m_gbm);
+
+// 7. Score fresh, independently-drawn data with the LightGBM model. A new RNG
+//    batch (same generative process) stands in for unseen rows. model_predict
+//    is a plugin-model feature; the built-in OLS/ridge families expose their
+//    coefficients (step 4/5) rather than a predict entry point.
+let holdout_raw = trades[select { row = rep(0, length_out=8) }][update { x1 = rand_normal(0.0, 1.0), u2 = rand_uniform(0.0, 4.0), x3 = rand_normal(0.0, 2.0) }];
+let holdout = holdout_raw[update { x2 = u2 - 2.0 }];
+let pred_gbm = model_predict(m_gbm, holdout);
+
+// 8. Show the recovery. A bare `name;` line prints the binding.
+ols_coef;
+ols_r2;
+ridge_coef;
+gbm_importance;
+gbm_r2;
+pred_gbm;

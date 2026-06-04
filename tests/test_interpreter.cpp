@@ -3663,6 +3663,31 @@ TEST_CASE("rand_int generates integers in [lo, hi]") {
     }
 }
 
+TEST_CASE("unary negation: literals, columns, and compound expressions", "[negation]") {
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.0, 2.0, 3.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // Negative literal (folded in the parser), column negation, and negation of
+    // a parenthesized expression (lowered as `0 - expr`).
+    auto ir = require_ir("t[update { lit = -2.5, negx = -x, grp = -(x + 1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& lit = std::get<Column<double>>(*result->find("lit"));
+    const auto& negx = std::get<Column<double>>(*result->find("negx"));
+    const auto& grp = std::get<Column<double>>(*result->find("grp"));
+    REQUIRE(lit.size() == 3);
+    for (std::size_t i = 0; i < 3; ++i) {
+        const double x = static_cast<double>(i + 1);
+        CHECK(lit[i] == -2.5);
+        CHECK(negx[i] == -x);
+        CHECK(grp[i] == -(x + 1.0));
+    }
+}
+
 TEST_CASE("rand_int lo == hi always yields lo") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3});

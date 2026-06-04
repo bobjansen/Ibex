@@ -2506,6 +2506,17 @@ class Lowerer {
                 return ir::Expr{.node = ir::IsNullExpr{.operand = operand_ptr,
                                                        .negated = unary->op == UnaryOp::IsNotNull}};
             }
+            if (unary->op == UnaryOp::Negate) {
+                // No dedicated IR negate node: lower `-x` as `0 - x`. Negation
+                // of a numeric literal is already folded away in the parser, so
+                // this path handles columns and compound expressions, where the
+                // integer zero promotes to the operand's type as needed.
+                auto zero =
+                    ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}});
+                return ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Sub,
+                                                       .left = std::move(zero),
+                                                       .right = operand_ptr}};
+            }
             return std::unexpected(
                 LowerError{.message = "unsupported unary operator in expression"});
         }

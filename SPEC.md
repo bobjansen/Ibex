@@ -1619,10 +1619,25 @@ Plugin model contract (`ModelOps`):
   - `native` — an opaque, self-freeing handle to the plugin's trained model
     (`shared_ptr<void>` whose deleter lives in the plugin). The runtime stores it
     in the `ModelResult` and never dereferences it.
-  - `fitted` — a single `Float64` column `"fitted"` of in-sample predictions.
+  - `fitted` — the per-row in-sample output. For supervised methods this is a
+    single `Float64` column `"fitted"` (predictions); for unsupervised methods it
+    is the natural per-row output, which may be a single column (e.g. cluster
+    ids) or multiple columns (e.g. PCA scores `pc1..pck`).
   - `importance` — a `{term: String, gain: Float64}` table (may be empty).
+  - `summary` — a free-form table with any schema/row count (e.g. cluster
+    centroids, PCA loadings), surfaced via `model_summary` (may be empty).
 - **predict** receives the `native` handle and a design matrix of feature columns
-  (no response) and returns a single-column `"prediction"` table.
+  (no response) and returns a table of scored output. Supervised methods return a
+  single `"prediction"` column; transform methods may return multiple columns
+  (e.g. PCA returns `pc1..pck`). The schema matches the method's `fitted` output.
+
+Unsupervised methods are written with a response-less formula, e.g.
+`model { ~ x1 + x2, method = kmeans, k = 3 }` (clustering) or
+`model { ~ x1 + x2 + x3 - 1, method = pca, k = 2 }` (transform). The `- 1`
+suppresses the design-matrix intercept, which is meaningless for a centered
+transform like PCA. When a model exposes neither coefficients nor importance,
+the clause's result table is the per-row `fitted` output (cluster ids, PCA
+scores, etc.).
 
 The runtime derives residuals and R² from the fitted values and the response.
 

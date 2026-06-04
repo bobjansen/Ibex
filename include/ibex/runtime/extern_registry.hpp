@@ -77,6 +77,8 @@ struct FittedModel {
     std::shared_ptr<void> native;
     Table fitted;      ///< single column "fitted": in-sample predictions, input order
     Table importance;  ///< term | gain (may be empty)
+    Table summary;     ///< free-form model summary, any schema/row count (e.g. cluster
+                       ///< centroids, PCA loadings); surfaced via model_summary. May be empty.
 };
 
 /// Parsed model parameters handed to a model plugin's `fit`

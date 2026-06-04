@@ -1,0 +1,5 @@
+// Principal Component Analysis plugin (pure C++, no external dependency).
+// Importing this file loads pca.so and registers the "pca" model method:
+//   df[model { ~ x1 + x2 + x3, method = pca, k = 2 }].
+// The result / model_fitted give the pc1..pck scores; model_summary gives the
+// loadings; model_predict projects new rows onto the trained components.

@@ -4010,6 +4010,57 @@ TEST_CASE("Two-key categorical group-by spills to hash above the dense limit") {
 
 // --- rep ---------------------------------------------------------------------
 
+TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_update]") {
+    auto make = [] {
+        runtime::Table t;
+        t.add_column("a", Column<std::int64_t>{10, 20, 30, 40});
+        t.add_column("g", Column<std::string>{"x", "y", "x", "y"});
+        runtime::TableRegistry r;
+        r.emplace("t", t);
+        return r;
+    };
+
+    // Row-local field (gather/scatter): only matching rows change.
+    {
+        auto registry = make();
+        auto ir = require_ir(R"(t[where g == "x" update { a = a * 100 }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto& a = std::get<Column<std::int64_t>>(*result->find("a"));
+        CHECK(a[0] == 1000);
+        CHECK(a[1] == 20);  // non-matching, unchanged
+        CHECK(a[2] == 3000);
+        CHECK(a[3] == 40);  // non-matching, unchanged
+    }
+
+    // Non-row-local field (lag): evaluated over the FULL table, then assigned to
+    // matching rows; a new column is null off-mask.
+    {
+        auto registry = make();
+        auto ir = require_ir(R"(t[where g == "y" update { prev = lag(a, 1) }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto& prev = std::get<Column<std::int64_t>>(*result->find("prev"));
+        REQUIRE(prev.size() == 4);
+        CHECK(prev[1] == 10);  // a[0] — the real previous row, not the previous y-row
+        CHECK(prev[3] == 30);  // a[2]
+        const auto* entry = result->find_entry("prev");
+        REQUIRE(entry->validity.has_value());
+        CHECK_FALSE((*entry->validity)[0]);  // x row: null
+        CHECK((*entry->validity)[1]);
+        CHECK_FALSE((*entry->validity)[2]);  // x row: null
+        CHECK((*entry->validity)[3]);
+    }
+
+    // A guarded assignment may not change an existing column's type.
+    {
+        auto registry = make();
+        auto ir = require_ir(R"(t[where g == "x" update { a = "big" }];)");
+        auto result = runtime::interpret(*ir, registry);
+        CHECK_FALSE(result.has_value());
+    }
+}
+
 TEST_CASE("Table(n) builds an n-row scaffold", "[table_rows]") {
     runtime::TableRegistry registry;
 

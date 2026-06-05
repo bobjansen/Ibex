@@ -5,6 +5,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/rng.hpp>
+#include <ibex/runtime/safe_arith.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -4043,6 +4044,41 @@ TEST_CASE("Table(n) builds an n-row scaffold", "[table_rows]") {
         auto result = runtime::interpret(*ir, registry);
         CHECK_FALSE(result.has_value());
     }
+}
+
+TEST_CASE("safe_idiv / safe_imod guard the UB cases", "[safe_arith]") {
+    using ibex::runtime::safe_idiv;
+    using ibex::runtime::safe_imod;
+    constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+
+    // Division / modulo by zero -> 0 (Ibex's defined result), never SIGFPE.
+    CHECK(safe_idiv<std::int64_t>(10, 0) == 0);
+    CHECK(safe_imod<std::int64_t>(10, 0) == 0);
+    // INT_MIN / -1 overflow -> two's-complement wrap, never #DE.
+    CHECK(safe_idiv<std::int64_t>(kMin, -1) == kMin);
+    CHECK(safe_imod<std::int64_t>(kMin, -1) == 0);
+    // Ordinary values are unchanged (sign of % follows the dividend, as in C++).
+    CHECK(safe_idiv<std::int64_t>(17, 5) == 3);
+    CHECK(safe_imod<std::int64_t>(17, 5) == 2);
+    CHECK(safe_idiv<std::int64_t>(-17, 5) == -3);
+    CHECK(safe_imod<std::int64_t>(-17, 5) == -2);
+}
+
+TEST_CASE("integer modulo by zero is guarded end-to-end (returns 0)", "[safe_arith]") {
+    runtime::Table table;
+    table.add_column("a", Column<std::int64_t>{10, 20, 30});
+    table.add_column("b", Column<std::int64_t>{3, 0, 7});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { r = a % b }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto& r = std::get<Column<std::int64_t>>(*result->find("r"));
+    REQUIRE(r.size() == 3);
+    CHECK(r[0] == 1);  // 10 % 3
+    CHECK(r[1] == 0);  // 20 % 0 -> guarded -> 0 (no crash)
+    CHECK(r[2] == 2);  // 30 % 7
 }
 
 TEST_CASE("RNG composes inside arithmetic", "[rng_compose]") {

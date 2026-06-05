@@ -5,6 +5,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/rng.hpp>
+#include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
 
 #include <fmt/core.h>
@@ -2266,9 +2267,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             case parser::BinaryOp::Mul:
                 return runtime::ScalarValue{lhs * rhs};
             case parser::BinaryOp::Div:
-                return runtime::ScalarValue{lhs / rhs};
+                return runtime::ScalarValue{runtime::safe_idiv(lhs, rhs)};
             case parser::BinaryOp::Mod:
-                return runtime::ScalarValue{lhs % rhs};
+                return runtime::ScalarValue{runtime::safe_imod(lhs, rhs)};
             default:
                 return std::unexpected("unsupported operator in scalar expression");
         }

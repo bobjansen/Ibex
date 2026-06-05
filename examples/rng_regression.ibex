@@ -54,11 +54,12 @@ let m_gbm = data[model { y ~ x1 + x2 + x3, method = lightgbm, iterations = 200, 
 let gbm_importance = model_importance(m_gbm);
 let gbm_r2 = model_r_squared(m_gbm);
 
-// 7. Score fresh, independently-drawn data with the LightGBM model. A new RNG
+// 7. Score fresh, independently-drawn data with each fitted model. A new RNG
 //    batch (same generative process) stands in for unseen rows. model_predict
-//    is a plugin-model feature; the built-in OLS/ridge families expose their
-//    coefficients (step 4/5) rather than a predict entry point.
+//    works for the built-in OLS model (it applies the coefficients X·β) and for
+//    the LightGBM plugin (it reuses the trained booster) — same call either way.
 let holdout = Table(8)[update { x1 = rand_normal(0.0, 1.0), x2 = rand_uniform(-2.0, 2.0), x3 = rand_normal(0.0, 2.0) }];
+let pred_ols = model_predict(m_ols, holdout);
 let pred_gbm = model_predict(m_gbm, holdout);
 
 // 8. Show the recovery. print(x) renders x and returns it; a bare `name;` line
@@ -68,4 +69,5 @@ print(ols_r2);
 print(ridge_coef);
 print(gbm_importance);
 print(gbm_r2);
+print(pred_ols);
 print(pred_gbm);

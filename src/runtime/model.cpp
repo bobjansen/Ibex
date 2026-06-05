@@ -794,15 +794,6 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
 
 auto predict_model(const ModelResult& model, const Table& newdata, const ExternRegistry& externs)
     -> std::expected<Table, std::string> {
-    const auto* ops = externs.find_model(model.method);
-    if (ops == nullptr || !ops->predict) {
-        return std::unexpected("model_predict: method '" + model.method +
-                               "' does not support prediction (not a plugin model)");
-    }
-    if (model.native == nullptr) {
-        return std::unexpected("model_predict: model has no trained handle to predict with");
-    }
-
     // Rebuild the design matrix from new data using the SAME formula, so the
     // feature columns line up with training (same order, intercept, encodings).
     auto matrix = build_model_matrix(newdata, model.formula);
@@ -811,11 +802,56 @@ auto predict_model(const ModelResult& model, const Table& newdata, const ExternR
     }
     auto& [col_names, x] = matrix.value();
 
-    Table design;
-    for (std::size_t j = 0; j < col_names.size(); ++j) {
-        design.add_column(col_names[j], Column<double>(x[j]));
+    // Plugin path: hand the design to the plugin, which reuses its trained
+    // native handle (no refit, no serialization).
+    const auto* ops = externs.find_model(model.method);
+    if (ops != nullptr && ops->predict) {
+        if (model.native == nullptr) {
+            return std::unexpected("model_predict: model has no trained handle to predict with");
+        }
+        Table design;
+        for (std::size_t j = 0; j < col_names.size(); ++j) {
+            design.add_column(col_names[j], Column<double>(x[j]));
+        }
+        return ops->predict(model.native.get(), design);
     }
-    return ops->predict(model.native.get(), design);
+
+    // Built-in linear path (ols / ridge / wls): prediction = X · beta, with the
+    // design columns matched to the fitted coefficients by term name (so a
+    // newdata level absent from training simply contributes nothing, while a
+    // brand-new level is an error).
+    const auto* term_cv = model.coefficients.find("term");
+    const auto* est_cv = model.coefficients.find("estimate");
+    const auto* terms = term_cv != nullptr ? std::get_if<Column<std::string>>(term_cv) : nullptr;
+    const auto* ests = est_cv != nullptr ? std::get_if<Column<double>>(est_cv) : nullptr;
+    if (terms == nullptr || ests == nullptr) {
+        return std::unexpected("model_predict: method '" + model.method +
+                               "' does not support prediction (no fitted coefficients)");
+    }
+    std::unordered_map<std::string, double> coef;
+    coef.reserve(terms->size());
+    for (std::size_t i = 0; i < terms->size(); ++i) {
+        coef.emplace((*terms)[i], (*ests)[i]);
+    }
+
+    const std::size_t n = x.empty() ? 0 : x.front().size();
+    Column<double> pred;
+    pred.resize(n);  // value-initialized to 0.0
+    for (std::size_t j = 0; j < col_names.size(); ++j) {
+        const auto it = coef.find(col_names[j]);
+        if (it == coef.end()) {
+            return std::unexpected("model_predict: design column '" + col_names[j] +
+                                   "' has no fitted coefficient (a new level in newdata?)");
+        }
+        const double c = it->second;
+        const auto& xj = x[j];
+        for (std::size_t i = 0; i < n; ++i) {
+            pred[i] += xj[i] * c;
+        }
+    }
+    Table out;
+    out.add_column("prediction", std::move(pred));
+    return out;
 }
 
 }  // namespace ibex::runtime

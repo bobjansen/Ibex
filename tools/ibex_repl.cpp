@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 auto main(int argc, char** argv) -> int {
     CLI::App app{"Ibex — interactive columnar DSL"};
@@ -15,6 +16,12 @@ auto main(int argc, char** argv) -> int {
     std::string plugin_path;
     std::string import_path;
     std::string history_file;
+    std::vector<std::string> scripts;
+    app.add_option("script", scripts,
+                   "Ibex script file(s) to execute (.ibex). When given, runs the "
+                   "files instead of starting the interactive REPL. Statements may "
+                   "span multiple lines.")
+        ->type_name("FILE");
     app.add_flag("-v,--verbose", verbose, "Enable verbose output");
     app.add_flag("--no-history", no_history, "Disable persistent readline history");
     app.add_option("--plugin-path", plugin_path,
@@ -55,6 +62,17 @@ auto main(int argc, char** argv) -> int {
     }
     if (!import_path.empty()) {
         config.import_search_paths.push_back(import_path);
+    }
+
+    // File argument(s): run each script and exit. Otherwise start the REPL.
+    if (!scripts.empty()) {
+        int exit_code = 0;
+        for (const auto& path : scripts) {
+            if (!ibex::repl::run_file(path, config, registry)) {
+                exit_code = 1;
+            }
+        }
+        return exit_code;
     }
 
     ibex::repl::run(config, registry);

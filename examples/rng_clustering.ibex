@@ -20,12 +20,13 @@
 //  spaces the centers along x, and 15·(g−1)² lifts the outer two blobs above
 //  the middle one — a non-collinear triangle k-means can separate cleanly.
 //
-//  NOTE: the REPL parses ONE statement per line, so each statement stays on a
-//  single line; a bare `name;` line prints that binding.
+//  NOTE: a bare `name;` line prints that binding. Statements may span multiple
+//  lines (the REPL keeps reading until brackets/braces balance), but this file
+//  keeps each on one line for easy line-by-line reading.
 //
 //  Run:  ./build-release/tools/ibex \
 //          --plugin-path build-release/tools \
-//          --import-path  build-release/tools  < examples/rng_clustering.ibex
+//          --import-path  build-release/tools  examples/rng_clustering.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "kmeans";

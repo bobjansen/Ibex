@@ -20,12 +20,13 @@
 //  on x/y/z with a near-zero loading on w. PC2 should pick up the independent
 //  w axis, and PC1's variance (eigenvalue) should dwarf PC2's.
 //
-//  NOTE: the REPL parses ONE statement per line, so each statement stays on a
-//  single line; a bare `name;` line prints that binding.
+//  NOTE: a bare `name;` line prints that binding. Statements may span multiple
+//  lines (the REPL keeps reading until brackets/braces balance), but this file
+//  keeps each on one line for easy line-by-line reading.
 //
 //  Run:  ./build-release/tools/ibex \
 //          --plugin-path build-release/tools \
-//          --import-path  build-release/tools  < examples/rng_pca.ibex
+//          --import-path  build-release/tools  examples/rng_pca.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "pca";

@@ -69,7 +69,6 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"String", TokenKind::KeywordString},
         {"Date", TokenKind::KeywordDate},
         {"Timestamp", TokenKind::KeywordTimestamp},
-        {"Column", TokenKind::KeywordColumn},
         {"Series", TokenKind::KeywordSeries},
         {"DataFrame", TokenKind::KeywordDataFrame},
         {"TimeFrame", TokenKind::KeywordTimeFrame},

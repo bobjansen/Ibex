@@ -227,7 +227,6 @@ TEST_CASE("Lexer: all type keywords", "[lexer]") {
         {"String", TokenKind::KeywordString},
         {"Date", TokenKind::KeywordDate},
         {"Timestamp", TokenKind::KeywordTimestamp},
-        {"Column", TokenKind::KeywordColumn},
         {"Series", TokenKind::KeywordSeries},
         {"DataFrame", TokenKind::KeywordDataFrame},
         {"TimeFrame", TokenKind::KeywordTimeFrame},

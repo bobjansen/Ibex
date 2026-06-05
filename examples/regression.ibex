@@ -26,6 +26,12 @@ let predictions  = model_fitted(m1);
 let resids       = model_residuals(m1);
 let r2           = model_r_squared(m1);
 
+// Score new data with the fitted OLS model. model_predict rebuilds the design
+// matrix from `newdata` with the model's formula and applies the coefficients
+// (X·β) — built-in linear models (ols/ridge/wls) predict, not just plugins.
+let scenarios = Table { open = [100.0, 105.0], volume = [1000000, 1500000] };
+let m1_scored = model_predict(m1, scenarios);   // prediction column
+
 // ── 2. No intercept — force regression through the origin ───────────────────
 let m2 = prices[model { close ~ open + volume - 1 }];
 

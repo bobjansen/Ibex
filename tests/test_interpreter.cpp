@@ -5929,6 +5929,64 @@ TEST_CASE("model: OLS multiple regression", "[model]") {
     REQUIRE(estimates[2] == Catch::Approx(3.0));  // x2
 }
 
+TEST_CASE("model_predict: built-in OLS applies coefficients", "[model][predict]") {
+    // y = 2 + 3*x exactly.
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.0, 3.0, 4.0});
+    t.add_column("y", Column<double>{5.0, 8.0, 11.0, 14.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x, method = ols }];");
+    runtime::ModelResult model_out;
+    auto fit = runtime::interpret(*ir, registry, nullptr, nullptr, &model_out);
+    REQUIRE(fit.has_value());
+
+    // Score fresh rows: prediction = 2 + 3*x.
+    runtime::Table newdata;
+    newdata.add_column("x", Column<double>{10.0, 20.0});
+
+    runtime::ExternRegistry externs;
+    auto pred = runtime::predict_model(model_out, newdata, externs);
+    REQUIRE(pred.has_value());
+
+    const auto* col = pred->find("prediction");
+    REQUIRE(col != nullptr);
+    const auto& p = std::get<Column<double>>(*col);
+    REQUIRE(p.size() == 2);
+    CHECK(p[0] == Catch::Approx(32.0));  // 2 + 3*10
+    CHECK(p[1] == Catch::Approx(62.0));  // 2 + 3*20
+}
+
+TEST_CASE("model_predict: built-in OLS multiple predictors", "[model][predict]") {
+    // y = 1 + 2*x1 - 0.5*x2 exactly.
+    runtime::Table t;
+    t.add_column("x1", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    t.add_column("x2", Column<double>{2.0, 0.0, 4.0, 1.0, 3.0});
+    t.add_column("y", Column<double>{2.0, 5.0, 5.0, 8.5, 9.5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[model { y ~ x1 + x2, method = ols }];");
+    runtime::ModelResult model_out;
+    auto fit = runtime::interpret(*ir, registry, nullptr, nullptr, &model_out);
+    REQUIRE(fit.has_value());
+
+    runtime::Table newdata;
+    newdata.add_column("x1", Column<double>{10.0});
+    newdata.add_column("x2", Column<double>{6.0});
+
+    runtime::ExternRegistry externs;
+    auto pred = runtime::predict_model(model_out, newdata, externs);
+    REQUIRE(pred.has_value());
+
+    const auto& p = std::get<Column<double>>(*pred->find("prediction"));
+    REQUIRE(p.size() == 1);
+    CHECK(p[0] == Catch::Approx(18.0));  // 1 + 2*10 - 0.5*6
+}
+
 TEST_CASE("model: OLS no intercept", "[model]") {
     // y = 2*x (through origin)
     runtime::Table t;

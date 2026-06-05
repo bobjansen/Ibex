@@ -12,13 +12,13 @@
 //
 //      x1 ~ Normal(0, 1)        x2 ~ Uniform(−2, 2)        x3 ~ Normal(0, 2)
 //
-//  NOTE: this file is fed to the REPL on stdin, which parses ONE statement per
-//  line — so each `let`/display statement is kept on a single line. A bare
-//  `name;` line prints that binding.
+//  NOTE: a bare `name;` line prints that binding. Statements may span multiple
+//  lines (the REPL reads until brackets/braces balance), but this file keeps
+//  each `let`/display statement on one line for easy line-by-line reading.
 //
 //  Run:  ./build-release/tools/ibex \
 //          --plugin-path build-release/tools \
-//          --import-path  build-release/tools  < examples/rng_regression.ibex
+//          --import-path  build-release/tools  examples/rng_regression.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "lightgbm";

@@ -45,6 +45,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry);
 [[nodiscard]] auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
                                   const ReplConfig& config) -> bool;
 
+/// Execute an Ibex script file by path. The whole file is parsed at once, so
+/// statements may span multiple physical lines (e.g. a multi-line `model { ... }`
+/// clause). Honors the config's plugin / import search paths. Returns false if
+/// the file cannot be read or a statement fails.
+[[nodiscard]] auto run_file(const std::string& path, const ReplConfig& config,
+                            runtime::ExternRegistry& registry) -> bool;
+
 /// Normalize a single REPL input line (e.g., inject implicit semicolon).
 [[nodiscard]] auto normalize_input(std::string_view input) -> std::string;
 

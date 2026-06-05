@@ -55,6 +55,47 @@ TEST_CASE("REPL loads script with inferred lets") {
     REQUIRE(ibex::repl::execute_script(source, registry));
 }
 
+TEST_CASE("REPL executes a multi-line statement via execute_script", "[repl][multiline]") {
+    ibex::runtime::ExternRegistry registry;
+    const std::string src =
+        "let t = Table {\n"
+        "  x = [1.0, 2.0, 3.0],\n"
+        "  y = [3.0, 5.0, 7.0]\n"
+        "};\n"
+        "let m = t[model {\n"
+        "  y ~ x,\n"
+        "  method = ols\n"
+        "}];\n"
+        "print(model_coef(m));\n";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL run_file runs a script file with multi-line statements", "[repl][multiline]") {
+    auto path = std::filesystem::temp_directory_path() / "ibex_multiline_test.ibex";
+    {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << "let t = Table {\n"
+               "  x = [1.0, 2.0, 3.0],\n"
+               "  y = [3.0, 5.0, 7.0]\n"
+               "};\n"
+               "let m = t[model {\n"
+               "  y ~ x,\n"
+               "  method = ols\n"
+               "}];\n";
+    }
+    ibex::runtime::ExternRegistry registry;
+    const ibex::repl::ReplConfig config;
+    REQUIRE(ibex::repl::run_file(path.string(), config, registry));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("REPL run_file reports a missing file", "[repl][multiline]") {
+    ibex::runtime::ExternRegistry registry;
+    const ibex::repl::ReplConfig config;
+    REQUIRE_FALSE(ibex::repl::run_file("/nonexistent/path/does_not_exist.ibex", config, registry));
+}
+
 TEST_CASE("REPL accepts scalar expression statements") {
     ibex::runtime::ExternRegistry registry;
     REQUIRE(ibex::repl::execute_script("1+1;", registry));

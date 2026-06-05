@@ -4010,6 +4010,42 @@ TEST_CASE("Two-key categorical group-by spills to hash above the dense limit") {
 
 // --- rep ---------------------------------------------------------------------
 
+TEST_CASE("null-aware functions and booleans in value position", "[null_aware]") {
+    // `a left join b on k` leaves k=2's `w` column null.
+    runtime::Table a;
+    a.add_column("k", Column<std::int64_t>{1, 2, 3});
+    a.add_column("x", Column<double>{10.0, 20.0, 30.0});
+    runtime::Table b;
+    b.add_column("k", Column<std::int64_t>{1, 3});
+    b.add_column("w", Column<double>{100.0, 300.0});
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir(
+        "(a left join b on k)[update { miss = is_null(w), have = is_not_null(w), "
+        "filled = coalesce(w, -1.0), big = x > 15.0 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& miss = std::get<Column<bool>>(*result->find("miss"));
+    CHECK_FALSE(miss[0]);
+    CHECK(miss[1]);  // unmatched row -> null
+    CHECK_FALSE(miss[2]);
+    const auto& have = std::get<Column<bool>>(*result->find("have"));
+    CHECK(have[0]);
+    CHECK_FALSE(have[1]);
+    CHECK(have[2]);
+    const auto& filled = std::get<Column<double>>(*result->find("filled"));
+    CHECK(filled[0] == 100.0);
+    CHECK(filled[1] == -1.0);  // null replaced
+    CHECK(filled[2] == 300.0);
+    const auto& big = std::get<Column<bool>>(*result->find("big"));  // comparison in value position
+    CHECK_FALSE(big[0]);
+    CHECK(big[1]);
+    CHECK(big[2]);
+}
+
 TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_update]") {
     auto make = [] {
         runtime::Table t;

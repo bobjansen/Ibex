@@ -1852,20 +1852,6 @@ class Parser {
         if (auto scalar = parse_scalar_type()) {
             return Type{.kind = Type::Kind::Scalar, .arg = *scalar};
         }
-        if (match(TokenKind::KeywordColumn)) {
-            if (!consume(TokenKind::Lt, "expected '<' after 'Column'")) {
-                return std::nullopt;
-            }
-            auto arg = parse_scalar_type();
-            if (!arg.has_value()) {
-                error_ = make_error(peek(), "expected scalar type in Column<T>");
-                return std::nullopt;
-            }
-            if (!consume(TokenKind::Gt, "expected '>' after Column type argument")) {
-                return std::nullopt;
-            }
-            return Type{.kind = Type::Kind::Series, .arg = *arg};
-        }
         if (match(TokenKind::KeywordSeries)) {
             if (!consume(TokenKind::Lt, "expected '<' after 'Series'")) {
                 return std::nullopt;

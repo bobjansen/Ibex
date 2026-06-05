@@ -156,7 +156,7 @@ asc    desc    as
 true   false
 Int32  Int64  Float32 Float64
 Bool   String Date    Timestamp
-Int    Column  Series DataFrame TimeFrame
+Int    Series DataFrame TimeFrame
 ```
 
 Built-in function names are **soft-reserved**: they cannot be shadowed by user
@@ -335,13 +335,12 @@ prices[update { vol_int = Int64(round(volume_f, nearest)) }];
 ### 3.2 Compound Types
 
 ```
-Column<T>         — alias for Series<T>
 Series<T>         — a column of scalar values of type T
 DataFrame<S>      — a relation with schema S
 TimeFrame<S>      — a time-indexed relation with schema S
 ```
 
-`Column<Bool>` is a first-class column type (boolean mask). It is produced by
+`Series<Bool>` is a first-class column type (boolean mask). It is produced by
 `rep(true)` / `rep(false)` and can appear in `update`/`select` field lists.
 Boolean column values are stored as bytes (0 = false, non-zero = true) and are
 not implicitly convertible to `Int64` in arithmetic expressions.
@@ -696,7 +695,6 @@ fn_stmt         = let_stmt
 (* --- Types --- *)
 
 type            = scalar_type
-                | "Column" "<" scalar_type ">"
                 | type_ctor [ "<" type_arg ">" ] ;
 
 scalar_type     = "Int" | "Int32" | "Int64" | "Float32" | "Float64"
@@ -2371,8 +2369,7 @@ fn <name>(<params>) -> <return_type> { <statements> }
 - Nested function declarations are not supported.
 - Parameters may have trailing default values.
 
-`Column<T>` is accepted in function signatures as an alias for `Series<T>`.
-Functions may return scalars, tables, or columns; the return expression must
+Functions may return scalars, tables, or series; the return expression must
 match the declared return type.
 
 Function calls inside DataFrame clause expressions are resolved against
@@ -2594,7 +2591,7 @@ output.
 ### 11.2 Parameter Types
 
 Extern function parameters may be any scalar type (`Int`, `Int64`, `Float64`,
-`Bool`, `String`, `Date`, `Timestamp`). Series/column parameters are not
+`Bool`, `String`, `Date`, `Timestamp`). Series parameters are not
 supported in the current runtime.
 
 Return types may be scalar or table types (`DataFrame`, `TimeFrame`). Extern
@@ -2612,7 +2609,7 @@ let summary = df[
 ```
 
 Extern functions currently accept only scalar arguments and are evaluated as
-**scalar functions** (applied element-wise). Column/series arguments are
+**scalar functions** (applied element-wise). Series arguments are
 reserved for a future extension.
 
 ### 11.4 REPL Plugin Loading
@@ -2830,7 +2827,7 @@ use `round(x, ceil|floor|trunc)` for a `Float -> Int64` conversion.
 
 **Boolean-valued expressions in value position.** Comparisons (`a > b`), logical
 connectives (`&&`, `||`, `!`), and the null tests `is_null` / `is_not_null` are
-not restricted to `filter` predicates — they produce a `Column<Bool>` and may be
+not restricted to `filter` predicates — they produce a `Series<Bool>` and may be
 assigned in `select`/`update` (e.g. `update { above = price > vwap, missing =
 is_null(sector) }`). `is_null`/`is_not_null`/`coalesce` are null-aware: they read
 the value's null bit rather than its (ignored) payload, so `coalesce(x, 0.0)`
@@ -3505,7 +3502,7 @@ asc  desc  true  false
 
 ```
 Int  Int32  Int64  Float32  Float64  Bool  String  Date  Timestamp
-Column  Series  DataFrame  TimeFrame
+Series  DataFrame  TimeFrame
 ```
 
 **Soft-reserved** (cannot be shadowed by user bindings):

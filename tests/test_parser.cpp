@@ -113,7 +113,7 @@ TEST_CASE("Parse extern declaration with inferred schema") {
 }
 
 TEST_CASE("Parse function declaration with typed params") {
-    const char* source = "fn foo(col: Column<Int>, x: Int) -> Int { x; }";
+    const char* source = "fn foo(col: Series<Int>, x: Int) -> Int { x; }";
 
     auto result = parse(source);
     REQUIRE(result.has_value());
@@ -136,6 +136,13 @@ TEST_CASE("Parse function declaration with typed params") {
     REQUIRE(std::get<ScalarType>(fn.return_type.arg) == ScalarType::Int64);
     REQUIRE(fn.body.size() == 1);
     REQUIRE(std::holds_alternative<ExprStmt>(fn.body.front()));
+}
+
+TEST_CASE("Column is not a DSL type alias") {
+    const char* source = "fn foo(col: Column<Int>) -> Int { 1; }";
+
+    auto result = parse(source);
+    REQUIRE_FALSE(result.has_value());
 }
 
 TEST_CASE("Parse extern and function declarations with effects") {

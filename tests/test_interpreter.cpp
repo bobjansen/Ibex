@@ -4045,6 +4045,37 @@ TEST_CASE("Table(n) builds an n-row scaffold", "[table_rows]") {
     }
 }
 
+TEST_CASE("RNG composes inside arithmetic", "[rng_compose]") {
+    runtime::Table table;
+    table.add_column("base", Column<double>{10.0, 20.0, 30.0, 40.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    // `base + rand_normal(...)` nests an RNG generator inside arithmetic — the
+    // whole field is evaluated vectorized. A tiny stddev keeps the result within
+    // a wide deterministic window of `base` (the per-row arithmetic is exact).
+    runtime::reseed(123);
+    auto ir = require_ir("t[update { y = base + rand_normal(0.0, 0.001) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto& y = std::get<Column<double>>(*result->find("y"));
+    REQUIRE(y.size() == 4);
+    CHECK(std::abs(y[0] - 10.0) < 0.1);
+    CHECK(std::abs(y[1] - 20.0) < 0.1);
+    CHECK(std::abs(y[2] - 30.0) < 0.1);
+    CHECK(std::abs(y[3] - 40.0) < 0.1);
+
+    // Pure-literal arithmetic around RNG also composes: 100 + 0*N -> ~100.
+    auto ir2 = require_ir("t[update { z = 100.0 + 2.0 * rand_uniform(0.0, 1.0) }];");
+    auto r2 = runtime::interpret(*ir2, registry);
+    REQUIRE(r2.has_value());
+    const auto& z = std::get<Column<double>>(*r2->find("z"));
+    for (std::size_t i = 0; i < z.size(); ++i) {
+        CHECK(z[i] >= 100.0);
+        CHECK(z[i] < 102.0);
+    }
+}
+
 TEST_CASE("rep scalar int fills table rows") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});

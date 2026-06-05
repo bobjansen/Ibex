@@ -2887,6 +2887,11 @@ df[update { w = rand_uniform(0.0, 1.0) }]
 df[update { die = rand_int(1, 6) }]
 ```
 
+RNG generators compose inside arithmetic — `price + rand_normal(0.0, 0.5)`,
+`3.0 + 2.0 * rand_normal(0.0, 1.0)`, `rand_normal(0.0, 1.0) * rand_uniform(1.0,
+2.0)` — and the whole expression is evaluated vectorized (each RNG sub-expression
+draws a column, then column arithmetic combines them).
+
 **Constraint.** RNG functions are **not** aggregate functions and must not
 appear inside aggregate function calls (Section 7.3). Each call produces
 exactly one value per row of the current table.

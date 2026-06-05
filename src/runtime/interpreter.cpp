@@ -1206,6 +1206,10 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
 auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,
                           const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<LagLeadResult, std::string>;
+// Vectorized RNG column generator (rand_normal/rand_uniform/...); eval_value_vec
+// treats an RNG call as a column leaf so RNG can be nested inside arithmetic.
+auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
+    -> std::expected<ColumnValue, std::string>;
 
 // Evaluate a value sub-expression over all n rows, returning a column.
 // Returns a pointer into the table for simple column references (zero-copy),
@@ -1267,6 +1271,16 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 res.owned_validity = merge_validity(lhs->get_validity(), rhs->get_validity(), n);
                 return res;
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                if (ir::is_rng_func(node.callee)) {
+                    // RNG generator as a column leaf — lets RNG be nested inside
+                    // arithmetic (e.g. `t + rand_normal(0, 1)`), using the same
+                    // vectorized draw as a bare RNG field.
+                    auto col = apply_rng_func(node, n);
+                    if (!col) {
+                        return std::unexpected(col.error());
+                    }
+                    return ColResult{std::move(*col)};
+                }
                 if (node.callee != "lag" && node.callee != "lead") {
                     // Any other call: delegate to the row-wise field evaluator,
                     // which dispatches through the shared scalar registry. Extern
@@ -5368,6 +5382,33 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
     return std::unexpected("row count expression must evaluate to Int64");
 }
 
+// True if `expr` contains an RNG generator call (rand_normal/rand_uniform/...)
+// anywhere in its tree.
+auto expr_contains_rng(const ir::Expr& expr) -> bool {
+    return std::visit(
+        [](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                if (ir::is_rng_func(node.callee)) {
+                    return true;
+                }
+                return std::ranges::any_of(node.args,
+                                           [](const auto& a) { return expr_contains_rng(*a); });
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                 std::is_same_v<T, ir::CompareExpr>) {
+                return expr_contains_rng(*node.left) || expr_contains_rng(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                return expr_contains_rng(*node.left) ||
+                       (node.right != nullptr && expr_contains_rng(*node.right));
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return expr_contains_rng(*node.operand);
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
+
 // Evaluate a single field expression against a (potentially growing) table,
 // returning the resulting column. Handles fast-path binary ops and row-by-row eval.
 auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
@@ -5377,6 +5418,22 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
     auto inferred = infer_expr_type(expr, input, scalars, externs);
     if (!inferred) {
         return std::unexpected(inferred.error());
+    }
+    // RNG nested inside arithmetic cannot be built per row (eval_expr is pure):
+    // evaluate such expressions vectorized via eval_value_vec, which materializes
+    // each RNG sub-expression as a column (the same draw as a bare RNG field) and
+    // applies column arithmetic. Scoped to arithmetic-topped expressions so a
+    // plain RNG call still takes the bare-field fast path and a registry call
+    // wrapping RNG does not bounce back here.
+    if (std::holds_alternative<ir::BinaryExpr>(expr.node) && expr_contains_rng(expr)) {
+        auto res = eval_value_vec(expr, input, scalars, rows);
+        if (!res) {
+            return std::unexpected(res.error());
+        }
+        if (auto* owned = std::get_if<ColumnValue>(&res->data)) {
+            return std::move(*owned);
+        }
+        return *std::get<const ColumnValue*>(res->data);
     }
     if (auto fast = try_fast_update_binary(expr, input, rows, inferred.value(), scalars);
         fast.has_value()) {
@@ -7494,6 +7551,26 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         auto inferred = infer_expr_type(field.expr, output, scalars, externs);
         if (!inferred) {
             return std::unexpected(inferred.error());
+        }
+        // RNG nested in arithmetic cannot be built per row (eval_expr is pure);
+        // evaluate vectorized via eval_value_vec, which materializes each RNG
+        // sub-expression as a column (same draw as a bare RNG field). See
+        // evaluate_field_column for the same routing on the windowed/select path.
+        if (std::holds_alternative<ir::BinaryExpr>(field.expr.node) &&
+            expr_contains_rng(field.expr)) {
+            auto res = eval_value_vec(field.expr, output, scalars, rows);
+            if (!res) {
+                return std::unexpected(res.error());
+            }
+            ColumnValue col = std::holds_alternative<ColumnValue>(res->data)
+                                  ? std::move(std::get<ColumnValue>(res->data))
+                                  : *std::get<const ColumnValue*>(res->data);
+            if (const auto* v = res->get_validity()) {
+                output.add_column(field.alias, std::move(col), *v);
+            } else {
+                output.add_column(field.alias, std::move(col));
+            }
+            continue;
         }
         if (auto fast = try_fast_update_binary(field.expr, output, rows, inferred.value(), scalars);
             fast.has_value()) {

@@ -4,6 +4,7 @@
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/rng.hpp>
+#include <ibex/runtime/safe_arith.hpp>
 
 #include <algorithm>
 #include <bit>
@@ -305,7 +306,7 @@ auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict
         case ir::ArithmeticOp::Div:
             if constexpr (std::is_integral_v<Out>)
                 for (std::size_t i = 0; i < n; ++i)
-                    dp[i] = rp[i] ? static_cast<Out>(lp[i]) / static_cast<Out>(rp[i]) : Out{0};
+                    dp[i] = safe_idiv<Out>(static_cast<Out>(lp[i]), static_cast<Out>(rp[i]));
             else
                 for (std::size_t i = 0; i < n; ++i)
                     dp[i] = static_cast<Out>(lp[i]) / static_cast<Out>(rp[i]);
@@ -313,7 +314,7 @@ auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict
         case ir::ArithmeticOp::Mod:
             if constexpr (std::is_integral_v<Out>)
                 for (std::size_t i = 0; i < n; ++i)
-                    dp[i] = rp[i] ? static_cast<Out>(lp[i]) % static_cast<Out>(rp[i]) : Out{0};
+                    dp[i] = safe_imod<Out>(static_cast<Out>(lp[i]), static_cast<Out>(rp[i]));
             else
                 for (std::size_t i = 0; i < n; ++i)
                     dp[i] = std::fmod(static_cast<Out>(lp[i]), static_cast<Out>(rp[i]));
@@ -2492,9 +2493,9 @@ auto apply_int_op(ir::ArithmeticOp op, std::int64_t lhs, std::int64_t rhs) -> st
         case ir::ArithmeticOp::Mul:
             return lhs * rhs;
         case ir::ArithmeticOp::Div:
-            return lhs / rhs;
+            return safe_idiv(lhs, rhs);
         case ir::ArithmeticOp::Mod:
-            return lhs % rhs;
+            return safe_imod(lhs, rhs);
     }
     return 0;
 }
@@ -2710,11 +2711,13 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
                     return make_int_result([](std::int64_t a, std::int64_t b) { return a * b; }, lp,
                                            ls, rp, rs);
                 case ir::ArithmeticOp::Div:
-                    return make_int_result([](std::int64_t a, std::int64_t b) { return a / b; }, lp,
-                                           ls, rp, rs);
+                    return make_int_result(
+                        [](std::int64_t a, std::int64_t b) { return safe_idiv(a, b); }, lp, ls, rp,
+                        rs);
                 case ir::ArithmeticOp::Mod:
-                    return make_int_result([](std::int64_t a, std::int64_t b) { return a % b; }, lp,
-                                           ls, rp, rs);
+                    return make_int_result(
+                        [](std::int64_t a, std::int64_t b) { return safe_imod(a, b); }, lp, ls, rp,
+                        rs);
             }
         }
         Column<std::int64_t> out;
@@ -5288,9 +5291,9 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 case ir::ArithmeticOp::Mul:
                     return lhs * rhs;
                 case ir::ArithmeticOp::Div:
-                    return lhs / rhs;
+                    return safe_idiv(lhs, rhs);
                 case ir::ArithmeticOp::Mod:
-                    return lhs % rhs;
+                    return safe_imod(lhs, rhs);
             }
         }
     }

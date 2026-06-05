@@ -773,7 +773,9 @@ select_clause   = "select" field_or_list ;
 
 distinct_clause = "distinct" field_or_list ;
 
-update_clause   = "update" field_or_list ;
+update_clause   = [ guard ] "update" field_or_list ;
+
+guard           = "where" expr ;   (* row guard: scopes the update to matching rows *)
 
 order_clause    = "order"
                 | "order" order_keys ;
@@ -833,8 +835,11 @@ tuple_field     = "(" col_name { "," col_name } ")" "=" expr ;
 
 col_name        = IDENT | QUOTED_IDENT ;
 
-update_clause   = "update" field_or_list
-                | "update" "=" expr ;      (* merge-all form *)
+update_clause   = [ guard ] "update" field_or_list
+                | [ guard ] "update" "=" expr ;      (* merge-all form *)
+                                                     (* guard = "where" expr; scopes the
+                                                        update to matching rows, leaving
+                                                        the rest unchanged *)
 
 join_keys       = IDENT
                 | "{" IDENT { "," IDENT } [ "," ] "}" ;
@@ -955,6 +960,7 @@ Within a single block:
 | C3 | At most **one** `distinct` clause. |
 | C4 | At most **one** `update` clause. |
 | C5 | `select`, `distinct`, and `update` are **mutually exclusive**. |
+| C5b | A `where <predicate>` row guard may prefix only an `update` clause (Section 5.3). The predicate must be `Bool`. Unlike `filter`, it does not change cardinality — non-matching rows are retained unchanged. |
 | C6 | At most **one** `order` clause. |
 | C7 | At most **one** `head` clause and at most **one** `tail` clause. |
 | C8 | `head` and `tail` are **mutually exclusive**. |
@@ -1176,6 +1182,69 @@ tuple fields are allowed in the same block:
 ```
 trades[update { log_price = log(price), (delta, gamma) = compute_greeks() }]
 ```
+
+**Guarded `update` — `where <predicate> update { ... }`**
+
+A `where <predicate>` prefix scopes an `update` to a subset of rows. Rows for
+which the predicate is `true` receive the field assignments; every other row —
+including rows where the predicate is `false` or `null` — keeps its existing
+value in every column. Cardinality is unchanged: no rows are dropped.
+
+```
+trades[where symbol == "AAPL" update { price = price * 1.1, tier = "A" }]
+```
+
+The predicate must have type `Bool` after column resolution (Section 6) — the
+same rule as a `filter` predicate. It is stated **once** and applies to every
+assignment in the block, which is what makes a multi-column subset update
+concise (the condition and the "keep the rest" behaviour are not repeated per
+field).
+
+**`where` keeps rows; `filter` drops them.** This is the essential contrast and
+the reason `where … update` is not just `filter, update`:
+
+| Form | Non-matching rows |
+|------|-------------------|
+| `t[filter C, update { ... }]` | **dropped**, then the survivors are updated |
+| `t[where C update { ... }]`   | **retained unchanged**; only matching rows are updated |
+
+Reach for `where … update` to modify a subset in place; reach for `filter` only
+when you actually want to discard the rest.
+
+**Semantics by desugaring.** A guarded update is pure sugar for a per-column
+conditional value-selection. It introduces no mutation and lowers, plans, and
+pushes down exactly like an ordinary `update`: each assigned column is set to
+its new expression on matching rows and left at its prior value on the rest.
+
+```
+where C update { a = ea, b = eb }
+   ≡   update where each row sets  a := (ea if C else a),  b := (eb if C else b)
+```
+
+Consequences that follow directly:
+
+- **Replacing an existing column** preserves the old value on non-matching rows.
+- **Introducing a new column** under a guard yields `null` on non-matching rows,
+  since there is no prior value: `where C update { c = ec }` sets
+  `c := (ec if C else null)`.
+- A row where `C` evaluates to `null` is treated as **non-matching** (not
+  updated), consistent with SQL `UPDATE … WHERE` and with `filter`'s 3VL rules
+  (Section 3.5).
+
+**Composition.** The guard binds to exactly the `update` it prefixes and does
+not affect other clauses in the pipeline. `where … update` combines with `by`
+(and `window`) like an ordinary update — assignments and any grouped or
+windowed expressions they contain are evaluated within each group, while the
+guard selects rows within that group:
+
+```
+trades[where price > rolling_mean(price) update { above = true }, by symbol, window 5m]
+```
+
+The keyword `where` is also used inside compile-time `map` bodies (earlier in
+this section) to filter generated items. The two are disambiguated by position:
+a clause-leading `where … update` is a runtime row guard, while a `where` inside
+a `map { ... }` body filters expansions at compile time.
 
 **`update = expr`**
 
@@ -3426,6 +3495,15 @@ sum  mean  min  max  count  first  last  median  std  ewma
 
 ```
 const  mutable  consume
+```
+
+**Contextual clause keywords** (reserved only in their syntactic position;
+usable as identifiers elsewhere):
+
+```
+where   (the `map ... where` compile-time expansion filter, and the
+         `where <predicate> update { ... }` row guard — Section 5.3)
+map  get  in
 ```
 
 ---

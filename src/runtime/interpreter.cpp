@@ -8019,6 +8019,12 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (update.children().empty()) {
                 return std::unexpected("update node missing child");
             }
+            if (update.guard() != nullptr) {
+                // TODO: execute the guarded update (where <pred> update { ... }).
+                return std::unexpected(
+                    "guarded update ('where <predicate> update { ... }') is parsed and lowered "
+                    "but not yet executed");
+            }
             auto child = interpret_node(*update.children().front(), registry, scalars, externs);
             if (!child) {
                 return std::unexpected(child.error());
@@ -13409,6 +13415,11 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const auto& update = static_cast<const ir::UpdateNode&>(node);
         if (update.children().empty()) {
             return std::unexpected("update node missing child");
+        }
+        if (update.guard() != nullptr) {
+            return std::unexpected(
+                "guarded update ('where <predicate> update { ... }') is parsed and lowered "
+                "but not yet executed");
         }
         if (!update.group_by().empty()) {
             const bool all_rank = std::all_of(

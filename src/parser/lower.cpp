@@ -1624,6 +1624,15 @@ class Lowerer {
             if (!update.has_value()) {
                 return std::unexpected(update.error());
             }
+            // Guarded update `where <predicate> update { ... }`: attach the
+            // lowered predicate to the UpdateNode (lower_update always returns one).
+            if (state.update->guard) {
+                auto guard = lower_expr_to_ir(*state.update->guard);
+                if (!guard.has_value()) {
+                    return std::unexpected(guard.error());
+                }
+                static_cast<ir::UpdateNode&>(*update.value()).set_guard(std::move(guard.value()));
+            }
             update.value()->add_child(std::move(node));
             node = std::move(update.value());
         }

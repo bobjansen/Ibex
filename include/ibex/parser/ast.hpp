@@ -176,6 +176,10 @@ struct UpdateClause {
     std::vector<MapField> map_fields;
     /// Set for the `update = expr` form: all columns of the result are merged in.
     ExprPtr merge_expr;
+    /// Set for the guarded form `where <predicate> update { ... }`: the update
+    /// applies only to rows where the predicate is true; other rows keep their
+    /// existing values. Null for an unguarded update.
+    ExprPtr guard;
 };
 
 struct RenameClause {

@@ -529,10 +529,19 @@ class UpdateNode final : public Node {
         return group_by_;
     }
 
+    /// Optional row guard from `where <predicate> update { ... }`: the update
+    /// applies only to rows where the predicate is true; other rows keep their
+    /// existing values. Null for an unguarded update.
+    void set_guard(Expr guard) { guard_ = std::move(guard); }
+    [[nodiscard]] auto guard() const noexcept -> const Expr* {
+        return guard_.has_value() ? &*guard_ : nullptr;
+    }
+
    private:
     std::vector<FieldSpec> fields_;
     std::vector<TupleFieldSpec> tuple_fields_;
     std::vector<ColumnRef> group_by_;
+    std::optional<Expr> guard_;
 };
 
 /// Rename node: renames specified columns while keeping all others intact.

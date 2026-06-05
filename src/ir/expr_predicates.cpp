@@ -5,28 +5,45 @@
 
 namespace ibex::ir {
 
-auto is_row_local_update_expr(const Expr& expr) -> bool {
+auto fn_kind(std::string_view name) -> FnKind {
+    if (is_rolling_func(name) || is_cum_func(name) || name == "lag" || name == "lead" ||
+        name == "fill_forward" || name == "fill_backward") {
+        return FnKind::Transform;
+    }
+    if (is_rng_func(name) || name == "rep") {
+        return FnKind::Generator;
+    }
+    if (is_aggregate_func(name)) {
+        return FnKind::Aggregate;
+    }
+    return FnKind::Scalar;
+}
+
+namespace {
+
+// Walk `expr`; a call is disqualifying when `bad(fn_kind(callee))`. A `RankExpr`
+// node is always disqualifying (non-row-local). Shared by the row-local and
+// subset-evaluable predicates so both classify through `fn_kind`.
+template <typename BadKind>
+auto no_call_of_kind(const Expr& expr, BadKind bad) -> bool {
     return std::visit(
-        [](const auto& n) -> bool {
+        [&](const auto& n) -> bool {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, ColumnRef> || std::is_same_v<T, Literal>) {
                 return true;
             } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-                return is_row_local_update_expr(*n.left) && is_row_local_update_expr(*n.right);
+                return no_call_of_kind(*n.left, bad) && no_call_of_kind(*n.right, bad);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
-                const auto& name = n.callee;
-                if (name == "lag" || name == "lead" || name == "rep" || is_rolling_func(name) ||
-                    is_cum_func(name) || is_rng_func(name) || name == "fill_forward" ||
-                    name == "fill_backward") {
+                if (bad(fn_kind(n.callee))) {
                     return false;
                 }
                 for (const auto& arg : n.args) {
-                    if (!is_row_local_update_expr(*arg)) {
+                    if (!no_call_of_kind(*arg, bad)) {
                         return false;
                     }
                 }
                 for (const auto& na : n.named_args) {
-                    if (!is_row_local_update_expr(*na.value)) {
+                    if (!no_call_of_kind(*na.value, bad)) {
                         return false;
                     }
                 }
@@ -38,6 +55,17 @@ auto is_row_local_update_expr(const Expr& expr) -> bool {
             }
         },
         expr.node);
+}
+
+}  // namespace
+
+auto is_row_local_update_expr(const Expr& expr) -> bool {
+    return no_call_of_kind(
+        expr, [](FnKind k) { return k == FnKind::Transform || k == FnKind::Generator; });
+}
+
+auto is_subset_evaluable_expr(const Expr& expr) -> bool {
+    return no_call_of_kind(expr, [](FnKind k) { return k != FnKind::Scalar; });
 }
 
 void collect_expr_column_refs(const Expr& expr, std::unordered_set<std::string>& out) {

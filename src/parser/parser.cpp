@@ -1238,6 +1238,19 @@ class Parser {
             }
             return TailClause{.count = std::move(count)};
         }
+        // Guarded update: `where <predicate> update { ... }`. The predicate
+        // scopes the update to matching rows; other rows keep their values.
+        ExprPtr update_guard;
+        if (match(TokenKind::KeywordWhere)) {
+            update_guard = parse_expression();
+            if (!update_guard) {
+                return std::nullopt;
+            }
+            if (!check(TokenKind::KeywordUpdate)) {
+                error_ = make_error(peek(), "expected 'update' after 'where <predicate>' guard");
+                return std::nullopt;
+            }
+        }
         if (match(TokenKind::KeywordUpdate)) {
             // `update = expr`: merge all columns from a table-returning expression.
             if (match(TokenKind::Eq)) {
@@ -1248,7 +1261,8 @@ class Parser {
                 return UpdateClause{.fields = {},
                                     .tuple_fields = {},
                                     .map_fields = {},
-                                    .merge_expr = std::move(expr)};
+                                    .merge_expr = std::move(expr),
+                                    .guard = std::move(update_guard)};
             }
             auto result = parse_clause_field_list_or_single();
             if (!result.has_value()) {
@@ -1257,7 +1271,8 @@ class Parser {
             return UpdateClause{.fields = std::move(result->fields),
                                 .tuple_fields = std::move(result->tuple_fields),
                                 .map_fields = std::move(result->map_fields),
-                                .merge_expr = {}};
+                                .merge_expr = {},
+                                .guard = std::move(update_guard)};
         }
         if (match(TokenKind::KeywordRename)) {
             auto fields = parse_field_list_or_single();

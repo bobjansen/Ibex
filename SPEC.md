@@ -345,6 +345,21 @@ TimeFrame<S>      — a time-indexed relation with schema S
 Boolean column values are stored as bytes (0 = false, non-zero = true) and are
 not implicitly convertible to `Int64` in arithmetic expressions.
 
+Series literals use bracket syntax:
+
+```
+let ids = [1, 2, 3];                   // Series<Int64>
+let px = [10.5, 11.0, 12.25];          // Series<Float64>
+let symbols = ["AAPL", "GOOG"];        // Series<String>
+let mask = [true, false, true];        // Series<Bool>
+let empty: Series<Float64> = [];       // typed empty Series
+```
+
+All elements must be literals of the same scalar kind. Empty series literals
+require a `Series<T>` annotation outside `Table { ... }`; inside a table
+constructor, `col = []` produces a zero-row `Int64` series by default.
+Duration literals (`1m`, `30s`) are not valid series elements.
+
 `TimeFrame<S>` is a `DataFrame<S>` with the additional invariant that exactly
 one column of type `Timestamp` is designated as the time index, and rows are
 sorted by that index in ascending order.
@@ -734,7 +749,7 @@ primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | schema_lit
                 | "(" expr ")" ;
 
-table_col_def   = IDENT "=" array_lit ;
+table_col_def   = IDENT "=" expr ;
 
 array_lit       = "[" [ expr { "," expr } [ "," ] ] "]" ;
 
@@ -2061,8 +2076,8 @@ df[select { symbol, total = sum(price) }]  // ERROR: 'symbol' is bare
 ## 8. Inline Table Construction
 
 The `Table { ... }` expression constructs a `DataFrame` from column definitions
-without requiring an extern data source. Column values may be inline array
-literals **or** arbitrary Ibex expressions that evaluate to a column vector.
+without requiring an extern data source. Column values may be inline series
+literals **or** arbitrary Ibex expressions that evaluate to a series or table.
 
 ### 8.1 Syntax
 
@@ -2071,8 +2086,9 @@ Table { col_name = expr, col_name = expr, ... }   // literal form
 Table(n)                                          // empty n-row frame
 ```
 
-In the **literal form** each `expr` is either an **array literal** `[v, v, ...]`
-or any expression that produces a table from which the column value is extracted.
+In the **literal form** each `expr` is either a **series literal** `[v, v, ...]`
+or any expression that produces a series or table from which the column value is
+extracted.
 
 The **`Table(n)` form** produces an empty frame with `n` rows and no columns,
 where `n` is any expression evaluating to a non-negative `Int64`. It is the
@@ -2092,9 +2108,9 @@ when immediately followed by `{` (literal form) or `(` (row-count form). It is
 not reserved and can be used as a regular binding or function name in other
 positions.
 
-### 8.2 Array-Literal Columns
+### 8.2 Series-Literal Columns
 
-The simplest form uses inline element lists:
+The simplest form uses inline series literals:
 
 ```
 let t = Table {
@@ -2116,14 +2132,15 @@ Supported element types and their inferred column types:
 | `date "…"`      | `Date`                |
 | `ts "…"`        | `Timestamp`           |
 
-All elements within one array must have the same literal kind; mixing types
+All elements within one series literal must have the same literal kind; mixing types
 is a lowering error. Duration literals (`1m`, `30s`) are not valid array
 elements.
 
 ### 8.3 Expression Columns
 
-Any expression that produces a **Table** may be used as a column value. The
-column is extracted from the result table using the following rule:
+Any expression that produces a **Series** or **Table** may be used as a column
+value. Series values are used directly. For table values, the column is
+extracted from the result table using the following rule:
 
 1. If the result table has **exactly one column**, that column is used
    (regardless of its name in the source table).
@@ -2161,7 +2178,7 @@ Literal and expression columns may be freely mixed within the same constructor:
 
 ```
 let ref = Table {
-    label = ["open", "close"],           // array literal
+    label = ["open", "close"],           // series literal
     value = ohlc[select { open }],       // expression
 };
 ```
@@ -2169,7 +2186,7 @@ let ref = Table {
 ### 8.4 Constraints
 
 1. **Equal column lengths.** Every column in the constructor must have the
-   same number of rows, whether the value is a literal array or an expression.
+   same number of rows, whether the value is a series literal or an expression.
    A mismatch is detected at interpret time and returns an error.
 
 2. **No duration literals in arrays.** Duration values (e.g. `1m`, `30s`) are

@@ -474,13 +474,13 @@ prices[
           <p>
             The <code>Table&nbsp;{&nbsp;&hellip;&nbsp;}</code> constructor builds
             a <code>DataFrame</code> column-by-column. Each column value is either
-            an inline array literal <code>[v,&nbsp;v,&nbsp;&hellip;]</code>
-            or any Ibex expression that produces a table &mdash; no file or
+            an inline <code>Series</code> literal <code>[v,&nbsp;v,&nbsp;&hellip;]</code>
+            or any Ibex expression that produces a series or table &mdash; no file or
             plugin declaration required.
           </p>
           <p>
-            For expression columns, the runtime extracts the column from the
-            result table: a <strong>single-column</strong> result is used
+            For table-valued expression columns, the runtime extracts the column
+            from the result table: a <strong>single-column</strong> result is used
             directly; a <strong>multi-column</strong> result is matched by
             column name. Literal and expression columns may be freely mixed.
           </p>
@@ -491,10 +491,14 @@ prices[
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm">// Array-literal columns</span>
+<pre><code><span class="cm">// Series literals</span>
+<span class="kw">let</span> price = [<span class="num">150.0</span>, <span class="num">140.0</span>, <span class="num">300.0</span>];
+<span class="kw">let</span> empty: Series&lt;Float64&gt; = [];
+
+<span class="cm">// Series-literal columns</span>
 <span class="kw">let</span> t = Table {
     symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>, <span class="str">"MSFT"</span>],
-    price  = [<span class="num">150.0</span>, <span class="num">140.0</span>, <span class="num">300.0</span>],
+    price  = price,
 };
 
 <span class="cm">// Columns from existing table expressions</span>

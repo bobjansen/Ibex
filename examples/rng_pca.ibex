@@ -35,13 +35,13 @@ seed_rng(8675309);
 // 1. N-row scaffold: an empty 4000-row frame.
 let scaffold = Table(4000);
 
-// 2. Draw the latent factor, three small per-axis noises, and the independent
-//    axis w (each rand_* is the sole RHS of its binding).
-let draws = scaffold[update { t = rand_normal(0.0, 4.0), e1 = rand_normal(0.0, 0.3), e2 = rand_normal(0.0, 0.3), e3 = rand_normal(0.0, 0.3), w = rand_normal(0.0, 1.0) }];
+// 2. Draw the latent factor and the independent axis w.
+let draws = scaffold[update { t = rand_normal(0.0, 4.0), w = rand_normal(0.0, 1.0) }];
 
-// 3. Build the correlated observed axes from the factor (pure column
-//    arithmetic; w is carried through unchanged).
-let data = draws[update { x = t + e1, y = t * 2.0 + e2, z = t * -1.5 + e3 }];
+// 3. Build the correlated observed axes from the factor. RNG composes inside
+//    arithmetic, so each axis is the factor plus its own fresh noise in a single
+//    expression (no separate noise columns); w is carried through unchanged.
+let data = draws[update { x = t + rand_normal(0.0, 0.3), y = t * 2.0 + rand_normal(0.0, 0.3), z = t * -1.5 + rand_normal(0.0, 0.3) }];
 
 // 4. PCA keeping the top 2 components. The −1 drops the intercept; PCA centers
 //    internally, so a constant design column would be meaningless.

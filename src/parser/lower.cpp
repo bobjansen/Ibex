@@ -1106,6 +1106,15 @@ class Lowerer {
     ///     expected to produce a single-column Table (or a Table containing a column
     ///     named after the column being defined) at interpret/codegen time.
     auto lower_table_expr(const TableExpr& tbl) -> LowerResult {
+        // `Table(n)` form: an empty frame with `n` rows and no columns.
+        if (tbl.row_count) {
+            auto count = lower_expr_to_ir(*tbl.row_count);
+            if (!count.has_value()) {
+                return std::unexpected(count.error());
+            }
+            return builder_.construct_rows(std::move(*count));
+        }
+
         std::vector<ir::ConstructColumn> construct_cols;
         construct_cols.reserve(tbl.columns.size());
 

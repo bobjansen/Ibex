@@ -26,10 +26,9 @@ import "lightgbm";
 // Reproducible draws: seed the thread-local RNG so every run is identical.
 seed_rng(20240601);
 
-// 1. Bootstrap an N-row scaffold. RNG functions emit one value per row of the
-//    current table, so we first widen the 4-row `trades` demo table to N rows
-//    with rep(0, length_out=N).
-let scaffold = trades[select { row = rep(0, length_out=4000) }];
+// 1. Bootstrap an N-row scaffold. `Table(n)` is an empty n-row frame; RNG
+//    functions then emit one value per row of it.
+let scaffold = Table(4000);
 
 // 2. Draw the independent predictors and the noise term. Each rand_* call is
 //    the sole right-hand side of its binding — RNG functions cannot be nested
@@ -59,7 +58,7 @@ let gbm_r2 = model_r_squared(m_gbm);
 //    batch (same generative process) stands in for unseen rows. model_predict
 //    is a plugin-model feature; the built-in OLS/ridge families expose their
 //    coefficients (step 4/5) rather than a predict entry point.
-let holdout = trades[select { row = rep(0, length_out=8) }][update { x1 = rand_normal(0.0, 1.0), x2 = rand_uniform(-2.0, 2.0), x3 = rand_normal(0.0, 2.0) }];
+let holdout = Table(8)[update { x1 = rand_normal(0.0, 1.0), x2 = rand_uniform(-2.0, 2.0), x3 = rand_normal(0.0, 2.0) }];
 let pred_gbm = model_predict(m_gbm, holdout);
 
 // 8. Show the recovery. print(x) renders x and returns it; a bare `name;` line

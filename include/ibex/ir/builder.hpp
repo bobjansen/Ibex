@@ -147,6 +147,11 @@ class Builder {
         return std::make_unique<ConstructNode>(next_id(), std::move(columns));
     }
 
+    /// `Table(n)` — an empty frame with `n` rows and no columns.
+    [[nodiscard]] auto construct_rows(Expr row_count) -> NodePtr {
+        return std::make_unique<ConstructNode>(next_id(), std::move(row_count));
+    }
+
     [[nodiscard]] auto program(std::vector<NodePtr> preamble, NodePtr main_node) -> NodePtr {
         return std::make_unique<ProgramNode>(next_id(), std::move(preamble), std::move(main_node));
     }

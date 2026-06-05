@@ -4009,6 +4009,42 @@ TEST_CASE("Two-key categorical group-by spills to hash above the dense limit") {
 
 // --- rep ---------------------------------------------------------------------
 
+TEST_CASE("Table(n) builds an n-row scaffold", "[table_rows]") {
+    runtime::TableRegistry registry;
+
+    // Bare Table(n): n rows, no columns. The logical row count survives the
+    // chunked-execution round trip (TableSource -> Materialize).
+    {
+        auto ir = require_ir("Table(5);");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->columns.empty());
+        CHECK(result->rows() == 5);
+    }
+    // As an update scaffold: generated columns each get n rows.
+    {
+        auto ir = require_ir("Table(7)[update { i = rep(0, length_out=7) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 7);
+        const auto& col = std::get<Column<std::int64_t>>(*result->find("i"));
+        CHECK(col.size() == 7);
+    }
+    // Table(0) is an empty frame.
+    {
+        auto ir = require_ir("Table(0);");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        CHECK(result->rows() == 0);
+    }
+    // A negative count is rejected.
+    {
+        auto ir = require_ir("Table(0 - 3);");
+        auto result = runtime::interpret(*ir, registry);
+        CHECK_FALSE(result.has_value());
+    }
+}
+
 TEST_CASE("rep scalar int fills table rows") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});

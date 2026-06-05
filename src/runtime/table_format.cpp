@@ -155,7 +155,13 @@ auto format_cell(const ColumnEntry& entry, std::size_t row) -> std::string {
 
 void format_table(const Table& table, std::ostream& out, std::size_t max_rows) {
     if (table.columns.empty()) {
-        fmt::print(out, "<empty>\n");
+        // A column-less frame may still carry a logical row count (e.g. from
+        // `Table(n)`); report it rather than the bare "<empty>".
+        if (table.rows() > 0) {
+            fmt::print(out, "rows: {}\n(no columns)\n", table.rows());
+        } else {
+            fmt::print(out, "<empty>\n");
+        }
         return;
     }
     fmt::print(out, "rows: {}\n", table.rows());

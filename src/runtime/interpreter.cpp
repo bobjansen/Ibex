@@ -7686,6 +7686,129 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     return output;
 }
 
+/// Execute a guarded update `where <predicate> update { ... }`: rows matching
+/// the predicate get the field assignments; non-matching rows keep their values
+/// (a new column is null off-mask). Each field is evaluated where it is needed —
+/// row-local (Scalar-only, `is_subset_evaluable_expr`) fields on just the
+/// matching rows (gather/scatter); non-row-local fields (lag/rolling/rank/...)
+/// over the full table, then selected by the mask. Both produce the same result;
+/// row-locality only decides where the work happens.
+auto apply_guarded_update(Table input, const ir::UpdateNode& update, const ScalarRegistry* scalars,
+                          const ExternRegistry* externs) -> std::expected<Table, std::string> {
+    if (!update.group_by().empty()) {
+        return std::unexpected("guarded update (where ... update) does not support `by` yet");
+    }
+    if (!update.tuple_fields().empty()) {
+        return std::unexpected(
+            "guarded update (where ... update) does not support tuple-bound fields yet");
+    }
+    const std::size_t n = input.rows();
+
+    // Mask: a row matches iff the predicate is true AND not null.
+    auto mask = compute_mask(*update.guard(), input, scalars, n);
+    if (!mask) {
+        return std::unexpected(mask.error());
+    }
+    std::vector<uint8_t> matched(n, 0);
+    std::vector<std::size_t> matched_idx;
+    for (std::size_t i = 0; i < n; ++i) {
+        const bool m = mask->value[i] != 0 && (!mask->valid.has_value() || (*mask->valid)[i] != 0);
+        matched[i] = m ? 1U : 0U;
+        if (m) {
+            matched_idx.push_back(i);
+        }
+    }
+
+    Table output = std::move(input);
+    std::optional<Table> sub;  // matching rows of the original columns (built lazily)
+
+    for (const auto& field : update.fields()) {
+        // Snapshot the old column + validity (if the name exists) before overwriting.
+        const ColumnEntry* old_entry = output.find_entry(field.alias);
+        std::optional<ColumnValue> old_col;
+        std::optional<ValidityBitmap> old_valid;
+        if (old_entry != nullptr) {
+            old_col = *old_entry->column;
+            old_valid = old_entry->validity;
+        }
+
+        // Evaluate the field. Subset-evaluable fields run on the matching rows
+        // only; the rest run over the full table.
+        const bool subset = ir::is_subset_evaluable_expr(field.expr);
+        ColumnValue new_vals;
+        std::optional<ValidityBitmap> new_valid;
+        {
+            if (subset && !sub.has_value()) {
+                sub = gather_rows(output, matched_idx);
+            }
+            Table src_in = subset ? Table{*sub} : Table{output};
+            auto upd = update_table(std::move(src_in), {field}, scalars, externs);
+            if (!upd) {
+                return std::unexpected(upd.error());
+            }
+            const ColumnEntry* e = upd->find_entry(field.alias);
+            new_vals = *e->column;
+            new_valid = e->validity;
+        }
+
+        // A guarded assignment may not change the type of an existing column —
+        // non-matching rows must keep their old (same-type) values.
+        if (old_col.has_value() && old_col->index() != new_vals.index()) {
+            return std::unexpected("guarded update cannot change the type of existing column '" +
+                                   field.alias + "'");
+        }
+
+        // Build the result column by pushing per row: matched -> new value
+        // (subset values are aligned with matched_idx; full values indexed by i),
+        // non-matched -> old value, or null for a new column.
+        auto [result_col, result_valid] = std::visit(
+            [&](const auto& src) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
+                using Col = std::decay_t<decltype(src)>;
+                const Col* oldc = old_col.has_value() ? &std::get<Col>(*old_col) : nullptr;
+                Col out;
+                out.reserve(n);
+                ValidityBitmap valid(n, true);
+                bool any_invalid = false;
+                std::size_t k = 0;  // running index into `src` for the subset case
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (matched[i] != 0) {
+                        const std::size_t si = subset ? k++ : i;
+                        out.push_back(src[si]);
+                        const bool v = !new_valid.has_value() || (*new_valid)[si];
+                        valid.set(i, v);
+                        any_invalid = any_invalid || !v;
+                    } else if (oldc != nullptr) {
+                        out.push_back((*oldc)[i]);
+                        const bool v = !old_valid.has_value() || (*old_valid)[i];
+                        valid.set(i, v);
+                        any_invalid = any_invalid || !v;
+                    } else {
+                        if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                            out.push_back(std::string_view{});
+                        } else {
+                            out.push_back(typename Col::value_type{});
+                        }
+                        valid.set(i, false);
+                        any_invalid = true;
+                    }
+                }
+                return {
+                    ColumnValue{std::move(out)},
+                    any_invalid ? std::optional<ValidityBitmap>{std::move(valid)} : std::nullopt};
+            },
+            new_vals);
+
+        if (auto it = output.index.find(field.alias); it != output.index.end()) {
+            output.replace_column(it->second, std::move(result_col), std::move(result_valid));
+        } else if (result_valid.has_value()) {
+            output.add_column(field.alias, std::move(result_col), std::move(*result_valid));
+        } else {
+            output.add_column(field.alias, std::move(result_col));
+        }
+    }
+    return output;
+}
+
 /// Per-group update: partition the input by `group_by`, run the regular
 /// `update_table` on each per-group slice, then scatter the new field
 /// columns back into a single full-sized output. Ordered ops like `lag`,
@@ -8019,15 +8142,12 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (update.children().empty()) {
                 return std::unexpected("update node missing child");
             }
-            if (update.guard() != nullptr) {
-                // TODO: execute the guarded update (where <pred> update { ... }).
-                return std::unexpected(
-                    "guarded update ('where <predicate> update { ... }') is parsed and lowered "
-                    "but not yet executed");
-            }
             auto child = interpret_node(*update.children().front(), registry, scalars, externs);
             if (!child) {
                 return std::unexpected(child.error());
+            }
+            if (update.guard() != nullptr) {
+                return apply_guarded_update(std::move(child.value()), update, scalars, externs);
             }
             if (!update.group_by().empty()) {
                 const bool all_rank = std::all_of(
@@ -13417,9 +13537,11 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("update node missing child");
         }
         if (update.guard() != nullptr) {
-            return std::unexpected(
-                "guarded update ('where <predicate> update { ... }') is parsed and lowered "
-                "but not yet executed");
+            return build_unary_materializing_operator(
+                *update.children().front(), registry, scalars, externs, model_out,
+                [&](Table input) -> std::expected<Table, std::string> {
+                    return apply_guarded_update(std::move(input), update, scalars, externs);
+                });
         }
         if (!update.group_by().empty()) {
             const bool all_rank = std::all_of(

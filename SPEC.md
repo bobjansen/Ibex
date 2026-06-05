@@ -1211,17 +1211,27 @@ the reason `where … update` is not just `filter, update`:
 Reach for `where … update` to modify a subset in place; reach for `filter` only
 when you actually want to discard the rest.
 
-**Semantics by desugaring.** A guarded update is pure sugar for a per-column
-conditional value-selection. It introduces no mutation and lowers, plans, and
-pushes down exactly like an ordinary `update`: each assigned column is set to
-its new expression on matching rows and left at its prior value on the rest.
+**Semantics.** For every assigned column the result is: matching rows get the
+expression's value, non-matching rows keep their prior value (a new column is
+`null` off the mask). The result is identical to a per-column conditional
+value-selection — `a` becomes `ea` where `C` holds and its prior value
+otherwise — but the assignment expression is **evaluated only where it is
+needed**, which makes the guard both efficient and protective:
 
-```
-where C update { a = ea, b = eb }
-   ≡   update where each row sets  a := (ea if C else a),  b := (eb if C else b)
-```
+- A **row-local** field expression (`out[i]` depends only on row `i` — scalar
+  arithmetic, casts, math, …) is evaluated on the **matching rows only**. So a
+  guard meant to protect an expression from bad inputs actually does:
+  `where x > 0 update { y = log(x) }` never evaluates `log` on a non-positive
+  `x`, and an expensive expression runs only on the subset it updates.
+- A **non-row-local** field expression (`lag`/`lead`, `rolling_*`, `rank`,
+  aggregates — anything that reads other rows) is evaluated over the **full
+  table** so its neighbours/window/order are correct, and the result is then
+  assigned to the matching rows. This is what makes "update the last row of each
+  group with `lag(x, 1)`" well-defined — `lag` sees the real previous row, not
+  the previous *matching* row.
 
-Consequences that follow directly:
+A guarded update introduces no mutation; it lowers, plans, and pushes down like
+an ordinary `update`. Consequences that follow directly:
 
 - **Replacing an existing column** preserves the old value on non-matching rows.
 - **Introducing a new column** under a guard yields `null` on non-matching rows,
@@ -1245,6 +1255,11 @@ The keyword `where` is also used inside compile-time `map` bodies (earlier in
 this section) to filter generated items. The two are disambiguated by position:
 a clause-leading `where … update` is a runtime row guard, while a `where` inside
 a `map { ... }` body filters expansions at compile time.
+
+*Current implementation status:* the guarded update supports plain field
+assignments (including non-row-local fields like `lag`/`rolling_*`). Combining a
+guard with `by` (grouped), tuple-LHS fields, or the `update = expr` merge form is
+not yet implemented and is a compile/run error.
 
 **`update = expr`**
 

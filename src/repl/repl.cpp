@@ -1205,6 +1205,129 @@ auto validate_column_type(const runtime::ColumnValue& column, const parser::Type
     return std::nullopt;
 }
 
+auto empty_series_for_type(parser::ScalarType type) -> runtime::ColumnValue {
+    switch (type) {
+        case parser::ScalarType::Int32:
+        case parser::ScalarType::Int64:
+            return Column<std::int64_t>{};
+        case parser::ScalarType::Float32:
+        case parser::ScalarType::Float64:
+            return Column<double>{};
+        case parser::ScalarType::Bool:
+            return Column<bool>{};
+        case parser::ScalarType::String:
+            return Column<std::string>{};
+        case parser::ScalarType::Date:
+            return Column<Date>{};
+        case parser::ScalarType::Timestamp:
+            return Column<Timestamp>{};
+    }
+    return Column<std::int64_t>{};
+}
+
+auto eval_series_literal(const parser::ArrayLiteralExpr& array,
+                         std::optional<parser::ScalarType> expected = std::nullopt)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    if (array.elements.empty()) {
+        if (!expected.has_value()) {
+            return std::unexpected("empty series literal requires a Series<T> annotation");
+        }
+        return empty_series_for_type(*expected);
+    }
+
+    const auto* first_lit = std::get_if<parser::LiteralExpr>(&array.elements.front()->node);
+    if (first_lit == nullptr) {
+        return std::unexpected("series literal elements must be literals");
+    }
+
+    const std::size_t type_index = first_lit->value.index();
+    if (type_index == 4) {
+        return std::unexpected("duration literals are not valid series elements");
+    }
+    for (const auto& element : array.elements) {
+        const auto* lit = std::get_if<parser::LiteralExpr>(&element->node);
+        if (lit == nullptr) {
+            return std::unexpected("series literal elements must be literals");
+        }
+        if (lit->value.index() == 4) {
+            return std::unexpected("duration literals are not valid series elements");
+        }
+        if (lit->value.index() != type_index) {
+            return std::unexpected("series literal has mixed element types");
+        }
+    }
+
+    runtime::ColumnValue out;
+    switch (type_index) {
+        case 0: {
+            Column<std::int64_t> col;
+            col.reserve(array.elements.size());
+            for (const auto& element : array.elements) {
+                col.push_back(
+                    std::get<std::int64_t>(std::get<parser::LiteralExpr>(element->node).value));
+            }
+            out = std::move(col);
+            break;
+        }
+        case 1: {
+            Column<double> col;
+            col.reserve(array.elements.size());
+            for (const auto& element : array.elements) {
+                col.push_back(std::get<double>(std::get<parser::LiteralExpr>(element->node).value));
+            }
+            out = std::move(col);
+            break;
+        }
+        case 2: {
+            Column<bool> col;
+            col.reserve(array.elements.size());
+            for (const auto& element : array.elements) {
+                col.push_back(std::get<bool>(std::get<parser::LiteralExpr>(element->node).value));
+            }
+            out = std::move(col);
+            break;
+        }
+        case 3: {
+            Column<std::string> col;
+            col.reserve(array.elements.size());
+            for (const auto& element : array.elements) {
+                const auto& value =
+                    std::get<std::string>(std::get<parser::LiteralExpr>(element->node).value);
+                col.push_back(std::string_view{value});
+            }
+            out = std::move(col);
+            break;
+        }
+        case 5: {
+            Column<Date> col;
+            col.reserve(array.elements.size());
+            for (const auto& element : array.elements) {
+                col.push_back(std::get<Date>(std::get<parser::LiteralExpr>(element->node).value));
+            }
+            out = std::move(col);
+            break;
+        }
+        case 6: {
+            Column<Timestamp> col;
+            col.reserve(array.elements.size());
+            for (const auto& element : array.elements) {
+                col.push_back(
+                    std::get<Timestamp>(std::get<parser::LiteralExpr>(element->node).value));
+            }
+            out = std::move(col);
+            break;
+        }
+        default:
+            return std::unexpected("unsupported series literal element type");
+    }
+
+    if (expected.has_value() && !column_type_matches(out, *expected)) {
+        return std::unexpected("series literal has wrong type (expected " +
+                               std::string(scalar_type_name(*expected)) + ")");
+    }
+    return out;
+}
+
 /// Validates that `table` satisfies the schema declared in `type`.
 /// All declared fields must be present with the correct type; extra columns are allowed.
 /// Returns nullopt on success, or an error message on failure.
@@ -1998,6 +2121,13 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         return eval_expr_value(*group->expr, tables, scalars, columns, models, functions,
                                compile_time_lists, extern_decls, externs, model_out);
     }
+    if (const auto* array = std::get_if<parser::ArrayLiteralExpr>(&expr.node)) {
+        auto series = eval_series_literal(*array);
+        if (!series) {
+            return std::unexpected(series.error());
+        }
+        return EvalValue{std::move(series.value())};
+    }
     if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
         std::holds_alternative<parser::UnaryExpr>(expr.node)) {
@@ -2417,6 +2547,53 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
                      runtime::ModelResult* model_out)
     -> std::expected<runtime::Table, std::string> {
+    if (auto* table_expr = std::get_if<parser::TableExpr>(&expr.node);
+        table_expr != nullptr && table_expr->row_count == nullptr) {
+        runtime::Table out;
+        for (const auto& col_def : table_expr->columns) {
+            std::expected<EvalValue, std::string> value = std::unexpected("");
+            if (const auto* array = std::get_if<parser::ArrayLiteralExpr>(&col_def.expr->node);
+                array != nullptr && array->elements.empty()) {
+                auto series = eval_series_literal(*array, parser::ScalarType::Int64);
+                if (!series) {
+                    return std::unexpected(series.error());
+                }
+                value = EvalValue{std::move(series.value())};
+            } else {
+                value = eval_expr_value(*col_def.expr, tables, scalars, columns, models, functions,
+                                        compile_time_lists, extern_decls, externs);
+            }
+            if (!value) {
+                return std::unexpected(value.error());
+            }
+
+            runtime::ColumnValue column;
+            if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                column = std::move(*col);
+            } else if (auto* table = std::get_if<runtime::Table>(&value.value())) {
+                if (table->columns.size() == 1) {
+                    column = *table->columns.front().column;
+                } else if (const auto* found = table->find(col_def.name); found != nullptr) {
+                    column = *found;
+                } else {
+                    return std::unexpected("Table constructor: expression for column '" +
+                                           col_def.name +
+                                           "' produced a table with no matching column");
+                }
+            } else {
+                return std::unexpected("Table constructor: expression for column '" + col_def.name +
+                                       "' must evaluate to a Series or DataFrame");
+            }
+
+            if (!out.columns.empty() && runtime::column_size(column) != out.rows()) {
+                return std::unexpected("Table constructor: column '" + col_def.name +
+                                       "' length does not match previous columns");
+            }
+            out.add_column(col_def.name, std::move(column));
+        }
+        return out;
+    }
+
     auto eval_extern_table_call =
         [&](parser::CallExpr& call) -> std::expected<runtime::Table, std::string> {
         const auto& decl = extern_decls.at(call.callee);
@@ -2731,31 +2908,44 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 }
             } else if (let_stmt.type.has_value() &&
                        let_stmt.type->kind == parser::Type::Kind::Series) {
-                auto value = eval_expr_value(*let_stmt.value, local_tables, local_scalars,
-                                             local_columns, local_models, functions,
-                                             local_compile_time_lists, extern_decls, externs);
+                std::expected<EvalValue, std::string> value = std::unexpected("");
+                if (const auto* array =
+                        std::get_if<parser::ArrayLiteralExpr>(&let_stmt.value->node)) {
+                    const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
+                    auto series = eval_series_literal(
+                        *array, st != nullptr ? std::optional{*st} : std::nullopt);
+                    if (!series) {
+                        return std::unexpected(series.error());
+                    }
+                    value = EvalValue{std::move(series.value())};
+                } else {
+                    value = eval_expr_value(*let_stmt.value, local_tables, local_scalars,
+                                            local_columns, local_models, functions,
+                                            local_compile_time_lists, extern_decls, externs);
+                }
                 if (!value) {
                     return std::unexpected(value.error());
                 }
                 if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                    if (auto err = validate_column_type(*col, *let_stmt.type)) {
+                        return std::unexpected("type error: '" + let_stmt.name + "': " + *err);
+                    }
                     local_columns.insert_or_assign(let_stmt.name, std::move(*col));
                 } else if (auto* table = std::get_if<runtime::Table>(&value.value())) {
                     if (table->columns.size() != 1) {
-                        return std::unexpected("Column binding must have exactly one column");
+                        return std::unexpected("Series binding must have exactly one column");
+                    }
+                    if (auto err =
+                            validate_column_type(*table->columns.front().column, *let_stmt.type)) {
+                        return std::unexpected("type error: '" + let_stmt.name + "': " + *err);
                     }
                     local_columns.insert_or_assign(let_stmt.name, *table->columns.front().column);
                 } else {
-                    return std::unexpected("Column binding must be a column or table");
+                    return std::unexpected("Series binding must be a Series or DataFrame");
                 }
                 local_compile_time_lists.erase(let_stmt.name);
                 local_models.erase(let_stmt.name);
             } else {
-                if (auto string_list = extract_compile_time_string_list(*let_stmt.value);
-                    string_list.has_value()) {
-                    local_compile_time_lists.insert_or_assign(let_stmt.name,
-                                                              std::move(*string_list));
-                    continue;
-                }
                 runtime::ModelResult model_value;
                 auto value = eval_expr_value(
                     *let_stmt.value, local_tables, local_scalars, local_columns, local_models,
@@ -2769,7 +2959,13 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     local_models.erase(let_stmt.name);
                 } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                     local_columns.insert_or_assign(let_stmt.name, std::move(*col));
-                    local_compile_time_lists.erase(let_stmt.name);
+                    if (auto string_list = extract_compile_time_string_list(*let_stmt.value);
+                        string_list.has_value()) {
+                        local_compile_time_lists.insert_or_assign(let_stmt.name,
+                                                                  std::move(*string_list));
+                    } else {
+                        local_compile_time_lists.erase(let_stmt.name);
+                    }
                     local_models.erase(let_stmt.name);
                 } else {
                     auto table_value = std::get<runtime::Table>(std::move(value.value()));
@@ -3138,14 +3334,31 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     continue;
                 }
                 if (expect_column) {
-                    auto value =
-                        eval_expr_value(*let_stmt.value, tables, scalars, columns, models,
-                                        functions, compile_time_lists, extern_decls, externs);
+                    std::expected<EvalValue, std::string> value = std::unexpected("");
+                    if (const auto* array =
+                            std::get_if<parser::ArrayLiteralExpr>(&let_stmt.value->node)) {
+                        const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
+                        auto series = eval_series_literal(
+                            *array, st != nullptr ? std::optional{*st} : std::nullopt);
+                        if (!series) {
+                            fmt::print("error: {}\n", series.error());
+                            return false;
+                        }
+                        value = EvalValue{std::move(series.value())};
+                    } else {
+                        value =
+                            eval_expr_value(*let_stmt.value, tables, scalars, columns, models,
+                                            functions, compile_time_lists, extern_decls, externs);
+                    }
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
                         return false;
                     }
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                        if (auto err = validate_column_type(*col, *let_stmt.type)) {
+                            fmt::print("error: '{}': {}\n", let_stmt.name, *err);
+                            return false;
+                        }
                         columns.insert_or_assign(let_stmt.name, std::move(*col));
                         compile_time_lists.erase(let_stmt.name);
                         models.erase(let_stmt.name);
@@ -3153,7 +3366,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     }
                     if (auto* table = std::get_if<runtime::Table>(&value.value())) {
                         if (table->columns.size() != 1) {
-                            fmt::print("error: column return must have exactly one column\n");
+                            fmt::print("error: Series return must have exactly one column\n");
+                            return false;
+                        }
+                        if (auto err = validate_column_type(*table->columns.front().column,
+                                                            *let_stmt.type)) {
+                            fmt::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }
                         columns.insert_or_assign(let_stmt.name, *table->columns.front().column);
@@ -3161,15 +3379,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         models.erase(let_stmt.name);
                         continue;
                     }
-                    fmt::print("error: expected column return for {}\n", let_stmt.name);
+                    fmt::print("error: expected Series return for {}\n", let_stmt.name);
                     return false;
                 }
-            }
-
-            if (auto string_list = extract_compile_time_string_list(*let_stmt.value);
-                string_list.has_value()) {
-                compile_time_lists.insert_or_assign(let_stmt.name, std::move(*string_list));
-                continue;
             }
 
             runtime::ModelResult model_value;
@@ -3186,7 +3398,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 models.erase(let_stmt.name);
             } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                 columns.insert_or_assign(let_stmt.name, std::move(*col));
-                compile_time_lists.erase(let_stmt.name);
+                if (auto string_list = extract_compile_time_string_list(*let_stmt.value);
+                    string_list.has_value()) {
+                    compile_time_lists.insert_or_assign(let_stmt.name, std::move(*string_list));
+                } else {
+                    compile_time_lists.erase(let_stmt.name);
+                }
                 models.erase(let_stmt.name);
             } else {
                 auto table_value = std::get<runtime::Table>(std::move(value.value()));

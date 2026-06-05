@@ -1,0 +1,10 @@
+let price = [10.0, 20.0, 30.0];
+let qty = [1, 2, 3];
+let empty: Series<Float64> = [];
+
+let trades = Table {
+    price = price,
+    qty = qty
+};
+
+trades[select { notional = price * Float64(qty) }];

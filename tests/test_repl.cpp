@@ -141,6 +141,39 @@ trades[select {
     REQUIRE(ibex::repl::execute_script(src, registry));
 }
 
+TEST_CASE("REPL binds array literal as Series") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let x = [1, 2, 3];
+let t = Table { x = x };
+t[select { total = sum(x) }];
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL uses Series annotation for empty array literal") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let x: Series<Float64> = [];
+x;
+)";
+
+    REQUIRE(ibex::repl::execute_script(src, registry));
+}
+
+TEST_CASE("REPL rejects untyped empty array literal") {
+    ibex::runtime::ExternRegistry registry;
+
+    const char* src = R"(
+let x = [];
+)";
+
+    REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
+}
+
 TEST_CASE("REPL executes compile-time map expansion from columns metadata table") {
     ibex::runtime::ExternRegistry registry;
 

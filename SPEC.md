@@ -2812,6 +2812,8 @@ extern implementations. The recommended path for custom scalar logic is
 | `pmin(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `pmax(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `is_nan(x)`     | `Float64 -> Bool`                  |
+| `is_null(x)` / `is_not_null(x)` | `Any -> Bool` (tests the value's null bit; never null itself) |
+| `coalesce(a, b, ...)` | `T{1+} -> T` (first non-null argument per row; args share one type) |
 | `year(t)`       | `Date|Timestamp -> Int32`          |
 | `month(t)`      | `Date|Timestamp -> Int32`          |
 | `day(t)`        | `Date|Timestamp -> Int32`          |
@@ -2825,6 +2827,14 @@ These scalar functions, the cast constructors of Section 3.1.1
 `select`, `update` (plain and windowed), and `filter` predicates. `ceil`/
 `floor`/`trunc` keep the numeric type (an integral `Float64` stays `Float64`);
 use `round(x, ceil|floor|trunc)` for a `Float -> Int64` conversion.
+
+**Boolean-valued expressions in value position.** Comparisons (`a > b`), logical
+connectives (`&&`, `||`, `!`), and the null tests `is_null` / `is_not_null` are
+not restricted to `filter` predicates — they produce a `Column<Bool>` and may be
+assigned in `select`/`update` (e.g. `update { above = price > vwap, missing =
+is_null(sector) }`). `is_null`/`is_not_null`/`coalesce` are null-aware: they read
+the value's null bit rather than its (ignored) payload, so `coalesce(x, 0.0)`
+replaces nulls and `is_null(x)` is never itself null.
 
 `round(x, mode)` converts a `Float64` scalar or `Series<Float64>` to `Int64` /
 `Series<Int64>`. The mode is a bare identifier (not a string):

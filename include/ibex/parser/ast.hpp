@@ -312,10 +312,16 @@ struct TableColumnDef {
     ExprPtr expr;  ///< Expected to be an ArrayLiteralExpr after parsing.
 };
 
-/// Table constructor expression: `Table { col1 = [...], col2 = [...] }`.
-/// All columns must have the same length; validated during lowering.
+/// Table constructor expression. Two forms:
+///   - Literal:  `Table { col1 = [...], col2 = [...] }` — `columns` populated,
+///     `row_count` null. All columns must have the same length (checked in
+///     lowering).
+///   - Empty n-row frame:  `Table(n)` — `row_count` set, `columns` empty. Yields
+///     a frame with `n` rows and no columns, for use as a generation scaffold
+///     (e.g. `Table(4000)[update { x = rand_normal(0.0, 1.0) }]`).
 struct TableExpr {
     std::vector<TableColumnDef> columns;
+    ExprPtr row_count;  ///< non-null iff the `Table(n)` paren form was used
 };
 
 struct JoinExpr {

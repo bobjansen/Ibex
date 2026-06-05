@@ -26,6 +26,10 @@ struct Chunk {
     std::vector<ColumnEntry> columns;
     std::optional<std::vector<ir::OrderKey>> ordering;
     std::optional<std::string> time_index;
+    /// Logical row count for a column-less chunk (e.g. from `Table(n)`); see
+    /// the matching field on `Table`. Only consulted by `rows()` when `columns`
+    /// is empty.
+    std::optional<std::size_t> logical_rows;
 
     void add_column(std::string name, ColumnValue column,
                     std::optional<ValidityBitmap> validity = std::nullopt) {
@@ -55,7 +59,7 @@ struct Chunk {
 
     [[nodiscard]] auto rows() const noexcept -> std::size_t {
         if (columns.empty()) {
-            return 0;
+            return logical_rows.value_or(0);
         }
         return column_size(*columns.front().column);
     }
@@ -95,6 +99,10 @@ class TableSourceOperator final : public Operator {
         chunk.columns = std::move(table_.columns);
         chunk.ordering = std::move(table_.ordering);
         chunk.time_index = std::move(table_.time_index);
+        // logical_rows is only meaningful for a column-less frame.
+        if (chunk.columns.empty()) {
+            chunk.logical_rows = table_.logical_rows;
+        }
         return std::optional<Chunk>{std::move(chunk)};
     }
 
@@ -137,6 +145,10 @@ class MaterializeOperator {
         }
         result.ordering = std::move(first.ordering);
         result.time_index = std::move(first.time_index);
+        // logical_rows is only meaningful for a column-less frame.
+        if (result.columns.empty()) {
+            result.logical_rows = first.logical_rows;
+        }
 
         const std::size_t n_cols = result.columns.size();
 

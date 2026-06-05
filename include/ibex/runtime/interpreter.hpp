@@ -179,6 +179,10 @@ struct Table {
     std::unordered_map<std::string, std::size_t> index;
     std::optional<std::vector<ir::OrderKey>> ordering;
     std::optional<std::string> time_index;
+    /// Logical row count for a column-less frame (e.g. produced by `Table(n)`).
+    /// Only consulted by `rows()` when `columns` is empty; once any column is
+    /// added the count is derived from the columns as usual.
+    std::optional<std::size_t> logical_rows;
 
     void add_column(std::string name, ColumnValue column);
     /// Add a column with an explicit validity bitmap (true = valid, false = null).
@@ -205,7 +209,7 @@ struct Table {
     [[nodiscard]] auto find_entry(const std::string& name) const -> const ColumnEntry*;
     [[nodiscard]] auto rows() const noexcept -> std::size_t {
         if (columns.empty()) {
-            return 0;
+            return logical_rows.value_or(0);
         }
         return column_size(*columns.front().column);
     }

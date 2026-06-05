@@ -8503,6 +8503,16 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
         }
         case ir::NodeKind::Construct: {
             const auto& cn = static_cast<const ir::ConstructNode&>(node);
+            // `Table(n)` form: an empty frame carrying an explicit row count.
+            if (cn.row_count().has_value()) {
+                auto n = evaluate_row_count_expr_impl(*cn.row_count(), scalars, externs);
+                if (!n.has_value()) {
+                    return std::unexpected(n.error());
+                }
+                Table empty;
+                empty.logical_rows = *n;
+                return empty;
+            }
             Table result;
             for (const auto& col : cn.columns()) {
                 if (col.expr_node) {
@@ -8808,6 +8818,9 @@ auto chunk_to_table(Chunk chunk) -> Table {
     }
     t.ordering = std::move(chunk.ordering);
     t.time_index = std::move(chunk.time_index);
+    if (t.columns.empty()) {  // logical_rows is only meaningful when column-less
+        t.logical_rows = chunk.logical_rows;
+    }
     return t;
 }
 
@@ -8816,6 +8829,9 @@ auto table_to_chunk(Table table) -> Chunk {
     c.columns = std::move(table.columns);
     c.ordering = std::move(table.ordering);
     c.time_index = std::move(table.time_index);
+    if (c.columns.empty()) {  // logical_rows is only meaningful when column-less
+        c.logical_rows = table.logical_rows;
+    }
     return c;
 }
 

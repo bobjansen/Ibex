@@ -1985,15 +1985,30 @@ literals **or** arbitrary Ibex expressions that evaluate to a column vector.
 ### 8.1 Syntax
 
 ```
-Table { col_name = expr, col_name = expr, ... }
+Table { col_name = expr, col_name = expr, ... }   // literal form
+Table(n)                                          // empty n-row frame
 ```
 
-where each `expr` is either an **array literal** `[v, v, ...]` or any expression
-that produces a table from which the column value is extracted.
+In the **literal form** each `expr` is either an **array literal** `[v, v, ...]`
+or any expression that produces a table from which the column value is extracted.
+
+The **`Table(n)` form** produces an empty frame with `n` rows and no columns,
+where `n` is any expression evaluating to a non-negative `Int64`. It is the
+canonical scaffold for data generation: a subsequent `update`/`select` fills it
+with columns sized to `n` rows, so RNG, `rep`, and sequence generators have a
+row count to emit against:
+
+```
+Table(4000)[update { x = rand_normal(0.0, 1.0), g = rep(0, length_out=4000) }]
+```
+
+A bare `Table(n)` displays as `rows: n` with no columns; once any column is
+added the row count is carried by the columns as usual.
 
 `Table` is a **contextual keyword**: it is only recognised as a constructor
-when immediately followed by `{`. It is not reserved and can be used as a
-regular binding or function name in other positions.
+when immediately followed by `{` (literal form) or `(` (row-count form). It is
+not reserved and can be used as a regular binding or function name in other
+positions.
 
 ### 8.2 Array-Literal Columns
 

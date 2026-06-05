@@ -744,12 +744,23 @@ class ConstructNode final : public Node {
     ConstructNode(NodeId id, std::vector<ConstructColumn> columns)
         : Node(NodeKind::Construct, id), columns_(std::move(columns)) {}
 
+    /// Row-count form: `Table(n)` — an empty frame with `n` rows and no columns.
+    /// `columns_` stays empty; `row_count_` holds the count expression.
+    ConstructNode(NodeId id, Expr row_count)
+        : Node(NodeKind::Construct, id), row_count_(std::move(row_count)) {}
+
     [[nodiscard]] auto columns() const noexcept -> const std::vector<ConstructColumn>& {
         return columns_;
     }
 
+    /// Non-null for the `Table(n)` form; null for the `Table { ... }` literal form.
+    [[nodiscard]] auto row_count() const noexcept -> const std::optional<Expr>& {
+        return row_count_;
+    }
+
    private:
     std::vector<ConstructColumn> columns_;
+    std::optional<Expr> row_count_;
 };
 
 /// Stream node: wires a source extern, an anonymous transform, and a sink extern into a

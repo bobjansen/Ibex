@@ -32,8 +32,8 @@ import "kmeans";
 
 seed_rng(31337);
 
-// 1. N-row scaffold (widen the 4-row `trades` demo table).
-let scaffold = trades[select { row = rep(0, length_out=3000) }];
+// 1. N-row scaffold: an empty 3000-row frame.
+let scaffold = Table(3000);
 
 // 2. Draw the latent label and the per-axis Gaussian noise (each rand_* is the
 //    sole RHS of its binding).

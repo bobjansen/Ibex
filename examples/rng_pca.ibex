@@ -32,8 +32,8 @@ import "pca";
 
 seed_rng(8675309);
 
-// 1. N-row scaffold (widen the 4-row `trades` demo table).
-let scaffold = trades[select { row = rep(0, length_out=4000) }];
+// 1. N-row scaffold: an empty 4000-row frame.
+let scaffold = Table(4000);
 
 // 2. Draw the latent factor, three small per-axis noises, and the independent
 //    axis w (each rand_* is the sole RHS of its binding).

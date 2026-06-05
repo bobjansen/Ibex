@@ -863,6 +863,10 @@ class Parser {
             if (name == "Table" && check(TokenKind::LBrace)) {
                 return parse_table_expr();
             }
+            // Empty n-row frame: `Table(n)` — a generation scaffold.
+            if (name == "Table" && check(TokenKind::LParen)) {
+                return parse_table_rows_expr();
+            }
             if (match(TokenKind::LParen)) {
                 if (name == "rank") {
                     return parse_rank_call();
@@ -1048,7 +1052,25 @@ class Parser {
             return nullptr;
         }
         auto expr = std::make_unique<Expr>();
-        expr->node = TableExpr{.columns = std::move(columns)};
+        expr->node = TableExpr{.columns = std::move(columns), .row_count = nullptr};
+        return expr;
+    }
+
+    /// Parse `Table(n)` — an empty frame with `n` rows and no columns, used as a
+    /// data-generation scaffold. The "Table" identifier has already been consumed.
+    auto parse_table_rows_expr() -> ExprPtr {
+        if (!consume(TokenKind::LParen, "expected '(' after 'Table'")) {
+            return nullptr;
+        }
+        auto count = parse_expression();
+        if (!count) {
+            return nullptr;
+        }
+        if (!consume(TokenKind::RParen, "expected ')' after Table(n) row count")) {
+            return nullptr;
+        }
+        auto expr = std::make_unique<Expr>();
+        expr->node = TableExpr{.columns = {}, .row_count = std::move(count)};
         return expr;
     }
 

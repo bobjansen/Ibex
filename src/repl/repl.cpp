@@ -3509,6 +3509,73 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry) 
     return execute_script(source, registry, ReplConfig{});
 }
 
+auto run_file(const std::string& path, const ReplConfig& config, runtime::ExternRegistry& registry)
+    -> bool {
+    std::ifstream input{path};
+    if (!input) {
+        fmt::print("error: failed to open '{}'\n", path);
+        return false;
+    }
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    return execute_script(source, registry, config);
+}
+
+namespace {
+
+/// Net open-delimiter depth of `src`, counting `()[]{}` while skipping anything
+/// inside string literals and `//` / `/* */` comments. Used by the interactive
+/// loop to decide whether an input is a complete statement (depth <= 0) or
+/// whether it should keep reading continuation lines (depth > 0). An unclosed
+/// block comment is treated as incomplete.
+auto delimiter_depth(std::string_view src) -> int {
+    int depth = 0;
+    std::size_t i = 0;
+    while (i < src.size()) {
+        const char c = src[i];
+        if (c == '"' || c == '\'') {
+            const char quote = c;
+            ++i;
+            while (i < src.size()) {
+                if (src[i] == '\\' && i + 1 < src.size()) {
+                    i += 2;
+                    continue;
+                }
+                if (src[i] == quote) {
+                    ++i;
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            const std::size_t nl = src.find('\n', i + 2);
+            if (nl == std::string_view::npos) {
+                return depth;  // line comment runs to end of buffer
+            }
+            i = nl;
+            continue;
+        }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            const std::size_t close = src.find("*/", i + 2);
+            if (close == std::string_view::npos) {
+                return depth + 1;  // unterminated block comment: incomplete
+            }
+            i = close + 2;
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            ++depth;
+        } else if (c == ')' || c == ']' || c == '}') {
+            --depth;
+        }
+        ++i;
+    }
+    return depth;
+}
+
+}  // namespace
+
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     if (config.verbose) {
         spdlog::info("Ibex REPL started (verbose={})", config.verbose);
@@ -3531,6 +3598,28 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     const std::string history_path = resolve_history_path(config);
     load_history_file(history_path, config.history_limit);
 
+    // Parse and execute one complete statement buffer (possibly spanning
+    // several physical lines). Shared by the normal path and the multi-line
+    // continuation path.
+    auto submit_buffer = [&](const std::string& buffer) {
+        auto normalized = normalize_input(buffer);
+        auto parsed = parser::parse(normalized);
+        if (!parsed) {
+            fmt::print("error: {}\n", parsed.error().format());
+            return;
+        }
+        execute_statements(parsed->statements, tables, scalars, columns, models, functions,
+                           compile_time_lists, extern_decls, registry, config.plugin_search_paths,
+                           loaded_plugins, config.import_search_paths, nullptr, nullptr,
+                           &function_sources, &declaration_docs, &imports, normalized);
+    };
+
+    // Accumulates a statement whose delimiters span multiple input lines. Empty
+    // while at a statement boundary; non-empty while awaiting continuation lines.
+    std::string pending;
+    const std::string continuation_prompt =
+        config.prompt.empty() ? std::string{} : std::string(config.prompt.size() - 1, '.') + " ";
+
     std::string line;
     while (true) {
         set_completion_context(CompletionContext{
@@ -3543,9 +3632,26 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             .extern_decls = &extern_decls,
             .imports = &imports,
         });
-        if (!read_repl_line(config.prompt, line)) {
+        if (!read_repl_line(pending.empty() ? config.prompt : continuation_prompt, line)) {
             fmt::print("\n");
+            if (!pending.empty()) {
+                submit_buffer(pending);  // surface the error in the unterminated buffer
+            }
             break;
+        }
+
+        // Mid statement: keep accumulating continuation lines (including blank
+        // ones) until the open delimiters balance, then execute. Colon commands
+        // are recognised only at a statement boundary, so they pass through here.
+        if (!pending.empty()) {
+            pending.push_back('\n');
+            pending += line;
+            if (delimiter_depth(pending) > 0) {
+                continue;
+            }
+            submit_buffer(pending);
+            pending.clear();
+            continue;
         }
 
         if (line.empty()) {
@@ -3837,17 +3943,14 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
 
-        auto normalized = normalize_input(line);
-        auto parsed = parser::parse(normalized);
-        if (!parsed) {
-            fmt::print("error: {}\n", parsed.error().format());
+        // Start of a statement. If its delimiters don't balance on this line,
+        // hold it and read continuation lines before parsing.
+        pending = line;
+        if (delimiter_depth(pending) > 0) {
             continue;
         }
-
-        execute_statements(parsed->statements, tables, scalars, columns, models, functions,
-                           compile_time_lists, extern_decls, registry, config.plugin_search_paths,
-                           loaded_plugins, config.import_search_paths, nullptr, nullptr,
-                           &function_sources, &declaration_docs, &imports, normalized);
+        pending.clear();
+        submit_buffer(line);
         report_timing();
     }
 

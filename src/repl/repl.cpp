@@ -2128,6 +2128,17 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         }
         return EvalValue{std::move(series.value())};
     }
+    // String interpolation (`...${expr}...`) lowers to a __interp call; it always
+    // produces a scalar string.
+    if (const auto* call = std::get_if<parser::CallExpr>(&expr.node);
+        call != nullptr && call->callee == "__interp") {
+        auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
+                                       compile_time_lists, extern_decls, externs);
+        if (!scalar) {
+            return std::unexpected(scalar.error());
+        }
+        return EvalValue{std::move(scalar.value())};
+    }
     if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
         std::holds_alternative<parser::UnaryExpr>(expr.node)) {
@@ -2405,6 +2416,21 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         }
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        if (call->callee == "__interp") {
+            // String interpolation: stringify each argument (literal segments and
+            // embedded value expressions alike) and concatenate. format_scalar
+            // renders strings unquoted, so the literals read verbatim.
+            std::string out;
+            for (auto& arg : call->args) {
+                auto value = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
+                                              compile_time_lists, extern_decls, externs);
+                if (!value) {
+                    return std::unexpected(value.error());
+                }
+                out += format_scalar(*value);
+            }
+            return runtime::ScalarValue{std::move(out)};
+        }
         if (is_model_scalar_accessor(call->callee)) {
             return eval_model_scalar_accessor(*call, models);
         }

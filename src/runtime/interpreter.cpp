@@ -7136,8 +7136,24 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
 
 auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t rows)
     -> std::expected<ColumnValue, std::string> {
-    if (call.args.size() != 1) {
-        return std::unexpected("rep: expected exactly one positional argument (x)");
+    if (call.args.empty()) {
+        return std::unexpected("rep: expected one positional argument (x or [array])");
+    }
+
+    // ── detect array-literal form (lowered by lower_expr_to_ir) ────────────
+    // When `rep([e0,e1,...])` is lowered, each element becomes a positional arg
+    // and a sentinel named arg `__array_len = N` is added. In that form all
+    // positional args are the elements to cycle over (not a single scalar x).
+    std::int64_t array_len_sentinel = 0;
+    for (const auto& narg : call.named_args) {
+        if (narg.name == "__array_len") {
+            const auto* lit = std::get_if<ir::Literal>(&narg.value->node);
+            if (lit != nullptr) {
+                if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                    array_len_sentinel = *iv;
+                }
+            }
+        }
     }
 
     // ── parse named args ────────────────────────────────────────────────────
@@ -7146,6 +7162,9 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
     std::int64_t length_out = static_cast<std::int64_t>(rows);  // default = table rows
 
     for (const auto& narg : call.named_args) {
+        if (narg.name == "__array_len") {
+            continue;  // already consumed above
+        }
         const auto* lit = std::get_if<ir::Literal>(&narg.value->node);
         auto as_int = [&]() -> std::expected<std::int64_t, std::string> {
             if (lit == nullptr) {
@@ -7190,50 +7209,118 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
     const std::size_t n_each = static_cast<std::size_t>(each);
 
     // ── scalar literal x ────────────────────────────────────────────────────
-    if (const auto* lit = std::get_if<ir::Literal>(&call.args[0]->node)) {
+    if (array_len_sentinel == 0) {
+        if (const auto* lit = std::get_if<ir::Literal>(&call.args[0]->node)) {
+            return std::visit(
+                [&](const auto& v) -> ColumnValue {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, bool>) {
+                        Column<bool> col;
+                        col.reserve(out_len);
+                        for (std::size_t i = 0; i < out_len; ++i)
+                            col.push_back(v);
+                        return col;
+                    } else if constexpr (std::is_same_v<T, std::int64_t>) {
+                        Column<std::int64_t> col;
+                        col.reserve(out_len);
+                        for (std::size_t i = 0; i < out_len; ++i)
+                            col.push_back(v);
+                        return col;
+                    } else if constexpr (std::is_same_v<T, double>) {
+                        Column<double> col;
+                        col.reserve(out_len);
+                        for (std::size_t i = 0; i < out_len; ++i)
+                            col.push_back(v);
+                        return col;
+                    } else if constexpr (std::is_same_v<T, std::string>) {
+                        Column<std::string> col;
+                        col.reserve(out_len);
+                        for (std::size_t i = 0; i < out_len; ++i)
+                            col.push_back(std::string_view{v});
+                        return col;
+                    } else if constexpr (std::is_same_v<T, Date>) {
+                        Column<Date> col;
+                        col.reserve(out_len);
+                        for (std::size_t i = 0; i < out_len; ++i)
+                            col.push_back(v);
+                        return col;
+                    } else {
+                        static_assert(std::is_same_v<T, Timestamp>);
+                        Column<Timestamp> col;
+                        col.reserve(out_len);
+                        for (std::size_t i = 0; i < out_len; ++i)
+                            col.push_back(v);
+                        return col;
+                    }
+                },
+                lit->value);
+        }
+    }  // end: array_len_sentinel == 0 guard around scalar arm
+
+    // ── array-literal form: rep([e0,e1,...]) cycles the elements ────────────
+    if (array_len_sentinel > 0) {
+        // All positional args are literal elements of the array pattern.
+        const std::size_t arr_len = static_cast<std::size_t>(array_len_sentinel);
+        if (call.args.size() != arr_len) {
+            return std::unexpected("rep: internal error: arg count mismatch for array form");
+        }
+        if (arr_len == 0) {
+            return std::unexpected("rep: array literal must not be empty");
+        }
+        const auto* first_lit = std::get_if<ir::Literal>(&call.args[0]->node);
+        if (first_lit == nullptr) {
+            return std::unexpected("rep: array literal elements must be literals");
+        }
+        // Build the output column cycling over the elements. The `each` and
+        // `times` named args apply to the array as a whole pattern (R semantics:
+        // each repeats each element before the next, times repeats the whole
+        // pattern, length_out trims/pads).
+        std::size_t pattern_len = arr_len * n_each * n_times;
         return std::visit(
-            [&](const auto& v) -> ColumnValue {
-                using T = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<T, bool>) {
-                    Column<bool> col;
-                    col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i)
-                        col.push_back(v);
-                    return col;
-                } else if constexpr (std::is_same_v<T, std::int64_t>) {
-                    Column<std::int64_t> col;
-                    col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i)
-                        col.push_back(v);
-                    return col;
-                } else if constexpr (std::is_same_v<T, double>) {
-                    Column<double> col;
-                    col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i)
-                        col.push_back(v);
-                    return col;
-                } else if constexpr (std::is_same_v<T, std::string>) {
-                    Column<std::string> col;
-                    col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i)
-                        col.push_back(std::string_view{v});
-                    return col;
-                } else if constexpr (std::is_same_v<T, Date>) {
-                    Column<Date> col;
-                    col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i)
-                        col.push_back(v);
-                    return col;
+            [&](const auto& proto) -> std::expected<ColumnValue, std::string> {
+                using T = std::decay_t<decltype(proto)>;
+                if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double> ||
+                              std::is_same_v<T, bool> || std::is_same_v<T, std::string> ||
+                              std::is_same_v<T, Date> || std::is_same_v<T, Timestamp>) {
+                    using ColT = Column<T>;
+                    // Collect all elements.
+                    ColT elements;
+                    elements.reserve(arr_len);
+                    for (std::size_t j = 0; j < arr_len; ++j) {
+                        const auto* lit = std::get_if<ir::Literal>(&call.args[j]->node);
+                        if (lit == nullptr) {
+                            return std::unexpected("rep: array element " + std::to_string(j) +
+                                                   " is not a literal");
+                        }
+                        const auto* v = std::get_if<T>(&lit->value);
+                        if (v == nullptr) {
+                            return std::unexpected("rep: array literal has mixed element types");
+                        }
+                        if constexpr (std::is_same_v<T, std::string>) {
+                            elements.push_back(std::string_view{*v});
+                        } else {
+                            elements.push_back(*v);
+                        }
+                    }
+                    // Fill output by cycling the elements.
+                    ColT result;
+                    result.reserve(out_len);
+                    for (std::size_t i = 0; i < out_len; ++i) {
+                        std::size_t pos_in_pattern = pattern_len > 0 ? (i % pattern_len) : 0;
+                        std::size_t pos_in_each_seq = pos_in_pattern % (arr_len * n_each);
+                        std::size_t src_idx = pos_in_each_seq / n_each;
+                        if constexpr (std::is_same_v<T, std::string>) {
+                            result.push_back(std::string_view{elements[src_idx]});
+                        } else {
+                            result.push_back(elements[src_idx]);
+                        }
+                    }
+                    return ColumnValue{std::move(result)};
                 } else {
-                    static_assert(std::is_same_v<T, Timestamp>);
-                    Column<Timestamp> col;
-                    col.reserve(out_len);
-                    for (std::size_t i = 0; i < out_len; ++i)
-                        col.push_back(v);
-                    return col;
+                    return std::unexpected("rep: unsupported array element type");
                 }
             },
-            lit->value);
+            first_lit->value);
     }
 
     // ── column reference x ───────────────────────────────────────────────────

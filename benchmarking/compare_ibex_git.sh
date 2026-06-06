@@ -35,6 +35,7 @@ Options:
   --ibex-suite <name,...>   Pass suite selection to bench_ibex.sh/ibex_bench
   --merge-validity-rows <N> Row count for merge_validity micro benchmark
   --rng-micro-rows <N>      Row count for rng_micro kernel benchmark
+  --filter-micro-rows <N>   Row count for filter_micro; 0 means all trades rows
   --csv <path>              prices.csv path
   --csv-multi <path>        prices_multi.csv path
   --csv-trades <path>       trades.csv path
@@ -62,6 +63,7 @@ NUMA_NODE=""
 IBEX_SUITE=""
 MERGE_VALIDITY_ROWS=""
 RNG_MICRO_ROWS=""
+FILTER_MICRO_ROWS=""
 
 CSV="$REPO_ROOT/benchmarking/data/prices.csv"
 CSV_MULTI="$REPO_ROOT/benchmarking/data/prices_multi.csv"
@@ -81,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --ibex-suite) IBEX_SUITE="$2"; shift 2 ;;
         --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
         --rng-micro-rows) RNG_MICRO_ROWS="$2"; shift 2 ;;
+        --filter-micro-rows) FILTER_MICRO_ROWS="$2"; shift 2 ;;
         --csv) CSV="$2"; shift 2 ;;
         --csv-multi) CSV_MULTI="$2"; shift 2 ;;
         --csv-trades) CSV_TRADES="$2"; shift 2 ;;
@@ -110,6 +113,10 @@ if [[ -n "$MERGE_VALIDITY_ROWS" && ! "$MERGE_VALIDITY_ROWS" =~ ^[1-9][0-9]*$ ]];
 fi
 if [[ -n "$RNG_MICRO_ROWS" && ! "$RNG_MICRO_ROWS" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: --rng-micro-rows must be a positive integer" >&2
+    exit 1
+fi
+if [[ -n "$FILTER_MICRO_ROWS" && ! "$FILTER_MICRO_ROWS" =~ ^[0-9]+$ ]]; then
+    echo "error: --filter-micro-rows must be a non-negative integer" >&2
     exit 1
 fi
 if [[ -n "$TASKSET_CPUSET" ]] && ! command -v taskset >/dev/null 2>&1; then
@@ -243,6 +250,7 @@ run_bench_once() {
     [[ -n "$IBEX_SUITE" ]] && args+=(--suite "$IBEX_SUITE")
     [[ -n "$MERGE_VALIDITY_ROWS" ]] && args+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
     [[ -n "$RNG_MICRO_ROWS" ]] && args+=(--rng-micro-rows "$RNG_MICRO_ROWS")
+    [[ -n "$FILTER_MICRO_ROWS" ]] && args+=(--filter-micro-rows "$FILTER_MICRO_ROWS")
     [[ -f "$CSV_MULTI" ]] && args+=(--csv-multi "$CSV_MULTI")
     [[ -f "$CSV_TRADES" ]] && args+=(--csv-trades "$CSV_TRADES")
     [[ -f "$CSV_EVENTS" ]] && args+=(--csv-events "$CSV_EVENTS")
@@ -341,6 +349,9 @@ if [[ -n "$MERGE_VALIDITY_ROWS" ]]; then
 fi
 if [[ -n "$RNG_MICRO_ROWS" ]]; then
     echo "rng_micro rows: $RNG_MICRO_ROWS" >&2
+fi
+if [[ -n "$FILTER_MICRO_ROWS" ]]; then
+    echo "filter_micro rows: $FILTER_MICRO_ROWS" >&2
 fi
 
 run_repeated_bench_and_aggregate "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_TSV" "$BASE_LOG"

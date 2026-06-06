@@ -63,11 +63,18 @@ let pred_ols = model_predict(m_ols, holdout);
 let pred_gbm = model_predict(m_gbm, holdout);
 
 // 8. Show the recovery. print(x) renders x and returns it; a bare `name;` line
-//    would display the same way.
+//    would display the same way. The true coefficients are (3, 2, -1.5, 0.5).
+print("OLS coefficients — should recover (intercept 3, x1 2, x2 -1.5, x3 0.5):");
 print(ols_coef);
+print("OLS R-squared:");
 print(ols_r2);
+print("Ridge coefficients — L2 shrinkage pulls these slightly toward 0:");
 print(ridge_coef);
+print("LightGBM feature importance — x1 and x2 should dominate, x3 least:");
 print(gbm_importance);
+print("LightGBM R-squared:");
 print(gbm_r2);
+print("OLS predictions on 8 fresh holdout rows:");
 print(pred_ols);
+print("LightGBM predictions on the same holdout rows:");
 print(pred_gbm);

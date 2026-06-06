@@ -4,10 +4,13 @@ let trades = Table {
 };
 
 // Last 2 rows in current order.
+print("tail 2 — last two rows in current order:");
 trades[tail 2];
 
 // Bottom 2 rows after sorting by score descending.
+print("order by score desc, then tail 2 — the two lowest scores:");
 trades[order { score desc }, tail 2];
 
 // Last 2 rows per symbol in the current ordered result.
+print("tail 2 by symbol — the two lowest scores within each symbol:");
 trades[order { score desc }, tail 2, by symbol];

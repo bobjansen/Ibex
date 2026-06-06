@@ -7,7 +7,10 @@
 //  terms are handled automatically by the model clause.
 //
 //  Python/statsmodels equivalent: ~40 lines.  Raw C++/Eigen: ~120 lines.
-//  Ibex: 30 lines.
+//
+//  Run:  ./build-release/tools/ibex \
+//          --plugin-path build-release/tools \
+//          --import-path  build-release/tools  examples/regression.ibex
 // ─────────────────────────────────────────────────────────────────────────────
 
 import "csv";
@@ -16,59 +19,72 @@ import "lightgbm";
 let prices = read_csv("examples/data/ohlcv.csv");
 
 // ── 1. Simple OLS: close price as a function of open and volume ─────────────
+print("══════════ 1. OLS  close ~ open + volume ══════════");
 let m1 = prices[model { close ~ open + volume, method=ols }];
 
-// m1 is a DataFrame of coefficients: (Intercept), open, volume
-// Access detailed results via accessor functions:
-let coefficients = model_coef(m1);
-let fit_summary  = model_summary(m1);
-let predictions  = model_fitted(m1);
-let resids       = model_residuals(m1);
-let r2           = model_r_squared(m1);
+// m1 carries a coefficient table plus fit diagnostics, reached via accessors.
+print("coefficients (term | estimate | ...):");
+print(model_coef(m1));
+print("R-squared:");
+print(model_r_squared(m1));
 
 // Score new data with the fitted OLS model. model_predict rebuilds the design
 // matrix from `newdata` with the model's formula and applies the coefficients
 // (X·β) — built-in linear models (ols/ridge/wls) predict, not just plugins.
 let scenarios = Table { open = [100.0, 105.0], volume = [1000000, 1500000] };
-let m1_scored = model_predict(m1, scenarios);   // prediction column
+print("predictions for two new (open, volume) scenarios:");
+print(model_predict(m1, scenarios));
 
 // ── 2. No intercept — force regression through the origin ───────────────────
+print("══════════ 2. OLS through the origin  close ~ open + volume - 1 ══════════");
 let m2 = prices[model { close ~ open + volume - 1 }];
+print(model_coef(m2));
 
 // ── 3. Dot notation — regress close on all other numeric columns ────────────
+print("══════════ 3. Dot notation  close ~ .  (all other numeric columns) ══════════");
 let numeric = prices[select { open, high, low, close, volume }];
 let m3 = numeric[model { close ~ . }];
+print(model_coef(m3));
 
 // ── 4. Interaction terms — open:volume adds the element-wise product ────────
+print("══════════ 4. Interaction  close ~ open + volume + open:volume ══════════");
 let m4 = prices[model { close ~ open + volume + open:volume }];
+print(model_coef(m4));
 
 // ── 5. Crossing operator — expands to main effects + interaction ────────────
 //    close ~ open * volume  ≡  close ~ open + volume + open:volume
+print("══════════ 5. Crossing  close ~ open * volume  (mains + interaction) ══════════");
 let m5 = prices[model { close ~ open * volume }];
+print(model_coef(m5));
 
 // ── 6. Filtered regression — only fit on rows matching a condition ───────────
+print("══════════ 6. Filtered fit  (volume > 1,000,000 only) ══════════");
 let m6 = prices[filter volume > 1000000, model { close ~ open + high + low }];
+print(model_coef(m6));
 
 // ── 7. Ridge regression — L2 penalty shrinks coefficients toward zero ───────
+print("══════════ 7. Ridge  (lambda = 0.1, coefficients shrunk toward 0) ══════════");
 let m7 = prices[model { close ~ open + volume, method = ridge, lambda = 0.1 }];
+print(model_coef(m7));
 
 // ── 8. Weighted least squares — down-weight high-volume rows ────────────────
+print("══════════ 8. Weighted least squares  (weights = 1 / volume) ══════════");
 let weighted = prices[update { w = 1.0 / volume }];
 let m8 = weighted[model { close ~ open + high + low, method = wls, weights = w }];
+print(model_coef(m8));
 
 // ── 9. LightGBM plugin method — real gradient-boosted trees ─────────────────
 //    Trains a Microsoft LightGBM model (linked via the plugin). Unlike the OLS
-//    family there are no linear coefficients; m9 is the per-feature gain
-//    importance table. Predictions and importances are available via accessors.
+//    family there are no linear coefficients; the model carries per-feature gain
+//    importance. Predictions and importances are available via accessors.
+print("══════════ 9. LightGBM  (gradient-boosted trees, 300 iterations) ══════════");
 let m9 = prices[model {
     close ~ open + high + low + volume,
     method = lightgbm,
     iterations = 300,
     learning_rate = 0.03
 }];
-
-let lgbm_preds      = model_fitted(m9);      // in-sample predictions
-let lgbm_importance = model_importance(m9);  // term | gain
-
-// Predict on new data — reuses the trained booster (no refit).
-let scored = model_predict(m9, prices);      // prediction column
+print("per-feature gain importance (term | gain):");
+print(model_importance(m9));
+print("predictions on the training rows (first rows shown):");
+print(model_predict(m9, prices));

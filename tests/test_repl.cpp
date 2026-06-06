@@ -110,6 +110,15 @@ TEST_CASE("REPL print builtin displays tables, scalars, and columns", "[repl][pr
     REQUIRE(ibex::repl::execute_script("print(trades[select { price }]);", registry));
 }
 
+TEST_CASE("REPL print displays text, not just tables", "[repl][print]") {
+    ibex::runtime::ExternRegistry registry;
+    // A bare string literal and a bound string scalar both print as text.
+    REQUIRE(ibex::repl::execute_script("print(\"=== a header line ===\");", registry));
+    REQUIRE(ibex::repl::execute_script("let s = \"some text\"; print(s);", registry));
+    // A bare string-literal statement also renders (no print needed).
+    REQUIRE(ibex::repl::execute_script("\"bare text\";", registry));
+}
+
 TEST_CASE("REPL print passes its argument through for binding", "[repl][print]") {
     ibex::runtime::ExternRegistry registry;
     // print(x) returns x, so it can be bound and used downstream.

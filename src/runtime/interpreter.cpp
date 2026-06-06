@@ -1106,6 +1106,119 @@ auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table)
     return std::nullopt;
 }
 
+struct NumericOperandSpec {
+    NumericSpecKind kind{};
+    bool is_lit = false;
+    const std::int64_t* i64 = nullptr;
+    const double* dbl = nullptr;
+    std::int64_t lit_i64 = 0;
+    double lit_dbl = 0.0;
+};
+
+struct NumericArithCmpSpec {
+    ir::ArithmeticOp arith_op{};
+    ir::CompareOp cmp_op{};
+    NumericOperandSpec lhs;
+    NumericOperandSpec rhs;
+    bool lit_is_int = false;
+    std::int64_t lit_i64 = 0;
+    double lit_dbl = 0.0;
+};
+
+auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table)
+    -> std::optional<NumericOperandSpec> {
+    NumericOperandSpec spec{};
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        spec.is_lit = true;
+        if (const auto* i = std::get_if<std::int64_t>(&lit->value)) {
+            spec.kind = NumericSpecKind::Int64;
+            spec.lit_i64 = *i;
+            spec.lit_dbl = static_cast<double>(*i);
+            return spec;
+        }
+        if (const auto* d = std::get_if<double>(&lit->value)) {
+            spec.kind = NumericSpecKind::Double;
+            spec.lit_dbl = *d;
+            return spec;
+        }
+        return std::nullopt;
+    }
+
+    const auto* col_node = std::get_if<ir::ColumnRef>(&expr.node);
+    if (col_node == nullptr) {
+        return std::nullopt;
+    }
+    auto it = table.index.find(col_node->name);
+    if (it == table.index.end()) {
+        return std::nullopt;
+    }
+    const auto& entry = table.columns[it->second];
+    if (entry.validity.has_value()) {
+        return std::nullopt;
+    }
+    if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry.column.get())) {
+        spec.kind = NumericSpecKind::Int64;
+        spec.i64 = int_column->data();
+        return spec;
+    }
+    if (const auto* double_column = std::get_if<Column<double>>(entry.column.get())) {
+        spec.kind = NumericSpecKind::Double;
+        spec.dbl = double_column->data();
+        return spec;
+    }
+    return std::nullopt;
+}
+
+auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table& table)
+    -> std::optional<NumericArithCmpSpec> {
+    const ir::BinaryExpr* bin = nullptr;
+    const ir::Literal* lit = nullptr;
+    ir::CompareOp op = cmp.op;
+
+    if (const auto* lbin = std::get_if<ir::BinaryExpr>(&cmp.left->node)) {
+        if (const auto* rlit = std::get_if<ir::Literal>(&cmp.right->node)) {
+            bin = lbin;
+            lit = rlit;
+        }
+    }
+    if (bin == nullptr) {
+        if (const auto* llit = std::get_if<ir::Literal>(&cmp.left->node)) {
+            if (const auto* rbin = std::get_if<ir::BinaryExpr>(&cmp.right->node)) {
+                bin = rbin;
+                lit = llit;
+                op = flip_cmp(op);
+            }
+        }
+    }
+    if (bin == nullptr || lit == nullptr) {
+        return std::nullopt;
+    }
+
+    auto lhs = try_extract_numeric_operand_spec(*bin->left, table);
+    auto rhs = try_extract_numeric_operand_spec(*bin->right, table);
+    if (!lhs || !rhs) {
+        return std::nullopt;
+    }
+
+    NumericArithCmpSpec spec{};
+    spec.arith_op = bin->op;
+    spec.cmp_op = op;
+    spec.lhs = *lhs;
+    spec.rhs = *rhs;
+    if (const auto* i = std::get_if<std::int64_t>(&lit->value)) {
+        spec.lit_is_int = true;
+        spec.lit_i64 = *i;
+        spec.lit_dbl = static_cast<double>(*i);
+        return spec;
+    }
+    if (const auto* d = std::get_if<double>(&lit->value)) {
+        spec.lit_is_int = false;
+        spec.lit_dbl = *d;
+        return spec;
+    }
+    return std::nullopt;
+}
+
 template <ir::CompareOp Op, typename L, typename R>
 auto cmp_eval(L lhs, R rhs) -> uint8_t {
     using C = std::common_type_t<L, R>;
@@ -1124,6 +1237,131 @@ auto cmp_eval(L lhs, R rhs) -> uint8_t {
     } else {
         return l >= r;
     }
+}
+
+template <typename T>
+struct NumericColumnOperand {
+    const T* data = nullptr;
+    [[nodiscard]] auto value(std::size_t i) const noexcept -> T { return data[i]; }
+};
+
+template <typename T>
+struct NumericLiteralOperand {
+    T literal{};
+    [[nodiscard]] auto value(std::size_t) const noexcept -> T { return literal; }
+};
+
+template <typename Fn>
+auto visit_numeric_operand(const NumericOperandSpec& spec, Fn&& fn) -> void {
+    if (spec.kind == NumericSpecKind::Int64) {
+        if (spec.is_lit) {
+            fn(NumericLiteralOperand<std::int64_t>{spec.lit_i64});
+        } else {
+            fn(NumericColumnOperand<std::int64_t>{spec.i64});
+        }
+    } else {
+        if (spec.is_lit) {
+            fn(NumericLiteralOperand<double>{spec.lit_dbl});
+        } else {
+            fn(NumericColumnOperand<double>{spec.dbl});
+        }
+    }
+}
+
+template <ir::ArithmeticOp Op, typename L, typename R>
+auto arith_eval(L lhs, R rhs) -> std::common_type_t<L, R> {
+    using Out = std::common_type_t<L, R>;
+    const Out l = static_cast<Out>(lhs);
+    const Out r = static_cast<Out>(rhs);
+    if constexpr (Op == ir::ArithmeticOp::Add) {
+        return l + r;
+    } else if constexpr (Op == ir::ArithmeticOp::Sub) {
+        return l - r;
+    } else if constexpr (Op == ir::ArithmeticOp::Mul) {
+        return l * r;
+    } else if constexpr (Op == ir::ArithmeticOp::Div) {
+        if constexpr (std::is_integral_v<Out>) {
+            return safe_idiv<Out>(l, r);
+        } else {
+            return l / r;
+        }
+    } else {
+        if constexpr (std::is_integral_v<Out>) {
+            return safe_imod<Out>(l, r);
+        } else {
+            return std::fmod(l, r);
+        }
+    }
+}
+
+template <ir::ArithmeticOp ArithOp, ir::CompareOp CmpOp, typename Lhs, typename Rhs, typename Lit>
+auto numeric_arith_cmp_mask(Lhs lhs, Rhs rhs, Lit lit, uint8_t* __restrict out, std::size_t n)
+    -> void {
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = cmp_eval<CmpOp>(arith_eval<ArithOp>(lhs.value(i), rhs.value(i)), lit);
+    }
+}
+
+template <ir::ArithmeticOp ArithOp, typename Lhs, typename Rhs, typename Lit>
+auto dispatch_numeric_arith_cmp_op(ir::CompareOp cmp_op, Lhs lhs, Rhs rhs, Lit lit, uint8_t* out,
+                                   std::size_t n) -> void {
+    switch (cmp_op) {
+        case ir::CompareOp::Eq:
+            numeric_arith_cmp_mask<ArithOp, ir::CompareOp::Eq>(lhs, rhs, lit, out, n);
+            break;
+        case ir::CompareOp::Ne:
+            numeric_arith_cmp_mask<ArithOp, ir::CompareOp::Ne>(lhs, rhs, lit, out, n);
+            break;
+        case ir::CompareOp::Lt:
+            numeric_arith_cmp_mask<ArithOp, ir::CompareOp::Lt>(lhs, rhs, lit, out, n);
+            break;
+        case ir::CompareOp::Le:
+            numeric_arith_cmp_mask<ArithOp, ir::CompareOp::Le>(lhs, rhs, lit, out, n);
+            break;
+        case ir::CompareOp::Gt:
+            numeric_arith_cmp_mask<ArithOp, ir::CompareOp::Gt>(lhs, rhs, lit, out, n);
+            break;
+        case ir::CompareOp::Ge:
+            numeric_arith_cmp_mask<ArithOp, ir::CompareOp::Ge>(lhs, rhs, lit, out, n);
+            break;
+    }
+}
+
+template <typename Lhs, typename Rhs, typename Lit>
+auto dispatch_numeric_arith_op(ir::ArithmeticOp arith_op, ir::CompareOp cmp_op, Lhs lhs, Rhs rhs,
+                               Lit lit, uint8_t* out, std::size_t n) -> void {
+    switch (arith_op) {
+        case ir::ArithmeticOp::Add:
+            dispatch_numeric_arith_cmp_op<ir::ArithmeticOp::Add>(cmp_op, lhs, rhs, lit, out, n);
+            break;
+        case ir::ArithmeticOp::Sub:
+            dispatch_numeric_arith_cmp_op<ir::ArithmeticOp::Sub>(cmp_op, lhs, rhs, lit, out, n);
+            break;
+        case ir::ArithmeticOp::Mul:
+            dispatch_numeric_arith_cmp_op<ir::ArithmeticOp::Mul>(cmp_op, lhs, rhs, lit, out, n);
+            break;
+        case ir::ArithmeticOp::Div:
+            dispatch_numeric_arith_cmp_op<ir::ArithmeticOp::Div>(cmp_op, lhs, rhs, lit, out, n);
+            break;
+        case ir::ArithmeticOp::Mod:
+            dispatch_numeric_arith_cmp_op<ir::ArithmeticOp::Mod>(cmp_op, lhs, rhs, lit, out, n);
+            break;
+    }
+}
+
+auto dispatch_numeric_arith_cmp_kernel(const NumericArithCmpSpec& spec, uint8_t* out, std::size_t n)
+    -> void {
+    visit_numeric_operand(spec.lhs, [&](auto lhs) {
+        visit_numeric_operand(spec.rhs, [&](auto rhs) {
+            if (spec.lit_is_int) {
+                dispatch_numeric_arith_op(spec.arith_op, spec.cmp_op, lhs, rhs, spec.lit_i64, out,
+                                          n);
+            } else {
+                dispatch_numeric_arith_op(spec.arith_op, spec.cmp_op, lhs, rhs, spec.lit_dbl, out,
+                                          n);
+            }
+        });
+    });
 }
 
 template <ir::CompareOp LOp, ir::CompareOp ROp, bool UseAnd, typename L, typename LLit, typename R,
@@ -1519,6 +1757,15 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
         [&](const auto& node) -> std::expected<Mask, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::CompareExpr>) {
+                // Fast path: row-local numeric arithmetic compared to a literal.
+                // This avoids materializing expressions such as `price * qty`
+                // when the filter only needs the final keep/drop mask.
+                if (auto spec = try_extract_numeric_arith_cmp_spec(node, table); spec.has_value()) {
+                    Mask fused;
+                    fused.value.resize(n);
+                    dispatch_numeric_arith_cmp_kernel(*spec, fused.value.data(), n);
+                    return fused;
+                }
                 // Fast path: column/expr op literal (no broadcast needed).
                 if (const auto* lit = std::get_if<ir::Literal>(&node.right->node)) {
                     auto lhs = eval_value_vec(*node.left, table, scalars, n);

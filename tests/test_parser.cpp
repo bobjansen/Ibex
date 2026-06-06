@@ -546,6 +546,44 @@ TEST_CASE("Parse select without braces") {
     REQUIRE(select.fields[0].expr == nullptr);
 }
 
+TEST_CASE("Parse implicit select single field") {
+    const char* source = "df[price];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& select = std::get<SelectClause>(block.clauses[0]);
+    REQUIRE(select.fields.size() == 1);
+    REQUIRE(select.fields[0].name == "price");
+    REQUIRE(select.fields[0].expr == nullptr);
+}
+
+TEST_CASE("Parse implicit select braced fields") {
+    const char* source = "df[{ symbol, price }];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& stmt = result->statements.front();
+    const auto& expr_stmt = std::get<ExprStmt>(stmt);
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    REQUIRE(block.clauses.size() == 1);
+
+    const auto& select = std::get<SelectClause>(block.clauses[0]);
+    REQUIRE(select.fields.size() == 2);
+    REQUIRE(select.fields[0].name == "symbol");
+    REQUIRE(select.fields[0].expr == nullptr);
+    REQUIRE(select.fields[1].name == "price");
+    REQUIRE(select.fields[1].expr == nullptr);
+}
+
 TEST_CASE("Parse distinct without braces") {
     const char* source = "df[distinct symbol];";
 

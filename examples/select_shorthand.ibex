@@ -1,0 +1,8 @@
+let trades = Table {
+    symbol = ["AAPL", "MSFT"],
+    price = [101.25, 299.80],
+    qty = [10, 7]
+};
+
+trades[price];
+trades[{ symbol, price }];

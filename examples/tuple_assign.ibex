@@ -25,5 +25,5 @@ let greeks_only = ohlcv[select { symbol, (delta, gamma) = compute_greeks(ohlcv) 
 // gen_prices returns however many columns it sees fit; all are merged into prices.
 let data    = get_ohlcv();
 let symbols = scalar(data, "symbol");
-let prices  = data[select { ts }];
+let prices  = data[ts];
 prices[update = gen_prices(symbols)];

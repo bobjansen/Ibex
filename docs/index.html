@@ -107,14 +107,18 @@
         <p>
           Pipeline operations chain left-to-right inside <code>[ ]</code>, in the
           order they execute. No wrapping every column in a function call, no
-          quoting names.
+          quoting names. A bare field list defaults to <code>select</code>, so
+          <code>trades[price]</code> and <code>trades[{ symbol, price }]</code>
+          are projection shorthand.
         </p>
 <pre><code>trades[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>,
   <span class="kw">select</span> {
     symbol,
     vwap = <span class="fn-name">sum</span>(price * qty)
          / <span class="fn-name">sum</span>(qty)
-  }, <span class="kw">by</span> symbol]</code></pre>
+  }, <span class="kw">by</span> symbol]
+
+trades[{ symbol, price }]</code></pre>
       </article>
       <article class="card">
         <h3>TimeFrames</h3>

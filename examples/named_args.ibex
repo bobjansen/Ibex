@@ -4,15 +4,12 @@ fn add3(x: Int, y: Int = 1, z: Int = 2) -> Int {
 
 // All positional, y and z take their defaults (1 and 2) → 10 + 1 + 2 = 13.
 let a = add3(10);
-print("add3(10):");
-print(a);
+print(`add3(10) = ${a}`);
 
 // Positional x, then z by name; y still defaults → 10 + 1 + 5 = 16.
 let b = add3(10, z = 5);
-print("add3(10, z = 5):");
-print(b);
+print(`add3(10, z = 5) = ${b}`);
 
 // Every argument by name, in any order → 10 + 7 + 5 = 22.
 let c = add3(x = 10, z = 5, y = 7);
-print("add3(x = 10, z = 5, y = 7):");
-print(c);
+print(`add3(x = 10, z = 5, y = 7) = ${c}`);

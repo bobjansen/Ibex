@@ -5125,6 +5125,48 @@ TEST_CASE("string interpolation formats numeric values", "[interp]") {
     CHECK(s[1] == "v=2");
 }
 
+TEST_CASE("transcendental builtins in a column update", "[math]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{0.0, 1.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[update { s = sin(x), c = cos(x), t2 = tan(0.0), l2 = log2(8.0), "
+        "l10 = log10(1000.0), at = atan(0.0), th = tanh(0.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& s = std::get<Column<double>>(*result->find("s"));
+    const auto& c = std::get<Column<double>>(*result->find("c"));
+    const auto& l2 = std::get<Column<double>>(*result->find("l2"));
+    const auto& l10 = std::get<Column<double>>(*result->find("l10"));
+    CHECK(s[0] == Catch::Approx(0.0));
+    CHECK(s[1] == Catch::Approx(std::sin(1.0)));
+    CHECK(c[0] == Catch::Approx(1.0));
+    CHECK(c[1] == Catch::Approx(std::cos(1.0)));
+    CHECK(l2[0] == Catch::Approx(3.0));   // log2(8) = 3
+    CHECK(l10[0] == Catch::Approx(3.0));  // log10(1000) = 3
+    CHECK(std::get<Column<double>>(*result->find("t2"))[0] == Catch::Approx(0.0));
+    CHECK(std::get<Column<double>>(*result->find("at"))[0] == Catch::Approx(0.0));
+    CHECK(std::get<Column<double>>(*result->find("th"))[0] == Catch::Approx(0.0));
+}
+
+TEST_CASE("transcendental builtin accepts an int column (promotes to Float64)", "[math]") {
+    runtime::Table t;
+    t.add_column("n", Column<std::int64_t>{1, 100});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { l = log10(n) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& l = std::get<Column<double>>(*result->find("l"));
+    CHECK(l[0] == Catch::Approx(0.0));  // log10(1) = 0
+    CHECK(l[1] == Catch::Approx(2.0));  // log10(100) = 2
+}
+
 // --- Table constructor from column vectors ------------------------------------
 
 TEST_CASE("Table constructor creates table from integer columns") {

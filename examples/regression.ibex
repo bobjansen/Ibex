@@ -42,7 +42,7 @@ print(model_coef(m2));
 
 // ── 3. Dot notation — regress close on all other numeric columns ────────────
 print("══════════ 3. Dot notation  close ~ .  (all other numeric columns) ══════════");
-let numeric = prices[select { open, high, low, close, volume }];
+let numeric = prices[{ open, high, low, close, volume }];
 let m3 = numeric[model { close ~ . }];
 print(model_coef(m3));
 

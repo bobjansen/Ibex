@@ -1,4 +1,4 @@
 import "parquet";
 
 let prices = read_parquet("https://data.example.com/prices.parquet");
-prices[select total = count()];
+prices[total = count()];

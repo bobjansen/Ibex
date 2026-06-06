@@ -119,6 +119,24 @@ TEST_CASE("REPL print displays text, not just tables", "[repl][print]") {
     REQUIRE(ibex::repl::execute_script("\"bare text\";", registry));
 }
 
+TEST_CASE("REPL evaluates scalar math builtins at top level", "[repl][math]") {
+    ibex::runtime::ExternRegistry registry;
+    // Math builtins now work in scalar position, not just in update/select.
+    REQUIRE(ibex::repl::execute_script("print(sqrt(4.0));", registry));
+    REQUIRE(ibex::repl::execute_script("print(sin(0.0));", registry));
+    REQUIRE(ibex::repl::execute_script("print(log10(1000.0));", registry));
+    REQUIRE(ibex::repl::execute_script("print(abs(-5));", registry));
+    REQUIRE(ibex::repl::execute_script("print(pmax(3, 7));", registry));
+    // Composes in arithmetic, let-binding, and interpolation.
+    REQUIRE(ibex::repl::execute_script("print(sqrt(2.0) * 2.0);", registry));
+    REQUIRE(ibex::repl::execute_script("let r = log2(8.0); print(r);", registry));
+    REQUIRE(ibex::repl::execute_script("let x = 16.0; print(`sqrt = ${sqrt(x)}`);", registry));
+    // Casts keep their dedicated handling (better error than the registry).
+    REQUIRE_FALSE(ibex::repl::execute_script("print(Int64(3.5));", registry));
+    // A genuinely unknown function still errors.
+    REQUIRE_FALSE(ibex::repl::execute_script("print(bogus(1.0));", registry));
+}
+
 TEST_CASE("REPL string interpolation in scalar position", "[repl][interp]") {
     ibex::runtime::ExternRegistry registry;
     // Backtick templates with ${expr} interpolate at runtime.

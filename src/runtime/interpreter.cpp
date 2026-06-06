@@ -14592,4 +14592,24 @@ auto extract_scalar(const Table& table, const std::string& column)
     return scalar_from_column(*col, 0);
 }
 
+auto is_scalar_builtin(std::string_view name) -> bool {
+    return scalar_builtins().contains(name);
+}
+
+auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& args)
+    -> std::expected<ScalarValue, std::string> {
+    auto it = scalar_builtins().find(name);
+    if (it == scalar_builtins().end()) {
+        return std::unexpected("not a scalar builtin: " + std::string(name));
+    }
+    const auto& fn = it->second;
+    const auto argc = static_cast<int>(args.size());
+    if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
+        return std::unexpected(std::string(name) + ": wrong number of arguments");
+    }
+    // ScalarValue and the interpreter's ExprValue are the same variant, so the
+    // already-evaluated scalar args pass straight into the registry's eval.
+    return fn.eval(name, args);
+}
+
 }  // namespace ibex::runtime

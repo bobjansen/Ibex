@@ -2292,6 +2292,16 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return EvalValue{std::move(table.value())};
         }
+        // Row-wise scalar builtins (sqrt/sin/log10/abs/…) yield a scalar; route
+        // to the scalar evaluator rather than treating the call as a table.
+        if (runtime::is_scalar_builtin(call->callee)) {
+            auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
+                                           compile_time_lists, extern_decls, externs);
+            if (!scalar) {
+                return std::unexpected(scalar.error());
+            }
+            return EvalValue{std::move(scalar.value())};
+        }
     }
     auto table = eval_table_expr(expr, tables, scalars, columns, models, functions,
                                  compile_time_lists, extern_decls, externs, model_out);
@@ -2564,6 +2574,23 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 return std::unexpected("round(): first argument must be Float");
             }
             return apply_scalar_round(std::get<double>(*value), *mode);
+        }
+        // Row-wise scalar builtins (sqrt, sin, log10, abs, ceil, floor, trunc,
+        // year/month/…, pmin, pmax, is_nan): evaluate the arguments and dispatch
+        // through the interpreter's shared registry, so these work at the REPL
+        // top level too — not just inside update/select/filter.
+        if (runtime::is_scalar_builtin(call->callee)) {
+            std::vector<runtime::ScalarValue> arg_values;
+            arg_values.reserve(call->args.size());
+            for (auto& arg : call->args) {
+                auto v = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
+                                          compile_time_lists, extern_decls, externs);
+                if (!v) {
+                    return std::unexpected(v.error());
+                }
+                arg_values.push_back(std::move(v.value()));
+            }
+            return runtime::eval_scalar_builtin(call->callee, arg_values);
         }
         return std::unexpected("unknown function: " + call->callee + " (available: " +
                                format_function_names(functions, extern_decls) + ")");

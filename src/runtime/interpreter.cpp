@@ -30,6 +30,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__AVX2__) || defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
 #ifdef __GLIBC__
 #include <malloc.h>  // mallopt
 #endif
@@ -233,6 +237,29 @@ auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
     }
     out_bit += count;
 }
+
+auto pack_mask_word_scalar(const std::uint8_t* mp, const std::uint8_t* vp, std::size_t lim) noexcept
+    -> std::uint64_t {
+    std::uint64_t bits = 0;
+    for (std::size_t i = 0; i < lim; ++i) {
+        const bool keep = vp ? ((mp[i] & vp[i]) != 0) : (mp[i] != 0);
+        bits |= static_cast<std::uint64_t>(keep) << i;
+    }
+    return bits;
+}
+
+#if defined(__AVX2__)
+auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp));
+    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + 32));
+    const auto lo_bits =
+        static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, zero)));
+    const auto hi_bits =
+        static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(hi, zero)));
+    return static_cast<std::uint64_t>(lo_bits) | (static_cast<std::uint64_t>(hi_bits) << 32);
+}
+#endif
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
 // Returns nullopt if no referenced column has a validity bitmap.
@@ -1634,12 +1661,14 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
     for (std::size_t w = 0; w < n_words; ++w) {
         const std::size_t base = w * 64;
         const std::size_t lim = std::min<std::size_t>(64, n - base);
-        std::uint64_t bits = 0;
-        for (std::size_t i = 0; i < lim; ++i) {
-            const std::size_t row = base + i;
-            const bool keep = vp ? ((mp[row] & vp[row]) != 0) : (mp[row] != 0);
-            bits |= static_cast<std::uint64_t>(keep) << i;
-        }
+#if defined(__AVX2__)
+        const std::uint64_t bits =
+            (vp == nullptr && lim == 64)
+                ? pack_mask_word_avx2(mp + base)
+                : pack_mask_word_scalar(mp + base, vp ? vp + base : nullptr, lim);
+#else
+        const std::uint64_t bits = pack_mask_word_scalar(mp + base, vp ? vp + base : nullptr, lim);
+#endif
         const std::size_t block_kept = static_cast<std::size_t>(std::popcount(bits));
         if (row_limit != 0 && out_n + block_kept >= row_limit) {
             // Trim this block's high-order keep bits so we emit exactly

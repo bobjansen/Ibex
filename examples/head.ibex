@@ -4,10 +4,13 @@ let trades = Table {
 };
 
 // First two rows in current order.
+print("head 2 — first two rows in current order:");
 trades[head 2];
 
 // Top two rows overall after ordering.
+print("order by score desc, then head 2 — the two highest scores:");
 trades[order { score desc }, head 2];
 
 // Top two rows per symbol after ordering.
+print("head 2 by symbol — the two highest scores within each symbol:");
 trades[order { score desc }, head 2, by symbol];

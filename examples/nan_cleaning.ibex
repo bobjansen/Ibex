@@ -13,25 +13,37 @@ let quotes = Table {
     den    = [1.0, 0.0, 1.0, 0.0, 1.0]
 };
 
+// px = num / den introduces NaN (0/0) and Inf (1/0) for the bad rows.
 let dirty = quotes[update {
     px = num / den
 }];
+print("dirty px = num / den  (note NaN from 0/0 and inf from 1/0):");
+print(dirty);
 
+// Three ways to flag/clean dirty floats side by side.
 let cleaned = dirty[update {
     px_is_nan = is_nan(px),
     px_null   = null_if_nan(px),
     px_finite = null_if_not_finite(px)
 }];
+print("flagged: is_nan, null_if_nan, null_if_not_finite columns:");
+print(cleaned);
 
+// Aggregating the cleaned column skips the nulls, so the average is well-defined.
+print("aggregate over the cleaned column (nulls skipped):");
 cleaned[select {
     avg_px = mean(px_finite),
     sum_px = sum(px_finite)
 }, by symbol, order symbol];
 
+// Same idea inline — clean inside the aggregate without a staging column.
+print("same, cleaning inline inside the aggregate:");
 dirty[select {
     avg_px_direct = mean(null_if_nan(px))
 }, by symbol, order symbol];
 
+// For contrast: aggregating the raw inputs (no NaN here) works directly.
+print("for contrast, mean(num + den) on the raw inputs:");
 quotes[select {
     avg_num_plus_den = mean(num + den)
 }, by symbol, order symbol];

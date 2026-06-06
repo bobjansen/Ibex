@@ -178,14 +178,37 @@ AMI_ID=$(aws ec2 create-image \
     --region "$REGION" \
     --instance-id "$INSTANCE_ID" \
     --name "$AMI_NAME" \
-    --description "ibex benchmark AMI — commit ${COMMIT:0:8}, prebuild=${PREBUILD}" \
+    --description "ibex benchmark AMI - commit ${COMMIT:0:8}, prebuild=${PREBUILD}" \
     --tag-specifications \
         "ResourceType=image,Tags=[{Key=Name,Value=${AMI_NAME}},{Key=Commit,Value=${COMMIT:0:8}}]" \
         "ResourceType=snapshot,Tags=[{Key=Name,Value=${AMI_NAME}}]" \
     --query "ImageId" --output text)
 
 echo "AMI: $AMI_ID — waiting for it to become available..."
-aws ec2 wait image-available --image-ids "$AMI_ID" --region "$REGION"
+# A prebuilt 60GB image can take >10 min to snapshot, longer than the default
+# `aws ec2 wait image-available` cap (40×15s). Poll manually up to 30 min.
+AMI_TIMEOUT=1800
+AMI_START=$(date +%s)
+while true; do
+    AMI_STATE=$(aws ec2 describe-images --image-ids "$AMI_ID" --region "$REGION" \
+        --query "Images[0].State" --output text 2>/dev/null || true)
+    [[ "$AMI_STATE" == "available" ]] && break
+    if [[ "$AMI_STATE" == "failed" ]]; then
+        echo "AMI $AMI_ID entered 'failed' state."
+        cleanup_instance
+        exit 1
+    fi
+    if (( $(date +%s) - AMI_START > AMI_TIMEOUT )); then
+        echo "AMI $AMI_ID still '$AMI_STATE' after $((AMI_TIMEOUT/60))m — check the console."
+        echo "It may still finish; once 'available', save it with:"
+        echo "  ./benchmarking/aws/lib.sh -> bench_save_config, or add IBEX_AMI=$AMI_ID to .config"
+        cleanup_instance
+        exit 1
+    fi
+    printf "."
+    sleep 20
+done
+echo ""
 echo "✓ AMI $AMI_ID available."
 
 cleanup_instance

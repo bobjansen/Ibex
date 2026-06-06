@@ -25,8 +25,8 @@ let m1 = prices[model { close ~ open + volume, method=ols }];
 // m1 carries a coefficient table plus fit diagnostics, reached via accessors.
 print("coefficients (term | estimate | ...):");
 print(model_coef(m1));
-print("R-squared:");
-print(model_r_squared(m1));
+let m1_r2 = model_r_squared(m1);
+print(`R-squared = ${m1_r2}`);
 
 // Score new data with the fitted OLS model. model_predict rebuilds the design
 // matrix from `newdata` with the model's formula and applies the coefficients

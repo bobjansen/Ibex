@@ -72,16 +72,14 @@ let pred_gbm = model_predict(m_gbm, holdout);
 //    would display the same way. The true coefficients are (3, 2, -1.5, 0.5).
 print("OLS coefficients — should recover (intercept 3, x1 2, x2 -1.5, x3 0.5):");
 print(ols_coef);
-print("OLS R-squared:");
-print(ols_r2);
+print(`OLS R-squared = ${ols_r2}`);
 print("Ridge (lambda = 1000) — slopes shrink toward 0 vs OLS; intercept ~3 unchanged:");
 print(ridge_mild_coef);
 print("Ridge (lambda = 5000) — stronger penalty, slopes shrink further toward 0:");
 print(ridge_strong_coef);
 print("LightGBM feature importance — x1 and x2 should dominate, x3 least:");
 print(gbm_importance);
-print("LightGBM R-squared:");
-print(gbm_r2);
+print(`LightGBM R-squared = ${gbm_r2}`);
 print("OLS predictions on 8 fresh holdout rows:");
 print(pred_ols);
 print("LightGBM predictions on the same holdout rows:");

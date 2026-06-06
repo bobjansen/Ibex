@@ -917,6 +917,11 @@ class Parser {
         }
         if (match(TokenKind::QuotedIdentifier)) {
             std::string name = unescape_quoted_identifier(previous().lexeme);
+            // A backtick string with `${...}` is an interpolated template string;
+            // without it, it's a plain quoted column identifier (e.g. `Sepal.Length`).
+            if (is_interpolated(name)) {
+                return build_interpolation(name);
+            }
             auto expr = std::make_unique<Expr>();
             expr->node = IdentifierExpr{.name = std::move(name)};
             return expr;
@@ -2146,6 +2151,91 @@ class Parser {
             result.push_back(ch);
         }
         return result;
+    }
+
+    // True if a backtick-string body uses `${...}` interpolation (vs. being a
+    // plain quoted column identifier like `Sepal.Length`).
+    static auto is_interpolated(std::string_view content) -> bool {
+        return content.find("${") != std::string_view::npos;
+    }
+
+    // Parse one embedded `${...}` expression (the text between the braces) by
+    // re-lexing and parsing it as a standalone expression.
+    auto parse_embedded_expression(std::string_view src) -> ExprPtr {
+        auto tokens = tokenize(src);
+        Parser sub(std::move(tokens));
+        auto expr = sub.parse_expression();
+        if (!expr) {
+            error_ = sub.error_;
+            return nullptr;
+        }
+        if (!sub.is_at_end()) {
+            error_ = make_error(peek(),
+                                "invalid expression in string interpolation: " + std::string(src));
+            return nullptr;
+        }
+        return expr;
+    }
+
+    // Desugar an interpolated backtick string `lit${e0}lit${e1}lit` into
+    // `__interp(lit0, e0, lit1, e1, ..., litN)` — a CallExpr whose args alternate
+    // string-literal segments and embedded value expressions. The runtime and the
+    // REPL stringify every argument and concatenate, so the literals carry through
+    // verbatim and the embedded expressions are formatted in place.
+    auto build_interpolation(const std::string& content) -> ExprPtr {
+        std::vector<ExprPtr> args;
+        std::string literal;
+        auto flush_literal = [&]() {
+            auto lit = std::make_unique<Expr>();
+            lit->node = LiteralExpr{.value = literal};
+            args.push_back(std::move(lit));
+            literal.clear();
+        };
+        for (std::size_t i = 0; i < content.size();) {
+            if (content[i] == '$' && i + 1 < content.size() && content[i + 1] == '{') {
+                flush_literal();
+                std::size_t depth = 1;
+                std::size_t j = i + 2;
+                std::string inner;
+                while (j < content.size() && depth > 0) {
+                    const char c = content[j];
+                    if (c == '{') {
+                        depth += 1;
+                        inner.push_back(c);
+                    } else if (c == '}') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            break;
+                        }
+                        inner.push_back(c);
+                    } else {
+                        inner.push_back(c);
+                    }
+                    j += 1;
+                }
+                if (depth != 0) {
+                    error_ = make_error(peek(), "unterminated '${' in string interpolation");
+                    return nullptr;
+                }
+                if (inner.empty()) {
+                    error_ = make_error(peek(), "empty '${}' in string interpolation");
+                    return nullptr;
+                }
+                auto embedded = parse_embedded_expression(inner);
+                if (!embedded) {
+                    return nullptr;
+                }
+                args.push_back(std::move(embedded));
+                i = j + 1;  // skip past the closing '}'
+            } else {
+                literal.push_back(content[i]);
+                i += 1;
+            }
+        }
+        flush_literal();  // trailing literal segment (possibly empty)
+        auto call = std::make_unique<Expr>();
+        call->node = CallExpr{.callee = "__interp", .args = std::move(args), .named_args = {}};
+        return call;
     }
 
     static auto parse_date_literal(std::string_view text) -> std::optional<Date> {

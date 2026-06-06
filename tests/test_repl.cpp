@@ -119,6 +119,21 @@ TEST_CASE("REPL print displays text, not just tables", "[repl][print]") {
     REQUIRE(ibex::repl::execute_script("\"bare text\";", registry));
 }
 
+TEST_CASE("REPL string interpolation in scalar position", "[repl][interp]") {
+    ibex::runtime::ExternRegistry registry;
+    // Backtick templates with ${expr} interpolate at runtime.
+    REQUIRE(ibex::repl::execute_script("let r2 = 0.5; print(`R-squared = ${r2}`);", registry));
+    REQUIRE(ibex::repl::execute_script(
+        "let a = 3; let b = 4; print(`sum of ${a} and ${b} is ${a + b}`);", registry));
+    // A let-bound interpolation is a String scalar usable downstream.
+    REQUIRE(ibex::repl::execute_script("let n = 5; let msg = `n is ${n}`; print(msg);", registry));
+    // A plain backtick (no ${}) is still a quoted identifier (column ref), not text.
+    REQUIRE(ibex::repl::execute_script(
+        "let t = Table { `od.d` = [1, 2] }; t[select { y = `od.d` * 2 }];", registry));
+    // A malformed embedded expression is a parse error.
+    REQUIRE_FALSE(ibex::repl::execute_script("print(`x = ${1 +}`);", registry));
+}
+
 TEST_CASE("REPL print passes its argument through for binding", "[repl][print]") {
     ibex::runtime::ExternRegistry registry;
     // print(x) returns x, so it can be bound and used downstream.

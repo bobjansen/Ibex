@@ -5016,6 +5016,43 @@ TEST_CASE("rep array literal string labels", "[rep]") {
     }
 }
 
+TEST_CASE("string interpolation builds a String column in update", "[interp]") {
+    // `row ${id}: ${g}` desugars to __interp(...) and produces a String column
+    // per row. This also exercises the per-row String-column builder.
+    runtime::Table t;
+    t.add_column("id", Column<std::int64_t>{1, 2, 3});
+    t.add_column("g", Column<std::string>{"a", "b", "c"});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { label = `row ${id}: ${g}` }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* label = std::get_if<Column<std::string>>(result->find("label"));
+    REQUIRE(label != nullptr);
+    REQUIRE(label->size() == 3);
+    CHECK((*label)[0] == "row 1: a");
+    CHECK((*label)[1] == "row 2: b");
+    CHECK((*label)[2] == "row 3: c");
+}
+
+TEST_CASE("string interpolation formats numeric values", "[interp]") {
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.5, 2.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[update { s = `v=${x}` }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& s = std::get<Column<std::string>>(*result->find("s"));
+    REQUIRE(s.size() == 2);
+    CHECK(s[0] == "v=1.5");
+    CHECK(s[1] == "v=2");
+}
+
 // --- Table constructor from column vectors ------------------------------------
 
 TEST_CASE("Table constructor creates table from integer columns") {

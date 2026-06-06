@@ -198,7 +198,25 @@ STRING_CHAR = <any UTF-8 codepoint except '"' and '\'> | ESCAPE_SEQ ;
 ESCAPE_SEQ  = '\' ( '"' | '\' | 'n' | 'r' | 't' | '0' ) ;
 ```
 
-Single-quoted strings are not supported. No string interpolation.
+Single-quoted strings are not supported. Double-quoted strings are plain
+literals (no interpolation).
+
+**Interpolated strings (backtick templates):** a backtick string containing
+`${expr}` is a runtime template — each `${...}` is evaluated and its value
+formatted in place, and the whole thing yields a `String`:
+
+```
+let r2 = 0.97;
+print(`R-squared = ${r2}`);            // R-squared = 0.97
+t[update { label = `row ${id}: ${g}` }];  // a String column, per row
+```
+
+`${expr}` accepts any expression (columns, scalars, arithmetic). Values format
+the same way they print (floats via the mixed float formatter, dates/timestamps
+via their formatters). A backtick string with **no** `${...}` is still a quoted
+*identifier* (a column name like `` `Sepal.Length` ``), not a template — the
+`${` is what distinguishes a template from a quoted identifier. This is distinct
+from the compile-time `${name}` expansion in `map` column-name aliases (§11).
 
 **Booleans:**
 

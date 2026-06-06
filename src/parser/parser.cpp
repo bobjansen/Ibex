@@ -1339,8 +1339,22 @@ class Parser {
         if (match(TokenKind::KeywordModel)) {
             return parse_model_clause();
         }
+        if (starts_implicit_select_clause()) {
+            auto result = parse_clause_field_list_or_single();
+            if (!result.has_value()) {
+                return std::nullopt;
+            }
+            return SelectClause{.fields = std::move(result->fields),
+                                .tuple_fields = std::move(result->tuple_fields),
+                                .map_fields = std::move(result->map_fields)};
+        }
         error_ = make_error(peek(), "expected clause");
         return std::nullopt;
+    }
+
+    auto starts_implicit_select_clause() const -> bool {
+        return check(TokenKind::Identifier) || check(TokenKind::QuotedIdentifier) ||
+               check(TokenKind::LBrace);
     }
 
     auto validate_param_defaults(const std::vector<Param>& params) -> bool {

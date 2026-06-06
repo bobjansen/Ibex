@@ -642,6 +642,19 @@ TEST_CASE("Lower select with multiple plain columns") {
     REQUIRE(project->columns()[2].name == "qty");
 }
 
+TEST_CASE("Lower implicit select with plain columns") {
+    auto program = require_parse("df[{ price, symbol, qty }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* project = as_node<ir::ProjectNode>(result->get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->columns().size() == 3);
+    REQUIRE(project->columns()[0].name == "price");
+    REQUIRE(project->columns()[1].name == "symbol");
+    REQUIRE(project->columns()[2].name == "qty");
+}
+
 TEST_CASE("Lower order with multiple keys") {
     auto program = require_parse("df[order { symbol asc, price desc }];");
     auto result = parser::lower(program);

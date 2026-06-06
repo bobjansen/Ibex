@@ -2,7 +2,7 @@
 import "csv";
 
 let measurements = read_csv("examples/measurements.txt", "", ";", false)
-    [select { station = col1, temp = col2 }];
+    [{ station = col1, temp = col2 }];
 
 measurements[select {
     min_temp = min(temp),

@@ -12,4 +12,4 @@ print(trades);
 
 // qty is an Int64 series, so cast it to Float64 to multiply by the price.
 print("notional = price * Float64(qty):");
-trades[select { notional = price * Float64(qty) }];
+trades[{ notional = price * Float64(qty) }];

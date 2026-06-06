@@ -35,7 +35,13 @@ Ibex replaces positional slots with **named clauses**:
 df[filter price > 100.0, select { symbol, avg = mean(price) }, by symbol]
 ```
 
-Every clause is self-identifying. No position is significant.
+Every clause is self-identifying. No position is significant. As a projection
+convenience, a field list with no clause keyword defaults to `select`:
+
+```
+trades[price]            // trades[select price]
+trades[{ symbol, price }] // trades[select { symbol, price }]
+```
 
 ### 1.2 Clause Ordering
 
@@ -766,6 +772,7 @@ clause_list     = clause { "," clause } [ "," ] ;
 
 clause          = filter_clause
                 | select_clause
+                | implicit_select_clause
                 | distinct_clause
                 | update_clause
                 | order_clause
@@ -783,6 +790,8 @@ clause          = filter_clause
 filter_clause   = "filter" expr ;
 
 select_clause   = "select" field_or_list ;
+
+implicit_select_clause = field_or_list ;
 
 distinct_clause = "distinct" field_or_list ;
 
@@ -1027,6 +1036,14 @@ either a **pass-through** (bare identifier naming an input column) or a
 
 ```
 trades[select { symbol, notional = price * volume }]
+```
+
+If a block clause starts directly with a field or field list, Ibex treats it
+as `select` shorthand:
+
+```
+trades[price]             // equivalent to trades[select price]
+trades[{ symbol, price }] // equivalent to trades[select { symbol, price }]
 ```
 
 Every computed field must be named. Bare non-identifier expressions are a

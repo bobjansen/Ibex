@@ -386,9 +386,28 @@ TEST_CASE("E2E: select single column", "[e2e]") {
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{10, 20, 30, 40, 50});
 }
 
+TEST_CASE("E2E: implicit select single column", "[e2e]") {
+    auto tables = make_trades();
+    auto out = run("trades[price];", tables);
+
+    REQUIRE(out.columns.size() == 1);
+    REQUIRE(out.rows() == 5);
+    CHECK(col_i64(out, "price") == std::vector<std::int64_t>{10, 20, 30, 40, 50});
+}
+
 TEST_CASE("E2E: select multiple columns", "[e2e]") {
     auto tables = make_trades();
     auto out = run("trades[select { price, symbol }];", tables);
+
+    REQUIRE(out.columns.size() == 2);
+    CHECK(out.find("price") != nullptr);
+    CHECK(out.find("symbol") != nullptr);
+    CHECK(out.find("qty") == nullptr);
+}
+
+TEST_CASE("E2E: implicit select multiple columns", "[e2e]") {
+    auto tables = make_trades();
+    auto out = run("trades[{ price, symbol }];", tables);
 
     REQUIRE(out.columns.size() == 2);
     CHECK(out.find("price") != nullptr);

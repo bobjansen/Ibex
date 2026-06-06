@@ -10,7 +10,7 @@ metrics;
 
 // Aggregates ignore null values (phase 3 semantics).
 metrics[
-  select {
+  {
     avg_ret = mean(ret),
     avg_beta = mean(beta),
     sum_notl = sum(notl),

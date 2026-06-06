@@ -165,7 +165,7 @@ HTML_TEMPLATE = """<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ibex | Benchmarks vs Polars, DuckDB, ClickHouse, DataFusion, data.table</title>
-  <meta name="description" content="Ibex benchmarked against Polars, DuckDB, ClickHouse, DataFusion and data.table across columnar DataFrame queries from 1M to 16M rows." />
+  <meta name="description" content="Ibex benchmarked against Polars, DuckDB, ClickHouse, DataFusion and data.table across columnar DataFrame queries from 1M to __MAXM__M rows." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -224,7 +224,7 @@ HTML_TEMPLATE = """<!doctype html>
     <p class="lead">
       Ibex against <strong>Polars</strong>, <strong>DuckDB</strong>,
       <strong>ClickHouse</strong>, <strong>DataFusion</strong> and
-      <strong>data.table</strong> on the same columnar queries, from 1M to 16M
+      <strong>data.table</strong> on the same columnar queries, from 1M to __MAXM__M
       rows. Times are the mean of timed iterations; lower is better.
     </p>
     <div class="stats" id="stats"></div>
@@ -662,7 +662,10 @@ def main(argv=None):
         return 1
     payload = build_payload(cells, mem, args.csv, commit=args.commit)
 
-    out_html = HTML_TEMPLATE.replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
+    max_rows_m = f"{max(payload['scales']) // 1_000_000}" if payload["scales"] else "16"
+    out_html = (HTML_TEMPLATE
+                .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
+                .replace("__MAXM__", max_rows_m))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(out_html, encoding="utf-8")
     print(f"wrote {args.out}  ({len(payload['queries'])} queries, "

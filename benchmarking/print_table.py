@@ -34,6 +34,7 @@ QUERY_ORDER = [
     "mean_by_symbol_day",
     "ohlc_by_symbol_day",
     "sum_by_user",
+    "distinct_symbol",
     # update / column ops
     "update_price_x2",
     "cumsum_price",
@@ -48,6 +49,11 @@ QUERY_ORDER = [
     "filter_arith",
     "filter_or",
     "filter_events",
+    # sort / top-k
+    "order_head_topk",
+    "order_head_topk_by_symbol",
+    "order_tail_topk",
+    "order_tail_topk_by_symbol",
     # joins
     "null_left_join",
     "null_semi_join",
@@ -56,11 +62,14 @@ QUERY_ORDER = [
     # reshape
     "melt_wide_to_long",
     "dcast_long_to_wide",
+    "dcast_long_to_wide_int_pivot",
+    "dcast_long_to_wide_cat_pivot",
     # fill / null propagation
     "fill_null",
     "fill_forward",
     "fill_backward",
     # time-series (cross-engine: ibex, pandas, polars, duckdb, data.table, dplyr)
+    "as_timeframe",
     "tf_lag1",
     "tf_rolling_count_1m",
     "tf_rolling_sum_1m",
@@ -96,8 +105,16 @@ QUERY_LABEL = {
     "null_semi_join": "semi join",
     "null_anti_join": "anti join",
     "null_cross_join_small": "cross join (2k×64)",
+    "distinct_symbol": "distinct symbol",
+    "order_head_topk": "top-k head",
+    "order_head_topk_by_symbol": "top-k head by symbol",
+    "order_tail_topk": "top-k tail",
+    "order_tail_topk_by_symbol": "top-k tail by symbol",
     "melt_wide_to_long": "melt wide→long",
     "dcast_long_to_wide": "dcast long→wide",
+    "dcast_long_to_wide_int_pivot": "dcast long→wide (int pivot)",
+    "dcast_long_to_wide_cat_pivot": "dcast long→wide (cat pivot)",
+    "as_timeframe": "as timeframe",
     "fill_null": "fill null (const)",
     "fill_forward": "fill forward (LOCF)",
     "fill_backward": "fill backward (NOCB)",

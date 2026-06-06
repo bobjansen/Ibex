@@ -49,20 +49,26 @@ CODE_ENGINES: list[tuple[str, str, str]] = [
 CATEGORIES: list[tuple[str, list[str]]] = [
     ("Group-by / aggregation", [
         "mean_by_symbol", "ohlc_by_symbol", "count_by_symbol_day",
-        "mean_by_symbol_day", "ohlc_by_symbol_day", "sum_by_user"]),
+        "mean_by_symbol_day", "ohlc_by_symbol_day", "sum_by_user",
+        "distinct_symbol"]),
     ("Column ops / update", [
         "update_price_x2", "cumsum_price", "cumprod_price", "rand_uniform",
         "rand_normal", "rand_int", "rand_bernoulli"]),
     ("Filters", [
         "filter_simple", "filter_and", "filter_arith", "filter_or",
         "filter_events"]),
+    ("Sort / top-k", [
+        "order_head_topk", "order_head_topk_by_symbol",
+        "order_tail_topk", "order_tail_topk_by_symbol"]),
     ("Joins", [
         "null_left_join", "null_semi_join", "null_anti_join",
         "null_cross_join_small"]),
-    ("Reshape", ["melt_wide_to_long", "dcast_long_to_wide"]),
+    ("Reshape", [
+        "melt_wide_to_long", "dcast_long_to_wide",
+        "dcast_long_to_wide_int_pivot", "dcast_long_to_wide_cat_pivot"]),
     ("Fill / null propagation", ["fill_null", "fill_forward", "fill_backward"]),
     ("Time-series (TimeFrame)", [
-        "tf_lag1", "tf_rolling_count_1m", "tf_rolling_sum_1m",
+        "as_timeframe", "tf_lag1", "tf_rolling_count_1m", "tf_rolling_sum_1m",
         "tf_rolling_mean_5m", "tf_rolling_median_1m", "tf_rolling_std_1m",
         "tf_rolling_ewma_1m", "tf_resample_1m_ohlc", "tf_asof_join",
         "tf_asof_join_by_symbol"]),

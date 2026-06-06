@@ -298,13 +298,20 @@ active[<span class="kw">select</span> { symbol, price }];</code></pre>
       <div>
         <p class="step-label">Option B &mdash; build from source</p>
         <p style="margin: 0 0 0.7rem; color: var(--muted); font-size: 0.93rem;">
-          Requirements: Clang 17+, CMake 3.26+, Ninja.
+          Requirements: CMake 3.26+ and a C++23 compiler such as Clang 17+,
+          GCC 13+, AppleClang, or MSVC 2022. Ninja is recommended on Linux and
+          macOS; CMake's Visual Studio generator works on Windows.
         </p>
-<pre><code>cmake -B build-release -G Ninja \
+<pre><code><span class="cm"># Linux/macOS with Clang or GCC</span>
+cmake -B build-release -G Ninja \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release</code></pre>
+cmake --build build-release
+
+<span class="cm"># Windows, from a Developer PowerShell</span>
+cmake -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --config Release</code></pre>
       </div>
 
       <div>

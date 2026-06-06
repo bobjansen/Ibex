@@ -792,10 +792,12 @@ ibex/
 
 ## Building
 
-Requirements: Clang 17+, CMake 3.26+, Ninja (recommended).
+Requirements: CMake 3.26+ and a C++23 compiler such as Clang 17+, GCC 13+,
+AppleClang, or MSVC 2022. Ninja is recommended on Linux and macOS; CMake's
+Visual Studio generator works on Windows.
 
 ```bash
-# Debug (with sanitizers)
+# Debug with Clang or GCC (with sanitizers)
 cmake -B build -G Ninja \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
@@ -804,12 +806,16 @@ cmake -B build -G Ninja \
 cmake --build build
 ctest --test-dir build --output-on-failure
 
-# Release
+# Release with Clang or GCC
 cmake -B build-release -G Ninja \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release
+
+# Windows, from a Developer PowerShell
+cmake -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --config Release
 ```
 
 ### Build Options

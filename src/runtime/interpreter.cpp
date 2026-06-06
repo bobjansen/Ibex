@@ -1216,6 +1216,18 @@ auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
 // position (e.g. `update { flag = x > 5 }`, `update { miss = is_null(x) }`).
 auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
                   std::size_t n) -> std::expected<Mask, std::string>;
+// True if a field expression must go through the vectorized, validity-aware
+// path (a boolean node, coalesce, or a non-row-local call — RNG / lag / lead —
+// anywhere in the tree). Defined far below; eval_value_vec needs it to decide
+// which arguments of a scalar call to materialize.
+auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool;
+// Evaluate a scalar call (abs, sqrt, casts, …) whose arguments nest a
+// non-row-local sub-expression (RNG / lag / lead): materialize those arguments
+// into columns, then apply the scalar function over them. Defined after
+// eval_value_vec (it recurses into it).
+auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
+                              const ScalarRegistry* scalars, std::size_t n)
+    -> std::expected<ColResult, std::string>;
 
 // Turn a boolean Mask into a `Column<Bool>` ColResult (3VL nulls -> validity).
 inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
@@ -1361,8 +1373,19 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                         deref_col(cols[0]));
                 }
                 if (node.callee != "lag" && node.callee != "lead") {
-                    // Any other call: delegate to the row-wise field evaluator,
-                    // which dispatches through the shared scalar registry. Extern
+                    // A scalar call (abs, sqrt, casts, round, pmin/pmax, date
+                    // parts, …). If any argument nests a non-row-local
+                    // sub-expression (RNG / lag / lead / a boolean node), the
+                    // per-row evaluator can't produce it — materialize those
+                    // arguments into columns first, then apply the scalar
+                    // function over them (e.g. `abs(rand_normal(0, 1))`).
+                    const bool args_need_vec = std::ranges::any_of(
+                        node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
+                    if (args_need_vec) {
+                        return eval_scalar_over_columns(node, table, scalars, n);
+                    }
+                    // Otherwise delegate to the row-wise field evaluator, which
+                    // dispatches through the shared scalar registry. Extern
                     // scalar functions are not available in predicate position
                     // (externs are not threaded into this vectorized evaluator).
                     auto col = evaluate_field_column(expr, table, scalars, nullptr);
@@ -1399,6 +1422,65 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
             }
         },
         expr.node);
+}
+
+// Evaluate a scalar call whose arguments nest non-row-local sub-expressions
+// (RNG / lag / lead / boolean nodes). Each such argument is materialized into a
+// synthetic column of a copy of the input table; the call is then rewritten to
+// reference those columns and run through the ordinary row-wise field evaluator
+// (e.g. `abs(rand_normal(0, 1))` -> materialize the draw, then apply `abs`).
+// Row-local arguments (columns, literals, arithmetic, round's mode identifier)
+// are kept verbatim. The result is null wherever any materialized argument was
+// null — standard scalar null propagation.
+auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
+                              const ScalarRegistry* scalars, std::size_t n)
+    -> std::expected<ColResult, std::string> {
+    Table tmp = table;
+    ir::CallExpr rewritten;
+    rewritten.callee = call.callee;
+    rewritten.args.reserve(call.args.size());
+    ValidityBitmap merged(n, true);
+    bool any_invalid = false;
+    int synth = 0;
+    for (const auto& arg : call.args) {
+        if (!field_uses_vectorized_eval(*arg)) {
+            rewritten.args.push_back(arg);  // row-local: keep verbatim (deep-copied)
+            continue;
+        }
+        auto c = eval_value_vec(*arg, table, scalars, n);
+        if (!c) {
+            return std::unexpected(c.error());
+        }
+        ColumnValue owned = std::holds_alternative<ColumnValue>(c->data)
+                                ? std::move(std::get<ColumnValue>(c->data))
+                                : *std::get<const ColumnValue*>(c->data);
+        const std::string name = "__ibex_nl_" + std::to_string(synth++) + "__";
+        if (const auto* v = c->get_validity()) {
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!(*v)[i]) {
+                    merged.set(i, false);
+                    any_invalid = true;
+                }
+            }
+            tmp.add_column(name, std::move(owned), *v);
+        } else {
+            tmp.add_column(name, std::move(owned));
+        }
+        ir::Expr ref;
+        ref.node = ir::ColumnRef{.name = name};
+        rewritten.args.push_back(ir::make_expr_ptr(std::move(ref)));
+    }
+    ir::Expr rewritten_expr;
+    rewritten_expr.node = std::move(rewritten);
+    auto col = evaluate_field_column(rewritten_expr, tmp, scalars, nullptr);
+    if (!col) {
+        return std::unexpected(col.error());
+    }
+    ColResult res{std::move(*col)};
+    if (any_invalid) {
+        res.owned_validity = std::move(merged);
+    }
+    return res;
 }
 
 // Compute a boolean Mask for all n rows, with 3-valued logic (3VL) for nulls.
@@ -5504,73 +5586,39 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
 
 // True if `expr` contains an RNG generator call (rand_normal/rand_uniform/...)
 // anywhere in its tree.
-auto expr_contains_rng(const ir::Expr& expr) -> bool {
+// True if a field expression must be evaluated through the vectorized, validity-
+// aware path (eval_value_vec) instead of the per-row eval_expr, because somewhere
+// in the tree it has a node the per-row evaluator can't produce:
+//   - a boolean node (comparison / logical / is_null), or
+//   - a `coalesce` call (validity-aware), or
+//   - a non-row-local call: an RNG generator (`rand_*`) or a `lag`/`lead` shift.
+// Detecting these anywhere (not just at the top or under arithmetic) is what
+// lets a non-row-local call nest inside arithmetic OR inside a scalar call —
+// e.g. `(close - lag(close,1)) / lag(close,1)` and `abs(rand_normal(0,1))`.
+// A plain scalar field (`abs(x)`, `x + 1`) contains none of these and stays on
+// the fast per-row path.
+auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
     return std::visit(
         [](const auto& node) -> bool {
             using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                if (ir::is_rng_func(node.callee)) {
+            if constexpr (std::is_same_v<T, ir::CompareExpr> ||
+                          std::is_same_v<T, ir::LogicalExpr> || std::is_same_v<T, ir::IsNullExpr>) {
+                return true;
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
+                return field_uses_vectorized_eval(*node.left) ||
+                       field_uses_vectorized_eval(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                if (ir::is_rng_func(node.callee) || node.callee == "lag" || node.callee == "lead" ||
+                    node.callee == "coalesce") {
                     return true;
                 }
-                return std::ranges::any_of(node.args,
-                                           [](const auto& a) { return expr_contains_rng(*a); });
-            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
-                                 std::is_same_v<T, ir::CompareExpr>) {
-                return expr_contains_rng(*node.left) || expr_contains_rng(*node.right);
-            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
-                return expr_contains_rng(*node.left) ||
-                       (node.right != nullptr && expr_contains_rng(*node.right));
-            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
-                return expr_contains_rng(*node.operand);
+                return std::ranges::any_of(
+                    node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
             } else {
                 return false;
             }
         },
         expr.node);
-}
-
-// True if a field expression must be evaluated through the vectorized, validity-
-// aware path (eval_value_vec) instead of the per-row eval_expr: it produces or
-// nests a boolean node (comparison / logical / is_null), a `coalesce` call, or
-// an RNG generator. Scoped to avoid bouncing a plain scalar call (abs, …) back
-// here: only a boolean-node top, a `coalesce` top, or arithmetic (BinaryExpr)
-// containing one of these — or RNG — triggers routing.
-auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
-    if (std::holds_alternative<ir::CompareExpr>(expr.node) ||
-        std::holds_alternative<ir::LogicalExpr>(expr.node) ||
-        std::holds_alternative<ir::IsNullExpr>(expr.node)) {
-        return true;
-    }
-    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
-        return call->callee == "coalesce";
-    }
-    if (std::holds_alternative<ir::BinaryExpr>(expr.node)) {
-        // arithmetic over RNG / coalesce / boolean-yielding sub-expressions.
-        std::function<bool(const ir::Expr&)> contains = [&](const ir::Expr& e) -> bool {
-            return std::visit(
-                [&](const auto& n) -> bool {
-                    using T = std::decay_t<decltype(n)>;
-                    if constexpr (std::is_same_v<T, ir::CompareExpr> ||
-                                  std::is_same_v<T, ir::LogicalExpr> ||
-                                  std::is_same_v<T, ir::IsNullExpr>) {
-                        return true;
-                    } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                        return contains(*n.left) || contains(*n.right);
-                    } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                        if (ir::is_rng_func(n.callee) || n.callee == "coalesce") {
-                            return true;
-                        }
-                        return std::ranges::any_of(n.args,
-                                                   [&](const auto& a) { return contains(*a); });
-                    } else {
-                        return false;
-                    }
-                },
-                e.node);
-        };
-        return contains(expr);
-    }
-    return false;
 }
 
 // Evaluate a single field expression against a (potentially growing) table,

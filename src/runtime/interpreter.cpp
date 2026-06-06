@@ -4159,37 +4159,39 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             const auto& col = *group_cats.front();
             const auto* codes = col.codes_data();
 
-            // Pass 1: Assign group IDs. One hash lookup per row, with a sorted-run shortcut
-            // that skips the lookup whenever the current key equals the previous one.
-            robin_hood::unordered_flat_map<Column<Categorical>::code_type, std::uint32_t> key_to_id;
-            key_to_id.reserve(64);
+            // Pass 1: Assign group IDs. Categorical codes are dense dictionary indexes,
+            // so use a direct code -> gid table instead of hashing each distinct code.
+            constexpr std::uint32_t no_gid = std::numeric_limits<std::uint32_t>::max();
+            std::vector<std::uint32_t> code_to_id(col.dictionary().size(), no_gid);
             std::vector<Column<Categorical>::code_type> order;
-            order.reserve(64);
+            order.reserve(std::min<std::size_t>(rows, col.dictionary().size()));
             // Flat AggSlot array: one contiguous allocation replaces n_groups heap allocations.
             // Layout: flat_slots[g * n_aggs + agg_i] is the slot for group g, aggregation agg_i.
             const std::size_t n_aggs = plan.size();
             AggState tmpl = make_state();
             std::vector<AggSlot> flat_slots;
-            flat_slots.reserve(64 * (n_aggs == 0 ? 1 : n_aggs));
+            flat_slots.reserve(order.capacity() * (n_aggs == 0 ? 1 : n_aggs));
             std::vector<std::uint32_t> group_ids(rows);
             {
                 Column<Categorical>::code_type prev_key = -1;
-                std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
+                std::uint32_t prev_gid = no_gid;
                 for (std::size_t row = 0; row < rows; ++row) {
                     auto key = codes[row];
                     std::uint32_t gid{};
                     if (key == prev_key) {
                         gid = prev_gid;
                     } else {
-                        auto it = key_to_id.find(key);
-                        if (it == key_to_id.end()) {
+                        if (key < 0 || static_cast<std::size_t>(key) >= code_to_id.size()) {
+                            return std::unexpected("invalid categorical code in group-by column: " +
+                                                   group_by.front().name);
+                        }
+                        gid = code_to_id[static_cast<std::size_t>(key)];
+                        if (gid == no_gid) {
                             gid = static_cast<std::uint32_t>(order.size());
-                            key_to_id.emplace(key, gid);
+                            code_to_id[static_cast<std::size_t>(key)] = gid;
                             order.push_back(key);
                             flat_slots.insert(flat_slots.end(), tmpl.slots.begin(),
                                               tmpl.slots.end());
-                        } else {
-                            gid = it->second;
                         }
                         prev_key = key;
                         prev_gid = gid;

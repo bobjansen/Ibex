@@ -293,6 +293,20 @@ TEST_CASE("Column<int> resize", "[core][column]") {
     REQUIRE(col[4] == 0);  // value-initialized
 }
 
+TEST_CASE("Column<int> resize_for_overwrite exposes writable slots", "[core][column]") {
+    ibex::Column<int> col;
+    col.resize_for_overwrite(3);
+
+    REQUIRE(col.size() == 3);
+    col.data()[0] = 10;
+    col.data()[1] = 20;
+    col.data()[2] = 30;
+
+    REQUIRE(col[0] == 10);
+    REQUIRE(col[1] == 20);
+    REQUIRE(col[2] == 30);
+}
+
 TEST_CASE("Column<int> clear and pop_back", "[core][column]") {
     ibex::Column<int> col{1, 2, 3};
 
@@ -334,8 +348,10 @@ TEST_CASE("Column<int> assign from initializer list", "[core][column]") {
 
 TEST_CASE("Column<int> emplace_back", "[core][column]") {
     ibex::Column<int> col;
+    col.emplace_back();
     col.emplace_back(42);
 
-    REQUIRE(col.size() == 1);
-    REQUIRE(col[0] == 42);
+    REQUIRE(col.size() == 2);
+    REQUIRE(col[0] == 0);
+    REQUIRE(col[1] == 42);
 }

@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ibex::detail {
@@ -22,6 +25,53 @@ struct StringHash {
         return std::hash<std::string_view>{}(sv);
     }
 };
+
+template <typename T>
+class NoInitAllocator {
+   public:
+    using value_type = T;
+
+    NoInitAllocator() noexcept = default;
+
+    template <typename U>
+    constexpr NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+
+    [[nodiscard]] auto allocate(std::size_t n) -> T* { return std::allocator<T>{}.allocate(n); }
+
+    void deallocate(T* p, std::size_t n) noexcept { std::allocator<T>{}.deallocate(p, n); }
+
+    template <typename U>
+    void construct(U* p) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        if constexpr (!std::is_trivially_default_constructible_v<U>) {
+            ::new (static_cast<void*>(p)) U();
+        }
+    }
+
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+        ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+
+    template <typename U>
+    void destroy(U* p) noexcept {
+        p->~U();
+    }
+
+    template <typename U>
+    struct rebind {
+        using other = NoInitAllocator<U>;
+    };
+};
+
+template <typename T, typename U>
+auto operator==(const NoInitAllocator<T>&, const NoInitAllocator<U>&) noexcept -> bool {
+    return true;
+}
+
+template <typename T, typename U>
+auto operator!=(const NoInitAllocator<T>&, const NoInitAllocator<U>&) noexcept -> bool {
+    return false;
+}
 }  // namespace ibex::detail
 
 namespace ibex {
@@ -42,6 +92,9 @@ class Column {
    public:
     using value_type = T;
     using size_type = std::size_t;
+    using storage_type = std::vector<T, detail::NoInitAllocator<T>>;
+    using iterator = typename storage_type::iterator;
+    using const_iterator = typename storage_type::const_iterator;
 
     static_assert(ColumnElement<T>,
                   "Column<T> requires T to satisfy ColumnElement (regular + totally ordered).");
@@ -50,7 +103,8 @@ class Column {
 
     Column() = default;
 
-    explicit Column(std::vector<T> data) : data_(std::move(data)) {}
+    explicit Column(std::vector<T> data)
+        : data_(std::make_move_iterator(data.begin()), std::make_move_iterator(data.end())) {}
 
     Column(std::initializer_list<T> init) : data_(init) {}
 
@@ -70,10 +124,12 @@ class Column {
     [[nodiscard]] auto operator[](size_type idx) noexcept -> T& { return data_[idx]; }
 
     /// Zero-copy immutable view of the underlying data.
-    [[nodiscard]] auto span() const noexcept -> std::span<const T> { return data_; }
+    [[nodiscard]] auto span() const noexcept -> std::span<const T> {
+        return {data_.data(), data_.size()};
+    }
 
     /// Zero-copy mutable view of the underlying data.
-    [[nodiscard]] auto span() noexcept -> std::span<T> { return data_; }
+    [[nodiscard]] auto span() noexcept -> std::span<T> { return {data_.data(), data_.size()}; }
 
     /// Append a value.
     void push_back(const T& value) { data_.push_back(value); }
@@ -85,6 +141,8 @@ class Column {
     auto emplace_back(Args&&... args) -> T& {
         return data_.emplace_back(std::forward<Args>(args)...);
     }
+
+    auto emplace_back() -> T& { return data_.emplace_back(T{}); }
 
     /// Assign from count and value.
     void assign(size_type count, const T& value) { data_.assign(count, value); }
@@ -99,52 +157,41 @@ class Column {
     void assign(std::initializer_list<T> init) { data_.assign(init); }
 
     /// Insert value before position.
-    [[nodiscard]] auto insert(typename std::vector<T>::const_iterator pos, const T& value) ->
-        typename std::vector<T>::iterator {
+    [[nodiscard]] auto insert(const_iterator pos, const T& value) -> iterator {
         return data_.insert(pos, value);
     }
-    [[nodiscard]] auto insert(typename std::vector<T>::const_iterator pos, T&& value) ->
-        typename std::vector<T>::iterator {
+    [[nodiscard]] auto insert(const_iterator pos, T&& value) -> iterator {
         return data_.insert(pos, std::move(value));
     }
 
     /// Insert count copies of value.
-    [[nodiscard]] auto insert(typename std::vector<T>::const_iterator pos, size_type count,
-                              const T& value) -> typename std::vector<T>::iterator {
+    [[nodiscard]] auto insert(const_iterator pos, size_type count, const T& value) -> iterator {
         return data_.insert(pos, count, value);
     }
 
     /// Insert range.
     template <typename InputIt>
         requires std::input_iterator<InputIt>
-    [[nodiscard]] auto insert(typename std::vector<T>::const_iterator pos, InputIt first,
-                              InputIt last) -> typename std::vector<T>::iterator {
+    [[nodiscard]] auto insert(const_iterator pos, InputIt first, InputIt last) -> iterator {
         return data_.insert(pos, first, last);
     }
 
     /// Insert initializer list.
-    [[nodiscard]] auto insert(typename std::vector<T>::const_iterator pos,
-                              std::initializer_list<T> init) -> typename std::vector<T>::iterator {
+    [[nodiscard]] auto insert(const_iterator pos, std::initializer_list<T> init) -> iterator {
         return data_.insert(pos, init);
     }
 
     /// Emplace value before position.
     template <typename... Args>
         requires std::constructible_from<T, Args...>
-    [[nodiscard]] auto emplace(typename std::vector<T>::const_iterator pos, Args&&... args) ->
-        typename std::vector<T>::iterator {
+    [[nodiscard]] auto emplace(const_iterator pos, Args&&... args) -> iterator {
         return data_.emplace(pos, std::forward<Args>(args)...);
     }
 
     /// Erase element at position.
-    [[nodiscard]] auto erase(typename std::vector<T>::const_iterator pos) ->
-        typename std::vector<T>::iterator {
-        return data_.erase(pos);
-    }
+    [[nodiscard]] auto erase(const_iterator pos) -> iterator { return data_.erase(pos); }
     /// Erase range.
-    [[nodiscard]] auto erase(typename std::vector<T>::const_iterator first,
-                             typename std::vector<T>::const_iterator last) ->
-        typename std::vector<T>::iterator {
+    [[nodiscard]] auto erase(const_iterator first, const_iterator last) -> iterator {
         return data_.erase(first, last);
     }
 
@@ -158,10 +205,17 @@ class Column {
     void clear() noexcept { data_.clear(); }
 
     /// Resize the column (value-initialize new elements).
-    void resize(size_type count) { data_.resize(count); }
+    void resize(size_type count) { data_.resize(count, T{}); }
 
     /// Resize the column (copy-initialize new elements with value).
     void resize(size_type count, const T& value) { data_.resize(count, value); }
+
+    /// Resize without value-initializing new slots. Callers must overwrite every element.
+    void resize_for_overwrite(size_type count)
+        requires std::is_trivially_default_constructible_v<T>
+    {
+        data_.resize(count);
+    }
 
     /// Reduce capacity to fit size.
     void shrink_to_fit() { data_.shrink_to_fit(); }
@@ -219,7 +273,7 @@ class Column {
     [[nodiscard]] auto crend() const noexcept { return data_.crend(); }
 
    private:
-    std::vector<T> data_;
+    storage_type data_;
 };
 
 /// Specialization for categorical columns (dictionary-encoded strings).

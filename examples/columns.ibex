@@ -6,10 +6,15 @@ let quotes = Table {
     qty    = [2.0, 4.0]
 };
 
+print("the quotes table:");
+print(quotes);
+
+print("its column names (a compile-time list):");
 columns(quotes);
 
 let cols = columns(quotes);
 
+print("duplicate every column as copy_<name> via a map over that list:");
 quotes[update {
     map c in cols => `copy_${c}` = get(c)
 }];

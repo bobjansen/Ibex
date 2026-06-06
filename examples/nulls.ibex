@@ -24,14 +24,17 @@ let dept = read_csv("examples/data/departments.csv");
 // ── 1. Left join: unmatched employees get null dept_name / budget ─────────────
 //   Result has 6 rows; Dave and Frank have null dept_name, null budget.
 let enriched = emp left join dept on dept_id;
+print("1. left join — Dave and Frank (dept 99) get null dept_name / budget:");
 enriched;
 
 // ── 2. IS NULL — find employees with no department on record ──────────────────
 //   Returns Dave and Frank (dept_id 99 is unknown).
+print("2. dept_name is null — the two employees with no department:");
 enriched[filter { dept_name is null }];
 
 // ── 3. IS NOT NULL — keep only employees with a known department ──────────────
 //   Returns Alice, Bob, Carol, Eve.
+print("3. dept_name is not null — employees with a known department:");
 enriched[filter { dept_name is not null }];
 
 // ── 4. Arithmetic null propagation ────────────────────────────────────────────
@@ -40,11 +43,13 @@ enriched[filter { dept_name is not null }];
 //   The validity bitmap propagates: even though the stored value of budget is 0,
 //   the output column bonus inherits the "null" flag and prints as null.
 let with_bonus = enriched[select { name, salary, dept_name, bonus = salary + budget }];
+print("4. bonus = salary + budget — null propagates for the unmatched rows:");
 with_bonus;
 
 // ── 5. Comparison with null drops the row (3VL: null > n = null → not kept) ──
 //   Only rows where bonus is a known value > 200000 survive.
 //   Dave and Frank are silently dropped — not kept, not an error.
+print("5. bonus > 200000 — null comparisons drop those rows:");
 with_bonus[filter { bonus > 200000 }];
 
 // ── 6. 3VL OR — true OR null = true ───────────────────────────────────────────
@@ -55,4 +60,5 @@ with_bonus[filter { bonus > 200000 }];
 //   Carol (salary 88000, non-null dept) is kept — true OR true = true.
 //   Eve (salary 115000, non-null dept) is kept — true OR true = true.
 //   Bob (salary 72000, non-null dept) is kept — true OR false = true.
+print("6. dept_name is not null OR salary > 80000 — 3VL OR keeps known-true rows:");
 enriched[filter { dept_name is not null || salary > 80000 }];

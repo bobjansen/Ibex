@@ -4,16 +4,28 @@ let scores = Table {
     ts = [2, 1, 3, 2, 1]
 };
 
+print("input scores:");
+print(scores);
+
+// Dense rank by score (descending) within each symbol. Ties share a rank and
+// no rank values are skipped — AAPL's two 100s both rank 1, the 90 ranks 2.
+print("dense_rank = rank(score, dense, descending) within each symbol:");
 let dense_by_score =
     scores[
         update { dense_rank = rank(score, method = dense, ascending = false) },
         by symbol
     ];
+print(dense_by_score);
 
+// Order-based rank with an explicit tie-break: score desc, then ts asc. method
+// = first means tied scores are broken by the order key (so ranks are unique).
+print("order_rank = rank(order { score desc, ts asc }, first) within each symbol:");
 let ordered_tie_break =
     scores[
         update { order_rank = rank(order { score desc, ts asc }, method = first) },
         by symbol
     ];
+print(ordered_tie_break);
 
+print("both ranks joined back together:");
 dense_by_score join ordered_tie_break on { symbol, score, ts };

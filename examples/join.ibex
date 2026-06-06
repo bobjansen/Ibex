@@ -5,23 +5,32 @@ import "csv";
 let iris = read_csv("data/iris.csv");
 let species_meta = read_csv("data/iris.csv");
 
+// Each result is truncated to 10 rows on display.
+
 // Inner join on a single key
+print("inner join on Species — only matching rows:");
 iris join species_meta on Species;
 
 // Left join on a single key
+print("left join on Species — all left rows, nulls where unmatched:");
 iris left join species_meta on Species;
 
 // Right join on a single key
+print("right join on Species — all right rows:");
 iris right join species_meta on Species;
 
 // Full outer join on a single key
+print("outer join on Species — union of both sides:");
 iris outer join species_meta on Species;
 
 // Semi join keeps only matching left rows
+print("semi join on Species — left rows that have a match (no right columns):");
 iris semi join species_meta on Species;
 
 // Anti join keeps only non-matching left rows
+print("anti join on Species — left rows with no match:");
 iris anti join species_meta on Species;
 
 // Cross join returns the cartesian product
+print("cross join — cartesian product of both sides:");
 iris cross join species_meta;

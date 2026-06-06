@@ -2,11 +2,14 @@ import "csv";
 
 let iris = read_csv("data/iris.csv");
 
-// Order by a single key (ascending by default).
+// Order by a single key (ascending by default). (Output truncated to 10 rows.)
+print("order by Species (ascending):");
 iris[order `Species`];
 
 // Order by multiple keys with explicit directions.
+print("order by Species asc, then Sepal.Length desc:");
 iris[order { `Species` asc, `Sepal.Length` desc }];
 
 // Order by all columns (schema order).
+print("order by all columns, left to right:");
 iris[order];

@@ -259,64 +259,6 @@ auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
         static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(hi, zero)));
     return static_cast<std::uint64_t>(lo_bits) | (static_cast<std::uint64_t>(hi_bits) << 32);
 }
-
-// AVX2 "left-pack" stream-compaction gather of a contiguous 8-byte primitive
-// column. Each 4-bit nibble of the keep-mask indexes a permute LUT that packs
-// the selected elements to the low lanes; the 256-bit register is stored and
-// the cursor advances by the nibble popcount. This replaces the scalar
-// countr_zero compaction loop (one dependent store per kept element) and runs
-// ~15% faster on dense filters.
-//
-// Each step issues a 4-wide load (32 source bytes) and a 4-wide store (32 dst
-// bytes). The final group(s) fall back to scalar whenever those would read past
-// `n` source rows or write past `out_n` outputs, so `dst` needs no slack: the
-// invariant `j + 4 <= out_n` guarantees the over-write region of a vector store
-// is always reclaimed by a later element.
-template <typename T>
-auto leftpack_gather_8b(const T* __restrict src, const std::uint64_t* keep_words,
-                        std::size_t n_words, std::size_t n, T* __restrict dst,
-                        std::size_t out_n) noexcept -> void {
-    static_assert(sizeof(T) == 8, "8-byte element required");
-    // LUT[m]: permutevar8x32 control for 4 elements (8 float lanes); element k
-    // occupies float lanes {2k, 2k+1}. Selected elements pack to the low lanes.
-    alignas(32) static constexpr std::int32_t lut[16][8] = {
-        {0, 1, 2, 3, 4, 5, 6, 7}, {0, 1, 2, 3, 4, 5, 6, 7}, {2, 3, 0, 1, 4, 5, 6, 7},
-        {0, 1, 2, 3, 4, 5, 6, 7}, {4, 5, 0, 1, 2, 3, 6, 7}, {0, 1, 4, 5, 2, 3, 6, 7},
-        {2, 3, 4, 5, 0, 1, 6, 7}, {0, 1, 2, 3, 4, 5, 6, 7}, {6, 7, 0, 1, 2, 3, 4, 5},
-        {0, 1, 6, 7, 2, 3, 4, 5}, {2, 3, 6, 7, 0, 1, 4, 5}, {0, 1, 2, 3, 6, 7, 4, 5},
-        {4, 5, 6, 7, 0, 1, 2, 3}, {0, 1, 4, 5, 6, 7, 2, 3}, {2, 3, 4, 5, 6, 7, 0, 1},
-        {0, 1, 2, 3, 4, 5, 6, 7},
-    };
-    const auto* src_f = reinterpret_cast<const float*>(src);
-    auto* dst_f = reinterpret_cast<float*>(dst);
-    std::size_t j = 0;
-    for (std::size_t w = 0; w < n_words; ++w) {
-        const std::uint64_t bits = keep_words[w];
-        if (bits == 0) {
-            continue;
-        }
-        const std::size_t base = w * 64;
-        for (std::size_t g = 0; g < 16; ++g) {
-            const unsigned nib = static_cast<unsigned>((bits >> (g * 4)) & 0xFU);
-            if (nib == 0) {
-                continue;
-            }
-            const std::size_t si = base + (g * 4);
-            if (si + 4 <= n && j + 4 <= out_n) {
-                const __m256 v = _mm256_loadu_ps(src_f + (si * 2));
-                const __m256i perm = _mm256_load_si256(reinterpret_cast<const __m256i*>(lut[nib]));
-                _mm256_storeu_ps(dst_f + (j * 2), _mm256_permutevar8x32_ps(v, perm));
-                j += static_cast<std::size_t>(std::popcount(nib));
-            } else {
-                unsigned m = nib;
-                while (m != 0) {
-                    dst[j++] = src[si + static_cast<unsigned>(std::countr_zero(m))];
-                    m &= m - 1;
-                }
-            }
-        }
-    }
-}
 #endif
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
@@ -2091,15 +2033,8 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                     dst->resize(out_n);
                     const T* sp = src.data();
                     T* dp = dst->data();
-#if defined(__AVX2__)
-                    if constexpr (sizeof(T) == 8 && std::is_trivially_copyable_v<T>) {
-                        leftpack_gather_8b<T>(sp, keep_words.data(), n_words, n, dp, out_n);
-                    } else
-#endif
-                    {
-                        std::size_t j = 0;
-                        for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
-                    }
+                    std::size_t j = 0;
+                    for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
                 }
             },
             *src_entry.column);

@@ -43,9 +43,15 @@ let m_ols = data[model { y ~ x1 + x2 + x3, method = ols }];
 let ols_coef = model_coef(m_ols);
 let ols_r2 = model_r_squared(m_ols);
 
-// 5. Ridge — L2 shrinkage; coefficients pulled slightly toward zero.
-let m_ridge = data[model { y ~ x1 + x2 + x3, method = ridge, lambda = 1.0 }];
-let ridge_coef = model_coef(m_ridge);
+// 5. Ridge — L2 shrinkage. The penalty lambda * ||beta||^2 competes with the
+//    least-squares fit, so larger lambda pulls the slope coefficients toward
+//    zero (trading a little bias for lower variance). The intercept is NOT
+//    penalized, so it stays near mean(y) ~ 3. With 4000 rows a small lambda is
+//    swamped by the data, so we fit two visibly-shrunk values to show the path.
+let m_ridge_mild = data[model { y ~ x1 + x2 + x3, method = ridge, lambda = 1000.0 }];
+let ridge_mild_coef = model_coef(m_ridge_mild);
+let m_ridge_strong = data[model { y ~ x1 + x2 + x3, method = ridge, lambda = 5000.0 }];
+let ridge_strong_coef = model_coef(m_ridge_strong);
 
 // 6. LightGBM — gradient-boosted trees; no linear coefficients, but per-feature
 //    gain importance. x1 (slope 2.0) and x2 (slope −1.5) should dominate; x3
@@ -68,8 +74,10 @@ print("OLS coefficients — should recover (intercept 3, x1 2, x2 -1.5, x3 0.5):
 print(ols_coef);
 print("OLS R-squared:");
 print(ols_r2);
-print("Ridge coefficients — L2 shrinkage pulls these slightly toward 0:");
-print(ridge_coef);
+print("Ridge (lambda = 1000) — slopes shrink toward 0 vs OLS; intercept ~3 unchanged:");
+print(ridge_mild_coef);
+print("Ridge (lambda = 5000) — stronger penalty, slopes shrink further toward 0:");
+print(ridge_strong_coef);
 print("LightGBM feature importance — x1 and x2 should dominate, x3 least:");
 print(gbm_importance);
 print("LightGBM R-squared:");

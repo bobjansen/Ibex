@@ -265,6 +265,16 @@ class ExternRegistry;
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)
     -> std::expected<ScalarValue, std::string>;
 
+/// Row-wise scalar builtins (abs, sqrt, the transcendentals, ceil/floor/trunc,
+/// date parts, pmin/pmax, is_nan, casts) live in one registry shared by the
+/// table-expression evaluators. These expose that registry so a scalar-only
+/// caller (the REPL's scalar evaluator) can route to it instead of maintaining
+/// a parallel table. `is_scalar_builtin` reports membership; `eval_scalar_builtin`
+/// applies the builtin to already-evaluated scalar arguments (validating arity).
+[[nodiscard]] auto is_scalar_builtin(std::string_view name) -> bool;
+[[nodiscard]] auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& args)
+    -> std::expected<ScalarValue, std::string>;
+
 [[nodiscard]] auto evaluate_row_count_expr(const ir::Expr& expr,
                                            const ScalarRegistry* scalars = nullptr,
                                            const ExternRegistry* externs = nullptr)

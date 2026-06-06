@@ -13,6 +13,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1243,67 +1244,109 @@ Stream {
 
 // Verify make_buffered_source: capacity is passed from the Ibex query as an
 // argument to the extern fn, so the C++ plugin does not hard-code it.
-//
-// Scenario: two ticks separated by 30 ms so the wall-clock flush fires; the
-// extern is declared with a capacity parameter and called as tick_src(8).
 TEST_CASE("make_buffered_source takes capacity from Ibex query argument", "[e2e][stream]") {
-    std::vector<runtime::Table> emitted;
+    SECTION("rejects invalid query capacity before starting the producer") {
+        std::atomic<bool> producer_started{false};
 
-    runtime::ExternRegistry registry;
+        runtime::ExternRegistry registry;
 
-    registry.register_table("tick_src",
-                            runtime::make_buffered_source([](runtime::StreamBuffered& buf) {
-                                runtime::Table t1;
-                                t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
-                                t1.add_column("price", Column<double>{300.0});
-                                t1.time_index = "ts";
-                                buf.write(t1);
+        registry.register_table("tick_src",
+                                runtime::make_buffered_source([&](runtime::StreamBuffered& buf) {
+                                    producer_started.store(true, std::memory_order_release);
 
-                                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                                    runtime::Table t;
+                                    t.add_column("ts", Column<Timestamp>{Timestamp{0}});
+                                    t.add_column("price", Column<double>{300.0});
+                                    t.time_index = "ts";
+                                    buf.write(t);
 
-                                runtime::Table t2;
-                                t2.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
-                                t2.add_column("price", Column<double>{310.0});
-                                t2.time_index = "ts";
-                                buf.write(t2);
+                                    buf.close();
+                                }));
 
-                                buf.close();
-                            }));
+        registry.register_scalar_table_consumer(
+            "tick_sink", runtime::ScalarKind::Int,
+            [](const runtime::Table&,
+               const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+                return runtime::ExternValue{std::int64_t{0}};
+            });
 
-    registry.register_scalar_table_consumer(
-        "tick_sink", runtime::ScalarKind::Int,
-        [&](const runtime::Table& t,
-            const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
-            emitted.push_back(t);
-            return runtime::ExternValue{std::int64_t{0}};
-        });
-
-    // Capacity 8 is passed from the query - the C++ plugin receives it on
-    // the first event-loop call and initialises the ring accordingly.
-    const char* src = R"(
+        // If the argument is not propagated from the query, make_buffered_source
+        // would fall back to its default capacity and start the producer.
+        const char* src = R"(
 extern fn tick_src(capacity: Int) -> TimeFrame from "fake.hpp";
 extern fn tick_sink(df: DataFrame) -> Int from "fake.hpp";
 Stream {
-    source    = tick_src(8),
+    source    = tick_src(0),
     transform = [resample 20ms, select { close = last(price) }],
     sink      = tick_sink()
 };
 )";
 
-    auto parsed = parser::parse(src);
-    REQUIRE(parsed.has_value());
-    auto lowered = parser::lower(*parsed);
-    REQUIRE(lowered.has_value());
-    auto result = runtime::interpret(*lowered.value(), {}, nullptr, &registry);
-    REQUIRE(result.has_value());
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        auto result = runtime::interpret(*lowered.value(), {}, nullptr, &registry);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("StreamBuffered capacity must be > 0") != std::string::npos);
+        CHECK_FALSE(producer_started.load(std::memory_order_acquire));
+    }
 
-    REQUIRE(emitted.size() == 2);
-    auto* c0 = std::get_if<Column<double>>(emitted[0].find("close"));
-    REQUIRE(c0 != nullptr);
-    CHECK((*c0)[0] == Catch::Approx(300.0));
-    auto* c1 = std::get_if<Column<double>>(emitted[1].find("close"));
-    REQUIRE(c1 != nullptr);
-    CHECK((*c1)[0] == Catch::Approx(310.0));
+    SECTION("streams with valid query capacity") {
+        std::vector<runtime::Table> emitted;
+
+        runtime::ExternRegistry registry;
+
+        registry.register_table("tick_src",
+                                runtime::make_buffered_source([](runtime::StreamBuffered& buf) {
+                                    runtime::Table t1;
+                                    t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
+                                    t1.add_column("price", Column<double>{300.0});
+                                    t1.time_index = "ts";
+                                    buf.write(t1);
+
+                                    runtime::Table t2;
+                                    t2.add_column("ts", Column<Timestamp>{Timestamp{1'000'000LL}});
+                                    t2.add_column("price", Column<double>{310.0});
+                                    t2.time_index = "ts";
+                                    buf.write(t2);
+
+                                    buf.close();
+                                }));
+
+        registry.register_scalar_table_consumer(
+            "tick_sink", runtime::ScalarKind::Int,
+            [&](const runtime::Table& t,
+                const runtime::ExternArgs&) -> std::expected<runtime::ExternValue, std::string> {
+                emitted.push_back(t);
+                return runtime::ExternValue{std::int64_t{0}};
+            });
+
+        const char* src = R"(
+extern fn tick_src(capacity: Int) -> TimeFrame from "fake.hpp";
+extern fn tick_sink(df: DataFrame) -> Int from "fake.hpp";
+Stream {
+    source    = tick_src(1),
+    transform = [resample 1ms, select { close = last(price) }],
+    sink      = tick_sink()
+};
+)";
+
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        auto result = runtime::interpret(*lowered.value(), {}, nullptr, &registry);
+        REQUIRE(result.has_value());
+
+        REQUIRE(emitted.size() == 2);
+        auto* c0 = std::get_if<Column<double>>(emitted[0].find("close"));
+        REQUIRE(c0 != nullptr);
+        CHECK((*c0)[0] == Catch::Approx(300.0));
+        auto* c1 = std::get_if<Column<double>>(emitted[1].find("close"));
+        REQUIRE(c1 != nullptr);
+        CHECK((*c1)[0] == Catch::Approx(310.0));
+    }
 }
 
 // Stress-test StreamBuffered under high producer rate and a jittery consumer.

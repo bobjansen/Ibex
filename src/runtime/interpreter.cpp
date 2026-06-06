@@ -5354,17 +5354,39 @@ const std::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtins() {
                 if (!x) {
                     return std::unexpected(std::string(name) + ": argument must be numeric");
                 }
-                if (name == "sqrt") {
-                    return ExprValue{std::sqrt(*x)};
-                }
-                if (name == "log") {
-                    return ExprValue{std::log(*x)};
-                }
-                return ExprValue{std::exp(*x)};
+                const double v = *x;
+                if (name == "sqrt")
+                    return ExprValue{std::sqrt(v)};
+                if (name == "log")
+                    return ExprValue{std::log(v)};
+                if (name == "log2")
+                    return ExprValue{std::log2(v)};
+                if (name == "log10")
+                    return ExprValue{std::log10(v)};
+                if (name == "exp")
+                    return ExprValue{std::exp(v)};
+                if (name == "sin")
+                    return ExprValue{std::sin(v)};
+                if (name == "cos")
+                    return ExprValue{std::cos(v)};
+                if (name == "tan")
+                    return ExprValue{std::tan(v)};
+                if (name == "asin")
+                    return ExprValue{std::asin(v)};
+                if (name == "acos")
+                    return ExprValue{std::acos(v)};
+                if (name == "atan")
+                    return ExprValue{std::atan(v)};
+                if (name == "sinh")
+                    return ExprValue{std::sinh(v)};
+                if (name == "cosh")
+                    return ExprValue{std::cosh(v)};
+                return ExprValue{std::tanh(v)};  // tanh
             }};
-        m.emplace("sqrt", transcendental);
-        m.emplace("log", transcendental);
-        m.emplace("exp", transcendental);
+        for (const auto* fn : {"sqrt", "log", "log2", "log10", "exp", "sin", "cos", "tan", "asin",
+                               "acos", "atan", "sinh", "cosh", "tanh"}) {
+            m.emplace(fn, transcendental);
+        }
 
         // ceil / floor / trunc: round to an integral value, preserving the
         // numeric type (Int is already integral, so it passes through). Use

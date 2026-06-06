@@ -169,7 +169,12 @@ constexpr std::string_view kMoreCompletionBuiltins[] = {
     "head",         "tail",
     "top",          "melt",
     "dcast",        "join",
-    "on",
+    "on",           "sin",
+    "cos",          "tan",
+    "asin",         "acos",
+    "atan",         "sinh",
+    "cosh",         "tanh",
+    "log2",         "log10",
 };
 
 CompletionContext g_completion_context;

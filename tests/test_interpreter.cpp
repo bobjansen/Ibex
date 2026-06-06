@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -1244,6 +1245,53 @@ TEST_CASE("Interpret update with double arithmetic") {
     REQUIRE((*col)[0] == Catch::Approx(3.0));
     REQUIRE((*col)[1] == Catch::Approx(5.0));
     REQUIRE((*col)[2] == Catch::Approx(7.0));
+}
+
+TEST_CASE("Interpret update fuses nested numeric arithmetic") {
+    runtime::Table table;
+    table.add_column("price", Column<double>{1.5, 2.5, 3.5});
+    table.add_column("qty", Column<std::int64_t>{2, 3, 4});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[update { score = (price * 2) + (qty - 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = std::get_if<Column<double>>(result->find("score"));
+    REQUIRE(col != nullptr);
+    REQUIRE(col->size() == 3);
+    REQUIRE((*col)[0] == Catch::Approx(4.0));
+    REQUIRE((*col)[1] == Catch::Approx(7.0));
+    REQUIRE((*col)[2] == Catch::Approx(10.0));
+}
+
+TEST_CASE("Interpret update fused numeric arithmetic preserves int div and mod semantics") {
+    runtime::Table table;
+    table.add_column("a", Column<std::int64_t>{10, std::numeric_limits<std::int64_t>::min(), 7});
+    table.add_column("b", Column<std::int64_t>{3, -1, 0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { q = (a / b) + 1, r = (a % b) + 2 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* q = std::get_if<Column<double>>(result->find("q"));
+    REQUIRE(q != nullptr);
+    REQUIRE((*q)[0] == Catch::Approx((10.0 / 3.0) + 1.0));
+    REQUIRE(
+        (*q)[1] ==
+        Catch::Approx(static_cast<double>(std::numeric_limits<std::int64_t>::min()) / -1.0 + 1.0));
+    REQUIRE(std::isinf((*q)[2]));
+
+    const auto* r = std::get_if<Column<std::int64_t>>(result->find("r"));
+    REQUIRE(r != nullptr);
+    CHECK((*r)[0] == 3);
+    CHECK((*r)[1] == 2);
+    CHECK((*r)[2] == 2);
 }
 
 TEST_CASE("Interpret update rejects out-of-range int64 to Date coercion") {
@@ -2710,6 +2758,30 @@ TEST_CASE("null 3vl: arithmetic propagates null", "[null][3vl]") {
     CHECK(p2[0] == 20);
     CHECK(p2[2] == 60);
     // row 1 should be null
+    REQUIRE(p2_entry.validity.has_value());
+    CHECK((*p2_entry.validity)[0] == true);
+    CHECK((*p2_entry.validity)[1] == false);
+    CHECK((*p2_entry.validity)[2] == true);
+}
+
+TEST_CASE("null 3vl: update arithmetic propagates null", "[null][3vl][update]") {
+    runtime::Table table;
+    Column<std::int64_t> price_col{10, 0, 30};
+    table.add_column("price", std::move(price_col));
+    table.columns[table.index.at("price")].validity = std::vector<bool>{true, false, true};
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { p2 = (price * 2) + 1 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& p2_entry = result->columns[result->index.at("p2")];
+    const auto& p2 = std::get<Column<std::int64_t>>(*p2_entry.column);
+    REQUIRE(p2.size() == 3);
+    CHECK(p2[0] == 21);
+    CHECK(p2[2] == 61);
     REQUIRE(p2_entry.validity.has_value());
     CHECK((*p2_entry.validity)[0] == true);
     CHECK((*p2_entry.validity)[1] == false);

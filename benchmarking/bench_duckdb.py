@@ -116,6 +116,43 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
     )
 
     run(
+        "distinct_symbol",
+        lambda: con.sql("SELECT DISTINCT symbol FROM prices").fetchnumpy(),
+    )
+
+    run(
+        "order_head_topk",
+        lambda: con.sql(
+            "SELECT * FROM prices ORDER BY price DESC LIMIT 100"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "order_head_topk_by_symbol",
+        lambda: con.sql(
+            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+            "PARTITION BY symbol ORDER BY price DESC) AS rn FROM prices) "
+            "WHERE rn <= 3"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "order_tail_topk",
+        lambda: con.sql(
+            "SELECT * FROM prices ORDER BY price ASC LIMIT 100"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "order_tail_topk_by_symbol",
+        lambda: con.sql(
+            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+            "PARTITION BY symbol ORDER BY price ASC) AS rn FROM prices) "
+            "WHERE rn <= 3"
+        ).fetchnumpy(),
+    )
+
+    run(
         "cumsum_price",
         lambda: con.sql(
             "SELECT *, SUM(price) OVER ("

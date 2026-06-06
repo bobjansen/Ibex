@@ -133,6 +133,43 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     )
 
     run(
+        "distinct_symbol",
+        lambda: ctx.sql("SELECT DISTINCT symbol FROM prices").collect(),
+    )
+
+    run(
+        "order_head_topk",
+        lambda: ctx.sql(
+            "SELECT * FROM prices ORDER BY price DESC LIMIT 100"
+        ).collect(),
+    )
+
+    run(
+        "order_head_topk_by_symbol",
+        lambda: ctx.sql(
+            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+            "PARTITION BY symbol ORDER BY price DESC) AS rn FROM prices) "
+            "WHERE rn <= 3"
+        ).collect(),
+    )
+
+    run(
+        "order_tail_topk",
+        lambda: ctx.sql(
+            "SELECT * FROM prices ORDER BY price ASC LIMIT 100"
+        ).collect(),
+    )
+
+    run(
+        "order_tail_topk_by_symbol",
+        lambda: ctx.sql(
+            "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+            "PARTITION BY symbol ORDER BY price ASC) AS rn FROM prices) "
+            "WHERE rn <= 3"
+        ).collect(),
+    )
+
+    run(
         "cumsum_price",
         lambda: ctx.sql(
             "SELECT *, SUM(price) OVER ("

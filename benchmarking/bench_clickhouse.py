@@ -135,6 +135,35 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     )
 
     run(
+        "distinct_symbol",
+        "SELECT DISTINCT symbol FROM prices",
+    )
+
+    run(
+        "order_head_topk",
+        "SELECT * FROM prices ORDER BY price DESC LIMIT 100",
+    )
+
+    run(
+        "order_head_topk_by_symbol",
+        "SELECT * FROM (SELECT *, row_number() OVER ("
+        "PARTITION BY symbol ORDER BY price DESC) AS rn FROM prices) "
+        "WHERE rn <= 3",
+    )
+
+    run(
+        "order_tail_topk",
+        "SELECT * FROM prices ORDER BY price ASC LIMIT 100",
+    )
+
+    run(
+        "order_tail_topk_by_symbol",
+        "SELECT * FROM (SELECT *, row_number() OVER ("
+        "PARTITION BY symbol ORDER BY price ASC) AS rn FROM prices) "
+        "WHERE rn <= 3",
+    )
+
+    run(
         "cumsum_price",
         "SELECT *, sum(price) OVER ("
         "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"

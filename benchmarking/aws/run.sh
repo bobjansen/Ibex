@@ -70,6 +70,26 @@ BRANCH=$(git -C "$IBEX_ROOT" rev-parse --abbrev-ref HEAD)
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%S)
 RESULT_KEY="benchmarks/${TIMESTAMP}_${COMMIT:0:8}/scales.csv"
 
+# The EC2 instance clones from origin, so a local-only commit cannot be
+# benchmarked by this runner. Fail here instead of spending money on an instance
+# that will terminate during user-data checkout.
+UPSTREAM=$(git -C "$IBEX_ROOT" rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null || true)
+if [[ -n "$UPSTREAM" ]]; then
+    UPSTREAM_REMOTE=$(git -C "$IBEX_ROOT" config "branch.${BRANCH}.remote" 2>/dev/null || true)
+    if [[ -n "$UPSTREAM_REMOTE" ]]; then
+        git -C "$IBEX_ROOT" fetch --quiet "$UPSTREAM_REMOTE" 2>/dev/null || true
+    fi
+    if ! git -C "$IBEX_ROOT" merge-base --is-ancestor "$COMMIT" "$UPSTREAM"; then
+        echo "ERROR: commit ${COMMIT:0:8} is not on upstream ${UPSTREAM}."
+        echo "The AWS runner clones ${REPO_URL} and checks out the exact local HEAD."
+        echo "Push this commit first, then rerun:"
+        echo "  git push ${UPSTREAM_REMOTE:-origin} ${BRANCH}"
+        exit 1
+    fi
+else
+    echo "WARNING: branch '$BRANCH' has no upstream; cannot verify ${COMMIT:0:8} is cloneable."
+fi
+
 # ── AMI: latest Ubuntu 24.04 (Noble) amd64 ───────────────────────────────────
 AMI=$(aws ec2 describe-images \
     --region "$REGION" \
@@ -99,17 +119,28 @@ echo ""
 USER_DATA=$(cat <<EOF
 #!/bin/bash
 # Stream to both /var/log/ibex-bench.log (full log for SSH users) AND the
-# kernel/serial console (visible via \`aws ec2 get-console-output\` without
-# SSH). Buffer overflow on the console is fine — we keep the file as
-# the authoritative log.
-exec > >(stdbuf -oL tee -a /var/log/ibex-bench.log > /dev/console) 2>&1
+# EC2 serial console (visible via \`aws ec2 get-console-output\` without SSH).
+# Buffer overflow on the console is fine — we keep the file as the authoritative
+# log when SSH is available.
+if [[ -w /dev/ttyS0 ]]; then
+    exec > >(stdbuf -oL tee -a /var/log/ibex-bench.log /dev/ttyS0) 2>&1
+else
+    exec > >(stdbuf -oL tee -a /var/log/ibex-bench.log /dev/console) 2>&1
+fi
+set -Eeuo pipefail
 set -x
+userdata_exit() {
+    code=\$?
+    echo "user-data exited with status \${code}"
+    if [[ "\${code}" -ne 0 ]]; then
+        shutdown -h now
+    fi
+}
+trap userdata_exit EXIT
 apt-get update -qq
-apt-get install -y git
+apt-get install -y ca-certificates git
 git clone "${REPO_URL}" /ibex
 cd /ibex
-# Fail loudly if the commit isn't on origin (e.g. forgot to push) instead of
-# silently building stale origin/HEAD — user-data has no top-level set -e.
 git checkout "${COMMIT}" || {
     echo "FATAL: commit ${COMMIT} not found on origin — did you 'git push'?"
     shutdown -h now

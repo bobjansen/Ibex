@@ -3047,7 +3047,7 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
     auto make_double_result = [&](auto op_fn, const double* lp, double ls, const double* rp,
                                   double rs) -> ColumnValue {
         Column<double> out;
-        out.resize(rows);
+        out.resize_for_overwrite(rows);
         double* dst = out.data();
         if (lp && rp) {
             for (std::size_t i = 0; i < rows; ++i)
@@ -3064,7 +3064,7 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
     auto make_int_result = [&](auto op_fn, const std::int64_t* lp, std::int64_t ls,
                                const std::int64_t* rp, std::int64_t rs) -> ColumnValue {
         Column<std::int64_t> out;
-        out.resize(rows);
+        out.resize_for_overwrite(rows);
         std::int64_t* dst = out.data();
         if (lp && rp) {
             for (std::size_t i = 0; i < rows; ++i)
@@ -3176,6 +3176,165 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
         return ColumnValue{std::move(out)};
     }
     return std::nullopt;
+}
+
+struct NumericUpdateNode {
+    enum class Kind : std::uint8_t {
+        IntColumn,
+        DoubleColumn,
+        IntLiteral,
+        DoubleLiteral,
+        Op,
+    };
+
+    Kind kind = Kind::IntLiteral;
+    ExprType type = ExprType::Int;
+    ir::ArithmeticOp op = ir::ArithmeticOp::Add;
+    std::uint32_t left = 0;
+    std::uint32_t right = 0;
+    const std::int64_t* i64 = nullptr;
+    const double* dbl = nullptr;
+    std::int64_t int_lit = 0;
+    double dbl_lit = 0.0;
+};
+
+auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
+                                     const ScalarRegistry* scalars,
+                                     std::vector<NumericUpdateNode>& nodes)
+    -> std::optional<std::uint32_t> {
+    if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        auto left = try_compile_numeric_update_expr(*bin->left, input, scalars, nodes);
+        if (!left.has_value()) {
+            return std::nullopt;
+        }
+        auto right = try_compile_numeric_update_expr(*bin->right, input, scalars, nodes);
+        if (!right.has_value()) {
+            return std::nullopt;
+        }
+
+        const auto left_type = nodes[*left].type;
+        const auto right_type = nodes[*right].type;
+        NumericUpdateNode node;
+        node.kind = NumericUpdateNode::Kind::Op;
+        node.op = bin->op;
+        node.left = *left;
+        node.right = *right;
+        node.type = bin->op == ir::ArithmeticOp::Div || left_type == ExprType::Double ||
+                            right_type == ExprType::Double
+                        ? ExprType::Double
+                        : ExprType::Int;
+        nodes.push_back(node);
+        return static_cast<std::uint32_t>(nodes.size() - 1);
+    }
+
+    auto operand = resolve_fast_operand(expr, input, scalars);
+    if (!operand.has_value()) {
+        return std::nullopt;
+    }
+    if (operand->kind != ExprType::Int && operand->kind != ExprType::Double) {
+        return std::nullopt;
+    }
+
+    NumericUpdateNode node;
+    node.type = operand->kind;
+    if (operand->is_column) {
+        if (operand->kind == ExprType::Int) {
+            node.kind = NumericUpdateNode::Kind::IntColumn;
+            node.i64 = std::get<Column<std::int64_t>>(*operand->column).data();
+        } else {
+            node.kind = NumericUpdateNode::Kind::DoubleColumn;
+            node.dbl = std::get<Column<double>>(*operand->column).data();
+        }
+    } else {
+        if (operand->kind == ExprType::Int) {
+            node.kind = NumericUpdateNode::Kind::IntLiteral;
+            node.int_lit = get_int_value(*operand, 0);
+        } else {
+            node.kind = NumericUpdateNode::Kind::DoubleLiteral;
+            node.dbl_lit = get_double_value(*operand, 0);
+        }
+    }
+
+    nodes.push_back(node);
+    return static_cast<std::uint32_t>(nodes.size() - 1);
+}
+
+auto eval_numeric_update_int(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
+                             std::size_t row) -> std::int64_t {
+    const auto& node = nodes[idx];
+    switch (node.kind) {
+        case NumericUpdateNode::Kind::IntColumn:
+            return node.i64[row];
+        case NumericUpdateNode::Kind::IntLiteral:
+            return node.int_lit;
+        case NumericUpdateNode::Kind::Op: {
+            const auto lhs = eval_numeric_update_int(nodes, node.left, row);
+            const auto rhs = eval_numeric_update_int(nodes, node.right, row);
+            return apply_int_op(node.op, lhs, rhs);
+        }
+        case NumericUpdateNode::Kind::DoubleColumn:
+        case NumericUpdateNode::Kind::DoubleLiteral:
+            invariant_violation("eval_numeric_update_int: unexpected double node");
+    }
+    invariant_violation("eval_numeric_update_int: unknown node kind");
+}
+
+auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
+                                std::size_t row) -> double {
+    const auto& node = nodes[idx];
+    switch (node.kind) {
+        case NumericUpdateNode::Kind::IntColumn:
+            return static_cast<double>(node.i64[row]);
+        case NumericUpdateNode::Kind::DoubleColumn:
+            return node.dbl[row];
+        case NumericUpdateNode::Kind::IntLiteral:
+            return static_cast<double>(node.int_lit);
+        case NumericUpdateNode::Kind::DoubleLiteral:
+            return node.dbl_lit;
+        case NumericUpdateNode::Kind::Op: {
+            const auto lhs = eval_numeric_update_double(nodes, node.left, row);
+            const auto rhs = eval_numeric_update_double(nodes, node.right, row);
+            return apply_double_op(node.op, lhs, rhs);
+        }
+    }
+    invariant_violation("eval_numeric_update_double: unknown node kind");
+}
+
+auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
+                                  ExprType output_kind, const ScalarRegistry* scalars)
+    -> std::optional<ColumnValue> {
+    if (auto fast = try_fast_update_binary(expr, input, rows, output_kind, scalars);
+        fast.has_value()) {
+        return fast;
+    }
+    if (output_kind != ExprType::Int && output_kind != ExprType::Double) {
+        return std::nullopt;
+    }
+
+    std::vector<NumericUpdateNode> nodes;
+    nodes.reserve(8);
+    auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes);
+    if (!root.has_value() || nodes[*root].type != output_kind) {
+        return std::nullopt;
+    }
+
+    if (output_kind == ExprType::Double) {
+        Column<double> out;
+        out.resize_for_overwrite(rows);
+        double* dst = out.data();
+        for (std::size_t row = 0; row < rows; ++row) {
+            dst[row] = eval_numeric_update_double(nodes, *root, row);
+        }
+        return ColumnValue{std::move(out)};
+    }
+
+    Column<std::int64_t> out;
+    out.resize_for_overwrite(rows);
+    std::int64_t* dst = out.data();
+    for (std::size_t row = 0; row < rows; ++row) {
+        dst[row] = eval_numeric_update_int(nodes, *root, row);
+    }
+    return ColumnValue{std::move(out)};
 }
 
 // NOLINTNEXTLINE(readability-function-size)
@@ -5967,7 +6126,7 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
         }
         return *std::get<const ColumnValue*>(res->data);
     }
-    if (auto fast = try_fast_update_binary(expr, input, rows, inferred.value(), scalars);
+    if (auto fast = try_fast_update_numeric_expr(expr, input, rows, inferred.value(), scalars);
         fast.has_value()) {
         return std::move(fast.value());
     }
@@ -8192,7 +8351,8 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             continue;
         }
-        if (auto fast = try_fast_update_binary(field.expr, output, rows, inferred.value(), scalars);
+        if (auto fast =
+                try_fast_update_numeric_expr(field.expr, output, rows, inferred.value(), scalars);
             fast.has_value()) {
             auto validity = collect_expr_validity(field.expr, output, rows);
             if (validity.has_value())

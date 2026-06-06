@@ -12,7 +12,7 @@
 # Usage:
 #   ./bench_ibex.sh [--csv path] [--csv-multi path] [--warmup N] [--iters N]
 #                   [--suite name[,name...]] [--merge-validity-rows N]
-#                   [--rng-micro-rows N] [--reshape-rows N]
+#                   [--rng-micro-rows N] [--filter-micro-rows N] [--reshape-rows N]
 #                   [--mode memory|scan] [--out results/ibex.tsv]
 #
 # --mode memory (default): time pure execution; CSVs are read once outside the
@@ -44,6 +44,7 @@ ITERS=5
 SUITE=""
 MERGE_VALIDITY_ROWS=""
 RNG_MICRO_ROWS=""
+FILTER_MICRO_ROWS=""
 RESHAPE_ROWS=""
 TF_ROWS="1000000"
 MODE="memory"
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --suite)       SUITE="$2";       shift 2 ;;
         --merge-validity-rows) MERGE_VALIDITY_ROWS="$2"; shift 2 ;;
         --rng-micro-rows) RNG_MICRO_ROWS="$2"; shift 2 ;;
+        --filter-micro-rows) FILTER_MICRO_ROWS="$2"; shift 2 ;;
         --reshape-rows) RESHAPE_ROWS="$2"; shift 2 ;;
         --tf-rows)     TF_ROWS="$2";     shift 2 ;;
         --mode)        MODE="$2";        shift 2 ;;
@@ -112,6 +114,7 @@ BENCH_ARGS=(
 [[ -n "$SUITE" ]] && BENCH_ARGS+=(--suite "$SUITE")
 [[ -n "$MERGE_VALIDITY_ROWS" ]] && BENCH_ARGS+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
 [[ -n "$RNG_MICRO_ROWS" ]] && BENCH_ARGS+=(--rng-micro-rows "$RNG_MICRO_ROWS")
+[[ -n "$FILTER_MICRO_ROWS" ]] && BENCH_ARGS+=(--filter-micro-rows "$FILTER_MICRO_ROWS")
 [[ -n "$RESHAPE_ROWS" ]] && BENCH_ARGS+=(--reshape-rows "$RESHAPE_ROWS")
 [[ -n "$TF_ROWS" ]] && BENCH_ARGS+=(--timeframe-rows "$TF_ROWS")
 [[ -f "$CSV_MULTI" ]]   && BENCH_ARGS+=(--csv-multi   "$CSV_MULTI")

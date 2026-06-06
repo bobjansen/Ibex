@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# run.sh — launch an EC2 instance (spot by default), run the scale benchmark suite, download results.
+# run.sh — launch one EC2 instance (spot by default), run the whole scale
+# benchmark suite on it, download the results.
+#
+# For one-box-per-engine fan-out (each engine isolated on its own instance,
+# running in parallel) use run-per-engine.sh instead.
+#
+# Boots from the baked AMI (build-ami.sh) when configured in .config, otherwise
+# from the stock Ubuntu image (provisioning then runs on the instance).
 #
 # Usage:
 #   ./benchmarking/aws/run.sh [options]
@@ -8,6 +15,8 @@
 #   --sizes  1M,2M,4M,8M,16M,32M,50M   (default)
 #   --warmup N                  warmup iterations  (default: 1)
 #   --iters  N                  timed iterations   (default: 5)
+#   --tf-rows N                 override TF row count
+#   --both-threading            also run single-thread duckdb/datafusion/clickhouse
 #   --type   INSTANCE_TYPE      EC2 instance type  (default: r7i.2xlarge)
 #   --key    KEY_PAIR_NAME      EC2 key pair for SSH debugging (optional)
 #   --region AWS_REGION         override region
@@ -18,6 +27,7 @@
 # Environment:
 #   S3_BUCKET   — bucket name (loaded from .config if not set)
 #   AWS_REGION  — region      (loaded from .config if not set)
+#   IBEX_AMI    — baked AMI id (loaded from .config; written by build-ami.sh)
 #
 # Estimated cost: a full 1M–16M run on r7i.2xlarge (~$0.53/hr on-demand) is well
 # under $1; spot is cheaper but risks capacity reclaim on long runs.
@@ -26,10 +36,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IBEX_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 # ── Load config ───────────────────────────────────────────────────────────────
-CONFIG_FILE="$SCRIPT_DIR/.config"
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+bench_load_config "$SCRIPT_DIR"
 
 # ── Defaults (override via env or args) ───────────────────────────────────────
 REGION="${AWS_REGION:-us-east-1}"
@@ -62,49 +73,20 @@ done
 
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET not set — run aws/setup.sh first}"
 
-# ── Git info ──────────────────────────────────────────────────────────────────
-REPO_URL=$(git -C "$IBEX_ROOT" remote get-url origin 2>/dev/null \
-    | sed 's|git@github.com:|https://github.com/|')
+# ── Git info + push preflight ─────────────────────────────────────────────────
+REPO_URL=$(bench_repo_url "$IBEX_ROOT")
 COMMIT=$(git -C "$IBEX_ROOT" rev-parse HEAD)
 BRANCH=$(git -C "$IBEX_ROOT" rev-parse --abbrev-ref HEAD)
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%S)
 RESULT_KEY="benchmarks/${TIMESTAMP}_${COMMIT:0:8}/scales.csv"
 
 # The EC2 instance clones from origin, so a local-only commit cannot be
-# benchmarked by this runner. Fail here instead of spending money on an instance
-# that will terminate during user-data checkout.
-UPSTREAM=$(git -C "$IBEX_ROOT" rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null || true)
-if [[ -n "$UPSTREAM" ]]; then
-    UPSTREAM_REMOTE=$(git -C "$IBEX_ROOT" config "branch.${BRANCH}.remote" 2>/dev/null || true)
-    if [[ -n "$UPSTREAM_REMOTE" ]]; then
-        git -C "$IBEX_ROOT" fetch --quiet "$UPSTREAM_REMOTE" 2>/dev/null || true
-    fi
-    if ! git -C "$IBEX_ROOT" merge-base --is-ancestor "$COMMIT" "$UPSTREAM"; then
-        echo "ERROR: commit ${COMMIT:0:8} is not on upstream ${UPSTREAM}."
-        echo "The AWS runner clones ${REPO_URL} and checks out the exact local HEAD."
-        echo "Push this commit first, then rerun:"
-        echo "  git push ${UPSTREAM_REMOTE:-origin} ${BRANCH}"
-        exit 1
-    fi
-else
-    echo "WARNING: branch '$BRANCH' has no upstream; cannot verify ${COMMIT:0:8} is cloneable."
-fi
+# benchmarked by this runner.
+bench_require_pushed "$IBEX_ROOT" "$COMMIT" "$BRANCH" "$REPO_URL" || exit 1
 
-# ── AMI: latest Ubuntu 24.04 (Noble) amd64 ───────────────────────────────────
-AMI=$(aws ec2 describe-images \
-    --region "$REGION" \
-    --owners 099720109477 \
-    --filters \
-        "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" \
-        "Name=state,Values=available" \
-    --query "sort_by(Images, &CreationDate)[-1].ImageId" \
-    --output text)
-
-SG_ID=$(aws ec2 describe-security-groups \
-    --region "$REGION" \
-    --filters "Name=group-name,Values=ibex-bench" \
-    --query "SecurityGroups[0].GroupId" \
-    --output text)
+# ── AMI + security group ──────────────────────────────────────────────────────
+AMI=$(bench_resolve_ami "$REGION")
+SG_ID=$(bench_security_group "$REGION")
 
 echo "Commit : ${COMMIT:0:8} ($BRANCH)"
 echo "Sizes  : $SIZES"
@@ -113,50 +95,16 @@ echo "Type   : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || e
 echo "Bucket : s3://$S3_BUCKET"
 echo ""
 
-# ── User-data: clone repo and delegate to bootstrap.sh ───────────────────────
-# Variables below expand on the *local* machine; the resulting script has
-# hardcoded values so the instance needs no extra configuration.
-USER_DATA=$(cat <<EOF
-#!/bin/bash
-# Stream to both /var/log/ibex-bench.log (full log for SSH users) AND the
-# EC2 serial console (visible via \`aws ec2 get-console-output\` without SSH).
-# Buffer overflow on the console is fine — we keep the file as the authoritative
-# log when SSH is available.
-if [[ -w /dev/ttyS0 ]]; then
-    exec > >(stdbuf -oL tee -a /var/log/ibex-bench.log /dev/ttyS0) 2>&1
-else
-    exec > >(stdbuf -oL tee -a /var/log/ibex-bench.log /dev/console) 2>&1
-fi
-set -Eeuo pipefail
-set -x
-userdata_exit() {
-    code=\$?
-    echo "user-data exited with status \${code}"
-    if [[ "\${code}" -ne 0 ]]; then
-        shutdown -h now
-    fi
-}
-trap userdata_exit EXIT
-apt-get update -qq
-apt-get install -y ca-certificates git
-git clone "${REPO_URL}" /ibex
-cd /ibex
-git checkout "${COMMIT}" || {
-    echo "FATAL: commit ${COMMIT} not found on origin — did you 'git push'?"
-    shutdown -h now
-    exit 1
-}
-IBEX_S3_BUCKET="${S3_BUCKET}" \\
-IBEX_RESULT_KEY="${RESULT_KEY}" \\
-IBEX_REGION="${REGION}" \\
-IBEX_SIZES="${SIZES}" \\
-IBEX_WARMUP="${WARMUP}" \\
-IBEX_ITERS="${ITERS}" \\
-IBEX_TF_ROWS="${TF_ROWS}" \\
-IBEX_BOTH_THREADING="${BOTH_THREADING}" \\
-  bash /ibex/benchmarking/aws/bootstrap.sh
-EOF
-)
+# ── User-data: clone/update repo and delegate to bootstrap.sh ─────────────────
+USER_DATA=$(bench_user_data "$REPO_URL" "$COMMIT" \
+    "IBEX_S3_BUCKET=${S3_BUCKET}" \
+    "IBEX_RESULT_KEY=${RESULT_KEY}" \
+    "IBEX_REGION=${REGION}" \
+    "IBEX_SIZES=${SIZES}" \
+    "IBEX_WARMUP=${WARMUP}" \
+    "IBEX_ITERS=${ITERS}" \
+    "IBEX_TF_ROWS=${TF_ROWS}" \
+    "IBEX_BOTH_THREADING=${BOTH_THREADING}")
 
 # ── Launch instance ───────────────────────────────────────────────────────────
 KEY_ARGS=()
@@ -220,8 +168,8 @@ while true; do
     fi
 
     # Detect a dead instance (spot interruption, failed bootstrap, OOM shutdown)
-    # so we fail fast instead of waiting out the full 2h timeout for a result
-    # that will never arrive. Checked every ~2.5 min to keep API calls light.
+    # so we fail fast instead of waiting out the full timeout for a result that
+    # will never arrive. Checked every ~2.5 min to keep API calls light.
     if (( DOTS % 5 == 0 )); then
         STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
             --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)

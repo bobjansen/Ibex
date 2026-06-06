@@ -4944,6 +4944,78 @@ TEST_CASE("rep missing positional argument returns error") {
     CHECK_FALSE(result.has_value());
 }
 
+TEST_CASE("rep array literal cycles elements to table length", "[rep]") {
+    // Table(10)[update { g = rep([1,2]) }] -> 1,2,1,2,...
+    runtime::Table table;
+    table.logical_rows = 10;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { g = rep([1,2]) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->find("g"));
+    REQUIRE(g.size() == 10);
+    for (std::size_t i = 0; i < 10; ++i) {
+        CHECK(g[i] == static_cast<std::int64_t>((i % 2) + 1));
+    }
+}
+
+TEST_CASE("rep array literal three elements", "[rep]") {
+    runtime::Table table;
+    table.logical_rows = 6;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { g = rep([1,2,3]) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->find("g"));
+    REQUIRE(g.size() == 6);
+    for (std::size_t i = 0; i < 6; ++i) {
+        CHECK(g[i] == static_cast<std::int64_t>((i % 3) + 1));
+    }
+}
+
+TEST_CASE("rep array literal with each=2 repeats each element", "[rep]") {
+    // rep([0,1,2], each=2) -> 0,0,1,1,2,2
+    runtime::Table table;
+    table.logical_rows = 6;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { g = rep([0,1,2], each=2) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& g = std::get<Column<std::int64_t>>(*result->find("g"));
+    REQUIRE(g.size() == 6);
+    const std::int64_t expected[] = {0, 0, 1, 1, 2, 2};
+    for (std::size_t i = 0; i < 6; ++i) {
+        CHECK(g[i] == expected[i]);
+    }
+}
+
+TEST_CASE("rep array literal string labels", "[rep]") {
+    runtime::Table table;
+    table.logical_rows = 7;
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { label = rep([\"a\",\"b\",\"c\"]) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& label = std::get<Column<std::string>>(*result->find("label"));
+    REQUIRE(label.size() == 7);
+    const std::string_view expected[] = {"a", "b", "c", "a", "b", "c", "a"};
+    for (std::size_t i = 0; i < 7; ++i) {
+        CHECK(label[i] == expected[i]);
+    }
+}
+
 // --- Table constructor from column vectors ------------------------------------
 
 TEST_CASE("Table constructor creates table from integer columns") {

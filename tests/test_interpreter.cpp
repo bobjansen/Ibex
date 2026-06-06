@@ -1605,6 +1605,80 @@ TEST_CASE("lag(val, 0) is identity") {
     REQUIRE((*same)[1] == 99);
 }
 
+TEST_CASE("lag nested in arithmetic in one update field", "[lag][nested]") {
+    // (close - lag(close,1)) / lag(close,1) — a non-row-local call (lag) nested
+    // inside arithmetic, in a single field. Row 0 is null (lag has no prior).
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("close", Column<double>{10.0, 11.0, 12.0, 13.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { ret = (close - lag(close,1)) / lag(close,1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* ret_entry = result->find_entry("ret");
+    REQUIRE(ret_entry != nullptr);
+    REQUIRE(ret_entry->validity.has_value());
+    const auto& ret = std::get<Column<double>>(*ret_entry->column);
+    REQUIRE(ret.size() == 4);
+    CHECK((*ret_entry->validity)[0] == false);  // lag(close,1)[0] is null -> ret null
+    CHECK((*ret_entry->validity)[1] == true);
+    CHECK(ret[1] == Catch::Approx(1.0 / 10.0));
+    CHECK(ret[2] == Catch::Approx(1.0 / 11.0));
+    CHECK(ret[3] == Catch::Approx(1.0 / 12.0));
+}
+
+TEST_CASE("scalar function wrapping lag preserves the null", "[lag][nested]") {
+    // abs(lag(c,1)) — a transform inside a scalar call. The scalar path can't
+    // see lag, so the argument is materialized; row 0 stays null.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("c", Column<double>{-5.0, 10.0, -3.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { a = abs(lag(c,1)) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* a_entry = result->find_entry("a");
+    REQUIRE(a_entry != nullptr);
+    REQUIRE(a_entry->validity.has_value());
+    const auto& a = std::get<Column<double>>(*a_entry->column);
+    CHECK((*a_entry->validity)[0] == false);
+    CHECK(a[1] == Catch::Approx(5.0));   // abs(-5)
+    CHECK(a[2] == Catch::Approx(10.0));  // abs(10)
+}
+
+TEST_CASE("RNG nested inside a scalar function in an update field", "[rng][nested]") {
+    // abs(rand_normal(0,1)) — a Generator nested inside a scalar call. Every
+    // value is the absolute value of a draw, so all are >= 0.
+    runtime::reseed(42);
+    runtime::Table table;
+    table.add_column("k", Column<std::int64_t>{0, 0, 0, 0, 0, 0, 0, 0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { x = abs(rand_normal(0.0, 1.0)) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* x = std::get_if<Column<double>>(result->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == 8);
+    for (double v : *x) {
+        CHECK(v >= 0.0);
+    }
+}
+
 TEST_CASE("lag on bool column preserves packed values", "[lag][bool]") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});

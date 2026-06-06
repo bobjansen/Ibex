@@ -2339,6 +2339,49 @@ class Lowerer {
                     .node = ir::IsNullExpr{.operand = ir::make_expr_ptr(std::move(operand.value())),
                                            .negated = call->callee == "is_not_null"}};
             }
+            // rep([e0, e1, ...], ...) — array-literal first arg. Expand the
+            // elements as positional literal args and mark with __array_len so
+            // the runtime knows they form the pattern to cycle over.
+            if (call->callee == "rep" && !call->args.empty()) {
+                if (const auto* arr = std::get_if<ArrayLiteralExpr>(&call->args.front()->node)) {
+                    if (arr->elements.empty()) {
+                        return std::unexpected(
+                            LowerError{.message = "rep: array literal must not be empty"});
+                    }
+                    ir::CallExpr lowered_rep;
+                    lowered_rep.callee = "rep";
+                    lowered_rep.args.reserve(arr->elements.size());
+                    for (const auto& elem : arr->elements) {
+                        auto lowered_elem = lower_expr_to_ir(*elem);
+                        if (!lowered_elem.has_value()) {
+                            return std::unexpected(lowered_elem.error());
+                        }
+                        if (!std::holds_alternative<ir::Literal>(lowered_elem->node)) {
+                            return std::unexpected(LowerError{
+                                .message = "rep: array literal elements must be literals"});
+                        }
+                        lowered_rep.args.push_back(
+                            ir::make_expr_ptr(std::move(lowered_elem.value())));
+                    }
+                    // sentinel: the positional args are array elements, not one scalar
+                    const auto array_len = static_cast<std::int64_t>(arr->elements.size());
+                    lowered_rep.named_args.push_back(ir::NamedArg{
+                        .name = "__array_len",
+                        .value =
+                            ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = array_len}})});
+                    // pass through length_out / times / each named args unchanged
+                    for (const auto& narg : call->named_args) {
+                        auto lowered_val = lower_expr_to_ir(*narg.value);
+                        if (!lowered_val.has_value()) {
+                            return std::unexpected(lowered_val.error());
+                        }
+                        lowered_rep.named_args.push_back(ir::NamedArg{
+                            .name = narg.name,
+                            .value = ir::make_expr_ptr(std::move(lowered_val.value()))});
+                    }
+                    return ir::Expr{.node = std::move(lowered_rep)};
+                }
+            }
             ir::CallExpr lowered_call;
             lowered_call.callee = call->callee;
             lowered_call.args.reserve(call->args.size());

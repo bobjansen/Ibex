@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ibex | Fast Typed DataFrame Pipelines</title>
-  <meta name="description" content="Ibex is a fast typed language for table, feature-engineering, and time-series pipelines. Run interactively or compile to C++23." />
+  <meta name="description" content="Ibex is a fast typed language for columnar DataFrame and time-series pipelines. See the benchmarks, then learn the core syntax and run your first script." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -17,1659 +17,350 @@
   <nav class="nav">
     <span class="nav-logo">Ibex</span>
     <div class="nav-links">
-      <a class="nav-link active" href="./index.html">Docs</a>
-      <a class="nav-link" href="./getting-started.html">Getting started</a>
-      <a class="nav-link" href="./io.html">I/O</a>
-      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
-      <a class="nav-link" href="./functions.html">Function reference</a>
-      <a class="nav-link" href="./comparison.html">Comparison</a>
+      <a class="nav-link active" href="./index.html">Home</a>
       <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./comparison.html">Comparison</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="./io.html">I/O</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
       <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
     </div>
   </nav>
 
   <!-- Hero -->
-  <section class="hero">
+  <section class="hero hero-home">
     <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
     <p class="eyebrow">Ibex</p>
-    <h1>Fast, typed query language for table&nbsp;pipelines</h1>
+    <h1>Typed table pipelines, from REPL to native code</h1>
     <p class="lead">
-      Ibex is a compact, statically typed query language for quant, analytics,
-      and data-engineering pipelines over columnar data. Write and explore in
-      an interactive REPL, then compile the exact same code to standalone C++23
-      when it ships, no rewrite required. Designed for concise table and time
-      series manipulation without giving up performance.
-    </p>
-    <p class="lead" style="margin-top: 5px">
-      <strong>Never the slowest. Often the fastest. On a single core.</strong>
-      Across grouped aggregation, rolling time-series, and null-handling at 1M–50M
-      rows, Ibex is competitive with or faster than multithreaded Polars, DuckDB,
-      DataFusion, and ClickHouse. Using only one thread.
+      Ibex gives DataFrame pipelines their own compact, statically typed
+      language. Explore in a REPL, embed the same code in Python or R notebooks,
+      and compile it to C++23 when the pipeline needs to ship.
     </p>
     <div class="cta-row">
-      <a class="button primary" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">View on GitHub</a>
-      <a class="button" href="./getting-started.html">Get started</a>
-      <a class="button" href="./benchmarks.html">Benchmarks</a>
+      <a class="button primary" href="./benchmarks.html">See the benchmarks</a>
+      <a class="button" href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">Download a release &#8599;</a>
+      <a class="button" href="#install">Install &darr;</a>
+    </div>
+    <div class="home-highlights" aria-label="Ibex highlights">
+      <span><strong>Typed</strong> table expressions</span>
+      <span><strong>REPL</strong> to C++23</span>
+      <span><strong>Single-core</strong> performance focus</span>
     </div>
   </section>
 
-  <!-- Audience -->
-  <section class="section">
-    <p class="section-label">Why?</p>
-    <h2>Ibex is focused solely on tabular data</h2>
+  <section class="section home-next">
+    <div class="grid-3">
+      <article class="card">
+        <span class="tour-tag">Performance</span>
+        <h3>Single-core speed that still shows up at scale</h3>
+        <p>Ibex is currently single-threaded, yet stays competitive with engines using all cores on many common columnar queries.</p>
+      </article>
+      <article class="card">
+        <span class="tour-tag">Language</span>
+        <h3>DataFrame work without stringly SQL glue</h3>
+        <p>Clauses compose left-to-right, columns are real names, and static types catch mistakes before a pipeline runs.</p>
+      </article>
+      <article class="card">
+        <span class="tour-tag">Deployment</span>
+        <h3>One pipeline, several surfaces</h3>
+        <p>Use the REPL for exploration, notebooks for analysis, plugins for I/O, and C++23 codegen for native binaries.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- Performance proof -->
+  <section class="section home-proof">
+    <p class="section-label">Performance</p>
+    <h2>Speed, measured</h2>
     <p class="section-sub">
-      Ibex only knows tables and scalars, this made it possible to create a new
-      language in which it is possible to write concise, performant code easy
-      to read table manipulation.
+      Ibex is built for the expensive part of table work: grouped aggregation,
+      rolling time windows, joins, filters, null handling, and reshaping. The
+      benchmark suite compares each query against the same operation in Polars,
+      DuckDB, ClickHouse, DataFusion, pandas, data.table, and dplyr.
     </p>
-    <div class="audience-grid">
-      <article class="audience-card">
-        <span class="tour-tag">Quant and market data</span>
-        <h3>OHLC, rolling windows, as-of joins, feature columns.</h3>
-        <p>
-          Work directly with columnar time-series pipelines, keep group and
-          window semantics explicit, then compile the same script when latency
-          or deployment starts to matter.
-        </p>
+    <div class="grid-3 proof-grid">
+      <article class="card proof-card">
+        <span class="proof-stat">33.6 ms</span>
+        <h3>mean by symbol, 16M rows</h3>
+        <p>Polars: 60.5 ms. Polars single-threaded: 216 ms.</p>
       </article>
-      <article class="audience-card">
-        <span class="tour-tag">Analytics engineering</span>
-        <h3>DataFrame expressiveness without stringly SQL glue.</h3>
-        <p>
-          Keep transformations readable with bracket clauses, strict types,
-          named arguments, imports, and reusable functions instead of sprawling
-          host-language orchestration.
-        </p>
+      <article class="card proof-card">
+        <span class="proof-stat">30.6 ms</span>
+        <h3>count by symbol x day, 16M rows</h3>
+        <p>Polars: 220 ms. DuckDB: 77.6 ms. DataFusion: 58.1 ms.</p>
       </article>
-      <article class="audience-card">
-        <span class="tour-tag">Notebook power users</span>
-        <h3>Move the heavy part into a real language.</h3>
-        <p>
-          Bind pandas, Arrow, or R data frames into Ibex, run the expensive
-          joins and aggregations there, and hand compact results back to the
-          notebook for plotting and review.
-        </p>
+      <article class="card proof-card">
+        <span class="proof-stat">49.7 ms</span>
+        <h3>rolling sum 1m, 16M rows</h3>
+        <p>Polars: 152 ms. Polars single-threaded: 283 ms.</p>
       </article>
     </div>
+    <div class="cta-row">
+      <a class="button primary" href="./benchmarks.html">Explore all benchmark rows</a>
+      <a class="button" href="./comparison.html">Compare query syntax</a>
+    </div>
+    <p class="bench-note">
+      Ibex currently runs on one thread. The benchmark page shows both default
+      engine settings and single-threaded Polars for a same-core comparison.
+    </p>
   </section>
 
-  <!-- Feature cards -->
-  <section class="section">
-    <p class="section-label">Features</p>
-    <h2>Interactive, typed, compiled</h2>
+  <!-- Pipelines -->
+  <section class="section" id="pipelines">
+    <p class="section-label">How a program is shaped</p>
+    <h2>Everything is a table flowing through a pipeline</h2>
     <p class="section-sub">
-      Explore in a REPL, trust the static types to catch shape and type errors
-      before anything runs, and compile the same script to C++23 when it ships.
+      An Ibex program is a handful of <code>let</code> bindings. Each one names a
+      table and the steps applied to it. There are no loops or mutable
+      variables &mdash; you describe the transformation you want and Ibex runs it.
     </p>
-    <div class="grid-3 audience-grid">
-      <article class="card">
-        <h3>Concise bracket syntax</h3>
-        <p>
-          Pipeline operations chain left-to-right inside <code>[ ]</code>, in the
-          order they execute. No wrapping every column in a function call, no
-          quoting names. A bare field list defaults to <code>select</code>, so
-          <code>trades[price]</code> and <code>trades[{ symbol, price }]</code>
-          are projection shorthand.
-        </p>
-<pre><code>trades[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>,
-  <span class="kw">select</span> {
-    symbol,
-    vwap = <span class="fn-name">sum</span>(price * qty)
-         / <span class="fn-name">sum</span>(qty)
-  }, <span class="kw">by</span> symbol]
-
-trades[{ symbol, price }]</code></pre>
-      </article>
-      <article class="card">
-        <h3>TimeFrames</h3>
-        <p>
-          <code>as_timeframe</code> promotes a DataFrame to a time-indexed
-          structure. Rolling windows are convenient and blazingly fast.
-        </p>
-<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks,
-                      <span class="str">"ts"</span>);
-tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">update</span> {
-  avg_5m = <span class="fn-name">rolling_mean</span>(px),
-  vol_5m = <span class="fn-name">rolling_sum</span>(qty)
-}]</code></pre>
-      </article>
-      <article class="card">
-        <h3>Grouped update</h3>
-        <p>
-          <code>update</code> with <code>by</code> computes a value per group and
-          writes it back to every row, so group statistics sit alongside the
-          originals.
-        </p>
-<pre><code>prices[<span class="kw">update</span> {
-  z = (price - <span class="fn-name">mean</span>(price))
-      / <span class="fn-name">std</span>(price)
-}, <span class="kw">by</span> symbol]</code></pre>
-      </article>
-      <article class="card">
-        <h3>C++23 codegen</h3>
-        <p>
-          <code>ibex_compile</code> transpiles any <code>.ibex</code> script to
-          idiomatic C++ using the <code>ibex::ops::*</code> library. Compiled and
-          interpreted outputs are behaviour-equivalent; both run near peak throughput.
-        </p>
-      </article>
-      <article class="card">
-        <h3>Strict type system</h3>
-        <p>
-          No implicit <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
-          coercion. Explicit cast constructors (<code>Int64(x)</code>,
-          <code>Float64(x)</code>) and a five-mode <code>round()</code>
-          built-in — including banker&rsquo;s rounding — cover every numeric
-          conversion. Optional annotations are validated when present.
-        </p>
-      </article>
-      <article class="card">
-        <h3>Python &amp; R notebooks</h3>
-        <p>
-          Drive Ibex from a notebook: the <code>ibex_ipython</code> extension
-          binds pandas or Arrow tables into <code>%%ibex</code> cells and hands
-          results back to pandas, <code>pyarrow</code>, or matplotlib; the
-          <code>ribex</code> package runs Ibex from pure R and returns a
-          <code>data.frame</code> ready for <code>ggplot2</code>. Both keep table
-          bindings alive across cells.
-        </p>
-      </article>
-    </div>
-  </section>
-
-  <section class="section">
-    <p class="section-label">Notebook integration</p>
-    <h2>Run Ibex inside Python or R notebook workflows</h2>
-    <p class="section-sub">Quickly switch between Python and Ibex cells in a
-    notebook. The results from Ibex can seamlessly be used by later cells in
-    the notebook.</p>
 
     <div class="tour">
       <div class="tour-item">
         <div class="tour-text">
-          <span class="tour-tag">Python Bridge</span>
-          <h3>Use Ibex as a DSL inside a real notebook workflow.</h3>
+          <span class="tour-tag">Pipelines</span>
+          <h3>A table, followed by the steps to apply to it</h3>
           <p>
-            The <code>ibex_pyarrow</code> bridge evaluates Ibex code and returns
-            a <code>pyarrow.Table</code>. The <code>ibex_ipython</code> extension
-            adds <code>%%ibex</code>, <code>%ibexfile</code>, and
-            <code>%ibexreset</code>, so notebooks can bind pandas or Arrow
-            tables and ordinary Python scalars into Ibex, keep expensive table
-            loads alive across cells, and keep plotting in Python.
+            Write a table name, then square brackets containing a
+            comma-separated list of <strong>clauses</strong> &mdash; one
+            operation each. The clauses run in the order you read them, each
+            taking the whole table and producing a new one.
           </p>
           <p>
-            Scalar bindings currently support Python <code>int</code>,
-            <code>float</code>, <code>bool</code>, <code>str</code>,
-            <code>datetime.date</code>, and <code>datetime.datetime</code>,
-            with the last two mapped to Ibex <code>Date</code> and
-            <code>Timestamp</code>.
-          </p>
-          <p>
-            This keeps Ibex focused on joins, aggregations, reshaping, and
-            time-series work, while reusing pandas, matplotlib, and the rest of
-            the notebook ecosystem for presentation.
-          </p>
-          <p>
-            Build the bridge with
-            <code>cmake --build build-release --parallel --target ibex_pyarrow</code>,
-            then start IPython from the repository root and load the extension.
+            Tables are values: a pipeline returns a new table and leaves its
+            input alone. You can name the result with <code>let</code>, or feed
+            it straight into another set of brackets.
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm"># IPython / Jupyter</span>
-%load_ext ibex_ipython
-
-<span class="kw">import</span> pandas <span class="kw">as</span> pd
-
-trades = pd.DataFrame({
-    <span class="str">"symbol"</span>: [<span class="str">"AAPL"</span>, <span class="str">"AAPL"</span>, <span class="str">"MSFT"</span>],
-    <span class="str">"qty"</span>: [<span class="num">10</span>, <span class="num">15</span>, <span class="num">7</span>],
-    <span class="str">"px"</span>: [<span class="num">101.2</span>, <span class="num">101.5</span>, <span class="num">299.8</span>],
-})
-offset = <span class="num">10</span>
-
-%%ibex --bind trades=trades --bind offset=offset --as pandas --out grouped
-trades[
-    <span class="kw">select</span> { total_qty = <span class="fn-name">sum</span>(qty + offset), avg_px = <span class="fn-name">mean</span>(px) },
-    <span class="kw">by</span> symbol,
-    <span class="kw">order</span> symbol
-];
-
-grouped.plot(kind=<span class="str">"bar"</span>, x=<span class="str">"symbol"</span>, y=<span class="str">"total_qty"</span>);</code></pre>
-        </div>
-      </div>
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Persistent Session</span>
-          <h3>Load once, reuse across notebook cells.</h3>
-          <p>
-            <code>%%ibex</code> keeps table-valued <code>let</code> bindings in
-            a hidden Ibex session. Large CSV or parquet loads do not need to be
-            repeated in every cell.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code>%%ibex --quiet
-import "csv";
-let train = read_csv(<span class="str">"../../kaggle/data/train.csv"</span>, <span class="str">"&lt;empty&gt;"</span>);
-
-%%ibex --as pandas --out bucket_summary
-train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>() }, <span class="kw">by</span> seconds_in_bucket, <span class="kw">order</span> seconds_in_bucket];
-
-%ibexreset  <span class="cm"># clear the hidden session</span></code></pre>
-        </div>
-      </div>
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">R Package</span>
-          <h3>Use Ibex from pure R and hand results straight to ggplot2.</h3>
-          <p>
-            The in-repo <code>ribex</code> package evaluates inline Ibex queries
-            or <code>.ibex</code> files from R. Results come back as a
-            <code>data.frame</code> by default, so the common
-            <code>ggplot2</code> path is immediate. For lower-level interop,
-            <code>format = "nanoarrow"</code> returns the Arrow-backed result.
-          </p>
-          <p>
-            Like the Python notebook path, <code>ribex</code> supports a
-            persistent Ibex session, so large CSV or parquet loads can happen
-            once and then be reused across later calls.
-          </p>
-          <p>
-            For literate reports, <code>ribex</code> can also register a real
-            <code>{ibex}</code> knitr engine inside R Markdown, so Ibex chunks
-            and ordinary R / <code>ggplot2</code> chunks can share one named
-            session.
-          </p>
-          <p>
-            R input bindings are available by copy for named
-            <code>data.frame</code> tables and named scalar lists. Scalars
-            currently support R <code>integer</code>, <code>double</code>,
-            <code>logical</code>, <code>character</code>, <code>Date</code>,
-            and <code>POSIXct</code>.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm"># R</span>
-library(ribex)
-library(ggplot2)
-
-ribex::register_knitr_engines()
-
-sess &lt;- create_session(
-  plugin_paths = c(<span class="str">"build-release/tools"</span>)
-)
-
-session_eval(
-  sess,
-  <span class="str">'
-  import "csv";
-  let iris = read_csv("data/iris.csv", "");
-  '</span>
-)
-
-summary &lt;- session_eval(
-  sess,
-  <span class="str">'
-  iris[
-      select { mean_sl = mean(Sepal_Length), n = count() },
-      by Species,
-      order Species
-  ];
-  '</span>
-)
-
-ggplot(summary, aes(Species, mean_sl)) +
-  geom_col()</code></pre>
-        </div>
-      </div>
-
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">CSV Options</span>
-          <h3>Read delimited files with or without headers.</h3>
-          <p>
-            The bundled CSV plugin supports custom delimiters and headerless
-            files. When <code>has_header</code> is <code>false</code>, Ibex
-            synthesizes column names <code>col1</code>, <code>col2</code>, and so on.
-          </p>
-          <p>
-            SQLite is also available through the optional ADBC plugin, so the
-            same pipeline can start from a SQL query instead of a flat file
-            when you want database-side staging first.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code>import "csv";
-
-let raw = read_csv("examples/measurements.txt", "", ";", false)
-    [select { station = col1, temp = col2 }];</code></pre>
-        </div>
-      </div>
-
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Compile-Time Map</span>
-          <h3>Generate feature families without leaving Ibex.</h3>
-          <p>
-            Braced <code>select</code> and <code>update</code> blocks support a
-            compile-time <code>map</code> form. It expands from earlier string-list
-            <code>let</code> bindings into ordinary named fields before lowering,
-            so runtime execution stays unchanged.
-          </p>
-          <p>
-            Use backtick aliases with <code>${name}</code> interpolation and
-            <code>get(name)</code> inside the map body to turn compile-time names
-            into column references.
-          </p>
-          <p>
-            <code>columns(table_expr)</code> returns a one-column metadata table
-            named <code>name</code>, so generated schemas can stay in Ibex
-            instead of being rebuilt in notebook host code.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="kw">let</span> measures = [<span class="str">"price"</span>, <span class="str">"fee"</span>];
-
-trades[<span class="kw">select</span> {
-    symbol,
-    <span class="kw">map</span> m <span class="kw">in</span> measures =&gt; <span class="id">`avg_${m}`</span> = <span class="fn-name">mean</span>(<span class="fn-name">get</span>(m))
-}, <span class="kw">by</span> symbol];
-
-<span class="kw">let</span> price_cols = [<span class="str">"ask_price"</span>, <span class="str">"bid_price"</span>, <span class="str">"wap"</span>];
-
-book[<span class="kw">update</span> {
-    <span class="kw">map</span> (i, a) <span class="kw">in</span> price_cols, (j, b) <span class="kw">in</span> price_cols
-        <span class="kw">where</span> i &gt; j
-        =&gt; <span class="id">`${a}_${b}_imb`</span> = (<span class="fn-name">get</span>(a) - <span class="fn-name">get</span>(b)) / (<span class="fn-name">get</span>(a) + <span class="fn-name">get</span>(b))
-}];
-
-<span class="kw">let</span> generated = columns(book);
-generated[<span class="kw">filter</span> name != <span class="str">"row_id"</span>];</code></pre>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Language tour -->
-  <section class="section">
-    <p class="section-label">Language tour</p>
-    <h2>Everything you need, nothing you don&rsquo;t</h2>
-    <p class="section-sub">A complete analytical pipeline in a handful of composable clauses.</p>
-
-    <div class="tour">
-
-      <!-- 1. Load & filter -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Load &amp; Filter</span>
-          <h3>External functions bring data in.</h3>
-          <p>
-            <code>extern fn</code> declares a C++ data-source function as a
-            first-class Ibex binding. The compiler resolves it at link time;
-            the REPL loads the corresponding plugin <code>.so</code> at runtime.
-          </p>
-          <p>
-            Filter expressions support arithmetic, comparisons, and boolean
-            logic (<code>and</code>, <code>or</code>, <code>not</code>).
-            Multiple clauses chain in reading order.
-          </p>
-          <p>
-            Output plugins mirror the input API: <code>write_csv</code>,
-            <code>write_json</code>, and <code>write_parquet</code> accept a
-            DataFrame and a path and return the number of rows written.
-          </p>
-          <p>
-            The dedicated <a href="./io.html">I/O guide</a> covers CSV and
-            Parquet usage in more detail, plus SQLite reads through ADBC and
-            Kafka/Redpanda streaming into WebSocket dashboards for both JSON
-            and Schema-Registry-backed Avro, including headerless files,
-            custom delimiters, schema hints, and end-to-end demos.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
-    <span class="fn-name">path</span>: String,
-    <span class="fn-name">nulls</span>: String = <span class="str">""</span>,
-    <span class="fn-name">delimiter</span>: String = <span class="str">","</span>,
-    <span class="fn-name">has_header</span>: Bool = <span class="kw">true</span>
-) -&gt; DataFrame
-    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
-<span class="kw">extern fn</span> <span class="fn-name">read_json</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
-    <span class="kw">from</span> <span class="str">"json.hpp"</span>;
-
-<span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
-<span class="kw">let</span> headerless = <span class="fn-name">read_csv</span>(<span class="str">"ticks.csv"</span>, <span class="fn-name">has_header</span> = <span class="kw">false</span>);
-<span class="kw">let</span> config = <span class="fn-name">read_json</span>(<span class="str">"config.json"</span>);
-
-<span class="cm">// Keep rows where price exceeds 1.0</span>
-<span class="kw">let</span> active = prices[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>];
-
-<span class="cm">// Chain filter with a column projection</span>
+<pre><code><span class="cm">// Keep the busy rows, then three columns</span>
 prices[
-    <span class="kw">filter</span> price &gt; <span class="num">1.0</span>,
+    <span class="kw">filter</span> volume &gt; <span class="num">1000</span>,
     <span class="kw">select</span> { symbol, price, volume }
 ];
 
-<span class="cm">// Write results back to disk</span>
-<span class="kw">import</span> <span class="str">"csv"</span>;
-<span class="kw">import</span> <span class="str">"json"</span>;
-<span class="kw">import</span> <span class="str">"parquet"</span>;
-
-<span class="kw">let</span> n = <span class="fn-name">write_csv</span>(active, <span class="str">"out/active.csv"</span>);
-<span class="fn-name">write_json</span>(active, <span class="str">"out/active.json"</span>);
-<span class="fn-name">write_parquet</span>(active, <span class="str">"out/active.parquet"</span>);</code></pre>
-          <p>
-            The bundled Parquet plugin also reads directly from public HTTPS
-            URLs, presigned URLs, and S3-compatible object storage with the same
-            <code>read_parquet(path)</code> call:
-            <code>read_parquet("https://data.example.com/prices.parquet")</code>
-            or
-            <code>read_parquet("s3://market-data/prices.parquet?region=us-east-1")</code>.
-          </p>
+<span class="cm">// Name a result and reuse it</span>
+<span class="kw">let</span> active = prices[<span class="kw">filter</span> volume &gt; <span class="num">1000</span>];
+active[<span class="kw">select</span> { symbol, price }];</code></pre>
         </div>
       </div>
+    </div>
+  </section>
 
-      <!-- 1b. Inline Table Construction -->
+  <!-- Syntax -->
+  <section class="section">
+    <p class="section-label">Reading the syntax</p>
+    <h2>Three kinds of bracket, one job each</h2>
+    <p class="section-sub">
+      Ibex uses square brackets, braces, and parentheses for three distinct
+      things. Knowing which is which is most of what it takes to read any
+      snippet.
+    </p>
+    <div class="grid-3">
+      <article class="card">
+        <h3><code>[ ]</code> &mdash; a pipeline</h3>
+        <p>
+          Square brackets attach to a table and hold a list of clauses to apply:
+          <code>prices[filter &hellip;, select &hellip;]</code>. Chaining
+          <code>[&hellip;][&hellip;]</code> just feeds one result into the next.
+        </p>
+      </article>
+      <article class="card">
+        <h3><code>{ }</code> &mdash; a list of fields</h3>
+        <p>
+          Braces hold the named members a clause works on &mdash; the output
+          columns of <code>select</code>, the sort keys of <code>order</code>,
+          the columns of a schema. Think struct fields, not a code block:
+          <code>{ avg = mean(px), n = count() }</code>.
+        </p>
+      </article>
+      <article class="card">
+        <h3><code>( )</code> &mdash; calls and grouping</h3>
+        <p>
+          Parentheses are the familiar kind: calling a function and grouping
+          arithmetic. <code>mean(price)</code>,
+          <code>(close - open) / open</code>. The expressions inside clauses are
+          ordinary too &mdash; comparisons, math, function calls.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <!-- Worked example -->
+  <section class="section">
+    <p class="section-label">A worked example</p>
+    <h2>One pipeline, start to finish</h2>
+    <p class="section-sub">
+      A common task &mdash; collapse tick data into daily bars per symbol &mdash;
+      shows how the pieces fit together.
+    </p>
+
+    <div class="tour">
       <div class="tour-item">
         <div class="tour-text">
-          <span class="tour-tag">Inline Tables</span>
-          <h3>Build DataFrames from literals or existing column vectors.</h3>
+          <span class="tour-tag">Step by step</span>
+          <h3>Group by symbol, reduce each group to one row</h3>
           <p>
-            The <code>Table&nbsp;{&nbsp;&hellip;&nbsp;}</code> constructor builds
-            a <code>DataFrame</code> column-by-column. Each column value is either
-            an inline <code>Series</code> literal <code>[v,&nbsp;v,&nbsp;&hellip;]</code>
-            or any Ibex expression that produces a series or table &mdash; no file or
-            plugin declaration required.
+            <code><span class="kw">select</span></code> chooses the output
+            columns. Each entry is <code>name = expression</code>; a bare name
+            passes a column through unchanged.
           </p>
           <p>
-            For table-valued expression columns, the runtime extracts the column
-            from the result table: a <strong>single-column</strong> result is used
-            directly; a <strong>multi-column</strong> result is matched by
-            column name. Literal and expression columns may be freely mixed.
+            <code><span class="kw">by</span> symbol</code> groups the rows, so
+            the aggregates in <code>select</code> &mdash; <code>first</code>,
+            <code>max</code>, <code>min</code>, <code>last</code> &mdash; run once
+            per symbol. Drop the <code>by</code> and they would collapse the whole
+            table to a single row instead.
           </p>
           <p>
-            All columns must have equal row counts. The result is a first-class
-            <code>DataFrame</code>: chain operations, promote to
-            <code>as_timeframe</code>, or join with another table.
+            <code><span class="kw">order</span></code> then sorts the result. The
+            whole thing is one expression, bound to <code>bars</code>.
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm">// Series literals</span>
-<span class="kw">let</span> price = [<span class="num">150.0</span>, <span class="num">140.0</span>, <span class="num">300.0</span>];
-<span class="kw">let</span> empty: Series&lt;Float64&gt; = [];
-
-<span class="cm">// Series-literal columns</span>
-<span class="kw">let</span> t = Table {
-    symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>, <span class="str">"MSFT"</span>],
-    price  = price,
-};
-
-<span class="cm">// Columns from existing table expressions</span>
-<span class="kw">let</span> summary = Table {
-    symbol = prices[<span class="kw">select</span> { symbol }],
-    high   = prices[<span class="kw">select</span> { high = <span class="fn-name">max</span>(price) }, <span class="kw">by</span> symbol],
-    low    = prices[<span class="kw">select</span> { low  = <span class="fn-name">min</span>(price) }, <span class="kw">by</span> symbol],
-};
-
-<span class="cm">// Mix literals and expressions</span>
-<span class="kw">let</span> ref = Table {
-    label  = [<span class="str">"open"</span>, <span class="str">"close"</span>],
-    value  = ohlc[<span class="kw">select</span> { value = <span class="fn-name">mean</span>(price) }],
-};
-
-<span class="cm">// Promote to TimeFrame</span>
-<span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(
-    Table { ts = [<span class="num">1000</span>, <span class="num">2000</span>, <span class="num">3000</span>], price = [<span class="num">10</span>, <span class="num">20</span>, <span class="num">30</span>] },
-    <span class="str">"ts"</span>
-);</code></pre>
+<pre><code><span class="kw">let</span> bars = ticks[
+    <span class="kw">select</span> {
+        open  = <span class="fn-name">first</span>(price),
+        high  = <span class="fn-name">max</span>(price),
+        low   = <span class="fn-name">min</span>(price),
+        close = <span class="fn-name">last</span>(price),
+        vol   = <span class="fn-name">sum</span>(size)
+    },
+    <span class="kw">by</span> symbol,
+    <span class="kw">order</span> symbol
+];</code></pre>
         </div>
       </div>
+    </div>
+  </section>
 
-      <!-- 2. Aggregate -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Aggregation</span>
-          <h3>One clause for projection and grouped reduction.</h3>
-          <p>
-            <code>select</code> doubles as a projection and an aggregation clause.
-            Add <code>by</code> to group; omit it for a global aggregate.
-          </p>
-          <p>
-            Aggregate functions: <code>first</code>, <code>last</code>,
-            <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>,
-            <code>count</code>, <code>median</code>, <code>std</code>,
-            <code>ewma</code>. All skip null rows by default. IEEE
-            <code>NaN</code> / <code>Inf</code> are not nulls, so normalize them
-            explicitly before aggregation when needed.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Mean sepal length and row count, by species</span>
-iris[<span class="kw">select</span> {
-    mean_sl = <span class="fn-name">mean</span>(`Sepal.Length`),
-    n       = <span class="fn-name">count</span>()
-}, <span class="kw">by</span> Species];
+  <!-- Vocabulary -->
+  <section class="section">
+    <p class="section-label">The vocabulary</p>
+    <h2>The core clauses</h2>
+    <p class="section-sub">
+      These drop inside <code>[ ]</code> and compose in any sensible order. The
+      <a href="./functions.html">function reference</a> and
+      <a href="./cheatsheet.html">cheat sheet</a> have the rest.
+    </p>
+    <div class="card">
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>filter <em>predicate</em></code></td><td>Keep rows where the predicate is true</td></tr>
+          <tr><td><code>select { <em>fields</em> }</code></td><td>Choose or compute output columns; aggregates when paired with <code>by</code></td></tr>
+          <tr><td><code>update { <em>fields</em> }</code></td><td>Add or replace columns, keeping all existing ones</td></tr>
+          <tr><td><code>where <em>predicate</em> update { <em>fields</em> }</code></td><td>Replace columns in selected rows</td></tr>
+          <tr><td><code>by <em>key</em></code></td><td>Group for <code>select</code> / <code>update</code> (like SQL <code>GROUP BY</code> / <code>PARTITION BY</code>)</td></tr>
+          <tr><td><code>order { <em>keys</em> }</code></td><td>Sort, with per-key <code>asc</code> / <code>desc</code></td></tr>
+          <tr><td><code>rename { <em>map</em> }</code></td><td>Relabel columns without touching data</td></tr>
+          <tr><td><code>distinct { <em>keys</em> }</code></td><td>Deduplicate on one or more columns</td></tr>
+          <tr><td><code>head <em>n</em></code> / <code>tail <em>n</em></code></td><td>Keep the first / last n rows (per group with <code>by</code>)</td></tr>
+          <tr><td><code><em>a</em> join <em>b</em> on <em>key</em></code></td><td>Inner / left / right / outer / semi / anti / cross / as-of joins</td></tr>
+          <tr><td><code>window <em>duration</em></code></td><td>Lookback window for rolling aggregates on a <code>TimeFrame</code> (e.g. <code>window 5m</code>)</td></tr>
+          <tr><td><code>resample <em>duration</em></code></td><td>Bucket a <code>TimeFrame</code> into fixed time intervals, then aggregate per bucket (e.g. 1m OHLC)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top: 0.9rem; color: var(--muted); font-size: 0.91rem;">
+      Outside the pipelines are a few top-level forms: <code>let</code> bindings,
+      <code>import</code> to load a plugin, <code>fn</code> /
+      <code>extern fn</code> for reusable functions and data sources, and
+      <code>Table { &hellip; }</code> to build a table from literals.
+    </p>
+  </section>
 
-<span class="cm">// OHLC per symbol — all in one pass</span>
-prices[<span class="kw">select</span> {
-    open   = <span class="fn-name">first</span>(price),
-    high   = <span class="fn-name">max</span>(price),
-    low    = <span class="fn-name">min</span>(price),
-    close  = <span class="fn-name">last</span>(price),
-    traded = <span class="fn-name">sum</span>(volume)
-}, <span class="kw">by</span> symbol];</code></pre>
-        </div>
+  <!-- Install -->
+  <section class="section" id="install">
+    <p class="section-label">Install &amp; run</p>
+    <h2>Get Ibex on your machine</h2>
+    <p class="section-sub">
+      A prebuilt release is the quickest start. Build from source if you want the
+      latest commits or a binary for your own platform.
+    </p>
+
+    <div class="steps">
+
+      <div>
+        <p class="step-label">Option A &mdash; download a release</p>
+        <p style="margin: 0 0 0.7rem; color: var(--muted); font-size: 0.93rem;">
+          Grab the prebuilt <code>ibex</code> REPL and bundled plugins, unpack,
+          and run &mdash; no toolchain required.
+        </p>
+        <p style="margin: 0 0 0.9rem;">
+          <a class="button primary" href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">github.com/bobjansen/Ibex/releases &#8599;</a>
+        </p>
+<pre><code><span class="cm"># Unpack the archive for your platform, then:</span>
+./ibex --plugin-path ./plugins</code></pre>
       </div>
 
-      <!-- 2b. Grouped update -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Grouped Update</span>
-          <h3>Broadcast group aggregates back to every row.</h3>
-          <p>
-            <code>update&nbsp;+&nbsp;by</code> evaluates each expression
-            <em>per group</em> and writes the result back to every row in
-            that group &mdash; no row reduction, no separate join step. This is
-            the equivalent of a SQL window function with
-            <code>PARTITION&nbsp;BY</code> and no frame clause.
-          </p>
-          <p>
-            Use it to attach group statistics (mean, z-score, rank) alongside
-            the original columns without losing any rows.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Attach species mean to every individual row</span>
-iris[<span class="kw">update</span> { group_mean = <span class="fn-name">mean</span>(`Sepal.Length`) }, <span class="kw">by</span> Species];
+      <div>
+        <p class="step-label">Option B &mdash; build from source</p>
+        <p style="margin: 0 0 0.7rem; color: var(--muted); font-size: 0.93rem;">
+          Requirements: Clang 17+, CMake 3.26+, Ninja.
+        </p>
+<pre><code>cmake -B build-release -G Ninja \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release</code></pre>
+      </div>
 
-<span class="cm">// Z-score within each symbol group</span>
-prices[<span class="kw">update</span> {
-    z = (price <span class="op">-</span> <span class="fn-name">mean</span>(price)) <span class="op">/</span> <span class="fn-name">std</span>(price)
-}, <span class="kw">by</span> symbol];
+      <div>
+        <p class="step-label">Run your first pipeline</p>
+<pre><code>./ibex --plugin-path ./plugins   <span class="cm"># from source: ./build-release/tools/ibex --plugin-path ./build-release/tools</span></code></pre>
+        <div class="card" style="margin-top: 0.7rem;">
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
 
-<span class="cm">// Combine grouped update with filter — keeps all original rows</span>
+<span class="cm">// Five most-traded symbols by total volume</span>
 prices[
-    <span class="kw">update</span> { avg = <span class="fn-name">mean</span>(price) }, <span class="kw">by</span> symbol,
-    <span class="kw">filter</span> price <span class="op">&gt;</span> avg
+    <span class="kw">select</span> { traded = <span class="fn-name">sum</span>(volume) }, <span class="kw">by</span> symbol,
+    <span class="kw">order</span> { traded <span class="kw">desc</span> },
+    <span class="kw">head</span> <span class="num">5</span>
 ];</code></pre>
-        </div>
-      </div>
-
-      <!-- 3. Update -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Derived Columns</span>
-          <h3>Add or replace columns without losing any data.</h3>
-          <p>
-            <code>update</code> appends named computed columns to every row.
-            All existing columns pass through untouched. A
-            <strong>tuple left-hand side</strong> unpacks a multi-column result
-            in one assignment. The bare <code>update = expr</code> form merges
-            <em>all</em> columns from a table-returning expression.
+          <p style="margin-top: 0.7rem; color: var(--muted); font-size: 0.91rem;">
+            Handy REPL commands: <code>:load &lt;file.ibex&gt;</code>,
+            <code>:schema &lt;table&gt;</code>, <code>:head &lt;table&gt; [n]</code>,
+            <code>:doc &lt;name&gt;</code>, <code>:help</code>.
           </p>
         </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Enrich every row with return, range, and notional</span>
-ohlcv[<span class="kw">update</span> {
-    ret      = (close <span class="op">-</span> open) <span class="op">/</span> open,
-    range    = (high  <span class="op">-</span> low)  <span class="op">/</span> open,
-    notional = close <span class="op">*</span> volume
-}];
-
-<span class="cm">// Unpack a multi-column result with a tuple LHS</span>
-df[<span class="kw">update</span> { (delta, gamma) = compute_greeks() }];
-
-<span class="cm">// Merge all columns from a table-returning function</span>
-prices[<span class="kw">update</span> = gen_prices(symbols)];
-
-<span class="cm">// Chain an update with an aggregation</span>
-<span class="kw">let</span> daily = ohlcv[<span class="kw">update</span> { ret = (close <span class="op">-</span> open) <span class="op">/</span> open }];
-daily[<span class="kw">select</span> {
-    avg_ret    = <span class="fn-name">mean</span>(ret),
-    n_sessions = <span class="fn-name">count</span>()
-}, <span class="kw">by</span> sector]
-    [<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }];</code></pre>
-        </div>
-      </div>
-
-      <!-- 4. Rename -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Rename</span>
-          <h3>Relabel columns without touching the data.</h3>
-          <p>
-            <code>rename</code> maps old column names to new ones while keeping
-            every other column intact. Use the single-name shorthand or the
-            braced multi-rename form. Column order is preserved.
-          </p>
-          <p>
-            Because <code>rename</code> runs before <code>select</code> in
-            canonical order, renamed columns are immediately visible to the
-            rest of the pipeline.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Single rename — no braces needed</span>
-trades[<span class="kw">rename</span> p = price];
-
-<span class="cm">// Rename multiple columns at once</span>
-trades[<span class="kw">rename</span> { p = price, q = volume }];
-
-<span class="cm">// Rename then select using the new name</span>
-trades[
-    <span class="kw">filter</span> price &gt; <span class="num">15</span>,
-    <span class="kw">rename</span> p = price,
-    <span class="kw">select</span> { p, volume }
-];
-
-<span class="cm">// Works with update and aggregation too</span>
-trades[
-    <span class="kw">rename</span> { sym = symbol, vol = volume },
-    <span class="kw">select</span> { total_vol = <span class="fn-name">sum</span>(vol) }, <span class="kw">by</span> sym
-];</code></pre>
-        </div>
-      </div>
-
-      <!-- 5. Order, Head & Distinct -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Order, Head, Tail &amp; Distinct</span>
-          <h3>Sort, keep the first or last rows, and deduplicate with explicit intent.</h3>
-          <p>
-            <code>order</code> accepts a single column, a multi-key block with
-            <code>asc</code>&thinsp;/&thinsp;<code>desc</code> annotations, or no
-            argument at all to sort by every column in schema order.
-          </p>
-          <p>
-            <code>head</code> keeps the first <code>n</code> rows in the current
-            order, while <code>tail</code> keeps the last <code>n</code> rows.
-            Both work per group when combined with <code>by</code>.
-          </p>
-          <p>
-            <code>distinct</code> deduplicates on a single column or a set.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Sort by a single key (ascending by default)</span>
-iris[<span class="kw">order</span> `Sepal.Length`];
-
-<span class="cm">// Multi-key sort with explicit directions</span>
-results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span>, symbol <span class="kw">asc</span> }];
-
-<span class="cm">// Keep the first 10 rows in current order</span>
-results[<span class="kw">head</span> <span class="num">10</span>];
-
-<span class="cm">// Top 3 rows per symbol after sorting</span>
-results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }, <span class="kw">head</span> <span class="num">3</span>, <span class="kw">by</span> symbol];
-
-<span class="cm">// Keep the last 10 rows in current order</span>
-results[<span class="kw">tail</span> <span class="num">10</span>];
-
-<span class="cm">// Bottom 3 rows per symbol after sorting</span>
-results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }, <span class="kw">tail</span> <span class="num">3</span>, <span class="kw">by</span> symbol];
-
-<span class="cm">// Sort by all columns in schema order</span>
-iris[<span class="kw">order</span>];
-
-<span class="cm">// Unique species names</span>
-iris[<span class="kw">distinct</span> Species];
-
-<span class="cm">// Unique (species, length) pairs</span>
-iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
-        </div>
-      </div>
-
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Filter With Lag</span>
-          <h3>Use previous or next rows directly in predicates.</h3>
-          <p>
-            Pure row-preserving functions such as <code>lag</code> and
-            <code>lead</code> can appear directly inside <code>filter</code>.
-            They use the current row order, so add a preceding
-            <code>order</code> block when the input order needs to be explicit.
-            The offset can be an integer literal or scalar <code>Int64</code>
-            expression.
-          </p>
-          <p>
-            This keeps shift-style patterns concise without materializing
-            temporary columns first. <code>Date - Date</code> returns an
-            integer day delta, so calendar-adjacent filters can combine
-            <code>lag(date_col, 1)</code> with date arithmetic directly.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Numbers that appear at least three times consecutively</span>
-<span class="kw">let</span> n = <span class="num">1</span>;
-logs[
-    <span class="kw">order</span> id
-][
-    <span class="kw">filter</span> num == <span class="fn-name">lag</span>(num, n) &amp;&amp; num == <span class="fn-name">lag</span>(num, n + <span class="num">1</span>)
-][
-    <span class="kw">distinct</span> { ConsecutiveNums = num }
-];</code></pre>
-        </div>
-      </div>
-
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Rank</span>
-          <h3>Assign dense, first, min/max, or average ranks inside update.</h3>
-          <p>
-            <code>rank(col)</code> is the shorthand single-key form. For
-            multi-key ranking, use
-            <code>rank(order { ... })</code> and spell sort direction per key.
-          </p>
-          <p>
-            The surrounding <code>by</code> clause partitions ranking by group,
-            which makes dense top-k filters much cleaner than
-            <code>distinct + order + head + semi join</code> rewrites.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Dense descending rank by score within each symbol</span>
-scores[
-    <span class="kw">update</span> { dense_rank = <span class="fn-name">rank</span>(score, method = dense, ascending = <span class="kw">false</span>) },
-    <span class="kw">by</span> symbol
-];
-
-<span class="cm">// Multi-key ranking with an explicit tie-break</span>
-scores[
-    <span class="kw">update</span> { order_rank = <span class="fn-name">rank</span>(<span class="kw">order</span> { score <span class="kw">desc</span>, ts <span class="kw">asc</span> }, method = first) },
-    <span class="kw">by</span> symbol
-];
-
-<span class="cm">// Top 3 dense ranks per department</span>
-employee[
-    <span class="kw">update</span> { salary_rank = <span class="fn-name">rank</span>(salary, method = dense, ascending = <span class="kw">false</span>) },
-    <span class="kw">by</span> departmentId
-][<span class="kw">filter</span> salary_rank &lt;= <span class="num">3</span>];</code></pre>
-        </div>
-      </div>
-
-      <!-- 6. Joins -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Joins</span>
-          <h3>Inner, left, right, outer, semi, anti, cross, as-of — and non-equijoin predicates.</h3>
-          <p>
-            The <strong>as-of join</strong> attaches the latest right row
-            at-or-before each left timestamp. It is the standard pattern for
-            enriching tick data with bar data, without look-ahead bias.
-          </p>
-          <p>
-            Join keys are named with <code>on</code>. When the expression after
-            <code>on</code> is a comparison or boolean expression rather than a
-            column name, it becomes a <strong>non-equijoin predicate</strong>
-            (theta join) evaluated for every pair of rows.
-            Both tables must be <code>TimeFrame</code>s for an asof join.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Inner join — drop non-matching rows</span>
-<span class="kw">let</span> enriched = daily <span class="kw">join</span> fund <span class="kw">on</span> symbol;
-
-<span class="cm">// Left join — preserve all left rows</span>
-<span class="kw">let</span> with_meta = prices <span class="kw">left join</span> metadata <span class="kw">on</span> symbol;
-
-<span class="cm">// Right join — preserve all right rows</span>
-<span class="kw">let</span> with_scores = prices <span class="kw">right join</span> scores <span class="kw">on</span> symbol;
-
-<span class="cm">// Outer join — preserve rows from both sides</span>
-<span class="kw">let</span> unioned = prices <span class="kw">outer join</span> metadata <span class="kw">on</span> symbol;
-
-<span class="cm">// Semi join — keep left rows that have a match</span>
-<span class="kw">let</span> matched = prices <span class="kw">semi join</span> metadata <span class="kw">on</span> symbol;
-
-<span class="cm">// Anti join — keep left rows that have no match</span>
-<span class="kw">let</span> missing = prices <span class="kw">anti join</span> metadata <span class="kw">on</span> symbol;
-
-<span class="cm">// Cross join — cartesian product</span>
-<span class="kw">let</span> cartesian = prices <span class="kw">cross join</span> metadata;
-
-<span class="cm">// Non-equijoin — pair rows where a column satisfies an inequality</span>
-<span class="kw">let</span> events = ticks <span class="kw">join</span> windows <span class="kw">on</span> ts &gt;= start &amp;&amp; ts &lt; end;
-
-<span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
-<span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);
-<span class="kw">let</span> bars = <span class="fn-name">as_timeframe</span>(bars_1m, <span class="str">"ts"</span>);
-tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code></pre>
-        </div>
-      </div>
-
-      <!-- 6b. Null handling -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Null Handling</span>
-          <h3>SQL-style three-valued logic, Arrow-style storage.</h3>
-          <p>
-            Every column carries an Arrow-compatible validity bitmap alongside
-            its value buffer. Null propagates through arithmetic and
-            comparisons: <code>null&nbsp;*&nbsp;x&nbsp;=&nbsp;null</code>,
-            <code>null&nbsp;&gt;&nbsp;5&nbsp;=&nbsp;null</code>.
-            <code>filter</code> silently drops rows where the predicate is null.
-          </p>
-          <p>
-            Use <code>is null</code> / <code>is not null</code> to inspect the
-            validity bitmap directly &mdash; these predicates always return a
-            valid <code>Bool</code>, never null. Three-valued boolean operators
-            follow SQL rules: <code>true&nbsp;OR&nbsp;null&nbsp;=&nbsp;true</code>,
-            <code>false&nbsp;AND&nbsp;null&nbsp;=&nbsp;false</code>.
-          </p>
-          <p>
-            Nulls arise from joins with unmatched rows (left join: unmatched
-            right columns; right join: unmatched left columns; outer join:
-            both sides), dcast (missing pivot combinations), and certain
-            aggregate functions (<code>std</code> on fewer than 2 non-null
-            values, <code>ewma</code> on an empty group,
-            <code>skew</code> on fewer than 3, <code>kurtosis</code> on
-            fewer than 4).
-          </p>
-          <p>
-            Floating-point <code>NaN</code> and <code>Inf</code> values are
-            separate from nulls. Use <code>null_if_nan</code> or
-            <code>null_if_not_finite</code> to convert them into nulls before
-            grouped reductions.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Left join introduces nulls for unmatched rows</span>
-<span class="kw">let</span> enriched = employees <span class="kw">left join</span> departments <span class="kw">on</span> dept_id;
-
-<span class="cm">// Test the validity bitmap with IS NULL / IS NOT NULL</span>
-enriched[<span class="kw">filter</span> { dept_name <span class="kw">is null</span> }];
-enriched[<span class="kw">filter</span> { dept_name <span class="kw">is not null</span> }];
-
-<span class="cm">// Null propagates through arithmetic</span>
-<span class="cm">// bonus is null wherever budget is null</span>
-enriched[<span class="kw">select</span> { name, bonus = salary <span class="op">+</span> budget }];
-
-<span class="cm">// 3VL: true OR null = true; keeps the row</span>
-enriched[<span class="kw">filter</span> { dept_name <span class="kw">is not null</span> <span class="op">||</span> salary <span class="op">&gt;</span> <span class="num">80000</span> }];
-
-<span class="cm">// Aggregates skip null rows automatically</span>
-enriched[<span class="kw">select</span> { avg_sal = <span class="fn-name">mean</span>(salary) }, <span class="kw">by</span> dept_name];</code></pre>
-        </div>
-      </div>
-
-      <!-- 6c. Scalar functions -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Scalar Functions</span>
-          <h3>Math and date extraction built in.</h3>
-          <p>
-            Ibex ships a small set of built-in scalar functions that apply
-            element-wise to a column. Math: <code>abs</code>, <code>log</code>,
-            <code>sqrt</code>, row-wise <code>pmin</code>, row-wise <code>pmax</code>.
-            Date/time extraction: <code>year</code>,
-            <code>month</code>, <code>day</code>, <code>hour</code>,
-            <code>minute</code>, <code>second</code>.
-          </p>
-          <p>
-            All scalar functions operate on <code>Numeric</code> or
-            <code>Date&nbsp;|&nbsp;Timestamp</code> columns and produce a new
-            column of the return type. Use them inside <code>update</code>,
-            <code>select</code>, or <code>filter</code> expressions.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Math functions</span>
-trades[<span class="kw">update</span> {
-    log_ret  = <span class="fn-name">log</span>(price <span class="op">/</span> <span class="fn-name">lag</span>(price, <span class="num">1</span>)),
-    vol      = <span class="fn-name">sqrt</span>(variance),
-    notional = <span class="fn-name">abs</span>(pnl),
-    hi       = <span class="fn-name">pmax</span>(bid, ask, wap),
-    lo       = <span class="fn-name">pmin</span>(bid, ask, wap)
-}];
-
-<span class="cm">// Date / time extraction</span>
-trades[<span class="kw">update</span> {
-    yr = <span class="fn-name">year</span>(date),
-    mo = <span class="fn-name">month</span>(date),
-    dy = <span class="fn-name">day</span>(date)
-}];
-
-trades[<span class="kw">update</span> { hr = <span class="fn-name">hour</span>(timestamp) }];
-
-<span class="cm">// Use in filter</span>
-trades[<span class="kw">filter</span> <span class="fn-name">year</span>(date) <span class="op">=</span> <span class="num">2024</span>];</code></pre>
-        </div>
-      </div>
-
-      <!-- 6d. Type system: casts and round() -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Type System</span>
-          <h3>Explicit casts and rounding for numeric conversions.</h3>
-          <p>
-            Ibex never coerces <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
-            implicitly. Use type-name constructors — <code>Int64(x)</code>,
-            <code>Float64(x)</code>, etc. — for explicit numeric casts. They
-            work on scalars and on entire columns.
-          </p>
-          <p>
-            <strong>Float &rarr; Int casts</strong> require the value to be a
-            whole number. Use <code>round(x,&nbsp;mode)</code> first when the
-            value may have a fractional part. Five modes are available:
-            <code>nearest</code> (ties away from zero), <code>bankers</code>
-            (ties to even — statistically unbiased), <code>floor</code>,
-            <code>ceil</code>, <code>trunc</code>.
-          </p>
-          <p>
-            Type annotations on <code>let</code> bindings and function
-            parameters are optional. When present, they are validated:
-            scalar types must match exactly; schema annotations require all
-            declared columns to be present with the correct types.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Explicit scalar casts</span>
-<span class="kw">let</span> n: Int64   = <span class="fn-name">Int64</span>(<span class="num">3.0</span>);   <span class="cm">// ok — 3.0 is a whole number</span>
-<span class="kw">let</span> f: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// ok — Int → Float always succeeds</span>
-<span class="cm">// Int64(3.9)  ← runtime error: fractional part</span>
-
-<span class="cm">// Round a Float column to Int</span>
-prices[<span class="kw">update</span> { vol_int = <span class="fn-name">round</span>(volume_f, nearest) }];
-
-<span class="cm">// All five rounding modes</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, nearest)   <span class="cm">// → 4  (ties away from zero)</span>
-<span class="fn-name">round</span>(<span class="num">2.5</span>, nearest)   <span class="cm">// → 3  (tie → away from zero)</span>
-<span class="fn-name">round</span>(<span class="num">2.5</span>, bankers)   <span class="cm">// → 2  (tie → nearest even)</span>
-<span class="fn-name">round</span>(<span class="num">3.5</span>, bankers)   <span class="cm">// → 4  (tie → nearest even)</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, floor)     <span class="cm">// → 3  (toward −∞)</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, ceil)      <span class="cm">// → 4  (toward +∞)</span>
-<span class="fn-name">round</span>(<span class="num">3.7</span>, trunc)     <span class="cm">// → 3  (toward zero)</span>
-
-<span class="cm">// Column-level cast after rounding</span>
-prices[<span class="kw">update</span> { vol_int = <span class="fn-name">Int64</span>(<span class="fn-name">round</span>(volume_f, nearest)) }];
-
-<span class="cm">// Annotation validation</span>
-<span class="kw">let</span> y: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// explicit cast satisfies annotation</span></code></pre>
-        </div>
-      </div>
-
-      <!-- 7. Vectorized RNG -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Vectorized RNG</span>
-          <h3>Generate random columns in a single vectorized pass.</h3>
-          <p>
-            Eight built-in <code>rand_*</code> functions each produce one
-            independent draw <em>per row</em> &mdash; no row-by-row loop, no
-            user-space scalar overhead. Each thread has its own
-            <code>mt19937_64</code> seeded from <code>std::random_device</code>,
-            so parallel queries produce independent streams without locking.
-          </p>
-          <p>
-            Continuous distributions return <code>Float64</code>:
-            <code>rand_uniform</code>, <code>rand_normal</code>,
-            <code>rand_student_t</code>, <code>rand_gamma</code>,
-            <code>rand_exponential</code>.
-            Discrete distributions return <code>Int64</code>:
-            <code>rand_bernoulli</code>, <code>rand_poisson</code>,
-            <code>rand_int</code>.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Gaussian noise column</span>
-df[<span class="kw">update</span> { noise = <span class="fn-name">rand_normal</span>(<span class="num">0.0</span>, <span class="num">1.0</span>) }];
-
-<span class="cm">// Uniform weight, biased coin, die roll — all in one pass</span>
-df[<span class="kw">update</span> {
-    w    = <span class="fn-name">rand_uniform</span>(<span class="num">0.0</span>, <span class="num">1.0</span>),
-    flip = <span class="fn-name">rand_bernoulli</span>(<span class="num">0.7</span>),
-    die  = <span class="fn-name">rand_int</span>(<span class="num">1</span>, <span class="num">6</span>)
-}];
-
-<span class="cm">// Simulate inter-arrival times and Poisson counts</span>
-df[<span class="kw">update</span> {
-    wait   = <span class="fn-name">rand_exponential</span>(<span class="num">2.5</span>),
-    events = <span class="fn-name">rand_poisson</span>(<span class="num">4.0</span>)
-}];</code></pre>
-        </div>
-      </div>
-
-      <!-- 8. rep() and boolean masks -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">rep &amp; Boolean Masks</span>
-          <h3>Fill, repeat, and cycle columns with named-argument syntax.</h3>
-          <p>
-            <code>rep(x)</code> mirrors R&rsquo;s <code>rep()</code>: it fills
-            a column by repeating a scalar literal or cycling an existing column.
-            Named arguments &mdash; <code>times</code>, <code>each</code>, and
-            <code>length_out</code> &mdash; control the exact repetition pattern.
-          </p>
-          <p>
-            Passing a <code>Bool</code> literal produces a first-class
-            <code>Series&lt;Bool&gt;</code> (a boolean mask), useful as a
-            computed flag or validity indicator alongside numeric columns.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Constant-fill: all rows set to zero</span>
-df[<span class="kw">update</span> { zero = <span class="fn-name">rep</span>(<span class="num">0</span>) }];
-
-<span class="cm">// All-true boolean mask</span>
-df[<span class="kw">update</span> { active = <span class="fn-name">rep</span>(<span class="kw">true</span>) }];
-
-<span class="cm">// Repeat each element of a column twice</span>
-df[<span class="kw">update</span> { rep2 = <span class="fn-name">rep</span>(price, each=<span class="num">2</span>) }];
-
-<span class="cm">// Named args: times, each, length_out</span>
-df[<span class="kw">update</span> { flag = <span class="fn-name">rep</span>(flag_col, times=<span class="num">50</span>) }];</code></pre>
-        </div>
-      </div>
-
-      <!-- 9. Cumulative functions -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Cumulative Functions</span>
-          <h3>Running totals and products in a single O(n) pass.</h3>
-          <p>
-            <code>cumsum(col)</code> and <code>cumprod(col)</code> compute
-            prefix sums and products over any <code>Int</code> or
-            <code>Float</code> column. Both return the same type as their input
-            and are valid in <code>select</code> and <code>update</code> blocks
-            &mdash; DataFrame or TimeFrame &mdash; with or without a
-            <code>window</code> clause.
-          </p>
-          <p>
-            Typical use: cumulative P&amp;L, compounded returns, or an
-            index-rebased price series.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Valid in select (produces only the cumulative column)</span>
-df[<span class="kw">select</span> { cum_pnl = <span class="fn-name">cumsum</span>(pnl) }];
-
-<span class="cm">// Valid in update (adds column alongside existing ones)</span>
-df[<span class="kw">update</span> { cum_pnl = <span class="fn-name">cumsum</span>(pnl) }];
-
-<span class="cm">// Compounded return: product of (1 + daily_ret)</span>
-df[<span class="kw">update</span> {
-    growth = <span class="fn-name">cumprod</span>(<span class="num">1.0</span> <span class="op">+</span> daily_ret)
-}];
-
-<span class="cm">// Also valid on a TimeFrame (no window clause needed)</span>
-tf[<span class="kw">update</span> { running_vol = <span class="fn-name">cumsum</span>(volume) }];</code></pre>
-        </div>
-      </div>
-
-      <!-- 10. Null / NaN cleanup -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Null / NaN Cleanup</span>
-          <h3>Clean missing and dirty float values before aggregation.</h3>
-          <p>
-            Three built-in functions cover data.table&rsquo;s
-            <code>nafill</code> semantics in a single O(n) pass:
-          </p>
-          <ul>
-            <li><code>fill_null(col, value)</code> &mdash; constant fill</li>
-            <li><code>fill_forward(col)</code> &mdash; LOCF (last observation carried forward)</li>
-            <li><code>fill_backward(col)</code> &mdash; NOCB (next observation carried backward)</li>
-          </ul>
-          <p>
-            All three work on any column type (<code>Int</code>,
-            <code>Float</code>, <code>String</code>, &hellip;) in
-            <code>select</code> or <code>update</code> blocks.
-            Unfillable leading (LOCF) or trailing (NOCB) nulls remain null.
-          </p>
-          <p>
-            For dirty <code>Float64</code> columns, Ibex also provides
-            <code>is_nan(col)</code>, <code>null_if_nan(col)</code>, and
-            <code>null_if_not_finite(col)</code>. These are the right way to
-            make grouped <code>mean</code> / <code>sum</code> ignore
-            <code>NaN</code> and infinities.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Constant fill: replace null prices with 0</span>
-df[<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];
-
-<span class="cm">// LOCF: carry last known price into gaps</span>
-df[<span class="kw">update</span> { price = <span class="fn-name">fill_forward</span>(price) }];
-
-<span class="cm">// NOCB: fill backwards from next available value</span>
-df[<span class="kw">update</span> { price = <span class="fn-name">fill_backward</span>(price) }];
-
-<span class="cm">// Chain: LOCF then fill remaining leading nulls with 0</span>
-df[<span class="kw">update</span> { price = <span class="fn-name">fill_forward</span>(price) }]
-  [<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];
-
-<span class="cm">// Float cleanup: turn NaN / Inf into null before aggregation</span>
-quotes[<span class="kw">update</span> {
-    px_bad   = <span class="fn-name">is_nan</span>(px),
-    px_clean = <span class="fn-name">null_if_not_finite</span>(px)
-}]
-[<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(px_clean) }, <span class="kw">by</span> symbol];
-
-<span class="cm">// Direct aggregate expressions are also allowed</span>
-quotes[<span class="kw">select</span> { avg_notional = <span class="fn-name">mean</span>(price * volume) }, <span class="kw">by</span> symbol];
-quotes[<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(<span class="fn-name">null_if_nan</span>(px)) }, <span class="kw">by</span> symbol];</code></pre>
-        </div>
-      </div>
-
-      <!-- 11. Rolling windows -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Rolling Windows</span>
-          <h3>Time-based rolling aggregates in one O(n) pass.</h3>
-          <p>
-            <code>as_timeframe</code> validates sort order in O(n) and records the
-            time-index column. <code>window&nbsp;&lt;dur&gt;</code> sets the
-            lookback; rolling functions (<code>rolling_sum</code>,
-            <code>rolling_mean</code>, <code>rolling_count</code>, <code>lag</code>)
-            use a two-pointer scan with no per-row heap allocation.
-          </p>
-          <p>
-            Duration literals: <code>1s</code>, <code>30s</code>, <code>1m</code>,
-            <code>5m</code>, <code>1h</code>, &hellip;
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
-
-<span class="cm">// Previous tick's price</span>
-tf[<span class="kw">update</span> { prev_price = <span class="fn-name">lag</span>(price, <span class="num">1</span>) }];
-
-<span class="cm">// Tick count in the last 60 seconds</span>
-tf[<span class="kw">window</span> <span class="num">1m</span>, <span class="kw">update</span> { ticks_1m = <span class="fn-name">rolling_count</span>() }];
-
-<span class="cm">// Multiple rolling aggregates in one pass</span>
-tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">update</span> {
-    sum_5m  = <span class="fn-name">rolling_sum</span>(price),
-    mean_5m = <span class="fn-name">rolling_mean</span>(price)
-}];</code></pre>
-        </div>
-      </div>
-
-      <!-- 8. Resample -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Resample</span>
-          <h3>Aggregate ticks into equal-width time buckets.</h3>
-          <p>
-            <code>resample&nbsp;&lt;dur&gt;</code> floors timestamps into
-            fixed-width intervals and reduces each bucket to one output row.
-            Combine with <code>by</code> for per-symbol bars.
-          </p>
-          <p>
-            The output <code>TimeFrame</code> carries the bucket start time as its
-            time index, ready for downstream joins or further resampling.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
-
-<span class="cm">// 1-minute OHLC bars</span>
-<span class="kw">let</span> bars = tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
-    open  = <span class="fn-name">first</span>(price),
-    high  = <span class="fn-name">max</span>(price),
-    low   = <span class="fn-name">min</span>(price),
-    close = <span class="fn-name">last</span>(price)
-}];
-
-<span class="cm">// Per-symbol 1-minute bars</span>
-tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
-    open  = <span class="fn-name">first</span>(price),
-    close = <span class="fn-name">last</span>(price)
-}, <span class="kw">by</span> symbol];
-
-<span class="cm">// Enrich ticks with the latest bar's close</span>
-tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code></pre>
-        </div>
-      </div>
-
-      <!-- 9. Reshape (melt & dcast) -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Reshape</span>
-          <h3>Pivot and unpivot with melt &amp; dcast.</h3>
-          <p>
-            <code>melt</code> converts a wide DataFrame to long format: id columns
-            stay fixed while measure columns are unpivoted into
-            <code>variable</code>&thinsp;/&thinsp;<code>value</code> rows.
-            Combine with <code>select</code> to choose specific measure columns.
-          </p>
-          <p>
-            <code>dcast</code> is the inverse &mdash; it pivots a long table back to
-            wide format. Distinct values of the pivot column become new column names.
-            Combine with <code>by</code> for row keys and <code>select</code> for the
-            value column. Missing cells are filled with null.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Wide → long: unpivot all columns except symbol</span>
-ohlc[<span class="kw">melt</span> symbol];
-<span class="cm">// → symbol | variable | value</span>
-<span class="cm">//   AAPL   | open     | 150.0</span>
-<span class="cm">//   AAPL   | high     | 155.0</span>
-<span class="cm">//   ...</span>
-
-<span class="cm">// Only unpivot specific columns</span>
-ohlc[<span class="kw">melt</span> symbol, <span class="kw">select</span> { open, close }];
-
-<span class="cm">// Long → wide: pivot back</span>
-long[<span class="kw">dcast</span> variable, <span class="kw">select</span> value, <span class="kw">by</span> symbol];
-<span class="cm">// → symbol | open  | high  | low   | close</span>
-
-<span class="cm">// Roundtrip: melt then dcast recovers original data</span>
-<span class="kw">let</span> long  = wide[<span class="kw">melt</span> symbol];
-<span class="kw">let</span> wide2 = long[<span class="kw">dcast</span> variable, <span class="kw">select</span> value, <span class="kw">by</span> symbol];</code></pre>
-        </div>
-      </div>
-
-      <!-- 10. Scalar & compile -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Scalar &amp; Codegen</span>
-          <h3>Extract single values and compile to C++.</h3>
-          <p>
-            <code>scalar</code> pulls one typed value out of a single-cell result
-            table. It is available as a binding in subsequent expressions.
-          </p>
-          <p>
-            <code>ibex_compile</code> transpiles a <code>.ibex</code> file to a
-            self-contained C++ source file. The helper script compiles and links it
-            in one step.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Pull a single value from an aggregate</span>
-<span class="kw">let</span> total = <span class="fn-name">scalar</span>(
-    prices[<span class="kw">select</span> { total = <span class="fn-name">sum</span>(price) }],
-    total
-);
-
-<span class="cm">// Use it in subsequent expressions</span>
-prices[<span class="kw">update</span> { weight = price <span class="op">/</span> total }];</code></pre>
-<pre style="margin-top: 0.6rem;"><code><span class="cm"># Compile and run in one step</span>
-scripts/ibex-run.sh examples/quant.ibex</code></pre>
-        </div>
-      </div>
-
-      <!-- 10. Stream -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Stream</span>
-          <h3>Continuous pipelines with no new syntax.</h3>
-          <p>
-            <code>Stream&nbsp;{&nbsp;}</code> wires a source extern, an anonymous
-            transform block, and a sink extern into a continuous event loop.
-            The transform is written in plain Ibex — the same clauses used
-            for batch queries.
-          </p>
-          <p>
-            When the transform contains <code>resample</code>, the runtime
-            automatically switches to <strong>TimeBucket</strong> mode:
-            it buffers rows and emits one output batch per closed time bucket.
-            Otherwise it operates <strong>PerRow</strong>, forwarding each
-            incoming batch immediately.
-          </p>
-          <p>
-            In <strong>TimeBucket</strong> mode the bucket is flushed by
-            whichever trigger fires first: a <em>wall-clock check</em> (the
-            configured duration has elapsed since the bucket opened) or a
-            <em>data-timestamp check</em> (an incoming row carries a later
-            bucket's timestamp). The wall-clock trigger gives prompt delivery
-            for real-time feeds; the data-timestamp trigger handles historical
-            replay correctly.
-          </p>
-          <p class="note">
-            <strong>Source timeout contract:</strong> the wall-clock check
-            runs only when the source call returns. Sources should use a short
-            internal timeout and return <code>StreamTimeout{}</code> when no
-            data arrives — the runtime fires the flush check and immediately
-            calls the source again. Ibex does not buffer data on behalf of the
-            source; whether messages arriving during this window are preserved
-            depends on the transport. For OS kernel-backed sockets (UDP, TCP)
-            the kernel's receive buffer holds packets safely. For user-space
-            transports use <code>StreamBuffered</code> (see below).
-          </p>
-          <p>
-            Use <code>import</code> to load a library stub that registers
-            the extern source and sink functions as a plugin.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Load the UDP plugin (registers udp_recv / udp_send)</span>
-<span class="kw">import</span> <span class="str">"udp"</span>;
-
-<span class="cm">// Receive ticks, resample to 1-minute OHLC bars, forward over UDP</span>
-<span class="kw">let</span> ohlc_stream = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
-    transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
-        open  = <span class="fn-name">first</span>(price),
-        high  = <span class="fn-name">max</span>(price),
-        low   = <span class="fn-name">min</span>(price),
-        close = <span class="fn-name">last</span>(price)
-    }],
-    sink = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
-};
-
-<span class="cm">// PerRow stream: forward filtered rows with no buffering</span>
-<span class="kw">let</span> live_filter = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
-    transform = [<span class="kw">filter</span> price &gt; <span class="num">100.0</span>, <span class="kw">rename</span> p = price],
-    sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9003</span>)
-};</code></pre>
-<pre style="margin-top:0.6rem;"><code><span class="cm">// WebSocket sink: push OHLC bars to browser dashboards</span>
-<span class="kw">import</span> <span class="str">"websocket"</span>;
-
-<span class="kw">let</span> ws_stream = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
-    transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
-        open  = <span class="fn-name">first</span>(price),
-        high  = <span class="fn-name">max</span>(price),
-        low   = <span class="fn-name">min</span>(price),
-        close = <span class="fn-name">last</span>(price)
-    }],
-    <span class="cm">// ws_send starts a TCP listener; browsers connect with new WebSocket("ws://…")</span>
-    sink = <span class="fn-name">ws_send</span>(<span class="num">8080</span>)
-};</code></pre>
-        </div>
-      </div>
-
-      <!-- 11. StreamBuffered -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">StreamBuffered</span>
-          <h3>A ready-made producer queue for in-process sources.</h3>
-          <p>
-            For in-process or user-space transports the plugin needs a
-            thread-safe queue between its producer and the Ibex event loop.
-            <code>StreamBuffered</code> provides one out of the box — a lockless
-            SPSC ring buffer paired with a compatible <code>ExternFn</code> —
-            so the plugin author doesn't have to implement their own.
-          </p>
-          <p>
-            Use <code>make_buffered_source(producer_fn)</code> to let the Ibex
-            query control the capacity: the plugin only supplies the
-            data-production logic; the ring is lazily initialised on the first
-            event-loop call using the <code>capacity</code> argument from the
-            query. A <strong>producer thread</strong> is started at that point,
-            calls <code>buf.write(table)</code> (blocking on backpressure), and
-            signals completion with <code>buf.close()</code>. The event loop
-            drains the ring, returning <code>StreamTimeout{}</code> when empty
-            so wall-clock bucket flushes still fire on schedule.
-          </p>
-          <p>
-            Cache-line-separated <code>std::atomic</code> head and tail indices
-            keep producer and consumer on independent cache lines — no false
-            sharing, no mutex on the hot path.
-          </p>
-          <p class="note">
-            <strong>When to use each approach:</strong> for UDP/TCP sockets the
-            OS kernel already manages a receive buffer (<code>SO_RCVBUF</code>)
-            independently of the application — no application-level queue is
-            needed. Return <code>StreamTimeout{}</code> directly from
-            <code>recvfrom</code> with a short socket timeout instead.
-            <code>StreamBuffered</code> is for in-process queues, shared-memory
-            channels, or any transport without a kernel-managed receive buffer.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// C++ plugin — only the data-production logic</span>
-<span class="kw">#include</span> &lt;ibex/runtime/stream_buffered.hpp&gt;
-
-registry.register_table(<span class="str">"my_src"</span>,
-    ibex::runtime::make_buffered_source([](ibex::runtime::StreamBuffered&amp; buf) {
-        <span class="kw">for</span> (<span class="kw">auto</span>&amp; batch : my_data_source) {
-            buf.write(batch);  <span class="cm">// yields if ring full</span>
-        }
-        buf.close();
-    }));</code></pre>
-<pre style="margin-top:0.6rem;"><code><span class="cm">// Ibex query — capacity is a first-class tuning parameter</span>
-<span class="kw">extern fn</span> my_src(capacity: Int) -&gt; TimeFrame <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
-<span class="kw">extern fn</span> my_sink(df: DataFrame) -&gt; Int <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
-
-Stream {
-    source    = <span class="fn-name">my_src</span>(<span class="num">512</span>),
-    transform = [<span class="kw">resample</span> <span class="num">1s</span>, <span class="kw">select</span> { close = <span class="fn-name">last</span>(price) }],
-    sink      = <span class="fn-name">my_sink</span>()
-};</code></pre>
-        </div>
-      </div>
-
-      <!-- 12. Model Specification -->
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Model Specification</span>
-          <h3>R-style formula syntax for regression, built into the query bracket.</h3>
-          <p>
-            The <code>model</code> clause lets you fit OLS, ridge, WLS, or the
-            plugin-backed <code>lightgbm</code> method
-            regressions with a familiar <code>y&nbsp;~&nbsp;x1&nbsp;+&nbsp;x2</code>
-            formula. Ibex builds the design matrix automatically — numeric columns
-            pass through, categorical columns are dummy-encoded, and interaction
-            terms (<code>:</code>) and crossing (<code>*</code>) expand just like in R.
-          </p>
-          <p>
-            Results are accessed via S3-style accessor functions:
-            <code>model_coef</code>, <code>model_summary</code>,
-            <code>model_fitted</code>, <code>model_residuals</code>,
-            <code>model_importance</code>, and
-            <code>model_r_squared</code>. The <code>method&nbsp;=</code> parameter
-            is optional and defaults to <code>ols</code>; it also supports
-            built-ins (<code>ols</code>, <code>ridge</code>,
-            <code>wls</code>) plus plugin methods registered by name. The bundled
-            <code>lightgbm</code> plugin links real Microsoft LightGBM and trains
-            gradient-boosted trees — use <code>model_fitted</code> for in-sample
-            predictions, <code>model_importance</code> for per-feature gains, and
-            <code>model_predict(m,&nbsp;newdata)</code> to score new data by
-            reusing the trained model.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// OLS with filter — all in one bracket</span>
-<span class="kw">let</span> m = prices[
-    <span class="kw">filter</span> volume &gt; <span class="num">1000000</span>,
-    <span class="kw">model</span> { close ~ open + high + low }
-];
-
-<span class="cm">// Accessor functions for detailed results</span>
-<span class="kw">let</span> coefs = <span class="fn-name">model_coef</span>(m);
-<span class="kw">let</span> stats = <span class="fn-name">model_summary</span>(m);
-<span class="kw">let</span> r2    = <span class="fn-name">model_r_squared</span>(m);</code></pre>
-<pre style="margin-top:0.6rem;"><code><span class="cm">// Ridge regression with L2 penalty</span>
-<span class="kw">let</span> ridge = prices[<span class="kw">model</span> {
-    close ~ open + volume,
-    method = ridge,
-    lambda = <span class="num">0.1</span>
-}];
-
-<span class="cm">// Real LightGBM gradient-boosted trees (load plugin first)</span>
-<span class="kw">import</span> <span class="str">"lightgbm"</span>;
-<span class="kw">let</span> boosted = prices[<span class="kw">model</span> {
-    close ~ open + high + low + volume,
-    method = lightgbm,
-    iterations = <span class="num">300</span>,
-    learning_rate = <span class="num">0.03</span>
-}];
-<span class="kw">let</span> preds = <span class="fn-name">model_fitted</span>(boosted);      <span class="cm">// in-sample predictions</span>
-<span class="kw">let</span> gains = <span class="fn-name">model_importance</span>(boosted);  <span class="cm">// term | gain</span>
-<span class="kw">let</span> scored = <span class="fn-name">model_predict</span>(boosted, new_prices);  <span class="cm">// score new data</span></code></pre>
-        </div>
-      </div>
-
-    </div><!-- .tour -->
-  </section>
-
-  <!-- Performance -->
-  <section class="section">
-    <p class="section-label">Performance</p>
-    <h2>Single-core speed that stays visible at scale</h2>
-    <p class="section-sub">
-      Latest AWS run, 2026-05-31, on r7i.2xlarge Sapphire Rapids hardware.
-      Ibex is single-threaded; Polars, DuckDB, DataFusion, and ClickHouse use
-      all 8 vCPUs where their engines do so by default. The full interactive
-      table is on the <a href="./benchmarks.html">benchmarks page</a>.
-    </p>
-
-    <div class="bench-grid">
-
-      <!-- Aggregation -->
-      <div class="card">
-        <p class="bench-title">Aggregation &mdash; 16 M rows</p>
-        <div class="bench-wrap">
-          <table class="bench">
-            <thead>
-              <tr>
-                <th>Query</th>
-                <th>Ibex</th>
-                <th>Polars</th>
-                <th>Polars ST</th>
-                <th>DuckDB</th>
-                <th>DataFusion</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr class="win">
-                <td>mean by symbol</td>
-                <td class="ibex">32.4 ms</td>
-                <td>51.9 ms</td>
-                <td>184 ms</td>
-                <td>59.2 ms</td>
-                <td>33.5 ms</td>
-              </tr>
-              <tr class="win">
-                <td>count by sym&times;day</td>
-                <td class="ibex">28.5 ms</td>
-                <td>200 ms</td>
-                <td>617 ms</td>
-                <td>65.2 ms</td>
-                <td>47.3 ms</td>
-              </tr>
-              <tr class="win">
-                <td>mean by sym&times;day</td>
-                <td class="ibex">37.0 ms</td>
-                <td>236 ms</td>
-                <td>818 ms</td>
-                <td>67.5 ms</td>
-                <td>49.6 ms</td>
-              </tr>
-              <tr class="win">
-                <td>OHLC by sym&times;day</td>
-                <td class="ibex">68.2 ms</td>
-                <td>264 ms</td>
-                <td>938 ms</td>
-                <td>96.4 ms</td>
-                <td>155 ms</td>
-              </tr>
-              <tr>
-                <td>sum by user (100K str)</td>
-                <td class="ibex">117 ms</td>
-                <td>268 ms</td>
-                <td>943 ms</td>
-                <td>173 ms</td>
-                <td>108 ms</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="bench-note">
-          Ibex wins the common low-cardinality and time-bucketed aggregation
-          cases on one core. DataFusion and ClickHouse still win selected wide
-          or highly parallel cells in the full suite.
-        </p>
-      </div>
-
-      <!-- TimeFrame -->
-      <div class="card">
-        <p class="bench-title">TimeFrame &mdash; 16 M rows, 1 s spacing</p>
-        <div class="bench-wrap">
-          <table class="bench">
-            <thead>
-              <tr>
-                <th>Operation</th>
-                <th>Ibex</th>
-                <th>Polars</th>
-                <th>Polars ST</th>
-                <th>DuckDB</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr class="win">
-                <td>rolling count 1m</td>
-                <td class="ibex">42.8 ms</td>
-                <td>65.2 ms</td>
-                <td>186 ms</td>
-                <td>488 ms</td>
-              </tr>
-              <tr class="win">
-                <td>rolling sum 1m</td>
-                <td class="ibex">51.6 ms</td>
-                <td>130 ms</td>
-                <td>240 ms</td>
-                <td>1.15 s</td>
-              </tr>
-              <tr class="win">
-                <td>rolling mean 5m</td>
-                <td class="ibex">58.2 ms</td>
-                <td>136 ms</td>
-                <td>244 ms</td>
-                <td>1.30 s</td>
-              </tr>
-              <tr class="win">
-                <td>rolling median 1m</td>
-                <td class="ibex">1.14 s</td>
-                <td>2.77 s</td>
-                <td>2.87 s</td>
-                <td>5.32 s</td>
-              </tr>
-              <tr class="win">
-                <td>rolling std 1m</td>
-                <td class="ibex">203 ms</td>
-                <td>280 ms</td>
-                <td>387 ms</td>
-                <td>1.04 s</td>
-              </tr>
-              <tr>
-                <td>resample 1m OHLC</td>
-                <td class="ibex">373 ms</td>
-                <td>85.8 ms</td>
-                <td>107 ms</td>
-                <td>236 ms</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="bench-note">
-          Rolling operations use a two-pointer O(n) scan with a single result-column
-          allocation. Resample is the known weak spot here: Polars'
-          <code>group_by_dynamic</code> is much faster on this query.
-        </p>
       </div>
 
     </div>
   </section>
 
-  <!-- Editor support -->
+  <!-- Where next -->
   <section class="section">
-    <p class="section-label">Editor support</p>
-    <h2>Syntax highlighting for VS Code</h2>
-    <p class="section-sub">
-      A TextMate grammar covering keywords, types, built-in functions, duration
-      literals, backtick-quoted column names, and comments.
-    </p>
-    <div class="steps" style="margin-top: 1rem;">
-      <div>
-        <p class="step-label">Install &mdash; WSL</p>
-<pre><code>cp -r editors/vscode \
-  /mnt/c/Users/&lt;username&gt;/.vscode/extensions/ibex-language-0.1.0</code></pre>
-      </div>
-      <div>
-        <p class="step-label">Install &mdash; macOS / native Linux</p>
-<pre><code>cp -r editors/vscode \
-  ~/.vscode/extensions/ibex-language-0.1.0</code></pre>
-      </div>
+    <p class="section-label">Where to go next</p>
+    <h2>Keep going</h2>
+    <div class="grid-3">
+      <article class="card">
+        <h3><a href="./benchmarks.html">Benchmarks</a></h3>
+        <p>Interactive timings and memory use against Polars, DuckDB, ClickHouse, DataFusion, pandas, and R.</p>
+      </article>
+      <article class="card">
+        <h3><a href="./comparison.html">Comparison</a></h3>
+        <p>The same query in Ibex, pandas, Polars, and SQL, side by side.</p>
+      </article>
+      <article class="card">
+        <h3><a href="./reference.html">Reference</a></h3>
+        <p>A guided walk through every clause, with runnable snippets for deeper evaluation.</p>
+      </article>
+      <article class="card">
+        <h3><a href="./io.html">I/O guide</a></h3>
+        <p>CSV, Parquet, SQLite via ADBC, and Kafka streaming into live dashboards.</p>
+      </article>
+      <article class="card">
+        <h3><a href="./functions.html">Function reference</a></h3>
+        <p>Every built-in function with signatures and behaviour notes.</p>
+      </article>
+      <article class="card">
+        <h3><a href="./cheatsheet.html">Cheat sheet</a></h3>
+        <p>One-page syntax and function reference once you know what you are looking for.</p>
+      </article>
     </div>
-    <p style="margin-top: 0.8rem; color: var(--muted); font-size: 0.91rem;">
-      Fully restart VS Code after copying. <code>.ibex</code> files are highlighted automatically.
-    </p>
   </section>
 
   <!-- Footer -->

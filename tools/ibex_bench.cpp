@@ -24,6 +24,7 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <csv.hpp>
 #include <fstream>
 #include <limits>
@@ -31,9 +32,14 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <random>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -989,6 +995,85 @@ void print_bench_line(std::string_view name, std::size_t iters, const BenchStats
 
 volatile std::uint64_t g_bench_sink = 0;
 
+auto pack_filter_micro_word_scalar(const std::uint8_t* mp, std::size_t lim) noexcept
+    -> std::uint64_t {
+    std::uint64_t bits = 0;
+    for (std::size_t i = 0; i < lim; ++i) {
+        bits |= static_cast<std::uint64_t>(mp[i] != 0) << i;
+    }
+    return bits;
+}
+
+#if defined(__AVX2__)
+auto pack_filter_micro_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp));
+    const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + 32));
+    const auto lo_bits =
+        static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(lo, zero)));
+    const auto hi_bits =
+        static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(hi, zero)));
+    return static_cast<std::uint64_t>(lo_bits) | (static_cast<std::uint64_t>(hi_bits) << 32);
+}
+#endif
+
+auto pack_filter_micro_mask(const std::vector<std::uint8_t>& mask,
+                            std::vector<std::uint64_t>& keep_words) -> std::size_t {
+    const std::size_t n = mask.size();
+    const std::size_t n_words = (n + 63) / 64;
+    keep_words.assign(n_words, 0);
+    std::size_t kept = 0;
+    for (std::size_t w = 0; w < n_words; ++w) {
+        const std::size_t base = w * 64;
+        const std::size_t lim = std::min<std::size_t>(64, n - base);
+#if defined(__AVX2__)
+        const std::uint64_t bits = (lim == 64)
+                                       ? pack_filter_micro_word_avx2(mask.data() + base)
+                                       : pack_filter_micro_word_scalar(mask.data() + base, lim);
+#else
+        const std::uint64_t bits = pack_filter_micro_word_scalar(mask.data() + base, lim);
+#endif
+        keep_words[w] = bits;
+        kept += static_cast<std::size_t>(std::popcount(bits));
+    }
+    return kept;
+}
+
+auto build_filter_micro_indices(const std::vector<std::uint64_t>& keep_words, std::size_t out_n)
+    -> std::vector<std::size_t> {
+    std::vector<std::size_t> indices;
+    indices.reserve(out_n);
+    for (std::size_t w = 0; w < keep_words.size(); ++w) {
+        std::uint64_t bits = keep_words[w];
+        const std::size_t base = w * 64;
+        while (bits != 0) {
+            const int bit = std::countr_zero(bits);
+            indices.push_back(base + static_cast<std::size_t>(bit));
+            bits &= bits - 1;
+        }
+    }
+    return indices;
+}
+
+template <typename T>
+auto digest_primitive_column(const ibex::Column<T>& col) -> std::uint64_t {
+    if (col.size() == 0) {
+        return 0;
+    }
+    const std::size_t mid = col.size() / 2;
+    auto value_bits = [](T value) -> std::uint64_t {
+        if constexpr (std::is_floating_point_v<T>) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &value, sizeof(value));
+            return bits;
+        } else {
+            return static_cast<std::uint64_t>(value);
+        }
+    };
+    return value_bits(col[0]) ^ (value_bits(col[mid]) << 1) ^
+           (value_bits(col[col.size() - 1]) << 2) ^ static_cast<std::uint64_t>(col.size());
+}
+
 template <typename Fn>
 auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
                                  std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
@@ -1239,6 +1324,7 @@ int main(int argc, char** argv) {
     std::size_t merge_validity_rows = 4'000'000;
     std::size_t rng_micro_rows = 4'000'000;
     std::size_t bool_rows = 4'000'000;
+    std::size_t filter_micro_rows = 0;
     std::vector<std::string> suites;
 
     app.add_option("--csv", csv_path, "CSV file path (symbol, price)")->check(CLI::ExistingFile);
@@ -1286,18 +1372,22 @@ int main(int argc, char** argv) {
     app.add_option("--bool-rows", bool_rows,
                    "Row count for bool-column benchmark suite (default: 4000000)")
         ->check(CLI::PositiveNumber);
+    app.add_option("--filter-micro-rows", filter_micro_rows,
+                   "Rows from csv-trades to use for filter_micro; 0 = all rows (default)")
+        ->check(CLI::NonNegativeNumber);
     app.add_option("--suite", suites,
                    "Benchmark suite(s) to run (comma-separated or repeated). "
                    "Supported: all, core, cumulative, rng, fill, null, filter, multi, "
-                   "events, reshape, timeframe, merge_validity, rng_micro, bool")
+                   "events, reshape, timeframe, merge_validity, rng_micro, bool, filter_micro")
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
-        "all",   "core",   "cumulative", "rng",       "fill",           "null",      "filter",
-        "multi", "events", "reshape",    "timeframe", "merge_validity", "rng_micro", "bool"};
+        "all",       "core",           "cumulative", "rng",    "fill",
+        "null",      "filter",         "multi",      "events", "reshape",
+        "timeframe", "merge_validity", "rng_micro",  "bool",   "filter_micro"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -1317,7 +1407,8 @@ int main(int argc, char** argv) {
             return false;
         }
         // Keep legacy --suite all behavior stable; micro suites are opt-in.
-        return suite != "merge_validity" && suite != "rng_micro" && suite != "bool";
+        return suite != "merge_validity" && suite != "rng_micro" && suite != "bool" &&
+               suite != "filter_micro";
     };
 
     int status = 0;
@@ -1603,6 +1694,473 @@ int main(int argc, char** argv) {
             if (status != 0) {
                 break;
             }
+        }
+    }
+
+    // Filter micro benchmarks: split predicate evaluation, mask packing, index
+    // materialization, and output gather so full filter timings are easier to
+    // attribute. These intentionally use the same trades.csv column shape as the
+    // filter suite but bypass the interpreter.
+    if (status == 0 && run_suite("filter_micro") && !csv_trades_path.empty()) {
+        ibex::runtime::Table trades_table;
+        try {
+            trades_table = read_csv(csv_trades_path);
+        } catch (const std::exception& e) {
+            fmt::print("error: failed to read trades CSV: {}\n", e.what());
+            return 1;
+        }
+        if (print_types) {
+            print_table_types("trades", trades_table);
+        }
+
+        const auto* price_value = trades_table.find("price");
+        const auto* qty_value = trades_table.find("qty");
+        const auto* symbol_value = trades_table.find("symbol");
+        const auto* price_col =
+            price_value == nullptr ? nullptr : std::get_if<ibex::Column<double>>(price_value);
+        const auto* qty_col =
+            qty_value == nullptr ? nullptr : std::get_if<ibex::Column<std::int64_t>>(qty_value);
+        if (price_col == nullptr || qty_col == nullptr || symbol_value == nullptr) {
+            fmt::print(
+                "error: filter_micro requires trades columns symbol, price:Double, qty:Int\n");
+            return 1;
+        }
+
+        const std::size_t n = filter_micro_rows == 0
+                                  ? trades_table.rows()
+                                  : std::min<std::size_t>(filter_micro_rows, trades_table.rows());
+        const double* price = price_col->data();
+        const std::int64_t* qty = qty_col->data();
+        std::vector<std::uint8_t> scratch_mask(n);
+
+        auto digest_mask = [&](const std::vector<std::uint8_t>& mask,
+                               std::size_t count) -> std::uint64_t {
+            if (mask.empty()) {
+                return 0;
+            }
+            return static_cast<std::uint64_t>(count) ^ (static_cast<std::uint64_t>(mask[0]) << 1) ^
+                   (static_cast<std::uint64_t>(mask[mask.size() / 2]) << 2) ^
+                   (static_cast<std::uint64_t>(mask[mask.size() - 1]) << 3);
+        };
+
+        auto fill_simple_mask = [&]() -> std::size_t {
+            std::size_t count = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto keep = static_cast<std::uint8_t>(price[i] > 500.0);
+                scratch_mask[i] = keep;
+                count += keep;
+            }
+            return count;
+        };
+        auto fill_and_mask = [&]() -> std::size_t {
+            std::size_t count = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto keep = static_cast<std::uint8_t>((price[i] > 500.0) & (qty[i] < 100));
+                scratch_mask[i] = keep;
+                count += keep;
+            }
+            return count;
+        };
+        auto fill_arith_mask = [&]() -> std::size_t {
+            std::size_t count = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto keep =
+                    static_cast<std::uint8_t>((price[i] * static_cast<double>(qty[i])) > 50000.0);
+                scratch_mask[i] = keep;
+                count += keep;
+            }
+            return count;
+        };
+        auto fill_or_mask = [&]() -> std::size_t {
+            std::size_t count = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto keep = static_cast<std::uint8_t>((price[i] > 900.0) | (qty[i] < 10));
+                scratch_mask[i] = keep;
+                count += keep;
+            }
+            return count;
+        };
+
+        fmt::print("\n-- Filter micro benchmarks ({} rows) --\n", n);
+        status = run_scalar_kernel_benchmark("filter_micro_mask_simple", n, warmup_iters, iters,
+                                             [&]() -> std::uint64_t {
+                                                 const auto count = fill_simple_mask();
+                                                 return digest_mask(scratch_mask, count);
+                                             });
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark("filter_micro_mask_and", n, warmup_iters, iters,
+                                                 [&]() -> std::uint64_t {
+                                                     const auto count = fill_and_mask();
+                                                     return digest_mask(scratch_mask, count);
+                                                 });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark("filter_micro_mask_arith", n, warmup_iters, iters,
+                                                 [&]() -> std::uint64_t {
+                                                     const auto count = fill_arith_mask();
+                                                     return digest_mask(scratch_mask, count);
+                                                 });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark("filter_micro_mask_or", n, warmup_iters, iters,
+                                                 [&]() -> std::uint64_t {
+                                                     const auto count = fill_or_mask();
+                                                     return digest_mask(scratch_mask, count);
+                                                 });
+        }
+
+        std::vector<std::uint8_t> simple_mask(n);
+        std::vector<std::uint8_t> arith_mask(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            simple_mask[i] = static_cast<std::uint8_t>(price[i] > 500.0);
+            arith_mask[i] =
+                static_cast<std::uint8_t>((price[i] * static_cast<double>(qty[i])) > 50000.0);
+        }
+        std::vector<std::uint64_t> simple_words;
+        std::vector<std::uint64_t> arith_words;
+        const std::size_t simple_out = pack_filter_micro_mask(simple_mask, simple_words);
+        const std::size_t arith_out = pack_filter_micro_mask(arith_mask, arith_words);
+        const auto simple_indices = build_filter_micro_indices(simple_words, simple_out);
+        const auto arith_indices = build_filter_micro_indices(arith_words, arith_out);
+
+        std::vector<std::uint64_t> scratch_words;
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_pack_simple", n, warmup_iters, iters, [&]() -> std::uint64_t {
+                    const auto count = pack_filter_micro_mask(simple_mask, scratch_words);
+                    return static_cast<std::uint64_t>(count) ^
+                           static_cast<std::uint64_t>(scratch_words.size());
+                });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_pack_arith", n, warmup_iters, iters, [&]() -> std::uint64_t {
+                    const auto count = pack_filter_micro_mask(arith_mask, scratch_words);
+                    return static_cast<std::uint64_t>(count) ^
+                           static_cast<std::uint64_t>(scratch_words.size());
+                });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_index_simple", simple_out, warmup_iters, iters,
+                [&]() -> std::uint64_t {
+                    auto idx = build_filter_micro_indices(simple_words, simple_out);
+                    return idx.empty() ? 0 : static_cast<std::uint64_t>(idx.front() ^ idx.back());
+                });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_index_arith", arith_out, warmup_iters, iters, [&]() -> std::uint64_t {
+                    auto idx = build_filter_micro_indices(arith_words, arith_out);
+                    return idx.empty() ? 0 : static_cast<std::uint64_t>(idx.front() ^ idx.back());
+                });
+        }
+
+        auto gather_price = [&](const std::vector<std::size_t>& indices) -> std::uint64_t {
+            ibex::Column<double> out;
+            out.resize(indices.size());
+            auto* dst = out.data();
+            for (std::size_t i = 0; i < indices.size(); ++i) {
+                dst[i] = price[indices[i]];
+            }
+            return digest_primitive_column(out);
+        };
+        auto gather_qty = [&](const std::vector<std::size_t>& indices) -> std::uint64_t {
+            ibex::Column<std::int64_t> out;
+            out.resize(indices.size());
+            auto* dst = out.data();
+            for (std::size_t i = 0; i < indices.size(); ++i) {
+                dst[i] = qty[indices[i]];
+            }
+            return digest_primitive_column(out);
+        };
+        auto gather_price_words = [&](const std::vector<std::uint64_t>& keep_words,
+                                      std::size_t out_n) -> std::uint64_t {
+            ibex::Column<double> out;
+            out.resize(out_n);
+            auto* dst = out.data();
+            std::size_t j = 0;
+            for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                std::uint64_t bits = keep_words[w];
+                const std::size_t base = w * 64;
+                while (bits != 0) {
+                    const int bit = std::countr_zero(bits);
+                    dst[j++] = price[base + static_cast<std::size_t>(bit)];
+                    bits &= bits - 1;
+                }
+            }
+            return digest_primitive_column(out);
+        };
+        auto gather_qty_words = [&](const std::vector<std::uint64_t>& keep_words,
+                                    std::size_t out_n) -> std::uint64_t {
+            ibex::Column<std::int64_t> out;
+            out.resize(out_n);
+            auto* dst = out.data();
+            std::size_t j = 0;
+            for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                std::uint64_t bits = keep_words[w];
+                const std::size_t base = w * 64;
+                while (bits != 0) {
+                    const int bit = std::countr_zero(bits);
+                    dst[j++] = qty[base + static_cast<std::size_t>(bit)];
+                    bits &= bits - 1;
+                }
+            }
+            return digest_primitive_column(out);
+        };
+        auto gather_symbol = [&](const std::vector<std::size_t>& indices) -> std::uint64_t {
+            if (const auto* cat = std::get_if<ibex::Column<ibex::Categorical>>(symbol_value)) {
+                ibex::Column<ibex::Categorical> out(cat->dictionary_ptr(), cat->index_ptr());
+                out.resize(indices.size());
+                const auto* src = cat->codes_data();
+                auto* dst = out.codes_data();
+                for (std::size_t i = 0; i < indices.size(); ++i) {
+                    dst[i] = src[indices[i]];
+                }
+                if (out.size() == 0) {
+                    return std::uint64_t{0};
+                }
+                return static_cast<std::uint64_t>(out.code_at(0)) ^
+                       (static_cast<std::uint64_t>(out.code_at(out.size() / 2)) << 1) ^
+                       (static_cast<std::uint64_t>(out.code_at(out.size() - 1)) << 2) ^
+                       static_cast<std::uint64_t>(out.size());
+            }
+            const auto* str = std::get_if<ibex::Column<std::string>>(symbol_value);
+            if (str == nullptr) {
+                return std::uint64_t{0};
+            }
+            const auto* src_off = str->offsets_data();
+            std::size_t total_chars = 0;
+            for (const auto si : indices) {
+                total_chars += src_off[si + 1] - src_off[si];
+            }
+            ibex::Column<std::string> out;
+            out.resize_for_gather(indices.size(), total_chars);
+            auto* dst_off = out.offsets_data();
+            auto* dst_chars = out.chars_data();
+            const auto* src_chars = str->chars_data();
+            dst_off[0] = 0;
+            std::uint32_t cur = 0;
+            for (std::size_t i = 0; i < indices.size(); ++i) {
+                const auto si = indices[i];
+                const auto len = src_off[si + 1] - src_off[si];
+                std::memcpy(dst_chars + cur, src_chars + src_off[si], len);
+                cur += len;
+                dst_off[i + 1] = cur;
+            }
+            return static_cast<std::uint64_t>(out.size()) ^
+                   (static_cast<std::uint64_t>(total_chars) << 1);
+        };
+        auto gather_symbol_words = [&](const std::vector<std::uint64_t>& keep_words,
+                                       std::size_t out_n) -> std::uint64_t {
+            if (const auto* cat = std::get_if<ibex::Column<ibex::Categorical>>(symbol_value)) {
+                ibex::Column<ibex::Categorical> out(cat->dictionary_ptr(), cat->index_ptr());
+                out.resize(out_n);
+                const auto* src = cat->codes_data();
+                auto* dst = out.codes_data();
+                std::size_t j = 0;
+                for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                    std::uint64_t bits = keep_words[w];
+                    const std::size_t base = w * 64;
+                    while (bits != 0) {
+                        const int bit = std::countr_zero(bits);
+                        dst[j++] = src[base + static_cast<std::size_t>(bit)];
+                        bits &= bits - 1;
+                    }
+                }
+                if (out.size() == 0) {
+                    return std::uint64_t{0};
+                }
+                return static_cast<std::uint64_t>(out.code_at(0)) ^
+                       (static_cast<std::uint64_t>(out.code_at(out.size() / 2)) << 1) ^
+                       (static_cast<std::uint64_t>(out.code_at(out.size() - 1)) << 2) ^
+                       static_cast<std::uint64_t>(out.size());
+            }
+            const auto* str = std::get_if<ibex::Column<std::string>>(symbol_value);
+            if (str == nullptr) {
+                return std::uint64_t{0};
+            }
+            const auto* src_off = str->offsets_data();
+            std::size_t total_chars = 0;
+            for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                std::uint64_t bits = keep_words[w];
+                const std::size_t base = w * 64;
+                while (bits != 0) {
+                    const int bit = std::countr_zero(bits);
+                    const std::size_t si = base + static_cast<std::size_t>(bit);
+                    total_chars += src_off[si + 1] - src_off[si];
+                    bits &= bits - 1;
+                }
+            }
+            ibex::Column<std::string> out;
+            out.resize_for_gather(out_n, total_chars);
+            auto* dst_off = out.offsets_data();
+            auto* dst_chars = out.chars_data();
+            const auto* src_chars = str->chars_data();
+            dst_off[0] = 0;
+            std::uint32_t cur = 0;
+            std::size_t j = 0;
+            for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                std::uint64_t bits = keep_words[w];
+                const std::size_t base = w * 64;
+                while (bits != 0) {
+                    const int bit = std::countr_zero(bits);
+                    const std::size_t si = base + static_cast<std::size_t>(bit);
+                    const auto len = src_off[si + 1] - src_off[si];
+                    std::memcpy(dst_chars + cur, src_chars + src_off[si], len);
+                    cur += len;
+                    dst_off[++j] = cur;
+                    bits &= bits - 1;
+                }
+            }
+            return static_cast<std::uint64_t>(out.size()) ^
+                   (static_cast<std::uint64_t>(total_chars) << 1);
+        };
+        auto gather_all = [&](const std::vector<std::size_t>& indices) -> std::uint64_t {
+            return gather_symbol(indices) ^ (gather_price(indices) << 1) ^
+                   (gather_qty(indices) << 2);
+        };
+        auto gather_all_words = [&](const std::vector<std::uint64_t>& keep_words,
+                                    std::size_t out_n) -> std::uint64_t {
+            return gather_symbol_words(keep_words, out_n) ^
+                   (gather_price_words(keep_words, out_n) << 1) ^
+                   (gather_qty_words(keep_words, out_n) << 2);
+        };
+        auto gather_all_combined_words = [&](const std::vector<std::uint64_t>& keep_words,
+                                             std::size_t out_n) -> std::uint64_t {
+            ibex::Column<double> price_out;
+            ibex::Column<std::int64_t> qty_out;
+            price_out.resize(out_n);
+            qty_out.resize(out_n);
+            auto* price_dst = price_out.data();
+            auto* qty_dst = qty_out.data();
+
+            if (const auto* cat = std::get_if<ibex::Column<ibex::Categorical>>(symbol_value)) {
+                ibex::Column<ibex::Categorical> symbol_out(cat->dictionary_ptr(), cat->index_ptr());
+                symbol_out.resize(out_n);
+                const auto* symbol_src = cat->codes_data();
+                auto* symbol_dst = symbol_out.codes_data();
+                std::size_t j = 0;
+                for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                    std::uint64_t bits = keep_words[w];
+                    const std::size_t base = w * 64;
+                    while (bits != 0) {
+                        const int bit = std::countr_zero(bits);
+                        const std::size_t si = base + static_cast<std::size_t>(bit);
+                        symbol_dst[j] = symbol_src[si];
+                        price_dst[j] = price[si];
+                        qty_dst[j] = qty[si];
+                        ++j;
+                        bits &= bits - 1;
+                    }
+                }
+                const auto symbol_digest =
+                    symbol_out.size() == 0
+                        ? std::uint64_t{0}
+                        : static_cast<std::uint64_t>(symbol_out.code_at(0)) ^
+                              (static_cast<std::uint64_t>(symbol_out.code_at(symbol_out.size() / 2))
+                               << 1) ^
+                              (static_cast<std::uint64_t>(symbol_out.code_at(symbol_out.size() - 1))
+                               << 2) ^
+                              static_cast<std::uint64_t>(symbol_out.size());
+                return symbol_digest ^ (digest_primitive_column(price_out) << 1) ^
+                       (digest_primitive_column(qty_out) << 2);
+            }
+
+            const auto* str = std::get_if<ibex::Column<std::string>>(symbol_value);
+            if (str == nullptr) {
+                return (digest_primitive_column(price_out) << 1) ^
+                       (digest_primitive_column(qty_out) << 2);
+            }
+            const auto* src_off = str->offsets_data();
+            std::size_t total_chars = 0;
+            for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                std::uint64_t bits = keep_words[w];
+                const std::size_t base = w * 64;
+                while (bits != 0) {
+                    const int bit = std::countr_zero(bits);
+                    const std::size_t si = base + static_cast<std::size_t>(bit);
+                    total_chars += src_off[si + 1] - src_off[si];
+                    bits &= bits - 1;
+                }
+            }
+            ibex::Column<std::string> symbol_out;
+            symbol_out.resize_for_gather(out_n, total_chars);
+            auto* dst_off = symbol_out.offsets_data();
+            auto* dst_chars = symbol_out.chars_data();
+            const auto* src_chars = str->chars_data();
+            dst_off[0] = 0;
+            std::uint32_t cur = 0;
+            std::size_t j = 0;
+            for (std::size_t w = 0; w < keep_words.size(); ++w) {
+                std::uint64_t bits = keep_words[w];
+                const std::size_t base = w * 64;
+                while (bits != 0) {
+                    const int bit = std::countr_zero(bits);
+                    const std::size_t si = base + static_cast<std::size_t>(bit);
+                    const auto len = src_off[si + 1] - src_off[si];
+                    std::memcpy(dst_chars + cur, src_chars + src_off[si], len);
+                    cur += len;
+                    dst_off[++j] = cur;
+                    price_dst[j - 1] = price[si];
+                    qty_dst[j - 1] = qty[si];
+                    bits &= bits - 1;
+                }
+            }
+            return (static_cast<std::uint64_t>(symbol_out.size()) ^
+                    (static_cast<std::uint64_t>(total_chars) << 1)) ^
+                   (digest_primitive_column(price_out) << 1) ^
+                   (digest_primitive_column(qty_out) << 2);
+        };
+
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_price_simple", simple_out, warmup_iters, iters,
+                [&]() -> std::uint64_t { return gather_price(simple_indices); });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_qty_simple", simple_out, warmup_iters, iters,
+                [&]() -> std::uint64_t { return gather_qty(simple_indices); });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_symbol_simple", simple_out, warmup_iters, iters,
+                [&]() -> std::uint64_t { return gather_symbol(simple_indices); });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_all_simple", simple_out, warmup_iters, iters,
+                [&]() -> std::uint64_t { return gather_all(simple_indices); });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_all_simple_words", simple_out, warmup_iters, iters,
+                [&]() -> std::uint64_t { return gather_all_words(simple_words, simple_out); });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_all_simple_combined_words", simple_out, warmup_iters, iters,
+                [&]() -> std::uint64_t {
+                    return gather_all_combined_words(simple_words, simple_out);
+                });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_all_arith", arith_out, warmup_iters, iters,
+                [&]() -> std::uint64_t { return gather_all(arith_indices); });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_all_arith_words", arith_out, warmup_iters, iters,
+                [&]() -> std::uint64_t { return gather_all_words(arith_words, arith_out); });
+        }
+        if (status == 0) {
+            status = run_scalar_kernel_benchmark(
+                "filter_micro_gather_all_arith_combined_words", arith_out, warmup_iters, iters,
+                [&]() -> std::uint64_t {
+                    return gather_all_combined_words(arith_words, arith_out);
+                });
         }
     }
 

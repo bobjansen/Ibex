@@ -1,4 +1,5 @@
 #include <ibex/core/column.hpp>
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/repl/repl.hpp>
@@ -2075,6 +2076,19 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                       const runtime::ExternRegistry& externs)
     -> std::expected<runtime::ScalarValue, std::string>;
 
+// Evaluate a call to a "series function": an aggregate (max/sum/mean/… reducing a
+// series to a scalar) or a row-wise scalar builtin (abs/sqrt/pmax/… applied
+// element-wise when any argument is a series, else to scalars). Returns a
+// ScalarValue or, for an element-wise result, a ColumnValue. Precondition:
+// ir::is_aggregate_func(callee) || runtime::is_scalar_builtin(callee).
+auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
+                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                      ModelRegistry& models, const FunctionRegistry& functions,
+                      CompileTimeListRegistry& compile_time_lists,
+                      const ExternDeclRegistry& extern_decls,
+                      const runtime::ExternRegistry& externs)
+    -> std::expected<EvalValue, std::string>;
+
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
                         ModelRegistry& models, const FunctionRegistry& functions,
@@ -2292,15 +2306,13 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return EvalValue{std::move(table.value())};
         }
-        // Row-wise scalar builtins (sqrt/sin/log10/abs/…) yield a scalar; route
-        // to the scalar evaluator rather than treating the call as a table.
-        if (runtime::is_scalar_builtin(call->callee)) {
-            auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
-                                           compile_time_lists, extern_decls, externs);
-            if (!scalar) {
-                return std::unexpected(scalar.error());
-            }
-            return EvalValue{std::move(scalar.value())};
+        // Series functions: aggregates over a series (max/sum/mean/… -> scalar)
+        // and row-wise scalar builtins (sqrt/abs/pmax/… -> scalar, or a series
+        // when applied element-wise to series arguments). Routed here rather than
+        // treated as a table function.
+        if (ir::is_aggregate_func(call->callee) || runtime::is_scalar_builtin(call->callee)) {
+            return eval_series_call(*call, tables, scalars, columns, models, functions,
+                                    compile_time_lists, extern_decls, externs);
         }
     }
     auto table = eval_table_expr(expr, tables, scalars, columns, models, functions,
@@ -2575,27 +2587,176 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             }
             return apply_scalar_round(std::get<double>(*value), *mode);
         }
-        // Row-wise scalar builtins (sqrt, sin, log10, abs, ceil, floor, trunc,
-        // year/month/…, pmin, pmax, is_nan): evaluate the arguments and dispatch
-        // through the interpreter's shared registry, so these work at the REPL
-        // top level too — not just inside update/select/filter.
-        if (runtime::is_scalar_builtin(call->callee)) {
-            std::vector<runtime::ScalarValue> arg_values;
-            arg_values.reserve(call->args.size());
-            for (auto& arg : call->args) {
-                auto v = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
+        // Aggregates over a series (max/sum/mean/…) and row-wise scalar builtins
+        // (sqrt/sin/abs/pmax/…) both flow through eval_series_call. In scalar
+        // position the result must be a scalar — an element-wise series result
+        // (e.g. pmax(s1, s2)) is an error here, but works via eval_expr_value.
+        if (ir::is_aggregate_func(call->callee) || runtime::is_scalar_builtin(call->callee)) {
+            auto value = eval_series_call(*call, tables, scalars, columns, models, functions,
                                           compile_time_lists, extern_decls, externs);
-                if (!v) {
-                    return std::unexpected(v.error());
-                }
-                arg_values.push_back(std::move(v.value()));
+            if (!value) {
+                return std::unexpected(value.error());
             }
-            return runtime::eval_scalar_builtin(call->callee, arg_values);
+            if (auto* s = std::get_if<runtime::ScalarValue>(&value.value())) {
+                return *s;
+            }
+            return std::unexpected(call->callee +
+                                   "(): produced a series where a scalar was expected");
         }
         return std::unexpected("unknown function: " + call->callee + " (available: " +
                                format_function_names(functions, extern_decls) + ")");
     }
     return std::unexpected("expected scalar expression");
+}
+
+// Extract element `i` of a column as a scalar (Categorical/String -> std::string).
+auto column_element(const runtime::ColumnValue& col, std::size_t i) -> runtime::ScalarValue {
+    return std::visit(
+        [i](const auto& c) -> runtime::ScalarValue {
+            auto value = c[i];
+            using V = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<V, std::string_view>) {
+                return runtime::ScalarValue{std::string(value)};
+            } else {
+                return runtime::ScalarValue{value};
+            }
+        },
+        col);
+}
+
+// Build a homogeneous column from a sequence of scalar values (all the same
+// variant alternative). Used to materialize an element-wise builtin result.
+auto column_from_scalars(const std::vector<runtime::ScalarValue>& vals)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    if (vals.empty()) {
+        return std::unexpected("internal: empty element-wise result");
+    }
+    return std::visit(
+        [&](const auto& first) -> std::expected<runtime::ColumnValue, std::string> {
+            using T = std::decay_t<decltype(first)>;
+            Column<T> col;
+            col.reserve(vals.size());
+            for (const auto& v : vals) {
+                const auto* p = std::get_if<T>(&v);
+                if (p == nullptr) {
+                    return std::unexpected("element-wise result has inconsistent types");
+                }
+                col.push_back(*p);
+            }
+            return runtime::ColumnValue{std::move(col)};
+        },
+        vals.front());
+}
+
+auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
+                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                      ModelRegistry& models, const FunctionRegistry& functions,
+                      CompileTimeListRegistry& compile_time_lists,
+                      const ExternDeclRegistry& extern_decls,
+                      const runtime::ExternRegistry& externs)
+    -> std::expected<EvalValue, std::string> {
+    // Evaluate every positional argument as a value (scalar or series).
+    std::vector<EvalValue> arg_values;
+    arg_values.reserve(call.args.size());
+    for (auto& arg : call.args) {
+        auto v = eval_expr_value(*arg, tables, scalars, columns, models, functions,
+                                 compile_time_lists, extern_decls, externs);
+        if (!v) {
+            return std::unexpected(v.error());
+        }
+        if (std::holds_alternative<runtime::Table>(v.value())) {
+            return std::unexpected(call.callee + "(): argument must be a scalar or a series");
+        }
+        arg_values.push_back(std::move(v.value()));
+    }
+
+    // Aggregate: reduce a single series to a scalar (max/sum/mean/...).
+    if (ir::is_aggregate_func(call.callee)) {
+        if (arg_values.empty()) {
+            return std::unexpected(call.callee + "(): expected a series argument");
+        }
+        const auto* col = std::get_if<runtime::ColumnValue>(&arg_values[0]);
+        if (col == nullptr) {
+            return std::unexpected(call.callee + "(): argument must be a series (column)");
+        }
+        double param = 0.0;
+        if (call.callee == "ewma" || call.callee == "quantile") {
+            if (arg_values.size() != 2) {
+                return std::unexpected(call.callee + "(): expected (series, number)");
+            }
+            const auto* p = std::get_if<runtime::ScalarValue>(&arg_values[1]);
+            if (p == nullptr) {
+                return std::unexpected(call.callee + "(): second argument must be a number");
+            }
+            if (const auto* d = std::get_if<double>(p)) {
+                param = *d;
+            } else if (const auto* iv = std::get_if<std::int64_t>(p)) {
+                param = static_cast<double>(*iv);
+            } else {
+                return std::unexpected(call.callee + "(): second argument must be a number");
+            }
+        }
+        auto result = runtime::aggregate_series(call.callee, *col, param);
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        return EvalValue{std::move(result.value())};
+    }
+
+    // Scalar builtin (abs/sqrt/sin/pmax/...): element-wise when any argument is a
+    // series (broadcasting scalars), otherwise a plain scalar result.
+    std::size_t n = 0;
+    bool any_series = false;
+    for (const auto& v : arg_values) {
+        if (const auto* c = std::get_if<runtime::ColumnValue>(&v)) {
+            any_series = true;
+            const std::size_t len = runtime::column_size(*c);
+            if (!any_series || n == 0) {
+                n = len;
+            }
+            if (len != n) {
+                return std::unexpected(call.callee + "(): series arguments have different lengths");
+            }
+        }
+    }
+    if (!any_series) {
+        std::vector<runtime::ScalarValue> scalar_args;
+        scalar_args.reserve(arg_values.size());
+        for (auto& v : arg_values) {
+            scalar_args.push_back(std::get<runtime::ScalarValue>(v));
+        }
+        auto result = runtime::eval_scalar_builtin(call.callee, scalar_args);
+        if (!result) {
+            return std::unexpected(result.error());
+        }
+        return EvalValue{std::move(result.value())};
+    }
+    if (n == 0) {
+        return std::unexpected(call.callee + "(): cannot apply to an empty series");
+    }
+    std::vector<runtime::ScalarValue> results;
+    results.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        std::vector<runtime::ScalarValue> row_args;
+        row_args.reserve(arg_values.size());
+        for (const auto& v : arg_values) {
+            if (const auto* c = std::get_if<runtime::ColumnValue>(&v)) {
+                row_args.push_back(column_element(*c, i));
+            } else {
+                row_args.push_back(std::get<runtime::ScalarValue>(v));
+            }
+        }
+        auto r = runtime::eval_scalar_builtin(call.callee, row_args);
+        if (!r) {
+            return std::unexpected(r.error());
+        }
+        results.push_back(std::move(r.value()));
+    }
+    auto col = column_from_scalars(results);
+    if (!col) {
+        return std::unexpected(col.error());
+    }
+    return EvalValue{std::move(col.value())};
 }
 
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,

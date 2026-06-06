@@ -275,6 +275,13 @@ class ExternRegistry;
 [[nodiscard]] auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& args)
     -> std::expected<ScalarValue, std::string>;
 
+/// Reduce a whole series to a scalar with an aggregate function (sum, mean, min,
+/// max, count, median, std, first, last, skew, kurtosis, and ewma/quantile with
+/// `param`). Lets `max(series)` etc. work in scalar position — distinct from the
+/// element-wise `pmax`/`pmin` (which are `is_scalar_builtin`).
+[[nodiscard]] auto aggregate_series(std::string_view name, const ColumnValue& column,
+                                    double param = 0.0) -> std::expected<ScalarValue, std::string>;
+
 [[nodiscard]] auto evaluate_row_count_expr(const ir::Expr& expr,
                                            const ScalarRegistry* scalars = nullptr,
                                            const ExternRegistry* externs = nullptr)

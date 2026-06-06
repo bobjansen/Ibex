@@ -14612,4 +14612,28 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     return fn.eval(name, args);
 }
 
+auto aggregate_series(std::string_view name, const ColumnValue& column, double param)
+    -> std::expected<ScalarValue, std::string> {
+    auto func = parse_aggregate_func(name);
+    if (!func.has_value()) {
+        return std::unexpected("not an aggregate function: " + std::string(name));
+    }
+    // Reduce the series via the shared aggregate kernel on a one-column table.
+    Table t;
+    t.add_column("__series", column);
+    ir::AggSpec spec{.func = *func,
+                     .column = ir::ColumnRef{.name = "__series"},
+                     .alias = "__agg",
+                     .param = param};
+    auto agg = aggregate_table(t, {}, std::vector<ir::AggSpec>{std::move(spec)});
+    if (!agg.has_value()) {
+        return std::unexpected(agg.error());
+    }
+    const auto* entry = agg->find_entry("__agg");
+    if (entry == nullptr || entry->column == nullptr) {
+        return std::unexpected(std::string(name) + "(): produced no result");
+    }
+    return scalar_from_column(*entry->column, 0);
+}
+
 }  // namespace ibex::runtime

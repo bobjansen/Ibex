@@ -137,6 +137,35 @@ TEST_CASE("REPL evaluates scalar math builtins at top level", "[repl][math]") {
     REQUIRE_FALSE(ibex::repl::execute_script("print(bogus(1.0));", registry));
 }
 
+TEST_CASE("REPL aggregates reduce a series to a scalar", "[repl][series]") {
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let s = [1, 5, 3]; print(max(s));", registry));
+    REQUIRE(ibex::repl::execute_script("let s = [1, 5, 3]; print(sum(s));", registry));
+    REQUIRE(ibex::repl::execute_script("let s = [1, 5, 3]; print(mean(s));", registry));
+    REQUIRE(ibex::repl::execute_script("let s = [1, 5, 3]; print(min(s));", registry));
+    // Aggregate result is a scalar, usable in arithmetic and interpolation.
+    REQUIRE(ibex::repl::execute_script("let s = [1.0, 5.0]; print(max(s) + 1.0);", registry));
+    REQUIRE(ibex::repl::execute_script("let s = [1, 5, 3]; print(`max=${max(s)}`);", registry));
+    // ewma/quantile carry a numeric parameter.
+    REQUIRE(
+        ibex::repl::execute_script("let s = [1.0, 2.0, 3.0]; print(quantile(s, 0.5));", registry));
+}
+
+TEST_CASE("REPL scalar builtins apply element-wise to series", "[repl][series]") {
+    ibex::runtime::ExternRegistry registry;
+    // pmax over two series returns the element-wise max series.
+    REQUIRE(ibex::repl::execute_script("print(pmax([1,2,3], [3,2,1]));", registry));
+    // A scalar argument broadcasts.
+    REQUIRE(ibex::repl::execute_script("print(pmax([1,5,3], 4));", registry));
+    // Unary math builtins map over a series.
+    REQUIRE(ibex::repl::execute_script("print(sqrt([1.0, 4.0, 9.0]));", registry));
+    REQUIRE(ibex::repl::execute_script("print(abs([-1, 2, -3]));", registry));
+    // Mismatched series lengths error.
+    REQUIRE_FALSE(ibex::repl::execute_script("print(pmax([1,2,3], [1,2]));", registry));
+    // A series result where a scalar is required (arithmetic) errors.
+    REQUIRE_FALSE(ibex::repl::execute_script("print(pmax([1,2],[3,4]) + 1);", registry));
+}
+
 TEST_CASE("REPL string interpolation in scalar position", "[repl][interp]") {
     ibex::runtime::ExternRegistry registry;
     // Backtick templates with ${expr} interpolate at runtime.

@@ -6,6 +6,7 @@ Outputs (written to the directory of this script by default):
   prices_multi.csv — symbol (str), price (f64), day (str)         — N rows
   trades.csv       — symbol (str), price (f64), qty (int64)       — N rows
   events.csv       — user_id (str), amount (f64), quantity (int64) — N rows
+  users.csv        — user_id (str), tier (int64)                   — 100 000 rows
 
 Distinct groups:
   prices:       252        (by symbol)
@@ -14,6 +15,9 @@ Distinct groups:
   events:       100 000    (by user_id — exceeds 4096 categorical threshold,
                             stays as Column<std::string> to stress string gather
                             and high-cardinality group-by)
+  users:        100 000    (one row per distinct events user_id; the dimension
+                            for the high-cardinality inner-join benchmark. Fixed
+                            size — independent of N.)
 
 Usage:
   uv run data/gen_data.py [output_dir]
@@ -134,6 +138,24 @@ def generate(out_dir: pathlib.Path, n: int = N, force: bool = False) -> None:
         mb = ev.stat().st_size / 1024 / 1024
         print(f"  wrote {ev}  ({n:,} rows, {N_USERS:,} distinct users, {mb:.0f} MB, "
               f"{time.perf_counter()-t0:.1f}s)")
+
+    # ── users.csv ────────────────────────────────────────────────────────────
+    # Dimension table for the high-cardinality inner-join benchmark: exactly one
+    # row per distinct events user_id (so events ⋈ users is one row per event).
+    # Fixed 100K rows regardless of N — it is the build side, not the fact table.
+    us = out_dir / "users.csv"
+    if us.exists() and not force:
+        print(f"  {us} already exists, skipping")
+    else:
+        if us.exists() and force:
+            us.unlink()
+        pool = np.array([f"user_{i:06d}" for i in range(1, N_USERS + 1)])
+        rng6 = np.random.default_rng(SEED + 5)
+        tier = rng6.integers(1, 6, size=N_USERS)   # uniform tier [1, 5]
+        t0 = time.perf_counter()
+        pd.DataFrame({"user_id": pool, "tier": tier}).to_csv(us, index=False)
+        mb = us.stat().st_size / 1024 / 1024
+        print(f"  wrote {us}  ({N_USERS:,} rows, {mb:.1f} MB, {time.perf_counter()-t0:.1f}s)")
 
 
 if __name__ == "__main__":

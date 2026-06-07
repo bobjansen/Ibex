@@ -142,6 +142,42 @@ def bench_sqlite_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ).fetchall(),
     )
 
+    # Grouped window functions (partition by symbol). SQLite has no MEDIAN /
+    # QUANTILE / STDDEV aggregate, so the groupagg suite is not represented here.
+    run(
+        "rank_by_symbol",
+        lambda: con.execute(
+            "SELECT *, DENSE_RANK() OVER ("
+            "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices"
+        ).fetchall(),
+    )
+
+    run(
+        "lag_by_symbol",
+        lambda: con.execute(
+            "SELECT *, LAG(price, 1) OVER ("
+            "PARTITION BY symbol ORDER BY rowid) AS prev FROM prices"
+        ).fetchall(),
+    )
+
+    run(
+        "cumsum_by_symbol",
+        lambda: con.execute(
+            "SELECT *, SUM(price) OVER ("
+            "PARTITION BY symbol ORDER BY rowid "
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs FROM prices"
+        ).fetchall(),
+    )
+
+    # Multi-stage pipeline: filter → group-by → order → head.
+    run(
+        "filter_group_sort",
+        lambda: con.execute(
+            "SELECT symbol, AVG(price) AS avg FROM prices WHERE price > 500.0 "
+            "GROUP BY symbol ORDER BY avg DESC LIMIT 10"
+        ).fetchall(),
+    )
+
     if csv_multi_path:
         _load_csv(con, "prices_multi", csv_multi_path)
 
@@ -251,6 +287,13 @@ def bench_sqlite_null(csv_path, csv_lookup_path, warmup, iters, con):
         lambda: con.execute(
             "SELECT p.* FROM prices p "
             "WHERE NOT EXISTS (SELECT 1 FROM lookup_symbols l WHERE l.symbol = p.symbol)"
+        ).fetchall(),
+    )
+    # Low-cardinality inner join: prices ⋈ lookup on symbol.
+    run(
+        "inner_join_symbol",
+        lambda: con.execute(
+            "SELECT * FROM prices JOIN lookup USING (symbol)"
         ).fetchall(),
     )
     run(
@@ -368,8 +411,10 @@ def bench_sqlite_reshape(warmup, iters, reshape_rows, con):
     return rows
 
 
-def bench_sqlite_events(csv_events_path, warmup, iters, con):
+def bench_sqlite_events(csv_events_path, warmup, iters, con, csv_users_path=None):
     _load_csv(con, "events", csv_events_path)
+    if csv_users_path:
+        _load_csv(con, "users", csv_users_path)
     rows = []
 
     def run(name, fn):
@@ -414,6 +459,15 @@ def bench_sqlite_events(csv_events_path, warmup, iters, con):
             "SELECT * FROM events WHERE amount > 500.0"
         ).fetchall(),
     )
+
+    # High-cardinality inner join: events ⋈ users on user_id (~100K keys).
+    if csv_users_path:
+        run(
+            "inner_join_user",
+            lambda: con.execute(
+                "SELECT * FROM events JOIN users USING (user_id)"
+            ).fetchall(),
+        )
 
     return rows
 
@@ -477,6 +531,7 @@ def main():
     ap.add_argument("--csv-trades", help="Path to trades.csv")
     ap.add_argument("--csv-events", help="Path to events.csv")
     ap.add_argument("--csv-lookup", help="Path to lookup.csv (null benchmark)")
+    ap.add_argument("--csv-users", help="Path to users.csv (inner-join dimension)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--out", default="results/sqlite.tsv")
@@ -508,7 +563,9 @@ def main():
             args.warmup, args.iters, args.reshape_rows, con
         )
     if args.csv_events:
-        all_rows += bench_sqlite_events(args.csv_events, args.warmup, args.iters, con)
+        all_rows += bench_sqlite_events(
+            args.csv_events, args.warmup, args.iters, con, args.csv_users
+        )
     if args.csv_lookup:
         all_rows += bench_sqlite_null(
             args.csv, args.csv_lookup, args.warmup, args.iters, con

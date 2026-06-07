@@ -191,6 +191,59 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ).collect(),
     )
 
+    # Grouped window functions (partition by symbol). lag_by_symbol is omitted:
+    # DataFusion has no stable row-id pseudo-column, so an input-order LAG (as
+    # ibex/pandas/polars compute) can't be expressed without injecting one.
+    run(
+        "rank_by_symbol",
+        lambda: ctx.sql(
+            "SELECT *, DENSE_RANK() OVER ("
+            "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices"
+        ).collect(),
+    )
+
+    run(
+        "cumsum_by_symbol",
+        lambda: ctx.sql(
+            "SELECT *, SUM(price) OVER ("
+            "PARTITION BY symbol ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+            ") AS cs FROM prices"
+        ).collect(),
+    )
+
+    # Expensive group aggregates (by symbol): median, p90 (approx — DataFusion
+    # has no exact percentile aggregate), sample stddev.
+    run(
+        "median_by_symbol",
+        lambda: ctx.sql(
+            "SELECT symbol, median(price) AS med FROM prices GROUP BY symbol"
+        ).collect(),
+    )
+
+    run(
+        "quantile_by_symbol",
+        lambda: ctx.sql(
+            "SELECT symbol, approx_percentile_cont(price, 0.9) AS p90 "
+            "FROM prices GROUP BY symbol"
+        ).collect(),
+    )
+
+    run(
+        "std_by_symbol",
+        lambda: ctx.sql(
+            "SELECT symbol, stddev_samp(price) AS sd FROM prices GROUP BY symbol"
+        ).collect(),
+    )
+
+    # Multi-stage pipeline: filter → group-by → order → head.
+    run(
+        "filter_group_sort",
+        lambda: ctx.sql(
+            "SELECT symbol, AVG(price) AS avg FROM prices WHERE price > 500.0 "
+            "GROUP BY symbol ORDER BY avg DESC LIMIT 10"
+        ).collect(),
+    )
+
     run(
         "rand_uniform",
         lambda: ctx.sql(
@@ -332,6 +385,13 @@ def bench_datafusion_null(csv_path, csv_lookup_path, warmup, iters, ctx):
             "WHERE NOT EXISTS (SELECT 1 FROM lookup_symbols l WHERE l.symbol = p.symbol)"
         ).collect(),
     )
+    # Low-cardinality inner join: prices ⋈ lookup on symbol.
+    run(
+        "inner_join_symbol",
+        lambda: ctx.sql(
+            "SELECT * FROM prices JOIN lookup USING (symbol)"
+        ).collect(),
+    )
     run(
         "null_cross_join_small",
         lambda: ctx.sql(
@@ -446,9 +506,11 @@ def bench_datafusion_reshape(warmup, iters, reshape_rows, ctx):
     return rows
 
 
-def bench_datafusion_events(csv_events_path, warmup, iters, ctx):
+def bench_datafusion_events(csv_events_path, warmup, iters, ctx, csv_users_path=None):
     print("datafusion: loading events...", file=sys.stderr, flush=True)
     _register_arrow(ctx, "events", csv_events_path)
+    if csv_users_path:
+        _register_arrow(ctx, "users", csv_users_path)
     rows = []
 
     def run(name, fn):
@@ -493,6 +555,15 @@ def bench_datafusion_events(csv_events_path, warmup, iters, ctx):
             "SELECT * FROM events WHERE amount > 500.0"
         ).collect(),
     )
+
+    # High-cardinality inner join: events ⋈ users on user_id (~100K keys).
+    if csv_users_path:
+        run(
+            "inner_join_user",
+            lambda: ctx.sql(
+                "SELECT * FROM events JOIN users USING (user_id)"
+            ).collect(),
+        )
 
     return rows
 
@@ -635,6 +706,7 @@ def main():
     ap.add_argument("--csv-multi", help="Path to prices_multi.csv")
     ap.add_argument("--csv-trades", help="Path to trades.csv")
     ap.add_argument("--csv-events", help="Path to events.csv")
+    ap.add_argument("--csv-users", help="Path to users.csv (inner-join dimension)")
     ap.add_argument("--csv-lookup", help="Path to lookup.csv (null benchmark)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=5)
@@ -677,7 +749,9 @@ def main():
             args.warmup, args.iters, args.reshape_rows, ctx
         )
     if args.csv_events:
-        all_rows += bench_datafusion_events(args.csv_events, args.warmup, args.iters, ctx)
+        all_rows += bench_datafusion_events(
+            args.csv_events, args.warmup, args.iters, ctx, args.csv_users
+        )
     if args.csv_lookup:
         all_rows += bench_datafusion_null(
             args.csv, args.csv_lookup, args.warmup, args.iters, ctx

@@ -48,12 +48,15 @@ CODE_ENGINES: list[tuple[str, str, str]] = [
 # Curated category grouping (order matters; queries not listed fall to "Other").
 CATEGORIES: list[tuple[str, list[str]]] = [
     ("Group-by / aggregation", [
-        "mean_by_symbol", "ohlc_by_symbol", "count_by_symbol_day",
+        "mean_by_symbol", "ohlc_by_symbol", "median_by_symbol",
+        "quantile_by_symbol", "std_by_symbol", "count_by_symbol_day",
         "mean_by_symbol_day", "ohlc_by_symbol_day", "sum_by_user",
         "distinct_symbol"]),
     ("Column ops / update", [
         "update_price_x2", "cumsum_price", "cumprod_price", "rand_uniform",
         "rand_normal", "rand_int", "rand_bernoulli"]),
+    ("Grouped window functions", [
+        "rank_by_symbol", "lag_by_symbol", "cumsum_by_symbol"]),
     ("Filters", [
         "filter_simple", "filter_and", "filter_arith", "filter_or",
         "filter_events"]),
@@ -61,8 +64,11 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "sort_price", "sort_symbol_price",
         "order_head_topk", "order_head_topk_by_symbol",
         "order_tail_topk", "order_tail_topk_by_symbol"]),
+    ("Multi-stage pipeline", [
+        "filter_group_sort"]),
     ("Joins", [
         "null_left_join", "null_semi_join", "null_anti_join",
+        "inner_join_symbol", "inner_join_user",
         "null_cross_join_small"]),
     ("Reshape", [
         "melt_wide_to_long", "dcast_long_to_wide",

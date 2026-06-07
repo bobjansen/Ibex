@@ -638,6 +638,264 @@ auto verify_sort_symbol_price(const ibex::runtime::Table& table, const ibex::run
     return true;
 }
 
+// Grouped cumulative sum: cumsum(price) by symbol. `update` preserves input row
+// order, so output row i corresponds to input row i; we recompute the running
+// per-symbol total and compare. A grouping bug (running over the whole table
+// instead of per symbol) shows up immediately.
+auto verify_cumsum_by_symbol(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                             std::size_t rows) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* price_col = table.find("price");
+    const auto* out_cs = result.find("cs");
+    if (sym_col == nullptr || price_col == nullptr || out_cs == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    std::unordered_map<std::string, double> running;
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::string key(string_view_at(*sym_col, row));
+        double& acc = running[key];
+        acc += double_at(*price_col, row);
+        if (std::abs(double_at(*out_cs, row) - acc) > 1e-6) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Grouped lag: lag(price, 1) by symbol. The first row of each symbol is null
+// (skipped here); every later row must equal the previous price *within the same
+// symbol*, not the previous row of the table.
+auto verify_lag_by_symbol(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                          std::size_t rows) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* price_col = table.find("price");
+    const auto* out_prev = result.find("prev");
+    if (sym_col == nullptr || price_col == nullptr || out_prev == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    std::unordered_map<std::string, double> prev_price;
+    std::unordered_set<std::string> seen;
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::string key(string_view_at(*sym_col, row));
+        if (seen.contains(key)) {
+            if (std::abs(double_at(*out_prev, row) - prev_price[key]) > 1e-9) {
+                return false;
+            }
+        }
+        seen.insert(key);
+        prev_price[key] = double_at(*price_col, row);
+    }
+    return true;
+}
+
+// Grouped dense rank: rank(price, method = dense, ascending = false) by symbol.
+// Recompute the dense rank of each row's price within its symbol's distinct,
+// descending-sorted price set.
+auto verify_rank_by_symbol(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                           std::size_t rows) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* price_col = table.find("price");
+    const auto* out_rk = result.find("rk");
+    if (sym_col == nullptr || price_col == nullptr || out_rk == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    // Per-symbol sorted-descending list of distinct prices → dense rank.
+    std::unordered_map<std::string, std::unordered_map<double, std::int64_t>> dense;
+    {
+        std::unordered_map<std::string, std::vector<double>> by_sym;
+        for (std::size_t row = 0; row < rows; ++row) {
+            by_sym[std::string(string_view_at(*sym_col, row))].push_back(
+                double_at(*price_col, row));
+        }
+        for (auto& [sym, vals] : by_sym) {
+            std::sort(vals.begin(), vals.end(), std::greater<double>{});
+            auto& rank_of = dense[sym];
+            std::int64_t r = 0;
+            double last = 0.0;
+            for (std::size_t i = 0; i < vals.size(); ++i) {
+                if (i == 0 || vals[i] != last) {
+                    ++r;
+                    last = vals[i];
+                }
+                rank_of.emplace(vals[i], r);
+            }
+        }
+    }
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::string key(string_view_at(*sym_col, row));
+        std::int64_t expected = dense[key][double_at(*price_col, row)];
+        if (int_at(*out_rk, row) != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Per-group statistic in encounter order: median / 90th-percentile / sample
+// stddev of price by symbol. `kind` selects which, and must match the result's
+// single value column name. The quantile/median/stddev math mirrors the
+// interpreter (linear-interpolated quantile, sample stddev with n-1).
+auto verify_group_stat(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                       std::size_t rows, std::string_view kind, std::string_view out_name) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* price_col = table.find("price");
+    const auto* out_sym = result.find("symbol");
+    const auto* out_val = result.find(std::string(out_name));
+    if (sym_col == nullptr || price_col == nullptr || out_sym == nullptr || out_val == nullptr) {
+        return false;
+    }
+    std::unordered_map<std::string, std::size_t> index;
+    std::vector<std::string> order;
+    std::vector<std::vector<double>> values;
+    for (std::size_t row = 0; row < rows; ++row) {
+        std::string key(string_view_at(*sym_col, row));
+        auto it = index.find(key);
+        std::size_t gid = 0;
+        if (it == index.end()) {
+            gid = order.size();
+            index.emplace(key, gid);
+            order.push_back(key);
+            values.emplace_back();
+        } else {
+            gid = it->second;
+        }
+        values[gid].push_back(double_at(*price_col, row));
+    }
+    if (result.rows() != order.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        if (string_view_at(*out_sym, i) != order[i]) {
+            return false;
+        }
+        std::vector<double> sorted = values[i];
+        std::sort(sorted.begin(), sorted.end());
+        const std::size_t n = sorted.size();
+        double expected = 0.0;
+        if (kind == "median") {
+            if (n > 0) {
+                expected = (n % 2 == 1) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+            }
+        } else if (kind == "quantile90") {
+            if (n > 0) {
+                double idx = 0.9 * static_cast<double>(n - 1);
+                std::size_t lo = static_cast<std::size_t>(idx);
+                std::size_t hi = lo + 1 < n ? lo + 1 : lo;
+                double frac = idx - static_cast<double>(lo);
+                expected = sorted[lo] + (frac * (sorted[hi] - sorted[lo]));
+            }
+        } else {  // std (sample)
+            if (n >= 2) {
+                double mean = 0.0;
+                for (double v : sorted) {
+                    mean += v;
+                }
+                mean /= static_cast<double>(n);
+                double m2 = 0.0;
+                for (double v : sorted) {
+                    m2 += (v - mean) * (v - mean);
+                }
+                expected = std::sqrt(m2 / static_cast<double>(n - 1));
+            }
+        }
+        if (std::abs(double_at(*out_val, i) - expected) > 1e-6) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Multi-stage pipeline: filter price > 500 → mean(price) by symbol → order avg
+// desc → head 10. Recompute the same chain and compare the top-10 (symbol, avg).
+auto verify_filter_group_sort(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                              std::size_t rows) -> bool {
+    const auto* sym_col = table.find("symbol");
+    const auto* price_col = table.find("price");
+    const auto* out_sym = result.find("symbol");
+    const auto* out_avg = result.find("avg");
+    if (sym_col == nullptr || price_col == nullptr || out_sym == nullptr || out_avg == nullptr) {
+        return false;
+    }
+    std::unordered_map<std::string, std::size_t> index;
+    std::vector<std::string> order;
+    std::vector<double> sum;
+    std::vector<std::int64_t> count;
+    for (std::size_t row = 0; row < rows; ++row) {
+        if (double_at(*price_col, row) <= 500.0) {
+            continue;
+        }
+        std::string key(string_view_at(*sym_col, row));
+        auto it = index.find(key);
+        std::size_t gid = 0;
+        if (it == index.end()) {
+            gid = order.size();
+            index.emplace(key, gid);
+            order.push_back(key);
+            sum.push_back(0.0);
+            count.push_back(0);
+        } else {
+            gid = it->second;
+        }
+        sum[gid] += double_at(*price_col, row);
+        count[gid] += 1;
+    }
+    std::vector<std::size_t> gids(order.size());
+    for (std::size_t i = 0; i < gids.size(); ++i) {
+        gids[i] = i;
+    }
+    auto avg_of = [&](std::size_t g) {
+        return count[g] == 0 ? 0.0 : sum[g] / static_cast<double>(count[g]);
+    };
+    std::stable_sort(gids.begin(), gids.end(),
+                     [&](std::size_t l, std::size_t r) { return avg_of(l) > avg_of(r); });
+    const std::size_t keep = std::min<std::size_t>(10, gids.size());
+    if (result.rows() != keep) {
+        return false;
+    }
+    for (std::size_t i = 0; i < keep; ++i) {
+        if (string_view_at(*out_sym, i) != order[gids[i]]) {
+            return false;
+        }
+        if (std::abs(double_at(*out_avg, i) - avg_of(gids[i])) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Inner join row count: rows of `left` whose `key` appears in `right`'s key set.
+// `right` keys are assumed unique (lookup symbols / users) so the inner join is
+// one row per matching left row.
+auto verify_inner_join(const ibex::runtime::Table& left, const ibex::runtime::Table& right,
+                       const ibex::runtime::Table& result, std::size_t left_rows,
+                       std::size_t right_rows, std::string_view key) -> bool {
+    const auto* l_key = left.find(std::string(key));
+    const auto* r_key = right.find(std::string(key));
+    if (l_key == nullptr || r_key == nullptr) {
+        return false;
+    }
+    std::unordered_set<std::string> keys;
+    for (std::size_t row = 0; row < right_rows; ++row) {
+        keys.emplace(string_view_at(*r_key, row));
+    }
+    std::size_t expected = 0;
+    for (std::size_t row = 0; row < left_rows; ++row) {
+        if (keys.contains(std::string(string_view_at(*l_key, row)))) {
+            ++expected;
+        }
+    }
+    return result.rows() == expected;
+}
+
 auto verify_filter(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
                    std::size_t rows, const std::string_view mode) -> bool {
     const auto* price_col = table.find("price");
@@ -788,6 +1046,16 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         lookup_small = &tables.at("lookup_small");
         sliced.emplace("lookup_small", slice_table(*lookup_small, max_rows));
     }
+    const ibex::runtime::Table* events = nullptr;
+    if (tables.contains("events")) {
+        events = &tables.at("events");
+        sliced.emplace("events", slice_table(*events, max_rows));
+    }
+    const ibex::runtime::Table* users = nullptr;
+    if (tables.contains("users")) {
+        users = &tables.at("users");
+        sliced.emplace("users", slice_table(*users, max_rows));
+    }
 
     auto result = ibex::runtime::interpret(*lowered.value(), sliced, &scalars);
     if (!result) {
@@ -872,6 +1140,78 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         std::size_t rows = sliced.at("prices").rows();
         if (!verify_sort_symbol_price(sliced.at("prices"), *result, rows)) {
             return "sort_symbol_price verification failed";
+        }
+    } else if (query.name == "cumsum_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_cumsum_by_symbol(sliced.at("prices"), *result, rows)) {
+            return "cumsum_by_symbol verification failed";
+        }
+    } else if (query.name == "lag_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_lag_by_symbol(sliced.at("prices"), *result, rows)) {
+            return "lag_by_symbol verification failed";
+        }
+    } else if (query.name == "rank_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_rank_by_symbol(sliced.at("prices"), *result, rows)) {
+            return "rank_by_symbol verification failed";
+        }
+    } else if (query.name == "median_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_group_stat(sliced.at("prices"), *result, rows, "median", "med")) {
+            return "median_by_symbol verification failed";
+        }
+    } else if (query.name == "quantile_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_group_stat(sliced.at("prices"), *result, rows, "quantile90", "p90")) {
+            return "quantile_by_symbol verification failed";
+        }
+    } else if (query.name == "std_by_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_group_stat(sliced.at("prices"), *result, rows, "std", "sd")) {
+            return "std_by_symbol verification failed";
+        }
+    } else if (query.name == "filter_group_sort") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_filter_group_sort(sliced.at("prices"), *result, rows)) {
+            return "filter_group_sort verification failed";
+        }
+    } else if (query.name == "inner_join_symbol") {
+        if (table == nullptr || lookup == nullptr) {
+            return "missing prices or lookup table";
+        }
+        if (!verify_inner_join(sliced.at("prices"), sliced.at("lookup"), *result,
+                               sliced.at("prices").rows(), sliced.at("lookup").rows(), "symbol")) {
+            return "inner_join_symbol verification failed";
+        }
+    } else if (query.name == "inner_join_user") {
+        if (events == nullptr || users == nullptr) {
+            return "missing events or users table";
+        }
+        if (!verify_inner_join(sliced.at("events"), sliced.at("users"), *result,
+                               sliced.at("events").rows(), sliced.at("users").rows(), "user_id")) {
+            return "inner_join_user verification failed";
         }
     } else if (query.name == "count_by_symbol_day") {
         if (multi == nullptr) {
@@ -1393,6 +1733,7 @@ int main(int argc, char** argv) {
     std::string csv_trades_path;
     std::string csv_events_path;
     std::string csv_lookup_path;
+    std::string csv_users_path;
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
@@ -1420,6 +1761,10 @@ int main(int argc, char** argv) {
         ->check(CLI::ExistingFile);
     app.add_option("--csv-lookup", csv_lookup_path,
                    "CSV file path for null benchmarks (symbol, sector) — half of prices symbols")
+        ->check(CLI::ExistingFile);
+    app.add_option("--csv-users", csv_users_path,
+                   "CSV file path for the join benchmark dimension (user_id, tier) — one row per "
+                   "distinct events user_id")
         ->check(CLI::ExistingFile);
     app.add_option("--warmup", warmup_iters, "Warmup iterations")->check(CLI::NonNegativeNumber);
     app.add_option("--iters", iters, "Measured iterations")->check(CLI::PositiveNumber);
@@ -1458,7 +1803,8 @@ int main(int argc, char** argv) {
         ->check(CLI::NonNegativeNumber);
     app.add_option("--suite", suites,
                    "Benchmark suite(s) to run (comma-separated or repeated). "
-                   "Supported: all, core, cumulative, sort, rng, fill, null, filter, multi, "
+                   "Supported: all, core, cumulative, sort, window, groupagg, pipeline, join, "
+                   "rng, fill, null, filter, multi, "
                    "events, reshape, timeframe, merge_validity, rng_micro, bool, filter_micro")
         ->delimiter(',');
 
@@ -1466,10 +1812,9 @@ int main(int argc, char** argv) {
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
-        "all",         "core",      "cumulative",     "sort",      "rng",
-        "fill",        "null",      "filter",         "multi",     "events",
-        "reshape",     "timeframe", "merge_validity", "rng_micro", "bool",
-        "filter_micro"};
+        "all",     "core",      "cumulative",     "sort",      "window", "groupagg",    "pipeline",
+        "join",    "rng",       "fill",           "null",      "filter", "multi",       "events",
+        "reshape", "timeframe", "merge_validity", "rng_micro", "bool",   "filter_micro"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -1638,6 +1983,90 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Grouped/partitioned window functions (by symbol). Unlike the global
+        // cumsum_price / tf_lag1 queries, these run a window primitive *within
+        // each group*: dense rank, lag(1), and a running sum reset per symbol.
+        if (status == 0 && run_suite("window")) {
+            fmt::print("\n-- Grouped window benchmarks ({} prices rows) --\n",
+                       tables.at("prices").rows());
+            std::vector<BenchQuery> window_queries = {
+                {"rank_by_symbol",
+                 "prices[update { rk = rank(price, method = dense, ascending = false) }, by "
+                 "symbol]"},
+                {"lag_by_symbol", "prices[update { prev = lag(price, 1) }, by symbol]"},
+                {"cumsum_by_symbol", "prices[update { cs = cumsum(price) }, by symbol]"},
+            };
+            for (const auto& query : window_queries) {
+                if (verify) {
+                    if (auto err = verify_benchmark(query, tables, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", query.name, *err);
+                        return 1;
+                    }
+                }
+                ScanPaths sp;
+                if (include_read) {
+                    sp.emplace_back("prices", csv_path);
+                }
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse, sp);
+                if (status != 0) {
+                    break;
+                }
+            }
+        }
+
+        // Expensive group-by aggregates (by symbol): exact median, 90th
+        // percentile, and sample standard deviation. These collect-and-reduce
+        // per group rather than the streaming sum/min/max of mean_by_symbol.
+        if (status == 0 && run_suite("groupagg")) {
+            fmt::print("\n-- Group aggregate benchmarks ({} prices rows) --\n",
+                       tables.at("prices").rows());
+            std::vector<BenchQuery> groupagg_queries = {
+                {"median_by_symbol", "prices[select { med = median(price) }, by symbol]"},
+                {"quantile_by_symbol", "prices[select { p90 = quantile(price, 0.9) }, by symbol]"},
+                {"std_by_symbol", "prices[select { sd = std(price) }, by symbol]"},
+            };
+            for (const auto& query : groupagg_queries) {
+                if (verify) {
+                    if (auto err = verify_benchmark(query, tables, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", query.name, *err);
+                        return 1;
+                    }
+                }
+                ScanPaths sp;
+                if (include_read) {
+                    sp.emplace_back("prices", csv_path);
+                }
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse, sp);
+                if (status != 0) {
+                    break;
+                }
+            }
+        }
+
+        // Multi-stage pipeline: filter → group-by → order → head, as a single
+        // query. Exercises the pipeline planner / operator fusion end-to-end,
+        // in contrast to the one-operator-per-benchmark queries above.
+        if (status == 0 && run_suite("pipeline")) {
+            fmt::print("\n-- Pipeline benchmarks ({} prices rows) --\n",
+                       tables.at("prices").rows());
+            BenchQuery pipeline_query{
+                "filter_group_sort",
+                "prices[filter price > 500.0][select { avg = mean(price) }, by symbol]"
+                "[order avg desc, head 10]"};
+            if (verify) {
+                if (auto err = verify_benchmark(pipeline_query, tables, verify_rows)) {
+                    fmt::print("error: verify failed for {}: {}\n", pipeline_query.name, *err);
+                    return 1;
+                }
+            }
+            ScanPaths sp;
+            if (include_read) {
+                sp.emplace_back("prices", csv_path);
+            }
+            status =
+                run_benchmark(pipeline_query, tables, warmup_iters, iters, saved_include_parse, sp);
+        }
+
         // Vectorized RNG benchmarks: rand_uniform and rand_normal appended as a
         // new column. Measures the column-at-a-time PRNG throughput.
         if (status == 0 && run_suite("rng")) {
@@ -1759,6 +2188,64 @@ int main(int argc, char** argv) {
                 }
                 status =
                     run_benchmark(cross_query, cross_reg, warmup_iters, iters, saved_include_parse);
+            }
+        }
+
+        // Inner equi-join benchmarks. The null suite above covers left/semi/anti
+        // against the small `lookup` dimension; this suite covers plain inner
+        // joins, including a *high-cardinality* build side: events (4M rows over
+        // 100K users) joined to the `users` dimension (100K rows). That builds a
+        // 100K-entry hash table and probes it 4M times — a very different shape
+        // from the ~126-key symbol join.
+        if (status == 0 && run_suite("join")) {
+            // Low-cardinality inner join: prices ⋈ lookup on symbol (~126 keys).
+            if (!csv_lookup_path.empty()) {
+                ibex::runtime::Table lookup_table;
+                try {
+                    lookup_table = read_csv(csv_lookup_path);
+                } catch (const std::exception& e) {
+                    fmt::print("error: failed to read lookup CSV: {}\n", e.what());
+                    return 1;
+                }
+                ibex::runtime::TableRegistry join_reg;
+                join_reg.emplace("prices", tables.at("prices"));
+                join_reg.emplace("lookup", std::move(lookup_table));
+                fmt::print("\n-- Inner join benchmark ({} prices x {} lookup rows) --\n",
+                           join_reg.at("prices").rows(), join_reg.at("lookup").rows());
+                BenchQuery q{"inner_join_symbol", "prices join lookup on symbol"};
+                if (verify) {
+                    if (auto err = verify_benchmark(q, join_reg, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", q.name, *err);
+                        return 1;
+                    }
+                }
+                status = run_benchmark(q, join_reg, warmup_iters, iters, saved_include_parse);
+            }
+
+            // High-cardinality inner join: events ⋈ users on user_id (~100K keys).
+            if (status == 0 && !csv_events_path.empty() && !csv_users_path.empty()) {
+                ibex::runtime::Table events_table;
+                ibex::runtime::Table users_table;
+                try {
+                    events_table = read_csv(csv_events_path);
+                    users_table = read_csv(csv_users_path);
+                } catch (const std::exception& e) {
+                    fmt::print("error: failed to read events/users CSV: {}\n", e.what());
+                    return 1;
+                }
+                ibex::runtime::TableRegistry join_reg;
+                join_reg.emplace("events", std::move(events_table));
+                join_reg.emplace("users", std::move(users_table));
+                fmt::print("\n-- Inner join benchmark ({} events x {} users rows) --\n",
+                           join_reg.at("events").rows(), join_reg.at("users").rows());
+                BenchQuery q{"inner_join_user", "events join users on user_id"};
+                if (verify) {
+                    if (auto err = verify_benchmark(q, join_reg, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", q.name, *err);
+                        return 1;
+                    }
+                }
+                status = run_benchmark(q, join_reg, warmup_iters, iters, saved_include_parse);
             }
         }
     }

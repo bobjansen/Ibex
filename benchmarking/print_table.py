@@ -30,6 +30,9 @@ QUERY_ORDER = [
     # group-by / aggregation
     "mean_by_symbol",
     "ohlc_by_symbol",
+    "median_by_symbol",
+    "quantile_by_symbol",
+    "std_by_symbol",
     "count_by_symbol_day",
     "mean_by_symbol_day",
     "ohlc_by_symbol_day",
@@ -43,6 +46,10 @@ QUERY_ORDER = [
     "rand_normal",
     "rand_int",
     "rand_bernoulli",
+    # grouped window functions
+    "rank_by_symbol",
+    "lag_by_symbol",
+    "cumsum_by_symbol",
     # filters
     "filter_simple",
     "filter_and",
@@ -56,10 +63,14 @@ QUERY_ORDER = [
     "order_head_topk_by_symbol",
     "order_tail_topk",
     "order_tail_topk_by_symbol",
+    # multi-stage pipeline
+    "filter_group_sort",
     # joins
     "null_left_join",
     "null_semi_join",
     "null_anti_join",
+    "inner_join_symbol",
+    "inner_join_user",
     "null_cross_join_small",
     # reshape
     "melt_wide_to_long",
@@ -106,8 +117,17 @@ QUERY_LABEL = {
     "null_left_join": "left join (50% null)",
     "null_semi_join": "semi join",
     "null_anti_join": "anti join",
+    "inner_join_symbol": "inner join (126 keys)",
+    "inner_join_user": "inner join (100K keys)",
     "null_cross_join_small": "cross join (2k×64)",
     "distinct_symbol": "distinct symbol",
+    "median_by_symbol": "median by symbol",
+    "quantile_by_symbol": "p90 by symbol",
+    "std_by_symbol": "stddev by symbol",
+    "rank_by_symbol": "dense rank by symbol",
+    "lag_by_symbol": "lag by symbol",
+    "cumsum_by_symbol": "cumsum by symbol",
+    "filter_group_sort": "filter→group→top-10",
     "sort_price": "sort (full)",
     "sort_symbol_price": "sort symbol,price (full)",
     "order_head_topk": "top-k head",

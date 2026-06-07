@@ -482,6 +482,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
         case NodeKind::FilterHead:
         case NodeKind::FilterTail:
         case NodeKind::TopK:
+        case NodeKind::Rbind:
         case NodeKind::Window: {
             if (node.children().empty()) {
                 return std::nullopt;
@@ -1226,6 +1227,25 @@ class Lowerer {
             }
             auto node = builder_.as_timeframe(*col_name);
             node->add_child(std::move(base.value()));
+            return node;
+        }
+        if (call.callee == "rbind") {
+            if (!call.named_args.empty()) {
+                return std::unexpected(
+                    LowerError{.message = "rbind does not accept named arguments"});
+            }
+            if (call.args.size() < 2) {
+                return std::unexpected(
+                    LowerError{.message = "rbind expects at least 2 table arguments"});
+            }
+            auto node = builder_.rbind();
+            for (const auto& arg : call.args) {
+                auto operand = lower_expr(*arg);
+                if (!operand.has_value()) {
+                    return operand;
+                }
+                node->add_child(std::move(operand.value()));
+            }
             return node;
         }
         if (call.callee == "columns") {
@@ -3569,6 +3589,10 @@ class Lowerer {
             }
             case ir::NodeKind::Matmul: {
                 clone = builder_.matmul();
+                break;
+            }
+            case ir::NodeKind::Rbind: {
+                clone = builder_.rbind();
                 break;
             }
             case ir::NodeKind::Model: {

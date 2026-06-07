@@ -86,6 +86,7 @@ The canonical order is recommended for readability but not enforced.
 | `corr`              | correlation matrix        | `CorrNode`      |
 | `transpose`         | row/column swap           | `TransposeNode` |
 | `matmul(a, b)`      | matrix multiply           | `MatmulNode`    |
+| `rbind(a, b, …)`    | vertical concatenation    | `RbindNode`     |
 | `Table { … }`       | literal construction      | `ConstructNode` |
 
 Every valid block expression maps to a composition of these operators. The
@@ -1644,6 +1645,36 @@ matmul(returns[select { open, close }], w)
 
 Constraint C22 (see §5.2): the inner dimensions of `a` and `b` must match.
 
+#### `rbind(a, b, …)` — Vertical Concatenation
+
+```
+rbind( df_expr_a , df_expr_b [ , df_expr_c … ] )
+```
+
+Stacks two or more DataFrames row-wise into a single frame. Every operand must
+expose **exactly the same set of columns** as the first — matching on both name
+and type. There are no wildcards and no implicit column coercion: a missing
+column, an extra column, or a type that differs from the first operand's is an
+error. Columns are bound by name, so operands may list them in any order; the
+result carries the first operand's column order with the rows of every operand
+appended in sequence. Nulls are preserved, and Categorical columns are remapped
+into a single combined dictionary.
+
+```
+// Combine three monthly slices into one frame.
+rbind(jan, feb, mar)
+
+// Project + ascribe each operand to pin the shared schema explicitly.
+rbind(
+  trades_a[{ price, symbol }] as DataFrame<{ price: Float64, symbol: String }>,
+  trades_b[{ price, symbol }] as DataFrame<{ price: Float64, symbol: String }>
+)
+```
+
+`rbind` takes at least two operands. The result is **not** a `TimeFrame` even
+if the operands are — concatenation may interleave time indices, so any time
+index and ordering are dropped.
+
 ### 5.4 Result Type Rules
 
 | Clauses Present       | Output Type | Schema Derivation |
@@ -1664,6 +1695,7 @@ Constraint C22 (see §5.2): the inner dimensions of `a` and `b` must match.
 | `corr`                | `DataFrame<S'>` | S' = {column: String} + N Float64 (N = numeric cols) |
 | `transpose`           | `DataFrame<S'>` | S' = {column: String} + one col per input row |
 | `matmul(a, b)`        | `DataFrame<S'>` | S' = numeric cols of b; nrow = nrow(a) |
+| `rbind(a, b, …)`      | `DataFrame<S>`  | S = schema of first operand (all must match); nrow = Σ nrow(operands) |
 | `model { ... }`       | `ModelResult`   | Coefficients table: {term: String, estimate: Float64} |
 
 If the input is a `TimeFrame` and no clause removes the time index column,

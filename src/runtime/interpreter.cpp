@@ -9286,6 +9286,26 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return matmul_table(left.value(), right.value());
         }
+        case ir::NodeKind::Rbind: {
+            if (node.children().size() < 2) {
+                return std::unexpected("rbind node expects at least two children");
+            }
+            std::vector<Table> operands;
+            operands.reserve(node.children().size());
+            for (const auto& child : node.children()) {
+                auto result = interpret_node(*child, registry, scalars, externs);
+                if (!result) {
+                    return std::unexpected(result.error());
+                }
+                operands.push_back(std::move(result.value()));
+            }
+            std::vector<const Table*> ptrs;
+            ptrs.reserve(operands.size());
+            for (const Table& t : operands) {
+                ptrs.push_back(&t);
+            }
+            return rbind_table(ptrs);
+        }
         case ir::NodeKind::Stream: {
             const auto& sn = static_cast<const ir::StreamNode&>(node);
             if (externs == nullptr) {

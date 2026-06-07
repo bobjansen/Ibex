@@ -3,9 +3,13 @@
 #include <cmath>
 #include <cstring>
 #include <robin_hood.h>
+#include <string>
+#include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "reshape_internal.hpp"
@@ -332,6 +336,137 @@ auto matmul_table(const Table& left, const Table& right) -> std::expected<Table,
     for (std::size_t j = 0; j < n; ++j) {
         Column<double> col_data(result[j]);
         out.add_column(right_names[j], std::move(col_data));
+    }
+    return out;
+}
+
+namespace {
+
+// Human-readable name for the active alternative of a ColumnValue, for use in
+// rbind's schema-mismatch diagnostics.
+auto column_type_label(const ColumnValue& column) -> std::string_view {
+    return std::visit(
+        [](const auto& col) -> std::string_view {
+            using Col = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
+                return "Int64";
+            } else if constexpr (std::is_same_v<Col, Column<double>>) {
+                return "Float64";
+            } else if constexpr (std::is_same_v<Col, Column<std::string>>) {
+                return "String";
+            } else if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                return "Categorical";
+            } else if constexpr (std::is_same_v<Col, Column<Date>>) {
+                return "Date";
+            } else if constexpr (std::is_same_v<Col, Column<Timestamp>>) {
+                return "Timestamp";
+            } else {
+                return "Bool";
+            }
+        },
+        column);
+}
+
+}  // namespace
+
+auto rbind_table(const std::vector<const Table*>& tables) -> std::expected<Table, std::string> {
+    if (tables.empty()) {
+        return std::unexpected("rbind: requires at least one operand");
+    }
+    const Table& ref = *tables[0];
+    const std::size_t ncols = ref.columns.size();
+
+    // Validate that every operand exposes exactly the reference column set
+    // (same names, same types), and record where each reference column lives in
+    // each operand so reordered-but-matching schemas bind correctly.
+    std::vector<std::vector<std::size_t>> col_pos(tables.size());
+    col_pos[0].reserve(ncols);
+    for (std::size_t ci = 0; ci < ncols; ++ci) {
+        col_pos[0].push_back(ci);
+    }
+    for (std::size_t ti = 1; ti < tables.size(); ++ti) {
+        const Table& other = *tables[ti];
+        if (other.columns.size() != ncols) {
+            return std::unexpected("rbind: operand " + std::to_string(ti + 1) + " has " +
+                                   std::to_string(other.columns.size()) +
+                                   " columns but operand 1 has " + std::to_string(ncols) +
+                                   " (operand 1: " + format_columns(ref) + "; operand " +
+                                   std::to_string(ti + 1) + ": " + format_columns(other) + ")");
+        }
+        col_pos[ti].reserve(ncols);
+        for (std::size_t ci = 0; ci < ncols; ++ci) {
+            const ColumnEntry& ref_entry = ref.columns[ci];
+            auto it = other.index.find(ref_entry.name);
+            if (it == other.index.end()) {
+                return std::unexpected("rbind: operand " + std::to_string(ti + 1) +
+                                       " is missing column '" + ref_entry.name +
+                                       "' present in operand 1 (operand " + std::to_string(ti + 1) +
+                                       ": " + format_columns(other) + ")");
+            }
+            const std::size_t pos = it->second;
+            const ColumnEntry& other_entry = other.columns[pos];
+            if (other_entry.column->index() != ref_entry.column->index()) {
+                return std::unexpected("rbind: column '" + ref_entry.name + "' is " +
+                                       std::string(column_type_label(*ref_entry.column)) +
+                                       " in operand 1 but " +
+                                       std::string(column_type_label(*other_entry.column)) +
+                                       " in operand " + std::to_string(ti + 1));
+            }
+            col_pos[ti].push_back(pos);
+        }
+    }
+
+    std::size_t total_rows = 0;
+    for (const Table* t : tables) {
+        total_rows += t->rows();
+    }
+
+    Table out;
+    out.columns.reserve(ncols);
+    for (std::size_t ci = 0; ci < ncols; ++ci) {
+        const ColumnEntry& ref_entry = ref.columns[ci];
+
+        // Any operand carrying nulls in this column forces a result bitmap.
+        bool any_null = false;
+        for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+            if (tables[ti]->columns[col_pos[ti][ci]].validity.has_value()) {
+                any_null = true;
+                break;
+            }
+        }
+
+        ColumnValue built = std::visit(
+            [&](const auto& ref_col) -> ColumnValue {
+                using Col = std::decay_t<decltype(ref_col)>;
+                Col dst;
+                dst.reserve(total_rows);
+                for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+                    const auto& src = std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
+                    const std::size_t n = src.size();
+                    for (std::size_t r = 0; r < n; ++r) {
+                        // For Categorical this remaps through each source's
+                        // dictionary into the result's; other types copy values.
+                        dst.push_back(src[r]);
+                    }
+                }
+                return ColumnValue{std::move(dst)};
+            },
+            *ref_entry.column);
+
+        if (any_null) {
+            ValidityBitmap validity;
+            validity.reserve(total_rows);
+            for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+                const ColumnEntry& entry = tables[ti]->columns[col_pos[ti][ci]];
+                const std::size_t n = column_size(*entry.column);
+                for (std::size_t r = 0; r < n; ++r) {
+                    validity.push_back(!is_null(entry, r));
+                }
+            }
+            out.add_column(ref_entry.name, std::move(built), std::move(validity));
+        } else {
+            out.add_column(ref_entry.name, std::move(built));
+        }
     }
     return out;
 }

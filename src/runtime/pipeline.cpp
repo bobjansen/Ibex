@@ -38,6 +38,7 @@ auto classify_node(ir::NodeKind kind) noexcept -> PipelineRole {
         case ir::NodeKind::Corr:
         case ir::NodeKind::Transpose:
         case ir::NodeKind::Matmul:
+        case ir::NodeKind::Rbind:
         case ir::NodeKind::Model:
         case ir::NodeKind::Program:
             return PipelineRole::Breaker;

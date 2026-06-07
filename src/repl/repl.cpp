@@ -146,6 +146,7 @@ constexpr std::string_view kCompletionBuiltins[] = {
     "rand_poisson",
     "rand_student_t",
     "rand_uniform",
+    "rbind",
     "rep",
     "residuals",
     "rolling_count",

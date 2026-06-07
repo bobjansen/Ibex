@@ -319,6 +319,7 @@ enum class NodeKind : std::uint8_t {
     Corr,           ///< Pearson correlation matrix of all numeric columns.
     Transpose,      ///< Transpose: swap rows and columns (homogeneous-type DataFrames).
     Matmul,         ///< Matrix multiply: (m×k) × (k×n) → (m×n).
+    Rbind,          ///< Row-bind: vertically concatenate operands with matching schemas.
     Model,          ///< Model fitting: formula → ModelResult.
     FilterProject,  ///< Fused Project(Filter(x)) — produced by canonicalize R5.
     FilterUpdateProject,  ///< Fused Project(Update(Filter(x))) — produced by canonicalize R6.
@@ -877,6 +878,15 @@ class TransposeNode final : public Node {
 class MatmulNode final : public Node {
    public:
     explicit MatmulNode(NodeId id) : Node(NodeKind::Matmul, id) {}
+};
+
+/// Rbind node: vertically concatenate two or more operands.
+/// Every child must expose the same set of columns (by name and type); the
+/// output carries the column order of child[0] with the rows of all children
+/// appended in order. No wildcards — schemas must match completely.
+class RbindNode final : public Node {
+   public:
+    explicit RbindNode(NodeId id) : Node(NodeKind::Rbind, id) {}
 };
 
 /// A single term in an IR-level model formula.

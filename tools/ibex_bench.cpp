@@ -573,6 +573,71 @@ auto verify_order_tail_topk_by_symbol(const ibex::runtime::Table& table,
     return true;
 }
 
+// Full-table single-key sort: result must be every input row, reordered into
+// ascending `price` order. Sorting a copy of the input prices and comparing
+// element-wise verifies both the permutation (same multiset) and the ordering.
+auto verify_sort_price(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                       std::size_t rows) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* out_price = result.find("price");
+    if (price_col == nullptr || out_price == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    std::vector<double> expected;
+    expected.reserve(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+        expected.push_back(double_at(*price_col, row));
+    }
+    std::sort(expected.begin(), expected.end());
+    for (std::size_t i = 0; i < rows; ++i) {
+        if (std::abs(double_at(*out_price, i) - expected[i]) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Full-table multi-key sort: rows ordered by (symbol asc, price asc). Comparing
+// against a stable_sort of the input indices on the same composite key checks
+// the whole permutation, including tie-break behaviour within a symbol.
+auto verify_sort_symbol_price(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                              std::size_t rows) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* symbol_col = table.find("symbol");
+    const auto* out_price = result.find("price");
+    const auto* out_symbol = result.find("symbol");
+    if (price_col == nullptr || symbol_col == nullptr || out_price == nullptr ||
+        out_symbol == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    std::vector<std::size_t> idx(rows);
+    std::iota(idx.begin(), idx.end(), std::size_t{0});
+    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+        const auto ls = string_view_at(*symbol_col, lhs);
+        const auto rs = string_view_at(*symbol_col, rhs);
+        if (ls != rs) {
+            return ls < rs;
+        }
+        return double_at(*price_col, lhs) < double_at(*price_col, rhs);
+    });
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::size_t row = idx[i];
+        if (string_view_at(*out_symbol, i) != string_view_at(*symbol_col, row)) {
+            return false;
+        }
+        if (std::abs(double_at(*out_price, i) - double_at(*price_col, row)) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto verify_filter(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
                    std::size_t rows, const std::string_view mode) -> bool {
     const auto* price_col = table.find("price");
@@ -791,6 +856,22 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         std::size_t rows = sliced.at("prices").rows();
         if (!verify_order_tail_topk_by_symbol(sliced.at("prices"), *result, rows, 3)) {
             return "order_tail_topk_by_symbol verification failed";
+        }
+    } else if (query.name == "sort_price") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_sort_price(sliced.at("prices"), *result, rows)) {
+            return "sort_price verification failed";
+        }
+    } else if (query.name == "sort_symbol_price") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_sort_symbol_price(sliced.at("prices"), *result, rows)) {
+            return "sort_symbol_price verification failed";
         }
     } else if (query.name == "count_by_symbol_day") {
         if (multi == nullptr) {
@@ -1377,7 +1458,7 @@ int main(int argc, char** argv) {
         ->check(CLI::NonNegativeNumber);
     app.add_option("--suite", suites,
                    "Benchmark suite(s) to run (comma-separated or repeated). "
-                   "Supported: all, core, cumulative, rng, fill, null, filter, multi, "
+                   "Supported: all, core, cumulative, sort, rng, fill, null, filter, multi, "
                    "events, reshape, timeframe, merge_validity, rng_micro, bool, filter_micro")
         ->delimiter(',');
 
@@ -1385,9 +1466,10 @@ int main(int argc, char** argv) {
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
-        "all",       "core",           "cumulative", "rng",    "fill",
-        "null",      "filter",         "multi",      "events", "reshape",
-        "timeframe", "merge_validity", "rng_micro",  "bool",   "filter_micro"};
+        "all",         "core",      "cumulative",     "sort",      "rng",
+        "fill",        "null",      "filter",         "multi",     "events",
+        "reshape",     "timeframe", "merge_validity", "rng_micro", "bool",
+        "filter_micro"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -1515,6 +1597,36 @@ int main(int argc, char** argv) {
                 {"cumprod_price", "prices[update { cp = cumprod(price) }]"},
             };
             for (const auto& query : cumulative_queries) {
+                ScanPaths sp;
+                if (include_read) {
+                    sp.emplace_back("prices", csv_path);
+                }
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse, sp);
+                if (status != 0) {
+                    break;
+                }
+            }
+        }
+
+        // Full-table sort benchmarks: unlike the order_*_topk queries (which
+        // only materialise the top/bottom N rows and can use a partial sort),
+        // these reorder *every* row. sort_price is a single Double key;
+        // sort_symbol_price is a composite (String, Double) key, exercising the
+        // string-comparator and multi-key path.
+        if (status == 0 && run_suite("sort")) {
+            fmt::print("\n-- Full-sort benchmarks ({} prices rows) --\n",
+                       tables.at("prices").rows());
+            std::vector<BenchQuery> sort_queries = {
+                {"sort_price", "prices[order price]"},
+                {"sort_symbol_price", "prices[order { symbol asc, price asc }]"},
+            };
+            for (const auto& query : sort_queries) {
+                if (verify) {
+                    if (auto err = verify_benchmark(query, tables, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", query.name, *err);
+                        return 1;
+                    }
+                }
                 ScanPaths sp;
                 if (include_read) {
                     sp.emplace_back("prices", csv_path);

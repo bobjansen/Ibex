@@ -174,6 +174,63 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ).fetchnumpy(),
     )
 
+    # Grouped window functions (partition by symbol).
+    run(
+        "rank_by_symbol",
+        lambda: con.sql(
+            "SELECT *, DENSE_RANK() OVER ("
+            "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "lag_by_symbol",
+        lambda: con.sql(
+            "SELECT *, LAG(price, 1) OVER ("
+            "PARTITION BY symbol ORDER BY rowid) AS prev FROM prices"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "cumsum_by_symbol",
+        lambda: con.sql(
+            "SELECT *, SUM(price) OVER ("
+            "PARTITION BY symbol ORDER BY rowid "
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs FROM prices"
+        ).fetchnumpy(),
+    )
+
+    # Expensive group aggregates (by symbol): median, p90, sample stddev.
+    run(
+        "median_by_symbol",
+        lambda: con.sql(
+            "SELECT symbol, MEDIAN(price) AS med FROM prices GROUP BY symbol"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "quantile_by_symbol",
+        lambda: con.sql(
+            "SELECT symbol, QUANTILE_CONT(price, 0.9) AS p90 FROM prices GROUP BY symbol"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "std_by_symbol",
+        lambda: con.sql(
+            "SELECT symbol, STDDEV_SAMP(price) AS sd FROM prices GROUP BY symbol"
+        ).fetchnumpy(),
+    )
+
+    # Multi-stage pipeline: filter → group-by → order → head.
+    run(
+        "filter_group_sort",
+        lambda: con.sql(
+            "SELECT symbol, AVG(price) AS avg FROM prices WHERE price > 500.0 "
+            "GROUP BY symbol ORDER BY avg DESC LIMIT 10"
+        ).fetchnumpy(),
+    )
+
     run(
         "rand_uniform",
         lambda: con.sql(
@@ -307,6 +364,13 @@ def bench_duckdb_null(csv_path, csv_lookup_path, warmup, iters, con):
             "SELECT * FROM prices ANTI JOIN lookup_symbols USING (symbol)"
         ).fetchnumpy(),
     )
+    # Low-cardinality inner join: prices ⋈ lookup on symbol.
+    run(
+        "inner_join_symbol",
+        lambda: con.sql(
+            "SELECT * FROM prices JOIN lookup USING (symbol)"
+        ).fetchnumpy(),
+    )
     run(
         "null_cross_join_small",
         lambda: con.sql(
@@ -402,11 +466,15 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
     return rows
 
 
-def bench_duckdb_events(csv_events_path, warmup, iters, con):
+def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None):
     print("duckdb: loading events...", file=sys.stderr, flush=True)
     con.execute(
         f"CREATE OR REPLACE TABLE events AS SELECT * FROM read_csv_auto('{csv_events_path}')"
     )
+    if csv_users_path:
+        con.execute(
+            f"CREATE OR REPLACE TABLE users AS SELECT * FROM read_csv_auto('{csv_users_path}')"
+        )
     rows = []
 
     def run(name, fn):
@@ -451,6 +519,15 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con):
             "SELECT * FROM events WHERE amount > 500.0"
         ).fetchnumpy(),
     )
+
+    # High-cardinality inner join: events ⋈ users on user_id (~100K keys).
+    if csv_users_path:
+        run(
+            "inner_join_user",
+            lambda: con.sql(
+                "SELECT * FROM events JOIN users USING (user_id)"
+            ).fetchnumpy(),
+        )
 
     return rows
 
@@ -644,6 +721,7 @@ def main():
     ap.add_argument("--csv-trades", help="Path to trades.csv")
     ap.add_argument("--csv-events", help="Path to events.csv")
     ap.add_argument("--csv-lookup", help="Path to lookup.csv (null benchmark)")
+    ap.add_argument("--csv-users", help="Path to users.csv (inner-join dimension)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--out", default="results/duckdb.tsv")
@@ -686,7 +764,9 @@ def main():
             args.warmup, args.iters, args.reshape_rows, con
         )
     if args.csv_events:
-        all_rows += bench_duckdb_events(args.csv_events, args.warmup, args.iters, con)
+        all_rows += bench_duckdb_events(
+            args.csv_events, args.warmup, args.iters, con, args.csv_users
+        )
     if args.csv_lookup:
         all_rows += bench_duckdb_null(
             args.csv, args.csv_lookup, args.warmup, args.iters, con

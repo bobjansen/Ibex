@@ -181,6 +181,45 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ") AS cs FROM prices",
     )
 
+    # Grouped window functions (partition by symbol). lag_by_symbol is omitted:
+    # an input-order LAG needs a stable row id that ClickHouse does not expose as
+    # a plain column here.
+    run(
+        "rank_by_symbol",
+        "SELECT *, dense_rank() OVER ("
+        "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices",
+    )
+
+    run(
+        "cumsum_by_symbol",
+        "SELECT *, sum(price) OVER ("
+        "PARTITION BY symbol ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+        ") AS cs FROM prices",
+    )
+
+    # Expensive group aggregates (by symbol): median, p90 (exact), sample stddev.
+    run(
+        "median_by_symbol",
+        "SELECT symbol, median(price) AS med FROM prices GROUP BY symbol",
+    )
+
+    run(
+        "quantile_by_symbol",
+        "SELECT symbol, quantileExact(0.9)(price) AS p90 FROM prices GROUP BY symbol",
+    )
+
+    run(
+        "std_by_symbol",
+        "SELECT symbol, stddevSamp(price) AS sd FROM prices GROUP BY symbol",
+    )
+
+    # Multi-stage pipeline: filter → group-by → order → head.
+    run(
+        "filter_group_sort",
+        "SELECT symbol, avg(price) AS avg FROM prices WHERE price > 500.0 "
+        "GROUP BY symbol ORDER BY avg DESC LIMIT 10",
+    )
+
     run(
         "rand_uniform",
         "SELECT *, rand() / 4294967295.0 AS r FROM prices",
@@ -298,6 +337,11 @@ def bench_clickhouse_null(csv_path, csv_lookup_path, warmup, iters, sess):
         "null_anti_join",
         "SELECT * FROM prices LEFT ANTI JOIN lookup_symbols USING (symbol)",
     )
+    # Low-cardinality inner join: prices ⋈ lookup on symbol.
+    run(
+        "inner_join_symbol",
+        "SELECT * FROM prices INNER JOIN lookup USING (symbol)",
+    )
     run(
         "null_cross_join_small",
         "SELECT * FROM prices_small CROSS JOIN lookup_small",
@@ -398,12 +442,17 @@ def bench_clickhouse_reshape(warmup, iters, reshape_rows, sess):
     return rows
 
 
-def bench_clickhouse_events(csv_events_path, warmup, iters, sess):
+def bench_clickhouse_events(csv_events_path, warmup, iters, sess, csv_users_path=None):
     print("clickhouse: loading events...", file=sys.stderr, flush=True)
     sess.query(
         f"CREATE OR REPLACE TABLE events ENGINE = Memory "
         f"AS SELECT * FROM file('{csv_events_path}', CSVWithNames)"
     )
+    if csv_users_path:
+        sess.query(
+            f"CREATE OR REPLACE TABLE users ENGINE = Memory "
+            f"AS SELECT * FROM file('{csv_users_path}', CSVWithNames)"
+        )
     rows = []
 
     def run(name, sql):
@@ -448,6 +497,13 @@ def bench_clickhouse_events(csv_events_path, warmup, iters, sess):
         "filter_events",
         "SELECT * FROM events WHERE amount > 500.0",
     )
+
+    # High-cardinality inner join: events ⋈ users on user_id (~100K keys).
+    if csv_users_path:
+        run(
+            "inner_join_user",
+            "SELECT * FROM events INNER JOIN users USING (user_id)",
+        )
 
     return rows
 
@@ -664,6 +720,7 @@ def main():
     ap.add_argument("--csv-trades", help="Path to trades.csv")
     ap.add_argument("--csv-events", help="Path to events.csv")
     ap.add_argument("--csv-lookup", help="Path to lookup.csv (null benchmark)")
+    ap.add_argument("--csv-users", help="Path to users.csv (inner-join dimension)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--out", default="results/clickhouse.tsv")
@@ -713,7 +770,7 @@ def main():
             args.warmup, args.iters, args.reshape_rows, sess))
     if args.csv_events:
         all_rows += run_phase("events", lambda: bench_clickhouse_events(
-            args.csv_events, args.warmup, args.iters, sess))
+            args.csv_events, args.warmup, args.iters, sess, args.csv_users))
     if args.csv_lookup:
         all_rows += run_phase("null", lambda: bench_clickhouse_null(
             args.csv, args.csv_lookup, args.warmup, args.iters, sess))

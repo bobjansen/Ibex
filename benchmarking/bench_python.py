@@ -161,6 +161,55 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         lambda: df.sort_values(["symbol", "price"], kind="mergesort"),
     )
 
+    # Grouped window functions (per symbol).
+    run(
+        "rank_by_symbol",
+        lambda: df.assign(
+            rk=df.groupby("symbol")["price"].rank(method="dense", ascending=False)
+        ),
+    )
+
+    run(
+        "lag_by_symbol",
+        lambda: df.assign(prev=df.groupby("symbol")["price"].shift(1)),
+    )
+
+    run(
+        "cumsum_by_symbol",
+        lambda: df.assign(cs=df.groupby("symbol")["price"].cumsum()),
+    )
+
+    # Expensive group aggregates (per symbol): median, p90, sample stddev.
+    run(
+        "median_by_symbol",
+        lambda: df.groupby("symbol", sort=False)
+        .agg(med=("price", "median"))
+        .reset_index(),
+    )
+
+    run(
+        "quantile_by_symbol",
+        lambda: df.groupby("symbol", sort=False)["price"]
+        .quantile(0.9)
+        .reset_index(name="p90"),
+    )
+
+    run(
+        "std_by_symbol",
+        lambda: df.groupby("symbol", sort=False).agg(sd=("price", "std")).reset_index(),
+    )
+
+    # Multi-stage pipeline: filter → group-by → order → head.
+    run(
+        "filter_group_sort",
+        lambda: df[df["price"] > 500.0]
+        .groupby("symbol", sort=False)
+        .agg(avg=("price", "mean"))
+        .reset_index()
+        .sort_values("avg", ascending=False)
+        .head(10),
+    )
+
     run("cumsum_price", lambda: df.assign(cs=df["price"].cumsum()))
 
     run("cumprod_price", lambda: df.assign(cp=df["price"].cumprod()))
@@ -295,6 +344,52 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("sort_price", lambda: df.sort("price"))
 
     run("sort_symbol_price", lambda: df.sort(["symbol", "price"]))
+
+    # Grouped window functions (per symbol).
+    run(
+        "rank_by_symbol",
+        lambda: df.with_columns(
+            pl.col("price").rank(method="dense", descending=True).over("symbol").alias("rk")
+        ),
+    )
+
+    run(
+        "lag_by_symbol",
+        lambda: df.with_columns(pl.col("price").shift(1).over("symbol").alias("prev")),
+    )
+
+    run(
+        "cumsum_by_symbol",
+        lambda: df.with_columns(pl.col("price").cum_sum().over("symbol").alias("cs")),
+    )
+
+    # Expensive group aggregates (per symbol): median, p90, sample stddev.
+    run(
+        "median_by_symbol",
+        lambda: df.group_by("symbol").agg(pl.col("price").median().alias("med")),
+    )
+
+    run(
+        "quantile_by_symbol",
+        lambda: df.group_by("symbol").agg(
+            pl.col("price").quantile(0.9, interpolation="linear").alias("p90")
+        ),
+    )
+
+    run(
+        "std_by_symbol",
+        lambda: df.group_by("symbol").agg(pl.col("price").std().alias("sd")),
+    )
+
+    # Multi-stage pipeline: filter → group-by → order → head.
+    run(
+        "filter_group_sort",
+        lambda: df.filter(pl.col("price") > 500.0)
+        .group_by("symbol")
+        .agg(pl.col("price").mean().alias("avg"))
+        .sort("avg", descending=True)
+        .head(10),
+    )
 
     run("cumsum_price", lambda: df.with_columns(pl.col("price").cum_sum().alias("cs")))
 
@@ -463,6 +558,54 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     # Full-table sorts (every row reordered).
     run("sort_price", lambda: scan().sort("price").collect())
     run("sort_symbol_price", lambda: scan().sort(["symbol", "price"]).collect())
+    # Grouped window functions (per symbol).
+    run(
+        "rank_by_symbol",
+        lambda: scan()
+        .with_columns(
+            pl.col("price").rank(method="dense", descending=True).over("symbol").alias("rk")
+        )
+        .collect(),
+    )
+    run(
+        "lag_by_symbol",
+        lambda: scan()
+        .with_columns(pl.col("price").shift(1).over("symbol").alias("prev"))
+        .collect(),
+    )
+    run(
+        "cumsum_by_symbol",
+        lambda: scan()
+        .with_columns(pl.col("price").cum_sum().over("symbol").alias("cs"))
+        .collect(),
+    )
+    # Expensive group aggregates (per symbol).
+    run(
+        "median_by_symbol",
+        lambda: scan().group_by("symbol").agg(pl.col("price").median().alias("med")).collect(),
+    )
+    run(
+        "quantile_by_symbol",
+        lambda: scan()
+        .group_by("symbol")
+        .agg(pl.col("price").quantile(0.9, interpolation="linear").alias("p90"))
+        .collect(),
+    )
+    run(
+        "std_by_symbol",
+        lambda: scan().group_by("symbol").agg(pl.col("price").std().alias("sd")).collect(),
+    )
+    # Multi-stage pipeline: filter → group-by → order → head.
+    run(
+        "filter_group_sort",
+        lambda: scan()
+        .filter(pl.col("price") > 500.0)
+        .group_by("symbol")
+        .agg(pl.col("price").mean().alias("avg"))
+        .sort("avg", descending=True)
+        .head(10)
+        .collect(),
+    )
     run(
         "cumsum_price",
         lambda: scan().with_columns(pl.col("price").cum_sum().alias("cs")).collect(),
@@ -576,6 +719,8 @@ def bench_pandas_null(csv_path, csv_lookup_path, warmup, iters):
         "null_semi_join", lambda: pd.merge(df, lookup_symbols, on="symbol", how="inner")
     )
     run("null_anti_join", lambda: df[~df["symbol"].isin(lookup_symbols["symbol"])])
+    # Low-cardinality inner join: prices ⋈ lookup on symbol.
+    run("inner_join_symbol", lambda: pd.merge(df, lookup, on="symbol", how="inner"))
     run(
         "null_cross_join_small",
         lambda: pd.merge(prices_small, lookup_small, how="cross"),
@@ -627,6 +772,8 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
     run("null_left_join", lambda: df.join(lookup, on="symbol", how="left"))
     run("null_semi_join", lambda: df.join(lookup_symbols, on="symbol", how="semi"))
     run("null_anti_join", lambda: df.join(lookup_symbols, on="symbol", how="anti"))
+    # Low-cardinality inner join: prices ⋈ lookup on symbol.
+    run("inner_join_symbol", lambda: df.join(lookup, on="symbol", how="inner"))
     run("null_cross_join_small", lambda: prices_small.join(lookup_small, how="cross"))
 
     return rows
@@ -890,10 +1037,11 @@ def bench_polars_fill(n_rows, warmup, iters):
     return rows
 
 
-def bench_pandas_events(csv_events_path, warmup, iters):
+def bench_pandas_events(csv_events_path, warmup, iters, csv_users_path=None):
     _fw = "pandas"
     print("pandas: loading events...", file=sys.stderr, flush=True)
     df = pd.read_csv(csv_events_path)
+    users = pd.read_csv(csv_users_path) if csv_users_path else None
     rows = []
 
     def run(name, fn):
@@ -934,13 +1082,18 @@ def bench_pandas_events(csv_events_path, warmup, iters):
 
     run("filter_events", lambda: df[df["amount"] > 500.0])
 
+    # High-cardinality inner join: events (N rows, 100K users) ⋈ users (100K).
+    if users is not None:
+        run("inner_join_user", lambda: df.merge(users, on="user_id", how="inner"))
+
     return rows
 
 
-def bench_polars_events(csv_events_path, warmup, iters):
+def bench_polars_events(csv_events_path, warmup, iters, csv_users_path=None):
     _fw = "polars"
     print("polars: loading events...", file=sys.stderr, flush=True)
     df = pl.read_csv(csv_events_path)
+    users = pl.read_csv(csv_users_path) if csv_users_path else None
     rows = []
 
     def run(name, fn):
@@ -978,6 +1131,10 @@ def bench_polars_events(csv_events_path, warmup, iters):
     )
 
     run("filter_events", lambda: df.filter(pl.col("amount") > 500.0))
+
+    # High-cardinality inner join: events (N rows, 100K users) ⋈ users (100K).
+    if users is not None:
+        run("inner_join_user", lambda: df.join(users, on="user_id", how="inner"))
 
     return rows
 
@@ -1182,6 +1339,7 @@ def main():
     ap.add_argument("--csv-trades", help="Path to trades.csv")
     ap.add_argument("--csv-events", help="Path to events.csv")
     ap.add_argument("--csv-lookup", help="Path to lookup.csv (null benchmark)")
+    ap.add_argument("--csv-users", help="Path to users.csv (inner-join dimension)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--out", default="results/python.tsv")
@@ -1240,9 +1398,13 @@ def main():
             )
     if args.csv_events:
         if not args.skip_pandas:
-            all_rows += bench_pandas_events(args.csv_events, args.warmup, args.iters)
+            all_rows += bench_pandas_events(
+                args.csv_events, args.warmup, args.iters, args.csv_users
+            )
         if not args.skip_polars:
-            all_rows += bench_polars_events(args.csv_events, args.warmup, args.iters)
+            all_rows += bench_polars_events(
+                args.csv_events, args.warmup, args.iters, args.csv_users
+            )
     if args.csv_lookup:
         if not args.skip_pandas:
             all_rows += bench_pandas_null(

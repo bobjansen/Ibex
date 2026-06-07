@@ -9304,7 +9304,28 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             for (const Table& t : operands) {
                 ptrs.push_back(&t);
             }
-            return rbind_table(ptrs);
+            auto concatenated = rbind_table(ptrs);
+            if (!concatenated) {
+                return std::unexpected(std::move(concatenated.error()));
+            }
+            // When every operand is a TimeFrame on the same time-index column,
+            // the result stays a TimeFrame: re-sort the concatenation by that
+            // column so the rows interleave in time order (SPEC §9.1 keeps
+            // TimeFrames sorted). Mixed/absent indices yield a plain DataFrame.
+            std::optional<std::string> common_ti = operands.front().time_index;
+            if (common_ti.has_value()) {
+                for (const Table& t : operands) {
+                    if (t.time_index != common_ti) {
+                        common_ti.reset();
+                        break;
+                    }
+                }
+            }
+            if (common_ti.has_value()) {
+                concatenated->time_index = common_ti;
+                return order_table(*concatenated, {{.name = *common_ti, .ascending = true}});
+            }
+            return concatenated;
         }
         case ir::NodeKind::Stream: {
             const auto& sn = static_cast<const ir::StreamNode&>(node);

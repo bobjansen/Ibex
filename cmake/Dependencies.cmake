@@ -82,6 +82,21 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(robin_hood)
 ibex_mark_target_system_headers(robin_hood::robin_hood)
 
+# pdqsort — pattern-defeating quicksort, a single-header drop-in for std::sort
+# (MIT). Used for comparison-sort fallbacks where our comparators break ties by
+# row index, so the unstable order is still total/deterministic. No CMakeLists in
+# the upstream repo, so we expose it as an INTERFACE target ourselves.
+FetchContent_Declare(
+    pdqsort
+    GIT_REPOSITORY https://github.com/orlp/pdqsort.git
+    GIT_TAG        b1ef26a55cdb60d236a5cb199c4234c704f46726
+)
+FetchContent_MakeAvailable(pdqsort)
+if(NOT TARGET pdqsort)
+    add_library(pdqsort INTERFACE)
+    target_include_directories(pdqsort SYSTEM INTERFACE ${pdqsort_SOURCE_DIR})
+endif()
+
 # fast_float — drop-in std::from_chars replacement for floats (Apache 2.0).
 # Much faster than libstdc++'s from_chars<double> on hot CSV ingest paths.
 FetchContent_Declare(

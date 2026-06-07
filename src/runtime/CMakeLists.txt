@@ -27,6 +27,7 @@ target_link_libraries(ibex_runtime
         fmt::fmt
         spdlog::spdlog
         robin_hood::robin_hood
+        pdqsort
 )
 
 # ── AVX2 / libmvec ────────────────────────────────────────────────────────────

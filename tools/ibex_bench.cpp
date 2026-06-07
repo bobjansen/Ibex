@@ -638,6 +638,102 @@ auto verify_sort_symbol_price(const ibex::runtime::Table& table, const ibex::run
     return true;
 }
 
+// Full-table descending sort on a single Double key — exercises the descending
+// radix path (order-preserving codes inverted before the radix pass).
+auto verify_sort_price_desc(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                            std::size_t rows) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* out_price = result.find("price");
+    if (price_col == nullptr || out_price == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    std::vector<double> expected;
+    expected.reserve(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+        expected.push_back(double_at(*price_col, row));
+    }
+    std::sort(expected.begin(), expected.end(), std::greater<double>{});
+    for (std::size_t i = 0; i < rows; ++i) {
+        if (std::abs(double_at(*out_price, i) - expected[i]) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Full-table sort on a single String key — exercises the comparison-sort
+// (pdqsort) fallback. Compared against a stable_sort of the input indices, so
+// the within-symbol tie order (input order) is checked too.
+auto verify_sort_symbol(const ibex::runtime::Table& table, const ibex::runtime::Table& result,
+                        std::size_t rows) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* symbol_col = table.find("symbol");
+    const auto* out_price = result.find("price");
+    const auto* out_symbol = result.find("symbol");
+    if (price_col == nullptr || symbol_col == nullptr || out_price == nullptr ||
+        out_symbol == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    std::vector<std::size_t> idx(rows);
+    std::iota(idx.begin(), idx.end(), std::size_t{0});
+    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+        return string_view_at(*symbol_col, lhs) < string_view_at(*symbol_col, rhs);
+    });
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::size_t row = idx[i];
+        if (string_view_at(*out_symbol, i) != string_view_at(*symbol_col, row)) {
+            return false;
+        }
+        if (std::abs(double_at(*out_price, i) - double_at(*price_col, row)) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Full-table mixed-direction multi-key sort: (symbol asc, price desc). Exercises
+// the multi-key radix with a descending secondary key.
+auto verify_sort_symbol_price_desc(const ibex::runtime::Table& table,
+                                   const ibex::runtime::Table& result, std::size_t rows) -> bool {
+    const auto* price_col = table.find("price");
+    const auto* symbol_col = table.find("symbol");
+    const auto* out_price = result.find("price");
+    const auto* out_symbol = result.find("symbol");
+    if (price_col == nullptr || symbol_col == nullptr || out_price == nullptr ||
+        out_symbol == nullptr) {
+        return false;
+    }
+    if (result.rows() != rows) {
+        return false;
+    }
+    std::vector<std::size_t> idx(rows);
+    std::iota(idx.begin(), idx.end(), std::size_t{0});
+    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+        const auto ls = string_view_at(*symbol_col, lhs);
+        const auto rs = string_view_at(*symbol_col, rhs);
+        if (ls != rs) {
+            return ls < rs;
+        }
+        return double_at(*price_col, lhs) > double_at(*price_col, rhs);
+    });
+    for (std::size_t i = 0; i < rows; ++i) {
+        const std::size_t row = idx[i];
+        if (string_view_at(*out_symbol, i) != string_view_at(*symbol_col, row)) {
+            return false;
+        }
+        if (std::abs(double_at(*out_price, i) - double_at(*price_col, row)) > 1e-9) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Grouped cumulative sum: cumsum(price) by symbol. `update` preserves input row
 // order, so output row i corresponds to input row i; we recompute the running
 // per-symbol total and compare. A grouping bug (running over the whole table
@@ -1140,6 +1236,30 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         std::size_t rows = sliced.at("prices").rows();
         if (!verify_sort_symbol_price(sliced.at("prices"), *result, rows)) {
             return "sort_symbol_price verification failed";
+        }
+    } else if (query.name == "sort_price_desc") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_sort_price_desc(sliced.at("prices"), *result, rows)) {
+            return "sort_price_desc verification failed";
+        }
+    } else if (query.name == "sort_symbol") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_sort_symbol(sliced.at("prices"), *result, rows)) {
+            return "sort_symbol verification failed";
+        }
+    } else if (query.name == "sort_symbol_price_desc") {
+        if (table == nullptr) {
+            return "missing prices table";
+        }
+        std::size_t rows = sliced.at("prices").rows();
+        if (!verify_sort_symbol_price_desc(sliced.at("prices"), *result, rows)) {
+            return "sort_symbol_price_desc verification failed";
         }
     } else if (query.name == "cumsum_by_symbol") {
         if (table == nullptr) {
@@ -1955,15 +2075,21 @@ int main(int argc, char** argv) {
 
         // Full-table sort benchmarks: unlike the order_*_topk queries (which
         // only materialise the top/bottom N rows and can use a partial sort),
-        // these reorder *every* row. sort_price is a single Double key;
-        // sort_symbol_price is a composite (String, Double) key, exercising the
-        // string-comparator and multi-key path.
+        // these reorder *every* row, covering each sort code path:
+        //   sort_price            — single ascending Double key (F64 radix)
+        //   sort_price_desc       — single descending Double key (inverted radix)
+        //   sort_symbol           — single String key (pdqsort comparison fallback)
+        //   sort_symbol_price     — (String asc, Double asc) multi-key radix
+        //   sort_symbol_price_desc— (String asc, Double desc) mixed multi-key radix
         if (status == 0 && run_suite("sort")) {
             fmt::print("\n-- Full-sort benchmarks ({} prices rows) --\n",
                        tables.at("prices").rows());
             std::vector<BenchQuery> sort_queries = {
                 {"sort_price", "prices[order price]"},
+                {"sort_price_desc", "prices[order { price desc }]"},
+                {"sort_symbol", "prices[order symbol]"},
                 {"sort_symbol_price", "prices[order { symbol asc, price asc }]"},
+                {"sort_symbol_price_desc", "prices[order { symbol asc, price desc }]"},
             };
             for (const auto& query : sort_queries) {
                 if (verify) {

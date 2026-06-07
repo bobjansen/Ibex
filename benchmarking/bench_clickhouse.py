@@ -170,8 +170,23 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     )
 
     run(
+        "sort_price_desc",
+        "SELECT * FROM prices ORDER BY price DESC",
+    )
+
+    run(
+        "sort_symbol",
+        "SELECT * FROM prices ORDER BY symbol ASC",
+    )
+
+    run(
         "sort_symbol_price",
         "SELECT * FROM prices ORDER BY symbol ASC, price ASC",
+    )
+
+    run(
+        "sort_symbol_price_desc",
+        "SELECT * FROM prices ORDER BY symbol ASC, price DESC",
     )
 
     run(

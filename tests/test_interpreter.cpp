@@ -6148,6 +6148,182 @@ TEST_CASE("matmul: inner dimension mismatch returns error", "[matmul][matrix]") 
     REQUIRE(result.error().find("inner dimensions") != std::string::npos);
 }
 
+// --- rbind (row-bind) Tests --------------------------------------------------
+
+TEST_CASE("rbind: concatenates matching tables", "[rbind]") {
+    runtime::Table a, b;
+    a.add_column("x", Column<std::int64_t>{1, 2});
+    a.add_column("s", Column<std::string>{"a", "b"});
+    b.add_column("x", Column<std::int64_t>{3, 4});
+    b.add_column("s", Column<std::string>{"c", "d"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("rbind(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto& x = std::get<Column<std::int64_t>>(*result->find("x"));
+    const auto& s = std::get<Column<std::string>>(*result->find("s"));
+    CHECK(x[0] == 1);
+    CHECK(x[1] == 2);
+    CHECK(x[2] == 3);
+    CHECK(x[3] == 4);
+    CHECK(s[0] == "a");
+    CHECK(s[3] == "d");
+}
+
+TEST_CASE("rbind: accepts three or more operands", "[rbind]") {
+    runtime::Table a, b, c;
+    a.add_column("x", Column<std::int64_t>{1});
+    b.add_column("x", Column<std::int64_t>{2});
+    c.add_column("x", Column<std::int64_t>{3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+    registry.emplace("c", c);
+
+    auto ir = require_ir("rbind(a, b, c);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+    const auto& x = std::get<Column<std::int64_t>>(*result->find("x"));
+    CHECK(x[0] == 1);
+    CHECK(x[1] == 2);
+    CHECK(x[2] == 3);
+}
+
+TEST_CASE("rbind: binds by column name regardless of order", "[rbind]") {
+    runtime::Table a, b;
+    a.add_column("x", Column<std::int64_t>{1});
+    a.add_column("y", Column<std::int64_t>{10});
+    // b's columns are in the opposite order but the names/types match.
+    b.add_column("y", Column<std::int64_t>{20});
+    b.add_column("x", Column<std::int64_t>{2});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("rbind(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    // Output keeps operand 1's column order.
+    REQUIRE(result->columns.size() == 2);
+    CHECK(result->columns[0].name == "x");
+    CHECK(result->columns[1].name == "y");
+    const auto& x = std::get<Column<std::int64_t>>(*result->find("x"));
+    const auto& y = std::get<Column<std::int64_t>>(*result->find("y"));
+    CHECK(x[0] == 1);
+    CHECK(x[1] == 2);
+    CHECK(y[0] == 10);
+    CHECK(y[1] == 20);
+}
+
+TEST_CASE("rbind: type mismatch on a shared column is an error", "[rbind]") {
+    runtime::Table a, b;
+    a.add_column("x", Column<std::int64_t>{1});
+    b.add_column("x", Column<double>{1.5});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("rbind(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("Int64") != std::string::npos);
+    CHECK(result.error().find("Float64") != std::string::npos);
+}
+
+TEST_CASE("rbind: differing column counts is an error", "[rbind]") {
+    runtime::Table a, b;
+    a.add_column("x", Column<std::int64_t>{1});
+    b.add_column("x", Column<std::int64_t>{2});
+    b.add_column("y", Column<std::int64_t>{3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("rbind(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("columns") != std::string::npos);
+}
+
+TEST_CASE("rbind: a missing column name is an error", "[rbind]") {
+    runtime::Table a, b;
+    a.add_column("x", Column<std::int64_t>{1});
+    b.add_column("z", Column<std::int64_t>{2});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("rbind(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("missing column 'x'") != std::string::npos);
+}
+
+TEST_CASE("rbind: preserves nulls from both operands", "[rbind][null]") {
+    runtime::Table a, b;
+    a.add_column("v", Column<double>{1.0, 2.0},
+                 runtime::ValidityBitmap{std::initializer_list<bool>{true, false}});
+    b.add_column("v", Column<double>{3.0, 4.0},
+                 runtime::ValidityBitmap{std::initializer_list<bool>{false, true}});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("rbind(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto& entry = result->columns[result->index.at("v")];
+    CHECK_FALSE(runtime::is_null(entry, 0));
+    CHECK(runtime::is_null(entry, 1));
+    CHECK(runtime::is_null(entry, 2));
+    CHECK_FALSE(runtime::is_null(entry, 3));
+}
+
+TEST_CASE("rbind: remaps categorical dictionaries", "[rbind][categorical]") {
+    // Two categorical columns with disjoint-but-overlapping dictionaries.
+    Column<Categorical> ca;
+    ca.push_back("x");
+    ca.push_back("y");
+    Column<Categorical> cb;
+    cb.push_back("y");
+    cb.push_back("z");
+
+    runtime::Table a, b;
+    a.add_column("g", std::move(ca));
+    b.add_column("g", std::move(cb));
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir("rbind(a, b);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto& g = std::get<Column<Categorical>>(*result->find("g"));
+    CHECK(g[0] == "x");
+    CHECK(g[1] == "y");
+    CHECK(g[2] == "y");
+    CHECK(g[3] == "z");
+}
+
 // --- Model Specification Tests -----------------------------------------------
 
 TEST_CASE("model: OLS simple regression", "[model]") {

@@ -280,6 +280,18 @@ auto matmul(const runtime::Table& left, const runtime::Table& right) -> runtime:
     return delegate_with_registry(std::move(node), reg);
 }
 
+auto rbind(const std::vector<runtime::Table>& tables) -> runtime::Table {
+    ir::Builder b;
+    auto node = b.rbind();
+    runtime::TableRegistry reg;
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        std::string key = "__ibex_rbind_" + std::to_string(i) + "__";
+        node->add_child(b.scan(key));
+        reg.emplace(std::move(key), tables[i]);
+    }
+    return delegate_with_registry(std::move(node), reg);
+}
+
 auto model_coef(const runtime::ModelResult& m) -> runtime::Table {
     return m.coefficients;
 }

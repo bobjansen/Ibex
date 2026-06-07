@@ -582,3 +582,19 @@ TEST_CASE("emitter: wildcard ascription emits open=true", "[codegen]") {
     CHECK(contains(out, "ibex::ops::ascribe("));
     CHECK(contains(out, ", true)"));  // wildcard (allows extras)
 }
+
+// --- rbind --------------------------------------------------------------------
+
+TEST_CASE("emitter: rbind emits a brace-init ops::rbind over its children", "[codegen]") {
+    ir::Builder b;
+    auto node = b.rbind();
+    node->add_child(make_source(b, "jan.csv"));
+    node->add_child(make_source(b, "feb.csv"));
+    node->add_child(make_source(b, "mar.csv"));
+
+    auto out = emit_to_string(*node);
+    CHECK(contains(out, "ibex::ops::rbind({"));
+    CHECK(contains(out, "read_csv(\"jan.csv\")"));
+    CHECK(contains(out, "read_csv(\"feb.csv\")"));
+    CHECK(contains(out, "read_csv(\"mar.csv\")"));
+}

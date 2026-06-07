@@ -39,6 +39,7 @@ CSV_MULTI="$SCRIPT_DIR/data/prices_multi.csv"
 CSV_TRADES="$SCRIPT_DIR/data/trades.csv"
 CSV_EVENTS="$SCRIPT_DIR/data/events.csv"
 CSV_LOOKUP="$SCRIPT_DIR/data/lookup.csv"
+CSV_USERS="$SCRIPT_DIR/data/users.csv"
 WARMUP=1
 ITERS=5
 SUITE=""
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --csv-trades)  CSV_TRADES="$2";  shift 2 ;;
         --csv-events)  CSV_EVENTS="$2";  shift 2 ;;
         --csv-lookup)  CSV_LOOKUP="$2";  shift 2 ;;
+        --csv-users)   CSV_USERS="$2";   shift 2 ;;
         --warmup)      WARMUP="$2";      shift 2 ;;
         --iters)       ITERS="$2";       shift 2 ;;
         --suite)       SUITE="$2";       shift 2 ;;
@@ -121,6 +123,7 @@ BENCH_ARGS=(
 [[ -f "$CSV_TRADES" ]]  && BENCH_ARGS+=(--csv-trades  "$CSV_TRADES")
 [[ -f "$CSV_EVENTS" ]]  && BENCH_ARGS+=(--csv-events  "$CSV_EVENTS")
 [[ -f "$CSV_LOOKUP" ]]  && BENCH_ARGS+=(--csv-lookup  "$CSV_LOOKUP")
+[[ -f "$CSV_USERS" ]]   && BENCH_ARGS+=(--csv-users   "$CSV_USERS")
 
 echo "=== $FW_TAG ===" >&2
 raw="$("$IBEX_BENCH" "${BENCH_ARGS[@]}")"

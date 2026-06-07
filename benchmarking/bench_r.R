@@ -28,6 +28,7 @@ csv_multi_path  <- parse_arg("--csv-multi")
 csv_trades_path <- parse_arg("--csv-trades")
 csv_events_path <- parse_arg("--csv-events")
 csv_lookup_path <- parse_arg("--csv-lookup")
+csv_users_path  <- parse_arg("--csv-users")
 warmup          <- as.integer(parse_arg("--warmup", "1"))
 iters           <- as.integer(parse_arg("--iters",  "5"))
 out_path        <- parse_arg("--out", "results/r.tsv")
@@ -255,6 +256,30 @@ if (!skip_data_table) {
     bench("data.table", "sort_symbol_price",
         function() dt[order(symbol, price)])
 
+    # Grouped window functions (per symbol).
+    bench("data.table", "rank_by_symbol",
+        function() dt[, rk := frank(-price, ties.method = "dense"), by = symbol][])
+
+    bench("data.table", "lag_by_symbol",
+        function() dt[, prev := shift(price, 1L), by = symbol][])
+
+    bench("data.table", "cumsum_by_symbol",
+        function() dt[, cs_sym := cumsum(price), by = symbol][])
+
+    # Expensive group aggregates (per symbol): median, p90 (type-7 linear), sd.
+    bench("data.table", "median_by_symbol",
+        function() dt[, .(med = median(price)), by = symbol])
+
+    bench("data.table", "quantile_by_symbol",
+        function() dt[, .(p90 = quantile(price, 0.9, type = 7)), by = symbol])
+
+    bench("data.table", "std_by_symbol",
+        function() dt[, .(sd = sd(price)), by = symbol])
+
+    # Multi-stage pipeline: filter -> group-by -> order -> head.
+    bench("data.table", "filter_group_sort",
+        function() head(dt[price > 500, .(avg = mean(price)), by = symbol][order(-avg)], 10L))
+
     bench("data.table", "cumsum_price",
         function() dt[, cs := cumsum(price)][])
 
@@ -315,6 +340,38 @@ if (!skip_dplyr) {
 
     bench("dplyr", "sort_symbol_price",
         function() tb |> arrange(symbol, price))
+
+    # Grouped window functions (per symbol).
+    bench("dplyr", "rank_by_symbol",
+        function() tb |> group_by(symbol) |>
+            mutate(rk = dense_rank(desc(price))) |> ungroup())
+
+    bench("dplyr", "lag_by_symbol",
+        function() tb |> group_by(symbol) |>
+            mutate(prev = lag(price, 1L)) |> ungroup())
+
+    bench("dplyr", "cumsum_by_symbol",
+        function() tb |> group_by(symbol) |>
+            mutate(cs = cumsum(price)) |> ungroup())
+
+    # Expensive group aggregates (per symbol): median, p90 (type-7 linear), sd.
+    bench("dplyr", "median_by_symbol",
+        function() tb |> group_by(symbol) |>
+            summarise(med = median(price), .groups = "drop"))
+
+    bench("dplyr", "quantile_by_symbol",
+        function() tb |> group_by(symbol) |>
+            summarise(p90 = quantile(price, 0.9, type = 7), .groups = "drop"))
+
+    bench("dplyr", "std_by_symbol",
+        function() tb |> group_by(symbol) |>
+            summarise(sd = sd(price), .groups = "drop"))
+
+    # Multi-stage pipeline: filter -> group-by -> order -> head.
+    bench("dplyr", "filter_group_sort",
+        function() tb |> filter(price > 500) |> group_by(symbol) |>
+            summarise(avg = mean(price), .groups = "drop") |>
+            arrange(desc(avg)) |> head(10L))
 
     bench("dplyr", "cumsum_price",
         function() tb |> mutate(cs = cumsum(price)))
@@ -513,6 +570,13 @@ if (!is.null(csv_events_path)) {
 
         bench("data.table", "filter_events",
             function() dt_ev[amount > 500.0])
+
+        # High-cardinality inner join: events |><| users on user_id (~100K keys).
+        if (!is.null(csv_users_path)) {
+            dt_users <- fread(csv_users_path)
+            bench("data.table", "inner_join_user",
+                function() merge(dt_ev, dt_users, by = "user_id"))
+        }
     }
 
     if (!skip_dplyr) {
@@ -527,6 +591,13 @@ if (!is.null(csv_events_path)) {
 
         bench("dplyr", "filter_events",
             function() tb_ev |> filter(amount > 500.0))
+
+        # High-cardinality inner join: events |><| users on user_id (~100K keys).
+        if (!is.null(csv_users_path)) {
+            tb_users <- as_tibble(fread(csv_users_path))
+            bench("dplyr", "inner_join_user",
+                function() tb_ev |> inner_join(tb_users, by = "user_id"))
+        }
     }
 }
 
@@ -554,6 +625,10 @@ if (!is.null(csv_lookup_path)) {
         bench("data.table", "null_anti_join",
             function() dt[!symbol %chin% lookup_symbols])
 
+        # Low-cardinality inner join: prices |><| lookup on symbol.
+        bench("data.table", "inner_join_symbol",
+            function() merge(dt, dt_lookup, by = "symbol"))
+
         bench("data.table", "null_cross_join_small",
             function() merge(left_small, right_small, by = "join_key", allow.cartesian = TRUE)
                 [, join_key := NULL][])
@@ -576,6 +651,10 @@ if (!is.null(csv_lookup_path)) {
 
         bench("dplyr", "null_anti_join",
             function() tb |> anti_join(tb_lookup_symbols, by = "symbol"))
+
+        # Low-cardinality inner join: prices |><| lookup on symbol.
+        bench("dplyr", "inner_join_symbol",
+            function() tb |> inner_join(tb_lookup, by = "symbol"))
 
         bench("dplyr", "null_cross_join_small",
             function() tibble::as_tibble(merge(tb_left_small, tb_right_small, by = NULL)))

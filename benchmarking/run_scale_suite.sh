@@ -411,13 +411,14 @@ for rows in "${SIZES[@]}"; do
     csv_trades="$size_data_dir/trades.csv"
     csv_events="$size_data_dir/events.csv"
     csv_lookup="$size_data_dir/lookup.csv"
+    csv_users="$size_data_dir/users.csv"
 
     if [[ $SKIP_IBEX -eq 0 ]]; then
         echo "  → ibex"
         IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
             bash "$SCRIPT_DIR/bench_ibex.sh" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --out "$size_result_dir/ibex.tsv" || engine_failed "ibex"
@@ -443,7 +444,7 @@ for rows in "${SIZES[@]}"; do
         fi
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -457,7 +458,7 @@ for rows in "${SIZES[@]}"; do
             polars_st_tsv="$size_result_dir/polars_st.tsv"
             POLARS_MAX_THREADS=1 IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_python.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -480,7 +481,7 @@ for rows in "${SIZES[@]}"; do
         fi
         Rscript "$SCRIPT_DIR/bench_r.R" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -501,7 +502,7 @@ for rows in "${SIZES[@]}"; do
         echo "  → duckdb"
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -514,7 +515,7 @@ for rows in "${SIZES[@]}"; do
             duckdb_st_tsv="$size_result_dir/duckdb_st.tsv"
             IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_duckdb.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -530,7 +531,7 @@ for rows in "${SIZES[@]}"; do
         echo "  → datafusion"
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -543,7 +544,7 @@ for rows in "${SIZES[@]}"; do
             datafusion_st_tsv="$size_result_dir/datafusion_st.tsv"
             IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_datafusion.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -559,7 +560,7 @@ for rows in "${SIZES[@]}"; do
         echo "  → clickhouse (chdb)"
         uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
             --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-            --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+            --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -572,7 +573,7 @@ for rows in "${SIZES[@]}"; do
             clickhouse_st_tsv="$size_result_dir/clickhouse_st.tsv"
             IBEX_FW_SUFFIX=-st uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_clickhouse.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \
@@ -591,7 +592,7 @@ for rows in "${SIZES[@]}"; do
             echo "  → sqlite"
             uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_sqlite.py" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
                 --fill-rows "$rows" \
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \

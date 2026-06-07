@@ -152,6 +152,15 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         .tail(3),
     )
 
+    # Full-table sorts (every row reordered), in contrast to the top-k queries
+    # above which only keep N rows.
+    run("sort_price", lambda: df.sort_values("price", kind="mergesort"))
+
+    run(
+        "sort_symbol_price",
+        lambda: df.sort_values(["symbol", "price"], kind="mergesort"),
+    )
+
     run("cumsum_price", lambda: df.assign(cs=df["price"].cumsum()))
 
     run("cumprod_price", lambda: df.assign(cp=df["price"].cumprod()))
@@ -281,6 +290,11 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         .group_by("symbol", maintain_order=True)
         .tail(3),
     )
+
+    # Full-table sorts (every row reordered).
+    run("sort_price", lambda: df.sort("price"))
+
+    run("sort_symbol_price", lambda: df.sort(["symbol", "price"]))
 
     run("cumsum_price", lambda: df.with_columns(pl.col("price").cum_sum().alias("cs")))
 
@@ -446,6 +460,9 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         .tail(3)
         .collect(),
     )
+    # Full-table sorts (every row reordered).
+    run("sort_price", lambda: scan().sort("price").collect())
+    run("sort_symbol_price", lambda: scan().sort(["symbol", "price"]).collect())
     run(
         "cumsum_price",
         lambda: scan().with_columns(pl.col("price").cum_sum().alias("cs")).collect(),

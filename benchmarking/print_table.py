@@ -50,6 +50,8 @@ QUERY_ORDER = [
     "filter_or",
     "filter_events",
     # sort / top-k
+    "sort_price",
+    "sort_symbol_price",
     "order_head_topk",
     "order_head_topk_by_symbol",
     "order_tail_topk",
@@ -106,6 +108,8 @@ QUERY_LABEL = {
     "null_anti_join": "anti join",
     "null_cross_join_small": "cross join (2k×64)",
     "distinct_symbol": "distinct symbol",
+    "sort_price": "sort (full)",
+    "sort_symbol_price": "sort symbol,price (full)",
     "order_head_topk": "top-k head",
     "order_head_topk_by_symbol": "top-k head by symbol",
     "order_tail_topk": "top-k tail",

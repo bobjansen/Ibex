@@ -746,6 +746,27 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Rbind: {
+            if (node.children().size() < 2) {
+                throw std::runtime_error("RbindNode expects at least two children");
+            }
+            std::vector<std::string> child_vars;
+            child_vars.reserve(node.children().size());
+            for (const auto& child : node.children()) {
+                child_vars.push_back(emit_node(*child));
+            }
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::rbind({";
+            for (std::size_t i = 0; i < child_vars.size(); ++i) {
+                if (i > 0) {
+                    *out_ << ", ";
+                }
+                *out_ << child_vars[i];
+            }
+            *out_ << "});\n";
+            return var;
+        }
+
         case ir::NodeKind::Model: {
             // Model fitting is not yet supported in codegen — it requires the full
             // runtime interpreter.  Emit a placeholder that errors at compile time.

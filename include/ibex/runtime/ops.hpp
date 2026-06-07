@@ -123,6 +123,10 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto matmul(const runtime::Table& left, const runtime::Table& right)
     -> runtime::Table;
 
+/// Row-bind: vertically concatenate operands sharing the same column schema
+/// (matched by name and type). Output carries the first operand's column order.
+[[nodiscard]] auto rbind(const std::vector<runtime::Table>& tables) -> runtime::Table;
+
 /// Model accessor functions — extract sub-tables from a ModelResult.
 [[nodiscard]] auto model_coef(const runtime::ModelResult& m) -> runtime::Table;
 [[nodiscard]] auto model_summary(const runtime::ModelResult& m) -> runtime::Table;

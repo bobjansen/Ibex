@@ -126,6 +126,8 @@ class Builder {
 
     [[nodiscard]] auto matmul() -> NodePtr { return std::make_unique<MatmulNode>(next_id()); }
 
+    [[nodiscard]] auto rbind() -> NodePtr { return std::make_unique<RbindNode>(next_id()); }
+
     [[nodiscard]] auto model(ModelFormula formula, std::string method,
                              std::vector<ModelParamSpec> params) -> NodePtr {
         return std::make_unique<ModelNode>(next_id(), std::move(formula), std::move(method),

@@ -208,6 +208,9 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         case NodeKind::Tail:
         case NodeKind::Distinct:
         case NodeKind::Window:
+        // Rbind requires every operand to share child[0]'s schema, so the
+        // output schema is simply that of the first child.
+        case NodeKind::Rbind:
             return child_schema(node, sources);
 
         case NodeKind::AsTimeframe: {

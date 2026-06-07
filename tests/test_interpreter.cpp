@@ -6324,6 +6324,66 @@ TEST_CASE("rbind: remaps categorical dictionaries", "[rbind][categorical]") {
     CHECK(g[3] == "z");
 }
 
+TEST_CASE("rbind: two TimeFrames interleave by time index and stay a TimeFrame",
+          "[rbind][timeframe]") {
+    runtime::Table a, b;
+    a.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(300)});
+    a.add_column("val", Column<std::int64_t>{1, 3});
+    b.add_column("ts", Column<Timestamp>{ts_from_nanos(200), ts_from_nanos(400)});
+    b.add_column("val", Column<std::int64_t>{2, 4});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir(R"(rbind(as_timeframe(a, "ts"), as_timeframe(b, "ts"));)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    // Result remains a TimeFrame indexed on "ts".
+    REQUIRE(result->time_index.has_value());
+    CHECK(*result->time_index == "ts");
+
+    // Rows from both operands interleave into ascending time order.
+    const auto& ts = std::get<Column<Timestamp>>(*result->find("ts"));
+    const auto& val = std::get<Column<std::int64_t>>(*result->find("val"));
+    CHECK(ts[0].nanos == 100);
+    CHECK(ts[1].nanos == 200);
+    CHECK(ts[2].nanos == 300);
+    CHECK(ts[3].nanos == 400);
+    CHECK(val[0] == 1);
+    CHECK(val[1] == 2);
+    CHECK(val[2] == 3);
+    CHECK(val[3] == 4);
+}
+
+TEST_CASE("rbind: a TimeFrame with a plain DataFrame yields a plain DataFrame",
+          "[rbind][timeframe]") {
+    runtime::Table a, b;
+    a.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(300)});
+    a.add_column("val", Column<std::int64_t>{1, 3});
+    b.add_column("ts", Column<Timestamp>{ts_from_nanos(200)});
+    b.add_column("val", Column<std::int64_t>{2});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    // Only the first operand is a TimeFrame; the result drops the index and
+    // preserves operand-append order rather than re-sorting.
+    auto ir = require_ir(R"(rbind(as_timeframe(a, "ts"), b);)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+    CHECK_FALSE(result->time_index.has_value());
+
+    const auto& ts = std::get<Column<Timestamp>>(*result->find("ts"));
+    CHECK(ts[0].nanos == 100);
+    CHECK(ts[1].nanos == 300);
+    CHECK(ts[2].nanos == 200);
+}
+
 // --- Model Specification Tests -----------------------------------------------
 
 TEST_CASE("model: OLS simple regression", "[model]") {

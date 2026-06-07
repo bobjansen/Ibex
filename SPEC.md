@@ -1671,9 +1671,13 @@ rbind(
 )
 ```
 
-`rbind` takes at least two operands. The result is **not** a `TimeFrame` even
-if the operands are — concatenation may interleave time indices, so any time
-index and ordering are dropped.
+`rbind` takes at least two operands. When **every** operand is a `TimeFrame`
+indexed on the same column, the result is a `TimeFrame` on that column: the rows
+of all operands are merged and re-sorted into ascending time order (SPEC §9.1
+keeps TimeFrames sorted), interleaving the inputs. If the operands carry mixed
+or differing time indices — including the case where only some are TimeFrames —
+the time index and ordering are dropped and the result is a plain `DataFrame`
+preserving the operand-append order.
 
 ### 5.4 Result Type Rules
 
@@ -1695,7 +1699,7 @@ index and ordering are dropped.
 | `corr`                | `DataFrame<S'>` | S' = {column: String} + N Float64 (N = numeric cols) |
 | `transpose`           | `DataFrame<S'>` | S' = {column: String} + one col per input row |
 | `matmul(a, b)`        | `DataFrame<S'>` | S' = numeric cols of b; nrow = nrow(a) |
-| `rbind(a, b, …)`      | `DataFrame<S>`  | S = schema of first operand (all must match); nrow = Σ nrow(operands) |
+| `rbind(a, b, …)`      | `DataFrame<S>` / `TimeFrame<S>` | S = schema of first operand (all must match); nrow = Σ nrow(operands). `TimeFrame` (merged + sorted by the index) iff all operands share one time index |
 | `model { ... }`       | `ModelResult`   | Coefficients table: {term: String, estimate: Float64} |
 
 If the input is a `TimeFrame` and no clause removes the time index column,

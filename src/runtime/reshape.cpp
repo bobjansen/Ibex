@@ -367,9 +367,42 @@ auto column_type_label(const ColumnValue& column) -> std::string_view {
         column);
 }
 
+// Extract the merge column of `table` (at position `pos`) as ascending-order
+// comparison keys. Only Timestamp/Date/Int64 are orderable time indices; any
+// other type yields nullopt so the caller can report it.
+auto extract_order_keys(const Table& table, std::size_t pos)
+    -> std::optional<std::vector<std::int64_t>> {
+    return std::visit(
+        [](const auto& col) -> std::optional<std::vector<std::int64_t>> {
+            using Col = std::decay_t<decltype(col)>;
+            std::vector<std::int64_t> keys;
+            keys.reserve(col.size());
+            if constexpr (std::is_same_v<Col, Column<Timestamp>>) {
+                for (std::size_t r = 0; r < col.size(); ++r) {
+                    keys.push_back(col[r].nanos);
+                }
+                return keys;
+            } else if constexpr (std::is_same_v<Col, Column<Date>>) {
+                for (std::size_t r = 0; r < col.size(); ++r) {
+                    keys.push_back(col[r].days);
+                }
+                return keys;
+            } else if constexpr (std::is_same_v<Col, Column<std::int64_t>>) {
+                for (std::size_t r = 0; r < col.size(); ++r) {
+                    keys.push_back(col[r]);
+                }
+                return keys;
+            } else {
+                return std::nullopt;
+            }
+        },
+        *table.columns[pos].column);
+}
+
 }  // namespace
 
-auto rbind_table(const std::vector<const Table*>& tables) -> std::expected<Table, std::string> {
+auto rbind_table(const std::vector<const Table*>& tables,
+                 const std::optional<std::string>& merge_key) -> std::expected<Table, std::string> {
     if (tables.empty()) {
         return std::unexpected("rbind: requires at least one operand");
     }
@@ -421,6 +454,52 @@ auto rbind_table(const std::vector<const Table*>& tables) -> std::expected<Table
         total_rows += t->rows();
     }
 
+    // Output row sequence as (operand, source-row) pairs. Without a merge key
+    // this is just every operand's rows in order; with one we k-way merge the
+    // already-sorted operands so the result lands sorted in a single pass —
+    // no concatenate-then-sort. Every column (and validity bitmap) is then
+    // gathered through this one order.
+    std::vector<std::pair<std::size_t, std::size_t>> order;
+    order.reserve(total_rows);
+    if (merge_key.has_value()) {
+        const std::size_t mci = ref.index.at(*merge_key);
+        std::vector<std::vector<std::int64_t>> keys(tables.size());
+        for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+            auto extracted = extract_order_keys(*tables[ti], col_pos[ti][mci]);
+            if (!extracted.has_value()) {
+                return std::unexpected("rbind: time index column '" + *merge_key +
+                                       "' must be Timestamp, Date, or Int64 to merge TimeFrames");
+            }
+            keys[ti] = std::move(extracted.value());
+        }
+        std::vector<std::size_t> cursor(tables.size(), 0);
+        for (std::size_t step = 0; step < total_rows; ++step) {
+            std::size_t best = tables.size();
+            std::int64_t best_key = 0;
+            for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+                if (cursor[ti] >= keys[ti].size()) {
+                    continue;
+                }
+                const std::int64_t kv = keys[ti][cursor[ti]];
+                // Strict `<` keeps the merge stable: on equal keys the
+                // earlier operand's row is emitted first.
+                if (best == tables.size() || kv < best_key) {
+                    best = ti;
+                    best_key = kv;
+                }
+            }
+            order.emplace_back(best, cursor[best]);
+            ++cursor[best];
+        }
+    } else {
+        for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+            const std::size_t n = tables[ti]->rows();
+            for (std::size_t r = 0; r < n; ++r) {
+                order.emplace_back(ti, r);
+            }
+        }
+    }
+
     Table out;
     out.columns.reserve(ncols);
     for (std::size_t ci = 0; ci < ncols; ++ci) {
@@ -440,14 +519,11 @@ auto rbind_table(const std::vector<const Table*>& tables) -> std::expected<Table
                 using Col = std::decay_t<decltype(ref_col)>;
                 Col dst;
                 dst.reserve(total_rows);
-                for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+                for (const auto& [ti, r] : order) {
                     const auto& src = std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
-                    const std::size_t n = src.size();
-                    for (std::size_t r = 0; r < n; ++r) {
-                        // For Categorical this remaps through each source's
-                        // dictionary into the result's; other types copy values.
-                        dst.push_back(src[r]);
-                    }
+                    // For Categorical this remaps through each source's
+                    // dictionary into the result's; other types copy values.
+                    dst.push_back(src[r]);
                 }
                 return ColumnValue{std::move(dst)};
             },
@@ -456,12 +532,8 @@ auto rbind_table(const std::vector<const Table*>& tables) -> std::expected<Table
         if (any_null) {
             ValidityBitmap validity;
             validity.reserve(total_rows);
-            for (std::size_t ti = 0; ti < tables.size(); ++ti) {
-                const ColumnEntry& entry = tables[ti]->columns[col_pos[ti][ci]];
-                const std::size_t n = column_size(*entry.column);
-                for (std::size_t r = 0; r < n; ++r) {
-                    validity.push_back(!is_null(entry, r));
-                }
+            for (const auto& [ti, r] : order) {
+                validity.push_back(!is_null(tables[ti]->columns[col_pos[ti][ci]], r));
             }
             out.add_column(ref_entry.name, std::move(built), std::move(validity));
         } else {

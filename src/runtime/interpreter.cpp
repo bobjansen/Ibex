@@ -2504,6 +2504,16 @@ auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows) -> So
     return radix_sort_impl<std::uint64_t>(std::move(keys), rows);
 }
 
+// Map an IEEE-754 double to a uint64 whose unsigned order matches ascending
+// double order, so radix_sort_u64_asc can sort doubles directly. For positive
+// values flip the sign bit; for negatives flip all bits. NaNs (sign bit clear)
+// sort to the end. The transform is a bijection, so radix stays stable.
+inline auto double_to_sortable_u64(double value) -> std::uint64_t {
+    const std::uint64_t bits = std::bit_cast<std::uint64_t>(value);
+    return bits ^ ((static_cast<std::uint64_t>(-static_cast<std::int64_t>(bits >> 63))) |
+                   (std::uint64_t{1} << 63));
+}
+
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     -> std::expected<Table, std::string> {
     std::size_t rows = input.rows();
@@ -2638,6 +2648,21 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     // Fast path: single ascending I64 key — radix sort (pre-sorted case already handled above).
     if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 && flat_keys[0].ascending) {
         auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
+        return std::visit(
+            [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
+                return gather_rows(input, idx, &resolved_keys);
+            },
+            sort_result);
+    }
+
+    // Fast path: single ascending F64 key — map each double to an order-preserving
+    // uint64 and radix sort, avoiding the comparison-based stable_sort.
+    if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::F64 && flat_keys[0].ascending) {
+        std::vector<std::uint64_t> radix_keys(rows);
+        const auto& f = flat_keys[0].f64;
+        for (std::size_t i = 0; i < rows; ++i)
+            radix_keys[i] = double_to_sortable_u64(f[i]);
+        auto sort_result = radix_sort_u64_asc(std::move(radix_keys), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
                 return gather_rows(input, idx, &resolved_keys);
@@ -10442,21 +10467,6 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
         lhs, rhs);
 }
 
-auto scalar_at_for_order(const ColumnValue& col, std::size_t row) -> ScalarValue {
-    return std::visit(
-        [row](const auto& c) -> ScalarValue {
-            using T = typename std::decay_t<decltype(c)>::value_type;
-            if constexpr (std::is_same_v<T, bool>) {
-                return static_cast<std::int64_t>(c[row] ? 1 : 0);
-            } else if constexpr (std::is_same_v<T, std::string_view>) {
-                return std::string(c[row]);
-            } else {
-                return c[row];
-            }
-        },
-        col);
-}
-
 auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                           const std::vector<ir::ColumnRef>& group_by)
     -> std::expected<ComputedColumn, std::string> {
@@ -10492,55 +10502,120 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         group_entries.push_back(entry);
     }
 
+    // Pre-flatten every group/order key into a typed array so the hot sort
+    // comparator does plain vector indexing instead of per-comparison variant
+    // dispatch. Crucially, string keys are flattened to string_view (views into
+    // the column's storage) rather than the std::string that scalar_at_for_order
+    // allocates on every access — without this, sorting 4M rows by a string key
+    // performs hundreds of millions of heap allocations.
+    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
+    enum class FlatKind : std::uint8_t { I64, F64, Str };
+    struct FlatCol {
+        FlatKind kind = FlatKind::I64;
+        std::vector<std::uint64_t> u64;  // Int / Date.days / Timestamp.nanos / bool, sign-flipped
+        std::vector<double> f64;
+        std::vector<std::string_view> str;  // views into original column storage
+        const ValidityBitmap* validity = nullptr;
+        bool ascending = true;
+    };
+
+    auto flatten = [&](const ColumnEntry* entry, bool ascending) -> FlatCol {
+        FlatCol fc;
+        fc.ascending = ascending;
+        if (entry->validity.has_value()) {
+            fc.validity = &*entry->validity;
+        }
+        std::visit(
+            [&](const auto& col) {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                    fc.kind = FlatKind::I64;
+                    fc.u64.reserve(rows);
+                    for (auto v : col)
+                        fc.u64.push_back(static_cast<std::uint64_t>(v) ^ kSignFlip);
+                } else if constexpr (std::is_same_v<ColT, Column<double>>) {
+                    fc.kind = FlatKind::F64;
+                    fc.f64.assign(col.begin(), col.end());
+                } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
+                    fc.kind = FlatKind::I64;
+                    fc.u64.reserve(rows);
+                    for (const auto& d : col)
+                        fc.u64.push_back(static_cast<std::uint64_t>(d.days) ^ kSignFlip);
+                } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+                    fc.kind = FlatKind::I64;
+                    fc.u64.reserve(rows);
+                    for (const auto& ts : col)
+                        fc.u64.push_back(static_cast<std::uint64_t>(ts.nanos) ^ kSignFlip);
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    fc.kind = FlatKind::I64;
+                    fc.u64.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i)
+                        fc.u64.push_back(static_cast<std::uint64_t>(col[i] ? 1 : 0) ^ kSignFlip);
+                } else {
+                    // Column<std::string> or categorical: view, no allocation.
+                    fc.kind = FlatKind::Str;
+                    fc.str.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i)
+                        fc.str.push_back(col[i]);
+                }
+            },
+            *entry->column);
+        return fc;
+    };
+
+    std::vector<FlatCol> group_flat;
+    group_flat.reserve(group_entries.size());
+    for (const auto* entry : group_entries)
+        group_flat.push_back(flatten(entry, /*ascending=*/true));
+
+    std::vector<FlatCol> order_flat;
+    order_flat.reserve(resolved_keys.size());
+    for (const auto& key : resolved_keys)
+        order_flat.push_back(flatten(key.entry, key.ascending));
+
+    auto flat_is_null = [](const FlatCol& fc, std::size_t row) -> bool {
+        return fc.validity != nullptr && !(*fc.validity)[row];
+    };
+    // Three-way compare of a single flat key; sign-flipped u64 compares as signed,
+    // string_view as lexicographic — both match compare_scalar_for_order.
+    auto flat_cmp = [](const FlatCol& fc, std::size_t lhs, std::size_t rhs) -> int {
+        switch (fc.kind) {
+            case FlatKind::I64: {
+                auto l = fc.u64[lhs];
+                auto r = fc.u64[rhs];
+                return l < r ? -1 : (l > r ? 1 : 0);
+            }
+            case FlatKind::F64: {
+                auto l = fc.f64[lhs];
+                auto r = fc.f64[rhs];
+                return l < r ? -1 : (r < l ? 1 : 0);
+            }
+            case FlatKind::Str: {
+                const auto& l = fc.str[lhs];
+                const auto& r = fc.str[rhs];
+                return l < r ? -1 : (r < l ? 1 : 0);
+            }
+        }
+        return 0;
+    };
+
     auto is_null_row_for_keys = [&](std::size_t row) -> bool {
-        return std::ranges::any_of(resolved_keys, [row](const auto& key) {
-            return key.entry->validity.has_value() && !(*key.entry->validity)[row];
-        });
+        return std::ranges::any_of(order_flat,
+                                   [&](const FlatCol& fc) { return flat_is_null(fc, row); });
     };
 
     auto same_group = [&](std::size_t lhs, std::size_t rhs) -> bool {
-        auto entry_matches = [&](const ColumnEntry* entry) -> bool {
-            if (entry->validity.has_value()) {
-                const bool lv = (*entry->validity)[lhs];
-                const bool rv = (*entry->validity)[rhs];
-                if (lv != rv) {
-                    return false;
-                }
-                if (!lv) {
-                    return true;
-                }
+        return std::ranges::all_of(group_flat, [&](const FlatCol& fc) {
+            const bool ln = flat_is_null(fc, lhs);
+            const bool rn = flat_is_null(fc, rhs);
+            if (ln != rn) {
+                return false;
             }
-
-            return compare_scalar_for_order(scalar_at_for_order(*entry->column, lhs),
-                                            scalar_at_for_order(*entry->column, rhs)) == 0;
-        };
-
-        return std::ranges::all_of(group_entries, entry_matches);
-    };
-
-    auto compare_rows = [&](std::size_t lhs, std::size_t rhs) -> bool {
-        const bool lhs_null = is_null_row_for_keys(lhs);
-        const bool rhs_null = is_null_row_for_keys(rhs);
-        if (lhs_null || rhs_null) {
-            if (lhs_null != rhs_null) {
-                if (rank.na_option == ir::RankNaOption::Top) {
-                    return lhs_null;
-                }
-                if (rank.na_option == ir::RankNaOption::Bottom) {
-                    return !lhs_null;
-                }
-                return lhs < rhs;
+            if (ln) {
+                return true;
             }
-            return lhs < rhs;
-        }
-        for (const auto& key : resolved_keys) {
-            int cmp = compare_scalar_for_order(scalar_at_for_order(*key.entry->column, lhs),
-                                               scalar_at_for_order(*key.entry->column, rhs));
-            if (cmp != 0) {
-                return key.ascending ? (cmp < 0) : (cmp > 0);
-            }
-        }
-        return lhs < rhs;
+            return flat_cmp(fc, lhs, rhs) == 0;
+        });
     };
 
     auto equal_rank_keys = [&](std::size_t lhs, std::size_t rhs) -> bool {
@@ -10549,41 +10624,119 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         if (lhs_null || rhs_null) {
             return lhs_null == rhs_null;
         }
-        return std::ranges::all_of(resolved_keys, [lhs, rhs](const auto& key) {
-            return compare_scalar_for_order(scalar_at_for_order(*key.entry->column, lhs),
-                                            scalar_at_for_order(*key.entry->column, rhs)) == 0;
-        });
+        return std::ranges::all_of(order_flat,
+                                   [&](const FlatCol& fc) { return flat_cmp(fc, lhs, rhs) == 0; });
     };
 
-    std::vector<std::size_t> idx(rows);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+    std::vector<std::size_t> idx;
+
+    // Fast path: a single non-null numeric order key with non-null group keys.
+    // Radix-argsort by the order value (no O(n log n) string/comparison sort),
+    // then a stable counting-sort by hashed group id makes each group contiguous
+    // while preserving the within-group order from the radix pass. Falls back to
+    // the comparison sort below for string order keys, multiple order keys, or
+    // any nullable key (where na_option / null-group semantics need the general
+    // path). This is the hot path for `rank(x) by g` over large frames.
+    const bool radix_order =
+        order_flat.size() == 1 && order_flat[0].kind != FlatKind::Str &&
+        order_flat[0].validity == nullptr &&
+        std::ranges::all_of(group_flat, [](const FlatCol& fc) { return fc.validity == nullptr; });
+    if (radix_order) {
+        const FlatCol& ok = order_flat[0];
+        std::vector<std::uint64_t> codes;
+        if (ok.kind == FlatKind::F64) {
+            codes.resize(rows);
+            for (std::size_t i = 0; i < rows; ++i)
+                codes[i] = double_to_sortable_u64(ok.f64[i]);
+        } else {
+            codes = ok.u64;  // already sign-flipped to order-preserving u64
+        }
+        // Invert the order-preserving codes for a descending key so an ascending
+        // radix sort yields descending order.
+        if (!ok.ascending) {
+            for (auto& c : codes)
+                c = ~c;
+        }
+        auto sort_result = radix_sort_u64_asc(std::move(codes), rows);
+        idx.resize(rows);
+        std::visit(
+            [&](const auto& sorted) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    idx[i] = sorted[i];
+            },
+            sort_result);
+
         if (!group_entries.empty()) {
-            const bool same = same_group(lhs, rhs);
-            // NOLINTNEXTLINE(readability-suspicious-call-argument)
-            const bool reverse_same = same_group(rhs, lhs);
-            if (!same || !reverse_same) {
-                for (const auto* entry : group_entries) {
-                    if (entry->validity.has_value()) {
-                        const bool lv = (*entry->validity)[lhs];
-                        const bool rv = (*entry->validity)[rhs];
-                        if (lv != rv) {
-                            return lv < rv;
-                        }
-                        if (!lv) {
-                            continue;
-                        }
-                    }
-                    int cmp = compare_scalar_for_order(scalar_at_for_order(*entry->column, lhs),
-                                                       scalar_at_for_order(*entry->column, rhs));
-                    if (cmp != 0) {
-                        return cmp < 0;
-                    }
+            robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+            std::vector<std::uint32_t> group_id(rows);
+            std::uint32_t ngroups = 0;
+            for (std::size_t r = 0; r < rows; ++r) {
+                Key key;
+                key.values.reserve(group_entries.size());
+                for (const auto* entry : group_entries)
+                    key.values.push_back(scalar_from_column(*entry->column, r));
+                auto [it, inserted] = group_index.emplace(std::move(key), ngroups);
+                if (inserted)
+                    ++ngroups;
+                group_id[r] = it->second;
+            }
+            // Stable counting sort of idx by group id.
+            std::vector<std::size_t> cnt(static_cast<std::size_t>(ngroups) + 1, 0);
+            for (std::size_t r = 0; r < rows; ++r)
+                ++cnt[static_cast<std::size_t>(group_id[r]) + 1];
+            for (std::size_t g = 0; g < ngroups; ++g)
+                cnt[g + 1] += cnt[g];
+            std::vector<std::size_t> grouped(rows);
+            for (std::size_t i = 0; i < rows; ++i) {
+                std::uint32_t g = group_id[idx[i]];
+                grouped[cnt[g]++] = idx[i];
+            }
+            idx = std::move(grouped);
+        }
+    } else {
+        idx.resize(rows);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+            // Order groups first (nulls sort first, ascending by value) so that rows
+            // of the same group are contiguous for the sweep below.
+            for (const auto& fc : group_flat) {
+                const bool ln = flat_is_null(fc, lhs);
+                const bool rn = flat_is_null(fc, rhs);
+                if (ln != rn) {
+                    return ln;  // null sorts first
+                }
+                if (ln) {
+                    continue;
+                }
+                int cmp = flat_cmp(fc, lhs, rhs);
+                if (cmp != 0) {
+                    return cmp < 0;
                 }
             }
-        }
-        return compare_rows(lhs, rhs);
-    });
+            // Within a group, order by the rank keys (honouring na_option).
+            const bool lhs_null = is_null_row_for_keys(lhs);
+            const bool rhs_null = is_null_row_for_keys(rhs);
+            if (lhs_null || rhs_null) {
+                if (lhs_null != rhs_null) {
+                    if (rank.na_option == ir::RankNaOption::Top) {
+                        return lhs_null;
+                    }
+                    if (rank.na_option == ir::RankNaOption::Bottom) {
+                        return !lhs_null;
+                    }
+                    return lhs < rhs;
+                }
+                return lhs < rhs;
+            }
+            for (const auto& fc : order_flat) {
+                int cmp = flat_cmp(fc, lhs, rhs);
+                if (cmp != 0) {
+                    return fc.ascending ? (cmp < 0) : (cmp > 0);
+                }
+            }
+            return lhs < rhs;
+        });
+    }
 
     std::vector<double> rank_values(rows, 0.0);
     ValidityBitmap validity(rows, true);

@@ -248,6 +248,13 @@ if (!skip_data_table) {
     bench("data.table", "order_tail_topk_by_symbol",
         function() dt[order(-price), tail(.SD, 3L), by = symbol])
 
+    # Full-table sorts (every row reordered, no head/tail).
+    bench("data.table", "sort_price",
+        function() dt[order(price)])
+
+    bench("data.table", "sort_symbol_price",
+        function() dt[order(symbol, price)])
+
     bench("data.table", "cumsum_price",
         function() dt[, cs := cumsum(price)][])
 
@@ -301,6 +308,13 @@ if (!skip_dplyr) {
     bench("dplyr", "order_tail_topk_by_symbol",
         function() tb |> arrange(desc(price)) |> group_by(symbol) |>
             slice_tail(n = 3L) |> ungroup())
+
+    # Full-table sorts (every row reordered, no head/tail).
+    bench("dplyr", "sort_price",
+        function() tb |> arrange(price))
+
+    bench("dplyr", "sort_symbol_price",
+        function() tb |> arrange(symbol, price))
 
     bench("dplyr", "cumsum_price",
         function() tb |> mutate(cs = cumsum(price)))

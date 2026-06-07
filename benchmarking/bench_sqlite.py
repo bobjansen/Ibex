@@ -129,6 +129,19 @@ def bench_sqlite_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ).fetchall(),
     )
 
+    # Full-table sorts (no LIMIT — every row materialised in order).
+    run(
+        "sort_price",
+        lambda: con.execute("SELECT * FROM prices ORDER BY price ASC").fetchall(),
+    )
+
+    run(
+        "sort_symbol_price",
+        lambda: con.execute(
+            "SELECT * FROM prices ORDER BY symbol ASC, price ASC"
+        ).fetchall(),
+    )
+
     if csv_multi_path:
         _load_csv(con, "prices_multi", csv_multi_path)
 

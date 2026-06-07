@@ -169,6 +169,19 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ).collect(),
     )
 
+    # Full-table sorts (no LIMIT — every row materialised in order).
+    run(
+        "sort_price",
+        lambda: ctx.sql("SELECT * FROM prices ORDER BY price ASC").collect(),
+    )
+
+    run(
+        "sort_symbol_price",
+        lambda: ctx.sql(
+            "SELECT * FROM prices ORDER BY symbol ASC, price ASC"
+        ).collect(),
+    )
+
     run(
         "cumsum_price",
         lambda: ctx.sql(

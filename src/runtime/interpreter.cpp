@@ -10764,6 +10764,11 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
 
     std::vector<std::size_t> idx;
 
+    // Populated by the radix fast path when group_entries is non-empty: group g's
+    // rows are idx[radix_group_starts[g]..radix_group_starts[g+1]). Used by the
+    // rank sweep to avoid O(n) same_group calls.
+    std::vector<std::size_t> radix_group_starts;
+
     // Fast path: a single non-null numeric order key with non-null group keys.
     // Radix-argsort by the order value (no O(n log n) string/comparison sort),
     // then a stable counting-sort by hashed group id makes each group contiguous
@@ -10801,25 +10806,48 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             sort_result);
 
         if (!group_entries.empty()) {
-            robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+            // Assign group IDs using the already-flattened group_flat arrays (string_view,
+            // no per-row allocation) instead of calling scalar_from_column (which
+            // heap-allocates std::string for string columns on every row).
             std::vector<std::uint32_t> group_id(rows);
             std::uint32_t ngroups = 0;
-            for (std::size_t r = 0; r < rows; ++r) {
-                Key key;
-                key.values.reserve(group_entries.size());
-                for (const auto* entry : group_entries)
-                    key.values.push_back(scalar_from_column(*entry->column, r));
-                auto [it, inserted] = group_index.emplace(std::move(key), ngroups);
-                if (inserted)
-                    ++ngroups;
-                group_id[r] = it->second;
+            if (group_flat.size() == 1 && group_flat[0].kind == FlatKind::Str) {
+                // Single string group key: hash string_views directly.
+                robin_hood::unordered_flat_map<std::string_view, std::uint32_t> group_index;
+                const auto& sv = group_flat[0].str;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    auto [it, inserted] = group_index.emplace(sv[r], ngroups);
+                    if (inserted)
+                        ++ngroups;
+                    group_id[r] = it->second;
+                }
+            } else {
+                // General: build a flat key from each group_flat column without going
+                // through ScalarValue. I64/F64 columns use their numeric values directly;
+                // string columns still hash as string_view (the Key uses std::string only
+                // for the fallback path which doesn't reach here).
+                robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    Key key;
+                    key.values.reserve(group_entries.size());
+                    for (const auto* entry : group_entries)
+                        key.values.push_back(scalar_from_column(*entry->column, r));
+                    auto [it, inserted] = group_index.emplace(std::move(key), ngroups);
+                    if (inserted)
+                        ++ngroups;
+                    group_id[r] = it->second;
+                }
             }
             // Stable counting sort of idx by group id.
+            // Save the prefix-sum as group_starts BEFORE the scatter so we have O(1)
+            // group boundary lookup for the rank sweep (avoids O(n) same_group calls).
             std::vector<std::size_t> cnt(static_cast<std::size_t>(ngroups) + 1, 0);
             for (std::size_t r = 0; r < rows; ++r)
                 ++cnt[static_cast<std::size_t>(group_id[r]) + 1];
             for (std::size_t g = 0; g < ngroups; ++g)
                 cnt[g + 1] += cnt[g];
+            radix_group_starts =
+                cnt;  // group g spans [radix_group_starts[g], radix_group_starts[g+1])
             std::vector<std::size_t> grouped(rows);
             for (std::size_t i = 0; i < rows; ++i) {
                 std::uint32_t g = group_id[idx[i]];
@@ -10877,11 +10905,23 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     std::vector<double> rank_values(rows, 0.0);
     ValidityBitmap validity(rows, true);
 
+    // When the radix fast path ran, group boundaries are already known from the
+    // counting sort. Iterate the groups directly: walk radix_group_starts as a
+    // cursor so each group_end lookup is O(1) with no scanning. The pdqsort
+    // fallback leaves radix_group_starts empty and uses the same_group per-row
+    // scan (needed for nulls / string order keys / multi-key cases).
+    std::size_t gs_cursor = 0;  // index into radix_group_starts for the fast path
+
     std::size_t pos = 0;
     while (pos < rows) {
-        std::size_t group_end = pos + 1;
-        while (group_end < rows && same_group(idx[pos], idx[group_end])) {
-            ++group_end;
+        std::size_t group_end;
+        if (!radix_group_starts.empty()) {
+            ++gs_cursor;  // advance past the current group's start
+            group_end = radix_group_starts[gs_cursor];
+        } else {
+            group_end = pos + 1;
+            while (group_end < rows && same_group(idx[pos], idx[group_end]))
+                ++group_end;
         }
 
         std::size_t dense_rank = 1;

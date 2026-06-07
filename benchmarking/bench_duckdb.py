@@ -159,9 +159,26 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
     )
 
     run(
+        "sort_price_desc",
+        lambda: con.sql("SELECT * FROM prices ORDER BY price DESC").fetchnumpy(),
+    )
+
+    run(
+        "sort_symbol",
+        lambda: con.sql("SELECT * FROM prices ORDER BY symbol ASC").fetchnumpy(),
+    )
+
+    run(
         "sort_symbol_price",
         lambda: con.sql(
             "SELECT * FROM prices ORDER BY symbol ASC, price ASC"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "sort_symbol_price_desc",
+        lambda: con.sql(
+            "SELECT * FROM prices ORDER BY symbol ASC, price DESC"
         ).fetchnumpy(),
     )
 

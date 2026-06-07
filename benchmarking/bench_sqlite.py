@@ -136,9 +136,26 @@ def bench_sqlite_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
     )
 
     run(
+        "sort_price_desc",
+        lambda: con.execute("SELECT * FROM prices ORDER BY price DESC").fetchall(),
+    )
+
+    run(
+        "sort_symbol",
+        lambda: con.execute("SELECT * FROM prices ORDER BY symbol ASC").fetchall(),
+    )
+
+    run(
         "sort_symbol_price",
         lambda: con.execute(
             "SELECT * FROM prices ORDER BY symbol ASC, price ASC"
+        ).fetchall(),
+    )
+
+    run(
+        "sort_symbol_price_desc",
+        lambda: con.execute(
+            "SELECT * FROM prices ORDER BY symbol ASC, price DESC"
         ).fetchall(),
     )
 

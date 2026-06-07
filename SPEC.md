@@ -1672,12 +1672,14 @@ rbind(
 ```
 
 `rbind` takes at least two operands. When **every** operand is a `TimeFrame`
-indexed on the same column, the result is a `TimeFrame` on that column: the rows
-of all operands are merged and re-sorted into ascending time order (SPEC §9.1
-keeps TimeFrames sorted), interleaving the inputs. If the operands carry mixed
-or differing time indices — including the case where only some are TimeFrames —
-the time index and ordering are dropped and the result is a plain `DataFrame`
-preserving the operand-append order.
+indexed on the same column, the result is a `TimeFrame` on that column: because
+TimeFrames are already sorted (SPEC §9.1), their rows are **k-way merged** in a
+single pass — interleaving the inputs into ascending time order without a
+separate sort. The merge is stable: rows with equal timestamps keep their
+operand order. If the operands carry mixed or differing time indices —
+including the case where only some are TimeFrames — the time index and ordering
+are dropped and the result is a plain `DataFrame` preserving the operand-append
+order.
 
 ### 5.4 Result Type Rules
 

@@ -21,6 +21,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <pdqsort.h>
 #include <random>
 #include <robin_hood.h>
 #include <set>
@@ -2440,8 +2441,14 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 // Keys must already be sign-flipped (int64 XOR 1<<63) so unsigned order == signed order.
 // All 8 byte histograms are built in a single pass; passes where every element
 // shares the same byte value are skipped (common for clustered timestamps).
+// Stable LSD radix sort of the index array `idx` by `src_keys` (parallel arrays;
+// idx is the payload carried alongside each key). `idx` is sorted in place and
+// must already hold a valid permutation of [0, rows) — passing iota gives a sort
+// from scratch, passing an existing order makes this a stable re-sort by a new
+// key (the building block for multi-key LSD). Keys are consumed.
 template <typename Idx>
-auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> std::vector<Idx> {
+void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx,
+                       std::size_t rows) {
     // Build all 8 byte-histograms in one sequential scan.
     std::array<std::array<std::size_t, 256>, 8> hists{};
     for (std::size_t i = 0; i < rows; ++i) {
@@ -2451,9 +2458,13 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
     }
 
     std::vector<std::uint64_t> dst_keys(rows);
-    std::vector<Idx> src_idx(rows);
     std::vector<Idx> dst_idx(rows);
-    std::iota(src_idx.begin(), src_idx.end(), Idx{0});
+    // Ping-pong between the caller's idx buffer and dst_idx; src_* point at the
+    // buffer currently holding live data.
+    std::vector<std::uint64_t>* src_k = &src_keys;
+    std::vector<std::uint64_t>* dst_k = &dst_keys;
+    std::vector<Idx>* src_i = &idx;
+    std::vector<Idx>* dst_i = &dst_idx;
 
     std::array<std::size_t, 256> cnt;  //  NOLINT(cppcoreguidelines-pro-type-member-init)
     for (std::size_t pass = 0; pass < 8; ++pass) {
@@ -2479,20 +2490,30 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
 #if defined(__GNUC__) || defined(__clang__)
             constexpr std::size_t kPrefetchDist = 8;
             if (i + kPrefetchDist < rows) {
-                std::size_t pb = (src_keys[i + kPrefetchDist] >> shift) & 0xFFU;
-                __builtin_prefetch(&dst_keys[cnt[pb]], 1, 1);
-                __builtin_prefetch(&dst_idx[cnt[pb]], 1, 1);
+                std::size_t pb = ((*src_k)[i + kPrefetchDist] >> shift) & 0xFFU;
+                __builtin_prefetch(&(*dst_k)[cnt[pb]], 1, 1);
+                __builtin_prefetch(&(*dst_i)[cnt[pb]], 1, 1);
             }
 #endif
-            std::size_t bucket = (src_keys[i] >> shift) & 0xFFU;
-            dst_keys[cnt[bucket]] = src_keys[i];
-            dst_idx[cnt[bucket]] = src_idx[i];
+            std::size_t bucket = ((*src_k)[i] >> shift) & 0xFFU;
+            (*dst_k)[cnt[bucket]] = (*src_k)[i];
+            (*dst_i)[cnt[bucket]] = (*src_i)[i];
             ++cnt[bucket];
         }
-        std::swap(src_keys, dst_keys);
-        std::swap(src_idx, dst_idx);
+        std::swap(src_k, dst_k);
+        std::swap(src_i, dst_i);
     }
-    return src_idx;
+    // Ensure the sorted permutation ends up in the caller's idx buffer.
+    if (src_i != &idx)
+        idx = std::move(*src_i);
+}
+
+template <typename Idx>
+auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> std::vector<Idx> {
+    std::vector<Idx> idx(rows);
+    std::iota(idx.begin(), idx.end(), Idx{0});
+    radix_sort_by_key(std::move(src_keys), idx, rows);
+    return idx;
 }
 
 // Dispatch to 32-bit indices for tables that fit, 64-bit otherwise.
@@ -2512,6 +2533,27 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
     const std::uint64_t bits = std::bit_cast<std::uint64_t>(value);
     return bits ^ ((static_cast<std::uint64_t>(-static_cast<std::int64_t>(bits >> 63))) |
                    (std::uint64_t{1} << 63));
+}
+
+// Stable multi-key sort by LSD radix: `codes[k]` holds one order-preserving u64
+// per row for sort key k (key 0 most significant). Sorts least- to most-
+// significant key, each pass stable, so the result equals a stable comparison
+// sort on the same keys with ties broken by original row order. Each key is
+// gathered into the current index order first so the radix scatter reads
+// sequentially.
+template <typename Idx>
+auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::size_t rows)
+    -> std::vector<Idx> {
+    std::vector<Idx> idx(rows);
+    std::iota(idx.begin(), idx.end(), Idx{0});
+    for (std::size_t k = codes.size(); k-- > 0;) {
+        const auto& code = codes[k];
+        std::vector<std::uint64_t> gathered(rows);
+        for (std::size_t i = 0; i < rows; ++i)
+            gathered[i] = code[idx[i]];
+        radix_sort_by_key(std::move(gathered), idx, rows);
+    }
+    return idx;
 }
 
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
@@ -2670,8 +2712,100 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
             sort_result);
     }
 
-    // General path: multi-key or non-I64 or descending — comparison-based stable sort.
-    // u64 keys compare correctly with unsigned < because sign-flip preserves order.
+    // Ordinal-encode a string column to order-preserving u64 codes: dedup via
+    // hash (O(rows)), sort the distinct values, map each row to its sorted rank.
+    // Codes preserve string order, so radix on them == lexicographic sort.
+    // Returns nullopt once the distinct count exceeds `cap` (bailing immediately,
+    // so a high-cardinality reject is cheap) — the caller then prefers a
+    // comparison sort, where the distinct-sort would cost as much as sorting all
+    // rows anyway.
+    auto ordinal_encode = [rows](const std::vector<std::string_view>& vals,
+                                 std::size_t cap) -> std::optional<std::vector<std::uint64_t>> {
+        std::unordered_map<std::string_view, std::uint64_t> code_of;
+        std::vector<std::string_view> distinct;
+        for (auto sv : vals) {
+            if (code_of.emplace(sv, 0).second) {
+                distinct.push_back(sv);
+                if (distinct.size() > cap)
+                    return std::nullopt;
+            }
+        }
+        std::sort(distinct.begin(), distinct.end());
+        for (std::uint64_t r = 0; r < distinct.size(); ++r)
+            code_of[distinct[r]] = r;
+        std::vector<std::uint64_t> code(rows);
+        for (std::size_t i = 0; i < rows; ++i)
+            code[i] = code_of[vals[i]];
+        return code;
+    };
+
+    auto radix_gather =
+        [&](std::vector<std::vector<std::uint64_t>>& codes) -> std::expected<Table, std::string> {
+        if (rows <= std::numeric_limits<std::uint32_t>::max()) {
+            auto idx = lsd_multi_radix<std::uint32_t>(codes, rows);
+            return gather_rows(input, idx, &resolved_keys);
+        }
+        auto idx = lsd_multi_radix<std::uint64_t>(codes, rows);
+        return gather_rows(input, idx, &resolved_keys);
+    };
+
+    // Invert order-preserving codes for a descending key so an ascending radix
+    // yields descending order (equal codes stay equal → still stable).
+    auto apply_descending = [](std::vector<std::uint64_t>& code, bool ascending) {
+        if (!ascending)
+            for (auto& c : code)
+                c = ~c;
+    };
+
+    // Radix path for multi-key sorts and single descending numeric keys. Map each
+    // key to an order-preserving u64 (strings via ordinal encoding, unconditional
+    // here since the alternative for multi-key is itself a slow comparison sort)
+    // and LSD-radix from the least- to the most-significant key. Single ascending
+    // numeric keys already returned via the fast paths above.
+    const bool use_radix_multi =
+        flat_keys.size() >= 2 || (flat_keys.size() == 1 && flat_keys[0].kind != FlatKind::Str);
+    if (use_radix_multi) {
+        std::vector<std::vector<std::uint64_t>> codes;
+        codes.reserve(flat_keys.size());
+        for (auto& fk : flat_keys) {
+            std::vector<std::uint64_t> code;
+            switch (fk.kind) {
+                case FlatKind::I64:
+                    code = std::move(fk.u64);  // already sign-flipped to order-preserving u64
+                    break;
+                case FlatKind::F64:
+                    code.resize(rows);
+                    for (std::size_t i = 0; i < rows; ++i)
+                        code[i] = double_to_sortable_u64(fk.f64[i]);
+                    break;
+                case FlatKind::Str:
+                    code =
+                        std::move(*ordinal_encode(fk.str, std::numeric_limits<std::size_t>::max()));
+                    break;
+            }
+            apply_descending(code, fk.ascending);
+            codes.push_back(std::move(code));
+        }
+        return radix_gather(codes);
+    }
+
+    // Single lone string key: ordinal-encode + radix when the column is low
+    // cardinality (categorical/dictionary-like, the common case), where the
+    // distinct-sort is far cheaper than sorting every row. High-cardinality
+    // columns exceed the cap and fall through to the comparison sort below.
+    if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::Str) {
+        constexpr std::size_t kOrdinalCap = std::size_t{1} << 16;
+        if (auto code = ordinal_encode(flat_keys[0].str, kOrdinalCap)) {
+            apply_descending(*code, flat_keys[0].ascending);
+            std::vector<std::vector<std::uint64_t>> codes;
+            codes.push_back(std::move(*code));
+            return radix_gather(codes);
+        }
+    }
+
+    // General path: a lone high-cardinality string key — comparison-based sort.
+    // pdqsort is unstable, but the comparator's `lhs < rhs` tiebreak makes the
+    // order total (no real ties), so the result matches a stable sort.
     auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
         for (const auto& fk : flat_keys) {
             switch (fk.kind) {
@@ -2702,7 +2836,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     };
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), 0);
-    std::stable_sort(idx.begin(), idx.end(), compare_row);
+    pdqsort(idx.begin(), idx.end(), compare_row);
     return gather_rows(input, idx, &resolved_keys);
 }
 
@@ -10696,7 +10830,9 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     } else {
         idx.resize(rows);
         std::iota(idx.begin(), idx.end(), 0);
-        std::stable_sort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
+        // pdqsort is unstable, but the comparator's `lhs < rhs` tiebreak makes the
+        // order total, so the result matches a stable sort.
+        pdqsort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
             // Order groups first (nulls sort first, ascending by value) so that rows
             // of the same group are contiguous for the sweep below.
             for (const auto& fc : group_flat) {

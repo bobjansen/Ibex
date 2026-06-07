@@ -157,8 +157,22 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("sort_price", lambda: df.sort_values("price", kind="mergesort"))
 
     run(
+        "sort_price_desc",
+        lambda: df.sort_values("price", ascending=False, kind="mergesort"),
+    )
+
+    run("sort_symbol", lambda: df.sort_values("symbol", kind="mergesort"))
+
+    run(
         "sort_symbol_price",
         lambda: df.sort_values(["symbol", "price"], kind="mergesort"),
+    )
+
+    run(
+        "sort_symbol_price_desc",
+        lambda: df.sort_values(
+            ["symbol", "price"], ascending=[True, False], kind="mergesort"
+        ),
     )
 
     # Grouped window functions (per symbol).
@@ -343,7 +357,16 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     # Full-table sorts (every row reordered).
     run("sort_price", lambda: df.sort("price"))
 
+    run("sort_price_desc", lambda: df.sort("price", descending=True))
+
+    run("sort_symbol", lambda: df.sort("symbol"))
+
     run("sort_symbol_price", lambda: df.sort(["symbol", "price"]))
+
+    run(
+        "sort_symbol_price_desc",
+        lambda: df.sort(["symbol", "price"], descending=[False, True]),
+    )
 
     # Grouped window functions (per symbol).
     run(
@@ -557,7 +580,13 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     )
     # Full-table sorts (every row reordered).
     run("sort_price", lambda: scan().sort("price").collect())
+    run("sort_price_desc", lambda: scan().sort("price", descending=True).collect())
+    run("sort_symbol", lambda: scan().sort("symbol").collect())
     run("sort_symbol_price", lambda: scan().sort(["symbol", "price"]).collect())
+    run(
+        "sort_symbol_price_desc",
+        lambda: scan().sort(["symbol", "price"], descending=[False, True]).collect(),
+    )
     # Grouped window functions (per symbol).
     run(
         "rank_by_symbol",

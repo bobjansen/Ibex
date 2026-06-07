@@ -61,7 +61,8 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "filter_simple", "filter_and", "filter_arith", "filter_or",
         "filter_events"]),
     ("Sort / top-k", [
-        "sort_price", "sort_symbol_price",
+        "sort_price", "sort_price_desc", "sort_symbol",
+        "sort_symbol_price", "sort_symbol_price_desc",
         "order_head_topk", "order_head_topk_by_symbol",
         "order_tail_topk", "order_tail_topk_by_symbol"]),
     ("Multi-stage pipeline", [

@@ -176,9 +176,26 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     )
 
     run(
+        "sort_price_desc",
+        lambda: ctx.sql("SELECT * FROM prices ORDER BY price DESC").collect(),
+    )
+
+    run(
+        "sort_symbol",
+        lambda: ctx.sql("SELECT * FROM prices ORDER BY symbol ASC").collect(),
+    )
+
+    run(
         "sort_symbol_price",
         lambda: ctx.sql(
             "SELECT * FROM prices ORDER BY symbol ASC, price ASC"
+        ).collect(),
+    )
+
+    run(
+        "sort_symbol_price_desc",
+        lambda: ctx.sql(
+            "SELECT * FROM prices ORDER BY symbol ASC, price DESC"
         ).collect(),
     )
 

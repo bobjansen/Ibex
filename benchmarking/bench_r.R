@@ -253,8 +253,17 @@ if (!skip_data_table) {
     bench("data.table", "sort_price",
         function() dt[order(price)])
 
+    bench("data.table", "sort_price_desc",
+        function() dt[order(-price)])
+
+    bench("data.table", "sort_symbol",
+        function() dt[order(symbol)])
+
     bench("data.table", "sort_symbol_price",
         function() dt[order(symbol, price)])
+
+    bench("data.table", "sort_symbol_price_desc",
+        function() dt[order(symbol, -price)])
 
     # Grouped window functions (per symbol).
     bench("data.table", "rank_by_symbol",
@@ -338,8 +347,17 @@ if (!skip_dplyr) {
     bench("dplyr", "sort_price",
         function() tb |> arrange(price))
 
+    bench("dplyr", "sort_price_desc",
+        function() tb |> arrange(desc(price)))
+
+    bench("dplyr", "sort_symbol",
+        function() tb |> arrange(symbol))
+
     bench("dplyr", "sort_symbol_price",
         function() tb |> arrange(symbol, price))
+
+    bench("dplyr", "sort_symbol_price_desc",
+        function() tb |> arrange(symbol, desc(price)))
 
     # Grouped window functions (per symbol).
     bench("dplyr", "rank_by_symbol",

@@ -9304,14 +9304,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             for (const Table& t : operands) {
                 ptrs.push_back(&t);
             }
-            auto concatenated = rbind_table(ptrs);
-            if (!concatenated) {
-                return std::unexpected(std::move(concatenated.error()));
-            }
             // When every operand is a TimeFrame on the same time-index column,
-            // the result stays a TimeFrame: re-sort the concatenation by that
-            // column so the rows interleave in time order (SPEC §9.1 keeps
-            // TimeFrames sorted). Mixed/absent indices yield a plain DataFrame.
+            // the result stays a TimeFrame: rbind_table k-way merges the
+            // already-sorted operands so the rows interleave in time order in a
+            // single pass (SPEC §9.1 keeps TimeFrames sorted). Mixed/absent
+            // indices yield a plain appended DataFrame.
             std::optional<std::string> common_ti = operands.front().time_index;
             if (common_ti.has_value()) {
                 for (const Table& t : operands) {
@@ -9321,11 +9318,17 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     }
                 }
             }
-            if (common_ti.has_value()) {
-                concatenated->time_index = common_ti;
-                return order_table(*concatenated, {{.name = *common_ti, .ascending = true}});
+            auto result = rbind_table(ptrs, common_ti);
+            if (!result) {
+                return std::unexpected(std::move(result.error()));
             }
-            return concatenated;
+            if (common_ti.has_value()) {
+                // The merge already produced sorted rows, so just stamp the
+                // index and its ordering — no re-sort.
+                result->time_index = common_ti;
+                normalize_time_index(*result);
+            }
+            return result;
         }
         case ir::NodeKind::Stream: {
             const auto& sn = static_cast<const ir::StreamNode&>(node);

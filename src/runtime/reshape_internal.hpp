@@ -3,6 +3,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <expected>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,8 +16,15 @@ namespace ibex::runtime {
     -> std::expected<Table, std::string>;
 /// Vertically concatenate `tables` (rbind). Every operand must expose the same
 /// set of columns by name and type as the first; the result carries the first
-/// operand's column order with the rows of all operands appended in order.
-[[nodiscard]] auto rbind_table(const std::vector<const Table*>& tables)
+/// operand's column order.
+///
+/// When `merge_key` is set, the operands are assumed already sorted ascending by
+/// that column (the TimeFrame invariant) and their rows are k-way **merged** in
+/// time order — one output allocation, no post-hoc sort. The key column must be
+/// Timestamp, Date, or Int64. When `merge_key` is null the rows of all operands
+/// are simply appended in operand order.
+[[nodiscard]] auto rbind_table(const std::vector<const Table*>& tables,
+                               const std::optional<std::string>& merge_key = std::nullopt)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                               const std::vector<std::string>& measure_columns)

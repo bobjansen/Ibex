@@ -6358,6 +6358,36 @@ TEST_CASE("rbind: two TimeFrames interleave by time index and stay a TimeFrame",
     CHECK(val[3] == 4);
 }
 
+TEST_CASE("rbind: merging TimeFrames is stable on equal timestamps", "[rbind][timeframe]") {
+    // Both operands carry a row at t=200; the merge must keep operand 1's row
+    // (val 99) before operand 2's (val 50) — a stable k-way merge.
+    runtime::Table a, b;
+    a.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
+    a.add_column("val", Column<std::int64_t>{1, 99});
+    b.add_column("ts", Column<Timestamp>{ts_from_nanos(200), ts_from_nanos(300)});
+    b.add_column("val", Column<std::int64_t>{50, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+    registry.emplace("b", b);
+
+    auto ir = require_ir(R"(rbind(as_timeframe(a, "ts"), as_timeframe(b, "ts"));)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto& ts = std::get<Column<Timestamp>>(*result->find("ts"));
+    const auto& val = std::get<Column<std::int64_t>>(*result->find("val"));
+    CHECK(ts[0].nanos == 100);
+    CHECK(ts[1].nanos == 200);
+    CHECK(ts[2].nanos == 200);
+    CHECK(ts[3].nanos == 300);
+    CHECK(val[0] == 1);
+    CHECK(val[1] == 99);  // operand 1's t=200 row first
+    CHECK(val[2] == 50);  // then operand 2's t=200 row
+    CHECK(val[3] == 3);
+}
+
 TEST_CASE("rbind: a TimeFrame with a plain DataFrame yields a plain DataFrame",
           "[rbind][timeframe]") {
     runtime::Table a, b;

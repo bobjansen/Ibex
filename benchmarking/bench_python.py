@@ -279,6 +279,15 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("rand_int", lambda: df.assign(r=rng_gen.integers(1, 101, len(df))))
     run("rand_bernoulli", lambda: df.assign(r=rng_gen.binomial(1, 0.3, len(df))))
 
+    # Scalar row-wise math builtins.
+    run("abs_price", lambda: df.assign(v=df["price"].abs()))
+    run("sqrt_price", lambda: df.assign(v=np.sqrt(df["price"])))
+    run("log_price", lambda: df.assign(v=np.log(df["price"])))
+    run("exp_price", lambda: df.assign(v=np.exp(df["price"] / 1000.0)))
+    run("round_price", lambda: df.assign(v=np.rint(df["price"])))
+    run("floor_price", lambda: df.assign(v=np.floor(df["price"])))
+    run("ceil_price", lambda: df.assign(v=np.ceil(df["price"])))
+
     if csv_multi_path:
         print("pandas: loading multi...", file=sys.stderr, flush=True)
         dfm = pd.read_csv(csv_multi_path)
@@ -557,6 +566,15 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         "rand_bernoulli",
         lambda: df.with_columns(pl.Series("r", rng_gen.binomial(1, 0.3, len(df)))),
     )
+
+    # Scalar row-wise math builtins.
+    run("abs_price", lambda: df.with_columns(pl.col("price").abs().alias("v")))
+    run("sqrt_price", lambda: df.with_columns(pl.col("price").sqrt().alias("v")))
+    run("log_price", lambda: df.with_columns(pl.col("price").log().alias("v")))
+    run("exp_price", lambda: df.with_columns((pl.col("price") / 1000.0).exp().alias("v")))
+    run("round_price", lambda: df.with_columns(pl.col("price").round(0).alias("v")))
+    run("floor_price", lambda: df.with_columns(pl.col("price").floor().alias("v")))
+    run("ceil_price", lambda: df.with_columns(pl.col("price").ceil().alias("v")))
 
     if csv_multi_path:
         print("polars: loading multi...", file=sys.stderr, flush=True)
@@ -847,6 +865,22 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     )
     # rand_* benchmarks inject a numpy-generated Series; skipping in lazy mode
     # since the inputs aren't expressible as a scan-only chain.
+
+    # Scalar row-wise math builtins.
+    run("abs_price",
+        lambda: scan().with_columns(pl.col("price").abs().alias("v")).collect())
+    run("sqrt_price",
+        lambda: scan().with_columns(pl.col("price").sqrt().alias("v")).collect())
+    run("log_price",
+        lambda: scan().with_columns(pl.col("price").log().alias("v")).collect())
+    run("exp_price",
+        lambda: scan().with_columns((pl.col("price") / 1000.0).exp().alias("v")).collect())
+    run("round_price",
+        lambda: scan().with_columns(pl.col("price").round(0).alias("v")).collect())
+    run("floor_price",
+        lambda: scan().with_columns(pl.col("price").floor().alias("v")).collect())
+    run("ceil_price",
+        lambda: scan().with_columns(pl.col("price").ceil().alias("v")).collect())
 
     if csv_multi_path:
         def scan_multi():

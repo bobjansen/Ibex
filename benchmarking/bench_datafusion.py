@@ -208,6 +208,16 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ).collect(),
     )
 
+    # Cumulative product via exp(cumsum(ln)) — no PRODUCT window aggregate.
+    run(
+        "cumprod_price",
+        lambda: ctx.sql(
+            "SELECT *, EXP(SUM(LN(price)) OVER ("
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+            ")) AS cp FROM prices"
+        ).collect(),
+    )
+
     # Grouped window functions (partition by symbol). lag_by_symbol is omitted:
     # DataFusion has no stable row-id pseudo-column, so an input-order LAG (as
     # ibex/pandas/polars compute) can't be expressed without injecting one.
@@ -316,6 +326,29 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ).collect(),
     )
 
+    # Normal deviates via Box-Muller (DataFusion has no native normal RNG).
+    run(
+        "rand_normal",
+        lambda: ctx.sql(
+            "SELECT *, sqrt(-2.0 * ln(random())) * cos(2.0 * 3.141592653589793 * random()) "
+            "AS n FROM prices"
+        ).collect(),
+    )
+
+    run(
+        "rand_int",
+        lambda: ctx.sql(
+            "SELECT *, CAST(floor(random() * 100) AS BIGINT) + 1 AS r FROM prices"
+        ).collect(),
+    )
+
+    run(
+        "rand_bernoulli",
+        lambda: ctx.sql(
+            "SELECT *, CAST(random() < 0.3 AS INT) AS r FROM prices"
+        ).collect(),
+    )
+
     if csv_multi_path:
         print("datafusion: loading multi...", file=sys.stderr, flush=True)
         _register_arrow(ctx, "prices_multi", csv_multi_path)
@@ -343,6 +376,17 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
                 "FIRST_VALUE(price) AS open, MAX(price) AS high, "
                 "MIN(price) AS low, LAST_VALUE(price) AS last "
                 "FROM prices_multi GROUP BY symbol, day"
+            ).collect(),
+        )
+
+        # Two-level rollup (funnel): by {symbol, day} then re-aggregate by symbol.
+        run(
+            "symbol_day_to_symbol",
+            lambda: ctx.sql(
+                "WITH daily AS (SELECT symbol, day, AVG(price) AS daily_mean, "
+                "stddev_samp(price) AS daily_vol FROM prices_multi GROUP BY symbol, day) "
+                "SELECT symbol, AVG(daily_mean) AS mean_of_means, AVG(daily_vol) AS mean_vol "
+                "FROM daily GROUP BY symbol"
             ).collect(),
         )
 

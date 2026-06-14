@@ -191,6 +191,16 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ).fetchnumpy(),
     )
 
+    # Cumulative product via exp(cumsum(ln)) — DuckDB has no PRODUCT window.
+    run(
+        "cumprod_price",
+        lambda: con.sql(
+            "SELECT *, EXP(SUM(LN(price)) OVER ("
+            "ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+            ")) AS cp FROM prices"
+        ).fetchnumpy(),
+    )
+
     # Grouped window functions (partition by symbol).
     run(
         "rank_by_symbol",
@@ -308,6 +318,29 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ).fetchnumpy(),
     )
 
+    # Normal deviates via Box-Muller (DuckDB has no native normal RNG).
+    run(
+        "rand_normal",
+        lambda: con.sql(
+            "SELECT *, sqrt(-2.0 * LN(random())) * cos(2.0 * pi() * random()) AS n "
+            "FROM prices"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "rand_int",
+        lambda: con.sql(
+            "SELECT *, CAST(floor(random() * 100) AS BIGINT) + 1 AS r FROM prices"
+        ).fetchnumpy(),
+    )
+
+    run(
+        "rand_bernoulli",
+        lambda: con.sql(
+            "SELECT *, CAST(random() < 0.3 AS INTEGER) AS r FROM prices"
+        ).fetchnumpy(),
+    )
+
     if csv_multi_path:
         print("duckdb: loading multi...", file=sys.stderr, flush=True)
         con.execute(
@@ -337,6 +370,17 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
                 "FIRST(price) AS open, MAX(price) AS high, "
                 "MIN(price) AS low, LAST(price) AS last "
                 "FROM prices_multi GROUP BY symbol, day"
+            ).fetchnumpy(),
+        )
+
+        # Two-level rollup (funnel): by {symbol, day} then re-aggregate by symbol.
+        run(
+            "symbol_day_to_symbol",
+            lambda: con.sql(
+                "WITH daily AS (SELECT symbol, day, AVG(price) AS daily_mean, "
+                "STDDEV_SAMP(price) AS daily_vol FROM prices_multi GROUP BY symbol, day) "
+                "SELECT symbol, AVG(daily_mean) AS mean_of_means, AVG(daily_vol) AS mean_vol "
+                "FROM daily GROUP BY symbol"
             ).fetchnumpy(),
         )
 

@@ -309,6 +309,21 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             .reset_index(),
         )
 
+        # Two-level rollup: by {symbol, day} then re-aggregate by symbol.
+        def _symbol_day_to_symbol():
+            daily = (
+                dfm.groupby(["symbol", "day"], sort=False)
+                .agg(daily_mean=("price", "mean"), daily_vol=("price", "std"))
+                .reset_index()
+            )
+            return (
+                daily.groupby("symbol", sort=False)
+                .agg(mean_of_means=("daily_mean", "mean"), mean_vol=("daily_vol", "mean"))
+                .reset_index()
+            )
+
+        run("symbol_day_to_symbol", _symbol_day_to_symbol)
+
     if csv_trades_path:
         print("pandas: loading trades...", file=sys.stderr, flush=True)
         dft = pd.read_csv(csv_trades_path)
@@ -566,6 +581,21 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 pl.col("price").max().alias("high"),
                 pl.col("price").min().alias("low"),
                 pl.col("price").last().alias("last"),
+            ),
+        )
+
+        # Two-level rollup: by {symbol, day} then re-aggregate by symbol.
+        run(
+            "symbol_day_to_symbol",
+            lambda: dfm.group_by(["symbol", "day"])
+            .agg(
+                pl.col("price").mean().alias("daily_mean"),
+                pl.col("price").std().alias("daily_vol"),
+            )
+            .group_by("symbol")
+            .agg(
+                pl.col("daily_mean").mean().alias("mean_of_means"),
+                pl.col("daily_vol").mean().alias("mean_vol"),
             ),
         )
 
@@ -840,6 +870,22 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
                 pl.col("price").min().alias("low"),
                 pl.col("price").last().alias("last"),
             ).collect(),
+        )
+        # Two-level rollup: by {symbol, day} then re-aggregate by symbol.
+        run(
+            "symbol_day_to_symbol",
+            lambda: scan_multi()
+            .group_by(["symbol", "day"])
+            .agg(
+                pl.col("price").mean().alias("daily_mean"),
+                pl.col("price").std().alias("daily_vol"),
+            )
+            .group_by("symbol")
+            .agg(
+                pl.col("daily_mean").mean().alias("mean_of_means"),
+                pl.col("daily_vol").mean().alias("mean_vol"),
+            )
+            .collect(),
         )
 
     if csv_trades_path:

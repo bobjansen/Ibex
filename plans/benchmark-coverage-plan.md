@@ -212,13 +212,16 @@ so ibex results are verifiable.
 
 ## Priority order
 
-1. `dcast_long_to_wide_int_pivot` / `cat_pivot` in all competitor harnesses
-2. `rand_normal/int/bernoulli` + `cumprod_price` for DuckDB/DataFusion/ClickHouse
-3. **Pipeline suite Tier 1**: `update_group_filter`, `group_rank_filter`, `normalize_by_group`
-4. **Pipeline suite Tier 2**: `join_update_group`, `join_filter_rank`
-5. **Pipeline suite Tier 3**: `symbol_day_to_symbol`, `log_return_momentum`
-6. `where_update_clip` + `pmin_clip` (scalar feature showcase)
-7. `rbind_two` (recently shipped, zero coverage)
-8. `corr_price_vol` (CorrNode gap)
+1. ~~`dcast_long_to_wide_int_pivot` / `cat_pivot` in all competitor harnesses~~ **DONE** (2026-06-14, commit ecd6c0a)
+2. ~~`rand_normal/int/bernoulli` + `cumprod_price` for DuckDB/DataFusion/ClickHouse~~ **DONE** (2026-06-14, commit f7b1b29)
+3. ~~**Pipeline suite Tier 1**: `update_group_filter`, `group_rank_filter`, `normalize_by_group`~~ **DONE** (2026-06-13, commit eba837d; surfaced + fixed the update+by mixed per-row/aggregate gap)
+4. **Pipeline suite Tier 2**: `join_update_group`, `join_filter_rank` — BLOCKED on data: needs new `users.csv` columns (`user_segment`, `tier_multiplier`) and an `events.symbol` column; requires gen_data.py changes + regenerate + join logic in every harness.
+5. **Pipeline suite Tier 3**: ~~`symbol_day_to_symbol`~~ **DONE** (2026-06-14, commit f7b1b29). `log_return_momentum` — BLOCKED: needs a timestamped prices table (rolling_mean is time-windowed); prices.csv has no ts column.
+6. ~~`where_update_clip` + `pmin_clip` (scalar feature showcase)~~ **DONE** (2026-06-13, commit eba837d)
+7. ~~`rbind_two` (recently shipped, zero coverage)~~ **DONE** (2026-06-13, commit eba837d)
+8. ~~`corr_price_vol` (CorrNode gap)~~ **DONE** (2026-06-13, commit eba837d)
 9. `tf_rolling_ewma_1m` for ClickHouse + R
 10. DataFusion: `lag_by_symbol`, `fill_forward/backward`, `tf_asof_join`
+
+Remaining: #4 (Tier 2 joins, needs data schema work), #5 `log_return_momentum`
+(needs timestamped table), #9, #10.

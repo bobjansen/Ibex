@@ -859,7 +859,11 @@ if (tf_rows > 0) {
         bench_capped("data.table", "tf_rolling_std_1m",
             function() dt_tf[, s := frollapply(price, 60L, sd)][],
             per_row_us = 7, n = tf_rows)
-        # data.table has no time-aware EWMA; skip (the slot will be blank).
+        # Full-series EWMA (alpha=0.1, adjust=False) via TTR::EMA — matches the
+        # pandas/polars ewm reference (n=1 seeds with the first value). Not
+        # time-windowed (no engine here uses ibex's time-windowed EWMA math).
+        bench("data.table", "tf_rolling_ewma_1m",
+            function() dt_tf[, e := suppressWarnings(TTR::EMA(price, n = 1L, ratio = 0.1))][])
         bench("data.table", "tf_resample_1m_ohlc",
             function() dt_tf[, .(open = data.table::first(price),
                                   high = max(price),
@@ -921,6 +925,10 @@ if (tf_rows > 0) {
             function() tb_tf |> mutate(s = slide_index_dbl(price, ts, sd,
                                                             .before = lubridate::seconds(60))),
             per_row_us = 20, n = tf_rows)
+        # Full-series EWMA (alpha=0.1, adjust=False) via TTR::EMA — matches the
+        # pandas/polars ewm reference. Not time-windowed.
+        bench("dplyr", "tf_rolling_ewma_1m",
+            function() tb_tf |> mutate(e = suppressWarnings(TTR::EMA(price, n = 1L, ratio = 0.1))))
         bench("dplyr", "tf_resample_1m_ohlc",
             function() tb_tf |>
                 mutate(bucket = lubridate::floor_date(ts, "minute")) |>

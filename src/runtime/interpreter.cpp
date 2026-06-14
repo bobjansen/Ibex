@@ -3743,6 +3743,32 @@ auto simd_transcendental(std::string_view, const double*, double*, std::size_t) 
 }
 #endif
 
+// Packed IEEE sqrt over a column: vsqrtpd on AVX2 chunks + a scalar tail.
+// std::sqrt sets errno on a negative argument, so without -fno-math-errno the
+// auto-vectorizer keeps the f(column) loop on scalar vsqrtsd (+ an errno-domain
+// branch) — ~2× slower than the packed form. Calling _mm256_sqrt_pd directly
+// sidesteps that for the whole-column shape without flipping errno semantics
+// TU-wide (which would pessimize the round→int64 loops). Bit-identical to
+// std::sqrt for finite inputs; sqrt(<0) is NaN either way, only errno differs,
+// which ibex never reads after a math builtin.
+#if defined(__AVX2__)
+void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        _mm256_storeu_pd(dst + i, _mm256_sqrt_pd(_mm256_loadu_pd(src + i)));
+    }
+    for (; i < n; ++i) {
+        dst[i] = std::sqrt(src[i]);
+    }
+}
+#else
+void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; ++i) {
+        dst[i] = std::sqrt(src[i]);
+    }
+}
+#endif
+
 // Forward declaration: try_fast_update_unary materialises a computed log/exp
 // argument through the full numeric fast path, which is defined just below it.
 auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
@@ -3780,7 +3806,19 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
         };
         const auto& m = moderef->name;
         if (m == "nearest") {
-            run([](double v) { return static_cast<std::int64_t>(std::llround(v)); });
+            // Round half away from zero, branchless so the loop vectorises
+            // (trunc/fabs/copysign → vroundpd/vandpd/vorpd) instead of calling
+            // libm llround per element. Exact: frac = v - trunc(v) is computed
+            // without error for |v| < 2^52, and |frac| >= 0.5 is the exact
+            // away-from-zero test (avoids the floor(v+0.5) double-rounding bug at
+            // v = nextafter(0.5, 0)). For |v| >= 2^52 v is already integral, frac
+            // is 0, and the result is v — matching llround.
+            run([](double v) {
+                double t = std::trunc(v);
+                double frac = v - t;
+                return static_cast<std::int64_t>(std::fabs(frac) >= 0.5 ? t + std::copysign(1.0, v)
+                                                                        : t);
+            });
         } else if (m == "bankers") {
             run([](double v) { return static_cast<std::int64_t>(std::llrint(v)); });
         } else if (m == "floor") {
@@ -3837,7 +3875,7 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
         };
         const auto& f = call->callee;
         if (f == "sqrt") {
-            run([](double x) { return std::sqrt(x); });
+            simd_sqrt(src, dst, rows);
         } else if (f == "abs") {
             run([](double x) { return std::fabs(x); });
         } else if (f == "floor") {

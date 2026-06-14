@@ -5787,6 +5787,29 @@ TEST_CASE("update scalar math builtins vectorise (sqrt/abs/floor/ceil/round)", "
     REQUIRE((*comp)[3] == Catch::Approx(9.0));
 }
 
+TEST_CASE("round nearest matches llround at the double-rounding boundary", "[update][scalar]") {
+    // The vectorised round(nearest) kernel rounds half away from zero via
+    // trunc/fabs/copysign, NOT floor(x + 0.5) — the latter mis-rounds the
+    // largest double below 0.5 (nextafter(0.5, 0)) up to 1 because x + 0.5
+    // rounds to 1.0. Guard that boundary and a few ties against std::llround.
+    runtime::TableRegistry registry;
+    runtime::Table t;
+    const double just_below_half = std::nextafter(0.5, 0.0);  // 0.49999999999999994
+    t.add_column("x", Column<double>{just_below_half, -just_below_half, 0.5, -0.5, 2.5});
+    registry["t"] = std::move(t);
+
+    auto ir = require_ir("t[update { r = round(x, nearest) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* r = std::get_if<Column<std::int64_t>>(result->find("r"));
+    REQUIRE(r != nullptr);
+    CHECK((*r)[0] == std::llround(just_below_half));   // 0, not 1
+    CHECK((*r)[1] == std::llround(-just_below_half));  // 0
+    CHECK((*r)[2] == std::llround(0.5));               // 1 (away from zero)
+    CHECK((*r)[3] == std::llround(-0.5));              // -1
+    CHECK((*r)[4] == std::llround(2.5));               // 3
+}
+
 TEST_CASE("update log/exp match scalar libm (SIMD path or fallback)", "[update][scalar]") {
     // log/exp may use the libmvec SIMD path (where available) or the scalar
     // tree-walk; both must agree with std::log/std::exp to Approx, for a bare

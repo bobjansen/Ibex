@@ -618,6 +618,35 @@ def bench_datafusion_reshape(warmup, iters, reshape_rows, ctx):
         ).collect(),
     )
 
+    # Typed-pivot variants: integer pivot key, and a dictionary-encoded
+    # (categorical) key. Same value matrix, conditional-aggregation mechanism.
+    run(
+        "dcast_long_to_wide_int_pivot",
+        lambda: ctx.sql(
+            "SELECT symbol, day, "
+            "MAX(CASE WHEN pivot_id = 0 THEN value END) AS c0, "
+            "MAX(CASE WHEN pivot_id = 1 THEN value END) AS c1, "
+            "MAX(CASE WHEN pivot_id = 2 THEN value END) AS c2, "
+            "MAX(CASE WHEN pivot_id = 3 THEN value END) AS c3 "
+            "FROM (SELECT symbol, day, value, CASE variable WHEN 'open' THEN 0 "
+            "WHEN 'high' THEN 1 WHEN 'low' THEN 2 ELSE 3 END AS pivot_id FROM long_tbl) "
+            "GROUP BY symbol, day"
+        ).collect(),
+    )
+    run(
+        "dcast_long_to_wide_cat_pivot",
+        lambda: ctx.sql(
+            "SELECT symbol, day, "
+            "MAX(CASE WHEN pivot_cat = 'open' THEN value END) AS open, "
+            "MAX(CASE WHEN pivot_cat = 'high' THEN value END) AS high, "
+            "MAX(CASE WHEN pivot_cat = 'low' THEN value END) AS low, "
+            "MAX(CASE WHEN pivot_cat = 'close' THEN value END) AS close "
+            "FROM (SELECT symbol, day, value, "
+            "arrow_cast(variable, 'Dictionary(Int32, Utf8)') AS pivot_cat FROM long_tbl) "
+            "GROUP BY symbol, day"
+        ).collect(),
+    )
+
     return rows
 
 

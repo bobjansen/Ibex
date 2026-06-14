@@ -1108,6 +1108,27 @@ def bench_pandas_reshape(csv_multi_path, warmup, iters, reshape_rows):
         ).reset_index(),
     )
 
+    # Typed-pivot variants: same value matrix as dcast_long_to_wide but with an
+    # integer / categorical pivot key (measures how pivot cost varies with key
+    # dtype). The key is derived from `variable` so the result is identical
+    # cross-engine regardless of melt row order.
+    _codes = {"open": 0, "high": 1, "low": 2, "close": 3}
+    long_int = long.assign(pivot_id=long["variable"].map(_codes).astype("int64"))
+    run(
+        "dcast_long_to_wide_int_pivot",
+        lambda: long_int.pivot_table(
+            index=["symbol", "day"], columns="pivot_id", values="value", aggfunc="first"
+        ).reset_index(),
+    )
+    long_cat = long.assign(pivot_cat=long["variable"].astype("category"))
+    run(
+        "dcast_long_to_wide_cat_pivot",
+        lambda: long_cat.pivot_table(
+            index=["symbol", "day"], columns="pivot_cat", values="value",
+            aggfunc="first", observed=True,
+        ).reset_index(),
+    )
+
     return rows
 
 
@@ -1179,6 +1200,22 @@ def bench_polars_reshape(csv_multi_path, warmup, iters, reshape_rows):
     run(
         "dcast_long_to_wide",
         lambda: long.pivot(on="variable", index=["symbol", "day"], values="value"),
+    )
+
+    # Typed-pivot variants: integer / categorical pivot key (same value matrix).
+    long_int = long.with_columns(
+        pl.col("variable")
+        .replace_strict({"open": 0, "high": 1, "low": 2, "close": 3}, return_dtype=pl.Int64)
+        .alias("pivot_id")
+    )
+    run(
+        "dcast_long_to_wide_int_pivot",
+        lambda: long_int.pivot(on="pivot_id", index=["symbol", "day"], values="value"),
+    )
+    long_cat = long.with_columns(pl.col("variable").cast(pl.Categorical).alias("pivot_cat"))
+    run(
+        "dcast_long_to_wide_cat_pivot",
+        lambda: long_cat.pivot(on="pivot_cat", index=["symbol", "day"], values="value"),
     )
 
     return rows

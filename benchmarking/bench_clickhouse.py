@@ -517,6 +517,38 @@ def bench_clickhouse_reshape(warmup, iters, reshape_rows, sess):
         "FROM long_tbl GROUP BY symbol, day",
     )
 
+    # Typed-pivot variants: integer pivot key, and a LowCardinality (categorical)
+    # key. Same value matrix; conditional-aggregation mechanism.
+    sess.query(
+        "CREATE OR REPLACE TABLE long_int ENGINE = Memory AS "
+        "SELECT symbol, day, value, "
+        "multiIf(variable = 'open', 0, variable = 'high', 1, variable = 'low', 2, 3) "
+        "AS pivot_id FROM long_tbl"
+    )
+    run(
+        "dcast_long_to_wide_int_pivot",
+        "SELECT symbol, day, "
+        "anyIf(value, pivot_id = 0) AS c0, "
+        "anyIf(value, pivot_id = 1) AS c1, "
+        "anyIf(value, pivot_id = 2) AS c2, "
+        "anyIf(value, pivot_id = 3) AS c3 "
+        "FROM long_int GROUP BY symbol, day",
+    )
+    sess.query(
+        "CREATE OR REPLACE TABLE long_cat ENGINE = Memory AS "
+        "SELECT symbol, day, value, CAST(variable AS LowCardinality(String)) AS pivot_cat "
+        "FROM long_tbl"
+    )
+    run(
+        "dcast_long_to_wide_cat_pivot",
+        "SELECT symbol, day, "
+        "anyIf(value, pivot_cat = 'open') AS open, "
+        "anyIf(value, pivot_cat = 'high') AS high, "
+        "anyIf(value, pivot_cat = 'low') AS low, "
+        "anyIf(value, pivot_cat = 'close') AS close "
+        "FROM long_cat GROUP BY symbol, day",
+    )
+
     return rows
 
 

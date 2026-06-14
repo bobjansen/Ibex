@@ -73,7 +73,7 @@ CATEGORIES: list[tuple[str, list[str]]] = [
     ("Joins", [
         "null_left_join", "null_semi_join", "null_anti_join",
         "inner_join_symbol", "inner_join_user",
-        "null_cross_join_small"]),
+        "null_cross_join_small", "join_update_group", "join_filter_rank"]),
     ("Reshape", [
         "melt_wide_to_long", "dcast_long_to_wide",
         "dcast_long_to_wide_int_pivot", "dcast_long_to_wide_cat_pivot"]),

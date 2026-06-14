@@ -677,6 +677,28 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
             ).fetchnumpy(),
         )
 
+        # Join-anchored pipelines (Tier 2): join → derive → roll up.
+        run(
+            "join_update_group",
+            lambda: con.sql(
+                "WITH j AS (SELECT e.symbol, u.user_segment, "
+                "e.amount * u.user_tier_multiplier AS revenue "
+                "FROM events e JOIN users u USING (user_id)) "
+                "SELECT symbol, user_segment, SUM(revenue) AS total_rev "
+                "FROM j GROUP BY symbol, user_segment"
+            ).fetchnumpy(),
+        )
+        run(
+            "join_filter_rank",
+            lambda: con.sql(
+                "WITH j AS (SELECT * FROM events JOIN users USING (user_id) "
+                "WHERE user_segment = 'premium'), "
+                "r AS (SELECT *, DENSE_RANK() OVER ("
+                "PARTITION BY symbol ORDER BY amount DESC) AS rk FROM j) "
+                "SELECT * FROM r WHERE rk <= 5"
+            ).fetchnumpy(),
+        )
+
     return rows
 
 

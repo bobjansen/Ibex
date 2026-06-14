@@ -699,6 +699,17 @@ if (!is.null(csv_events_path)) {
             dt_users <- fread(csv_users_path)
             bench("data.table", "inner_join_user",
                 function() merge(dt_ev, dt_users, by = "user_id"))
+
+            # Join-anchored pipelines (Tier 2): join -> derive -> roll up.
+            bench("data.table", "join_update_group",
+                function() merge(dt_ev, dt_users, by = "user_id")[
+                    , revenue := amount * user_tier_multiplier][
+                    , .(total_rev = sum(revenue)), by = .(symbol, user_segment)])
+
+            bench("data.table", "join_filter_rank",
+                function() merge(dt_ev, dt_users, by = "user_id")[
+                    user_segment == "premium"][
+                    , rk := frank(-amount, ties.method = "dense"), by = symbol][rk <= 5])
         }
     }
 
@@ -720,6 +731,20 @@ if (!is.null(csv_events_path)) {
             tb_users <- as_tibble(fread(csv_users_path))
             bench("dplyr", "inner_join_user",
                 function() tb_ev |> inner_join(tb_users, by = "user_id"))
+
+            # Join-anchored pipelines (Tier 2): join -> derive -> roll up.
+            bench("dplyr", "join_update_group",
+                function() tb_ev |> inner_join(tb_users, by = "user_id") |>
+                    mutate(revenue = amount * user_tier_multiplier) |>
+                    group_by(symbol, user_segment) |>
+                    summarise(total_rev = sum(revenue), .groups = "drop"))
+
+            bench("dplyr", "join_filter_rank",
+                function() tb_ev |> inner_join(tb_users, by = "user_id") |>
+                    filter(user_segment == "premium") |>
+                    group_by(symbol) |>
+                    mutate(rk = dense_rank(desc(amount))) |>
+                    filter(rk <= 5) |> ungroup())
         }
     }
 }

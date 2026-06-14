@@ -1375,6 +1375,27 @@ def bench_pandas_events(csv_events_path, warmup, iters, csv_users_path=None):
     if users is not None:
         run("inner_join_user", lambda: df.merge(users, on="user_id", how="inner"))
 
+        # Join-anchored pipelines (Tier 2): enrich events with the user
+        # dimension, then derive + roll up (the classic DW pattern).
+        def _join_update_group():
+            j = df.merge(users, on="user_id", how="inner")
+            j = j.assign(revenue=j["amount"] * j["user_tier_multiplier"])
+            return (
+                j.groupby(["symbol", "user_segment"], sort=False)
+                .agg(total_rev=("revenue", "sum"))
+                .reset_index()
+            )
+
+        run("join_update_group", _join_update_group)
+
+        def _join_filter_rank():
+            j = df.merge(users, on="user_id", how="inner")
+            j = j[j["user_segment"] == "premium"]
+            j = j.assign(rk=j.groupby("symbol")["amount"].rank(method="dense", ascending=False))
+            return j[j["rk"] <= 5]
+
+        run("join_filter_rank", _join_filter_rank)
+
     return rows
 
 
@@ -1424,6 +1445,26 @@ def bench_polars_events(csv_events_path, warmup, iters, csv_users_path=None):
     # High-cardinality inner join: events (N rows, 100K users) ⋈ users (100K).
     if users is not None:
         run("inner_join_user", lambda: df.join(users, on="user_id", how="inner"))
+
+        # Join-anchored pipelines (Tier 2): join → derive → roll up.
+        run(
+            "join_update_group",
+            lambda: df.join(users, on="user_id", how="inner")
+            .with_columns(
+                (pl.col("amount") * pl.col("user_tier_multiplier")).alias("revenue")
+            )
+            .group_by(["symbol", "user_segment"])
+            .agg(pl.col("revenue").sum().alias("total_rev")),
+        )
+        run(
+            "join_filter_rank",
+            lambda: df.join(users, on="user_id", how="inner")
+            .filter(pl.col("user_segment") == "premium")
+            .with_columns(
+                pl.col("amount").rank(method="dense", descending=True).over("symbol").alias("rk")
+            )
+            .filter(pl.col("rk") <= 5),
+        )
 
     return rows
 

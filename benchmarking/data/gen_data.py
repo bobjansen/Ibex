@@ -5,8 +5,10 @@ Outputs (written to the directory of this script by default):
   prices.csv       — symbol (str), price (f64)                    — N rows
   prices_multi.csv — symbol (str), price (f64), day (str)         — N rows
   trades.csv       — symbol (str), price (f64), qty (int64)       — N rows
-  events.csv       — user_id (str), amount (f64), quantity (int64) — N rows
-  users.csv        — user_id (str), tier (int64)                   — 100 000 rows
+  events.csv       — user_id (str), amount (f64), quantity (int64),
+                     symbol (str)                                  — N rows
+  users.csv        — user_id (str), tier (int64), user_segment (str),
+                     user_tier_multiplier (f64)                    — 100 000 rows
 
 Distinct groups:
   prices:       252        (by symbol)
@@ -133,8 +135,12 @@ def generate(out_dir: pathlib.Path, n: int = N, force: bool = False) -> None:
         users  = pool[rng4.integers(0, N_USERS, size=n)]
         amount = np.round(rng4.uniform(1.0, 1000.0, size=n), 4)
         qty    = rng4.integers(1, 101, size=n)          # uniform [1, 100]
+        # symbol: 252 distinct tickers — the group/partition key for the
+        # join-anchored pipeline benchmarks (join_update_group, join_filter_rank).
+        symbol_ev = tickers[rng4.integers(0, N_SYMBOLS, size=n)]
         t0 = time.perf_counter()
-        pd.DataFrame({"user_id": users, "amount": amount, "quantity": qty}).to_csv(ev, index=False)
+        pd.DataFrame({"user_id": users, "amount": amount, "quantity": qty,
+                      "symbol": symbol_ev}).to_csv(ev, index=False)
         mb = ev.stat().st_size / 1024 / 1024
         print(f"  wrote {ev}  ({n:,} rows, {N_USERS:,} distinct users, {mb:.0f} MB, "
               f"{time.perf_counter()-t0:.1f}s)")
@@ -152,8 +158,15 @@ def generate(out_dir: pathlib.Path, n: int = N, force: bool = False) -> None:
         pool = np.array([f"user_{i:06d}" for i in range(1, N_USERS + 1)])
         rng6 = np.random.default_rng(SEED + 5)
         tier = rng6.integers(1, 6, size=N_USERS)   # uniform tier [1, 5]
+        # Dimension attributes for the join-anchored pipeline benchmarks:
+        #   user_segment         — string class; ~1/3 "premium" (filter target)
+        #   user_tier_multiplier — revenue weight derived from tier (1.25 .. 2.25)
+        segments = np.array(["premium", "standard", "basic"])
+        user_segment = segments[rng6.integers(0, len(segments), size=N_USERS)]
+        user_tier_multiplier = np.round(1.0 + tier * 0.25, 4)
         t0 = time.perf_counter()
-        pd.DataFrame({"user_id": pool, "tier": tier}).to_csv(us, index=False)
+        pd.DataFrame({"user_id": pool, "tier": tier, "user_segment": user_segment,
+                      "user_tier_multiplier": user_tier_multiplier}).to_csv(us, index=False)
         mb = us.stat().st_size / 1024 / 1024
         print(f"  wrote {us}  ({N_USERS:,} rows, {mb:.1f} MB, {time.perf_counter()-t0:.1f}s)")
 

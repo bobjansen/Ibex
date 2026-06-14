@@ -215,7 +215,7 @@ so ibex results are verifiable.
 1. ~~`dcast_long_to_wide_int_pivot` / `cat_pivot` in all competitor harnesses~~ **DONE** (2026-06-14, commit ecd6c0a)
 2. ~~`rand_normal/int/bernoulli` + `cumprod_price` for DuckDB/DataFusion/ClickHouse~~ **DONE** (2026-06-14, commit f7b1b29)
 3. ~~**Pipeline suite Tier 1**: `update_group_filter`, `group_rank_filter`, `normalize_by_group`~~ **DONE** (2026-06-13, commit eba837d; surfaced + fixed the update+by mixed per-row/aggregate gap)
-4. **Pipeline suite Tier 2**: `join_update_group`, `join_filter_rank` — BLOCKED on data: needs new `users.csv` columns (`user_segment`, `tier_multiplier`) and an `events.symbol` column; requires gen_data.py changes + regenerate + join logic in every harness.
+4. ~~**Pipeline suite Tier 2**: `join_update_group`, `join_filter_rank`~~ **DONE** (2026-06-14). Added `events.symbol` + `users.user_segment`/`user_tier_multiplier` to gen_data.py (regenerate with `--force`); join is parenthesised as the pipeline base in ibex. Mirrored across all harnesses (SQL via CTE). 756 / 1260 rows, consistent cross-engine. Existing inner_join_user/events verifications still pass with the wider schema.
 5. **Pipeline suite Tier 3**: ~~`symbol_day_to_symbol`~~ **DONE** (2026-06-14, commit f7b1b29). `log_return_momentum` — BLOCKED: needs a timestamped prices table (rolling_mean is time-windowed); prices.csv has no ts column.
 6. ~~`where_update_clip` + `pmin_clip` (scalar feature showcase)~~ **DONE** (2026-06-13, commit eba837d)
 7. ~~`rbind_two` (recently shipped, zero coverage)~~ **DONE** (2026-06-13, commit eba837d)
@@ -223,5 +223,5 @@ so ibex results are verifiable.
 9. `tf_rolling_ewma_1m` — **R DONE** (2026-06-14; data.table + dplyr via `TTR::EMA(n=1, ratio=0.1)`, matches the pandas/polars full-series `ewm(alpha=0.1, adjust=False)`). ClickHouse still TODO: `exponentialMovingAverage` is a time-windowed aggregate, not a per-row full-series column — needs an arrayFold/recursive workaround; deferred.
 10. DataFusion: `lag_by_symbol`, `fill_forward/backward`, `tf_asof_join` — `lag_by_symbol` blocked (no stable row order without a ts/row-id column, same as the existing omission); `fill_*`/`asof` still open.
 
-Remaining: #4 (Tier 2 joins, needs data schema work), #5 `log_return_momentum`
-(needs timestamped table), #9 ClickHouse EWMA, #10 DataFusion fill/asof.
+Remaining: #5 `log_return_momentum` (needs timestamped table), #9 ClickHouse
+EWMA, #10 DataFusion fill/asof.

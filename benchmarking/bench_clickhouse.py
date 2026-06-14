@@ -615,6 +615,21 @@ def bench_clickhouse_events(csv_events_path, warmup, iters, sess, csv_users_path
             "SELECT * FROM events INNER JOIN users USING (user_id)",
         )
 
+        # Join-anchored pipelines (Tier 2): join → derive → roll up.
+        run(
+            "join_update_group",
+            "SELECT symbol, user_segment, sum(amount * user_tier_multiplier) AS total_rev "
+            "FROM events INNER JOIN users USING (user_id) "
+            "GROUP BY symbol, user_segment",
+        )
+        run(
+            "join_filter_rank",
+            "SELECT * FROM (SELECT *, dense_rank() OVER ("
+            "PARTITION BY symbol ORDER BY amount DESC) AS rk FROM ("
+            "SELECT * FROM events INNER JOIN users USING (user_id) "
+            "WHERE user_segment = 'premium')) WHERE rk <= 5",
+        )
+
     return rows
 
 

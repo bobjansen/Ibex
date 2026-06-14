@@ -332,6 +332,15 @@ if (!skip_data_table) {
 
     bench("data.table", "rand_bernoulli",
         function() dt[, r := rbinom(.N, 1L, 0.3)][])
+
+    # Scalar row-wise math builtins.
+    bench("data.table", "abs_price",   function() dt[, v := abs(price)][])
+    bench("data.table", "sqrt_price",  function() dt[, v := sqrt(price)][])
+    bench("data.table", "log_price",   function() dt[, v := log(price)][])
+    bench("data.table", "exp_price",   function() dt[, v := exp(price / 1000.0)][])
+    bench("data.table", "round_price", function() dt[, v := as.integer(round(price))][])
+    bench("data.table", "floor_price", function() dt[, v := floor(price)][])
+    bench("data.table", "ceil_price",  function() dt[, v := ceiling(price)][])
 }
 
 if (!skip_dplyr) {
@@ -465,6 +474,15 @@ if (!skip_dplyr) {
 
     bench("dplyr", "rand_bernoulli",
         function() tb |> mutate(r = rbinom(n(), 1L, 0.3)))
+
+    # Scalar row-wise math builtins.
+    bench("dplyr", "abs_price",   function() tb |> mutate(v = abs(price)))
+    bench("dplyr", "sqrt_price",  function() tb |> mutate(v = sqrt(price)))
+    bench("dplyr", "log_price",   function() tb |> mutate(v = log(price)))
+    bench("dplyr", "exp_price",   function() tb |> mutate(v = exp(price / 1000.0)))
+    bench("dplyr", "round_price", function() tb |> mutate(v = as.integer(round(price))))
+    bench("dplyr", "floor_price", function() tb |> mutate(v = floor(price)))
+    bench("dplyr", "ceil_price",  function() tb |> mutate(v = ceiling(price)))
 }
 
 # ── Multi-column group-by ─────────────────────────────────────────────────────

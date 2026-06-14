@@ -5787,6 +5787,33 @@ TEST_CASE("update scalar math builtins vectorise (sqrt/abs/floor/ceil/round)", "
     REQUIRE((*comp)[3] == Catch::Approx(9.0));
 }
 
+TEST_CASE("update log/exp match scalar libm (SIMD path or fallback)", "[update][scalar]") {
+    // log/exp may use the libmvec SIMD path (where available) or the scalar
+    // tree-walk; both must agree with std::log/std::exp to Approx, for a bare
+    // column and a computed argument.
+    runtime::TableRegistry registry;
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 2.5, 10.0, 100.0});
+    registry["t"] = std::move(t);
+
+    auto ir = require_ir("t[update { lg = log(x), ex = exp(x / 100.0), lg_comp = log(x * 2.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* lg = std::get_if<Column<double>>(result->find("lg"));
+    REQUIRE(lg != nullptr);
+    const auto* ex = std::get_if<Column<double>>(result->find("ex"));
+    REQUIRE(ex != nullptr);
+    const auto* lg_comp = std::get_if<Column<double>>(result->find("lg_comp"));
+    REQUIRE(lg_comp != nullptr);
+    const double xs[] = {1.0, 2.5, 10.0, 100.0};
+    for (std::size_t i = 0; i < 4; ++i) {
+        REQUIRE((*lg)[i] == Catch::Approx(std::log(xs[i])));
+        REQUIRE((*ex)[i] == Catch::Approx(std::exp(xs[i] / 100.0)));
+        REQUIRE((*lg_comp)[i] == Catch::Approx(std::log(xs[i] * 2.0)));
+    }
+}
+
 TEST_CASE("grouped update mixes a per-row column with an inline aggregate", "[update]") {
     // The single-expression demean `price - mean(price)` (the aggregate inlined
     // rather than split into a prior field) must evaluate per row within each

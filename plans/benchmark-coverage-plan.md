@@ -220,8 +220,8 @@ so ibex results are verifiable.
 6. ~~`where_update_clip` + `pmin_clip` (scalar feature showcase)~~ **DONE** (2026-06-13, commit eba837d)
 7. ~~`rbind_two` (recently shipped, zero coverage)~~ **DONE** (2026-06-13, commit eba837d)
 8. ~~`corr_price_vol` (CorrNode gap)~~ **DONE** (2026-06-13, commit eba837d)
-9. `tf_rolling_ewma_1m` for ClickHouse + R
-10. DataFusion: `lag_by_symbol`, `fill_forward/backward`, `tf_asof_join`
+9. `tf_rolling_ewma_1m` — **R DONE** (2026-06-14; data.table + dplyr via `TTR::EMA(n=1, ratio=0.1)`, matches the pandas/polars full-series `ewm(alpha=0.1, adjust=False)`). ClickHouse still TODO: `exponentialMovingAverage` is a time-windowed aggregate, not a per-row full-series column — needs an arrayFold/recursive workaround; deferred.
+10. DataFusion: `lag_by_symbol`, `fill_forward/backward`, `tf_asof_join` — `lag_by_symbol` blocked (no stable row order without a ts/row-id column, same as the existing omission); `fill_*`/`asof` still open.
 
 Remaining: #4 (Tier 2 joins, needs data schema work), #5 `log_return_momentum`
-(needs timestamped table), #9, #10.
+(needs timestamped table), #9 ClickHouse EWMA, #10 DataFusion fill/asof.

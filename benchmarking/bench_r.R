@@ -489,6 +489,13 @@ if (!is.null(csv_multi_path)) {
                                low  = min(price),
                                last = data.table::last(price)),
                            by = .(symbol, day)])
+
+        # Two-level rollup (funnel): by {symbol, day} then re-aggregate by symbol.
+        bench("data.table", "symbol_day_to_symbol",
+            function() dtm[, .(daily_mean = mean(price), daily_vol = sd(price)),
+                           by = .(symbol, day)][
+                , .(mean_of_means = mean(daily_mean), mean_vol = mean(daily_vol)),
+                by = symbol])
     }
 
     if (!skip_dplyr) {
@@ -512,6 +519,15 @@ if (!is.null(csv_multi_path)) {
                           low  = min(price),
                           last = dplyr::last(price),
                           .groups = "drop"))
+
+        # Two-level rollup (funnel): by {symbol, day} then re-aggregate by symbol.
+        bench("dplyr", "symbol_day_to_symbol",
+            function() tbm |> group_by(symbol, day) |>
+                summarise(daily_mean = mean(price), daily_vol = sd(price),
+                          .groups = "drop") |>
+                group_by(symbol) |>
+                summarise(mean_of_means = mean(daily_mean),
+                          mean_vol = mean(daily_vol), .groups = "drop"))
     }
 }
 

@@ -66,7 +66,10 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "order_head_topk", "order_head_topk_by_symbol",
         "order_tail_topk", "order_tail_topk_by_symbol"]),
     ("Multi-stage pipeline", [
-        "filter_group_sort"]),
+        "filter_group_sort", "update_group_filter", "group_rank_filter",
+        "normalize_by_group"]),
+    ("Transforms", [
+        "pmin_clip", "where_update_clip", "rbind_two", "corr_price_vol"]),
     ("Joins", [
         "null_left_join", "null_semi_join", "null_anti_join",
         "inner_join_symbol", "inner_join_user",

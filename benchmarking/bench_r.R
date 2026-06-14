@@ -569,6 +569,16 @@ if (reshape_rows <= 0) {
 
         bench("data.table", "dcast_long_to_wide",
             function() dcast(long_dt, symbol + day ~ variable, value.var = "value"))
+
+        # Typed-pivot variants: integer pivot key, and an explicit factor
+        # (categorical) key. Same value matrix as dcast_long_to_wide.
+        long_int_dt <- copy(long_dt)[, pivot_id := as.integer(variable) - 1L]
+        bench("data.table", "dcast_long_to_wide_int_pivot",
+            function() dcast(long_int_dt, symbol + day ~ pivot_id, value.var = "value"))
+
+        long_cat_dt <- copy(long_dt)[, pivot_cat := factor(variable)]
+        bench("data.table", "dcast_long_to_wide_cat_pivot",
+            function() dcast(long_cat_dt, symbol + day ~ pivot_cat, value.var = "value"))
     }
 
     if (!skip_dplyr) {
@@ -600,6 +610,20 @@ if (reshape_rows <= 0) {
         bench("dplyr", "dcast_long_to_wide",
             function() long_tb |> pivot_wider(names_from = variable,
                                                values_from = value))
+
+        # Typed-pivot variants: integer pivot key, and a factor (categorical) key.
+        long_int_tb <- long_tb |>
+            mutate(pivot_id = match(variable, c("open", "high", "low", "close")) - 1L)
+        bench("dplyr", "dcast_long_to_wide_int_pivot",
+            function() long_int_tb |> pivot_wider(id_cols = c(symbol, day),
+                                                   names_from = pivot_id,
+                                                   values_from = value))
+
+        long_cat_tb <- long_tb |> mutate(pivot_cat = factor(variable))
+        bench("dplyr", "dcast_long_to_wide_cat_pivot",
+            function() long_cat_tb |> pivot_wider(id_cols = c(symbol, day),
+                                                   names_from = pivot_cat,
+                                                   values_from = value))
     }
 }
 

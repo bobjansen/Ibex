@@ -5739,6 +5739,56 @@ TEST_CASE("grouped update broadcasts aggregate values per group", "[update]") {
     REQUIRE((*centered_col)[2] == 0.0);
 }
 
+TEST_CASE("grouped update mixes a per-row column with an inline aggregate", "[update]") {
+    // The single-expression demean `price - mean(price)` (the aggregate inlined
+    // rather than split into a prior field) must evaluate per row within each
+    // group: it both reduces (mean) and reads `price` row-wise.
+    runtime::TableRegistry registry;
+    runtime::Table trades;
+    trades.add_column("symbol", Column<std::string>{"AAPL", "AAPL", "AAPL", "GOOG", "GOOG"});
+    trades.add_column("price", Column<double>{1.0, 2.0, 3.0, 10.0, 20.0});
+    registry["trades"] = std::move(trades);
+
+    auto ir = require_ir("trades[update { d = price - mean(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 5);
+
+    const auto* d = std::get_if<Column<double>>(result->find("d"));
+    REQUIRE(d != nullptr);
+    REQUIRE((*d)[0] == Catch::Approx(-1.0));  // AAPL mean 2
+    REQUIRE((*d)[1] == Catch::Approx(0.0));
+    REQUIRE((*d)[2] == Catch::Approx(1.0));
+    REQUIRE((*d)[3] == Catch::Approx(-5.0));  // GOOG mean 15
+    REQUIRE((*d)[4] == Catch::Approx(5.0));
+}
+
+TEST_CASE("grouped update inline z-score divides per-row deviation by group std", "[update]") {
+    // Two aggregates in one expression combined with a per-row column:
+    // `(price - mean(price)) / std(price)`. Each group's z-scores have mean 0.
+    runtime::TableRegistry registry;
+    runtime::Table trades;
+    trades.add_column("symbol", Column<std::string>{"A", "A", "A", "B", "B", "B"});
+    trades.add_column("price", Column<double>{2.0, 4.0, 6.0, 10.0, 20.0, 30.0});
+    registry["trades"] = std::move(trades);
+
+    auto ir = require_ir("trades[update { z = (price - mean(price)) / std(price) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 6);
+
+    const auto* z = std::get_if<Column<double>>(result->find("z"));
+    REQUIRE(z != nullptr);
+    // Group A: mean 4, sample std 2 -> (-1, 0, 1).
+    REQUIRE((*z)[0] == Catch::Approx(-1.0));
+    REQUIRE((*z)[1] == Catch::Approx(0.0));
+    REQUIRE((*z)[2] == Catch::Approx(1.0));
+    // Group B: mean 20, sample std 10 -> (-1, 0, 1).
+    REQUIRE((*z)[3] == Catch::Approx(-1.0));
+    REQUIRE((*z)[4] == Catch::Approx(0.0));
+    REQUIRE((*z)[5] == Catch::Approx(1.0));
+}
+
 // --- Filter type coverage: double / string columns ---------------------------
 // These exercise template specialisations that the all-int64 tests miss.
 

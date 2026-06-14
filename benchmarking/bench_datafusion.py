@@ -261,6 +261,54 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ).collect(),
     )
 
+    # rank within group → top-N per group → aggregate survivors. (No
+    # update_group_filter here: it needs a row-order LAG, which DataFusion can't
+    # express without an injected ordering column — same reason lag_by_symbol is
+    # absent above.)
+    run(
+        "group_rank_filter",
+        lambda: ctx.sql(
+            "WITH ranked AS (SELECT *, DENSE_RANK() OVER ("
+            "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices) "
+            "SELECT symbol, AVG(price) AS avg_top10 FROM ranked WHERE rk <= 10 GROUP BY symbol"
+        ).collect(),
+    )
+
+    # grouped z-score → clip to ±3 → re-aggregate.
+    run(
+        "normalize_by_group",
+        lambda: ctx.sql(
+            "WITH z AS (SELECT symbol, "
+            "(price - AVG(price) OVER (PARTITION BY symbol)) "
+            "/ stddev_samp(price) OVER (PARTITION BY symbol) AS z FROM prices), "
+            "clipped AS (SELECT symbol, "
+            "CASE WHEN z < -3.0 THEN -3.0 WHEN z > 3.0 THEN 3.0 ELSE z END AS clipped FROM z) "
+            "SELECT symbol, AVG(clipped) AS mean_z, stddev_samp(clipped) AS sd_z "
+            "FROM clipped GROUP BY symbol"
+        ).collect(),
+    )
+
+    # Transforms / single-pass language features.
+    run(
+        "pmin_clip",
+        lambda: ctx.sql(
+            "SELECT *, CASE WHEN price < 500.0 THEN price ELSE 500.0 END AS clipped FROM prices"
+        ).collect(),
+    )
+    run(
+        "where_update_clip",
+        lambda: ctx.sql(
+            "SELECT symbol, CASE WHEN price > 900.0 THEN 900.0 ELSE price END AS price "
+            "FROM prices"
+        ).collect(),
+    )
+    run(
+        "rbind_two",
+        lambda: ctx.sql(
+            "SELECT * FROM prices UNION ALL SELECT * FROM prices"
+        ).collect(),
+    )
+
     run(
         "rand_uniform",
         lambda: ctx.sql(
@@ -328,6 +376,12 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
             lambda: ctx.sql(
                 "SELECT * FROM trades WHERE price > 900.0 OR qty < 10"
             ).collect(),
+        )
+
+        # Correlation over the numeric columns (price, qty).
+        run(
+            "corr_price_vol",
+            lambda: ctx.sql("SELECT corr(price, qty) AS corr FROM trades").collect(),
         )
 
     return rows

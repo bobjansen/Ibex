@@ -3710,14 +3710,52 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size
     return std::nullopt;
 }
 
+// Vectorised transcendentals (log/exp) via libmvec — the same mechanism zorro
+// uses for the RNG normal/exponential paths. Fills dst[i] = fn(src[i]) in 4-wide
+// AVX2 chunks + a scalar tail, ~5–10× the scalar libm tree-walk. Returns false
+// (caller falls back to the scalar tree-walk) when the build lacks AVX2/libmvec
+// or `name` has no kernel here, so non-x86/glibc targets stay correct.
+#if defined(__AVX2__) && defined(ZORRO_USE_LIBMVEC)
+extern "C" __m256d _ZGVdN4v_log(__m256d) noexcept;
+extern "C" __m256d _ZGVdN4v_exp(__m256d) noexcept;
+auto simd_transcendental(std::string_view name, const double* src, double* dst, std::size_t n)
+    -> bool {
+    __m256d (*kern)(__m256d) noexcept = nullptr;
+    if (name == "log") {
+        kern = _ZGVdN4v_log;
+    } else if (name == "exp") {
+        kern = _ZGVdN4v_exp;
+    } else {
+        return false;
+    }
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        _mm256_storeu_pd(dst + i, kern(_mm256_loadu_pd(src + i)));
+    }
+    for (; i < n; ++i) {
+        dst[i] = (name == "log") ? std::log(src[i]) : std::exp(src[i]);
+    }
+    return true;
+}
+#else
+auto simd_transcendental(std::string_view, const double*, double*, std::size_t) -> bool {
+    return false;
+}
+#endif
+
+// Forward declaration: try_fast_update_unary materialises a computed log/exp
+// argument through the full numeric fast path, which is defined just below it.
+auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
+                                  ExprType output_kind, const ScalarRegistry* scalars)
+    -> std::optional<ColumnValue>;
+
 // SIMD fast path for the hot unary-over-column shapes: the auto-vectorisable
 // double→double ops (sqrt/abs/floor/ceil/trunc) directly over a Double column,
-// and round(col, mode) → Int. Dispatching on the op outside the loop keeps each
-// body a direct, inlinable kernel the compiler turns into vsqrtpd/vandpd/
-// vroundpd. The transcendentals (log/exp/trig) are deliberately excluded — they
-// hit scalar libm regardless, so the generic tree-walk already matches this.
-// A computed argument (e.g. sqrt(price*2)) resolves to no raw pointer and falls
-// through to that tree-walk.
+// round(col, mode) → Int, and libmvec log/exp (which also accept a fast-
+// computable argument, materialised first). Dispatching on the op outside the
+// loop keeps each body a direct, inlinable kernel (vsqrtpd/vandpd/vroundpd) or a
+// libmvec chunk. Remaining transcendentals (trig/hyperbolic) fall through to the
+// scalar tree-walk.
 auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t rows,
                            ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
@@ -3753,6 +3791,33 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
             run([](double v) { return static_cast<std::int64_t>(std::trunc(v)); });
         } else {
             return std::nullopt;
+        }
+        return ColumnValue{std::move(out)};
+    }
+
+    // log/exp via libmvec: accept a bare Double column or any fast-computable
+    // numeric argument (materialised to a temp column first). Falls back to the
+    // scalar tree-walk when libmvec is unavailable.
+    if (call->args.size() == 1 && output_kind == ExprType::Double &&
+        (call->callee == "log" || call->callee == "exp")) {
+        auto arg = resolve_fast_operand(*call->args[0], input, scalars);
+        ColumnValue owned;  // backing store if the argument is computed
+        const double* src = nullptr;
+        if (arg && arg->is_column && arg->kind == ExprType::Double) {
+            src = std::get<Column<double>>(*arg->column).data();
+        } else {
+            auto materialised = try_fast_update_numeric_expr(*call->args[0], input, rows,
+                                                             ExprType::Double, scalars);
+            if (!materialised || !std::holds_alternative<Column<double>>(*materialised)) {
+                return std::nullopt;  // non-double / non-fast arg: tree-walk
+            }
+            owned = std::move(*materialised);
+            src = std::get<Column<double>>(owned).data();
+        }
+        Column<double> out;
+        out.resize_for_overwrite(rows);
+        if (!simd_transcendental(call->callee, src, out.data(), rows)) {
+            return std::nullopt;  // no SIMD kernel on this target: tree-walk
         }
         return ColumnValue{std::move(out)};
     }

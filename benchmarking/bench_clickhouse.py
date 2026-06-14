@@ -196,6 +196,14 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ") AS cs FROM prices",
     )
 
+    # Cumulative product via exp(cumsum(ln)) — no PRODUCT window aggregate.
+    run(
+        "cumprod_price",
+        "SELECT *, exp(sum(ln(price)) OVER ("
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+        ")) AS cp FROM prices",
+    )
+
     # Grouped window functions (partition by symbol). lag_by_symbol is omitted:
     # an input-order LAG needs a stable row id that ClickHouse does not expose as
     # a plain column here.
@@ -269,6 +277,21 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         "SELECT *, rand() / 4294967295.0 AS r FROM prices",
     )
 
+    run(
+        "rand_normal",
+        "SELECT *, randNormal(0, 1) AS n FROM prices",
+    )
+
+    run(
+        "rand_int",
+        "SELECT *, toInt64(floor(rand() / 4294967295.0 * 100)) + 1 AS r FROM prices",
+    )
+
+    run(
+        "rand_bernoulli",
+        "SELECT *, toInt32(rand() / 4294967295.0 < 0.3) AS r FROM prices",
+    )
+
     if csv_multi_path:
         print("clickhouse: loading multi...", file=sys.stderr, flush=True)
         sess.query(
@@ -294,6 +317,14 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
             "any(price) AS open, max(price) AS high, "
             "min(price) AS low, anyLast(price) AS last "
             "FROM prices_multi GROUP BY symbol, day",
+        )
+
+        # Two-level rollup (funnel): by {symbol, day} then re-aggregate by symbol.
+        run(
+            "symbol_day_to_symbol",
+            "SELECT symbol, avg(daily_mean) AS mean_of_means, avg(daily_vol) AS mean_vol FROM ("
+            "SELECT symbol, day, avg(price) AS daily_mean, stddevSamp(price) AS daily_vol "
+            "FROM prices_multi GROUP BY symbol, day) GROUP BY symbol",
         )
 
     if csv_trades_path:

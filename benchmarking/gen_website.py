@@ -67,7 +67,7 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "order_tail_topk", "order_tail_topk_by_symbol"]),
     ("Multi-stage pipeline", [
         "filter_group_sort", "update_group_filter", "group_rank_filter",
-        "normalize_by_group"]),
+        "normalize_by_group", "symbol_day_to_symbol"]),
     ("Transforms", [
         "pmin_clip", "where_update_clip", "rbind_two", "corr_price_vol"]),
     ("Joins", [

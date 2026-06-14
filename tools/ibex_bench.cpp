@@ -2988,6 +2988,17 @@ int main(int argc, char** argv) {
                 "prices_multi[select {open = first(price), high = max(price), low = min(price), "
                 "last = last(price)}, by {symbol, day}]",
             },
+            // Two-level rollup (funnel): aggregate by {symbol, day}, then
+            // re-aggregate the per-day stats by symbol. The second select's
+            // inputs are the first select's output columns — in SQL this needs
+            // a CTE/subquery; in ibex it chains. Tier 3 of the pipeline plan.
+            {
+                "symbol_day_to_symbol",
+                "prices_multi[select {daily_mean = mean(price), daily_vol = std(price)}, "
+                "by {symbol, day}]"
+                "[select {mean_of_means = mean(daily_mean), mean_vol = mean(daily_vol)}, "
+                "by symbol]",
+            },
         };
 
         for (const auto& query : multi_queries) {

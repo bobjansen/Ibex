@@ -85,6 +85,8 @@ QUERY_ORDER = [
     "inner_join_symbol",
     "inner_join_user",
     "null_cross_join_small",
+    "join_update_group",
+    "join_filter_rank",
     # reshape
     "melt_wide_to_long",
     "dcast_long_to_wide",
@@ -132,6 +134,8 @@ QUERY_LABEL = {
     "null_anti_join": "anti join",
     "inner_join_symbol": "inner join (126 keys)",
     "inner_join_user": "inner join (100K keys)",
+    "join_update_group": "join→revenue→rollup",
+    "join_filter_rank": "join→filter→rank top-5",
     "null_cross_join_small": "cross join (2k×64)",
     "distinct_symbol": "distinct symbol",
     "median_by_symbol": "median by symbol",

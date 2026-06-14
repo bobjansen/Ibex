@@ -709,6 +709,28 @@ def bench_datafusion_events(csv_events_path, warmup, iters, ctx, csv_users_path=
             ).collect(),
         )
 
+        # Join-anchored pipelines (Tier 2): join → derive → roll up.
+        run(
+            "join_update_group",
+            lambda: ctx.sql(
+                "WITH j AS (SELECT e.symbol, u.user_segment, "
+                "e.amount * u.user_tier_multiplier AS revenue "
+                "FROM events e JOIN users u ON e.user_id = u.user_id) "
+                "SELECT symbol, user_segment, SUM(revenue) AS total_rev "
+                "FROM j GROUP BY symbol, user_segment"
+            ).collect(),
+        )
+        run(
+            "join_filter_rank",
+            lambda: ctx.sql(
+                "WITH j AS (SELECT e.symbol, e.amount FROM events e "
+                "JOIN users u ON e.user_id = u.user_id WHERE u.user_segment = 'premium'), "
+                "r AS (SELECT *, DENSE_RANK() OVER ("
+                "PARTITION BY symbol ORDER BY amount DESC) AS rk FROM j) "
+                "SELECT * FROM r WHERE rk <= 5"
+            ).collect(),
+        )
+
     return rows
 
 

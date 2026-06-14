@@ -2418,6 +2418,28 @@ int main(int argc, char** argv) {
                     }
                 }
                 status = run_benchmark(q, join_reg, warmup_iters, iters, saved_include_parse);
+
+                // Join-anchored pipelines (Tier 2): enrich events with the user
+                // dimension, then continue. Mirrors the classic DW pattern of
+                // join → derive → roll up. The join is parenthesised so it forms
+                // the base of the bracket-clause pipeline.
+                std::vector<BenchQuery> join_pipelines = {
+                    {"join_update_group",
+                     "(events join users on user_id)"
+                     "[update { revenue = amount * user_tier_multiplier }]"
+                     "[select { total_rev = sum(revenue) }, by { symbol, user_segment }]"},
+                    {"join_filter_rank",
+                     "(events join users on user_id)"
+                     "[filter user_segment == \"premium\"]"
+                     "[update { rk = rank(amount, method = dense, ascending = false) }, by symbol]"
+                     "[filter rk <= 5]"},
+                };
+                for (const auto& jp : join_pipelines) {
+                    status = run_benchmark(jp, join_reg, warmup_iters, iters, saved_include_parse);
+                    if (status != 0) {
+                        break;
+                    }
+                }
             }
         }
     }

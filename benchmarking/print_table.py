@@ -68,6 +68,15 @@ QUERY_ORDER = [
     "order_tail_topk_by_symbol",
     # multi-stage pipeline
     "filter_group_sort",
+    "update_group_filter",
+    "group_rank_filter",
+    "normalize_by_group",
+    # transforms / single-pass language features
+    "pmin_clip",
+    "where_update_clip",
+    "rbind_two",
+    # statistics
+    "corr_price_vol",
     # joins
     "null_left_join",
     "null_semi_join",
@@ -131,6 +140,13 @@ QUERY_LABEL = {
     "lag_by_symbol": "lag by symbol",
     "cumsum_by_symbol": "cumsum by symbol",
     "filter_group_sort": "filter→group→top-10",
+    "update_group_filter": "update→filter→regroup",
+    "group_rank_filter": "rank→top-N→aggregate",
+    "normalize_by_group": "z-score→clip→aggregate",
+    "pmin_clip": "pmin clip (winsorise)",
+    "where_update_clip": "guarded update (CASE WHEN)",
+    "rbind_two": "rbind (vertical concat)",
+    "corr_price_vol": "correlation matrix",
     "sort_price": "sort (full)",
     "sort_price_desc": "sort desc (full)",
     "sort_symbol": "sort symbol (full)",

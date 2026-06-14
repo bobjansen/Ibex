@@ -1932,9 +1932,10 @@ int main(int argc, char** argv) {
 
     std::unordered_set<std::string> selected_suites;
     const std::unordered_set<std::string> allowed_suites = {
-        "all",     "core",      "cumulative",     "sort",      "window", "groupagg",    "pipeline",
-        "join",    "rng",       "fill",           "null",      "filter", "multi",       "events",
-        "reshape", "timeframe", "merge_validity", "rng_micro", "bool",   "filter_micro"};
+        "all",      "core",         "cumulative", "sort",      "window",         "groupagg",
+        "pipeline", "join",         "rng",        "fill",      "null",           "filter",
+        "multi",    "events",       "reshape",    "timeframe", "merge_validity", "rng_micro",
+        "bool",     "filter_micro", "transform",  "stats"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -2169,28 +2170,73 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Multi-stage pipeline: filter → group-by → order → head, as a single
-        // query. Exercises the pipeline planner / operator fusion end-to-end,
-        // in contrast to the one-operator-per-benchmark queries above.
+        // Multi-stage pipelines: deeper operator chains than the single-operator
+        // benchmarks above, exercising the pipeline planner / operator fusion
+        // and the handoff of derived columns between stages.
+        //   filter_group_sort   — filter → group-by → order → head (fused TopK)
+        //   update_group_filter — update by → filter on derived col → re-aggregate
+        //   group_rank_filter   — rank within group → top-N filter → aggregate
+        //   normalize_by_group  — grouped z-score (per-row col + group aggregate)
+        //                         → clip → re-aggregate
         if (status == 0 && run_suite("pipeline")) {
             fmt::print("\n-- Pipeline benchmarks ({} prices rows) --\n",
                        tables.at("prices").rows());
-            BenchQuery pipeline_query{
-                "filter_group_sort",
-                "prices[filter price > 500.0][select { avg = mean(price) }, by symbol]"
-                "[order avg desc, head 10]"};
-            if (verify) {
-                if (auto err = verify_benchmark(pipeline_query, tables, verify_rows)) {
-                    fmt::print("error: verify failed for {}: {}\n", pipeline_query.name, *err);
-                    return 1;
+            std::vector<BenchQuery> pipeline_queries = {
+                {"filter_group_sort",
+                 "prices[filter price > 500.0][select { avg = mean(price) }, by symbol]"
+                 "[order avg desc, head 10]"},
+                {"update_group_filter",
+                 "prices[update { lr = log(price / lag(price, 1)) }, by symbol]"
+                 "[filter lr > 0.0][select { pos_days = count() }, by symbol]"},
+                {"group_rank_filter",
+                 "prices[update { rk = rank(price, method = dense, ascending = false) }, by symbol]"
+                 "[filter rk <= 10][select { avg_top10 = mean(price) }, by symbol]"},
+                {"normalize_by_group",
+                 "prices[update { z = (price - mean(price)) / std(price) }, by symbol]"
+                 "[update { clipped = pmin(pmax(z, -3.0), 3.0) }]"
+                 "[select { mean_z = mean(clipped), sd_z = std(clipped) }, by symbol]"},
+            };
+            for (const auto& query : pipeline_queries) {
+                if (verify) {
+                    if (auto err = verify_benchmark(query, tables, verify_rows)) {
+                        fmt::print("error: verify failed for {}: {}\n", query.name, *err);
+                        return 1;
+                    }
+                }
+                ScanPaths sp;
+                if (include_read) {
+                    sp.emplace_back("prices", csv_path);
+                }
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse, sp);
+                if (status != 0) {
+                    break;
                 }
             }
-            ScanPaths sp;
-            if (include_read) {
-                sp.emplace_back("prices", csv_path);
+        }
+
+        // Transform benchmarks: core single-pass language features that had no
+        // coverage. pmin_clip exercises the vectorised pmin path (winsorising a
+        // column against a scalar); where_update_clip is a guarded update (the
+        // ibex equivalent of SQL CASE WHEN — replaces matching rows, keeps
+        // cardinality); rbind_two vertically concatenates two tables (RbindNode).
+        if (status == 0 && run_suite("transform")) {
+            fmt::print("\n-- Transform benchmarks ({} prices rows) --\n",
+                       tables.at("prices").rows());
+            std::vector<BenchQuery> transform_queries = {
+                {"pmin_clip", "prices[update { clipped = pmin(price, 500.0) }]"},
+                {"where_update_clip", "prices[where price > 900.0 update { price = 900.0 }]"},
+                {"rbind_two", "rbind(prices, prices)"},
+            };
+            for (const auto& query : transform_queries) {
+                ScanPaths sp;
+                if (include_read) {
+                    sp.emplace_back("prices", csv_path);
+                }
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse, sp);
+                if (status != 0) {
+                    break;
+                }
             }
-            status =
-                run_benchmark(pipeline_query, tables, warmup_iters, iters, saved_include_parse, sp);
         }
 
         // Vectorized RNG benchmarks: rand_uniform and rand_normal appended as a
@@ -2887,6 +2933,29 @@ int main(int argc, char** argv) {
                     return gather_all_combined_words(arith_words, arith_out);
                 });
         }
+    }
+
+    // Statistics benchmarks: the correlation matrix (CorrNode) over all numeric
+    // columns. Uses trades.csv (price:Double, qty:Int) for a 2x2 matrix; the
+    // cost is dominated by the two-pass mean/variance/covariance scan.
+    if (status == 0 && run_suite("stats") && !csv_trades_path.empty()) {
+        ibex::runtime::Table trades_table;
+        try {
+            trades_table = read_csv(csv_trades_path);
+        } catch (const std::exception& e) {
+            fmt::print("error: failed to read trades CSV: {}\n", e.what());
+            return 1;
+        }
+        ibex::runtime::TableRegistry trades_tables;
+        trades_tables.emplace("trades", std::move(trades_table));
+        fmt::print("\n-- Statistics benchmarks ({} trades rows) --\n",
+                   trades_tables.at("trades").rows());
+        BenchQuery q{"corr_price_vol", "trades[corr]"};
+        ScanPaths sp;
+        if (include_read) {
+            sp.emplace_back("trades", csv_trades_path);
+        }
+        status = run_benchmark(q, trades_tables, warmup_iters, iters, saved_include_parse, sp);
     }
 
     // Multi-column group-by: exercises the compound-key fallback path (std::unordered_map<Key>).

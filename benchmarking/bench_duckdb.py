@@ -248,6 +248,59 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ).fetchnumpy(),
     )
 
+    # update by → filter on derived column → re-aggregate.
+    run(
+        "update_group_filter",
+        lambda: con.sql(
+            "WITH lr AS (SELECT symbol, "
+            "LN(price / LAG(price, 1) OVER (PARTITION BY symbol ORDER BY rowid)) AS lr "
+            "FROM prices) "
+            "SELECT symbol, COUNT(lr) AS pos_days FROM lr WHERE lr > 0.0 GROUP BY symbol"
+        ).fetchnumpy(),
+    )
+
+    # rank within group → top-N per group → aggregate survivors.
+    run(
+        "group_rank_filter",
+        lambda: con.sql(
+            "WITH ranked AS (SELECT *, DENSE_RANK() OVER ("
+            "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices) "
+            "SELECT symbol, AVG(price) AS avg_top10 FROM ranked WHERE rk <= 10 GROUP BY symbol"
+        ).fetchnumpy(),
+    )
+
+    # grouped z-score → clip to ±3 → re-aggregate.
+    run(
+        "normalize_by_group",
+        lambda: con.sql(
+            "WITH z AS (SELECT symbol, "
+            "(price - AVG(price) OVER (PARTITION BY symbol)) "
+            "/ STDDEV_SAMP(price) OVER (PARTITION BY symbol) AS z FROM prices), "
+            "clipped AS (SELECT symbol, LEAST(GREATEST(z, -3.0), 3.0) AS clipped FROM z) "
+            "SELECT symbol, AVG(clipped) AS mean_z, STDDEV_SAMP(clipped) AS sd_z "
+            "FROM clipped GROUP BY symbol"
+        ).fetchnumpy(),
+    )
+
+    # Transforms / single-pass language features.
+    run(
+        "pmin_clip",
+        lambda: con.sql("SELECT *, LEAST(price, 500.0) AS clipped FROM prices").fetchnumpy(),
+    )
+    run(
+        "where_update_clip",
+        lambda: con.sql(
+            "SELECT symbol, CASE WHEN price > 900.0 THEN 900.0 ELSE price END AS price "
+            "FROM prices"
+        ).fetchnumpy(),
+    )
+    run(
+        "rbind_two",
+        lambda: con.sql(
+            "SELECT * FROM prices UNION ALL SELECT * FROM prices"
+        ).fetchnumpy(),
+    )
+
     run(
         "rand_uniform",
         lambda: con.sql(
@@ -319,6 +372,12 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             lambda: con.sql(
                 "SELECT * FROM trades WHERE price > 900.0 OR qty < 10"
             ).fetchnumpy(),
+        )
+
+        # Correlation over the numeric columns (price, qty).
+        run(
+            "corr_price_vol",
+            lambda: con.sql("SELECT CORR(price, qty) AS corr FROM trades").fetchnumpy(),
         )
 
     return rows

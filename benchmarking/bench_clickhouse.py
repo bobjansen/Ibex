@@ -235,6 +235,35 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         "GROUP BY symbol ORDER BY avg DESC LIMIT 10",
     )
 
+    # rank within group → top-N per group → aggregate survivors. (No
+    # update_group_filter: it needs a row-order LAG, which ClickHouse can't
+    # express here — same reason lag_by_symbol is omitted above.)
+    run(
+        "group_rank_filter",
+        "SELECT symbol, avg(price) AS avg_top10 FROM ("
+        "SELECT symbol, price, dense_rank() OVER ("
+        "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices"
+        ") WHERE rk <= 10 GROUP BY symbol",
+    )
+
+    # grouped z-score → clip to ±3 → re-aggregate.
+    run(
+        "normalize_by_group",
+        "SELECT symbol, avg(clipped) AS mean_z, stddevSamp(clipped) AS sd_z FROM ("
+        "SELECT symbol, greatest(least(z, 3.0), -3.0) AS clipped FROM ("
+        "SELECT symbol, (price - avg(price) OVER (PARTITION BY symbol)) "
+        "/ stddevSamp(price) OVER (PARTITION BY symbol) AS z FROM prices"
+        ")) GROUP BY symbol",
+    )
+
+    # Transforms / single-pass language features.
+    run("pmin_clip", "SELECT *, least(price, 500.0) AS clipped FROM prices")
+    run(
+        "where_update_clip",
+        "SELECT symbol, if(price > 900.0, 900.0, price) AS price FROM prices",
+    )
+    run("rbind_two", "SELECT * FROM prices UNION ALL SELECT * FROM prices")
+
     run(
         "rand_uniform",
         "SELECT *, rand() / 4294967295.0 AS r FROM prices",
@@ -293,6 +322,9 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
             "filter_or",
             "SELECT * FROM trades WHERE price > 900.0 OR qty < 10",
         )
+
+        # Correlation over the numeric columns (price, qty).
+        run("corr_price_vol", "SELECT corr(price, qty) AS corr FROM trades")
 
     return rows
 

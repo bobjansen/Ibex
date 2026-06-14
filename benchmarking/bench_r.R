@@ -289,6 +289,32 @@ if (!skip_data_table) {
     bench("data.table", "filter_group_sort",
         function() head(dt[price > 500, .(avg = mean(price)), by = symbol][order(-avg)], 10L))
 
+    # update by -> filter on derived column -> re-aggregate.
+    bench("data.table", "update_group_filter",
+        function() dt[, lr := log(price / shift(price, 1L)), by = symbol][
+            lr > 0, .(pos_days = .N), by = symbol])
+
+    # rank within group -> top-N per group -> aggregate survivors.
+    bench("data.table", "group_rank_filter",
+        function() dt[, rk := frank(-price, ties.method = "dense"), by = symbol][
+            rk <= 10, .(avg_top10 = mean(price)), by = symbol])
+
+    # grouped z-score -> clip to +/-3 -> re-aggregate.
+    bench("data.table", "normalize_by_group",
+        function() dt[, z := (price - mean(price)) / sd(price), by = symbol][
+            , clipped := pmin(pmax(z, -3.0), 3.0)][
+            , .(mean_z = mean(clipped), sd_z = sd(clipped)), by = symbol])
+
+    # Transforms / single-pass language features (non-mutating selects).
+    bench("data.table", "pmin_clip",
+        function() dt[, .(symbol, price, clipped = pmin(price, 500.0))])
+
+    bench("data.table", "where_update_clip",
+        function() dt[, .(symbol, price = fifelse(price > 900.0, 900.0, price))])
+
+    bench("data.table", "rbind_two",
+        function() rbindlist(list(dt[, .(symbol, price)], dt[, .(symbol, price)])))
+
     bench("data.table", "cumsum_price",
         function() dt[, cs := cumsum(price)][])
 
@@ -390,6 +416,37 @@ if (!skip_dplyr) {
         function() tb |> filter(price > 500) |> group_by(symbol) |>
             summarise(avg = mean(price), .groups = "drop") |>
             arrange(desc(avg)) |> head(10L))
+
+    # update by -> filter on derived column -> re-aggregate.
+    bench("dplyr", "update_group_filter",
+        function() tb |> group_by(symbol) |>
+            mutate(lr = log(price / lag(price, 1L))) |>
+            filter(lr > 0) |>
+            summarise(pos_days = n(), .groups = "drop"))
+
+    # rank within group -> top-N per group -> aggregate survivors.
+    bench("dplyr", "group_rank_filter",
+        function() tb |> group_by(symbol) |>
+            mutate(rk = dense_rank(desc(price))) |>
+            filter(rk <= 10) |>
+            summarise(avg_top10 = mean(price), .groups = "drop"))
+
+    # grouped z-score -> clip to +/-3 -> re-aggregate.
+    bench("dplyr", "normalize_by_group",
+        function() tb |> group_by(symbol) |>
+            mutate(z = (price - mean(price)) / sd(price),
+                   clipped = pmin(pmax(z, -3.0), 3.0)) |>
+            summarise(mean_z = mean(clipped), sd_z = sd(clipped), .groups = "drop"))
+
+    # Transforms / single-pass language features.
+    bench("dplyr", "pmin_clip",
+        function() tb |> mutate(clipped = pmin(price, 500.0)))
+
+    bench("dplyr", "where_update_clip",
+        function() tb |> mutate(price = if_else(price > 900.0, 900.0, price)))
+
+    bench("dplyr", "rbind_two",
+        function() bind_rows(tb, tb))
 
     bench("dplyr", "cumsum_price",
         function() tb |> mutate(cs = cumsum(price)))
@@ -551,6 +608,10 @@ if (!is.null(csv_trades_path)) {
 
         bench("data.table", "filter_or",
             function() dt_trades[price > 900.0 | qty < 10])
+
+        # Correlation over the numeric columns (price, qty).
+        bench("data.table", "corr_price_vol",
+            function() data.table(corr = cor(dt_trades$price, dt_trades$qty)))
     }
 
     if (!skip_dplyr) {
@@ -570,6 +631,10 @@ if (!is.null(csv_trades_path)) {
 
         bench("dplyr", "filter_or",
             function() tb_trades |> filter(price > 900.0 | qty < 10))
+
+        # Correlation over the numeric columns (price, qty).
+        bench("dplyr", "corr_price_vol",
+            function() summarise(tb_trades, corr = cor(price, qty)))
     }
 }
 

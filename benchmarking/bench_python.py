@@ -224,6 +224,51 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         .head(10),
     )
 
+    # update by → filter on derived column → re-aggregate.
+    def _update_group_filter():
+        g = df.assign(lr=np.log(df["price"] / df.groupby("symbol")["price"].shift(1)))
+        g = g[g["lr"] > 0.0]
+        return (
+            g.groupby("symbol", sort=False).agg(pos_days=("lr", "count")).reset_index()
+        )
+
+    run("update_group_filter", _update_group_filter)
+
+    # rank within group → top-N per group → aggregate survivors.
+    def _group_rank_filter():
+        g = df.assign(
+            rk=df.groupby("symbol")["price"].rank(method="dense", ascending=False)
+        )
+        g = g[g["rk"] <= 10]
+        return (
+            g.groupby("symbol", sort=False)
+            .agg(avg_top10=("price", "mean"))
+            .reset_index()
+        )
+
+    run("group_rank_filter", _group_rank_filter)
+
+    # grouped z-score → clip to ±3 → re-aggregate.
+    def _normalize_by_group():
+        grp = df.groupby("symbol")["price"]
+        z = (df["price"] - grp.transform("mean")) / grp.transform("std")
+        g = df.assign(clipped=z.clip(-3.0, 3.0))
+        return (
+            g.groupby("symbol", sort=False)
+            .agg(mean_z=("clipped", "mean"), sd_z=("clipped", "std"))
+            .reset_index()
+        )
+
+    run("normalize_by_group", _normalize_by_group)
+
+    # Transforms / single-pass language features.
+    run("pmin_clip", lambda: df.assign(clipped=df["price"].clip(upper=500.0)))
+    run(
+        "where_update_clip",
+        lambda: df.assign(price=df["price"].where(df["price"] <= 900.0, 900.0)),
+    )
+    run("rbind_two", lambda: pd.concat([df, df], ignore_index=True))
+
     run("cumsum_price", lambda: df.assign(cs=df["price"].cumsum()))
 
     run("cumprod_price", lambda: df.assign(cp=df["price"].cumprod()))
@@ -275,6 +320,9 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         run("filter_arith", lambda: dft[dft["price"] * dft["qty"] > 50000.0])
 
         run("filter_or", lambda: dft[(dft["price"] > 900.0) | (dft["qty"] < 10)])
+
+        # Correlation matrix over the numeric columns (price, qty).
+        run("corr_price_vol", lambda: dft[["price", "qty"]].corr())
 
     return rows
 
@@ -414,6 +462,63 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         .head(10),
     )
 
+    # update by → filter on derived column → re-aggregate.
+    run(
+        "update_group_filter",
+        lambda: df.with_columns(
+            (pl.col("price") / pl.col("price").shift(1).over("symbol"))
+            .log()
+            .alias("lr")
+        )
+        .filter(pl.col("lr") > 0.0)
+        .group_by("symbol")
+        .agg(pl.col("lr").count().alias("pos_days")),
+    )
+
+    # rank within group → top-N per group → aggregate survivors.
+    run(
+        "group_rank_filter",
+        lambda: df.with_columns(
+            pl.col("price").rank(method="dense", descending=True).over("symbol").alias("rk")
+        )
+        .filter(pl.col("rk") <= 10)
+        .group_by("symbol")
+        .agg(pl.col("price").mean().alias("avg_top10")),
+    )
+
+    # grouped z-score → clip to ±3 → re-aggregate.
+    run(
+        "normalize_by_group",
+        lambda: df.with_columns(
+            (
+                (pl.col("price") - pl.col("price").mean().over("symbol"))
+                / pl.col("price").std().over("symbol")
+            ).alias("z")
+        )
+        .with_columns(pl.col("z").clip(-3.0, 3.0).alias("clipped"))
+        .group_by("symbol")
+        .agg(
+            pl.col("clipped").mean().alias("mean_z"),
+            pl.col("clipped").std().alias("sd_z"),
+        ),
+    )
+
+    # Transforms / single-pass language features.
+    run(
+        "pmin_clip",
+        lambda: df.with_columns(pl.col("price").clip(upper_bound=500.0).alias("clipped")),
+    )
+    run(
+        "where_update_clip",
+        lambda: df.with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(900.0)
+            .otherwise(pl.col("price"))
+            .alias("price")
+        ),
+    )
+    run("rbind_two", lambda: pl.concat([df, df]))
+
     run("cumsum_price", lambda: df.with_columns(pl.col("price").cum_sum().alias("cs")))
 
     run(
@@ -483,6 +588,12 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         run(
             "filter_or",
             lambda: dft.filter((pl.col("price") > 900.0) | (pl.col("qty") < 10)),
+        )
+
+        # Correlation matrix over the numeric columns (price, qty).
+        run(
+            "corr_price_vol",
+            lambda: dft.select(pl.corr("price", "qty").alias("corr")),
         )
 
     return rows
@@ -635,6 +746,67 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         .head(10)
         .collect(),
     )
+    # update by → filter on derived column → re-aggregate.
+    run(
+        "update_group_filter",
+        lambda: scan()
+        .with_columns(
+            (pl.col("price") / pl.col("price").shift(1).over("symbol")).log().alias("lr")
+        )
+        .filter(pl.col("lr") > 0.0)
+        .group_by("symbol")
+        .agg(pl.col("lr").count().alias("pos_days"))
+        .collect(),
+    )
+    # rank within group → top-N per group → aggregate survivors.
+    run(
+        "group_rank_filter",
+        lambda: scan()
+        .with_columns(
+            pl.col("price").rank(method="dense", descending=True).over("symbol").alias("rk")
+        )
+        .filter(pl.col("rk") <= 10)
+        .group_by("symbol")
+        .agg(pl.col("price").mean().alias("avg_top10"))
+        .collect(),
+    )
+    # grouped z-score → clip to ±3 → re-aggregate.
+    run(
+        "normalize_by_group",
+        lambda: scan()
+        .with_columns(
+            (
+                (pl.col("price") - pl.col("price").mean().over("symbol"))
+                / pl.col("price").std().over("symbol")
+            ).alias("z")
+        )
+        .with_columns(pl.col("z").clip(-3.0, 3.0).alias("clipped"))
+        .group_by("symbol")
+        .agg(
+            pl.col("clipped").mean().alias("mean_z"),
+            pl.col("clipped").std().alias("sd_z"),
+        )
+        .collect(),
+    )
+    # Transforms / single-pass language features.
+    run(
+        "pmin_clip",
+        lambda: scan()
+        .with_columns(pl.col("price").clip(upper_bound=500.0).alias("clipped"))
+        .collect(),
+    )
+    run(
+        "where_update_clip",
+        lambda: scan()
+        .with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(900.0)
+            .otherwise(pl.col("price"))
+            .alias("price")
+        )
+        .collect(),
+    )
+    run("rbind_two", lambda: pl.concat([scan(), scan()]).collect())
     run(
         "cumsum_price",
         lambda: scan().with_columns(pl.col("price").cum_sum().alias("cs")).collect(),
@@ -695,6 +867,11 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             lambda: scan_trades()
             .filter((pl.col("price") > 900.0) | (pl.col("qty") < 10))
             .collect(),
+        )
+        # Correlation matrix over the numeric columns (price, qty).
+        run(
+            "corr_price_vol",
+            lambda: scan_trades().select(pl.corr("price", "qty").alias("corr")).collect(),
         )
 
     return rows

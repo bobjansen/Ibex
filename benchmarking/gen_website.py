@@ -55,6 +55,9 @@ CATEGORIES: list[tuple[str, list[str]]] = [
     ("Column ops / update", [
         "update_price_x2", "cumsum_price", "cumprod_price", "rand_uniform",
         "rand_normal", "rand_int", "rand_bernoulli"]),
+    ("Scalar math builtins", [
+        "abs_price", "sqrt_price", "log_price", "exp_price",
+        "round_price", "floor_price", "ceil_price"]),
     ("Grouped window functions", [
         "rank_by_symbol", "lag_by_symbol", "cumsum_by_symbol"]),
     ("Filters", [

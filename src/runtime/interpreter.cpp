@@ -3337,6 +3337,43 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
     return std::nullopt;
 }
 
+// Pure double→double row-wise math builtins (sqrt/log/exp/trig + the
+// type-preserving abs/floor/ceil/trunc when applied to a Double). Looked up by
+// name so they can be compiled into the no-variant numeric fast path instead of
+// the per-row scalar registry. Returns nullptr for names not in this set.
+using UnaryDoubleFn = double (*)(double);
+auto lookup_unary_double_fn(std::string_view name) -> UnaryDoubleFn {
+    static const std::unordered_map<std::string_view, UnaryDoubleFn> table = {
+        {"sqrt", [](double x) { return std::sqrt(x); }},
+        {"log", [](double x) { return std::log(x); }},
+        {"exp", [](double x) { return std::exp(x); }},
+        {"log2", [](double x) { return std::log2(x); }},
+        {"log10", [](double x) { return std::log10(x); }},
+        {"sin", [](double x) { return std::sin(x); }},
+        {"cos", [](double x) { return std::cos(x); }},
+        {"tan", [](double x) { return std::tan(x); }},
+        {"asin", [](double x) { return std::asin(x); }},
+        {"acos", [](double x) { return std::acos(x); }},
+        {"atan", [](double x) { return std::atan(x); }},
+        {"sinh", [](double x) { return std::sinh(x); }},
+        {"cosh", [](double x) { return std::cosh(x); }},
+        {"tanh", [](double x) { return std::tanh(x); }},
+        {"abs", [](double x) { return std::fabs(x); }},
+        {"floor", [](double x) { return std::floor(x); }},
+        {"ceil", [](double x) { return std::ceil(x); }},
+        {"trunc", [](double x) { return std::trunc(x); }},
+    };
+    auto it = table.find(name);
+    return it == table.end() ? nullptr : it->second;
+}
+
+// abs/floor/ceil/trunc preserve the argument type (Int stays Int); only these
+// may take an Int argument on the fast path. The transcendentals always widen
+// to Double, so an Int argument is cast.
+auto unary_fn_is_type_preserving(std::string_view name) -> bool {
+    return name == "abs" || name == "floor" || name == "ceil" || name == "trunc";
+}
+
 struct NumericUpdateNode {
     enum class Kind : std::uint8_t {
         IntColumn,
@@ -3344,8 +3381,10 @@ struct NumericUpdateNode {
         IntLiteral,
         DoubleLiteral,
         Op,
-        Min,  ///< pmin(left, right) — element-wise minimum
-        Max,  ///< pmax(left, right) — element-wise maximum
+        Min,          ///< pmin(left, right) — element-wise minimum
+        Max,          ///< pmax(left, right) — element-wise maximum
+        UnaryDouble,  ///< dbl_fn(child) — row-wise double→double math (child = left)
+        UnaryToInt,   ///< int_fn(child as double) — round(x, mode): Double → Int (child = left)
     };
 
     Kind kind = Kind::IntLiteral;
@@ -3357,7 +3396,40 @@ struct NumericUpdateNode {
     const double* dbl = nullptr;
     std::int64_t int_lit = 0;
     double dbl_lit = 0.0;
+    UnaryDoubleFn dbl_fn = nullptr;
+    std::int64_t (*int_fn)(double) = nullptr;
 };
+
+// round(x, mode) → Int64. mode is a bare identifier; resolve it to a kernel at
+// compile time. Mirrors apply_round() exactly. Returns nullptr for bad modes.
+auto lookup_round_int_fn(std::string_view mode) -> std::int64_t (*)(double) {
+    if (mode == "nearest") {
+        return [](double v) {
+            return static_cast<std::int64_t>(std::llround(v));
+        };
+    }
+    if (mode == "bankers") {
+        return [](double v) {
+            return static_cast<std::int64_t>(std::llrint(v));
+        };
+    }
+    if (mode == "floor") {
+        return [](double v) {
+            return static_cast<std::int64_t>(std::floor(v));
+        };
+    }
+    if (mode == "ceil") {
+        return [](double v) {
+            return static_cast<std::int64_t>(std::ceil(v));
+        };
+    }
+    if (mode == "trunc") {
+        return [](double v) {
+            return static_cast<std::int64_t>(std::trunc(v));
+        };
+    }
+    return nullptr;
+}
 
 auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                                      const ScalarRegistry* scalars,
@@ -3386,6 +3458,29 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                         : ExprType::Int;
         nodes.push_back(node);
         return static_cast<std::uint32_t>(nodes.size() - 1);
+    }
+
+    // round(x, mode) → Int: compile the value child and wrap in a UnaryToInt
+    // node whose kernel is fixed by the (compile-time) mode identifier.
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "round" && call->args.size() == 2 && call->named_args.empty()) {
+            const auto* moderef = std::get_if<ir::ColumnRef>(&call->args[1]->node);
+            auto kern = moderef != nullptr ? lookup_round_int_fn(moderef->name) : nullptr;
+            if (kern == nullptr) {
+                return std::nullopt;
+            }
+            auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes);
+            if (!child.has_value()) {
+                return std::nullopt;
+            }
+            NumericUpdateNode node;
+            node.kind = NumericUpdateNode::Kind::UnaryToInt;
+            node.type = ExprType::Int;
+            node.left = *child;
+            node.int_fn = kern;
+            nodes.push_back(node);
+            return static_cast<std::uint32_t>(nodes.size() - 1);
+        }
     }
 
     // pmin / pmax over numeric args: fold the (variadic) argument list into a
@@ -3417,6 +3512,29 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                 acc = static_cast<std::uint32_t>(nodes.size() - 1);
             }
             return acc;
+        }
+        // Unary double→double math (sqrt/log/exp/…, and abs/floor/ceil/trunc on
+        // a Double argument): compile the child, wrap in a UnaryDouble node.
+        if (call->args.size() == 1 && call->named_args.empty()) {
+            if (auto fn = lookup_unary_double_fn(call->callee)) {
+                auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes);
+                if (!child.has_value()) {
+                    return std::nullopt;
+                }
+                // abs/floor/ceil/trunc keep an Int argument Int — leave those to
+                // the generic path (this fast node always yields Double).
+                if (unary_fn_is_type_preserving(call->callee) &&
+                    nodes[*child].type != ExprType::Double) {
+                    return std::nullopt;
+                }
+                NumericUpdateNode node;
+                node.kind = NumericUpdateNode::Kind::UnaryDouble;
+                node.type = ExprType::Double;
+                node.left = *child;
+                node.dbl_fn = fn;
+                nodes.push_back(node);
+                return static_cast<std::uint32_t>(nodes.size() - 1);
+            }
         }
         return std::nullopt;  // other calls aren't fast-compilable here
     }
@@ -3453,6 +3571,9 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
     return static_cast<std::uint32_t>(nodes.size() - 1);
 }
 
+auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
+                                std::size_t row) -> double;
+
 auto eval_numeric_update_int(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
                              std::size_t row) -> std::int64_t {
     const auto& node = nodes[idx];
@@ -3476,8 +3597,11 @@ auto eval_numeric_update_int(const std::vector<NumericUpdateNode>& nodes, std::u
             const auto rhs = eval_numeric_update_int(nodes, node.right, row);
             return rhs > lhs ? rhs : lhs;
         }
+        case NumericUpdateNode::Kind::UnaryToInt:
+            return node.int_fn(eval_numeric_update_double(nodes, node.left, row));
         case NumericUpdateNode::Kind::DoubleColumn:
         case NumericUpdateNode::Kind::DoubleLiteral:
+        case NumericUpdateNode::Kind::UnaryDouble:
             invariant_violation("eval_numeric_update_int: unexpected double node");
     }
     invariant_violation("eval_numeric_update_int: unknown node kind");
@@ -3510,6 +3634,11 @@ auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std
             const auto rhs = eval_numeric_update_double(nodes, node.right, row);
             return rhs > lhs ? rhs : lhs;
         }
+        case NumericUpdateNode::Kind::UnaryDouble:
+            return node.dbl_fn(eval_numeric_update_double(nodes, node.left, row));
+        case NumericUpdateNode::Kind::UnaryToInt:
+            return static_cast<double>(
+                node.int_fn(eval_numeric_update_double(nodes, node.left, row)));
     }
     invariant_violation("eval_numeric_update_double: unknown node kind");
 }
@@ -3581,6 +3710,85 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size
     return std::nullopt;
 }
 
+// SIMD fast path for the hot unary-over-column shapes: the auto-vectorisable
+// double→double ops (sqrt/abs/floor/ceil/trunc) directly over a Double column,
+// and round(col, mode) → Int. Dispatching on the op outside the loop keeps each
+// body a direct, inlinable kernel the compiler turns into vsqrtpd/vandpd/
+// vroundpd. The transcendentals (log/exp/trig) are deliberately excluded — they
+// hit scalar libm regardless, so the generic tree-walk already matches this.
+// A computed argument (e.g. sqrt(price*2)) resolves to no raw pointer and falls
+// through to that tree-walk.
+auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t rows,
+                           ExprType output_kind, const ScalarRegistry* scalars)
+    -> std::optional<ColumnValue> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+
+    if (call->callee == "round" && call->args.size() == 2 && output_kind == ExprType::Int) {
+        const auto* moderef = std::get_if<ir::ColumnRef>(&call->args[1]->node);
+        auto arg = resolve_fast_operand(*call->args[0], input, scalars);
+        if (moderef == nullptr || !arg || !arg->is_column || arg->kind != ExprType::Double) {
+            return std::nullopt;
+        }
+        const double* src = std::get<Column<double>>(*arg->column).data();
+        Column<std::int64_t> out;
+        out.resize_for_overwrite(rows);
+        std::int64_t* dst = out.data();
+        auto run = [&](auto k) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = k(src[i]);
+        };
+        const auto& m = moderef->name;
+        if (m == "nearest") {
+            run([](double v) { return static_cast<std::int64_t>(std::llround(v)); });
+        } else if (m == "bankers") {
+            run([](double v) { return static_cast<std::int64_t>(std::llrint(v)); });
+        } else if (m == "floor") {
+            run([](double v) { return static_cast<std::int64_t>(std::floor(v)); });
+        } else if (m == "ceil") {
+            run([](double v) { return static_cast<std::int64_t>(std::ceil(v)); });
+        } else if (m == "trunc") {
+            run([](double v) { return static_cast<std::int64_t>(std::trunc(v)); });
+        } else {
+            return std::nullopt;
+        }
+        return ColumnValue{std::move(out)};
+    }
+
+    if (call->args.size() == 1 && output_kind == ExprType::Double) {
+        auto arg = resolve_fast_operand(*call->args[0], input, scalars);
+        if (!arg || !arg->is_column || arg->kind != ExprType::Double) {
+            return std::nullopt;
+        }
+        const double* src = std::get<Column<double>>(*arg->column).data();
+        Column<double> out;
+        out.resize_for_overwrite(rows);
+        double* dst = out.data();
+        auto run = [&](auto k) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = k(src[i]);
+        };
+        const auto& f = call->callee;
+        if (f == "sqrt") {
+            run([](double x) { return std::sqrt(x); });
+        } else if (f == "abs") {
+            run([](double x) { return std::fabs(x); });
+        } else if (f == "floor") {
+            run([](double x) { return std::floor(x); });
+        } else if (f == "ceil") {
+            run([](double x) { return std::ceil(x); });
+        } else if (f == "trunc") {
+            run([](double x) { return std::trunc(x); });
+        } else {
+            return std::nullopt;  // transcendentals: tree-walk (libm-bound anyway)
+        }
+        return ColumnValue{std::move(out)};
+    }
+    return std::nullopt;
+}
+
 auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
                                   ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
@@ -3589,6 +3797,10 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std:
         return fast;
     }
     if (auto fast = try_fast_update_pminmax(expr, input, rows, output_kind, scalars);
+        fast.has_value()) {
+        return fast;
+    }
+    if (auto fast = try_fast_update_unary(expr, input, rows, output_kind, scalars);
         fast.has_value()) {
         return fast;
     }

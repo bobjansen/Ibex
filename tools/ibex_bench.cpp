@@ -1935,7 +1935,7 @@ int main(int argc, char** argv) {
         "all",      "core",         "cumulative", "sort",      "window",         "groupagg",
         "pipeline", "join",         "rng",        "fill",      "null",           "filter",
         "multi",    "events",       "reshape",    "timeframe", "merge_validity", "rng_micro",
-        "bool",     "filter_micro", "transform",  "stats"};
+        "bool",     "filter_micro", "transform",  "stats",     "scalar"};
     for (const auto& token : suites) {
         auto normalized = normalize_suite_name(token);
         if (!allowed_suites.contains(normalized)) {
@@ -2228,6 +2228,34 @@ int main(int argc, char** argv) {
                 {"rbind_two", "rbind(prices, prices)"},
             };
             for (const auto& query : transform_queries) {
+                ScanPaths sp;
+                if (include_read) {
+                    sp.emplace_back("prices", csv_path);
+                }
+                status = run_benchmark(query, tables, warmup_iters, iters, saved_include_parse, sp);
+                if (status != 0) {
+                    break;
+                }
+            }
+        }
+
+        // Scalar row-wise builtins: each maps one input cell to one output cell.
+        // These exercise the per-row scalar-function path (abs/sqrt/log/exp/
+        // round/floor/ceil/casts/is_nan) — the throughput floor for elementwise
+        // math kernels, comparable to update_price_x2's arithmetic fast path.
+        if (status == 0 && run_suite("scalar")) {
+            fmt::print("\n-- Scalar builtin benchmarks ({} prices rows) --\n",
+                       tables.at("prices").rows());
+            std::vector<BenchQuery> scalar_queries = {
+                {"abs_price", "prices[update { v = abs(price) }]"},
+                {"sqrt_price", "prices[update { v = sqrt(price) }]"},
+                {"log_price", "prices[update { v = log(price) }]"},
+                {"exp_price", "prices[update { v = exp(price / 1000.0) }]"},
+                {"round_price", "prices[update { v = round(price, nearest) }]"},
+                {"floor_price", "prices[update { v = floor(price) }]"},
+                {"ceil_price", "prices[update { v = ceil(price) }]"},
+            };
+            for (const auto& query : scalar_queries) {
                 ScanPaths sp;
                 if (include_read) {
                     sp.emplace_back("prices", csv_path);

@@ -5739,6 +5739,54 @@ TEST_CASE("grouped update broadcasts aggregate values per group", "[update]") {
     REQUIRE((*centered_col)[2] == 0.0);
 }
 
+TEST_CASE("update scalar math builtins vectorise (sqrt/abs/floor/ceil/round)", "[update][scalar]") {
+    // These row-wise math builtins must take the compiled numeric fast path
+    // (SIMD for column args, tree-walk for computed args), not the per-row
+    // scalar registry. Checks values, type, round modes, and the computed-arg
+    // fallback.
+    runtime::TableRegistry registry;
+    runtime::Table t;
+    t.add_column("x", Column<double>{2.4, -2.5, 3.5, 9.0});
+    registry["t"] = std::move(t);
+
+    auto ir = require_ir(
+        "t[update { sq = sqrt(abs(x)), fl = floor(x), ce = ceil(x), ab = abs(x), "
+        "rn = round(x, nearest), rb = round(x, bankers), comp = sqrt(x * x) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* ab = std::get_if<Column<double>>(result->find("ab"));
+    REQUIRE(ab != nullptr);
+    REQUIRE((*ab)[1] == Catch::Approx(2.5));
+
+    const auto* fl = std::get_if<Column<double>>(result->find("fl"));
+    REQUIRE((*fl)[0] == Catch::Approx(2.0));
+    REQUIRE((*fl)[1] == Catch::Approx(-3.0));
+
+    const auto* ce = std::get_if<Column<double>>(result->find("ce"));
+    REQUIRE((*ce)[0] == Catch::Approx(3.0));
+    REQUIRE((*ce)[1] == Catch::Approx(-2.0));
+
+    const auto* sq = std::get_if<Column<double>>(result->find("sq"));
+    REQUIRE((*sq)[2] == Catch::Approx(std::sqrt(3.5)));
+
+    // round(x, mode) yields Int64; nearest rounds half away, bankers ties-to-even.
+    const auto* rn = std::get_if<Column<std::int64_t>>(result->find("rn"));
+    REQUIRE(rn != nullptr);
+    REQUIRE((*rn)[1] == -3);  // round(-2.5, nearest)
+    REQUIRE((*rn)[2] == 4);   // round(3.5, nearest)
+    const auto* rb = std::get_if<Column<std::int64_t>>(result->find("rb"));
+    REQUIRE(rb != nullptr);
+    REQUIRE((*rb)[1] == -2);  // round(-2.5, bankers) -> ties to even
+    REQUIRE((*rb)[2] == 4);   // round(3.5, bankers)  -> ties to even
+
+    // Computed argument exercises the tree-walk UnaryDouble path.
+    const auto* comp = std::get_if<Column<double>>(result->find("comp"));
+    REQUIRE(comp != nullptr);
+    REQUIRE((*comp)[0] == Catch::Approx(2.4));  // sqrt(2.4^2)
+    REQUIRE((*comp)[3] == Catch::Approx(9.0));
+}
+
 TEST_CASE("grouped update mixes a per-row column with an inline aggregate", "[update]") {
     // The single-expression demean `price - mean(price)` (the aggregate inlined
     // rather than split into a prior field) must evaluate per row within each

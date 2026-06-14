@@ -292,6 +292,15 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         "SELECT *, toInt32(rand() / 4294967295.0 < 0.3) AS r FROM prices",
     )
 
+    # Scalar row-wise math builtins.
+    run("abs_price", "SELECT *, abs(price) AS v FROM prices")
+    run("sqrt_price", "SELECT *, sqrt(price) AS v FROM prices")
+    run("log_price", "SELECT *, log(price) AS v FROM prices")
+    run("exp_price", "SELECT *, exp(price / 1000.0) AS v FROM prices")
+    run("round_price", "SELECT *, toInt64(round(price)) AS v FROM prices")
+    run("floor_price", "SELECT *, floor(price) AS v FROM prices")
+    run("ceil_price", "SELECT *, ceil(price) AS v FROM prices")
+
     if csv_multi_path:
         print("clickhouse: loading multi...", file=sys.stderr, flush=True)
         sess.query(

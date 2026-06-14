@@ -5763,6 +5763,51 @@ TEST_CASE("grouped update mixes a per-row column with an inline aggregate", "[up
     REQUIRE((*d)[4] == Catch::Approx(5.0));
 }
 
+TEST_CASE("update pmin/pmax vectorise (clip, nested, col-col, int)", "[update][pmin]") {
+    // pmin/pmax must take the compiled numeric fast path, not the per-row scalar
+    // registry. Covers the SIMD 2-arg clip, nested pmin(pmax(...)), column×column,
+    // and the integer case (which stays Int).
+    runtime::TableRegistry registry;
+    runtime::Table t;
+    t.add_column("x", Column<double>{1.0, 600.0, 500.0, 250.0});
+    t.add_column("y", Column<double>{10.0, 20.0, 5.0, 999.0});
+    t.add_column("i", Column<std::int64_t>{1, 600, 50, 250});
+    registry["t"] = std::move(t);
+
+    auto ir = require_ir(
+        "t[update { clip = pmin(x, 500.0), lo = pmax(x, 300.0), "
+        "both = pmin(pmax(x, -3.0), 550.0), cc = pmin(x, y), mi = pmin(i, 100) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* clip = std::get_if<Column<double>>(result->find("clip"));
+    REQUIRE(clip != nullptr);
+    REQUIRE((*clip)[0] == Catch::Approx(1.0));
+    REQUIRE((*clip)[1] == Catch::Approx(500.0));
+    REQUIRE((*clip)[3] == Catch::Approx(250.0));
+
+    const auto* lo = std::get_if<Column<double>>(result->find("lo"));
+    REQUIRE(lo != nullptr);
+    REQUIRE((*lo)[0] == Catch::Approx(300.0));
+    REQUIRE((*lo)[1] == Catch::Approx(600.0));
+
+    const auto* both = std::get_if<Column<double>>(result->find("both"));
+    REQUIRE(both != nullptr);
+    REQUIRE((*both)[1] == Catch::Approx(550.0));  // pmin(pmax(600,-3),550)
+    REQUIRE((*both)[2] == Catch::Approx(500.0));
+
+    const auto* cc = std::get_if<Column<double>>(result->find("cc"));
+    REQUIRE(cc != nullptr);
+    REQUIRE((*cc)[1] == Catch::Approx(20.0));  // min(600, 20)
+    REQUIRE((*cc)[3] == Catch::Approx(250.0));
+
+    // Integer pmin stays Int (no widening to Double).
+    const auto* mi = std::get_if<Column<std::int64_t>>(result->find("mi"));
+    REQUIRE(mi != nullptr);
+    REQUIRE((*mi)[1] == 100);
+    REQUIRE((*mi)[2] == 50);
+}
+
 TEST_CASE("grouped update inline z-score divides per-row deviation by group std", "[update]") {
     // Two aggregates in one expression combined with a per-row column:
     // `(price - mean(price)) / std(price)`. Each group's z-scores have mean 0.

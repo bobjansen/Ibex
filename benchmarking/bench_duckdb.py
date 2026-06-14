@@ -583,6 +583,34 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
         ).fetchnumpy(),
     )
 
+    # Typed-pivot variants: integer pivot key, and a categorical (ENUM) key.
+    # Same value matrix as dcast_long_to_wide; measures pivot cost by key dtype.
+    con.execute(
+        "CREATE OR REPLACE TABLE long_int AS SELECT symbol, day, value, "
+        "CASE variable WHEN 'open' THEN 0 WHEN 'high' THEN 1 WHEN 'low' THEN 2 "
+        "ELSE 3 END AS pivot_id FROM long_tbl"
+    )
+    run(
+        "dcast_long_to_wide_int_pivot",
+        lambda: con.sql(
+            "PIVOT long_int ON pivot_id USING FIRST(value) GROUP BY symbol, day"
+        ).fetchnumpy(),
+    )
+
+    con.execute("DROP TABLE IF EXISTS long_cat")
+    con.execute("DROP TYPE IF EXISTS measure")
+    con.execute("CREATE TYPE measure AS ENUM ('open', 'high', 'low', 'close')")
+    con.execute(
+        "CREATE TABLE long_cat AS SELECT symbol, day, value, "
+        "variable::measure AS pivot_cat FROM long_tbl"
+    )
+    run(
+        "dcast_long_to_wide_cat_pivot",
+        lambda: con.sql(
+            "PIVOT long_cat ON pivot_cat USING FIRST(value) GROUP BY symbol, day"
+        ).fetchnumpy(),
+    )
+
     return rows
 
 

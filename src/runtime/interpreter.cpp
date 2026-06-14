@@ -3344,6 +3344,8 @@ struct NumericUpdateNode {
         IntLiteral,
         DoubleLiteral,
         Op,
+        Min,  ///< pmin(left, right) — element-wise minimum
+        Max,  ///< pmax(left, right) — element-wise maximum
     };
 
     Kind kind = Kind::IntLiteral;
@@ -3384,6 +3386,39 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                         : ExprType::Int;
         nodes.push_back(node);
         return static_cast<std::uint32_t>(nodes.size() - 1);
+    }
+
+    // pmin / pmax over numeric args: fold the (variadic) argument list into a
+    // left-associative chain of Min/Max nodes so the elementwise clip lands on
+    // this no-variant fast path instead of the per-row scalar-registry loop.
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        const bool is_min = call->callee == "pmin";
+        const bool is_max = call->callee == "pmax";
+        if ((is_min || is_max) && call->args.size() >= 2 && call->named_args.empty()) {
+            std::optional<std::uint32_t> acc;
+            for (const auto& arg : call->args) {
+                auto a = try_compile_numeric_update_expr(*arg, input, scalars, nodes);
+                if (!a.has_value()) {
+                    return std::nullopt;  // non-numeric arg (string/date/…): slow path
+                }
+                if (!acc.has_value()) {
+                    acc = a;
+                    continue;
+                }
+                NumericUpdateNode node;
+                node.kind = is_min ? NumericUpdateNode::Kind::Min : NumericUpdateNode::Kind::Max;
+                node.left = *acc;
+                node.right = *a;
+                node.type =
+                    (nodes[*acc].type == ExprType::Double || nodes[*a].type == ExprType::Double)
+                        ? ExprType::Double
+                        : ExprType::Int;
+                nodes.push_back(node);
+                acc = static_cast<std::uint32_t>(nodes.size() - 1);
+            }
+            return acc;
+        }
+        return std::nullopt;  // other calls aren't fast-compilable here
     }
 
     auto operand = resolve_fast_operand(expr, input, scalars);
@@ -3431,6 +3466,16 @@ auto eval_numeric_update_int(const std::vector<NumericUpdateNode>& nodes, std::u
             const auto rhs = eval_numeric_update_int(nodes, node.right, row);
             return apply_int_op(node.op, lhs, rhs);
         }
+        case NumericUpdateNode::Kind::Min: {
+            const auto lhs = eval_numeric_update_int(nodes, node.left, row);
+            const auto rhs = eval_numeric_update_int(nodes, node.right, row);
+            return rhs < lhs ? rhs : lhs;
+        }
+        case NumericUpdateNode::Kind::Max: {
+            const auto lhs = eval_numeric_update_int(nodes, node.left, row);
+            const auto rhs = eval_numeric_update_int(nodes, node.right, row);
+            return rhs > lhs ? rhs : lhs;
+        }
         case NumericUpdateNode::Kind::DoubleColumn:
         case NumericUpdateNode::Kind::DoubleLiteral:
             invariant_violation("eval_numeric_update_int: unexpected double node");
@@ -3455,14 +3500,95 @@ auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std
             const auto rhs = eval_numeric_update_double(nodes, node.right, row);
             return apply_double_op(node.op, lhs, rhs);
         }
+        case NumericUpdateNode::Kind::Min: {
+            const auto lhs = eval_numeric_update_double(nodes, node.left, row);
+            const auto rhs = eval_numeric_update_double(nodes, node.right, row);
+            return rhs < lhs ? rhs : lhs;  // NaN-parity with the scalar pmin
+        }
+        case NumericUpdateNode::Kind::Max: {
+            const auto lhs = eval_numeric_update_double(nodes, node.left, row);
+            const auto rhs = eval_numeric_update_double(nodes, node.right, row);
+            return rhs > lhs ? rhs : lhs;
+        }
     }
     invariant_violation("eval_numeric_update_double: unknown node kind");
+}
+
+// SIMD fast path for the hot 2-argument `pmin`/`pmax` shape (e.g. the
+// winsorising clip `pmin(price, 500.0)`), mirroring try_fast_update_binary's
+// branch-free array kernels. Only fires when both operands resolve to a raw
+// pointer/scalar of the *same* numeric category (both Double or both Int) — a
+// mixed int/double clip or a nested pmin(pmax(...)) falls through to the generic
+// NumericUpdateNode tree-walk. The compare order (`b < a ? b : a`) matches the
+// scalar pmin builtin for NaN/tie parity.
+auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size_t rows,
+                             ExprType output_kind, const ScalarRegistry* scalars)
+    -> std::optional<ColumnValue> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr) {
+        return std::nullopt;
+    }
+    const bool is_min = call->callee == "pmin";
+    const bool is_max = call->callee == "pmax";
+    if ((!is_min && !is_max) || call->args.size() != 2 || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    auto left = resolve_fast_operand(*call->args[0], input, scalars);
+    auto right = resolve_fast_operand(*call->args[1], input, scalars);
+    if (!left || !right || left->kind != output_kind || right->kind != output_kind) {
+        return std::nullopt;  // mixed int/double or non-numeric: generic path
+    }
+
+    auto run = [&](auto* dst, auto lp, auto ls, auto rp, auto rs) {
+        using V = std::decay_t<decltype(ls)>;
+        auto pick = [is_min](V a, V b) -> V {
+            return is_min ? (b < a ? b : a) : (b > a ? b : a);
+        };
+        if (lp && rp) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = pick(lp[i], rp[i]);
+        } else if (lp) {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = pick(lp[i], rs);
+        } else {
+            for (std::size_t i = 0; i < rows; ++i)
+                dst[i] = pick(ls, rp[i]);
+        }
+    };
+
+    if (output_kind == ExprType::Double) {
+        const double* lp =
+            left->is_column ? std::get<Column<double>>(*left->column).data() : nullptr;
+        const double* rp =
+            right->is_column ? std::get<Column<double>>(*right->column).data() : nullptr;
+        Column<double> out;
+        out.resize_for_overwrite(rows);
+        run(out.data(), lp, left->is_column ? 0.0 : get_double_value(*left, 0), rp,
+            right->is_column ? 0.0 : get_double_value(*right, 0));
+        return ColumnValue{std::move(out)};
+    }
+    if (output_kind == ExprType::Int) {
+        const std::int64_t* lp =
+            left->is_column ? std::get<Column<std::int64_t>>(*left->column).data() : nullptr;
+        const std::int64_t* rp =
+            right->is_column ? std::get<Column<std::int64_t>>(*right->column).data() : nullptr;
+        Column<std::int64_t> out;
+        out.resize_for_overwrite(rows);
+        run(out.data(), lp, left->is_column ? std::int64_t{0} : get_int_value(*left, 0), rp,
+            right->is_column ? std::int64_t{0} : get_int_value(*right, 0));
+        return ColumnValue{std::move(out)};
+    }
+    return std::nullopt;
 }
 
 auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
                                   ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
     if (auto fast = try_fast_update_binary(expr, input, rows, output_kind, scalars);
+        fast.has_value()) {
+        return fast;
+    }
+    if (auto fast = try_fast_update_pminmax(expr, input, rows, output_kind, scalars);
         fast.has_value()) {
         return fast;
     }

@@ -155,6 +155,21 @@ polars-st. Genuine grouped-aggregation gap, moderate.
 - `tf_rolling_median_1m` 0.50×, rolling_sum/mean ~0.70×, rolling_std 0.86×.
 - `rand_bernoulli` 0.30×, `rand_normal` 0.57×, cumprod, count_by_symbol_day,
   cross_join.
+- Scalar math builtins (`update {v = f(col)}`): abs/sqrt/log/exp/round/floor/ceil
+  and now the full transcendental set (sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/
+  log2/log10) all on the libmvec AVX2 path. At 4M `sin` 3.4 vs polars 7.3, `cos`
+  3.9 vs 8.1 — ibex faster. The update fast path (`try_fast_update_numeric_expr`)
+  is shared by plain update, windowed update, and select-of-expression.
+
+## P4 — `tanh`: the one sub-parity scalar cell
+
+At 4M ibex `tanh` is **9.7 vs polars 6.3 ms (~1.5×)** — the only scalar-math op
+where ibex trails polars after the transcendental SIMD work. It already uses
+libmvec `_ZGVdN4v_tanh`; polars is faster because its kernel is a cheaper
+rational/poly approximation. An `1 - 2/(1+exp(2x))` form over the fast SIMD `exp`
+kernel would likely beat polars but is *less* accurate than `std::tanh` (the
+codebase distinguishes Approx from exact). Deferred pending a decision on whether
+a benchmarked op may trade accuracy for speed. Low priority (single cell, 1.5×).
 
 ---
 

@@ -868,28 +868,44 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                    ", but asof requires Timestamp, Date, or Int";
         };
 
-        std::vector<std::int64_t> left_times;
-        left_times.reserve(n_left);
-        for (std::size_t l = 0; l < n_left; ++l) {
-            auto v = time_value(*left_time_col, l);
-            if (!v.has_value()) {
-                return std::unexpected(wrong_type_error("left", *left_time_col));
+        // The two-pointer merge only needs the time keys as int64. Timestamp is
+        // layout-compatible with int64_t (a single `nanos` member), so for the
+        // common Timestamp case read the column storage directly and skip
+        // materialising two int64 arrays — the right one spans the whole right
+        // table (128 MB at 16M rows). Date/Int convert into a backing buffer.
+        std::vector<std::int64_t> left_times_buf;
+        std::vector<std::int64_t> right_times_buf;
+        auto as_int64_view =
+            [&](const ColumnValue& col, std::size_t n, std::vector<std::int64_t>& buf,
+                const char* label) -> std::expected<const std::int64_t*, std::string> {
+            if (const auto* ts = std::get_if<Column<Timestamp>>(&col)) {
+                static_assert(sizeof(Timestamp) == sizeof(std::int64_t));
+                return reinterpret_cast<const std::int64_t*>(ts->data());
             }
-            left_times.push_back(*v);
-        }
-
-        std::vector<std::int64_t> right_times;
-        right_times.reserve(n_right);
-        for (std::size_t r = 0; r < n_right; ++r) {
-            auto v = time_value(*right_time_col, r);
-            if (!v.has_value()) {
-                return std::unexpected(wrong_type_error("right", *right_time_col));
+            buf.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                auto v = time_value(col, i);
+                if (!v.has_value()) {
+                    return std::unexpected(wrong_type_error(label, col));
+                }
+                buf.push_back(*v);
             }
-            right_times.push_back(*v);
-        }
+            return buf.data();
+        };
 
-        const bool left_sorted = std::is_sorted(left_times.begin(), left_times.end());
-        const bool right_sorted = std::is_sorted(right_times.begin(), right_times.end());
+        auto left_times_v = as_int64_view(*left_time_col, n_left, left_times_buf, "left");
+        if (!left_times_v) {
+            return std::unexpected(left_times_v.error());
+        }
+        auto right_times_v = as_int64_view(*right_time_col, n_right, right_times_buf, "right");
+        if (!right_times_v) {
+            return std::unexpected(right_times_v.error());
+        }
+        const std::int64_t* left_times = *left_times_v;
+        const std::int64_t* right_times = *right_times_v;
+
+        const bool left_sorted = std::is_sorted(left_times, left_times + n_left);
+        const bool right_sorted = std::is_sorted(right_times, right_times + n_right);
         if (!left_sorted || !right_sorted) {
             const char* which = (!left_sorted && !right_sorted)
                                     ? "both sides are"
@@ -914,7 +930,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             right_eq_keys.push_back(right_keys[i]);
         }
 
-        std::vector<std::size_t> left_idx(n_left);
+        // Asof keeps every left row exactly once in input order, so the left
+        // side is the identity permutation — only the matched right row per left
+        // row varies. We therefore build just right_idx and materialise the left
+        // columns wholesale (no identity gather, no n_left index array).
         std::vector<std::size_t> right_idx(n_left);
         bool grouped_done = false;
 
@@ -927,7 +946,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             // the entire right table and dominates the cost for large rights.
             std::size_t pos = 0;  // # right rows with time <= current left time
             for (std::size_t l = 0; l < n_left; ++l) {
-                left_idx[l] = l;
                 while (pos < n_right && right_times[pos] <= left_times[l]) {
                     ++pos;
                 }
@@ -968,7 +986,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                         }
                         std::vector<std::size_t> cursor(buckets.size(), 0);
                         for (std::size_t l = 0; l < n_left; ++l) {
-                            left_idx[l] = l;
                             auto it = dict.find(lc[l]);
                             if (it == dict.end()) {
                                 right_idx[l] = kNull;
@@ -1003,8 +1020,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             right_pos.reserve(right_groups.size());
 
             for (std::size_t l = 0; l < n_left; ++l) {
-                left_idx[l] = l;
-
                 Key group;
                 group.values.reserve(left_eq_keys.size());
                 for (const auto* col : left_eq_keys) {
@@ -1029,8 +1044,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
 
-        static const std::vector<std::size_t> empty_key_idx;
-        materialize(left_idx, right_idx, empty_key_idx);
+        materialize_left_identity(right_idx);
         output.time_index = left.time_index;
         return output;
     }

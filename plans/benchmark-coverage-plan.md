@@ -216,7 +216,7 @@ so ibex results are verifiable.
 2. ~~`rand_normal/int/bernoulli` + `cumprod_price` for DuckDB/DataFusion/ClickHouse~~ **DONE** (2026-06-14, commit f7b1b29)
 3. ~~**Pipeline suite Tier 1**: `update_group_filter`, `group_rank_filter`, `normalize_by_group`~~ **DONE** (2026-06-13, commit eba837d; surfaced + fixed the update+by mixed per-row/aggregate gap)
 4. ~~**Pipeline suite Tier 2**: `join_update_group`, `join_filter_rank`~~ **DONE** (2026-06-14). Added `events.symbol` + `users.user_segment`/`user_tier_multiplier` to gen_data.py (regenerate with `--force`); join is parenthesised as the pipeline base in ibex. Mirrored across all harnesses (SQL via CTE). 756 / 1260 rows, consistent cross-engine. Existing inner_join_user/events verifications still pass with the wider schema.
-5. **Pipeline suite Tier 3**: ~~`symbol_day_to_symbol`~~ **DONE** (2026-06-14, commit f7b1b29). `log_return_momentum` — BLOCKED: needs a timestamped prices table (rolling_mean is time-windowed); prices.csv has no ts column.
+5. **Pipeline suite Tier 3**: ~~`symbol_day_to_symbol`~~ **DONE** (2026-06-14, commit f7b1b29). ~~`log_return_momentum`~~ **DONE** (2026-06-15, commit e14edd0). Added `prices_ts.csv` (symbol, ts:int64-ns, price) to gen_data.py — purely additive, prices.csv baseline untouched; `as_timeframe` promotes the Int ts → Timestamp so no schema hint/plugin needed. ibex_bench auto-derives the path beside `--csv`. Mirrored with identical semantics across all 7 engines; cross-checked byte-identical per-symbol output. Two gotchas: the syntax is `[window 5m, update { mom = rolling_mean(lr) }]` (duration in a `window` clause, not a fn arg); and the first return per symbol is null (lag→null), which **poisons the time-windowed rolling_mean → inf** (known grouped-rolling/null gap), so the query `coalesce(..., 0.0)`s it. ibex @16M: 2.74 s — grouped time-windowed rolling is a future perf target.
 6. ~~`where_update_clip` + `pmin_clip` (scalar feature showcase)~~ **DONE** (2026-06-13, commit eba837d)
 7. ~~`rbind_two` (recently shipped, zero coverage)~~ **DONE** (2026-06-13, commit eba837d)
 8. ~~`corr_price_vol` (CorrNode gap)~~ **DONE** (2026-06-13, commit eba837d)
@@ -228,5 +228,4 @@ so ibex results are verifiable.
     ClickHouse, data.table, dplyr). Paired with vectorising every kernel via
     libmvec AVX2 — see [[benchmark-perf-priorities]] P4 for the lone `tanh` gap.
 
-Remaining: #5 `log_return_momentum` (needs timestamped table), #9 ClickHouse
-EWMA, #10 DataFusion fill/asof.
+Remaining: #9 ClickHouse EWMA, #10 DataFusion fill/asof.

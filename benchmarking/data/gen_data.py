@@ -4,6 +4,8 @@
 Outputs (written to the directory of this script by default):
   prices.csv       — symbol (str), price (f64)                    — N rows
   prices_multi.csv — symbol (str), price (f64), day (str)         — N rows
+  prices_ts.csv    — symbol (str), ts (int64 ns), price (f64)     — N rows
+                     (time-windowed pipeline: log_return_momentum)
   trades.csv       — symbol (str), price (f64), qty (int64)       — N rows
   events.csv       — user_id (str), amount (f64), quantity (int64),
                      symbol (str)                                  — N rows
@@ -87,6 +89,31 @@ def generate(out_dir: pathlib.Path, n: int = N, force: bool = False) -> None:
         mb = pm.stat().st_size / 1024 / 1024
         print(f"  wrote {pm}  ({n:,} rows, {mb:.0f} MB, {time.perf_counter()-t0:.1f}s)")
 
+
+    # ── prices_ts.csv ────────────────────────────────────────────────────────
+    # Timestamped prices for the time-windowed pipeline benchmark
+    # (log_return_momentum): symbol (str), ts (int64 ns), price (f64). read_csv
+    # loads ts as int64; as_timeframe promotes Int → Timestamp (ns). ts is a
+    # globally monotonic sequence so as_timeframe hits its pre-sorted fast path,
+    # and since symbols are random each symbol's rows stay time-ordered within
+    # the global order. 100 ms row spacing gives ~N/N_SYMBOLS rows per symbol
+    # and ~12 rows per symbol inside a 5-minute window (300 s / 0.1 s / 252).
+    pt = out_dir / "prices_ts.csv"
+    if pt.exists() and not force:
+        print(f"  {pt} already exists, skipping")
+    else:
+        if pt.exists() and force:
+            pt.unlink()
+        rng7   = np.random.default_rng(SEED + 6)
+        sym7   = tickers[rng7.integers(0, N_SYMBOLS, size=n)]
+        price7 = np.round(rng7.uniform(1.0, 1000.0, size=n), 4)
+        base   = 1_704_067_200_000_000_000  # 2024-01-01T00:00:00Z, nanoseconds
+        step   = 100_000_000                # 100 ms in nanoseconds
+        ts     = base + np.arange(n, dtype=np.int64) * step
+        t0 = time.perf_counter()
+        pd.DataFrame({"symbol": sym7, "ts": ts, "price": price7}).to_csv(pt, index=False)
+        mb = pt.stat().st_size / 1024 / 1024
+        print(f"  wrote {pt}  ({n:,} rows, {mb:.0f} MB, {time.perf_counter()-t0:.1f}s)")
 
     # ── trades.csv ───────────────────────────────────────────────────────────
     tr = out_dir / "trades.csv"

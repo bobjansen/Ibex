@@ -81,6 +81,14 @@ def _materialize(sess, sql):
 def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, sess):
     print("clickhouse: loading...", file=sys.stderr, flush=True)
     sess.query(f"CREATE OR REPLACE TABLE prices ENGINE = Memory AS SELECT * FROM file('{csv_path}', CSVWithNames)")
+    pts_path = None
+    _p = pathlib.Path(csv_path)
+    if _p.name == "prices.csv" and _p.with_name("prices_ts.csv").exists():
+        pts_path = str(_p.with_name("prices_ts.csv"))
+        sess.query(
+            f"CREATE OR REPLACE TABLE prices_ts ENGINE = Memory "
+            f"AS SELECT * FROM file('{pts_path}', CSVWithNames)"
+        )
     rows = []
 
     def run(name, sql):
@@ -263,6 +271,25 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         "/ stddevSamp(price) OVER (PARTITION BY symbol) AS z FROM prices"
         ")) GROUP BY symbol",
     )
+
+    # Tier 3 funnel on the timestamped table: log returns → 5-minute time-windowed
+    # momentum → Sharpe-like ratio per symbol. ts has a stable order key (unlike
+    # update_group_filter above), so lagInFrame works. ClickHouse RANGE offsets
+    # must fit in 32 bits, so the window orders by microseconds (intDiv(ts,1000))
+    # with a 300000000 µs = 5-minute frame (inclusive both ends — matches ibex);
+    # the 100 ms row spacing keeps µs values tie-free. stddevSamp = ddof=1.
+    if pts_path is not None:
+        run(
+            "log_return_momentum",
+            "SELECT symbol, avg(mom) AS mean_mom, stddevSamp(mom) AS std_mom, "
+            "avg(mom) / stddevSamp(mom) AS sharpe FROM ("
+            "SELECT symbol, avg(lr) OVER (PARTITION BY symbol ORDER BY tus "
+            "RANGE BETWEEN 300000000 PRECEDING AND CURRENT ROW) AS mom FROM ("
+            "SELECT symbol, intDiv(ts, 1000) AS tus, "
+            "coalesce(log(price / lagInFrame(price, 1) OVER ("
+            "PARTITION BY symbol ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)), 0.0) AS lr "
+            "FROM prices_ts)) GROUP BY symbol",
+        )
 
     # Transforms / single-pass language features.
     run("pmin_clip", "SELECT *, least(price, 500.0) AS clipped FROM prices")

@@ -77,6 +77,11 @@ def _register_arrow(ctx, name, csv_path):
 def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, ctx):
     print("datafusion: loading...", file=sys.stderr, flush=True)
     _register_arrow(ctx, "prices", csv_path)
+    pts_path = None
+    _p = pathlib.Path(csv_path)
+    if _p.name == "prices.csv" and _p.with_name("prices_ts.csv").exists():
+        pts_path = str(_p.with_name("prices_ts.csv"))
+        _register_arrow(ctx, "prices_ts", pts_path)
     rows = []
 
     def run(name, fn):
@@ -297,6 +302,24 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
             "FROM clipped GROUP BY symbol"
         ).collect(),
     )
+
+    # Tier 3 funnel on the timestamped table: log returns → 5-minute time-windowed
+    # momentum → Sharpe-like ratio per symbol. ts is int64 ns, so the 5-minute
+    # window is RANGE 300000000000 PRECEDING (inclusive both ends — matches ibex);
+    # first return coalesced to 0; stddev_samp = ddof=1.
+    if pts_path is not None:
+        run(
+            "log_return_momentum",
+            lambda: ctx.sql(
+                "WITH base AS (SELECT symbol, ts, "
+                "COALESCE(LN(price / LAG(price, 1) OVER ("
+                "PARTITION BY symbol ORDER BY ts)), 0.0) AS lr FROM prices_ts), "
+                "mom AS (SELECT symbol, AVG(lr) OVER (PARTITION BY symbol ORDER BY ts "
+                "RANGE BETWEEN 300000000000 PRECEDING AND CURRENT ROW) AS mom FROM base) "
+                "SELECT symbol, AVG(mom) AS mean_mom, stddev_samp(mom) AS std_mom, "
+                "AVG(mom) / stddev_samp(mom) AS sharpe FROM mom GROUP BY symbol"
+            ).collect(),
+        )
 
     # Transforms / single-pass language features.
     run(

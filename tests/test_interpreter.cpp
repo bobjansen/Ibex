@@ -2118,6 +2118,144 @@ TEST_CASE("rolling_mean with 1ns window") {
     REQUIRE((*m)[2] == Catch::Approx(25.0));
 }
 
+TEST_CASE("rolling_mean skips NULL elements; their payload is never read", "[rolling][null]") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10), ts_from_nanos(20),
+                                             ts_from_nanos(30)});
+    // val[1] is NULL — its payload (a poison value) must be ignored, not summed.
+    table.add_column("val", Column<double>{10.0, 1e300, 30.0, 40.0},
+                     runtime::ValidityBitmap{true, false, true, true});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1000ns, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    CHECK((*m)[0] == Catch::Approx(10.0));        // {10}
+    CHECK((*m)[1] == Catch::Approx(10.0));        // {10, NULL} -> {10}
+    CHECK((*m)[2] == Catch::Approx(20.0));        // {10, 30}
+    CHECK((*m)[3] == Catch::Approx(80.0 / 3.0));  // {10, 30, 40}
+    // No window was entirely null, so the result carries no nulls.
+    CHECK_FALSE(result->find_entry("m")->validity.has_value());
+}
+
+TEST_CASE("rolling_mean: a window of only NULLs yields a NULL result", "[rolling][null]") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10)});
+    table.add_column("val", Column<double>{7.0, 20.0}, runtime::ValidityBitmap{false, true});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    // 1ns window: each row sees only itself.
+    auto ir = require_ir("data[window 1ns, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* entry = result->find_entry("m");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK(runtime::is_null(*entry, 0));        // window {NULL} -> NULL
+    CHECK_FALSE(runtime::is_null(*entry, 1));  // window {20} -> 20
+    CHECK((*std::get_if<Column<double>>(result->find("m")))[1] == Catch::Approx(20.0));
+}
+
+TEST_CASE("rolling_mean: a real NaN propagates within its window, then recovers on exit",
+          "[rolling][nan]") {
+    // val[1] is a genuine NaN (validity=true) — distinct from a NULL. It must
+    // poison only the windows it overlaps, then clear once it ages out (which the
+    // running-sum approach can only do by keeping NaNs out of the accumulator).
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10), ts_from_nanos(20),
+                                             ts_from_nanos(30)});
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    table.add_column("val", Column<double>{10.0, nan, 30.0, 40.0});  // all valid
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 15ns, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    CHECK((*m)[0] == Catch::Approx(10.0));  // {10}
+    CHECK(std::isnan((*m)[1]));             // {10, NaN}  -> NaN
+    CHECK(std::isnan((*m)[2]));             // {NaN, 30}  -> NaN
+    CHECK((*m)[3] == Catch::Approx(35.0));  // {30, 40}   -> NaN aged out, recovered
+    // A NaN is a present value, not a NULL: no validity bitmap on the result.
+    CHECK_FALSE(result->find_entry("m")->validity.has_value());
+}
+
+TEST_CASE("rolling_sum/std/min skip NULLs consistently", "[rolling][null]") {
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10), ts_from_nanos(20)});
+    table.add_column("vi", Column<std::int64_t>{10, 999, 30},
+                     runtime::ValidityBitmap{true, false, true});
+    table.add_column("vd", Column<double>{5.0, 1e300, 2.0},
+                     runtime::ValidityBitmap{true, false, true});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[window 1000ns, update { s = rolling_sum(vi), sd = rolling_std(vd), "
+        "mn = rolling_min(vd) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    REQUIRE(s != nullptr);
+    CHECK((*s)[0] == 10);  // {10}
+    CHECK((*s)[1] == 10);  // {10, NULL} -> {10}
+    CHECK((*s)[2] == 40);  // {10, 30}
+
+    const auto* mn = std::get_if<Column<double>>(result->find("mn"));
+    REQUIRE(mn != nullptr);
+    CHECK((*mn)[0] == Catch::Approx(5.0));  // {5}
+    CHECK((*mn)[1] == Catch::Approx(5.0));  // {5, NULL} -> {5}
+    CHECK((*mn)[2] == Catch::Approx(2.0));  // {5, 2}
+
+    const auto* sd = std::get_if<Column<double>>(result->find("sd"));
+    REQUIRE(sd != nullptr);
+    CHECK((*sd)[2] == Catch::Approx(std::sqrt(4.5)));  // std{5,2} sample = sqrt(4.5)
+}
+
+TEST_CASE("grouped windowed rolling carries per-group input validity", "[rolling][null][grouped]") {
+    // Two symbols interleaved; val is NULL on each symbol's first row. The grouped
+    // windowed update must carry that validity into each per-symbol slice — else
+    // rolling reads the undefined null payload and the result is garbage. This is
+    // the log_return_momentum shape (lag → null first return) without coalesce.
+    runtime::Table table;
+    table.add_column("sym", Column<std::string>{"A", "B", "A", "B"});
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10), ts_from_nanos(20),
+                                             ts_from_nanos(30)});
+    table.add_column("val", Column<double>{1e300, 1e300, 30.0, 40.0},
+                     runtime::ValidityBitmap{false, false, true, true});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[window 1000ns, update { m = rolling_mean(val) }, by sym];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("m");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK(runtime::is_null(*entry, 0));        // A's first row: window {NULL} -> NULL
+    CHECK(runtime::is_null(*entry, 1));        // B's first row: window {NULL} -> NULL
+    CHECK_FALSE(runtime::is_null(*entry, 2));  // A: {NULL, 30} -> 30
+    CHECK_FALSE(runtime::is_null(*entry, 3));  // B: {NULL, 40} -> 40
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    CHECK((*m)[2] == Catch::Approx(30.0));
+    CHECK((*m)[3] == Catch::Approx(40.0));
+}
+
 TEST_CASE("rolling_count with 1ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});

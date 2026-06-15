@@ -70,6 +70,20 @@ def timer(fn, warmup: int, iters: int):
 # ── Benchmark suites ──────────────────────────────────────────────────────────
 
 
+def derive_prices_ts(csv_path):
+    """Path to prices_ts.csv beside the prices CSV, or None when absent.
+
+    prices_ts.csv (symbol, ts:int64-ns, price) drives the time-windowed
+    log_return_momentum pipeline; it is generated alongside prices.csv but only
+    loaded by harnesses that run that benchmark."""
+    p = pathlib.Path(csv_path)
+    if p.name == "prices.csv":
+        cand = p.with_name("prices_ts.csv")
+        if cand.exists():
+            return str(cand)
+    return None
+
+
 def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     _fw = "pandas"
     print("pandas: loading...", file=sys.stderr, flush=True)
@@ -260,6 +274,32 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         )
 
     run("normalize_by_group", _normalize_by_group)
+
+    # Tier 3 funnel on the timestamped table: log returns → 5-minute time-windowed
+    # momentum → Sharpe-like ratio per symbol. Matches ibex: sort by ts, first
+    # return = 0 (coalesce null), window closed on both ends, sample std (ddof=1).
+    pts_path = derive_prices_ts(csv_path)
+    if pts_path is not None:
+        pt = pd.read_csv(pts_path)
+        pt = pt.sort_values("ts", kind="stable").reset_index(drop=True)
+        pt["dt"] = pd.to_datetime(pt["ts"])
+
+        def _log_return_momentum():
+            g = pt.copy()
+            g["lr"] = np.log(g["price"] / g.groupby("symbol")["price"].shift(1)).fillna(0.0)
+            g["mom"] = g.groupby("symbol", group_keys=False).apply(
+                lambda s: pd.Series(
+                    s.set_index("dt")["lr"].rolling("5min", closed="both").mean().to_numpy(),
+                    index=s.index,
+                )
+            )
+            res = g.groupby("symbol", sort=False).agg(
+                mean_mom=("mom", "mean"), std_mom=("mom", lambda s: s.std(ddof=1))
+            )
+            res["sharpe"] = res["mean_mom"] / res["std_mom"]
+            return res.reset_index()
+
+        run("log_return_momentum", _log_return_momentum)
 
     # Transforms / single-pass language features.
     run("pmin_clip", lambda: df.assign(clipped=df["price"].clip(upper=500.0)))
@@ -529,6 +569,35 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             pl.col("clipped").std().alias("sd_z"),
         ),
     )
+
+    # Tier 3 funnel on the timestamped table (see bench_pandas for semantics):
+    # log returns → 5-minute time-windowed momentum → Sharpe-like ratio per symbol.
+    pts_path = derive_prices_ts(csv_path)
+    if pts_path is not None:
+        pt = pl.read_csv(pts_path).sort("ts").with_columns(
+            pl.from_epoch("ts", time_unit="ns").alias("dt")
+        )
+        run(
+            "log_return_momentum",
+            lambda: pt.with_columns(
+                (pl.col("price") / pl.col("price").shift(1).over("symbol"))
+                .log()
+                .fill_null(0.0)
+                .alias("lr")
+            )
+            .with_columns(
+                pl.col("lr")
+                .rolling_mean_by("dt", window_size="5m", closed="both")
+                .over("symbol")
+                .alias("mom")
+            )
+            .group_by("symbol")
+            .agg(
+                pl.col("mom").mean().alias("mean_mom"),
+                pl.col("mom").std().alias("std_mom"),
+            )
+            .with_columns((pl.col("mean_mom") / pl.col("std_mom")).alias("sharpe")),
+        )
 
     # Transforms / single-pass language features.
     run(
@@ -842,6 +911,36 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         )
         .collect(),
     )
+    # Tier 3 funnel on the timestamped table (see bench_pandas for semantics).
+    pts_path = derive_prices_ts(csv_path)
+    if pts_path is not None:
+        def scan_ts():
+            return pl.scan_csv(pts_path).sort("ts").with_columns(
+                pl.from_epoch("ts", time_unit="ns").alias("dt")
+            )
+        run(
+            "log_return_momentum",
+            lambda: scan_ts()
+            .with_columns(
+                (pl.col("price") / pl.col("price").shift(1).over("symbol"))
+                .log()
+                .fill_null(0.0)
+                .alias("lr")
+            )
+            .with_columns(
+                pl.col("lr")
+                .rolling_mean_by("dt", window_size="5m", closed="both")
+                .over("symbol")
+                .alias("mom")
+            )
+            .group_by("symbol")
+            .agg(
+                pl.col("mom").mean().alias("mean_mom"),
+                pl.col("mom").std().alias("std_mom"),
+            )
+            .with_columns((pl.col("mean_mom") / pl.col("std_mom")).alias("sharpe"))
+            .collect(),
+        )
     # Transforms / single-pass language features.
     run(
         "pmin_clip",

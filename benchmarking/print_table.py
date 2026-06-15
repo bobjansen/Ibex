@@ -82,6 +82,7 @@ QUERY_ORDER = [
     "update_group_filter",
     "group_rank_filter",
     "normalize_by_group",
+    "log_return_momentum",
     "symbol_day_to_symbol",
     # transforms / single-pass language features
     "pmin_clip",
@@ -169,6 +170,7 @@ QUERY_LABEL = {
     "update_group_filter": "update→filter→regroup",
     "group_rank_filter": "rank→top-N→aggregate",
     "normalize_by_group": "z-score→clip→aggregate",
+    "log_return_momentum": "log-return→5m roll→sharpe",
     "symbol_day_to_symbol": "symbol×day→symbol rollup",
     "pmin_clip": "pmin clip (winsorise)",
     "where_update_clip": "guarded update (CASE WHEN)",

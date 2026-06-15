@@ -1854,6 +1854,7 @@ int main(int argc, char** argv) {
     std::string csv_events_path;
     std::string csv_lookup_path;
     std::string csv_users_path;
+    std::string csv_prices_ts_path;
     std::size_t warmup_iters = 1;
     std::size_t iters = 5;
     bool include_parse = true;
@@ -1885,6 +1886,10 @@ int main(int argc, char** argv) {
     app.add_option("--csv-users", csv_users_path,
                    "CSV file path for the join benchmark dimension (user_id, tier) — one row per "
                    "distinct events user_id")
+        ->check(CLI::ExistingFile);
+    app.add_option("--csv-prices-ts", csv_prices_ts_path,
+                   "CSV file path for the time-windowed pipeline (symbol, ts:int64-ns, price). "
+                   "Defaults to prices_ts.csv beside --csv when present.")
         ->check(CLI::ExistingFile);
     app.add_option("--warmup", warmup_iters, "Warmup iterations")->check(CLI::NonNegativeNumber);
     app.add_option("--iters", iters, "Measured iterations")->check(CLI::PositiveNumber);
@@ -1975,6 +1980,34 @@ int main(int argc, char** argv) {
         tables.emplace("prices", std::move(table));
         if (print_types) {
             print_table_types("prices", tables.find("prices")->second);
+        }
+
+        // Timestamped prices for the time-windowed pipeline (log_return_momentum).
+        // Use --csv-prices-ts if given, else auto-derive prices_ts.csv beside the
+        // prices CSV so existing invocations pick it up with no new flag. ts is
+        // int64 ns; as_timeframe promotes Int → Timestamp in the query.
+        std::string prices_ts_path = csv_prices_ts_path;
+        if (prices_ts_path.empty()) {
+            const std::string suffix = "prices.csv";
+            if (csv_path.size() >= suffix.size() &&
+                csv_path.compare(csv_path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                std::string candidate = csv_path;
+                candidate.replace(csv_path.size() - suffix.size(), suffix.size(), "prices_ts.csv");
+                if (std::ifstream(candidate).good()) {
+                    prices_ts_path = candidate;
+                }
+            }
+        }
+        if (!prices_ts_path.empty()) {
+            try {
+                tables.emplace("prices_ts", read_csv(prices_ts_path));
+                if (print_types) {
+                    print_table_types("prices_ts", tables.find("prices_ts")->second);
+                }
+            } catch (const std::exception& e) {
+                fmt::print("warning: failed to read prices_ts CSV ({}): {}\n", prices_ts_path,
+                           e.what());
+            }
         }
 
         // Single-column group-by: exercises the string fast path (robin_hood).
@@ -2196,6 +2229,22 @@ int main(int argc, char** argv) {
                  "[update { clipped = pmin(pmax(z, -3.0), 3.0) }]"
                  "[select { mean_z = mean(clipped), sd_z = std(clipped) }, by symbol]"},
             };
+            // Tier 3 funnel on the timestamped table: log returns → time-windowed
+            // momentum (5-minute rolling mean of returns) → Sharpe-like ratio per
+            // symbol. Needs prices_ts (ts promoted to a Timestamp index via
+            // as_timeframe); skipped when that table is absent.
+            if (tables.contains("prices_ts")) {
+                // First return per symbol is null (lag → null); coalesce to 0 so
+                // the time-windowed rolling_mean isn't poisoned by the null (a null
+                // anywhere in the window yields inf). Defines the first log return
+                // as 0, which the competitor harnesses mirror.
+                pipeline_queries.push_back(
+                    {"log_return_momentum",
+                     R"(as_timeframe(prices_ts, "ts")[update { lr = coalesce(log(price / lag(price, 1)), 0.0) }, by symbol])"
+                     "[window 5m, update { mom = rolling_mean(lr) }, by symbol]"
+                     "[select { mean_mom = mean(mom), sharpe = mean(mom) / std(mom) }, by "
+                     "symbol]"});
+            }
             for (const auto& query : pipeline_queries) {
                 if (verify) {
                     if (auto err = verify_benchmark(query, tables, verify_rows)) {

@@ -97,8 +97,14 @@ in order:
   single-key `aggregate_table` path lacks the sorted-run shortcut the categorical/
   string paths have and over-reserves `rows`/`rows*n_aggs` — a latent cleanup, but
   the dedicated resample path sidesteps it.
-- `tf_asof_join` (time-only) 2.2× vs polars-st (114 vs 53) — some headroom left
-  in the merge/materialise.
+- `tf_asof_join` (time-only) — **merge/materialise headroom taken (commit
+  0fac194).** Two wins: (1) the left side is always the identity permutation for
+  asof, so materialise the left columns wholesale instead of gathering through an
+  identity index (and drop the n_left index array); (2) the two-pointer merge
+  reads the Timestamp column storage directly (layout-compatible with int64)
+  instead of copying all right times into a 128 MB array. **74.1 → 52.5 ms at
+  16M (1.41×), peak RSS 813 → 691 MB**; by-symbol variant drops ~200 MB RSS too.
+  Re-measure vs polars-st on the next AWS run (was 2.2×).
 - `tf_rolling_ewma_1m` 1.4×, `fill_null` 1.4× — minor.
 Everything else: ibex is fastest single-thread. Multi-thread parallelism is a
 separate roadmap item ([[project_execution_roadmap]]), not an algorithmic fix.

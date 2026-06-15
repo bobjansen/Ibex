@@ -29,6 +29,7 @@ bench_results/**
 benchmarking/data/**
 benchmarking/results/compiled/**
 *.csv
+*.tsv
 !examples/leetcode/data/*.csv
 *.parquet
 *.so

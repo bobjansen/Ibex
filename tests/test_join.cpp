@@ -263,6 +263,34 @@ TEST_CASE("join: asof join time-only key (no equality keys)", "[join][asof]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{50, 200, 250, 250});
 }
 
+TEST_CASE("join: asof join time-only key with an Int time index", "[join][asof]") {
+    // An Int (non-Timestamp) time index exercises the buffer-materialisation
+    // fallback in as_int64_view — Timestamp reads the column storage directly,
+    // but Int/Date must convert into a temporary int64 array first.
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<std::int64_t>{10, 20, 30, 40});
+    lhs.add_column("lval", Column<std::int64_t>{1, 2, 3, 4});
+    lhs.time_index = "ts";
+
+    runtime::Table rhs;
+    rhs.add_column("ts", Column<std::int64_t>{5, 20, 25});
+    rhs.add_column("rval", Column<std::int64_t>{50, 200, 250});
+    rhs.time_index = "ts";
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs asof join rhs on ts;", tables);
+
+    CHECK(out.rows() == 4);
+    REQUIRE(out.time_index.has_value());
+    CHECK(*out.time_index == "ts");
+    CHECK(col_i64(out, "ts") == std::vector<std::int64_t>{10, 20, 30, 40});
+    // Same at-or-before semantics as the Timestamp case.
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{50, 200, 250, 250});
+}
+
 TEST_CASE("join: asof join time-only key, left before all right rows fills default",
           "[join][asof]") {
     runtime::Table lhs;

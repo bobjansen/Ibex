@@ -276,8 +276,9 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("normalize_by_group", _normalize_by_group)
 
     # Tier 3 funnel on the timestamped table: log returns → 5-minute time-windowed
-    # momentum → Sharpe-like ratio per symbol. Matches ibex: sort by ts, first
-    # return = 0 (coalesce null), window closed on both ends, sample std (ddof=1).
+    # momentum → Sharpe-like ratio per symbol. Matches ibex: sort by ts; the first
+    # return per symbol is null (skipped — pandas rolling.mean and .mean()/.std()
+    # are NaN-aware); window closed on both ends; sample std (ddof=1).
     pts_path = derive_prices_ts(csv_path)
     if pts_path is not None:
         pt = pd.read_csv(pts_path)
@@ -286,7 +287,7 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
         def _log_return_momentum():
             g = pt.copy()
-            g["lr"] = np.log(g["price"] / g.groupby("symbol")["price"].shift(1)).fillna(0.0)
+            g["lr"] = np.log(g["price"] / g.groupby("symbol")["price"].shift(1))
             g["mom"] = g.groupby("symbol", group_keys=False).apply(
                 lambda s: pd.Series(
                     s.set_index("dt")["lr"].rolling("5min", closed="both").mean().to_numpy(),
@@ -582,7 +583,6 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             lambda: pt.with_columns(
                 (pl.col("price") / pl.col("price").shift(1).over("symbol"))
                 .log()
-                .fill_null(0.0)
                 .alias("lr")
             )
             .with_columns(
@@ -924,7 +924,6 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             .with_columns(
                 (pl.col("price") / pl.col("price").shift(1).over("symbol"))
                 .log()
-                .fill_null(0.0)
                 .alias("lr")
             )
             .with_columns(

@@ -5837,6 +5837,55 @@ TEST_CASE("update log/exp match scalar libm (SIMD path or fallback)", "[update][
     }
 }
 
+TEST_CASE("update trig/log transcendentals match scalar libm over a column", "[update][scalar]") {
+    // sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/log2/log10 over a bare Double
+    // column route through the libmvec SIMD path where available and the scalar
+    // tree-walk otherwise; both must agree with std::<fn> to Approx. The column
+    // length (10, not a multiple of 4) exercises both the 4-wide body and the
+    // scalar tail. Arguments are kept in [-0.9, 0.9] so asin/acos stay in-domain
+    // and inputs to log2/log10 are positive.
+    const std::vector<double> xs = {-0.9, -0.7, -0.3, -0.1, 0.05, 0.2, 0.4, 0.6, 0.8, 0.9};
+    runtime::TableRegistry registry;
+    runtime::Table t;
+    t.add_column("x", Column<double>(xs));
+    // log2/log10 need a strictly positive column.
+    std::vector<double> pos;
+    pos.reserve(xs.size());
+    for (double x : xs) {
+        pos.push_back(x + 1.0);  // (0.1, 1.9]
+    }
+    t.add_column("p", Column<double>(std::move(pos)));
+    registry["t"] = std::move(t);
+
+    auto ir = require_ir(
+        "t[update { vsin = sin(x), vcos = cos(x), vtan = tan(x), vasin = asin(x), "
+        "vacos = acos(x), vatan = atan(x), vsinh = sinh(x), vcosh = cosh(x), vtanh = tanh(x), "
+        "vlog2 = log2(p), vlog10 = log10(p) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    auto col = [&](const char* name) -> const Column<double>& {
+        const auto* c = std::get_if<Column<double>>(result->find(name));
+        REQUIRE(c != nullptr);
+        return *c;
+    };
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+        const double x = xs[i];
+        const double p = x + 1.0;
+        CHECK(col("vsin")[i] == Catch::Approx(std::sin(x)));
+        CHECK(col("vcos")[i] == Catch::Approx(std::cos(x)));
+        CHECK(col("vtan")[i] == Catch::Approx(std::tan(x)));
+        CHECK(col("vasin")[i] == Catch::Approx(std::asin(x)));
+        CHECK(col("vacos")[i] == Catch::Approx(std::acos(x)));
+        CHECK(col("vatan")[i] == Catch::Approx(std::atan(x)));
+        CHECK(col("vsinh")[i] == Catch::Approx(std::sinh(x)));
+        CHECK(col("vcosh")[i] == Catch::Approx(std::cosh(x)));
+        CHECK(col("vtanh")[i] == Catch::Approx(std::tanh(x)));
+        CHECK(col("vlog2")[i] == Catch::Approx(std::log2(p)));
+        CHECK(col("vlog10")[i] == Catch::Approx(std::log10(p)));
+    }
+}
+
 TEST_CASE("grouped update mixes a per-row column with an inline aggregate", "[update]") {
     // The single-expression demean `price - mean(price)` (the aggregate inlined
     // rather than split into a prior field) must evaluate per row within each

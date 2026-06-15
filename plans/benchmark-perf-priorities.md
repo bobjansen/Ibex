@@ -144,6 +144,20 @@ jemalloc @16M: ibex **172 ms vs clickhouse 62 / datafusion 72 / polars 73 =
 ~2.6×** (252 groups, 4 aggregates each). Slowest of the columnar engines except
 polars-st. Genuine grouped-aggregation gap, moderate.
 
+**Pass-fusion tried, did NOT help (negative result, 2026-06-15).** `run_flat_pass2`
+makes one full row pass per aggregate, so ohlc streams gids+price 4× — the
+hypothesis was that this is memory-bandwidth-bound and fusing the four reducers
+(first/max/min/last) into a single row pass would cut it ~4×. Two fused variants
+(inner switch; func-partitioned inner loops with hoisted raw pointers) both came
+in at ~49–60 ms locally vs the per-aggregate baseline ~50 ms — i.e. no win (or a
+regression with the switch). Decomposition explains why: with ~252 groups the
+accumulators are L1-resident, so pass-2 is **not** bandwidth-bound but bound by
+the 64M scatter-accumulate writes (`acc[gid]`), and fusion does the same 64M
+scatters — it can't reduce them. Real levers would be group-id locality (radix
+partition / pre-sort by key so writes are sequential) or SIMD/threaded scatter,
+both large. Deferred; don't re-attempt naive fusion. (Local baseline: ohlc 50 ms
+vs mean_by_symbol 23 ms @16M; the ~27 ms delta is the 3 extra scatter passes.)
+
 ## Resolved / non-issues under jemalloc
 
 - **melt_wide_to_long — NOT a gap.** ibex 448 ms vs polars 402 / polars-st 466 /

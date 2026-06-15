@@ -3710,35 +3710,84 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size
     return std::nullopt;
 }
 
-// Vectorised transcendentals (log/exp) via libmvec — the same mechanism zorro
-// uses for the RNG normal/exponential paths. Fills dst[i] = fn(src[i]) in 4-wide
-// AVX2 chunks + a scalar tail, ~5–10× the scalar libm tree-walk. Returns false
-// (caller falls back to the scalar tree-walk) when the build lacks AVX2/libmvec
-// or `name` has no kernel here, so non-x86/glibc targets stay correct.
+// Vectorised transcendentals via libmvec — the same mechanism zorro uses for the
+// RNG normal/exponential paths. Fills dst[i] = fn(src[i]) in 4-wide AVX2 chunks +
+// a scalar tail, ~5–10× the scalar libm tree-walk. Returns false (caller falls
+// back to the scalar tree-walk) when the build lacks AVX2/libmvec or `name` has
+// no kernel here, so non-x86/glibc targets stay correct.
 #if defined(__AVX2__) && defined(ZORRO_USE_LIBMVEC)
-extern "C" __m256d _ZGVdN4v_log(__m256d) noexcept;
-extern "C" __m256d _ZGVdN4v_exp(__m256d) noexcept;
+// glibc AVX2 packed-double symbols (one arg). Every name below is also a
+// registered scalar builtin, so the SIMD body and the scalar tail/fallback agree.
+extern "C" {
+__m256d _ZGVdN4v_log(__m256d) noexcept;
+__m256d _ZGVdN4v_log2(__m256d) noexcept;
+__m256d _ZGVdN4v_log10(__m256d) noexcept;
+__m256d _ZGVdN4v_exp(__m256d) noexcept;
+__m256d _ZGVdN4v_sin(__m256d) noexcept;
+__m256d _ZGVdN4v_cos(__m256d) noexcept;
+__m256d _ZGVdN4v_tan(__m256d) noexcept;
+__m256d _ZGVdN4v_asin(__m256d) noexcept;
+__m256d _ZGVdN4v_acos(__m256d) noexcept;
+__m256d _ZGVdN4v_atan(__m256d) noexcept;
+__m256d _ZGVdN4v_sinh(__m256d) noexcept;
+__m256d _ZGVdN4v_cosh(__m256d) noexcept;
+__m256d _ZGVdN4v_tanh(__m256d) noexcept;
+}
+struct SimdKernel {
+    std::string_view name;
+    __m256d (*vec)(__m256d) noexcept;  // 4-wide AVX2 body
+    double (*scalar)(double);          // matching libm scalar for the tail
+};
+// Non-capturing lambdas decay to function pointers; std::log etc. are overloaded,
+// so wrap each to pin the double overload without an explicit cast per row.
+const std::array<SimdKernel, 13> kSimdKernels = {{
+    {"log", _ZGVdN4v_log, [](double x) { return std::log(x); }},
+    {"log2", _ZGVdN4v_log2, [](double x) { return std::log2(x); }},
+    {"log10", _ZGVdN4v_log10, [](double x) { return std::log10(x); }},
+    {"exp", _ZGVdN4v_exp, [](double x) { return std::exp(x); }},
+    {"sin", _ZGVdN4v_sin, [](double x) { return std::sin(x); }},
+    {"cos", _ZGVdN4v_cos, [](double x) { return std::cos(x); }},
+    {"tan", _ZGVdN4v_tan, [](double x) { return std::tan(x); }},
+    {"asin", _ZGVdN4v_asin, [](double x) { return std::asin(x); }},
+    {"acos", _ZGVdN4v_acos, [](double x) { return std::acos(x); }},
+    {"atan", _ZGVdN4v_atan, [](double x) { return std::atan(x); }},
+    {"sinh", _ZGVdN4v_sinh, [](double x) { return std::sinh(x); }},
+    {"cosh", _ZGVdN4v_cosh, [](double x) { return std::cosh(x); }},
+    {"tanh", _ZGVdN4v_tanh, [](double x) { return std::tanh(x); }},
+}};
+auto find_simd_kernel(std::string_view name) -> const SimdKernel* {
+    for (const auto& k : kSimdKernels) {
+        if (k.name == name) {
+            return &k;
+        }
+    }
+    return nullptr;
+}
 auto simd_transcendental(std::string_view name, const double* src, double* dst, std::size_t n)
     -> bool {
-    __m256d (*kern)(__m256d) noexcept = nullptr;
-    if (name == "log") {
-        kern = _ZGVdN4v_log;
-    } else if (name == "exp") {
-        kern = _ZGVdN4v_exp;
-    } else {
+    const SimdKernel* k = find_simd_kernel(name);
+    if (k == nullptr) {
         return false;
     }
     std::size_t i = 0;
     for (; i + 4 <= n; i += 4) {
-        _mm256_storeu_pd(dst + i, kern(_mm256_loadu_pd(src + i)));
+        _mm256_storeu_pd(dst + i, k->vec(_mm256_loadu_pd(src + i)));
     }
     for (; i < n; ++i) {
-        dst[i] = (name == "log") ? std::log(src[i]) : std::exp(src[i]);
+        dst[i] = k->scalar(src[i]);
     }
     return true;
 }
+// True iff simd_transcendental has a kernel for `name` on this build — lets the
+// unary fast path gate on it before materialising the argument.
+auto simd_transcendental_supported(std::string_view name) -> bool {
+    return find_simd_kernel(name) != nullptr;
+}
 #else
 auto simd_transcendental(std::string_view, const double*, double*, std::size_t) -> bool {
+    return false;
+}
+auto simd_transcendental_supported(std::string_view) -> bool {
     return false;
 }
 #endif
@@ -3833,11 +3882,13 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
         return ColumnValue{std::move(out)};
     }
 
-    // log/exp via libmvec: accept a bare Double column or any fast-computable
-    // numeric argument (materialised to a temp column first). Falls back to the
-    // scalar tree-walk when libmvec is unavailable.
+    // Transcendentals via libmvec: accept a bare Double column or any
+    // fast-computable numeric argument (materialised to a temp column first).
+    // simd_transcendental returns false for names it has no kernel for and for
+    // builds lacking AVX2/libmvec, so the caller falls back to the scalar
+    // tree-walk. (sqrt is handled by the dedicated vsqrtpd path below.)
     if (call->args.size() == 1 && output_kind == ExprType::Double &&
-        (call->callee == "log" || call->callee == "exp")) {
+        simd_transcendental_supported(call->callee)) {
         auto arg = resolve_fast_operand(*call->args[0], input, scalars);
         ColumnValue owned;  // backing store if the argument is computed
         const double* src = nullptr;

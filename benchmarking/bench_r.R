@@ -341,6 +341,9 @@ if (!skip_data_table) {
     bench("data.table", "round_price", function() dt[, v := as.integer(round(price))][])
     bench("data.table", "floor_price", function() dt[, v := floor(price)][])
     bench("data.table", "ceil_price",  function() dt[, v := ceiling(price)][])
+    bench("data.table", "sin_price",   function() dt[, v := sin(price)][])
+    bench("data.table", "cos_price",   function() dt[, v := cos(price)][])
+    bench("data.table", "tanh_price",  function() dt[, v := tanh(price / 1000.0)][])
 }
 
 if (!skip_dplyr) {
@@ -483,6 +486,9 @@ if (!skip_dplyr) {
     bench("dplyr", "round_price", function() tb |> mutate(v = as.integer(round(price))))
     bench("dplyr", "floor_price", function() tb |> mutate(v = floor(price)))
     bench("dplyr", "ceil_price",  function() tb |> mutate(v = ceiling(price)))
+    bench("dplyr", "sin_price",   function() tb |> mutate(v = sin(price)))
+    bench("dplyr", "cos_price",   function() tb |> mutate(v = cos(price)))
+    bench("dplyr", "tanh_price",  function() tb |> mutate(v = tanh(price / 1000.0)))
 }
 
 # ── Multi-column group-by ─────────────────────────────────────────────────────

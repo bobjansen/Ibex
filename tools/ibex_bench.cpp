@@ -2254,6 +2254,9 @@ int main(int argc, char** argv) {
                 {"round_price", "prices[update { v = round(price, nearest) }]"},
                 {"floor_price", "prices[update { v = floor(price) }]"},
                 {"ceil_price", "prices[update { v = ceil(price) }]"},
+                {"sin_price", "prices[update { v = sin(price) }]"},
+                {"cos_price", "prices[update { v = cos(price) }]"},
+                {"tanh_price", "prices[update { v = tanh(price / 1000.0) }]"},
             };
             for (const auto& query : scalar_queries) {
                 ScanPaths sp;

@@ -286,8 +286,8 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
             "SELECT symbol, avg(lr) OVER (PARTITION BY symbol ORDER BY tus "
             "RANGE BETWEEN 300000000 PRECEDING AND CURRENT ROW) AS mom FROM ("
             "SELECT symbol, intDiv(ts, 1000) AS tus, "
-            "coalesce(log(price / lagInFrame(price, 1) OVER ("
-            "PARTITION BY symbol ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)), 0.0) AS lr "
+            "log(price / lagInFrame(price, 1) OVER ("
+            "PARTITION BY symbol ORDER BY ts ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) AS lr "
             "FROM prices_ts)) GROUP BY symbol",
         )
 

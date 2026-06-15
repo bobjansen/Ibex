@@ -2234,13 +2234,14 @@ int main(int argc, char** argv) {
             // symbol. Needs prices_ts (ts promoted to a Timestamp index via
             // as_timeframe); skipped when that table is absent.
             if (tables.contains("prices_ts")) {
-                // First return per symbol is null (lag → null); coalesce to 0 so
-                // the time-windowed rolling_mean isn't poisoned by the null (a null
-                // anywhere in the window yields inf). Defines the first log return
-                // as 0, which the competitor harnesses mirror.
+                // The first return per symbol is null (lag → null). rolling_mean is
+                // null-aware: it skips the null, so the first row's momentum is null
+                // and the final mean/std skip it. Every competitor engine null-skips
+                // in its rolling mean and aggregate too, so the per-symbol output is
+                // identical cross-engine (verified on the small dataset).
                 pipeline_queries.push_back(
                     {"log_return_momentum",
-                     R"(as_timeframe(prices_ts, "ts")[update { lr = coalesce(log(price / lag(price, 1)), 0.0) }, by symbol])"
+                     R"(as_timeframe(prices_ts, "ts")[update { lr = log(price / lag(price, 1)) }, by symbol])"
                      "[window 5m, update { mom = rolling_mean(lr) }, by symbol]"
                      "[select { mean_mom = mean(mom), sharpe = mean(mom) / std(mom) }, by "
                      "symbol]"});

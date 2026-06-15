@@ -319,15 +319,17 @@ if (!skip_data_table) {
             , .(mean_z = mean(clipped), sd_z = sd(clipped)), by = symbol])
 
     # Tier 3 funnel on the timestamped table: log returns -> 5-minute time-windowed
-    # momentum -> Sharpe-like ratio per symbol. First return coalesced to 0; sd()
-    # is ddof=1; slide_index_dbl's .before window is inclusive both ends.
+    # momentum -> Sharpe-like ratio per symbol. The first return per symbol is NA
+    # (lag); na.rm=TRUE skips it (R's mean/sd don't, unlike pandas/polars/SQL which
+    # null-skip by default). sd() is ddof=1; .before window is inclusive both ends.
     if (has_prices_ts) {
         bench("data.table", "log_return_momentum", function() {
             d <- copy(dt_ts); setorder(d, ts)
-            d[, lr := fcoalesce(log(price / shift(price, 1L)), 0), by = symbol]
-            d[, mom := slide_index_dbl(lr, ts, mean, .before = 300000000000), by = symbol]
-            d[, .(mean_mom = mean(mom), std_mom = sd(mom)), by = symbol][
-                , sharpe := mean_mom / std_mom][]
+            d[, lr := log(price / shift(price, 1L)), by = symbol]
+            d[, mom := slide_index_dbl(lr, ts, ~mean(.x, na.rm = TRUE),
+                                       .before = 300000000000), by = symbol]
+            d[, .(mean_mom = mean(mom, na.rm = TRUE), std_mom = sd(mom, na.rm = TRUE)),
+              by = symbol][, sharpe := mean_mom / std_mom][]
         })
     }
 
@@ -480,9 +482,11 @@ if (!skip_dplyr) {
     if (has_prices_ts) {
         bench("dplyr", "log_return_momentum",
             function() tb_ts |> arrange(ts) |> group_by(symbol) |>
-                mutate(lr  = coalesce(log(price / lag(price, 1L)), 0),
-                       mom = slide_index_dbl(lr, ts, mean, .before = 300000000000)) |>
-                summarise(mean_mom = mean(mom), std_mom = sd(mom), .groups = "drop") |>
+                mutate(lr  = log(price / lag(price, 1L)),
+                       mom = slide_index_dbl(lr, ts, ~mean(.x, na.rm = TRUE),
+                                             .before = 300000000000)) |>
+                summarise(mean_mom = mean(mom, na.rm = TRUE),
+                          std_mom = sd(mom, na.rm = TRUE), .groups = "drop") |>
                 mutate(sharpe = mean_mom / std_mom))
     }
 

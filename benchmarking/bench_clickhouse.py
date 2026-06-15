@@ -300,6 +300,9 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     run("round_price", "SELECT *, toInt64(round(price)) AS v FROM prices")
     run("floor_price", "SELECT *, floor(price) AS v FROM prices")
     run("ceil_price", "SELECT *, ceil(price) AS v FROM prices")
+    run("sin_price", "SELECT *, sin(price) AS v FROM prices")
+    run("cos_price", "SELECT *, cos(price) AS v FROM prices")
+    run("tanh_price", "SELECT *, tanh(price / 1000.0) AS v FROM prices")
 
     if csv_multi_path:
         print("clickhouse: loading multi...", file=sys.stderr, flush=True)

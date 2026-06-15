@@ -316,8 +316,8 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "log_return_momentum",
             lambda: con.sql(
                 "WITH base AS (SELECT symbol, ts, "
-                "COALESCE(LN(price / LAG(price, 1) OVER ("
-                "PARTITION BY symbol ORDER BY ts)), 0.0) AS lr FROM prices_ts), "
+                "LN(price / LAG(price, 1) OVER ("
+                "PARTITION BY symbol ORDER BY ts)) AS lr FROM prices_ts), "
                 "mom AS (SELECT symbol, AVG(lr) OVER (PARTITION BY symbol ORDER BY ts "
                 "RANGE BETWEEN 300000000000 PRECEDING AND CURRENT ROW) AS mom FROM base) "
                 "SELECT symbol, AVG(mom) AS mean_mom, STDDEV_SAMP(mom) AS std_mom, "

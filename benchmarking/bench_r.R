@@ -211,6 +211,19 @@ if (!skip_dplyr) {
     tb <- as_tibble(fread(csv_path))
 }
 
+# Timestamped prices for the time-windowed pipeline (log_return_momentum):
+# prices_ts.csv (symbol, ts:int64-ns, price) beside the prices CSV. The 5-minute
+# window is slider's .before = 3e11 ns (inclusive both ends — matches ibex).
+prices_ts_path <- sub("prices\\.csv$", "prices_ts.csv", csv_path)
+has_prices_ts  <- grepl("prices\\.csv$", csv_path) && file.exists(prices_ts_path)
+dt_ts <- NULL
+tb_ts <- NULL
+if (has_prices_ts) {
+    suppressMessages(library(slider))
+    if (!skip_data_table) dt_ts <- fread(prices_ts_path)
+    if (!skip_dplyr)      tb_ts <- as_tibble(fread(prices_ts_path))
+}
+
 # ── Single-column group-by ────────────────────────────────────────────────────
 if (!skip_data_table) {
     message("\n=== data.table ===")
@@ -304,6 +317,19 @@ if (!skip_data_table) {
         function() dt[, z := (price - mean(price)) / sd(price), by = symbol][
             , clipped := pmin(pmax(z, -3.0), 3.0)][
             , .(mean_z = mean(clipped), sd_z = sd(clipped)), by = symbol])
+
+    # Tier 3 funnel on the timestamped table: log returns -> 5-minute time-windowed
+    # momentum -> Sharpe-like ratio per symbol. First return coalesced to 0; sd()
+    # is ddof=1; slide_index_dbl's .before window is inclusive both ends.
+    if (has_prices_ts) {
+        bench("data.table", "log_return_momentum", function() {
+            d <- copy(dt_ts); setorder(d, ts)
+            d[, lr := fcoalesce(log(price / shift(price, 1L)), 0), by = symbol]
+            d[, mom := slide_index_dbl(lr, ts, mean, .before = 300000000000), by = symbol]
+            d[, .(mean_mom = mean(mom), std_mom = sd(mom)), by = symbol][
+                , sharpe := mean_mom / std_mom][]
+        })
+    }
 
     # Transforms / single-pass language features (non-mutating selects).
     bench("data.table", "pmin_clip",
@@ -449,6 +475,16 @@ if (!skip_dplyr) {
             mutate(z = (price - mean(price)) / sd(price),
                    clipped = pmin(pmax(z, -3.0), 3.0)) |>
             summarise(mean_z = mean(clipped), sd_z = sd(clipped), .groups = "drop"))
+
+    # Tier 3 funnel on the timestamped table (see data.table version for semantics).
+    if (has_prices_ts) {
+        bench("dplyr", "log_return_momentum",
+            function() tb_ts |> arrange(ts) |> group_by(symbol) |>
+                mutate(lr  = coalesce(log(price / lag(price, 1L)), 0),
+                       mom = slide_index_dbl(lr, ts, mean, .before = 300000000000)) |>
+                summarise(mean_mom = mean(mom), std_mom = sd(mom), .groups = "drop") |>
+                mutate(sharpe = mean_mom / std_mom))
+    }
 
     # Transforms / single-pass language features.
     bench("dplyr", "pmin_clip",

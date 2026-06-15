@@ -7524,8 +7524,20 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
 
 // Compute a rolling aggregate column over a time-indexed window.
 // The table must be a TimeFrame (time_index set, sorted ascending).
+//
+// Null/NaN semantics (three states per input element, matching polars/Arrow):
+//   • NULL    (validity=false): a missing observation — skipped entirely; its
+//     payload is undefined and never read. A window of only nulls yields null.
+//   • NaN     (validity=true, value is NaN): a present-but-undefined value —
+//     propagated, so any window overlapping it yields NaN. NaNs are tracked in a
+//     separate counter rather than fed into the running accumulator, because a
+//     later subtraction cannot undo a NaN (NaN−NaN=NaN) — so a NaN poisons only
+//     the windows it actually overlaps and clears once it ages out.
+//   • finite: fed into the accumulator as usual.
+// When no input element is null the result carries no validity bitmap (nullopt)
+// and the numbers are bit-identical to the null-unaware path.
 auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Duration duration)
-    -> std::expected<ColumnValue, std::string> {
+    -> std::expected<ComputedColumn, std::string> {
     const auto& time_col = *table.find(*table.time_index);
     std::size_t rows = table.rows();
 
@@ -7568,7 +7580,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
             advance_lo(lo, i);
             result[i] = static_cast<std::int64_t>(i - lo + 1);
         }
-        return result;
+        return ComputedColumn{std::move(result), std::nullopt};
     }
 
     if (call.args.empty()) {
@@ -7582,28 +7594,70 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     if (!src) {
         return std::unexpected(call.callee + ": unknown column '" + col_ref->name + "'");
     }
+    // Source validity: nullptr means every element is valid (the common case).
+    // valid_at(j) is false only for true NULLs — never read col[j] when false.
+    const auto* src_entry = table.find_entry(col_ref->name);
+    const ValidityBitmap* sv =
+        (src_entry != nullptr && src_entry->validity.has_value()) ? &*src_entry->validity : nullptr;
+    auto valid_at = [sv](std::size_t j) noexcept -> bool {
+        return sv == nullptr || (*sv)[j];
+    };
 
     if (call.callee == "rolling_mean") {
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = typename std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_mean: column must be numeric (Int or Float)");
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    std::optional<ValidityBitmap> out_valid;  // built lazily on first null result
                     double sum = 0.0;
+                    std::size_t val_cnt = 0;  // finite, non-null elements in the window
+                    std::size_t nan_cnt = 0;  // valid-but-NaN elements in the window
+                    auto add = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;  // NULL: skip, payload undefined
+                        double v = static_cast<double>(col[j]);
+                        if (std::isnan(v))
+                            ++nan_cnt;
+                        else {
+                            sum += v;
+                            ++val_cnt;
+                        }
+                    };
+                    auto drop = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        double v = static_cast<double>(col[j]);
+                        if (std::isnan(v))
+                            --nan_cnt;
+                        else {
+                            sum -= v;
+                            --val_cnt;
+                        }
+                    };
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        sum += static_cast<double>(col[i]);
+                        add(i);
                         std::int64_t threshold = time_vals[i] - dur_val;
                         while (lo < i && time_vals[lo] < threshold) {
-                            sum -= static_cast<double>(col[lo]);
+                            drop(lo);
                             ++lo;
                         }
-                        result[i] = sum / static_cast<double>(i - lo + 1);
+                        if (nan_cnt > 0) {
+                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                        } else if (val_cnt > 0) {
+                            result[i] = sum / static_cast<double>(val_cnt);
+                        } else {
+                            result[i] = 0.0;  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                        }
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
             },
             *src);
@@ -7611,7 +7665,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
 
     if (call.callee == "rolling_sum") {
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using ColT = std::decay_t<decltype(col)>;
                 using T = typename ColT::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
@@ -7619,18 +7673,56 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 } else {
                     ColT result;
                     result.resize(rows);
+                    std::optional<ValidityBitmap> out_valid;
                     T sum{};
+                    std::size_t val_cnt = 0;  // non-null, non-NaN elements in window
+                    std::size_t nan_cnt = 0;  // valid-but-NaN (Float only; Int never NaN)
+                    auto add = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        if constexpr (std::is_floating_point_v<T>) {
+                            if (std::isnan(col[j])) {
+                                ++nan_cnt;
+                                return;
+                            }
+                        }
+                        sum += col[j];
+                        ++val_cnt;
+                    };
+                    auto drop = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        if constexpr (std::is_floating_point_v<T>) {
+                            if (std::isnan(col[j])) {
+                                --nan_cnt;
+                                return;
+                            }
+                        }
+                        sum -= col[j];
+                        --val_cnt;
+                    };
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        sum += col[i];
+                        add(i);
                         std::int64_t threshold = time_vals[i] - dur_val;
                         while (lo < i && time_vals[lo] < threshold) {
-                            sum -= col[lo];
+                            drop(lo);
                             ++lo;
                         }
-                        result[i] = sum;
+                        if (nan_cnt > 0) {
+                            // Only reachable for Float columns (Int has no NaN).
+                            if constexpr (std::is_floating_point_v<T>)
+                                result[i] = std::numeric_limits<T>::quiet_NaN();
+                        } else if (val_cnt > 0) {
+                            result[i] = sum;
+                        } else {
+                            result[i] = T{};  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                        }
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
             },
             *src);
@@ -7638,7 +7730,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
 
     if (call.callee == "rolling_median") {
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = typename std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_median: column must be numeric (Int or Float)");
@@ -7688,18 +7780,51 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
 
                     Column<double> result;
                     result.resize(rows);
+                    std::optional<ValidityBitmap> out_valid;
+                    std::size_t nan_cnt = 0;  // valid-but-NaN values in window
+                    // Only finite, non-null values enter the multisets; NULLs are
+                    // skipped and NaNs counted (NaN can't participate in an ordered
+                    // structure and would corrupt the median).
+                    auto add = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        double v = static_cast<double>(col[j]);
+                        if (std::isnan(v))
+                            ++nan_cnt;
+                        else
+                            insert_val(v);
+                    };
+                    auto drop = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        double v = static_cast<double>(col[j]);
+                        if (std::isnan(v))
+                            --nan_cnt;
+                        else
+                            remove_val(v);
+                    };
                     std::size_t lo_ptr = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        insert_val(static_cast<double>(col[i]));
+                        add(i);
                         std::int64_t threshold = time_vals[i] - dur_val;
                         while (lo_ptr < i && time_vals[lo_ptr] < threshold) {
-                            remove_val(static_cast<double>(col[lo_ptr]));
+                            drop(lo_ptr);
                             ++lo_ptr;
                         }
-                        result[i] = (lo.size() > hi.size()) ? static_cast<double>(*lo.rbegin())
-                                                            : (*lo.rbegin() + *hi.begin()) / 2.0;
+                        if (nan_cnt > 0) {
+                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                        } else if (lo.empty() && hi.empty()) {
+                            result[i] = 0.0;  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                        } else {
+                            result[i] = (lo.size() > hi.size())
+                                            ? static_cast<double>(*lo.rbegin())
+                                            : (*lo.rbegin() + *hi.begin()) / 2.0;
+                        }
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
             },
             *src);
@@ -7707,7 +7832,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
 
     if (call.callee == "rolling_std") {
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = typename std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_std: column must be numeric (Int or Float)");
@@ -7715,39 +7840,69 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     // O(n) sliding window. The TimeFrame is sorted ascending, so
                     // `lo` is monotonic: each row is added once on the right and
                     // dropped once on the left. We maintain running (mean, m2)
-                    // with Welford add and its exact inverse for removal, which
-                    // matches the from-scratch Welford result the old O(n*w) loop
-                    // produced — but in a single pass instead of one per row.
+                    // with Welford add and its exact inverse for removal. Only
+                    // finite, non-null values enter Welford; NULLs are skipped and
+                    // NaNs counted separately (a NaN can't be inverse-Welford'd out,
+                    // so keeping it out of the recurrence lets it clear on exit).
                     Column<double> result;
                     result.resize(rows);
+                    std::optional<ValidityBitmap> out_valid;
                     double mean = 0.0;
                     double m2 = 0.0;
-                    std::size_t cnt = 0;
-                    std::size_t lo = 0;
-                    for (std::size_t i = 0; i < rows; ++i) {
-                        // Add col[i] on the right (standard Welford).
-                        double x = static_cast<double>(col[i]);
+                    std::size_t cnt = 0;      // finite, non-null values in window
+                    std::size_t nan_cnt = 0;  // valid-but-NaN values in window
+                    auto add = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        double x = static_cast<double>(col[j]);
+                        if (std::isnan(x)) {
+                            ++nan_cnt;
+                            return;
+                        }
                         ++cnt;
                         double delta = x - mean;
                         mean += delta / static_cast<double>(cnt);
                         m2 += delta * (x - mean);
-                        // Drop rows that have aged out on the left (inverse Welford).
+                    };
+                    auto drop = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        double y = static_cast<double>(col[j]);
+                        if (std::isnan(y)) {
+                            --nan_cnt;
+                            return;
+                        }
+                        double mean_old = mean;
+                        --cnt;
+                        mean = cnt == 0 ? 0.0
+                                        : ((static_cast<double>(cnt) + 1.0) * mean_old - y) /
+                                              static_cast<double>(cnt);
+                        m2 -= (y - mean_old) * (y - mean);
+                    };
+                    std::size_t lo = 0;
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        add(i);
                         std::int64_t threshold = time_vals[i] - dur_val;
                         while (lo < i && time_vals[lo] < threshold) {
-                            double y = static_cast<double>(col[lo]);
-                            double mean_old = mean;
-                            --cnt;
-                            mean = ((static_cast<double>(cnt) + 1.0) * mean_old - y) /
-                                   static_cast<double>(cnt);
-                            m2 -= (y - mean_old) * (y - mean);
+                            drop(lo);
                             ++lo;
                         }
-                        std::size_t n = i - lo + 1;  // == cnt
-                        // Clamp away tiny negative m2 from floating-point drift.
-                        result[i] =
-                            n < 2 ? 0.0 : std::sqrt(std::max(0.0, m2) / static_cast<double>(n - 1));
+                        if (nan_cnt > 0) {
+                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                        } else if (cnt == 0) {
+                            result[i] = 0.0;  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                        } else {
+                            // Clamp away tiny negative m2 from floating-point drift.
+                            result[i] =
+                                cnt < 2
+                                    ? 0.0
+                                    : std::sqrt(std::max(0.0, m2) / static_cast<double>(cnt - 1));
+                        }
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
             },
             *src);
@@ -7772,7 +7927,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
             return std::unexpected("rolling_ewma: alpha must be a numeric literal");
         }
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = typename std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_ewma: column must be numeric (Int or Float)");
@@ -7787,7 +7942,16 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     //   drop left:  R -= beta^(i-lo)*col[lo]
                     // reproducing the from-scratch O(n*w) recurrence in one pass.
                     // beta_pow caches beta^k (k bounded by the window width).
+                    //
+                    // Null handling: the weights are position-based, so a null
+                    // can't be skipped without renumbering the whole window.
+                    // Instead a null contributes 0 (a "no-return" tick) — its
+                    // payload is never read. (NaN still propagates through the
+                    // recurrence; genuine NaNs in an EWMA input are out of scope.)
                     const double beta = 1.0 - alpha;
+                    auto val = [&](std::size_t j) -> double {
+                        return valid_at(j) ? static_cast<double>(col[j]) : 0.0;
+                    };
                     Column<double> result;
                     result.resize(rows);
                     std::vector<double> beta_pow{1.0};  // beta_pow[k] == beta^k
@@ -7800,16 +7964,15 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     double r = 0.0;
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        r = (beta * r) + static_cast<double>(col[i]);  // add col[i] at weight 1
+                        r = (beta * r) + val(i);  // add col[i] at weight 1
                         std::int64_t threshold = time_vals[i] - dur_val;
                         while (lo < i && time_vals[lo] < threshold) {
-                            r -= bpow(i - lo) * static_cast<double>(col[lo]);
+                            r -= bpow(i - lo) * val(lo);
                             ++lo;
                         }
-                        result[i] = (alpha * r) +
-                                    ((1.0 - alpha) * bpow(i - lo) * static_cast<double>(col[lo]));
+                        result[i] = (alpha * r) + ((1.0 - alpha) * bpow(i - lo) * val(lo));
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::nullopt};
                 }
             },
             *src);
@@ -7834,7 +7997,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
             return std::unexpected("rolling_quantile: p must be a numeric literal");
         }
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = typename std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected(
@@ -7842,21 +8005,42 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    std::optional<ValidityBitmap> out_valid;
+                    std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
                         std::size_t lo = window_lo(time_col, i, duration);
-                        std::size_t n = i - lo + 1;
-                        std::vector<double> window;
-                        window.reserve(n);
-                        for (std::size_t j = lo; j <= i; ++j)
-                            window.push_back(static_cast<double>(col[j]));
+                        // Collect finite, non-null values; flag any valid NaN.
+                        window.clear();
+                        bool has_nan = false;
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            if (!valid_at(j))
+                                continue;
+                            double v = static_cast<double>(col[j]);
+                            if (std::isnan(v))
+                                has_nan = true;
+                            else
+                                window.push_back(v);
+                        }
+                        if (has_nan) {
+                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            continue;
+                        }
+                        if (window.empty()) {
+                            result[i] = 0.0;  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                            continue;
+                        }
                         std::sort(window.begin(), window.end());
+                        std::size_t n = window.size();
                         double idx = p * static_cast<double>(n - 1);
                         std::size_t idx_lo = static_cast<std::size_t>(idx);
                         std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
                         double frac = idx - static_cast<double>(idx_lo);
                         result[i] = window[idx_lo] + (frac * (window[idx_hi] - window[idx_lo]));
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
             },
             *src);
@@ -7864,28 +8048,52 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
 
     if (call.callee == "rolling_skew") {
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = typename std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_skew: column must be numeric (Int or Float)");
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    std::optional<ValidityBitmap> out_valid;
+                    std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
                         std::size_t lo = window_lo(time_col, i, duration);
-                        std::size_t n = i - lo + 1;
+                        window.clear();
+                        bool has_nan = false;
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            if (!valid_at(j))
+                                continue;
+                            double v = static_cast<double>(col[j]);
+                            if (std::isnan(v))
+                                has_nan = true;
+                            else
+                                window.push_back(v);
+                        }
+                        if (has_nan) {
+                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            continue;
+                        }
+                        if (window.empty()) {
+                            result[i] = 0.0;  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                            continue;
+                        }
+                        std::size_t n = window.size();
                         if (n < 3) {
                             result[i] = 0.0;
                             continue;
                         }
                         double mean = 0.0;
-                        for (std::size_t j = lo; j <= i; ++j)
-                            mean += static_cast<double>(col[j]);
+                        for (double v : window)
+                            mean += v;
                         mean /= static_cast<double>(n);
                         double m2 = 0.0;
                         double m3 = 0.0;
-                        for (std::size_t j = lo; j <= i; ++j) {
-                            double d = static_cast<double>(col[j]) - mean;
+                        for (double v : window) {
+                            double d = v - mean;
                             m2 += d * d;
                             m3 += d * d * d;
                         }
@@ -7897,7 +8105,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                                 (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
                         }
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
             },
             *src);
@@ -7905,7 +8113,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
 
     if (call.callee == "rolling_kurtosis") {
         return std::visit(
-            [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = typename std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected(
@@ -7913,21 +8121,45 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    std::optional<ValidityBitmap> out_valid;
+                    std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
                         std::size_t lo = window_lo(time_col, i, duration);
-                        std::size_t n = i - lo + 1;
+                        window.clear();
+                        bool has_nan = false;
+                        for (std::size_t j = lo; j <= i; ++j) {
+                            if (!valid_at(j))
+                                continue;
+                            double v = static_cast<double>(col[j]);
+                            if (std::isnan(v))
+                                has_nan = true;
+                            else
+                                window.push_back(v);
+                        }
+                        if (has_nan) {
+                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            continue;
+                        }
+                        if (window.empty()) {
+                            result[i] = 0.0;  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                            continue;
+                        }
+                        std::size_t n = window.size();
                         if (n < 4) {
                             result[i] = 0.0;
                             continue;
                         }
                         double mean = 0.0;
-                        for (std::size_t j = lo; j <= i; ++j)
-                            mean += static_cast<double>(col[j]);
+                        for (double v : window)
+                            mean += v;
                         mean /= static_cast<double>(n);
                         double m2 = 0.0;
                         double m4 = 0.0;
-                        for (std::size_t j = lo; j <= i; ++j) {
-                            double d = static_cast<double>(col[j]) - mean;
+                        for (double v : window) {
+                            double d = v - mean;
                             double d2 = d * d;
                             m2 += d2;
                             m4 += d2 * d2;
@@ -7941,7 +8173,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                                         ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
                         }
                     }
-                    return result;
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
             },
             *src);
@@ -7950,7 +8182,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     // rolling_min / rolling_max — O(n·w), monotonic deque not yet implemented.
     bool is_min = call.callee == "rolling_min";
     return std::visit(
-        [&](const auto& col) -> std::expected<ColumnValue, std::string> {
+        [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
             using ColT = std::decay_t<decltype(col)>;
             if constexpr (std::is_same_v<ColT, Column<Categorical>> ||
                           std::is_same_v<ColT, Column<std::string>>) {
@@ -7958,17 +8190,40 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
             } else {
                 using T = typename ColT::value_type;
                 ColT result;
-                result.reserve(rows);
+                result.resize(rows);
+                std::optional<ValidityBitmap> out_valid;
                 for (std::size_t i = 0; i < rows; ++i) {
                     std::size_t win_lo = window_lo(time_col, i, duration);
-                    T best = col[win_lo];
-                    for (std::size_t j = win_lo + 1; j <= i; ++j) {
-                        if (is_min ? (col[j] < best) : (col[j] > best))
+                    T best{};
+                    bool seen = false;
+                    bool has_nan = false;
+                    for (std::size_t j = win_lo; j <= i; ++j) {
+                        if (!valid_at(j))
+                            continue;  // NULL: skip, payload undefined
+                        if constexpr (std::is_floating_point_v<T>) {
+                            if (std::isnan(col[j])) {
+                                has_nan = true;
+                                continue;
+                            }
+                        }
+                        if (!seen || (is_min ? (col[j] < best) : (col[j] > best))) {
                             best = col[j];
+                            seen = true;
+                        }
                     }
-                    result.push_back(best);
+                    if (has_nan) {
+                        if constexpr (std::is_floating_point_v<T>)
+                            result[i] = std::numeric_limits<T>::quiet_NaN();
+                    } else if (seen) {
+                        result[i] = best;
+                    } else {
+                        result[i] = T{};  // window of only nulls -> null
+                        if (!out_valid)
+                            out_valid.emplace(rows, true);
+                        out_valid->set(i, false);
+                    }
                 }
-                return result;
+                return ComputedColumn{std::move(result), std::move(out_valid)};
             }
         },
         *src);
@@ -8671,7 +8926,12 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 if (!col) {
                     return std::unexpected(col.error());
                 }
-                output.add_column(field.alias, std::move(col.value()));
+                if (col->validity.has_value()) {
+                    output.add_column(field.alias, std::move(col->column),
+                                      std::move(*col->validity));
+                } else {
+                    output.add_column(field.alias, std::move(col->column));
+                }
                 continue;
             }
             if (call->callee == "lag" || call->callee == "lead") {
@@ -8844,7 +9104,19 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         Table sub;
         for (const auto& entry : input.columns) {
             ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
-            sub.add_column(entry.name, std::move(gathered));
+            // Carry each input column's validity into the per-group slice — else a
+            // rolling/lag field over a nullable input column (e.g. a computed
+            // log-return whose first per-symbol row is null) would see a slice
+            // with no validity bitmap and read the undefined null payload.
+            if (entry.validity.has_value()) {
+                ValidityBitmap vb(row_idx.size(), true);
+                for (std::size_t k = 0; k < row_idx.size(); ++k) {
+                    vb.set(k, (*entry.validity)[row_idx[k]]);
+                }
+                sub.add_column(entry.name, std::move(gathered), std::move(vb));
+            } else {
+                sub.add_column(entry.name, std::move(gathered));
+            }
         }
         sub.time_index = input.time_index;
         return windowed_update_table(std::move(sub), fields, duration, scalars, externs);

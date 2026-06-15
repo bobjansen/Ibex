@@ -222,6 +222,11 @@ so ibex results are verifiable.
 8. ~~`corr_price_vol` (CorrNode gap)~~ **DONE** (2026-06-13, commit eba837d)
 9. `tf_rolling_ewma_1m` — **R DONE** (2026-06-14; data.table + dplyr via `TTR::EMA(n=1, ratio=0.1)`, matches the pandas/polars full-series `ewm(alpha=0.1, adjust=False)`). ClickHouse still TODO: `exponentialMovingAverage` is a time-windowed aggregate, not a per-row full-series column — needs an arrayFold/recursive workaround; deferred.
 10. DataFusion: `lag_by_symbol`, `fill_forward/backward`, `tf_asof_join` — `lag_by_symbol` blocked (no stable row order without a ts/row-id column, same as the existing omission); `fill_*`/`asof` still open.
+11. ~~**Scalar math suite** (`abs/sqrt/log/exp/round/floor/ceil` + the transcendental
+    set `sin/cos/tanh`)~~ **DONE** (2026-06-15). ibex_bench scalar suite + all
+    competitor harnesses (pandas, polars eager/lazy, DuckDB, DataFusion,
+    ClickHouse, data.table, dplyr). Paired with vectorising every kernel via
+    libmvec AVX2 — see [[benchmark-perf-priorities]] P4 for the lone `tanh` gap.
 
 Remaining: #5 `log_return_momentum` (needs timestamped table), #9 ClickHouse
 EWMA, #10 DataFusion fill/asof.

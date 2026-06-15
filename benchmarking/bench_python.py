@@ -287,6 +287,9 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("round_price", lambda: df.assign(v=np.rint(df["price"])))
     run("floor_price", lambda: df.assign(v=np.floor(df["price"])))
     run("ceil_price", lambda: df.assign(v=np.ceil(df["price"])))
+    run("sin_price", lambda: df.assign(v=np.sin(df["price"])))
+    run("cos_price", lambda: df.assign(v=np.cos(df["price"])))
+    run("tanh_price", lambda: df.assign(v=np.tanh(df["price"] / 1000.0)))
 
     if csv_multi_path:
         print("pandas: loading multi...", file=sys.stderr, flush=True)
@@ -575,6 +578,9 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     run("round_price", lambda: df.with_columns(pl.col("price").round(0).alias("v")))
     run("floor_price", lambda: df.with_columns(pl.col("price").floor().alias("v")))
     run("ceil_price", lambda: df.with_columns(pl.col("price").ceil().alias("v")))
+    run("sin_price", lambda: df.with_columns(pl.col("price").sin().alias("v")))
+    run("cos_price", lambda: df.with_columns(pl.col("price").cos().alias("v")))
+    run("tanh_price", lambda: df.with_columns((pl.col("price") / 1000.0).tanh().alias("v")))
 
     if csv_multi_path:
         print("polars: loading multi...", file=sys.stderr, flush=True)
@@ -881,6 +887,12 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         lambda: scan().with_columns(pl.col("price").floor().alias("v")).collect())
     run("ceil_price",
         lambda: scan().with_columns(pl.col("price").ceil().alias("v")).collect())
+    run("sin_price",
+        lambda: scan().with_columns(pl.col("price").sin().alias("v")).collect())
+    run("cos_price",
+        lambda: scan().with_columns(pl.col("price").cos().alias("v")).collect())
+    run("tanh_price",
+        lambda: scan().with_columns((pl.col("price") / 1000.0).tanh().alias("v")).collect())
 
     if csv_multi_path:
         def scan_multi():

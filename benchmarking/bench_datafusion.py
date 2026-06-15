@@ -358,6 +358,9 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ("round_price", "SELECT *, CAST(round(price) AS BIGINT) AS v FROM prices"),
         ("floor_price", "SELECT *, floor(price) AS v FROM prices"),
         ("ceil_price", "SELECT *, ceil(price) AS v FROM prices"),
+        ("sin_price", "SELECT *, sin(price) AS v FROM prices"),
+        ("cos_price", "SELECT *, cos(price) AS v FROM prices"),
+        ("tanh_price", "SELECT *, tanh(price / 1000.0) AS v FROM prices"),
     ):
         run(_name, lambda sql=_sql: ctx.sql(sql).collect())
 

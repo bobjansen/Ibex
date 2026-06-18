@@ -4157,14 +4157,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
             if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Quantile ||
                 agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) {
-                double x{};
-                if (std::holds_alternative<Column<std::int64_t>>(column)) {
-                    x = static_cast<double>(
-                        std::get<std::int64_t>(scalar_from_column(column, row)));
-                } else {
-                    x = std::get<double>(scalar_from_column(column, row));
-                }
-                slot.values.push_back(x);
+                // Collected contiguously after grouping (reserve-then-fill from the
+                // value column directly), not per row here — see the collect pass
+                // below. Per-row push_back into one growing vector per group was the
+                // dominant cost of median/quantile by-group.
                 continue;
             }
             if (agg.func == ir::AggFunc::Stddev) {
@@ -4448,15 +4444,17 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return output;
     };
 
-    auto append_agg_values_flat = [&](Table& output,
-                                      const AggSlot* slots) -> std::optional<std::string> {
+    // Non-const slots: Median/Quantile select in place (std::nth_element) on
+    // slot.values rather than copying + fully sorting it. Every caller passes a
+    // mutable, about-to-be-discarded slot array, so the in-place reorder is safe.
+    auto append_agg_values_flat = [&](Table& output, AggSlot* slots) -> std::optional<std::string> {
         for (std::size_t i = 0; i < aggregations.size(); ++i) {
             const auto& agg = aggregations[i];
             auto* column = output.find(agg.alias);
             if (column == nullptr) {
                 return "missing aggregate column in output";
             }
-            const AggSlot& slot = slots[i];
+            AggSlot& slot = slots[i];
             switch (agg.func) {
                 case ir::AggFunc::Count:
                     append_scalar(*column, slot.count);
@@ -4495,19 +4493,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         append_scalar(*column, slot.last_value);
                     }
                     break;
-                case ir::AggFunc::Median: {
-                    if (slot.values.empty()) {
-                        append_scalar(*column, 0.0);
-                    } else {
-                        std::vector<double> sorted = slot.values;
-                        std::ranges::sort(sorted);
-                        std::size_t n = sorted.size();
-                        double med = (n % 2 == 1) ? sorted[n / 2]
-                                                  : (sorted[(n / 2) - 1] + sorted[n / 2]) / 2.0;
-                        append_scalar(*column, med);
-                    }
+                // Median/Quantile/Skew/Kurtosis are reduced in the contiguous
+                // collect pass (above); the scalar result is already in
+                // slot.double_value, so just emit it.
+                case ir::AggFunc::Median:
+                    append_scalar(*column, slot.double_value);
                     break;
-                }
                 case ir::AggFunc::Stddev:
                     if (slot.count < 2) {
                         append_scalar(*column, 0.0);
@@ -4519,78 +4510,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 case ir::AggFunc::Ewma:
                     append_scalar(*column, slot.double_value);
                     break;
-                case ir::AggFunc::Quantile: {
-                    if (slot.values.empty()) {
-                        append_scalar(*column, 0.0);
-                    } else {
-                        std::vector<double> sorted = slot.values;
-                        std::sort(sorted.begin(), sorted.end());
-                        double idx = slot.param * static_cast<double>(sorted.size() - 1);
-                        std::size_t lo = static_cast<std::size_t>(idx);
-                        std::size_t hi = lo + 1 < sorted.size() ? lo + 1 : lo;
-                        double frac = idx - static_cast<double>(lo);
-                        append_scalar(*column, sorted[lo] + (frac * (sorted[hi] - sorted[lo])));
-                    }
+                case ir::AggFunc::Quantile:
+                    append_scalar(*column, slot.double_value);
                     break;
-                }
-                case ir::AggFunc::Skew: {
-                    std::size_t n = slot.values.size();
-                    if (n < 3) {
-                        append_scalar(*column, 0.0);
-                    } else {
-                        double mean = 0.0;
-                        for (double x : slot.values)
-                            mean += x;
-                        mean /= static_cast<double>(n);
-                        double m2 = 0.0;
-                        double m3 = 0.0;
-                        for (double x : slot.values) {
-                            double d = x - mean;
-                            m2 += d * d;
-                            m3 += d * d * d;
-                        }
-                        if (m2 == 0.0) {
-                            append_scalar(*column, 0.0);
-                        } else {
-                            double dn = static_cast<double>(n);
-                            // Fisher–Pearson sample skewness (same as pandas default)
-                            double skew =
-                                (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
-                            append_scalar(*column, skew);
-                        }
-                    }
+                case ir::AggFunc::Skew:
+                    append_scalar(*column, slot.double_value);
                     break;
-                }
-                case ir::AggFunc::Kurtosis: {
-                    std::size_t n = slot.values.size();
-                    if (n < 4) {
-                        append_scalar(*column, 0.0);
-                    } else {
-                        double mean = 0.0;
-                        for (double x : slot.values)
-                            mean += x;
-                        mean /= static_cast<double>(n);
-                        double m2 = 0.0;
-                        double m4 = 0.0;
-                        for (double x : slot.values) {
-                            double d = x - mean;
-                            double d2 = d * d;
-                            m2 += d2;
-                            m4 += d2 * d2;
-                        }
-                        if (m2 == 0.0) {
-                            append_scalar(*column, 0.0);
-                        } else {
-                            auto dn = static_cast<double>(n);
-                            // Fisher excess kurtosis (unbiased, matches scipy/pandas default):
-                            // G2 = (n-1)/((n-2)*(n-3)) * [(n+1)*n*m4/m2^2 - 3*(n-1)]
-                            double kurt = (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
-                                          ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
-                            append_scalar(*column, kurt);
-                        }
-                    }
+                case ir::AggFunc::Kurtosis:
+                    append_scalar(*column, slot.double_value);
                     break;
-                }
             }
         }
         return std::nullopt;
@@ -4605,17 +4533,19 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             case ir::AggFunc::Min:
             case ir::AggFunc::Max:
                 return slot.has_value;
+            // Median/Quantile/Skew/Kurtosis are reduced in the contiguous collect
+            // pass, which records the group's value count in slot.count.
             case ir::AggFunc::Median:
             case ir::AggFunc::Quantile:
-                return !slot.values.empty();
+                return slot.count > 0;
             case ir::AggFunc::Stddev:
                 return slot.count >= 2;
             case ir::AggFunc::Ewma:
                 return slot.has_value;
             case ir::AggFunc::Skew:
-                return slot.values.size() >= 3;
+                return slot.count >= 3;
             case ir::AggFunc::Kurtosis:
-                return slot.values.size() >= 4;
+                return slot.count >= 4;
             case ir::AggFunc::Count:
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
@@ -4880,6 +4810,24 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         std::vector<AggState> states;
         states.reserve(rows == 0 ? 1 : rows);
 
+        // Collect-aggregates (median/quantile/skew/kurtosis) gather every value
+        // into a per-group buffer. Doing that per row (push_back into one growing
+        // vector per group, via scalar_from_column) dominates their cost. Instead
+        // record each row's group id during grouping and fill the buffers in a
+        // contiguous reserve-then-scatter pass below, reading the value column
+        // directly. Only allocate row_gid when a collect-aggregate is present.
+        std::vector<std::size_t> collect_aggs;
+        for (std::size_t i = 0; i < plan.size(); ++i) {
+            if (plan[i].func == ir::AggFunc::Median || plan[i].func == ir::AggFunc::Quantile ||
+                plan[i].func == ir::AggFunc::Skew || plan[i].func == ir::AggFunc::Kurtosis) {
+                collect_aggs.push_back(i);
+            }
+        }
+        std::vector<std::uint32_t> row_gid;
+        if (!collect_aggs.empty()) {
+            row_gid.resize(rows);
+        }
+
         for (std::size_t row = 0; row < rows; ++row) {
             Key key;
             key.values.reserve(group_columns.size());
@@ -4892,9 +4840,130 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 group_order.push_back(it->first);
                 states.push_back(make_state());
             }
+            if (!collect_aggs.empty()) {
+                row_gid[row] = static_cast<std::uint32_t>(it->second);
+            }
 
             if (auto err = update_state(states[it->second].slots.data(), row)) {
                 return std::unexpected(*err);
+            }
+        }
+
+        // Contiguous collect pass: per aggregate, histogram group sizes into a
+        // prefix-sum offset table, scatter the value column into ONE flat buffer
+        // by group id (buf[cursor[g]++] = v — no per-group vector, no pointer
+        // chase), then reduce each contiguous group slice in place. The result
+        // lands in slot.double_value and the group size in slot.count, so the
+        // finalize below and validity just read those.
+        if (!collect_aggs.empty() && rows > 0) {
+            const std::size_t n_groups = states.size();
+            std::vector<std::size_t> offsets(n_groups + 1);
+            std::vector<std::size_t> cursor(n_groups);
+            std::vector<double> buf;
+            for (std::size_t ai : collect_aggs) {
+                const ColumnValue& col = *agg_columns[ai];
+                const ValidityBitmap* vb = agg_validity[ai];
+                std::fill(offsets.begin(), offsets.end(), std::size_t{0});
+                for (std::size_t row = 0; row < rows; ++row) {
+                    if (vb == nullptr || (*vb)[row]) {
+                        ++offsets[row_gid[row] + 1];
+                    }
+                }
+                for (std::size_t g = 0; g < n_groups; ++g) {
+                    offsets[g + 1] += offsets[g];
+                }
+                buf.resize(offsets[n_groups]);
+                std::copy(offsets.begin(), offsets.end() - 1, cursor.begin());
+                auto scatter = [&](const auto& typed) {
+                    const auto* data = typed.data();
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        if (vb == nullptr || (*vb)[row]) {
+                            buf[cursor[row_gid[row]]++] = static_cast<double>(data[row]);
+                        }
+                    }
+                };
+                if (const auto* dc = std::get_if<Column<double>>(&col)) {
+                    scatter(*dc);
+                } else if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
+                    scatter(*ic);
+                }
+
+                const ir::AggFunc f = plan[ai].func;
+                const double p = plan[ai].param;
+                for (std::size_t g = 0; g < n_groups; ++g) {
+                    double* lo = buf.data() + offsets[g];
+                    double* hi = buf.data() + offsets[g + 1];
+                    const std::size_t n = static_cast<std::size_t>(hi - lo);
+                    AggSlot& slot = states[g].slots[ai];
+                    slot.count = static_cast<std::int64_t>(n);
+                    double result = 0.0;
+                    if (f == ir::AggFunc::Median) {
+                        if (n > 0) {
+                            const std::size_t mid = n / 2;
+                            std::nth_element(lo, lo + static_cast<std::ptrdiff_t>(mid), hi);
+                            const double upper = lo[mid];
+                            result = (n % 2 == 0)
+                                         ? (*std::max_element(
+                                                lo, lo + static_cast<std::ptrdiff_t>(mid)) +
+                                            upper) /
+                                               2.0
+                                         : upper;
+                        }
+                    } else if (f == ir::AggFunc::Quantile) {
+                        if (n > 0) {
+                            const double idx = p * static_cast<double>(n - 1);
+                            const std::size_t qlo = static_cast<std::size_t>(idx);
+                            const double frac = idx - static_cast<double>(qlo);
+                            std::nth_element(lo, lo + static_cast<std::ptrdiff_t>(qlo), hi);
+                            const double vlo = lo[qlo];
+                            const double vhi =
+                                (qlo + 1 < n) ? *std::min_element(
+                                                    lo + static_cast<std::ptrdiff_t>(qlo + 1), hi)
+                                              : vlo;
+                            result = vlo + (frac * (vhi - vlo));
+                        }
+                    } else if (f == ir::AggFunc::Skew) {
+                        if (n >= 3) {
+                            double mean = 0.0;
+                            for (double* it = lo; it != hi; ++it)
+                                mean += *it;
+                            mean /= static_cast<double>(n);
+                            double m2 = 0.0;
+                            double m3 = 0.0;
+                            for (double* it = lo; it != hi; ++it) {
+                                const double d = *it - mean;
+                                m2 += d * d;
+                                m3 += d * d * d;
+                            }
+                            if (m2 != 0.0) {
+                                const double dn = static_cast<double>(n);
+                                result = (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) *
+                                         (m3 / std::pow(m2, 1.5));
+                            }
+                        }
+                    } else {  // Kurtosis
+                        if (n >= 4) {
+                            double mean = 0.0;
+                            for (double* it = lo; it != hi; ++it)
+                                mean += *it;
+                            mean /= static_cast<double>(n);
+                            double m2 = 0.0;
+                            double m4 = 0.0;
+                            for (double* it = lo; it != hi; ++it) {
+                                const double d = *it - mean;
+                                const double d2 = d * d;
+                                m2 += d2;
+                                m4 += d2 * d2;
+                            }
+                            if (m2 != 0.0) {
+                                const double dn = static_cast<double>(n);
+                                result = (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
+                                         ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
+                            }
+                        }
+                    }
+                    slot.double_value = result;
+                }
             }
         }
 
@@ -4927,7 +4996,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 append_scalar(*column, key.values[ci]);
             }
 
-            const AggSlot* slots = states[g].slots.data();
+            AggSlot* slots = states[g].slots.data();
             for (std::size_t i = 0; i < aggregations.size(); ++i) {
                 if (track_agg_validity[i] != 0U) {
                     agg_validity_out[i].push_back(agg_result_is_valid(i, slots[i]));

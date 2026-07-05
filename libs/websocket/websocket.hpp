@@ -124,11 +124,11 @@ struct Sha1Digest {
 };
 
 inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
-    std::uint32_t h0 = 0x67452301u;
-    std::uint32_t h1 = 0xEFCDAB89u;
-    std::uint32_t h2 = 0x98BADCFEu;
-    std::uint32_t h3 = 0x10325476u;
-    std::uint32_t h4 = 0xC3D2E1F0u;
+    std::uint32_t h0 = 0x67452301U;
+    std::uint32_t h1 = 0xEFCDAB89U;
+    std::uint32_t h2 = 0x98BADCFEU;
+    std::uint32_t h3 = 0x10325476U;
+    std::uint32_t h4 = 0xC3D2E1F0U;
 
     auto rol32 = [](std::uint32_t v, int n) -> std::uint32_t {
         return (v << n) | (v >> (32 - n));
@@ -136,18 +136,18 @@ inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
 
     // Pre-processing: append 0x80, pad to 56 mod 64 bytes, append big-endian bit length.
     std::vector<std::uint8_t> msg(data, data + len);
-    msg.push_back(0x80u);
+    msg.push_back(0x80U);
     while (msg.size() % 64 != 56)
-        msg.push_back(0x00u);
-    const std::uint64_t bit_len = static_cast<std::uint64_t>(len) * 8u;
+        msg.push_back(0x00U);
+    const std::uint64_t bit_len = static_cast<std::uint64_t>(len) * 8U;
     for (int i = 7; i >= 0; --i)
-        msg.push_back(static_cast<std::uint8_t>((bit_len >> (i * 8)) & 0xFFu));
+        msg.push_back(static_cast<std::uint8_t>((bit_len >> (i * 8)) & 0xFFU));
 
     // Process each 64-byte chunk.
     for (std::size_t chunk = 0; chunk < msg.size(); chunk += 64) {
         std::array<std::uint32_t, 80> w{};
         for (int i = 0; i < 16; ++i) {
-            const std::uint8_t* p = &msg[chunk + static_cast<std::size_t>(i) * 4];
+            const std::uint8_t* p = &msg[chunk + (static_cast<std::size_t>(i) * 4)];
             w[static_cast<std::size_t>(i)] = (std::uint32_t{p[0]} << 24) |
                                              (std::uint32_t{p[1]} << 16) |
                                              (std::uint32_t{p[2]} << 8) | std::uint32_t{p[3]};
@@ -157,22 +157,26 @@ inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
             w[idx] = rol32(w[idx - 3] ^ w[idx - 8] ^ w[idx - 14] ^ w[idx - 16], 1);
         }
 
-        std::uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+        std::uint32_t a = h0;
+        std::uint32_t b = h1;
+        std::uint32_t c = h2;
+        std::uint32_t d = h3;
+        std::uint32_t e = h4;
         for (int i = 0; i < 80; ++i) {
             std::uint32_t f{};
             std::uint32_t k{};
             if (i < 20) {
                 f = (b & c) | (~b & d);
-                k = 0x5A827999u;
+                k = 0x5A827999U;
             } else if (i < 40) {
                 f = b ^ c ^ d;
-                k = 0x6ED9EBA1u;
+                k = 0x6ED9EBA1U;
             } else if (i < 60) {
                 f = (b & c) | (b & d) | (c & d);
-                k = 0x8F1BBCDCu;
+                k = 0x8F1BBCDCU;
             } else {
                 f = b ^ c ^ d;
-                k = 0xCA62C1D6u;
+                k = 0xCA62C1D6U;
             }
             const std::uint32_t temp = rol32(a, 5) + f + e + k + w[static_cast<std::size_t>(i)];
             e = d;
@@ -190,10 +194,10 @@ inline auto sha1(const std::uint8_t* data, std::size_t len) -> Sha1Digest {
 
     Sha1Digest digest;
     auto store = [&](std::size_t i, std::uint32_t h) {
-        digest.bytes[i * 4 + 0] = static_cast<std::uint8_t>((h >> 24) & 0xFFu);
-        digest.bytes[i * 4 + 1] = static_cast<std::uint8_t>((h >> 16) & 0xFFu);
-        digest.bytes[i * 4 + 2] = static_cast<std::uint8_t>((h >> 8) & 0xFFu);
-        digest.bytes[i * 4 + 3] = static_cast<std::uint8_t>(h & 0xFFu);
+        digest.bytes[(i * 4) + 0] = static_cast<std::uint8_t>((h >> 24) & 0xFFu);
+        digest.bytes[(i * 4) + 1] = static_cast<std::uint8_t>((h >> 16) & 0xFFu);
+        digest.bytes[(i * 4) + 2] = static_cast<std::uint8_t>((h >> 8) & 0xFFu);
+        digest.bytes[(i * 4) + 3] = static_cast<std::uint8_t>(h & 0xFFu);
     };
     store(0, h0);
     store(1, h1);
@@ -212,13 +216,13 @@ inline auto base64_encode(const std::uint8_t* data, std::size_t len) -> std::str
     out.reserve(((len + 2) / 3) * 4);
     for (std::size_t i = 0; i < len; i += 3) {
         const std::uint32_t a = data[i];
-        const std::uint32_t b = (i + 1 < len) ? data[i + 1] : 0u;
-        const std::uint32_t c = (i + 2 < len) ? data[i + 2] : 0u;
+        const std::uint32_t b = (i + 1 < len) ? data[i + 1] : 0U;
+        const std::uint32_t c = (i + 2 < len) ? data[i + 2] : 0U;
         const std::uint32_t triple = (a << 16) | (b << 8) | c;
-        out += kChars[(triple >> 18) & 0x3Fu];
-        out += kChars[(triple >> 12) & 0x3Fu];
-        out += (i + 1 < len) ? kChars[(triple >> 6) & 0x3Fu] : '=';
-        out += (i + 2 < len) ? kChars[triple & 0x3Fu] : '=';
+        out += kChars[(triple >> 18) & 0x3FU];
+        out += kChars[(triple >> 12) & 0x3FU];
+        out += (i + 1 < len) ? kChars[(triple >> 6) & 0x3FU] : '=';
+        out += (i + 2 < len) ? kChars[triple & 0x3FU] : '=';
     }
     return out;
 }
@@ -230,7 +234,7 @@ static constexpr std::string_view kWsMagicGuid = "258EAFA5-E914-47DA-95CA-C5AB0D
 // Extract the base64 value of the Sec-WebSocket-Key header from an HTTP request.
 inline auto extract_ws_key(std::string_view http) -> std::optional<std::string> {
     // Header name is case-insensitive; check both common forms.
-    for (auto hdr : {"Sec-WebSocket-Key:", "sec-websocket-key:"}) {
+    for (const auto* hdr : {"Sec-WebSocket-Key:", "sec-websocket-key:"}) {
         auto pos = http.find(hdr);
         if (pos == std::string_view::npos)
             continue;
@@ -291,10 +295,10 @@ inline auto ws_decode_frame(std::string& buf) -> std::optional<WsFrame> {
         return std::nullopt;
 
     const auto* raw = reinterpret_cast<const std::uint8_t*>(buf.data());
-    const bool fin = (raw[0] & 0x80u) != 0;
-    const std::uint8_t opcode = raw[0] & 0x0Fu;
-    const bool masked = (raw[1] & 0x80u) != 0;
-    std::uint64_t payload_len = raw[1] & 0x7Fu;
+    const bool fin = (raw[0] & 0x80U) != 0;
+    const std::uint8_t opcode = raw[0] & 0x0FU;
+    const bool masked = (raw[1] & 0x80U) != 0;
+    std::uint64_t payload_len = raw[1] & 0x7FU;
     std::size_t header_size = 2;
 
     if (payload_len == 126) {
@@ -346,6 +350,8 @@ struct WsServer {
     std::vector<WsClient> clients;
 
     WsServer() = default;
+    WsServer(WsServer&&) = delete;
+    WsServer& operator=(WsServer&&) = delete;
     WsServer(const WsServer&) = delete;
     auto operator=(const WsServer&) -> WsServer& = delete;
 
@@ -507,12 +513,11 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
     for (const auto& c : srv.clients) {
         if (c.fd >= 0) {
             FD_SET(c.fd, &rfds);
-            if (c.fd > maxfd)
-                maxfd = c.fd;
+            maxfd = std::max(c.fd, maxfd);
         }
     }
 
-    struct timeval tv{0, 200'000};  // 200 ms
+    struct timeval tv{.tv_sec = 0, .tv_usec = 200'000};  // 200 ms
     const int nready = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
     if (nready <= 0)
         return StreamTimeout{};
@@ -521,7 +526,7 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
     if (FD_ISSET(srv.listen_fd, &rfds)) {
         const int cfd = ::accept(srv.listen_fd, nullptr, nullptr);
         if (cfd >= 0)
-            srv.clients.push_back(WsClient{cfd, false, {}});
+            srv.clients.push_back(WsClient{.fd = cfd, .handshaked = false, .buf = {}});
     }
 
     // ── Service each client ───────────────────────────────────────────────────
@@ -551,7 +556,7 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
 
             const auto& frame = *frame_opt;
 
-            if (frame.opcode == 0x8u) {
+            if (frame.opcode == 0x8U) {
                 // Close frame: echo close and mark disconnected.
                 const std::string close_resp = {'\x88', '\x00'};
                 ::send(c.fd, close_resp.data(), close_resp.size(), MSG_NOSIGNAL);
@@ -561,17 +566,17 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
                 return ExternValue{Table{}};  // EOF
             }
 
-            if (frame.opcode == 0x9u) {
+            if (frame.opcode == 0x9U) {
                 // Ping: send pong.
                 std::string pong;
                 pong += '\x8A';
-                pong += static_cast<char>(frame.payload.size() & 0x7Fu);
+                pong += static_cast<char>(frame.payload.size() & 0x7FU);
                 pong += frame.payload;
                 ::send(c.fd, pong.data(), pong.size(), MSG_NOSIGNAL);
                 continue;
             }
 
-            if (frame.opcode == 0x1u || frame.opcode == 0x0u) {
+            if (frame.opcode == 0x1U || frame.opcode == 0x0U) {
                 // Text frame (or continuation — treat as complete for simplicity).
                 std::string_view json = frame.payload;
 

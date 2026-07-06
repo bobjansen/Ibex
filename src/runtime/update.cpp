@@ -6,34 +6,21 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/rng.hpp>
+#include <ibex/runtime/rng.hpp>  // zorro libmvec extern decls for the SIMD transcendental fast path
 #include <ibex/runtime/safe_arith.hpp>
-#include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
-#include <bit>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
-#include <limits>
-#include <mutex>
-#include <numeric>
 #include <optional>
-#include <pdqsort.h>
-#include <random>
 #include <robin_hood.h>
-#include <set>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -45,6 +32,8 @@
 
 namespace ibex::runtime {
 
+namespace {
+
 struct FastOperand {
     bool is_column = false;
     const ColumnValue* column = nullptr;
@@ -52,36 +41,42 @@ struct FastOperand {
     ExprType kind = ExprType::Int;
 };
 
-static auto resolve_fast_operand(const ir::Expr& expr, const Table& input,
-                                 const ScalarRegistry* scalars) -> std::optional<FastOperand> {
+auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
+    -> std::optional<FastOperand> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
         if (const auto* source = input.find(col->name); source != nullptr) {
-            return FastOperand{.is_column = true,
-                               .column = source,
-                               .literal = ScalarValue{},
-                               .kind = expr_type_for_column(*source)};
+            return FastOperand{
+                .is_column = true,
+                .column = source,
+                .literal = ScalarValue{},
+                .kind = expr_type_for_column(*source),
+            };
         }
         if (scalars != nullptr) {
             if (auto it = scalars->find(col->name); it != scalars->end()) {
-                return FastOperand{.is_column = false,
-                                   .column = nullptr,
-                                   .literal = it->second,
-                                   .kind = scalar_kind_from_value(it->second)};
+                return FastOperand{
+                    .is_column = false,
+                    .column = nullptr,
+                    .literal = it->second,
+                    .kind = scalar_kind_from_value(it->second),
+                };
             }
         }
         return std::nullopt;
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         ScalarValue value = scalar_from_literal(*lit);
-        return FastOperand{.is_column = false,
-                           .column = nullptr,
-                           .literal = value,
-                           .kind = scalar_kind_from_value(value)};
+        return FastOperand{
+            .is_column = false,
+            .column = nullptr,
+            .literal = value,
+            .kind = scalar_kind_from_value(value),
+        };
     }
     return std::nullopt;
 }
 
-static auto apply_int_op(ir::ArithmeticOp op, std::int64_t lhs, std::int64_t rhs) -> std::int64_t {
+auto apply_int_op(ir::ArithmeticOp op, std::int64_t lhs, std::int64_t rhs) -> std::int64_t {
     switch (op) {
         case ir::ArithmeticOp::Add:
             return lhs + rhs;
@@ -97,7 +92,7 @@ static auto apply_int_op(ir::ArithmeticOp op, std::int64_t lhs, std::int64_t rhs
     return 0;
 }
 
-static auto apply_double_op(ir::ArithmeticOp op, double lhs, double rhs) -> double {
+auto apply_double_op(ir::ArithmeticOp op, double lhs, double rhs) -> double {
     switch (op) {
         case ir::ArithmeticOp::Add:
             return lhs + rhs;
@@ -113,7 +108,7 @@ static auto apply_double_op(ir::ArithmeticOp op, double lhs, double rhs) -> doub
     return 0.0;
 }
 
-static auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
+auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_t {
     if (!op.is_column) {
         if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
             return *int_value;
@@ -141,7 +136,7 @@ static auto get_int_value(const FastOperand& op, std::size_t row) -> std::int64_
     invariant_violation("get_int_value: unexpected operand column type");
 }
 
-static auto get_double_value(const FastOperand& op, std::size_t row) -> double {
+auto get_double_value(const FastOperand& op, std::size_t row) -> double {
     if (!op.is_column) {
         if (const auto* int_value = std::get_if<std::int64_t>(&op.literal)) {
             return static_cast<double>(*int_value);
@@ -169,8 +164,8 @@ static auto get_double_value(const FastOperand& op, std::size_t row) -> double {
     invariant_violation("get_double_value: unexpected operand column type");
 }
 
-static auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_t rows,
-                                   ExprType output_kind, const ScalarRegistry* scalars)
+auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_t rows,
+                            ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
     const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
     if (bin == nullptr) {
@@ -327,12 +322,16 @@ static auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std
     return std::nullopt;
 }
 
+}  // namespace
+
 // Pure double→double row-wise math builtins (sqrt/log/exp/trig + the
 // type-preserving abs/floor/ceil/trunc when applied to a Double). Looked up by
 // name so they can be compiled into the no-variant numeric fast path instead of
 // the per-row scalar registry. Returns nullptr for names not in this set.
 using UnaryDoubleFn = double (*)(double);
-static auto lookup_unary_double_fn(std::string_view name) -> UnaryDoubleFn {
+namespace {
+
+auto lookup_unary_double_fn(std::string_view name) -> UnaryDoubleFn {
     static const std::unordered_map<std::string_view, UnaryDoubleFn> table = {
         {"sqrt", [](double x) { return std::sqrt(x); }},
         {"log", [](double x) { return std::log(x); }},
@@ -360,7 +359,7 @@ static auto lookup_unary_double_fn(std::string_view name) -> UnaryDoubleFn {
 // abs/floor/ceil/trunc preserve the argument type (Int stays Int); only these
 // may take an Int argument on the fast path. The transcendentals always widen
 // to Double, so an Int argument is cast.
-static auto unary_fn_is_type_preserving(std::string_view name) -> bool {
+auto unary_fn_is_type_preserving(std::string_view name) -> bool {
     return name == "abs" || name == "floor" || name == "ceil" || name == "trunc";
 }
 
@@ -392,7 +391,7 @@ struct NumericUpdateNode {
 
 // round(x, mode) → Int64. mode is a bare identifier; resolve it to a kernel at
 // compile time. Mirrors apply_round() exactly. Returns nullptr for bad modes.
-static auto lookup_round_int_fn(std::string_view mode) -> std::int64_t (*)(double) {
+auto lookup_round_int_fn(std::string_view mode) -> std::int64_t (*)(double) {
     if (mode == "nearest") {
         return [](double v) {
             return static_cast<std::int64_t>(std::llround(v));
@@ -421,9 +420,9 @@ static auto lookup_round_int_fn(std::string_view mode) -> std::int64_t (*)(doubl
     return nullptr;
 }
 
-static auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
-                                            const ScalarRegistry* scalars,
-                                            std::vector<NumericUpdateNode>& nodes)
+auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
+                                     const ScalarRegistry* scalars,
+                                     std::vector<NumericUpdateNode>& nodes)
     -> std::optional<std::uint32_t> {
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
         auto left = try_compile_numeric_update_expr(*bin->left, input, scalars, nodes);
@@ -561,11 +560,11 @@ static auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& i
     return static_cast<std::uint32_t>(nodes.size() - 1);
 }
 
-static auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes,
-                                       std::uint32_t idx, std::size_t row) -> double;
+auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
+                                std::size_t row) -> double;
 
-static auto eval_numeric_update_int(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
-                                    std::size_t row) -> std::int64_t {
+auto eval_numeric_update_int(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
+                             std::size_t row) -> std::int64_t {
     const auto& node = nodes[idx];
     switch (node.kind) {
         case NumericUpdateNode::Kind::IntColumn:
@@ -640,8 +639,8 @@ auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std
 // mixed int/double clip or a nested pmin(pmax(...)) falls through to the generic
 // NumericUpdateNode tree-walk. The compare order (`b < a ? b : a`) matches the
 // scalar pmin builtin for NaN/tie parity.
-static auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size_t rows,
-                                    ExprType output_kind, const ScalarRegistry* scalars)
+auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size_t rows,
+                             ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     if (call == nullptr) {
@@ -700,6 +699,8 @@ static auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, st
     return std::nullopt;
 }
 
+}  // namespace
+
 // Vectorised transcendentals via libmvec — the same mechanism zorro uses for the
 // RNG normal/exponential paths. Fills dst[i] = fn(src[i]) in 4-wide AVX2 chunks +
 // a scalar tail, ~5–10× the scalar libm tree-walk. Returns false (caller falls
@@ -708,8 +709,10 @@ static auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, st
 #if defined(__AVX2__) && defined(ZORRO_USE_LIBMVEC)
 // glibc AVX2 packed-double symbols (one arg). Every name below is also a
 // registered scalar builtin, so the SIMD body and the scalar tail/fallback agree.
+// NOLINTBEGIN(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) — these
+// are glibc's fixed vector-ABI symbol names; the spelling is not ours to choose.
 extern "C" {
-__m256d _ZGVdN4v_log(__m256d) noexcept;
+
 __m256d _ZGVdN4v_log2(__m256d) noexcept;
 __m256d _ZGVdN4v_log10(__m256d) noexcept;
 __m256d _ZGVdN4v_exp(__m256d) noexcept;
@@ -723,29 +726,38 @@ __m256d _ZGVdN4v_sinh(__m256d) noexcept;
 __m256d _ZGVdN4v_cosh(__m256d) noexcept;
 __m256d _ZGVdN4v_tanh(__m256d) noexcept;
 }
+// NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
+namespace {
+
 struct SimdKernel {
     std::string_view name;
     __m256d (*vec)(__m256d) noexcept;  // 4-wide AVX2 body
     double (*scalar)(double);          // matching libm scalar for the tail
 };
+
+}  // namespace
 // Non-capturing lambdas decay to function pointers; std::log etc. are overloaded,
 // so wrap each to pin the double overload without an explicit cast per row.
-const std::array<SimdKernel, 13> kSimdKernels = {{
-    {"log", _ZGVdN4v_log, [](double x) { return std::log(x); }},
-    {"log2", _ZGVdN4v_log2, [](double x) { return std::log2(x); }},
-    {"log10", _ZGVdN4v_log10, [](double x) { return std::log10(x); }},
-    {"exp", _ZGVdN4v_exp, [](double x) { return std::exp(x); }},
-    {"sin", _ZGVdN4v_sin, [](double x) { return std::sin(x); }},
-    {"cos", _ZGVdN4v_cos, [](double x) { return std::cos(x); }},
-    {"tan", _ZGVdN4v_tan, [](double x) { return std::tan(x); }},
-    {"asin", _ZGVdN4v_asin, [](double x) { return std::asin(x); }},
-    {"acos", _ZGVdN4v_acos, [](double x) { return std::acos(x); }},
-    {"atan", _ZGVdN4v_atan, [](double x) { return std::atan(x); }},
-    {"sinh", _ZGVdN4v_sinh, [](double x) { return std::sinh(x); }},
-    {"cosh", _ZGVdN4v_cosh, [](double x) { return std::cosh(x); }},
-    {"tanh", _ZGVdN4v_tanh, [](double x) { return std::tanh(x); }},
-}};
-static auto find_simd_kernel(std::string_view name) -> const SimdKernel* {
+const std::array<SimdKernel, 13> kSimdKernels = {
+    {
+        {"log", _ZGVdN4v_log, [](double x) { return std::log(x); }},
+        {"log2", _ZGVdN4v_log2, [](double x) { return std::log2(x); }},
+        {"log10", _ZGVdN4v_log10, [](double x) { return std::log10(x); }},
+        {"exp", _ZGVdN4v_exp, [](double x) { return std::exp(x); }},
+        {"sin", _ZGVdN4v_sin, [](double x) { return std::sin(x); }},
+        {"cos", _ZGVdN4v_cos, [](double x) { return std::cos(x); }},
+        {"tan", _ZGVdN4v_tan, [](double x) { return std::tan(x); }},
+        {"asin", _ZGVdN4v_asin, [](double x) { return std::asin(x); }},
+        {"acos", _ZGVdN4v_acos, [](double x) { return std::acos(x); }},
+        {"atan", _ZGVdN4v_atan, [](double x) { return std::atan(x); }},
+        {"sinh", _ZGVdN4v_sinh, [](double x) { return std::sinh(x); }},
+        {"cosh", _ZGVdN4v_cosh, [](double x) { return std::cosh(x); }},
+        {"tanh", _ZGVdN4v_tanh, [](double x) { return std::tanh(x); }},
+    },
+};
+namespace {
+
+auto find_simd_kernel(std::string_view name) -> const SimdKernel* {
     for (const auto& k : kSimdKernels) {
         if (k.name == name) {
             return &k;
@@ -753,8 +765,8 @@ static auto find_simd_kernel(std::string_view name) -> const SimdKernel* {
     }
     return nullptr;
 }
-static auto simd_transcendental(std::string_view name, const double* src, double* dst,
-                                std::size_t n) -> bool {
+auto simd_transcendental(std::string_view name, const double* src, double* dst, std::size_t n)
+    -> bool {
     const SimdKernel* k = find_simd_kernel(name);
     if (k == nullptr) {
         return false;
@@ -770,9 +782,11 @@ static auto simd_transcendental(std::string_view name, const double* src, double
 }
 // True iff simd_transcendental has a kernel for `name` on this build — lets the
 // unary fast path gate on it before materialising the argument.
-static auto simd_transcendental_supported(std::string_view name) -> bool {
+auto simd_transcendental_supported(std::string_view name) -> bool {
     return find_simd_kernel(name) != nullptr;
 }
+
+}  // namespace
 #else
 auto simd_transcendental(std::string_view, const double*, double*, std::size_t) -> bool {
     return false;
@@ -790,8 +804,10 @@ auto simd_transcendental_supported(std::string_view) -> bool {
 // TU-wide (which would pessimize the round→int64 loops). Bit-identical to
 // std::sqrt for finite inputs; sqrt(<0) is NaN either way, only errno differs,
 // which ibex never reads after a math builtin.
-#if defined(__AVX2__)
-static void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
+#ifdef __AVX2__
+namespace {
+
+void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
     std::size_t i = 0;
     for (; i + 4 <= n; i += 4) {
         _mm256_storeu_pd(dst + i, _mm256_sqrt_pd(_mm256_loadu_pd(src + i)));
@@ -800,6 +816,8 @@ static void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
         dst[i] = std::sqrt(src[i]);
     }
 }
+
+}  // namespace
 #else
 void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
     for (std::size_t i = 0; i < n; ++i) {
@@ -810,9 +828,8 @@ void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
 
 // Forward declaration: try_fast_update_unary materialises a computed log/exp
 // argument through the full numeric fast path, which is defined just below it.
-auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
-                                  ExprType output_kind, const ScalarRegistry* scalars)
-    -> std::optional<ColumnValue>;
+
+namespace {
 
 // SIMD fast path for the hot unary-over-column shapes: the auto-vectorisable
 // double→double ops (sqrt/abs/floor/ceil/trunc) directly over a Double column,
@@ -821,8 +838,8 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std:
 // loop keeps each body a direct, inlinable kernel (vsqrtpd/vandpd/vroundpd) or a
 // libmvec chunk. Remaining transcendentals (trig/hyperbolic) fall through to the
 // scalar tree-walk.
-static auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t rows,
-                                  ExprType output_kind, const ScalarRegistry* scalars)
+auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t rows,
+                           ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     if (call == nullptr || !call->named_args.empty()) {
@@ -933,6 +950,8 @@ static auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std:
     return std::nullopt;
 }
 
+}  // namespace
+
 auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
                                   ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
@@ -1031,7 +1050,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 continue;
             }
             if (is_fill_func(call->callee)) {
-                auto res = [&]() -> std::expected<FillResult, std::string> {
+                auto res = [&] -> std::expected<FillResult, std::string> {
                     if (call->callee == "fill_null") {
                         return eval_fill_null(*call, output);
                     }
@@ -1399,7 +1418,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 continue;
             }
             if (is_fill_func(call->callee)) {
-                auto res = [&]() -> std::expected<FillResult, std::string> {
+                auto res = [&] -> std::expected<FillResult, std::string> {
                     if (call->callee == "fill_null") {
                         return eval_fill_null(*call, output);
                     }
@@ -1494,9 +1513,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             if (!res) {
                 return std::unexpected(res.error());
             }
-            ColumnValue col = std::holds_alternative<ColumnValue>(res->data)
-                                  ? std::move(std::get<ColumnValue>(res->data))
-                                  : *std::get<const ColumnValue*>(res->data);
+            ColumnValue col;
+            if (auto* v = std::get_if<ColumnValue>(&res->data)) {
+                col = std::move(*v);
+            } else {
+                col = *std::get<const ColumnValue*>(res->data);
+            }
             if (const auto* v = res->get_validity()) {
                 output.add_column(field.alias, std::move(col), *v);
             } else {
@@ -1544,7 +1566,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             std::visit(
                 [&](auto& col) {
                     using ColType = std::decay_t<decltype(col)>;
-                    using ValueType = typename ColType::value_type;
+                    using ValueType = ColType::value_type;
                     if constexpr (std::is_same_v<ValueType, std::int64_t>) {
                         if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
                             col.push_back(*int_value);
@@ -1802,7 +1824,7 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         sub.time_index = input.time_index;
 
         std::vector<ir::FieldSpec> pending_row_fields;
-        auto flush_pending = [&]() -> std::expected<void, std::string> {
+        auto flush_pending = [&] -> std::expected<void, std::string> {
             if (pending_row_fields.empty()) {
                 return {};
             }

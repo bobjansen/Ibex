@@ -3,14 +3,7 @@
 // head/tail selection.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
-#include <ibex/ir/expr_predicates.hpp>
-#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/rng.hpp>
-#include <ibex/runtime/safe_arith.hpp>
-#include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -48,9 +41,12 @@ namespace ibex::runtime {
 // must already hold a valid permutation of [0, rows) — passing iota gives a sort
 // from scratch, passing an existing order makes this a stable re-sort by a new
 // key (the building block for multi-key LSD). Keys are consumed.
+namespace {
+
 template <typename Idx>
-static void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx,
-                              std::size_t rows) {
+
+void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& idx,
+                       std::size_t rows) {
     // Build all 8 byte-histograms in one sequential scan.
     std::array<std::array<std::size_t, 256>, 8> hists{};
     for (std::size_t i = 0; i < rows; ++i) {
@@ -110,14 +106,20 @@ static void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<I
         idx = std::move(*src_i);
 }
 
+}  // namespace
+
+namespace {
+
 template <typename Idx>
-static auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows)
-    -> std::vector<Idx> {
+
+auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> std::vector<Idx> {
     std::vector<Idx> idx(rows);
     std::iota(idx.begin(), idx.end(), Idx{0});
     radix_sort_by_key(std::move(src_keys), idx, rows);
     return idx;
 }
+
+}  // namespace
 
 // Dispatch to 32-bit indices for tables that fit, 64-bit otherwise.
 using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64_t>>;
@@ -133,8 +135,11 @@ auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows) -> So
 // sort on the same keys with ties broken by original row order. Each key is
 // gathered into the current index order first so the radix scatter reads
 // sequentially.
+namespace {
+
 template <typename Idx>
-static auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::size_t rows)
+
+auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::size_t rows)
     -> std::vector<Idx> {
     std::vector<Idx> idx(rows);
     std::iota(idx.begin(), idx.end(), Idx{0});
@@ -147,6 +152,8 @@ static auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes
     }
     return idx;
 }
+
+}  // namespace
 
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     -> std::expected<Table, std::string> {
@@ -322,7 +329,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                     return std::nullopt;
             }
         }
-        std::sort(distinct.begin(), distinct.end());
+        std::ranges::sort(distinct);
         for (std::uint64_t r = 0; r < distinct.size(); ++r)
             code_of[distinct[r]] = r;
         std::vector<std::uint64_t> code(rows);
@@ -427,7 +434,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         return lhs < rhs;
     };
     std::vector<std::size_t> idx(rows);
-    std::iota(idx.begin(), idx.end(), 0);
+    std::ranges::iota(idx, 0);
     pdqsort(idx.begin(), idx.end(), compare_row);
     return gather_rows(input, idx, &resolved_keys);
 }
@@ -454,7 +461,7 @@ auto head_table(const Table& input, std::size_t count, const std::vector<ir::Col
 
     if (group_by.empty()) {
         std::vector<std::size_t> idx(std::min(rows, count));
-        std::iota(idx.begin(), idx.end(), 0);
+        std::ranges::iota(idx, 0);
         return gather_rows(input, idx);
     }
 
@@ -510,7 +517,7 @@ auto tail_table(const Table& input, std::size_t count, const std::vector<ir::Col
         const std::size_t keep = std::min(rows, count);
         std::vector<std::size_t> idx(keep);
         const std::size_t start = rows - keep;
-        std::iota(idx.begin(), idx.end(), start);
+        std::ranges::iota(idx, start);
         return gather_rows(input, idx);
     }
 

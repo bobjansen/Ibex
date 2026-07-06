@@ -1,5 +1,9 @@
 add_library(ibex_runtime STATIC
+    aggregate.cpp
+    chunked.cpp
+    expr.cpp
     extern_registry.cpp
+    filter.cpp
     interpreter.cpp
     join.cpp
     model.cpp
@@ -8,7 +12,10 @@ add_library(ibex_runtime STATIC
     reshape.cpp
     rng.cpp
     runtime_internal.cpp
+    sort.cpp
     table_format.cpp
+    update.cpp
+    window.cpp
 )
 add_library(Ibex::runtime ALIAS ibex_runtime)
 

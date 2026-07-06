@@ -2,14 +2,7 @@
 // windows (apply_rolling_func) and timeframe resampling (resample_table).
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
-#include <ibex/ir/expr_predicates.hpp>
-#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/rng.hpp>
-#include <ibex/runtime/safe_arith.hpp>
-#include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -20,8 +13,6 @@
 #include <ctime>
 #include <limits>
 #include <optional>
-#include <pdqsort.h>
-#include <robin_hood.h>
 #include <set>
 #include <type_traits>
 #include <unordered_map>
@@ -35,10 +26,11 @@
 
 namespace ibex::runtime {
 
+namespace {
+
 // Find the first row index lo in [0, row] where time[lo] >= time[row] - duration.
 // The time index column must be Timestamp or Date and sorted ascending.
-static auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration duration)
-    -> std::size_t {
+auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration duration) -> std::size_t {
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(&time_col)) {
         std::int64_t threshold = (*ts_col)[row].nanos - duration.count();
         std::size_t lo = 0;
@@ -70,6 +62,8 @@ static auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration
     }
     return lo;
 }
+
+}  // namespace
 
 // Compute a rolling aggregate column over a time-indexed window.
 // The table must be a TimeFrame (time_index set, sorted ascending).
@@ -155,7 +149,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     if (call.callee == "rolling_mean") {
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
-                using T = typename std::decay_t<decltype(col)>::value_type;
+                using T = std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_mean: column must be numeric (Int or Float)");
                 } else {
@@ -168,10 +162,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;  // NULL: skip, payload undefined
-                        double v = static_cast<double>(col[j]);
-                        if (std::isnan(v))
+                        auto v = static_cast<double>(col[j]);
+                        if (std::isnan(v)) {
                             ++nan_cnt;
-                        else {
+                        } else {
                             sum += v;
                             ++val_cnt;
                         }
@@ -179,10 +173,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        double v = static_cast<double>(col[j]);
-                        if (std::isnan(v))
+                        auto v = static_cast<double>(col[j]);
+                        if (std::isnan(v)) {
                             --nan_cnt;
-                        else {
+                        } else {
                             sum -= v;
                             --val_cnt;
                         }
@@ -216,7 +210,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using ColT = std::decay_t<decltype(col)>;
-                using T = typename ColT::value_type;
+                using T = ColT::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_sum: column must be numeric (Int or Float)");
                 } else {
@@ -280,7 +274,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     if (call.callee == "rolling_median") {
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
-                using T = typename std::decay_t<decltype(col)>::value_type;
+                using T = std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_median: column must be numeric (Int or Float)");
                 } else {
@@ -297,7 +291,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::multiset<double> hi;  // upper half  — min is begin()
 
                     // Restore invariant (1) after a single insert or erase.
-                    auto rebalance = [&]() {
+                    auto rebalance = [&] {
                         if (lo.size() > hi.size() + 1) {
                             hi.insert(*lo.rbegin());
                             lo.erase(std::prev(lo.end()));
@@ -337,7 +331,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        double v = static_cast<double>(col[j]);
+                        auto v = static_cast<double>(col[j]);
                         if (std::isnan(v))
                             ++nan_cnt;
                         else
@@ -346,7 +340,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        double v = static_cast<double>(col[j]);
+                        auto v = static_cast<double>(col[j]);
                         if (std::isnan(v))
                             --nan_cnt;
                         else
@@ -382,7 +376,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     if (call.callee == "rolling_std") {
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
-                using T = typename std::decay_t<decltype(col)>::value_type;
+                using T = std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_std: column must be numeric (Int or Float)");
                 } else {
@@ -403,7 +397,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        double x = static_cast<double>(col[j]);
+                        auto x = static_cast<double>(col[j]);
                         if (std::isnan(x)) {
                             ++nan_cnt;
                             return;
@@ -416,7 +410,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        double y = static_cast<double>(col[j]);
+                        auto y = static_cast<double>(col[j]);
                         if (std::isnan(y)) {
                             --nan_cnt;
                             return;
@@ -424,7 +418,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         double mean_old = mean;
                         --cnt;
                         mean = cnt == 0 ? 0.0
-                                        : ((static_cast<double>(cnt) + 1.0) * mean_old - y) /
+                                        : (((static_cast<double>(cnt) + 1.0) * mean_old) - y) /
                                               static_cast<double>(cnt);
                         m2 -= (y - mean_old) * (y - mean);
                     };
@@ -477,7 +471,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         }
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
-                using T = typename std::decay_t<decltype(col)>::value_type;
+                using T = std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_ewma: column must be numeric (Int or Float)");
                 } else {
@@ -547,7 +541,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         }
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
-                using T = typename std::decay_t<decltype(col)>::value_type;
+                using T = std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected(
                         "rolling_quantile: column must be numeric (Int or Float)");
@@ -564,7 +558,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         for (std::size_t j = lo; j <= i; ++j) {
                             if (!valid_at(j))
                                 continue;
-                            double v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(col[j]);
                             if (std::isnan(v))
                                 has_nan = true;
                             else
@@ -581,10 +575,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                             out_valid->set(i, false);
                             continue;
                         }
-                        std::sort(window.begin(), window.end());
+                        std::ranges::sort(window);
                         std::size_t n = window.size();
                         double idx = p * static_cast<double>(n - 1);
-                        std::size_t idx_lo = static_cast<std::size_t>(idx);
+                        auto idx_lo = static_cast<std::size_t>(idx);
                         std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
                         double frac = idx - static_cast<double>(idx_lo);
                         result[i] = window[idx_lo] + (frac * (window[idx_hi] - window[idx_lo]));
@@ -598,7 +592,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     if (call.callee == "rolling_skew") {
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
-                using T = typename std::decay_t<decltype(col)>::value_type;
+                using T = std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_skew: column must be numeric (Int or Float)");
                 } else {
@@ -613,7 +607,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         for (std::size_t j = lo; j <= i; ++j) {
                             if (!valid_at(j))
                                 continue;
-                            double v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(col[j]);
                             if (std::isnan(v))
                                 has_nan = true;
                             else
@@ -663,7 +657,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
     if (call.callee == "rolling_kurtosis") {
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
-                using T = typename std::decay_t<decltype(col)>::value_type;
+                using T = std::decay_t<decltype(col)>::value_type;
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected(
                         "rolling_kurtosis: column must be numeric (Int or Float)");
@@ -679,7 +673,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         for (std::size_t j = lo; j <= i; ++j) {
                             if (!valid_at(j))
                                 continue;
-                            double v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(col[j]);
                             if (std::isnan(v))
                                 has_nan = true;
                             else
@@ -716,10 +710,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                         if (m2 == 0.0) {
                             result[i] = 0.0;
                         } else {
-                            double dn = static_cast<double>(n);
+                            auto dn = static_cast<double>(n);
                             // Fisher excess kurtosis (unbiased, matches scipy/pandas):
                             result[i] = (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
-                                        ((dn + 1.0) * dn * m4 / (m2 * m2) - 3.0 * (dn - 1.0));
+                                        (((dn + 1.0) * dn * m4 / (m2 * m2)) - (3.0 * (dn - 1.0)));
                         }
                     }
                     return ComputedColumn{std::move(result), std::move(out_valid)};
@@ -737,7 +731,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                           std::is_same_v<ColT, Column<std::string>>) {
                 return std::unexpected(call.callee + ": string columns not supported");
             } else {
-                using T = typename ColT::value_type;
+                using T = ColT::value_type;
                 ColT result;
                 result.resize(rows);
                 std::optional<ValidityBitmap> out_valid;
@@ -812,7 +806,7 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
     // reduce with tight (auto-vectorising) loops — far cheaper than the generic
     // row-wise aggregate. Falls through for extra group-by, complex aggregates
     // (median/stddev/...), nullable inputs, or non-numeric columns.
-    auto simple_resample = [&]() -> std::optional<std::expected<Table, std::string>> {
+    auto simple_resample = [&] -> std::optional<std::expected<Table, std::string>> {
         if (!extra_group_by.empty() || rows == 0) {
             return std::nullopt;
         }
@@ -880,7 +874,7 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
             const ColumnValue& cv = *input.find_entry(agg.column.name)->column;
             std::visit(
                 [&](const auto& src) {
-                    using T = typename std::decay_t<decltype(src)>::value_type;
+                    using T = std::decay_t<decltype(src)>::value_type;
                     if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
                         const bool to_double = (agg.func == ir::AggFunc::Mean);
                         if (to_double) {

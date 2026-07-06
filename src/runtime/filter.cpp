@@ -5,36 +5,21 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/ir/expr_predicates.hpp>
-#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
-#include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
 #include <bit>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
-#include <limits>
-#include <mutex>
-#include <numeric>
 #include <optional>
-#include <pdqsort.h>
-#include <random>
-#include <robin_hood.h>
-#include <set>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -89,15 +74,16 @@ auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_
     return out;
 }
 
-static auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept
-    -> std::uint64_t {
-#if defined(__BMI2__)
+namespace {
+
+auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept -> std::uint64_t {
+#ifdef __BMI2__
     return _pext_u64(values, mask);
 #else
     std::uint64_t packed = 0;
     unsigned out_bit = 0;
     while (mask != 0) {
-        const unsigned bit = static_cast<unsigned>(std::countr_zero(mask));
+        const auto bit = static_cast<unsigned>(std::countr_zero(mask));
         packed |= ((values >> bit) & std::uint64_t{1}) << out_bit;
         ++out_bit;
         mask &= (mask - 1);
@@ -107,15 +93,15 @@ static auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) no
 }
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-static auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
-                                    Column<bool>::word_type* dst_words,
-                                    std::size_t& out_bit) noexcept -> void {
+auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
+                             Column<bool>::word_type* dst_words, std::size_t& out_bit) noexcept
+    -> void {
     if (count == 0) {
         return;
     }
     constexpr std::size_t kBitsPerWord = sizeof(Column<bool>::word_type) * 8;
     const std::size_t dst_word = out_bit / kBitsPerWord;
-    const unsigned shift = static_cast<unsigned>(out_bit % kBitsPerWord);
+    const auto shift = static_cast<unsigned>(out_bit % kBitsPerWord);
     dst_words[dst_word] |= packed << shift;
     if (shift != 0 && count > kBitsPerWord - shift) {
         dst_words[dst_word + 1] |= packed >> (kBitsPerWord - shift);
@@ -123,8 +109,8 @@ static auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
     out_bit += count;
 }
 
-static auto pack_mask_word_scalar(const std::uint8_t* mp, const std::uint8_t* vp,
-                                  std::size_t lim) noexcept -> std::uint64_t {
+auto pack_mask_word_scalar(const std::uint8_t* mp, const std::uint8_t* vp, std::size_t lim) noexcept
+    -> std::uint64_t {
     std::uint64_t bits = 0;
     for (std::size_t i = 0; i < lim; ++i) {
         const bool keep = vp ? ((mp[i] & vp[i]) != 0) : (mp[i] != 0);
@@ -133,8 +119,12 @@ static auto pack_mask_word_scalar(const std::uint8_t* mp, const std::uint8_t* vp
     return bits;
 }
 
-#if defined(__AVX2__)
-static auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
+}  // namespace
+
+#ifdef __AVX2__
+namespace {
+
+auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp));
     const __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp + 32));
@@ -144,6 +134,8 @@ static auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_
         static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_cmpgt_epi8(hi, zero)));
     return static_cast<std::uint64_t>(lo_bits) | (static_cast<std::uint64_t>(hi_bits) << 32);
 }
+
+}  // namespace
 #endif
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
@@ -182,8 +174,10 @@ auto collect_expr_validity(const ir::Expr& expr, const Table& table, std::size_t
     return result;
 }
 
+namespace {
+
 // Flip a comparison operator (swap lhs and rhs).
-static auto flip_cmp(ir::CompareOp op) -> ir::CompareOp {
+auto flip_cmp(ir::CompareOp op) -> ir::CompareOp {
     switch (op) {
         case ir::CompareOp::Lt:
             return ir::CompareOp::Gt;
@@ -198,10 +192,15 @@ static auto flip_cmp(ir::CompareOp op) -> ir::CompareOp {
     }
 }
 
+}  // namespace
+
 // Element-wise arithmetic: result type = common_type<L, R>.
+namespace {
+
 template <typename L, typename R>
-static auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict rp,
-                       std::common_type_t<L, R>* __restrict dp, std::size_t n) -> void {
+
+auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict rp,
+                std::common_type_t<L, R>* __restrict dp, std::size_t n) -> void {
     using Out = std::common_type_t<L, R>;
     switch (op) {
         case ir::ArithmeticOp::Add:
@@ -234,6 +233,8 @@ static auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __r
             break;
     }
 }
+
+}  // namespace
 
 // Dispatch arith_into over all numeric column-type combinations.
 auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n)
@@ -285,11 +286,14 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& r
 
 // Element-wise comparison between a column and a scalar literal.
 // The scalar is hoisted out of the loop — no broadcast allocation.
+namespace {
+
 template <typename ColT, typename LitT>
-static auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict cp, LitT rv,
-                                uint8_t* __restrict mp, std::size_t n) -> void {
+
+auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict cp, LitT rv,
+                         uint8_t* __restrict mp, std::size_t n) -> void {
     using Common = std::common_type_t<ColT, LitT>;
-    const Common crv = static_cast<Common>(rv);
+    const auto crv = static_cast<Common>(rv);
     switch (op) {
         case ir::CompareOp::Eq:
             for (std::size_t i = 0; i < n; ++i)
@@ -318,9 +322,14 @@ static auto cmp_col_scalar_into(ir::CompareOp op, const ColT* __restrict cp, Lit
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <ir::CompareOp Op>
-static auto cmp_col_scalar_into_double_op(const double* __restrict cp, double rv,
-                                          uint8_t* __restrict mp, std::size_t n) -> void {
+
+auto cmp_col_scalar_into_double_op(const double* __restrict cp, double rv, uint8_t* __restrict mp,
+                                   std::size_t n) -> void {
     if constexpr (Op == ir::CompareOp::Eq) {
         for (std::size_t i = 0; i < n; ++i)
             mp[i] = cp[i] == rv;
@@ -342,8 +351,8 @@ static auto cmp_col_scalar_into_double_op(const double* __restrict cp, double rv
     }
 }
 
-static auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, double rv,
-                                       uint8_t* __restrict mp, std::size_t n) -> void {
+auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, double rv,
+                                uint8_t* __restrict mp, std::size_t n) -> void {
     switch (op) {
         case ir::CompareOp::Eq:
             cmp_col_scalar_into_double_op<ir::CompareOp::Eq>(cp, rv, mp, n);
@@ -366,10 +375,14 @@ static auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restric
     }
 }
 
+}  // namespace
+
 // Dispatch column-vs-scalar comparison over all type combinations.
 using LitVal = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
-static auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit,
-                               std::size_t n, const ValidityBitmap* validity = nullptr)
+namespace {
+
+auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit, std::size_t n,
+                        const ValidityBitmap* validity = nullptr)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
@@ -591,7 +604,7 @@ static auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const L
         if (const auto* d = std::get_if<double>(&lit)) {
             const double rhs = *d;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const double lhs = static_cast<double>(date_col->data()[idx].days);
+                const auto lhs = static_cast<double>(date_col->data()[idx].days);
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -649,7 +662,7 @@ static auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const L
         if (const auto* d = std::get_if<double>(&lit)) {
             const double rhs = *d;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const double lhs = static_cast<double>(ts_col->data()[idx].nanos);
+                const auto lhs = static_cast<double>(ts_col->data()[idx].nanos);
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -679,10 +692,15 @@ static auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const L
     return std::unexpected("filter: cannot compare string and numeric");
 }
 
+}  // namespace
+
 // Element-wise comparison between two full columns.
+namespace {
+
 template <typename L, typename R>
-static auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restrict rp,
-                     uint8_t* __restrict mp, std::size_t n) -> void {
+
+auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restrict rp,
+              uint8_t* __restrict mp, std::size_t n) -> void {
     using Common = std::common_type_t<L, R>;
     switch (op) {
         case ir::CompareOp::Eq:
@@ -713,9 +731,9 @@ static auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restri
 }
 
 // Dispatch column-vs-column comparison over all type combinations.
-static auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rhs,
-                        std::size_t n, const ValidityBitmap* lv = nullptr,
-                        const ValidityBitmap* rv = nullptr) -> std::expected<Mask, std::string> {
+auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n,
+                 const ValidityBitmap* lv = nullptr, const ValidityBitmap* rv = nullptr)
+    -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
     uint8_t* mp = result.value.data();
@@ -849,7 +867,7 @@ static auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnVa
                 break;
         }
     };
-    auto return_with_validity = [&]() -> Mask {
+    auto return_with_validity = [&] -> Mask {
         auto merged_v = merge_validity(lv, rv, n);
         result.apply_validity(merged_v ? &*merged_v : nullptr, n);
         return std::move(result);
@@ -924,7 +942,7 @@ struct NumericCmpSpec {
     double lit_dbl = 0.0;
 };
 
-static auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table)
+auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table)
     -> std::optional<NumericCmpSpec> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
     if (cmp == nullptr) {
@@ -1007,7 +1025,7 @@ struct NumericArithCmpSpec {
     double lit_dbl = 0.0;
 };
 
-static auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table)
+auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table)
     -> std::optional<NumericOperandSpec> {
     NumericOperandSpec spec{};
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
@@ -1051,7 +1069,7 @@ static auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& 
     return std::nullopt;
 }
 
-static auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table& table)
+auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table& table)
     -> std::optional<NumericArithCmpSpec> {
     const ir::BinaryExpr* bin = nullptr;
     const ir::Literal* lit = nullptr;
@@ -1101,8 +1119,13 @@ static auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const
     return std::nullopt;
 }
 
+}  // namespace
+
+namespace {
+
 template <ir::CompareOp Op, typename L, typename R>
-static auto cmp_eval(L lhs, R rhs) -> uint8_t {
+
+auto cmp_eval(L lhs, R rhs) -> uint8_t {
     using C = std::common_type_t<L, R>;
     const C l = static_cast<C>(lhs);
     const C r = static_cast<C>(rhs);
@@ -1121,20 +1144,31 @@ static auto cmp_eval(L lhs, R rhs) -> uint8_t {
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <typename T>
+
 struct NumericColumnOperand {
     const T* data = nullptr;
     [[nodiscard]] auto value(std::size_t i) const noexcept -> T { return data[i]; }
 };
 
+}  // namespace
+
+namespace {
+
 template <typename T>
+
 struct NumericLiteralOperand {
     T literal{};
-    [[nodiscard]] auto value(std::size_t) const noexcept -> T { return literal; }
+    [[nodiscard]] auto value(std::size_t /*unused*/) const noexcept -> T { return literal; }
 };
 
 template <typename Fn>
-static auto visit_numeric_operand(const NumericOperandSpec& spec, Fn&& fn) -> void {
+
+auto visit_numeric_operand(const NumericOperandSpec& spec, Fn&& fn) -> void {
     if (spec.kind == NumericSpecKind::Int64) {
         if (spec.is_lit) {
             fn(NumericLiteralOperand<std::int64_t>{spec.lit_i64});
@@ -1150,8 +1184,13 @@ static auto visit_numeric_operand(const NumericOperandSpec& spec, Fn&& fn) -> vo
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <ir::ArithmeticOp Op, typename L, typename R>
-static auto arith_eval(L lhs, R rhs) -> std::common_type_t<L, R> {
+
+auto arith_eval(L lhs, R rhs) -> std::common_type_t<L, R> {
     using Out = std::common_type_t<L, R>;
     const Out l = static_cast<Out>(lhs);
     const Out r = static_cast<Out>(rhs);
@@ -1176,17 +1215,27 @@ static auto arith_eval(L lhs, R rhs) -> std::common_type_t<L, R> {
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <ir::ArithmeticOp ArithOp, ir::CompareOp CmpOp, typename Lhs, typename Rhs, typename Lit>
-static auto numeric_arith_cmp_mask(Lhs lhs, Rhs rhs, Lit lit, uint8_t* __restrict out,
-                                   std::size_t n) -> void {
+
+auto numeric_arith_cmp_mask(Lhs lhs, Rhs rhs, Lit lit, uint8_t* __restrict out, std::size_t n)
+    -> void {
     for (std::size_t i = 0; i < n; ++i) {
         out[i] = cmp_eval<CmpOp>(arith_eval<ArithOp>(lhs.value(i), rhs.value(i)), lit);
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <ir::ArithmeticOp ArithOp, typename Lhs, typename Rhs, typename Lit>
-static auto dispatch_numeric_arith_cmp_op(ir::CompareOp cmp_op, Lhs lhs, Rhs rhs, Lit lit,
-                                          uint8_t* out, std::size_t n) -> void {
+
+auto dispatch_numeric_arith_cmp_op(ir::CompareOp cmp_op, Lhs lhs, Rhs rhs, Lit lit, uint8_t* out,
+                                   std::size_t n) -> void {
     switch (cmp_op) {
         case ir::CompareOp::Eq:
             numeric_arith_cmp_mask<ArithOp, ir::CompareOp::Eq>(lhs, rhs, lit, out, n);
@@ -1209,9 +1258,14 @@ static auto dispatch_numeric_arith_cmp_op(ir::CompareOp cmp_op, Lhs lhs, Rhs rhs
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <typename Lhs, typename Rhs, typename Lit>
-static auto dispatch_numeric_arith_op(ir::ArithmeticOp arith_op, ir::CompareOp cmp_op, Lhs lhs,
-                                      Rhs rhs, Lit lit, uint8_t* out, std::size_t n) -> void {
+
+auto dispatch_numeric_arith_op(ir::ArithmeticOp arith_op, ir::CompareOp cmp_op, Lhs lhs, Rhs rhs,
+                               Lit lit, uint8_t* out, std::size_t n) -> void {
     switch (arith_op) {
         case ir::ArithmeticOp::Add:
             dispatch_numeric_arith_cmp_op<ir::ArithmeticOp::Add>(cmp_op, lhs, rhs, lit, out, n);
@@ -1231,8 +1285,8 @@ static auto dispatch_numeric_arith_op(ir::ArithmeticOp arith_op, ir::CompareOp c
     }
 }
 
-static auto dispatch_numeric_arith_cmp_kernel(const NumericArithCmpSpec& spec, uint8_t* out,
-                                              std::size_t n) -> void {
+auto dispatch_numeric_arith_cmp_kernel(const NumericArithCmpSpec& spec, uint8_t* out, std::size_t n)
+    -> void {
     visit_numeric_operand(spec.lhs, [&](auto lhs) {
         visit_numeric_operand(spec.rhs, [&](auto rhs) {
             if (spec.lit_is_int) {
@@ -1246,10 +1300,15 @@ static auto dispatch_numeric_arith_cmp_kernel(const NumericArithCmpSpec& spec, u
     });
 }
 
+}  // namespace
+
+namespace {
+
 template <ir::CompareOp LOp, ir::CompareOp ROp, bool UseAnd, typename L, typename LLit, typename R,
           typename RLit>
-static auto cmp_pair_mask(const L* __restrict lhs_data, LLit lhs_lit, const R* __restrict rhs_data,
-                          RLit rhs_lit, uint8_t* __restrict out, std::size_t n) -> void {
+
+auto cmp_pair_mask(const L* __restrict lhs_data, LLit lhs_lit, const R* __restrict rhs_data,
+                   RLit rhs_lit, uint8_t* __restrict out, std::size_t n) -> void {
     for (std::size_t i = 0; i < n; ++i) {
         const uint8_t l = cmp_eval<LOp>(lhs_data[i], lhs_lit);
         const uint8_t r = cmp_eval<ROp>(rhs_data[i], rhs_lit);
@@ -1257,10 +1316,14 @@ static auto cmp_pair_mask(const L* __restrict lhs_data, LLit lhs_lit, const R* _
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <bool UseAnd, typename L, typename LLit, typename R, typename RLit>
-static auto dispatch_cmp_pair_ops(ir::CompareOp lop, ir::CompareOp rop, const L* lhs_data,
-                                  LLit lhs_lit, const R* rhs_data, RLit rhs_lit, uint8_t* out,
-                                  std::size_t n) -> void {
+
+auto dispatch_cmp_pair_ops(ir::CompareOp lop, ir::CompareOp rop, const L* lhs_data, LLit lhs_lit,
+                           const R* rhs_data, RLit rhs_lit, uint8_t* out, std::size_t n) -> void {
     auto dispatch_right = [&](auto left_op_tag) {
         constexpr ir::CompareOp LOp = decltype(left_op_tag)::value;
         auto apply_right = [&](auto right_op_tag) {
@@ -1310,10 +1373,15 @@ static auto dispatch_cmp_pair_ops(ir::CompareOp lop, ir::CompareOp rop, const L*
     }
 }
 
+}  // namespace
+
+namespace {
+
 template <bool UseAnd>
-static auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
-                                             const NumericCmpSpec& rhs_spec, uint8_t* out,
-                                             std::size_t n) -> void {
+
+auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
+                                      const NumericCmpSpec& rhs_spec, uint8_t* out, std::size_t n)
+    -> void {
     auto run_rhs = [&](auto* lhs_data, auto lhs_lit) {
         auto apply_rhs = [&](auto* rhs_data, auto rhs_lit) {
             dispatch_cmp_pair_ops<UseAnd>(lhs_spec.op, rhs_spec.op, lhs_data, lhs_lit, rhs_data,
@@ -1340,42 +1408,39 @@ static auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
     }
 }
 
+}  // namespace
+
 // Forward declarations: the vectorized predicate evaluator below dispatches the
 // same way the select/update field evaluator does, rather than reimplementing
 // functions. Row-wise calls go to evaluate_field_column (which consults the one
 // scalar-function registry: casts, ceil/floor/trunc, round, math, date parts,
 // pmin/pmax, is_nan); the column-level lag/lead go to eval_lag_lead_column (the
 // same helper select/update uses). Neither is duplicated here.
-auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
-                           const ExternRegistry* externs)
-    -> std::expected<ColumnValue, std::string>;
-auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,
-                          const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<LagLeadResult, std::string>;
+
 // Vectorized RNG column generator (rand_normal/rand_uniform/...); eval_value_vec
 // treats an RNG call as a column leaf so RNG can be nested inside arithmetic.
-auto apply_rng_func(const ir::CallExpr& call, std::size_t rows)
-    -> std::expected<ColumnValue, std::string>;
+
 // Boolean predicate evaluator (comparisons, logical, is_null). eval_value_vec
 // routes boolean-producing nodes here so a Bool result can be used in value
 // position (e.g. `update { flag = x > 5 }`, `update { miss = is_null(x) }`).
-auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
-                  std::size_t n) -> std::expected<Mask, std::string>;
+
 // True if a field expression must go through the vectorized, validity-aware
 // path (a boolean node, coalesce, or a non-row-local call — RNG / lag / lead —
 // anywhere in the tree). Defined far below; eval_value_vec needs it to decide
 // which arguments of a scalar call to materialize.
-auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool;
+
+namespace {
+
 // Evaluate a scalar call (abs, sqrt, casts, …) whose arguments nest a
 // non-row-local sub-expression (RNG / lag / lead): materialize those arguments
 // into columns, then apply the scalar function over them. Defined after
 // eval_value_vec (it recurses into it).
-static auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
-                                     const ScalarRegistry* scalars, std::size_t n)
+auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
+                              const ScalarRegistry* scalars, std::size_t n)
     -> std::expected<ColResult, std::string>;
 
 // Turn a boolean Mask into a `Column<Bool>` ColResult (3VL nulls -> validity).
-static inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
+inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
     Column<bool> col;
     col.resize(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -1391,6 +1456,8 @@ static inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
     }
     return r;
 }
+
+}  // namespace
 
 // Evaluate a value sub-expression over all n rows, returning a column.
 // Returns a pointer into the table for simple column references (zero-copy),
@@ -1575,6 +1642,7 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
 // Row-local arguments (columns, literals, arithmetic, round's mode identifier)
 // are kept verbatim. The result is null wherever any materialized argument was
 // null — standard scalar null propagation.
+namespace {
 auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
                               const ScalarRegistry* scalars, std::size_t n)
     -> std::expected<ColResult, std::string> {
@@ -1594,9 +1662,12 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
         if (!c) {
             return std::unexpected(c.error());
         }
-        ColumnValue owned = std::holds_alternative<ColumnValue>(c->data)
-                                ? std::move(std::get<ColumnValue>(c->data))
-                                : *std::get<const ColumnValue*>(c->data);
+        ColumnValue owned;
+        if (auto* v = std::get_if<ColumnValue>(&c->data)) {
+            owned = std::move(*v);
+        } else {
+            owned = *std::get<const ColumnValue*>(c->data);
+        }
         const std::string name = "__ibex_nl_" + std::to_string(synth++) + "__";
         if (const auto* v = c->get_validity()) {
             for (std::size_t i = 0; i < n; ++i) {
@@ -1625,6 +1696,7 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
     }
     return res;
 }
+}  // namespace
 
 // Compute a boolean Mask for all n rows, with 3-valued logic (3VL) for nulls.
 // valid==nullopt means all rows are valid (common non-null path, zero overhead).
@@ -1762,9 +1834,11 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
         expr.node);
 }
 
-static auto filter_table_impl(const Table& input, const ir::Expr& predicate,
-                              const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
-                              const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+namespace {
+
+auto filter_table_impl(const Table& input, const ir::Expr& predicate,
+                       const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
+                       const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     const std::size_t n = input.rows();
 
     auto mask_result = compute_mask(predicate, input, scalars, n);
@@ -1784,7 +1858,7 @@ static auto filter_table_impl(const Table& input, const ir::Expr& predicate,
     for (std::size_t w = 0; w < n_words; ++w) {
         const std::size_t base = w * 64;
         const std::size_t lim = std::min<std::size_t>(64, n - base);
-#if defined(__AVX2__)
+#ifdef __AVX2__
         const std::uint64_t bits =
             (vp == nullptr && lim == 64)
                 ? pack_mask_word_avx2(mp + base)
@@ -1792,7 +1866,7 @@ static auto filter_table_impl(const Table& input, const ir::Expr& predicate,
 #else
         const std::uint64_t bits = pack_mask_word_scalar(mp + base, vp ? vp + base : nullptr, lim);
 #endif
-        const std::size_t block_kept = static_cast<std::size_t>(std::popcount(bits));
+        const auto block_kept = static_cast<std::size_t>(std::popcount(bits));
         if (row_limit != 0 && out_n + block_kept >= row_limit) {
             // Trim this block's high-order keep bits so we emit exactly
             // `row_limit - out_n` more rows and then stop.
@@ -1905,7 +1979,7 @@ static auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                                                 dst_words, out_bit);
                     }
                 } else {
-                    using T = typename ColT::value_type;
+                    using T = ColT::value_type;
                     dst->resize(out_n);
                     const T* sp = src.data();
                     T* dp = dst->data();
@@ -1943,6 +2017,8 @@ static auto filter_table_impl(const Table& input, const ir::Expr& predicate,
     normalize_time_index(output);
     return output;
 }
+
+}  // namespace
 
 auto filter_table(const Table& input, const ir::Expr& predicate, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {

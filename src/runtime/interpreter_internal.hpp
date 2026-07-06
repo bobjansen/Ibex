@@ -67,7 +67,8 @@ inline auto deref_col(const ColResult& r) -> const ColumnValue& {
             if constexpr (std::is_same_v<std::decay_t<decltype(v)>, const ColumnValue*>) {
                 return *v;
             } else {
-                return v;
+                return v;  // NOLINT(bugprone-return-const-ref-from-parameter) — rvalue overloads
+                           // are deleted below
             }
         },
         r.data);
@@ -97,7 +98,8 @@ constexpr bool is_string_like_v =
 // inlines them less aggressively than internal ones), costing ~15% on the
 // grouped-update benchmarks. Key never appears in a cross-TU function
 // signature, so per-TU distinct types are safe.
-namespace {  // NOLINT(cert-dcl59-cpp) — deliberate per-TU internal linkage, see comment above
+namespace {  // NOLINT(cert-dcl59-cpp,misc-anonymous-namespace-in-header) — deliberate per-TU
+             // internal linkage, see comment above
 
 struct Key {
     std::vector<ScalarValue> values;
@@ -160,9 +162,9 @@ inline void agg_update_stddev(AggSlot& slot, double x) {
 // Full m2/m3/m4 update for skewness/kurtosis (Pébay single-value recurrence).
 // Updates m4 and m3 before m2 because they read the pre-update accumulators.
 inline void agg_update_moments(AggSlot& slot, double x) {
-    const double n1 = static_cast<double>(slot.count);
+    const auto n1 = static_cast<double>(slot.count);
     slot.count += 1;
-    const double n = static_cast<double>(slot.count);
+    const auto n = static_cast<double>(slot.count);
     const double delta = x - slot.double_value;
     const double delta_n = delta / n;
     const double delta_n2 = delta_n * delta_n;
@@ -249,8 +251,9 @@ struct BroadcastAggregateColumn {
 struct ScalarBuiltin {
     int min_args = 1;
     int max_args = 1;  // -1 == variadic
-    std::expected<ExprType, std::string> (*infer)(std::string_view, const std::vector<ExprType>&);
-    std::expected<ExprValue, std::string> (*eval)(std::string_view, const std::vector<ExprValue>&);
+    std::expected<ExprType, std::string> (*infer)(std::string_view, const std::vector<ExprType>&){};
+    std::expected<ExprValue, std::string> (*eval)(std::string_view,
+                                                  const std::vector<ExprValue>&){};
 };
 
 // ── Inline helpers shared by per-row/per-group loops in several TUs ──────────
@@ -259,7 +262,7 @@ inline auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void
     std::visit(
         [&](auto& col) {
             using ColType = std::decay_t<decltype(col)>;
-            using ValueType = typename ColType::value_type;
+            using ValueType = ColType::value_type;
             if constexpr (std::is_same_v<ValueType, std::int64_t>) {
                 if (const auto* int_value = std::get_if<std::int64_t>(&value)) {
                     col.push_back(*int_value);
@@ -486,7 +489,7 @@ using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64
 // values flip the sign bit; for negatives flip all bits. NaNs (sign bit clear)
 // sort to the end. The transform is a bijection, so radix stays stable.
 inline auto double_to_sortable_u64(double value) -> std::uint64_t {
-    const std::uint64_t bits = std::bit_cast<std::uint64_t>(value);
+    const auto bits = std::bit_cast<std::uint64_t>(value);
     return bits ^ ((static_cast<std::uint64_t>(-static_cast<std::int64_t>(bits >> 63))) |
                    (std::uint64_t{1} << 63));
 }

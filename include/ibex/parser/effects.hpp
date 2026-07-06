@@ -6,9 +6,9 @@
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -42,13 +42,13 @@ struct CallableSummary {
 };
 
 struct EffectAnalysis {
-    std::unordered_map<std::string, CallableSummary> user_functions;
-    std::unordered_map<std::string, CallableSummary> externs;
-    std::unordered_map<std::string, CallableSummary> builtins;
+    robin_hood::unordered_map<std::string, CallableSummary> user_functions;
+    robin_hood::unordered_map<std::string, CallableSummary> externs;
+    robin_hood::unordered_map<std::string, CallableSummary> builtins;
 
     [[nodiscard]] auto find_callee(std::string_view name) const -> const CallableSummary*;
     [[nodiscard]] auto merged_callee_summaries() const
-        -> std::unordered_map<std::string, CallableSummary>;
+        -> robin_hood::unordered_map<std::string, CallableSummary>;
 };
 
 [[nodiscard]] auto effect_kind_name(EffectKind kind) -> std::string_view;

@@ -4,9 +4,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -668,8 +668,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         (std::holds_alternative<Column<std::string>>(*left_keys[0]) ||
          std::holds_alternative<Column<Categorical>>(*left_keys[0]))) {
         if (n_left < n_right) {
-            std::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
-                               std::equal_to<>>
+            robin_hood::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
+                                      std::equal_to<>>
                 left_sv_index;
             left_sv_index.reserve(n_left);
             if (const auto* ls = std::get_if<Column<std::string>>(left_keys[0])) {
@@ -703,8 +703,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return output;
         }
 
-        std::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
-                           std::equal_to<>>
+        robin_hood::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
+                                  std::equal_to<>>
             right_sv_index;
         right_sv_index.reserve(n_right);
         if (const auto* rs = std::get_if<Column<std::string>>(right_keys[0])) {
@@ -787,7 +787,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
 
         if (n_left < n_right) {
-            std::unordered_map<std::int64_t, std::vector<std::size_t>> left_int_index;
+            robin_hood::unordered_map<std::int64_t, std::vector<std::size_t>> left_int_index;
             left_int_index.reserve(n_left);
             for (std::size_t l = 0; l < n_left; ++l) {
                 left_int_index[left_ints[l]].push_back(l);
@@ -808,7 +808,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return output;
         }
 
-        std::unordered_map<std::int64_t, std::vector<std::size_t>> right_int_index;
+        robin_hood::unordered_map<std::int64_t, std::vector<std::size_t>> right_int_index;
         right_int_index.reserve(n_right);
         bool unique_right = preserve_left_only;
         for (std::size_t r = 0; r < n_right; ++r) {
@@ -975,7 +975,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                             return;  // left/right key types differ -> generic path
                         }
                         const auto& lc = *lcp;
-                        std::unordered_map<KeyV, std::size_t> dict;
+                        robin_hood::unordered_map<KeyV, std::size_t> dict;
                         std::vector<std::vector<std::size_t>> buckets;
                         for (std::size_t r = 0; r < n_right; ++r) {
                             auto [it, inserted] = dict.try_emplace(rc[r], buckets.size());
@@ -1005,7 +1005,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         if (!grouped_done) {
-            std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
+            robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
             right_groups.reserve(n_right);
             for (std::size_t r = 0; r < n_right; ++r) {
                 Key group;
@@ -1016,7 +1016,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 right_groups[group].push_back(r);
             }
 
-            std::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
+            robin_hood::unordered_map<Key, std::size_t, KeyHash, KeyEq> right_pos;
             right_pos.reserve(right_groups.size());
 
             for (std::size_t l = 0; l < n_left; ++l) {
@@ -1050,9 +1050,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
 
     // ── Generic multi-key fallback ───────────────────────────────────────
-    std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_index;
+    robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_index;
     if (n_left < n_right) {
-        std::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> left_index;
+        robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> left_index;
         left_index.reserve(n_left);
         for (std::size_t l = 0; l < n_left; ++l) {
             Key key;

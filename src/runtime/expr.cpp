@@ -21,9 +21,9 @@
 #include <ctime>
 #include <optional>
 #include <random>
+#include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -140,11 +140,11 @@ auto eval_date_part(std::string_view name, const ExprValue& v)
 
 }  // namespace
 
-const std::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtins() {
+const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtins() {
     using IT = std::expected<ExprType, std::string>;
     using IV = std::expected<ExprValue, std::string>;
-    static const std::unordered_map<std::string_view, ScalarBuiltin> table = [] {
-        std::unordered_map<std::string_view, ScalarBuiltin> m;
+    static const robin_hood::unordered_map<std::string_view, ScalarBuiltin> table = [] {
+        robin_hood::unordered_map<std::string_view, ScalarBuiltin> m;
 
         // abs: numeric -> same numeric type.
         m.emplace("abs", ScalarBuiltin{
@@ -189,15 +189,15 @@ const std::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtins() {
 
         // sqrt / log / exp: numeric -> Float64.
         const ScalarBuiltin transcendental{
-            1,
-            1,
-            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+            .min_args = 1,
+            .max_args = 1,
+            .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
                     return ExprType::Double;
                 }
                 return std::unexpected(std::string(name) + ": argument must be numeric");
             },
-            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+            .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
                 auto x = expr_value_to_double(a[0]);
                 if (!x) {
                     return std::unexpected(std::string(name) + ": argument must be numeric");

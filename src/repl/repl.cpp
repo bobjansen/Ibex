@@ -32,9 +32,9 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <system_error>
-#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 
@@ -47,13 +47,13 @@ namespace ibex::repl {
 
 namespace {
 
-using FunctionRegistry = std::unordered_map<std::string, parser::FunctionDecl>;
-using ExternDeclRegistry = std::unordered_map<std::string, parser::ExternDecl>;
-using ColumnRegistry = std::unordered_map<std::string, runtime::ColumnValue>;
-using ModelRegistry = std::unordered_map<std::string, runtime::ModelResult>;
-using CompileTimeListRegistry = std::unordered_map<std::string, std::vector<std::string>>;
-using FunctionSourceRegistry = std::unordered_map<std::string, std::string>;
-using DeclarationDocRegistry = std::unordered_map<std::string, std::string>;
+using FunctionRegistry = robin_hood::unordered_map<std::string, parser::FunctionDecl>;
+using ExternDeclRegistry = robin_hood::unordered_map<std::string, parser::ExternDecl>;
+using ColumnRegistry = robin_hood::unordered_map<std::string, runtime::ColumnValue>;
+using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResult>;
+using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vector<std::string>>;
+using FunctionSourceRegistry = robin_hood::unordered_map<std::string, std::string>;
+using DeclarationDocRegistry = robin_hood::unordered_map<std::string, std::string>;
 using ImportRegistry = std::unordered_set<std::string>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
@@ -724,7 +724,7 @@ auto bind_call_arguments(const std::string& callee, parser::CallExpr& call,
                          const std::vector<parser::Param>& params)
     -> std::expected<std::vector<BoundCallArg>, std::string> {
     std::vector<BoundCallArg> bound(params.size());
-    std::unordered_map<std::string, std::size_t> param_index;
+    robin_hood::unordered_map<std::string, std::size_t> param_index;
     param_index.reserve(params.size());
     for (std::size_t i = 0; i < params.size(); ++i) {
         param_index.emplace(params[i].name, i);
@@ -1625,7 +1625,7 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
         fmt::print("\n");
     }
 
-    std::unordered_map<std::string, std::vector<std::string>> by_source;
+    robin_hood::unordered_map<std::string, std::vector<std::string>> by_source;
     for (const auto& [name, decl] : extern_decls) {
         if (!decl.source_path.empty()) {
             by_source[decl.source_path].push_back(name);

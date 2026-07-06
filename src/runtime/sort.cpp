@@ -19,7 +19,6 @@
 #include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -320,7 +319,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     // rows anyway.
     auto ordinal_encode = [rows](const std::vector<std::string_view>& vals,
                                  std::size_t cap) -> std::optional<std::vector<std::uint64_t>> {
-        std::unordered_map<std::string_view, std::uint64_t> code_of;
+        robin_hood::unordered_map<std::string_view, std::uint64_t> code_of;
         std::vector<std::string_view> distinct;
         for (auto sv : vals) {
             if (code_of.emplace(sv, 0).second) {

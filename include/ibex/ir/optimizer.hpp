@@ -5,8 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -45,7 +45,7 @@ struct CallableSummary {
 };
 
 struct OptimizationContext {
-    std::unordered_map<std::string, CallableSummary> callee_summaries;
+    robin_hood::unordered_map<std::string, CallableSummary> callee_summaries;
     CallableSummary unknown_callee = {
         .effects =
             EffectSummary{

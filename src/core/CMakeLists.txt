@@ -10,6 +10,12 @@ target_include_directories(ibex_core
 )
 
 target_link_libraries(ibex_core
+    PUBLIC
+        # robin_hood is header-only and appears in public headers (e.g.
+        # core/column.hpp's categorical index_map), so its include path must
+        # propagate to every consumer. Linking it PUBLIC here reaches ir,
+        # parser, runtime, codegen, repl, tools, tests, and plugins transitively.
+        robin_hood::robin_hood
     PRIVATE
         Ibex::CompilerOptions
         fmt::fmt

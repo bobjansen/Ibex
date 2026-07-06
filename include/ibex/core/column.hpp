@@ -5,20 +5,19 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
-#include <new>
 #include <optional>
+#include <robin_hood.h>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace ibex::detail {
 /// Transparent hasher that accepts std::string, std::string_view, and const char*,
-/// enabling std::unordered_map::find(string_view) without constructing a std::string.
+/// enabling robin_hood::unordered_map::find(string_view) without constructing a std::string.
 struct StringHash {
     using is_transparent = void;
     auto operator()(std::string_view sv) const noexcept -> std::size_t {
@@ -284,7 +283,7 @@ class Column<Categorical> {
     using size_type = std::size_t;
     using code_type = std::int32_t;
     using index_map =
-        std::unordered_map<std::string, code_type, detail::StringHash, std::equal_to<>>;
+        robin_hood::unordered_map<std::string, code_type, detail::StringHash, std::equal_to<>>;
 
     Column()
         : dict_(std::make_shared<std::vector<std::string>>()),

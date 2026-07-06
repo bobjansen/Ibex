@@ -7,8 +7,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -202,8 +202,8 @@ class ExternRegistry {
     }
 
    private:
-    std::unordered_map<std::string, ExternFunction> registry_;
-    std::unordered_map<std::string, ModelOps> models_;
+    robin_hood::unordered_map<std::string, ExternFunction> registry_;
+    robin_hood::unordered_map<std::string, ModelOps> models_;
 };
 
 }  // namespace ibex::runtime

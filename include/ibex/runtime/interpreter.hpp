@@ -8,8 +8,8 @@
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -176,7 +176,7 @@ struct ColumnEntry {
 
 struct Table {
     std::vector<ColumnEntry> columns;
-    std::unordered_map<std::string, std::size_t> index;
+    robin_hood::unordered_map<std::string, std::size_t> index;
     std::optional<std::vector<ir::OrderKey>> ordering;
     std::optional<std::string> time_index;
     /// Logical row count for a column-less frame (e.g. produced by `Table(n)`).
@@ -215,8 +215,8 @@ struct Table {
     }
 };
 
-using TableRegistry = std::unordered_map<std::string, Table>;
-using ScalarRegistry = std::unordered_map<std::string, ScalarValue>;
+using TableRegistry = robin_hood::unordered_map<std::string, Table>;
+using ScalarRegistry = robin_hood::unordered_map<std::string, ScalarValue>;
 
 /// Opaque model result produced by the `model { ... }` clause.
 /// Accessor functions (`coef`, `residuals`, `fitted`, `summary`) extract
@@ -239,7 +239,7 @@ struct ModelResult {
     std::size_t n_params = 0;
 };
 
-using ModelRegistry = std::unordered_map<std::string, ModelResult>;
+using ModelRegistry = robin_hood::unordered_map<std::string, ModelResult>;
 
 /// Interpret an IR node tree against a table registry.
 class ExternRegistry;

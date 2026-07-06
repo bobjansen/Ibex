@@ -67,13 +67,13 @@
 #include <netinet/in.h>
 #include <optional>
 #include <random>
+#include <robin_hood.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <unordered_map>
 #include <vector>
 
 namespace ibex_ws {
@@ -459,7 +459,7 @@ struct WsServer {
 
 // One WsServer per port, lazily constructed.
 inline auto get_server(int port) -> WsServer& {
-    static std::unordered_map<int, std::unique_ptr<WsServer>> g_servers;
+    static robin_hood::unordered_map<int, std::unique_ptr<WsServer>> g_servers;
     auto it = g_servers.find(port);
     if (it != g_servers.end())
         return *it->second;
@@ -820,7 +820,7 @@ inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOpti
 inline auto get_connection(const std::string& url, std::string_view schema_spec,
                            std::string_view options_spec, const WsOptions& options)
     -> WsConnection& {
-    static std::unordered_map<std::string, std::unique_ptr<WsConnection>> g_connections;
+    static robin_hood::unordered_map<std::string, std::unique_ptr<WsConnection>> g_connections;
     std::string cache_key = url + '\n';
     cache_key += schema_spec;
     cache_key += '\n';

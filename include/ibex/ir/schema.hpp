@@ -6,7 +6,6 @@
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <vector>
 
 namespace ibex::ir {
@@ -84,8 +83,9 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 ///
 /// Returns an error message for the first provably-absent reference, or
 /// `nullopt`.
-[[nodiscard]] auto check_column_refs(const Node& node, const SourceSchemas& sources = {},
-                                     const std::unordered_set<std::string>& lexical_names = {},
-                                     bool check_expressions = false) -> std::optional<std::string>;
+[[nodiscard]] auto check_column_refs(
+    const Node& node, const SourceSchemas& sources = {},
+    const robin_hood::unordered_set<std::string>& lexical_names = {},
+    bool check_expressions = false) -> std::optional<std::string>;
 
 }  // namespace ibex::ir

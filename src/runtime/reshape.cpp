@@ -6,7 +6,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -258,7 +257,7 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
     }
 
     {
-        std::unordered_set<std::string> seen;
+        robin_hood::unordered_set<std::string> seen;
         for (const auto& name : out_col_names) {
             if (!seen.insert(name).second) {
                 return std::unexpected("transpose: duplicate label value '" + name +
@@ -556,7 +555,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
         id_indices.push_back(it->second);
     }
 
-    std::unordered_set<std::string> id_set(id_columns.begin(), id_columns.end());
+    robin_hood::unordered_set<std::string> id_set(id_columns.begin(), id_columns.end());
     std::vector<std::size_t> measure_indices;
     std::vector<std::string> measure_names;
     if (measure_columns.empty()) {

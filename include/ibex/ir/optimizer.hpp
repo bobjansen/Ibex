@@ -7,7 +7,6 @@
 #include <memory>
 #include <robin_hood.h>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace ibex::ir {
@@ -33,8 +32,8 @@ struct EffectSummary {
     EffectMask mask = 0;
     bool io_read_unscoped = false;
     bool io_write_unscoped = false;
-    std::unordered_set<std::string> io_read_resources;
-    std::unordered_set<std::string> io_write_resources;
+    robin_hood::unordered_set<std::string> io_read_resources;
+    robin_hood::unordered_set<std::string> io_write_resources;
 
     [[nodiscard]] auto is_pure() const noexcept -> bool { return mask == 0; }
 };

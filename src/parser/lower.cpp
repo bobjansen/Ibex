@@ -10,7 +10,6 @@
 #include <functional>
 #include <memory>
 #include <robin_hood.h>
-#include <unordered_set>
 
 namespace ibex::parser {
 
@@ -871,8 +870,8 @@ class Lowerer {
         robin_hood::unordered_map<std::string, ir::NodePtr>* bindings,
         robin_hood::unordered_map<std::string, std::vector<std::string>>
             initial_compile_time_lists = {},
-        std::unordered_set<std::string> initial_table_externs = {},
-        std::unordered_set<std::string> initial_sink_externs = {},
+        robin_hood::unordered_set<std::string> initial_table_externs = {},
+        robin_hood::unordered_set<std::string> initial_sink_externs = {},
         robin_hood::unordered_map<std::string, const ExternDecl*> initial_table_extern_decls = {},
         ir::SourceSchemas initial_source_schemas = {},
         robin_hood::unordered_map<std::string, const FunctionDecl*> initial_functions = {})
@@ -2431,7 +2430,7 @@ class Lowerer {
                 lowered_rank.order_keys.push_back(
                     ir::OrderKey{.name = key.name, .ascending = key.ascending});
             }
-            std::unordered_set<std::string> seen_named;
+            robin_hood::unordered_set<std::string> seen_named;
             for (const auto& narg : rank->named_args) {
                 if (!seen_named.insert(narg.name).second) {
                     return std::unexpected(LowerError{
@@ -3783,8 +3782,8 @@ class Lowerer {
     ir::Builder builder_;
     robin_hood::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
     robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
-    std::unordered_set<std::string> table_externs_;
-    std::unordered_set<std::string> sink_externs_;
+    robin_hood::unordered_set<std::string> table_externs_;
+    robin_hood::unordered_set<std::string> sink_externs_;
     robin_hood::unordered_map<std::string, const ExternDecl*> table_extern_decls_;
     ir::SourceSchemas binding_schemas_;
     robin_hood::unordered_map<std::string, const FunctionDecl*> functions_;
@@ -3792,7 +3791,7 @@ class Lowerer {
     // parameter substitutions (top = innermost inlined body) and a guard set to
     // reject recursive inlining.
     std::vector<robin_hood::unordered_map<std::string, ir::Expr>> inline_scopes_;
-    std::unordered_set<std::string> inlining_active_;
+    robin_hood::unordered_set<std::string> inlining_active_;
 };
 
 }  // namespace

@@ -6,9 +6,9 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 #include "schema_registry.hpp"
 
@@ -227,7 +227,7 @@ class SchemaRegistryClient {
     SchemaRegistryClientOptions options_;
     Getter getter_;
     std::mutex mu_;
-    std::unordered_map<std::int32_t, RegistrySchemaEntry> schema_cache_;
+    robin_hood::unordered_map<std::int32_t, RegistrySchemaEntry> schema_cache_;
 };
 
 }  // namespace ibex_kafka

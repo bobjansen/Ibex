@@ -7,7 +7,6 @@
 #include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -221,7 +220,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         right_keys.push_back(right_col);
     }
 
-    std::unordered_set<std::string> key_set(keys.begin(), keys.end());
+    robin_hood::unordered_set<std::string> key_set(keys.begin(), keys.end());
 
     const std::size_t n_left = left.rows();
     const std::size_t n_right = right.rows();
@@ -235,7 +234,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     Table output;
     output.columns.reserve(left.columns.size() + right.columns.size());
 
-    std::unordered_set<std::string> out_names;
+    robin_hood::unordered_set<std::string> out_names;
     out_names.reserve(left.columns.size() + right.columns.size());
 
     for (const auto& entry : left.columns) {
@@ -411,7 +410,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         std::vector<NLJRightCol> nlj_right;
         nlj_right.reserve(right.columns.size());
         {
-            std::unordered_set<std::string> batch_left_names;
+            robin_hood::unordered_set<std::string> batch_left_names;
             for (const auto& entry : left.columns) {
                 batch_left_names.insert(entry.name);
             }

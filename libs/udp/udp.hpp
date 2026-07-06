@@ -39,12 +39,12 @@
 #include <fcntl.h>
 #include <memory>
 #include <netinet/in.h>
+#include <robin_hood.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <unordered_map>
 #include <vector>
 
 // recvmmsg / sendmmsg batch syscalls (Linux ≥ 2.6.33).
@@ -128,7 +128,7 @@ struct RecvSocket {
 };
 
 inline auto get_recv_socket(int port) -> RecvSocket& {
-    static std::unordered_map<int, std::unique_ptr<RecvSocket>> sockets;
+    static robin_hood::unordered_map<int, std::unique_ptr<RecvSocket>> sockets;
     auto it = sockets.find(port);
     if (it == sockets.end()) {
         it = sockets.emplace(port, std::make_unique<RecvSocket>(port)).first;

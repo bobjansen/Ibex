@@ -2140,7 +2140,7 @@ class Lowerer {
     /// substitution scope so the trailing expression sees `let`-bound names.
     struct InlinableBodyShape {
         std::vector<const LetStmt*> lets;
-        const Expr* final_expr;
+        const Expr* final_expr{};
     };
     static auto inlinable_body_shape(const FunctionDecl& fn) -> std::optional<InlinableBodyShape> {
         if (fn.body.empty()) {

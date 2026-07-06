@@ -323,10 +323,11 @@
             <tr><td><code>kafka_recv(brokers, topic, group, schema[, options])</code></td><td>Poll one JSON Kafka message, decode it with an explicit schema, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
             <tr><td><code>kafka_recv_avro(brokers, topic, group, schema, registry_url[, options])</code></td><td>Poll one Schema-Registry-framed Avro Kafka message, decode it with an explicit schema plus registry URL, and return a one-row DataFrame or <code>StreamTimeout</code>.</td></tr>
             <tr><td><code>kafka_send(df, brokers, topic[, options])</code></td><td>Serialize each DataFrame row to one JSON Kafka message and return sent-row count.</td></tr>
-            <tr><td><code>udp_recv(port)</code></td><td>Read rows from UDP into a DataFrame batch.</td></tr>
+            <tr><td><code>udp_recv(port, schema[, options])</code></td><td>Read JSON datagrams into a DataFrame batch, decoded with an explicit schema.</td></tr>
             <tr><td><code>udp_send(df, host, port)</code></td><td>Send a DataFrame batch via UDP and return sent-row count.</td></tr>
             <tr><td><code>ws_listen(port)</code></td><td>Start a WebSocket listener.</td></tr>
-            <tr><td><code>ws_recv(port)</code></td><td>Receive WebSocket messages as DataFrame batches.</td></tr>
+            <tr><td><code>ws_recv(port, schema[, options])</code></td><td>Receive JSON WebSocket messages as one-row DataFrames, decoded with an explicit schema.</td></tr>
+            <tr><td><code>ws_connect(url, schema[, options])</code></td><td>Connect to an external WebSocket feed (<code>ws://…</code>) and receive JSON messages as one-row DataFrames.</td></tr>
             <tr><td><code>ws_send(df, port)</code></td><td>Broadcast a DataFrame batch to connected WebSocket clients.</td></tr>
           </tbody>
         </table>

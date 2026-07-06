@@ -25,8 +25,9 @@ import "websocket";
 ws_listen(8765);
 
 let bars = Stream {
-    // Receive one tick datagram per call; block up to 200 ms then timeout.
-    source    = udp_recv(9001),
+    // Receive a batch of tick datagrams per call; blocks until data arrives.
+    // The schema string maps JSON fields to typed columns.
+    source    = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
 
     // Group ticks into 10-second buckets per symbol and compute OHLC.
     transform = [resample 10s, by symbol, select {

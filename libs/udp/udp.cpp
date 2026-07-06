@@ -5,33 +5,43 @@
 // script declares:
 //
 //   import "udp";
-//
-// or explicitly:
-//
-//   extern fn udp_recv(port: Int) -> DataFrame from "udp";
-//   extern fn udp_send(df: DataFrame, host: String, port: Int) -> Int from "udp";
 
 #include "udp.hpp"
 
 #include <ibex/runtime/extern_registry.hpp>
 
 extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
-    // udp_recv(port: Int) -> DataFrame
-    // Blocks until one UDP datagram arrives, returns a one-row Table.
-    // Returns an empty Table to signal end-of-stream (EOF sentinel or error).
+    // udp_recv(port: Int, schema: String[, options: String]) -> DataFrame
+    // Blocks until at least one UDP datagram arrives, drains the ready batch,
+    // and returns a multi-row Table whose columns follow the schema string,
+    // e.g. "ts:timestamp,symbol:str,price:f64,volume:i64".
+    // Returns an empty Table to signal end-of-stream ({"eof":true} sentinel
+    // or socket error).
     registry->register_table(
         "udp_recv",
         [](const ibex::runtime::ExternArgs& args)
             -> std::expected<ibex::runtime::ExternValue, std::string> {
-            if (args.size() != 1) {
-                return std::unexpected("udp_recv(port) expects exactly 1 argument");
+            if (args.size() != 2 && args.size() != 3) {
+                return std::unexpected(
+                    "udp_recv(port, schema[, options]) expects 2 or 3 arguments");
             }
             const auto* port = std::get_if<std::int64_t>(&args[0]);
-            if (port == nullptr) {
-                return std::unexpected("udp_recv(port): port must be an integer");
+            const auto* schema = std::get_if<std::string>(&args[1]);
+            if (port == nullptr || schema == nullptr) {
+                return std::unexpected(
+                    "udp_recv(port, schema[, options]): port must be an integer and schema a "
+                    "string");
+            }
+            std::string options;
+            if (args.size() == 3) {
+                const auto* opts = std::get_if<std::string>(&args[2]);
+                if (opts == nullptr) {
+                    return std::unexpected("udp_recv: options must be a string");
+                }
+                options = *opts;
             }
             try {
-                return ibex::runtime::ExternValue{ibex_udp::udp_recv(*port)};
+                return ibex::runtime::ExternValue{ibex_udp::udp_recv(*port, *schema, options)};
             } catch (const std::exception& e) {
                 return std::unexpected(std::string(e.what()));
             }

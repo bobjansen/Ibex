@@ -22,7 +22,7 @@
 
 namespace {
 
-enum class ImportedColumnKind {
+enum class ImportedColumnKind : std::uint8_t {
     Bool,
     Int64,
     Float64,

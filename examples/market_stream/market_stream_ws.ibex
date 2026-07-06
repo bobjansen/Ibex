@@ -40,8 +40,10 @@ ws_listen(8765);
 // DataFrame (tick_sender.py sends {"eof":true} as the last packet).
 
 let ohlc_stream = Stream {
-    // Source: receive one UDP tick per call.  Blocks until data arrives.
-    source    = udp_recv(9001),
+    // Source: receive a batch of UDP ticks per call.  Blocks until data
+    // arrives.  The schema string maps JSON fields to typed columns; the
+    // first ts field becomes the time index.
+    source    = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
 
     // Transform: compute OHLC bars for each 1-minute time bucket.
     // Identical to batch usage — no stream-specific syntax needed.

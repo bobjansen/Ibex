@@ -72,7 +72,7 @@ TEST_CASE("Kafka schema parser accepts explicit typed fields") {
 TEST_CASE("Kafka schema parser rejects duplicate or malformed fields") {
     auto duplicate = ibex_kafka::parse_kafka_schema("symbol:str, symbol:cat");
     REQUIRE_FALSE(duplicate);
-    REQUIRE(duplicate.error() == "Kafka schema contains duplicate field 'symbol'");
+    REQUIRE(duplicate.error() == "schema contains duplicate field 'symbol'");
 
     auto malformed = ibex_kafka::parse_kafka_schema("symbol");
     REQUIRE_FALSE(malformed);
@@ -125,7 +125,7 @@ TEST_CASE("Kafka JSON payload rejects missing required fields") {
 
     auto table = ibex_kafka::table_from_json_payload(R"({"symbol":"AAPL"})", *schema);
     REQUIRE_FALSE(table);
-    REQUIRE(table.error() == "Kafka payload is missing required field 'price'");
+    REQUIRE(table.error() == "payload is missing required field 'price'");
 }
 
 TEST_CASE("Kafka JSON payload rejects wrong field types") {
@@ -134,7 +134,7 @@ TEST_CASE("Kafka JSON payload rejects wrong field types") {
 
     auto table = ibex_kafka::table_from_json_payload(R"({"size":"42"})", *schema);
     REQUIRE_FALSE(table);
-    REQUIRE(table.error() == "Kafka field 'size' must be an integer");
+    REQUIRE(table.error() == "field 'size' must be an integer");
 }
 
 TEST_CASE("Kafka table rows serialize supported columns and nulls to JSON") {

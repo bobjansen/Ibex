@@ -206,7 +206,7 @@ df[<span class="kw">model</span> { y ~ x, method = wls,
 <pre><code><span class="kw">import</span> <span class="str">"udp"</span>;
 
 <span class="kw">let</span> s = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">filter</span> price &gt; <span class="num">0</span>],
     sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
 };</code></pre>

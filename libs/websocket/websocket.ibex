@@ -5,14 +5,30 @@
 //
 // After importing, the following functions are available:
 //
-//   ws_recv(port: Int) -> DataFrame
+//   ws_recv(port: Int, schema: String) -> DataFrame
+//   ws_recv(port: Int, schema: String, options: String) -> DataFrame
 //     Starts a WebSocket server on `port` (if not already running) and blocks
-//     up to 200 ms for an incoming JSON tick message from any connected client.
-//     Returns a one-row DataFrame {ts: Timestamp, symbol: String, price:
-//     Float64, volume: Int} on success.  Returns an empty DataFrame to signal
-//     end-of-stream ({"eof":true} message or WebSocket close frame).  Returns
+//     up to poll_timeout_ms for an incoming JSON message from any connected
+//     client.  The message shape is described by the schema string, e.g.
+//     "ts:timestamp,symbol:str,price:f64,volume:i64" (types: i64, f64, bool,
+//     str, cat, date, ts).  The first date/ts field becomes the time index.
+//     Returns a one-row DataFrame on success, an empty DataFrame to signal
+//     end-of-stream ({"eof":true} message or WebSocket close frame), and
 //     StreamTimeout when no message arrives — the stream runtime calls the
 //     source again after handling any pending time-bucket flushes.
+//
+//   ws_connect(url: String, schema: String) -> DataFrame
+//   ws_connect(url: String, schema: String, options: String) -> DataFrame
+//     WebSocket client source: connects to an external feed at `url`
+//     (ws://host[:port][/path]; TLS is not supported yet) and converts each
+//     incoming JSON message using the same schema mini-language and stream
+//     protocol as ws_recv.  The options key subscribe=<text> sends a text
+//     frame right after the handshake (e.g. an exchange subscribe message).
+//
+//   Options for ws_recv / ws_connect ("key=value;key=value"):
+//     poll_timeout_ms=200       polling window before StreamTimeout
+//     on_malformed=skip|error   messages that fail the schema (default skip)
+//     subscribe=<text>          ws_connect only
 //
 //   ws_listen(port: Int) -> Int
 //     Eagerly opens the WebSocket listen socket on `port` so that browser
@@ -27,5 +43,8 @@
 //     (without ws_recv).  Returns the number of rows sent.
 
 extern fn ws_listen(port: Int) -> Int from "websocket";
-extern fn ws_recv(port: Int) -> DataFrame from "websocket";
+extern fn ws_recv(port: Int, schema: String) -> DataFrame from "websocket";
+extern fn ws_recv(port: Int, schema: String, options: String) -> DataFrame from "websocket";
+extern fn ws_connect(url: String, schema: String) -> DataFrame from "websocket";
+extern fn ws_connect(url: String, schema: String, options: String) -> DataFrame from "websocket";
 extern fn ws_send(df: DataFrame, port: Int) -> Int from "websocket";

@@ -1339,7 +1339,7 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
 
 <span class="cm">// Receive ticks, resample to 1-minute OHLC bars, forward over UDP</span>
 <span class="kw">let</span> ohlc_stream = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
         open  = <span class="fn-name">first</span>(price),
         high  = <span class="fn-name">max</span>(price),
@@ -1351,7 +1351,7 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
 
 <span class="cm">// PerRow stream: forward filtered rows with no buffering</span>
 <span class="kw">let</span> live_filter = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">filter</span> price &gt; <span class="num">100.0</span>, <span class="kw">rename</span> p = price],
     sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9003</span>)
 };</code></pre>
@@ -1359,7 +1359,7 @@ scripts/ibex-run.sh examples/quant.ibex</code></pre>
 <span class="kw">import</span> <span class="str">"websocket"</span>;
 
 <span class="kw">let</span> ws_stream = Stream {
-    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>),
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
     transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
         open  = <span class="fn-name">first</span>(price),
         high  = <span class="fn-name">max</span>(price),

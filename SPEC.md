@@ -3203,7 +3203,7 @@ The source extern must be declared via `extern fn` (Section 10) or loaded
 with `import` before the `Stream` expression is evaluated.
 
 ```
-source = udp_recv(9001)
+source = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64")
 ```
 
 **`transform = [<clause>, ...]`**
@@ -3351,7 +3351,7 @@ The following example reads tick data from UDP port 9001, resamples it into
 import "udp";
 
 let ohlc_stream = Stream {
-    source    = udp_recv(9001),
+    source    = udp_recv(9001, "ts:ts,symbol:str,price:f64,volume:i64"),
     transform = [resample 1m, select {
         open  = first(price),
         high  = max(price),

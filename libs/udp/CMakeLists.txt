@@ -17,6 +17,7 @@ target_link_libraries(ibex_udp_plugin
     PRIVATE
         Ibex::runtime
         Ibex::CompilerOptions
+        nlohmann_json::nlohmann_json
 )
 
 if(TARGET Ibex::Sanitizers)

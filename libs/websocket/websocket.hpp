@@ -1,16 +1,41 @@
-// Ibex WebSocket plugin — streaming tick source and data sink over WebSocket.
+// Ibex WebSocket plugin — schema-driven streaming source, sink, and client.
 //
-// Wire protocol: one JSON object per WebSocket text message.
+// Wire protocol: one JSON object per WebSocket text message.  The message
+// shape is described by an explicit schema string using the shared plugin
+// mini-language (see <ibex/plugin/schema.hpp>):
 //
-//   Tick (source, ws_recv): {"ts":<ns>,"symbol":"<str>","price":<float>,"volume":<int>}
-//   Data (sink, ws_send):   any DataFrame row serialised as a flat JSON object
+//   "ts:timestamp,symbol:cat,price:f64,volume:i64"
+//
+// Functions:
+//
+//   ws_recv(port, schema[, options])   — WebSocket *server* source: accepts
+//       client connections on `port` and converts each incoming JSON text
+//       message to a one-row DataFrame following `schema`.
+//   ws_connect(url, schema[, options]) — WebSocket *client* source: connects
+//       to an external feed at `url` (ws://host[:port][/path]) and converts
+//       each incoming JSON text message the same way.
+//   ws_send(df, port)                  — sink: broadcasts each DataFrame row
+//       as a JSON text frame to all clients connected on `port`.
+//   ws_listen(port)                    — eagerly binds the listen socket.
+//
+// Options (key=value pairs separated by ';'):
+//   poll_timeout_ms=200       select() window before returning StreamTimeout
+//   on_malformed=skip|error   what to do with messages that fail the schema
+//                             (default: skip)
+//   subscribe=<text>          ws_connect only: text frame sent right after
+//                             the handshake (e.g. an exchange subscribe
+//                             message; must not contain ';')
+//
+// End-of-stream: a message {"eof":true} or a WebSocket close frame yields an
+// empty DataFrame, which terminates the Stream event loop.
 //
 // Usage in an Ibex script:
 //   import "websocket";
 //
-//   // Ingest UDP ticks, resample to 1-minute OHLC bars, push to browser dashboard.
+//   // Ingest ticks from an external feed, resample, push to a dashboard.
 //   let ohlc_stream = Stream {
-//       source    = udp_recv(9001),
+//       source    = ws_connect("ws://feed.example.com/ticks",
+//                              "ts:timestamp,symbol:str,price:f64,volume:i64"),
 //       transform = [resample 1m, select {
 //           open  = first(price),
 //           high  = max(price),
@@ -20,16 +45,13 @@
 //       sink = ws_send(8080)
 //   };
 //
-// Browser clients connect to ws://localhost:8080 and receive OHLC bars in
-// real time.  ws_recv(port) lets WebSocket clients send tick data into Ibex
-// instead of (or in addition to) UDP.
-//
-// Both functions share server state for the same port, so a single TCP listen
-// socket serves all connected browser clients.
+// ws_recv and ws_send share server state for the same port, so a single TCP
+// listen socket serves all connected browser clients.
 
 #pragma once
 
 #include <ibex/core/column.hpp>
+#include <ibex/plugin/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
@@ -37,13 +59,14 @@
 #include <arpa/inet.h>
 #include <array>
 #include <cerrno>
-#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -54,66 +77,6 @@
 #include <vector>
 
 namespace ibex_ws {
-
-// ─── Minimal JSON field extractor ────────────────────────────────────────────
-//
-// Same helpers as the UDP plugin — duplicated here so the websocket plugin is
-// self-contained and has no inter-plugin dependency.
-
-inline auto json_get_str(std::string_view json, std::string_view key)
-    -> std::optional<std::string> {
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return std::nullopt;
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
-        ++pos;
-    if (pos >= json.size() || json[pos] != '"')
-        return std::nullopt;
-    ++pos;  // skip opening quote
-    auto end = json.find('"', pos);
-    if (end == std::string_view::npos)
-        return std::nullopt;
-    return std::string(json.substr(pos, end - pos));
-}
-
-inline auto json_get_int64(std::string_view json, std::string_view key)
-    -> std::optional<std::int64_t> {
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return std::nullopt;
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
-        ++pos;
-    std::int64_t value = 0;
-    auto [ptr, ec] = std::from_chars(json.data() + pos, json.data() + json.size(), value);
-    if (ec != std::errc{})
-        return std::nullopt;
-    return value;
-}
-
-inline auto json_get_double(std::string_view json, std::string_view key) -> std::optional<double> {
-    std::string needle = "\"";
-    needle += key;
-    needle += "\":";
-    auto pos = json.find(needle);
-    if (pos == std::string_view::npos)
-        return std::nullopt;
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
-        ++pos;
-    char* end_ptr = nullptr;
-    double value = std::strtod(json.data() + pos, &end_ptr);
-    if (end_ptr == json.data() + pos)
-        return std::nullopt;
-    return value;
-}
 
 // ─── SHA-1 ───────────────────────────────────────────────────────────────────
 //
@@ -231,15 +194,22 @@ inline auto base64_encode(const std::uint8_t* data, std::size_t len) -> std::str
 
 static constexpr std::string_view kWsMagicGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-// Extract the base64 value of the Sec-WebSocket-Key header from an HTTP request.
-inline auto extract_ws_key(std::string_view http) -> std::optional<std::string> {
-    // Header name is case-insensitive; check both common forms.
-    for (const auto* hdr : {"Sec-WebSocket-Key:", "sec-websocket-key:"}) {
-        auto pos = http.find(hdr);
-        if (pos == std::string_view::npos)
+// Extract the value of an HTTP header (case-insensitive name match).
+inline auto extract_http_header(std::string_view http, std::string_view name)
+    -> std::optional<std::string> {
+    auto lower = [](char c) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    };
+    for (std::size_t i = 0; i + name.size() + 1 < http.size(); ++i) {
+        if (i != 0 && http[i - 1] != '\n')
+            continue;  // headers start at the beginning of a line
+        std::size_t j = 0;
+        while (j < name.size() && lower(http[i + j]) == lower(name[j]))
+            ++j;
+        if (j != name.size() || http[i + j] != ':')
             continue;
-        pos += std::string_view(hdr).size();
-        while (pos < http.size() && http[pos] == ' ')
+        std::size_t pos = i + name.size() + 1;
+        while (pos < http.size() && (http[pos] == ' ' || http[pos] == '\t'))
             ++pos;
         auto end = http.find('\r', pos);
         if (end == std::string_view::npos)
@@ -251,6 +221,11 @@ inline auto extract_ws_key(std::string_view http) -> std::optional<std::string> 
     return std::nullopt;
 }
 
+// Extract the base64 value of the Sec-WebSocket-Key header from an HTTP request.
+inline auto extract_ws_key(std::string_view http) -> std::optional<std::string> {
+    return extract_http_header(http, "Sec-WebSocket-Key");
+}
+
 // Compute the Sec-WebSocket-Accept header value (RFC 6455 §4.2.2).
 inline auto compute_accept_key(std::string_view client_key) -> std::string {
     std::string combined = std::string(client_key) + std::string(kWsMagicGuid);
@@ -258,29 +233,62 @@ inline auto compute_accept_key(std::string_view client_key) -> std::string {
     return base64_encode(digest.bytes.data(), digest.bytes.size());
 }
 
-// ─── WebSocket frame encoding (server → client, unmasked) ────────────────────
+// Random bytes for client masks and Sec-WebSocket-Key nonces.
+inline void random_bytes(std::uint8_t* out, std::size_t n) {
+    thread_local std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<int> dist(0, 255);
+    for (std::size_t i = 0; i < n; ++i)
+        out[i] = static_cast<std::uint8_t>(dist(rng));
+}
 
-inline auto ws_encode_text_frame(std::string_view payload) -> std::string {
+// Generate a random 16-byte base64 Sec-WebSocket-Key (RFC 6455 §4.1).
+inline auto random_ws_key() -> std::string {
+    std::array<std::uint8_t, 16> nonce{};
+    random_bytes(nonce.data(), nonce.size());
+    return base64_encode(nonce.data(), nonce.size());
+}
+
+// ─── WebSocket frame encoding ─────────────────────────────────────────────────
+//
+// Server→client frames are unmasked; client→server frames must be masked
+// (RFC 6455 §5.3).
+
+inline auto ws_encode_frame(std::uint8_t opcode, std::string_view payload, bool masked)
+    -> std::string {
     std::string frame;
-    frame.reserve(payload.size() + 10);
-    frame += '\x81';  // FIN=1, opcode=0x1 (text)
+    frame.reserve(payload.size() + 14);
+    frame += static_cast<char>(0x80U | (opcode & 0x0FU));  // FIN=1
     const std::size_t len = payload.size();
+    const std::uint8_t mask_bit = masked ? 0x80U : 0x00U;
     if (len <= 125) {
-        frame += static_cast<char>(len);
+        frame += static_cast<char>(mask_bit | len);
     } else if (len <= 65535) {
-        frame += '\x7E';
+        frame += static_cast<char>(mask_bit | 0x7EU);
         frame += static_cast<char>((len >> 8) & 0xFF);
         frame += static_cast<char>(len & 0xFF);
     } else {
-        frame += '\x7F';
+        frame += static_cast<char>(mask_bit | 0x7FU);
         for (int i = 7; i >= 0; --i)
             frame += static_cast<char>((len >> (i * 8)) & 0xFF);
     }
-    frame.append(payload);
+    if (masked) {
+        std::array<std::uint8_t, 4> key{};
+        random_bytes(key.data(), key.size());
+        for (const auto byte : key)
+            frame += static_cast<char>(byte);
+        for (std::size_t i = 0; i < len; ++i)
+            frame += static_cast<char>(static_cast<std::uint8_t>(payload[i]) ^ key[i % 4]);
+    } else {
+        frame.append(payload);
+    }
     return frame;
 }
 
-// ─── WebSocket frame decoding (client → server, masked) ──────────────────────
+inline auto ws_encode_text_frame(std::string_view payload) -> std::string {
+    return ws_encode_frame(0x1U, payload, /*masked=*/false);
+}
+
+// ─── WebSocket frame decoding ─────────────────────────────────────────────────
 
 struct WsFrame {
     std::uint8_t opcode{};
@@ -290,6 +298,7 @@ struct WsFrame {
 
 // Attempts to decode one frame from `buf`, consuming its bytes on success.
 // Returns nullopt when buf contains fewer bytes than the complete frame.
+// Handles both masked (client→server) and unmasked (server→client) frames.
 inline auto ws_decode_frame(std::string& buf) -> std::optional<WsFrame> {
     if (buf.size() < 2)
         return std::nullopt;
@@ -335,6 +344,90 @@ inline auto ws_decode_frame(std::string& buf) -> std::optional<WsFrame> {
 
     buf.erase(0, header_size + static_cast<std::size_t>(payload_len));
     return frame;
+}
+
+// ─── Options ──────────────────────────────────────────────────────────────────
+
+struct WsOptions {
+    int poll_timeout_ms = 200;
+    bool malformed_error = false;  // on_malformed=skip (default) | error
+    std::string subscribe;         // ws_connect only: text frame sent after handshake
+};
+
+// Parse the options spec for ws_recv / ws_connect.  Throws on unknown keys.
+inline auto parse_ws_options(std::string_view spec, bool allow_subscribe) -> WsOptions {
+    WsOptions options;
+    auto parsed = ibex::plugin::parse_key_value_options(spec);
+    if (!parsed)
+        throw std::runtime_error("ws: " + parsed.error());
+    for (auto& [key, value] : *parsed) {
+        if (key == "poll_timeout_ms") {
+            auto timeout = ibex::plugin::parse_non_negative_int(value, "poll_timeout_ms");
+            if (!timeout)
+                throw std::runtime_error("ws: " + timeout.error());
+            options.poll_timeout_ms = *timeout;
+            continue;
+        }
+        if (key == "on_malformed") {
+            if (value == "skip") {
+                options.malformed_error = false;
+            } else if (value == "error") {
+                options.malformed_error = true;
+            } else {
+                throw std::runtime_error("ws: on_malformed must be 'skip' or 'error'");
+            }
+            continue;
+        }
+        if (allow_subscribe && key == "subscribe") {
+            options.subscribe = std::move(value);
+            continue;
+        }
+        throw std::runtime_error("ws: unsupported option: " + key);
+    }
+    return options;
+}
+
+// Parse and validate a schema spec, throwing on error (the plugin registry
+// entry points catch and convert to std::unexpected).
+inline auto parse_schema_or_throw(std::string_view spec) -> std::vector<ibex::plugin::SchemaField> {
+    auto schema = ibex::plugin::parse_schema(spec);
+    if (!schema)
+        throw std::runtime_error("ws: " + schema.error());
+    return std::move(*schema);
+}
+
+// ─── Message → row conversion ─────────────────────────────────────────────────
+
+enum class PayloadResult : std::uint8_t {
+    Row,   // `out` holds a one-row Table
+    Eof,   // {"eof":true} sentinel — end of stream
+    Skip,  // malformed message, on_malformed=skip
+};
+
+// Convert one JSON text payload to a one-row Table following `schema`.
+// Throws when the message is malformed and on_malformed=error.
+inline auto payload_to_row(std::string_view payload,
+                           const std::vector<ibex::plugin::SchemaField>& schema,
+                           const WsOptions& options, ibex::runtime::Table& out) -> PayloadResult {
+    const nlohmann::json object =
+        nlohmann::json::parse(payload, nullptr, /*allow_exceptions=*/false);
+    if (object.is_discarded() || !object.is_object()) {
+        if (options.malformed_error)
+            throw std::runtime_error("ws: payload is not a JSON object");
+        return PayloadResult::Skip;
+    }
+
+    if (auto it = object.find("eof"); it != object.end() && it->is_boolean() && it->get<bool>())
+        return PayloadResult::Eof;
+
+    auto table = ibex::plugin::table_from_json_object(object, schema);
+    if (!table) {
+        if (options.malformed_error)
+            throw std::runtime_error("ws: " + table.error());
+        return PayloadResult::Skip;
+    }
+    out = std::move(*table);
+    return PayloadResult::Row;
 }
 
 // ─── Server state ─────────────────────────────────────────────────────────────
@@ -439,71 +532,87 @@ inline void prune_clients(WsServer& srv) {
                       srv.clients.end());
 }
 
-// Serialise one row of `table` as a compact JSON object string.
-inline auto row_to_json(const ibex::runtime::Table& table, std::size_t row) -> std::string {
+// Decode and handle all complete frames buffered for client `c`.  Returns a
+// value (one-row Table or empty Table for EOF) as soon as one message is
+// useful; nullopt when the buffer holds no complete, useful frame.
+inline auto service_client_frames(WsClient& c, const std::vector<ibex::plugin::SchemaField>& schema,
+                                  const WsOptions& options)
+    -> std::optional<ibex::runtime::ExternValue> {
     using namespace ibex::runtime;
-    using namespace ibex;
 
-    std::string json = "{";
-    bool first_field = true;
-    for (const auto& entry : table.columns) {
-        if (!first_field)
-            json += ',';
-        first_field = false;
-        json += '"';
-        json += entry.name;
-        json += "\":";
-        if (is_null(entry, row)) {
-            json += "null";
+    while (true) {
+        auto frame_opt = ws_decode_frame(c.buf);
+        if (!frame_opt)
+            return std::nullopt;
+
+        const auto& frame = *frame_opt;
+
+        if (frame.opcode == 0x8U) {
+            // Close frame: echo close and mark disconnected.
+            const std::string close_resp = ws_encode_frame(0x8U, {}, /*masked=*/false);
+            ::send(c.fd, close_resp.data(), close_resp.size(), MSG_NOSIGNAL);
+            ::close(c.fd);
+            c.fd = -1;
+            return ExternValue{Table{}};  // EOF
+        }
+
+        if (frame.opcode == 0x9U) {
+            // Ping: send pong.
+            const std::string pong = ws_encode_frame(0xAU, frame.payload, /*masked=*/false);
+            ::send(c.fd, pong.data(), pong.size(), MSG_NOSIGNAL);
             continue;
         }
-        std::visit(
-            [&](const auto& col) {
-                using ColType = std::decay_t<decltype(col)>;
-                if constexpr (std::is_same_v<ColType, Column<std::int64_t>>) {
-                    json += std::to_string(col[row]);
-                } else if constexpr (std::is_same_v<ColType, Column<double>>) {
-                    char tmp[64];
-                    std::snprintf(tmp, sizeof(tmp), "%.6g", col[row]);
-                    json += tmp;
-                } else if constexpr (std::is_same_v<ColType, Column<std::string>>) {
-                    json += '"';
-                    json += col[row];
-                    json += '"';
-                } else if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                    json += '"';
-                    json += col[row];  // operator[] returns std::string_view
-                    json += '"';
-                } else if constexpr (std::is_same_v<ColType, Column<Timestamp>>) {
-                    json += std::to_string(col[row].nanos);
-                } else if constexpr (std::is_same_v<ColType, Column<Date>>) {
-                    json += std::to_string(col[row].days);
-                }
-            },
-            *entry.column);
+
+        if (frame.opcode == 0x1U || frame.opcode == 0x0U) {
+            // Text frame (or continuation — treat as complete for simplicity).
+            Table row;
+            switch (payload_to_row(frame.payload, schema, options, row)) {
+                case PayloadResult::Eof:
+                    return ExternValue{Table{}};
+                case PayloadResult::Row:
+                    return ExternValue{std::move(row)};
+                case PayloadResult::Skip:
+                    continue;  // wait for next message
+            }
+        }
     }
-    json += '}';
-    return json;
 }
 
 // ─── ws_recv ──────────────────────────────────────────────────────────────────
 //
-// Listens on `port` for WebSocket client connections, reads one JSON tick
-// message from any connected client, and returns a one-row DataFrame.
+// WebSocket server source.  Listens on `port` for client connections, reads
+// one JSON text message from any connected client, and returns a one-row
+// DataFrame following `schema_spec`.
 //
-// The function uses a 200 ms select() timeout so the stream event loop can
-// fire wall-clock bucket flushes (TimeBucket mode) during idle periods.
+// The select() timeout (poll_timeout_ms, default 200 ms) lets the stream
+// event loop fire wall-clock bucket flushes (TimeBucket mode) during idle
+// periods.
 //
 // Return values:
-//   ExternValue{Table}          — one tick row (normal case)
+//   ExternValue{Table}          — one message row (normal case)
 //   ExternValue{Table{}}        — empty Table = EOF ({"eof":true} or close frame)
-//   ExternValue{StreamTimeout}  — no message in 200 ms; call again
+//   ExternValue{StreamTimeout}  — no message in the poll window; call again
 
-inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
+inline auto ws_recv(std::int64_t port, std::string_view schema_spec,
+                    std::string_view options_spec = {}) -> ibex::runtime::ExternValue {
     using namespace ibex::runtime;
-    using namespace ibex;
+
+    const auto schema = parse_schema_or_throw(schema_spec);
+    const auto options = parse_ws_options(options_spec, /*allow_subscribe=*/false);
 
     WsServer& srv = get_server(static_cast<int>(port));
+
+    // ── Serve frames already buffered from a previous call ───────────────────
+    // A previous call may have returned mid-buffer; those bytes are no longer
+    // visible to select(), so drain them before waiting on the sockets.
+    for (auto& c : srv.clients) {
+        if (c.fd < 0 || !c.handshaked || c.buf.empty())
+            continue;
+        if (auto value = service_client_frames(c, schema, options)) {
+            prune_clients(srv);
+            return std::move(*value);
+        }
+    }
 
     // ── Build select() fd set ─────────────────────────────────────────────────
     fd_set rfds;
@@ -517,7 +626,8 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
         }
     }
 
-    struct timeval tv{.tv_sec = 0, .tv_usec = 200'000};  // 200 ms
+    struct timeval tv{.tv_sec = options.poll_timeout_ms / 1000,
+                      .tv_usec = (options.poll_timeout_ms % 1000) * 1000};
     const int nready = ::select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
     if (nready <= 0)
         return StreamTimeout{};
@@ -548,82 +658,260 @@ inline auto ws_recv(std::int64_t port) -> ibex::runtime::ExternValue {
             continue;  // wait for first data frame after handshake
         }
 
-        // Decode WebSocket frames; return on the first useful text message.
+        if (auto value = service_client_frames(c, schema, options)) {
+            prune_clients(srv);
+            return std::move(*value);
+        }
+    }
+
+    prune_clients(srv);
+    return StreamTimeout{};
+}
+
+// ─── ws_connect ───────────────────────────────────────────────────────────────
+//
+// WebSocket client source.  Connects to `url` (ws://host[:port][/path]),
+// performs the client side of the opening handshake, optionally sends a
+// subscribe message, then converts each incoming JSON text message to a
+// one-row DataFrame following `schema_spec`.
+//
+// The connection is cached per (url, schema, options) and reused across
+// calls, matching the Stream event-loop contract.
+
+struct WsUrl {
+    std::string host;
+    std::string port;
+    std::string path;
+};
+
+inline auto parse_ws_url(std::string_view url) -> WsUrl {
+    if (url.starts_with("wss://"))
+        throw std::runtime_error("ws_connect: TLS (wss://) is not supported yet: " +
+                                 std::string(url));
+    if (!url.starts_with("ws://"))
+        throw std::runtime_error("ws_connect: URL must start with ws://: " + std::string(url));
+    url.remove_prefix(std::string_view("ws://").size());
+
+    WsUrl parsed;
+    const auto slash = url.find('/');
+    std::string_view authority = slash == std::string_view::npos ? url : url.substr(0, slash);
+    parsed.path = slash == std::string_view::npos ? "/" : std::string(url.substr(slash));
+
+    const auto colon = authority.find(':');
+    if (colon == std::string_view::npos) {
+        parsed.host = std::string(authority);
+        parsed.port = "80";
+    } else {
+        parsed.host = std::string(authority.substr(0, colon));
+        parsed.port = std::string(authority.substr(colon + 1));
+    }
+    if (parsed.host.empty())
+        throw std::runtime_error("ws_connect: URL is missing a host: " + std::string(url));
+    return parsed;
+}
+
+struct WsConnection {
+    int fd{-1};
+    std::string buf;  // partial receive buffer (may hold frames from handshake)
+    bool eof{false};
+
+    WsConnection() = default;
+    WsConnection(WsConnection&&) = delete;
+    WsConnection& operator=(WsConnection&&) = delete;
+    WsConnection(const WsConnection&) = delete;
+    auto operator=(const WsConnection&) -> WsConnection& = delete;
+
+    ~WsConnection() {
+        if (fd >= 0)
+            ::close(fd);
+    }
+};
+
+// Establish the TCP connection and perform the client opening handshake.
+// Throws with a descriptive message on any failure.
+inline void ws_client_connect(WsConnection& conn, const WsUrl& url, const WsOptions& options) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* addrs = nullptr;
+    const int rc = ::getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &addrs);
+    if (rc != 0)
+        throw std::runtime_error("ws_connect: resolve " + url.host + ": " + ::gai_strerror(rc));
+
+    int fd = -1;
+    for (const addrinfo* ai = addrs; ai != nullptr; ai = ai->ai_next) {
+        fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0)
+            continue;
+        // Bound the handshake: 5 s send/receive timeouts (also bounds connect on Linux).
+        struct timeval tv{.tv_sec = 5, .tv_usec = 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+            break;
+        ::close(fd);
+        fd = -1;
+    }
+    ::freeaddrinfo(addrs);
+    if (fd < 0)
+        throw std::runtime_error("ws_connect: cannot connect to " + url.host + ":" + url.port +
+                                 ": " + std::strerror(errno));
+
+    // ── Opening handshake ─────────────────────────────────────────────────────
+    const std::string key = random_ws_key();
+    const std::string request = "GET " + url.path +
+                                " HTTP/1.1\r\n"
+                                "Host: " +
+                                url.host + ":" + url.port +
+                                "\r\n"
+                                "Upgrade: websocket\r\n"
+                                "Connection: Upgrade\r\n"
+                                "Sec-WebSocket-Key: " +
+                                key +
+                                "\r\n"
+                                "Sec-WebSocket-Version: 13\r\n\r\n";
+    if (::send(fd, request.data(), request.size(), MSG_NOSIGNAL) < 0) {
+        ::close(fd);
+        throw std::runtime_error(std::string("ws_connect: handshake send: ") +
+                                 std::strerror(errno));
+    }
+
+    std::string response;
+    while (response.find("\r\n\r\n") == std::string::npos) {
+        if (response.size() > 64 * 1024) {
+            ::close(fd);
+            throw std::runtime_error("ws_connect: handshake response too large");
+        }
+        char tmp[4096];
+        const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) {
+            ::close(fd);
+            throw std::runtime_error("ws_connect: connection closed during handshake");
+        }
+        response.append(tmp, static_cast<std::size_t>(n));
+    }
+
+    const auto header_end = response.find("\r\n\r\n");
+    const std::string_view headers = std::string_view(response).substr(0, header_end + 4);
+    if (headers.find(" 101 ") == std::string_view::npos) {
+        ::close(fd);
+        throw std::runtime_error("ws_connect: server did not upgrade (no HTTP 101): " +
+                                 std::string(headers.substr(0, headers.find('\r'))));
+    }
+    const auto accept = extract_http_header(headers, "Sec-WebSocket-Accept");
+    if (!accept || *accept != compute_accept_key(key)) {
+        ::close(fd);
+        throw std::runtime_error("ws_connect: invalid Sec-WebSocket-Accept in handshake");
+    }
+
+    conn.fd = fd;
+    // Keep any frame bytes that arrived bundled with the handshake response.
+    conn.buf.assign(response, header_end + 4, response.size() - header_end - 4);
+
+    if (!options.subscribe.empty()) {
+        const std::string frame = ws_encode_frame(0x1U, options.subscribe, /*masked=*/true);
+        if (::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL) < 0)
+            throw std::runtime_error(std::string("ws_connect: subscribe send: ") +
+                                     std::strerror(errno));
+    }
+}
+
+// One cached connection per (url, schema, options) triple.
+inline auto get_connection(const std::string& url, std::string_view schema_spec,
+                           std::string_view options_spec, const WsOptions& options)
+    -> WsConnection& {
+    static std::unordered_map<std::string, std::unique_ptr<WsConnection>> g_connections;
+    std::string cache_key = url + '\n';
+    cache_key += schema_spec;
+    cache_key += '\n';
+    cache_key += options_spec;
+    auto it = g_connections.find(cache_key);
+    if (it != g_connections.end())
+        return *it->second;
+
+    auto conn = std::make_unique<WsConnection>();
+    ws_client_connect(*conn, parse_ws_url(url), options);
+    it = g_connections.emplace(std::move(cache_key), std::move(conn)).first;
+    return *it->second;
+}
+
+inline auto ws_connect(std::string_view url, std::string_view schema_spec,
+                       std::string_view options_spec = {}) -> ibex::runtime::ExternValue {
+    using namespace ibex::runtime;
+
+    const auto schema = parse_schema_or_throw(schema_spec);
+    const auto options = parse_ws_options(options_spec, /*allow_subscribe=*/true);
+    WsConnection& conn = get_connection(std::string(url), schema_spec, options_spec, options);
+
+    if (conn.eof)
+        return ExternValue{Table{}};
+
+    // Drain buffered frames first (e.g. bundled with the handshake response),
+    // then poll the socket once for more.
+    for (int pass = 0; pass < 2; ++pass) {
         while (true) {
-            auto frame_opt = ws_decode_frame(c.buf);
+            auto frame_opt = ws_decode_frame(conn.buf);
             if (!frame_opt)
                 break;
 
             const auto& frame = *frame_opt;
 
             if (frame.opcode == 0x8U) {
-                // Close frame: echo close and mark disconnected.
-                const std::string close_resp = {'\x88', '\x00'};
-                ::send(c.fd, close_resp.data(), close_resp.size(), MSG_NOSIGNAL);
-                ::close(c.fd);
-                c.fd = -1;
-                prune_clients(srv);
-                return ExternValue{Table{}};  // EOF
+                // Close frame: echo (masked) close and end the stream.
+                const std::string close_resp = ws_encode_frame(0x8U, {}, /*masked=*/true);
+                ::send(conn.fd, close_resp.data(), close_resp.size(), MSG_NOSIGNAL);
+                ::close(conn.fd);
+                conn.fd = -1;
+                conn.eof = true;
+                return ExternValue{Table{}};
             }
 
             if (frame.opcode == 0x9U) {
-                // Ping: send pong.
-                std::string pong;
-                pong += '\x8A';
-                pong += static_cast<char>(frame.payload.size() & 0x7FU);
-                pong += frame.payload;
-                ::send(c.fd, pong.data(), pong.size(), MSG_NOSIGNAL);
+                // Ping: send (masked) pong.
+                const std::string pong = ws_encode_frame(0xAU, frame.payload, /*masked=*/true);
+                ::send(conn.fd, pong.data(), pong.size(), MSG_NOSIGNAL);
                 continue;
             }
 
             if (frame.opcode == 0x1U || frame.opcode == 0x0U) {
-                // Text frame (or continuation — treat as complete for simplicity).
-                std::string_view json = frame.payload;
-
-                // EOF sentinel from client.
-                if (json.find("\"eof\"") != std::string_view::npos &&
-                    json.find("true") != std::string_view::npos) {
-                    prune_clients(srv);
-                    return ExternValue{Table{}};
+                Table row;
+                switch (payload_to_row(frame.payload, schema, options, row)) {
+                    case PayloadResult::Eof:
+                        conn.eof = true;
+                        return ExternValue{Table{}};
+                    case PayloadResult::Row:
+                        return ExternValue{std::move(row)};
+                    case PayloadResult::Skip:
+                        continue;
                 }
-
-                // Parse tick fields.
-                auto ts_opt = json_get_int64(json, "ts");
-                auto symbol_opt = json_get_str(json, "symbol");
-                auto price_opt = json_get_double(json, "price");
-                auto volume_opt = json_get_int64(json, "volume");
-
-                if (!ts_opt || !symbol_opt || !price_opt || !volume_opt) {
-                    // Malformed message — skip and wait for next.
-                    continue;
-                }
-
-                Table table;
-
-                Column<Timestamp> ts_col;
-                ts_col.push_back(Timestamp{.nanos = *ts_opt});
-                table.add_column("ts", ColumnValue{std::move(ts_col)});
-                table.time_index = "ts";
-
-                Column<std::string> sym_col;
-                sym_col.push_back(std::move(*symbol_opt));
-                table.add_column("symbol", ColumnValue{std::move(sym_col)});
-
-                Column<double> price_col;
-                price_col.push_back(*price_opt);
-                table.add_column("price", ColumnValue{std::move(price_col)});
-
-                Column<std::int64_t> vol_col;
-                vol_col.push_back(*volume_opt);
-                table.add_column("volume", ColumnValue{std::move(vol_col)});
-
-                prune_clients(srv);
-                return ExternValue{std::move(table)};
             }
         }
+
+        if (pass == 1)
+            break;
+
+        // ── Poll the socket for more bytes ────────────────────────────────────
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(conn.fd, &rfds);
+        struct timeval tv{.tv_sec = options.poll_timeout_ms / 1000,
+                          .tv_usec = (options.poll_timeout_ms % 1000) * 1000};
+        const int nready = ::select(conn.fd + 1, &rfds, nullptr, nullptr, &tv);
+        if (nready <= 0)
+            return StreamTimeout{};
+
+        char tmp[4096];
+        const ssize_t n = ::recv(conn.fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) {
+            // Peer closed without a close frame.
+            ::close(conn.fd);
+            conn.fd = -1;
+            conn.eof = true;
+            return ExternValue{Table{}};
+        }
+        conn.buf.append(tmp, static_cast<std::size_t>(n));
     }
 
-    prune_clients(srv);
     return StreamTimeout{};
 }
 
@@ -673,8 +961,10 @@ inline auto ws_send(const ibex::runtime::Table& table, std::int64_t port) -> std
     std::int64_t sent = 0;
 
     for (std::size_t row = 0; row < rows; ++row) {
-        const std::string json = row_to_json(table, row);
-        const std::string frame = ws_encode_text_frame(json);
+        auto json = ibex::plugin::table_row_to_json(table, row);
+        if (!json)
+            throw std::runtime_error("ws_send: " + json.error());
+        const std::string frame = ws_encode_text_frame(*json);
 
         for (auto& c : srv.clients) {
             if (!c.handshaked)
@@ -705,6 +995,7 @@ inline auto ws_listen(std::int64_t port) -> std::int64_t {
 // ─── Global aliases ───────────────────────────────────────────────────────────
 // Expose plugin functions without namespace qualification so that ibex_compile-
 // generated code can call them by their extern fn name directly.
+using ibex_ws::ws_connect;
 using ibex_ws::ws_listen;
 using ibex_ws::ws_recv;
 using ibex_ws::ws_send;

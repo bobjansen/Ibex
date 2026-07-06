@@ -26,7 +26,7 @@ set(IBEX_TEST_SOURCES
     test_operator.cpp
 )
 if(NOT WIN32)
-    list(APPEND IBEX_TEST_SOURCES test_websocket.cpp)
+    list(APPEND IBEX_TEST_SOURCES test_websocket.cpp test_udp.cpp)
 endif()
 if(TARGET avrocpp_s OR TARGET avrocpp)
     list(APPEND IBEX_TEST_SOURCES test_kafka_avro.cpp)
@@ -42,6 +42,7 @@ target_include_directories(ibex_tests PRIVATE
 if(NOT WIN32)
     target_include_directories(ibex_tests PRIVATE
         "${PROJECT_SOURCE_DIR}/libs/websocket"
+        "${PROJECT_SOURCE_DIR}/libs/udp"
     )
 endif()
 

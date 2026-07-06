@@ -893,6 +893,7 @@ it looks for `csv.so` in the plugin search path and calls its
 | `adbc` | `read_adbc` | Optional ADBC/Arrow driver-manager source plugin |
 | `kafka` | `kafka_recv`, `kafka_recv_avro`, `kafka_send` | Optional Kafka streaming plugin for JSON and Schema-Registry-backed Avro |
 | `udp`  | `udp_recv`, `udp_send` | JSON-over-UDP streaming |
+| `websocket` | `ws_recv`, `ws_connect`, `ws_send`, `ws_listen` | JSON-over-WebSocket streaming: server source/sink plus client mode for external feeds |
 
 Parquet reads can target public HTTPS URLs, presigned URLs, and S3-compatible
 object storage. HTTPS URLs require no client cloud setup. S3 credentials come

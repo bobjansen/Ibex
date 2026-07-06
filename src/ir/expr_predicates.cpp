@@ -68,7 +68,7 @@ auto is_subset_evaluable_expr(const Expr& expr) -> bool {
     return no_call_of_kind(expr, [](FnKind k) { return k != FnKind::Scalar; });
 }
 
-void collect_expr_column_refs(const Expr& expr, std::unordered_set<std::string>& out) {
+void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out) {
     std::visit(
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;

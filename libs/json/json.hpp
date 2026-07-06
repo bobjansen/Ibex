@@ -27,10 +27,10 @@
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <robin_hood.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -140,7 +140,7 @@ inline auto read_json(std::string_view path) -> ibex::runtime::Table {
 
     // First pass: collect column names in order and determine types.
     std::vector<std::string> col_names;
-    std::unordered_map<std::string, std::size_t> col_index;
+    robin_hood::unordered_map<std::string, std::size_t> col_index;
     std::vector<JsonColType> col_types;
 
     for (const auto& row : rows) {
@@ -269,7 +269,8 @@ inline auto read_json(std::string_view path) -> ibex::runtime::Table {
             codes.reserve(n_rows);
             std::vector<std::string> dict;
             dict.reserve(std::min(n_rows, max_uniques));
-            std::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type> idx;
+            robin_hood::unordered_map<std::string_view, ibex::Column<ibex::Categorical>::code_type>
+                idx;
             idx.reserve(std::min(n_rows, max_uniques));
             bool ok = true;
             for (const auto& v : vals) {

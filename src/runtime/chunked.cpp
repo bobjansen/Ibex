@@ -22,7 +22,6 @@
 #include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
-#include <unordered_set>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -2801,7 +2800,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         output.columns.reserve(left_side.columns.size() + right_emit_idx_.size());
 
-        std::unordered_set<std::string> out_names;
+        robin_hood::unordered_set<std::string> out_names;
         out_names.reserve(left_side.columns.size() + right_emit_idx_.size());
 
         auto gather_with_validity =
@@ -4431,8 +4430,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (fup.children().empty()) {
             return std::unexpected("filter_update_project node missing child");
         }
-        std::unordered_set<std::string> update_outputs;
-        std::unordered_set<std::string> needed;
+        robin_hood::unordered_set<std::string> update_outputs;
+        robin_hood::unordered_set<std::string> needed;
         for (const auto& f : fup.fields()) {
             update_outputs.insert(f.alias);
             collect_expr_column_refs(f.expr, needed);

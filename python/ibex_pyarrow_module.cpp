@@ -14,9 +14,9 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <robin_hood.h>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,10 +83,10 @@ struct ExportedArrowCapsules {
 
 struct SessionState {
     ibex::runtime::TableRegistry tables;
-    std::unordered_set<std::string> table_externs;
-    std::unordered_set<std::string> sink_externs;
+    robin_hood::unordered_set<std::string> table_externs;
+    robin_hood::unordered_set<std::string> sink_externs;
     ibex::runtime::ExternRegistry externs;
-    std::unordered_set<std::string> loaded_plugins;
+    robin_hood::unordered_set<std::string> loaded_plugins;
     std::vector<std::string> plugin_paths;
 };
 
@@ -248,7 +248,7 @@ struct PluginLoadResult {
 };
 
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
-                     std::unordered_set<std::string>& loaded_plugins,
+                     robin_hood::unordered_set<std::string>& loaded_plugins,
                      ibex::runtime::ExternRegistry& externs) -> PluginLoadResult {
     if (loaded_plugins.contains(stem)) {
         return {PluginLoadStatus::Loaded, ""};
@@ -296,7 +296,7 @@ auto load_source_plugins(const ibex::parser::Program& program,
                          const std::vector<std::string>& plugin_search_paths,
                          ibex::runtime::ExternRegistry& externs)
     -> std::expected<void, std::string> {
-    std::unordered_set<std::string> loaded_plugins;
+    robin_hood::unordered_set<std::string> loaded_plugins;
     for (const auto& stmt : program.statements) {
         if (auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
             if (decl->source_path.empty()) {

@@ -2,8 +2,8 @@
 
 #include <ibex/ir/node.hpp>
 
+#include <robin_hood.h>
 #include <string_view>
-#include <unordered_set>
 
 namespace ibex::ir {
 
@@ -58,6 +58,6 @@ enum class FnKind : std::uint8_t { Scalar, Transform, Generator, Aggregate };
 [[nodiscard]] auto is_subset_evaluable_expr(const Expr& expr) -> bool;
 
 /// Collects the set of column names referenced anywhere inside `expr` into `out`.
-void collect_expr_column_refs(const Expr& expr, std::unordered_set<std::string>& out);
+void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out);
 
 }  // namespace ibex::ir

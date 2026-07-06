@@ -23,12 +23,12 @@
 #include <mutex>
 #include <netinet/in.h>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
-#include <unordered_map>
 #include <vector>
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -367,7 +367,7 @@ struct Bar {
 };
 
 static std::mutex g_mu;
-static std::unordered_map<std::string, Bar> g_bars;  // latest bar per symbol
+static robin_hood::unordered_map<std::string, Bar> g_bars;  // latest bar per symbol
 
 // ─── ANSI helpers ─────────────────────────────────────────────────────────────
 
@@ -388,7 +388,7 @@ static auto ns_to_hms(std::int64_t ns) -> std::string {
 
 // ─── Summary printer ─────────────────────────────────────────────────────────
 
-static void print_summary(const std::unordered_map<std::string, Bar>& bars) {
+static void print_summary(const robin_hood::unordered_map<std::string, Bar>& bars) {
     char timebuf[32];
     const std::time_t now = std::time(nullptr);
     struct tm tm_utc{};
@@ -470,7 +470,7 @@ int main(int argc, char* argv[]) {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_until(next);
             next += interval_ns;
-            std::unordered_map<std::string, Bar> snapshot;
+            robin_hood::unordered_map<std::string, Bar> snapshot;
             {
                 std::lock_guard lk(g_mu);
                 snapshot = g_bars;

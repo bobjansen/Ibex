@@ -6,7 +6,6 @@
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 
 namespace ibex::parser {
@@ -169,7 +168,7 @@ class EffectAnalyzer {
     }
 
     void apply_call_effect(const std::string& callee, EffectSummary& direct,
-                           std::unordered_set<std::string>& deps) const {
+                           robin_hood::unordered_set<std::string>& deps) const {
         if (user_functions_.contains(callee)) {
             deps.insert(callee);
             return;
@@ -184,7 +183,7 @@ class EffectAnalyzer {
     }
 
     void collect_clause_effects(const Clause& clause, EffectSummary& direct,
-                                std::unordered_set<std::string>& deps) const {
+                                robin_hood::unordered_set<std::string>& deps) const {
         std::visit(
             [&](const auto& c) {
                 using T = std::decay_t<decltype(c)>;
@@ -246,7 +245,7 @@ class EffectAnalyzer {
     }
 
     void collect_expr_effects(const Expr& expr, EffectSummary& direct,
-                              std::unordered_set<std::string>& deps) const {
+                              robin_hood::unordered_set<std::string>& deps) const {
         std::visit(
             [&](const auto& node) {
                 using T = std::decay_t<decltype(node)>;
@@ -311,7 +310,7 @@ class EffectAnalyzer {
     void compute_user_function_effects() {
         for (const auto& [name, fn] : user_functions_) {
             EffectSummary direct;
-            std::unordered_set<std::string> deps;
+            robin_hood::unordered_set<std::string> deps;
             for (const auto& stmt : fn->body) {
                 std::visit(
                     [&](const auto& s) {
@@ -399,7 +398,7 @@ class EffectAnalyzer {
     robin_hood::unordered_map<std::string, const FunctionDecl*> user_functions_;
     robin_hood::unordered_map<std::string, CallableSummary> externs_;
     robin_hood::unordered_map<std::string, EffectSummary> direct_effects_;
-    robin_hood::unordered_map<std::string, std::unordered_set<std::string>> dep_graph_;
+    robin_hood::unordered_map<std::string, robin_hood::unordered_set<std::string>> dep_graph_;
     robin_hood::unordered_map<std::string, EffectSummary> inferred_effects_;
 };
 

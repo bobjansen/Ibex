@@ -6,7 +6,6 @@
 #include <optional>
 #include <robin_hood.h>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 
 namespace ibex::ir {
@@ -54,7 +53,7 @@ auto take_unique_child(Node& parent) -> NodePtr {
 // projection's output (no Project may have computed columns after lowering,
 // so a key passes iff its name is one of the projected column names).
 auto keys_preserved_by_project(const std::vector<OrderKey>& keys, const ProjectNode& proj) -> bool {
-    std::unordered_set<std::string> out;
+    robin_hood::unordered_set<std::string> out;
     out.reserve(proj.columns().size());
     for (const auto& col : proj.columns()) {
         out.insert(col.name);
@@ -66,7 +65,7 @@ auto keys_preserved_by_project(const std::vector<OrderKey>& keys, const ProjectN
 // Returns true when every group_by column appears in the projection output.
 auto group_by_preserved_by_project(const std::vector<ColumnRef>& group_by, const ProjectNode& proj)
     -> bool {
-    std::unordered_set<std::string> out;
+    robin_hood::unordered_set<std::string> out;
     out.reserve(proj.columns().size());
     for (const auto& col : proj.columns()) {
         out.insert(col.name);
@@ -112,7 +111,7 @@ auto remap_group_by_through_rename(std::vector<ColumnRef> group_by,
 }
 
 // Collect the set of column names referenced by a predicate expression.
-void collect_filter_column_refs(const Expr& expr, std::unordered_set<std::string>& out) {
+void collect_filter_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out) {
     std::visit(
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;
@@ -177,7 +176,7 @@ auto compose_renames(const std::vector<RenameSpec>& outer, const std::vector<Ren
     for (const auto& rs : inner) {
         inner_new_to_old.emplace(rs.new_name, rs.old_name);
     }
-    std::unordered_set<std::string> used_inner;
+    robin_hood::unordered_set<std::string> used_inner;
     used_inner.reserve(inner.size());
     std::vector<RenameSpec> out;
     out.reserve(outer.size() + inner.size());
@@ -204,7 +203,7 @@ auto compose_renames(const std::vector<RenameSpec>& outer, const std::vector<Ren
 // Walks through FilterAnd nodes; any `col == literal` (or `literal == col`)
 // contributes `col`. Other shapes (OR, NOT, arithmetic, non-Eq comparisons)
 // are skipped — the column is not provably constant under those.
-void collect_equality_pinned_cols(const Expr& expr, std::unordered_set<std::string>& out) {
+void collect_equality_pinned_cols(const Expr& expr, robin_hood::unordered_set<std::string>& out) {
     std::visit(
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;
@@ -624,7 +623,7 @@ auto try_order_drop_pinned_keys(NodePtr node) -> TryResult {
     }
     const auto& order_n = static_cast<const OrderNode&>(*node);
     const auto& filter = static_cast<const FilterNode&>(*node->children().front());
-    std::unordered_set<std::string> pinned;
+    robin_hood::unordered_set<std::string> pinned;
     collect_equality_pinned_cols(filter.predicate(), pinned);
     if (pinned.empty()) {
         return {false, std::move(node)};
@@ -666,7 +665,7 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
     if (!update_eligible) {
         return {false, std::move(node)};
     }
-    std::unordered_set<std::string> pred_cols;
+    robin_hood::unordered_set<std::string> pred_cols;
     collect_filter_column_refs(filter.predicate(), pred_cols);
     const bool predicate_independent =
         std::none_of(upd.fields().begin(), upd.fields().end(),
@@ -734,7 +733,7 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     }
     auto& agg = static_cast<AggregateNode&>(*node);
     std::vector<ColumnRef> needed;
-    std::unordered_set<std::string> seen;
+    robin_hood::unordered_set<std::string> seen;
     needed.reserve(agg.group_by().size() + agg.aggregations().size());
     for (const auto& g : agg.group_by()) {
         if (seen.insert(g.name).second) {
@@ -801,12 +800,12 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
         // drops it, but that's a HAVING-style filter — not pushable.
         return {false, std::move(node)};
     }
-    std::unordered_set<std::string> gb_names;
+    robin_hood::unordered_set<std::string> gb_names;
     gb_names.reserve(agg.group_by().size());
     for (const auto& c : agg.group_by()) {
         gb_names.insert(c.name);
     }
-    std::unordered_set<std::string> pred_cols;
+    robin_hood::unordered_set<std::string> pred_cols;
     collect_filter_column_refs(filter.predicate(), pred_cols);
     const bool only_group_by =
         std::all_of(pred_cols.begin(), pred_cols.end(),

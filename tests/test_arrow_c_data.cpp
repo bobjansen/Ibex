@@ -3,8 +3,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstring>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_map>
 
 namespace {
 
@@ -15,8 +15,8 @@ auto read_i32_le(const char* p) -> std::int32_t {
            (static_cast<std::int32_t>(static_cast<unsigned char>(p[3])) << 24);
 }
 
-auto decode_metadata(const char* metadata) -> std::unordered_map<std::string, std::string> {
-    std::unordered_map<std::string, std::string> out;
+auto decode_metadata(const char* metadata) -> robin_hood::unordered_map<std::string, std::string> {
+    robin_hood::unordered_map<std::string, std::string> out;
     if (metadata == nullptr) {
         return out;
     }

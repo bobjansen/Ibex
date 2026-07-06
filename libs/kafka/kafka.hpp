@@ -5,8 +5,8 @@
 #include <librdkafka/rdkafka.h>
 #include <memory>
 #include <mutex>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_map>
 
 #include "kafka_avro.hpp"
 #include "kafka_common.hpp"
@@ -270,7 +270,7 @@ inline auto get_consumer_state(const std::string& brokers, const std::string& to
                                const std::string& options)
     -> std::expected<ConsumerState*, std::string> {
     static std::mutex mu;
-    static std::unordered_map<std::string, std::unique_ptr<ConsumerState>> states;
+    static robin_hood::unordered_map<std::string, std::unique_ptr<ConsumerState>> states;
 
     const std::string key = consumer_key(brokers, topic, group, schema, options);
     std::lock_guard<std::mutex> lock(mu);
@@ -289,7 +289,7 @@ inline auto get_producer_state(const std::string& brokers, const std::string& to
                                const std::string& options)
     -> std::expected<ProducerState*, std::string> {
     static std::mutex mu;
-    static std::unordered_map<std::string, std::unique_ptr<ProducerState>> states;
+    static robin_hood::unordered_map<std::string, std::unique_ptr<ProducerState>> states;
 
     const std::string key = producer_key(brokers, topic, options);
     std::lock_guard<std::mutex> lock(mu);
@@ -309,7 +309,7 @@ inline auto get_avro_consumer_state(const std::string& brokers, const std::strin
                                     const std::string& registry_url, const std::string& options)
     -> std::expected<AvroConsumerState*, std::string> {
     static std::mutex mu;
-    static std::unordered_map<std::string, std::unique_ptr<AvroConsumerState>> states;
+    static robin_hood::unordered_map<std::string, std::unique_ptr<AvroConsumerState>> states;
 
     const std::string key = avro_consumer_key(brokers, topic, group, schema, registry_url, options);
     std::lock_guard<std::mutex> lock(mu);

@@ -35,7 +35,6 @@
 #include <robin_hood.h>
 #include <string>
 #include <system_error>
-#include <unordered_set>
 #include <variant>
 
 #ifdef IBEX_HAS_READLINE
@@ -54,7 +53,7 @@ using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResul
 using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vector<std::string>>;
 using FunctionSourceRegistry = robin_hood::unordered_map<std::string, std::string>;
 using DeclarationDocRegistry = robin_hood::unordered_map<std::string, std::string>;
-using ImportRegistry = std::unordered_set<std::string>;
+using ImportRegistry = robin_hood::unordered_set<std::string>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
 
 struct BoundCallArg {
@@ -3298,7 +3297,7 @@ struct PluginLoadResult {
 };
 
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
-                     std::unordered_set<std::string>& loaded_plugins,
+                     robin_hood::unordered_set<std::string>& loaded_plugins,
                      runtime::ExternRegistry& externs) -> PluginLoadResult {
     if (loaded_plugins.contains(stem)) {
         return {PluginLoadStatus::Loaded, ""};
@@ -3387,7 +3386,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         CompileTimeListRegistry& compile_time_lists,
                         ExternDeclRegistry& extern_decls, runtime::ExternRegistry& externs,
                         const std::vector<std::string>& plugin_search_paths,
-                        std::unordered_set<std::string>& loaded_plugins,
+                        robin_hood::unordered_set<std::string>& loaded_plugins,
                         const std::vector<std::string>& import_search_paths = {},
                         const std::vector<std::vector<std::string>>* print_comment_groups = nullptr,
                         const std::vector<std::vector<std::string>>* doc_comment_groups = nullptr,
@@ -3717,7 +3716,7 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
     ImportRegistry imports;
     auto comments = collect_script_comment_lines(source);
     auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
-    std::unordered_set<std::string> loaded_plugins;
+    robin_hood::unordered_set<std::string> loaded_plugins;
     return execute_statements(parsed->statements, tables, scalars, columns, models, functions,
                               compile_time_lists, extern_decls, registry,
                               config.plugin_search_paths, loaded_plugins,
@@ -3811,7 +3810,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     FunctionSourceRegistry function_sources;
     DeclarationDocRegistry declaration_docs;
     ImportRegistry imports;
-    std::unordered_set<std::string> loaded_plugins;
+    robin_hood::unordered_set<std::string> loaded_plugins;
     bool timing_enabled = false;
     bool load_comments_enabled = false;
     configure_line_editing();

@@ -6,9 +6,9 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <robin_hood.h>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 namespace ibex::tools {
@@ -160,7 +160,7 @@ inline auto stable_path_key(const std::filesystem::path& path) -> std::string {
 
 inline auto expand_imports_impl(parser::Program program, const std::filesystem::path& current_dir,
                                 const std::vector<std::filesystem::path>& search_paths,
-                                std::unordered_set<std::string>& imported_paths)
+                                robin_hood::unordered_set<std::string>& imported_paths)
     -> std::expected<parser::Program, std::string> {
     parser::Program out;
     out.statements.reserve(program.statements.size());
@@ -220,7 +220,7 @@ inline auto expand_imports(parser::Program program, const std::string& entry_fil
     fs::path entry = fs::absolute(fs::path(entry_file));
     auto paths = detail::import_search_paths(entry, explicit_paths);
 
-    std::unordered_set<std::string> imported_paths;
+    robin_hood::unordered_set<std::string> imported_paths;
     return detail::expand_imports_impl(std::move(program), entry.parent_path(), paths,
                                        imported_paths);
 }

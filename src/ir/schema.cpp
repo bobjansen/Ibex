@@ -549,8 +549,8 @@ void collect_expr_columns(const Expr& expr, std::vector<std::string>& out) {
 }  // namespace
 
 auto check_column_refs(const Node& node, const SourceSchemas& sources,
-                       const std::unordered_set<std::string>& lexical_names, bool check_expressions)
-    -> std::optional<std::string> {
+                       const robin_hood::unordered_set<std::string>& lexical_names,
+                       bool check_expressions) -> std::optional<std::string> {
     if (node.kind() == NodeKind::Program) {
         const auto& program = static_cast<const ProgramNode&>(node);
         for (const auto& pre : program.preamble()) {

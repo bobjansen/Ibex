@@ -10,9 +10,9 @@
 #include <cstdint>
 #include <expected>
 #include <limits>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -115,7 +115,7 @@ class AvroSchemaCache {
 
    private:
     SchemaRegistryClient client_;
-    std::unordered_map<std::int32_t, avro::ValidSchema> compiled_;
+    robin_hood::unordered_map<std::int32_t, avro::ValidSchema> compiled_;
 };
 
 inline auto unwrap_avro_datum(const avro::GenericDatum& datum, std::string_view field_name)

@@ -10,9 +10,8 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <variant>
 
 #include "import_resolver.hpp"
@@ -22,7 +21,7 @@ namespace {
 using ScalarValue = ibex::codegen::Emitter::Config::ScalarValue;
 
 auto eval_scalar_expr(const ibex::parser::Expr& expr,
-                      const std::unordered_map<std::string, ScalarValue>& env)
+                      const robin_hood::unordered_map<std::string, ScalarValue>& env)
     -> std::expected<ScalarValue, std::string> {
     using namespace ibex::parser;
 
@@ -133,7 +132,7 @@ auto eval_scalar_expr(const ibex::parser::Expr& expr,
 auto collect_scalar_bindings(const ibex::parser::Program& program)
     -> std::expected<std::vector<std::pair<std::string, ScalarValue>>, std::string> {
     std::vector<std::pair<std::string, ScalarValue>> ordered;
-    std::unordered_map<std::string, ScalarValue> env;
+    robin_hood::unordered_map<std::string, ScalarValue> env;
 
     ibex::parser::LowerContext lower_ctx;
 
@@ -265,7 +264,7 @@ int main(int argc, char* argv[]) {
     config.bench_iters = bench_iters;
     config.scalar_bindings = std::move(*scalar_bindings);
     {
-        std::unordered_set<std::string> seen_headers;
+        robin_hood::unordered_set<std::string> seen_headers;
         for (const auto& stmt : program->statements) {
             if (const auto* ext = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
                 if (!ext->source_path.empty()) {

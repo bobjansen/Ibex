@@ -55,12 +55,11 @@
 #include <fstream>
 #include <optional>
 #include <random>
+#include <robin_hood.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -97,7 +96,7 @@ struct CsvSchemaHint {
 
 struct CsvReadOptions {
     bool null_if_empty = false;
-    std::unordered_set<std::string> null_tokens;
+    robin_hood::unordered_set<std::string> null_tokens;
     char delimiter = ',';
     bool has_header = true;
     CsvSchemaHint schema;
@@ -1066,8 +1065,8 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                 // Keys are owned `std::string`. Storing `std::string_view`
                 // would dangle when `dict.push_back` reallocates the dict
                 // buffer, causing repeat values to be assigned fresh codes.
-                std::unordered_map<std::string, ibex::Column<ibex::Categorical>::code_type,
-                                   ibex::detail::StringHash, std::equal_to<>>
+                robin_hood::unordered_map<std::string, ibex::Column<ibex::Categorical>::code_type,
+                                          ibex::detail::StringHash, std::equal_to<>>
                     index;
                 for (std::size_t i = 0; i < n; ++i) {
                     if (is_null(i)) {
@@ -1201,8 +1200,8 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             // (or moves SSO strings during reallocation), causing repeat
             // values to be assigned fresh codes — which downstream looks like
             // group-by producing more groups than distinct keys.
-            std::unordered_map<std::string, ibex::Column<ibex::Categorical>::code_type,
-                               ibex::detail::StringHash, std::equal_to<>>
+            robin_hood::unordered_map<std::string, ibex::Column<ibex::Categorical>::code_type,
+                                      ibex::detail::StringHash, std::equal_to<>>
                 index;
             bool ok = true;
             for (auto sv : vals) {

@@ -17,8 +17,8 @@ auto has_non_io_effects(EffectMask mask) -> bool {
            has_effect(mask, kEffBlocking) || has_effect(mask, kEffMayFail);
 }
 
-auto resources_overlap(const std::unordered_set<std::string>& lhs,
-                       const std::unordered_set<std::string>& rhs) -> bool {
+auto resources_overlap(const robin_hood::unordered_set<std::string>& lhs,
+                       const robin_hood::unordered_set<std::string>& rhs) -> bool {
     if (lhs.empty() || rhs.empty()) {
         return false;
     }

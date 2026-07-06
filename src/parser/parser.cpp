@@ -9,8 +9,8 @@
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_set>
 #include <utility>
 
 namespace ibex::parser {
@@ -237,7 +237,7 @@ class Parser {
             return false;
         }
         std::vector<EffectSpec> effects;
-        std::unordered_set<std::string> seen;
+        robin_hood::unordered_set<std::string> seen;
         if (!check(TokenKind::RBrace)) {
             do {
                 auto spec = parse_effect_spec();

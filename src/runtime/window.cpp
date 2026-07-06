@@ -15,7 +15,6 @@
 #include <optional>
 #include <set>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)

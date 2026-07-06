@@ -19,7 +19,6 @@
 #include <optional>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)

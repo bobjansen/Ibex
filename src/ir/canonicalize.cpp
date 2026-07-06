@@ -4,8 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <optional>
+#include <robin_hood.h>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -80,7 +80,7 @@ auto group_by_preserved_by_project(const std::vector<ColumnRef>& group_by, const
 // sort comparator references the pre-rename schema beneath.
 auto remap_keys_through_rename(std::vector<OrderKey> keys, const std::vector<RenameSpec>& renames)
     -> std::vector<OrderKey> {
-    std::unordered_map<std::string, std::string> new_to_old;
+    robin_hood::unordered_map<std::string, std::string> new_to_old;
     new_to_old.reserve(renames.size());
     for (const auto& rs : renames) {
         new_to_old.emplace(rs.new_name, rs.old_name);
@@ -97,7 +97,7 @@ auto remap_keys_through_rename(std::vector<OrderKey> keys, const std::vector<Ren
 auto remap_group_by_through_rename(std::vector<ColumnRef> group_by,
                                    const std::vector<RenameSpec>& renames)
     -> std::vector<ColumnRef> {
-    std::unordered_map<std::string, std::string> new_to_old;
+    robin_hood::unordered_map<std::string, std::string> new_to_old;
     new_to_old.reserve(renames.size());
     for (const auto& rs : renames) {
         new_to_old.emplace(rs.new_name, rs.old_name);
@@ -138,8 +138,8 @@ void collect_filter_column_refs(const Expr& expr, std::unordered_set<std::string
 }
 
 // Remap ColumnRef references inside a predicate expression new→old.
-void remap_filter_expr_through_rename(Expr& expr,
-                                      const std::unordered_map<std::string, std::string>& n2o) {
+void remap_filter_expr_through_rename(
+    Expr& expr, const robin_hood::unordered_map<std::string, std::string>& n2o) {
     std::visit(
         [&](auto& n) {
             using T = std::decay_t<decltype(n)>;
@@ -172,7 +172,7 @@ void remap_filter_expr_through_rename(Expr& expr,
 // (new == old) are dropped in the result.
 auto compose_renames(const std::vector<RenameSpec>& outer, const std::vector<RenameSpec>& inner)
     -> std::vector<RenameSpec> {
-    std::unordered_map<std::string, std::string> inner_new_to_old;
+    robin_hood::unordered_map<std::string, std::string> inner_new_to_old;
     inner_new_to_old.reserve(inner.size());
     for (const auto& rs : inner) {
         inner_new_to_old.emplace(rs.new_name, rs.old_name);
@@ -559,7 +559,7 @@ auto try_filter_past_rename(NodePtr node) -> TryResult {
     }
     auto& filter = static_cast<FilterNode&>(*node);
     const auto& rename = static_cast<const RenameNode&>(*node->children().front());
-    std::unordered_map<std::string, std::string> n2o;
+    robin_hood::unordered_map<std::string, std::string> n2o;
     n2o.reserve(rename.renames().size());
     for (const auto& rs : rename.renames()) {
         n2o.emplace(rs.new_name, rs.old_name);

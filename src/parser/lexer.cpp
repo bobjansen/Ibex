@@ -1,7 +1,7 @@
 #include <ibex/parser/lexer.hpp>
 
 #include <cctype>
-#include <unordered_map>
+#include <robin_hood.h>
 
 namespace ibex::parser {
 
@@ -18,7 +18,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         });
     };
 
-    const std::unordered_map<std::string_view, TokenKind> keywords = {
+    const robin_hood::unordered_map<std::string_view, TokenKind> keywords = {
         {"let", TokenKind::KeywordLet},
         {"mut", TokenKind::KeywordMut},
         {"extern", TokenKind::KeywordExtern},

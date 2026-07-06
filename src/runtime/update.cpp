@@ -20,7 +20,6 @@
 #include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -332,7 +331,7 @@ using UnaryDoubleFn = double (*)(double);
 namespace {
 
 auto lookup_unary_double_fn(std::string_view name) -> UnaryDoubleFn {
-    static const std::unordered_map<std::string_view, UnaryDoubleFn> table = {
+    static const robin_hood::unordered_map<std::string_view, UnaryDoubleFn> table = {
         {"sqrt", [](double x) { return std::sqrt(x); }},
         {"log", [](double x) { return std::log(x); }},
         {"exp", [](double x) { return std::exp(x); }},

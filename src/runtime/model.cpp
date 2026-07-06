@@ -1,7 +1,7 @@
 #include <cmath>
 #include <cstdint>
+#include <robin_hood.h>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -828,7 +828,7 @@ auto predict_model(const ModelResult& model, const Table& newdata, const ExternR
         return std::unexpected("model_predict: method '" + model.method +
                                "' does not support prediction (no fitted coefficients)");
     }
-    std::unordered_map<std::string, double> coef;
+    robin_hood::unordered_map<std::string, double> coef;
     coef.reserve(terms->size());
     for (std::size_t i = 0; i < terms->size(); ++i) {
         coef.emplace((*terms)[i], (*ests)[i]);

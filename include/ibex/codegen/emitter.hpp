@@ -5,8 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <robin_hood.h>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -51,7 +51,7 @@ class Emitter {
     int tmp_counter_{0};
     /// Cache of nodes already emitted (used in bench mode to avoid re-emitting
     /// ExternCall nodes inside the timing loop).
-    std::unordered_map<const ir::Node*, std::string> cached_vars_;
+    robin_hood::unordered_map<const ir::Node*, std::string> cached_vars_;
     /// When emitting a stream transform, holds the C++ variable name that
     /// substitutes for `ScanNode("__stream_input__")` in the transform IR.
     std::string stream_scan_var_;

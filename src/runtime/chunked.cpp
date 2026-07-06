@@ -6,14 +6,8 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/rng.hpp>
-#include <ibex/runtime/safe_arith.hpp>
-#include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
-#include <bit>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -22,13 +16,10 @@
 #include <ctime>
 #include <deque>
 #include <limits>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <pdqsort.h>
-#include <random>
 #include <robin_hood.h>
-#include <set>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -47,7 +38,9 @@
 
 namespace ibex::runtime {
 
-static auto chunk_to_table(Chunk chunk) -> Table {
+namespace {
+
+auto chunk_to_table(Chunk chunk) -> Table {
     Table t;
     t.columns = std::move(chunk.columns);
     for (std::size_t i = 0; i < t.columns.size(); ++i) {
@@ -61,7 +54,7 @@ static auto chunk_to_table(Chunk chunk) -> Table {
     return t;
 }
 
-static auto table_to_chunk(Table table) -> Chunk {
+auto table_to_chunk(Table table) -> Chunk {
     Chunk c;
     c.columns = std::move(table.columns);
     c.ordering = std::move(table.ordering);
@@ -71,6 +64,8 @@ static auto table_to_chunk(Table table) -> Chunk {
     }
     return c;
 }
+
+}  // namespace
 
 /// Per-chunk filter: pulls a chunk from the child, wraps it as a `Table`,
 /// reuses the existing `filter_table` predicate evaluator, and emits the
@@ -558,7 +553,7 @@ class ChunkedHeadOperator final : public Operator {
 
         Table t = chunk_to_table(std::move(chunk));
         std::vector<std::size_t> idx(remaining_);
-        std::iota(idx.begin(), idx.end(), std::size_t{0});
+        std::ranges::iota(idx, std::size_t{0});
         remaining_ = 0;
         done_ = true;
         return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
@@ -887,7 +882,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         }
     } else {
         idx.resize(rows);
-        std::iota(idx.begin(), idx.end(), 0);
+        std::ranges::iota(idx, 0);
         // pdqsort is unstable, but the comparator's `lhs < rhs` tiebreak makes the
         // order total, so the result matches a stable sort.
         pdqsort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
@@ -944,7 +939,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
 
     std::size_t pos = 0;
     while (pos < rows) {
-        std::size_t group_end;
+        std::size_t group_end = 0;
         if (!radix_group_starts.empty()) {
             ++gs_cursor;  // advance past the current group's start
             group_end = radix_group_starts[gs_cursor];
@@ -972,8 +967,8 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             } else {
                 switch (rank.method) {
                     case ir::RankMethod::Average: {
-                        const double first_rank = static_cast<double>(ordinal);
-                        const double last_rank = static_cast<double>(ordinal + (tie_end - i) - 1);
+                        const auto first_rank = static_cast<double>(ordinal);
+                        const auto last_rank = static_cast<double>(ordinal + (tie_end - i) - 1);
                         assigned = (first_rank + last_rank) / 2.0;
                         break;
                     }
@@ -990,7 +985,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 }
                 if (rank.method == ir::RankMethod::First) {
                     for (std::size_t k = i; k < tie_end; ++k) {
-                        double value = static_cast<double>(ordinal + (k - i));
+                        auto value = static_cast<double>(ordinal + (k - i));
                         rank_values[idx[k]] =
                             rank.pct ? value / static_cast<double>(group_end - pos) : value;
                     }
@@ -1705,16 +1700,16 @@ class ChunkedOrderedLimitOperator final : public Operator {
     auto push_entry(std::vector<Entry>& heap, Entry entry) const -> void {
         if (heap.size() < count_) {
             heap.push_back(std::move(entry));
-            std::push_heap(heap.begin(), heap.end(),
-                           [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
+            std::ranges::push_heap(
+                heap, [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
             return;
         }
 
-        std::pop_heap(heap.begin(), heap.end(),
-                      [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
+        std::ranges::pop_heap(
+            heap, [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
         heap.back() = std::move(entry);
-        std::push_heap(heap.begin(), heap.end(),
-                       [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
+        std::ranges::push_heap(
+            heap, [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
     }
 
     template <typename T>
@@ -1839,8 +1834,8 @@ class ChunkedOrderedLimitOperator final : public Operator {
             return empty_template_.value_or(Table{});
         }
 
-        std::sort(winners.begin(), winners.end(),
-                  [&](const Entry& a, const Entry& b) { return row_comes_first(a, b); });
+        std::ranges::sort(winners,
+                          [&](const Entry& a, const Entry& b) { return row_comes_first(a, b); });
 
         Table out = empty_template_.value_or(Table{});
         for (const auto& entry : winners) {
@@ -2117,36 +2112,36 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 
         if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
             right_kind_ = ExprType::Int;
-            for (std::size_t row = 0; row < col->size(); ++row) {
-                right_i64_.insert((*col)[row]);
+            for (long row : *col) {
+                right_i64_.insert(row);
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<double>>(key)) {
             right_kind_ = ExprType::Double;
-            for (std::size_t row = 0; row < col->size(); ++row) {
-                right_f64_.insert((*col)[row]);
+            for (double row : *col) {
+                right_f64_.insert(row);
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<bool>>(key)) {
             right_kind_ = ExprType::Bool;
-            for (std::size_t row = 0; row < col->size(); ++row) {
-                right_bool_.insert((*col)[row]);
+            for (bool row : *col) {
+                right_bool_.insert(row);
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<Date>>(key)) {
             right_kind_ = ExprType::Date;
-            for (std::size_t row = 0; row < col->size(); ++row) {
-                right_date_.insert((*col)[row]);
+            for (auto row : *col) {
+                right_date_.insert(row);
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<Timestamp>>(key)) {
             right_kind_ = ExprType::Timestamp;
-            for (std::size_t row = 0; row < col->size(); ++row) {
-                right_timestamp_.insert((*col)[row]);
+            for (auto row : *col) {
+                right_timestamp_.insert(row);
             }
             return std::nullopt;
         }
@@ -2160,8 +2155,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         }
         if (const auto* col = std::get_if<Column<std::string>>(key)) {
             right_kind_ = ExprType::String;
-            for (std::size_t row = 0; row < col->size(); ++row) {
-                owned_strings_.emplace_back((*col)[row]);
+            for (auto row : *col) {
+                owned_strings_.emplace_back(row);
                 right_strings_.insert(std::string_view{owned_strings_.back()});
             }
             return std::nullopt;
@@ -3542,7 +3537,7 @@ class ChunkedAggregateOperator final : public Operator {
         }
 
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
-            if (track_validity[i] == 0U || agg_validity[i].size() == 0) {
+            if (track_validity[i] == 0U || agg_validity[i].empty()) {
                 continue;
             }
             bool has_null = false;
@@ -3762,7 +3757,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     // are exactly the group_by columns (as a set; direction and intra-prefix
     // order don't matter for contiguity). Nullable group keys fall back, since
     // the streaming key compare ignores validity.
-    auto sorted_on_group_by(const Chunk& chunk) const -> bool {
+    [[nodiscard]] auto sorted_on_group_by(const Chunk& chunk) const -> bool {
         if (group_by_->empty()) {
             return false;  // global aggregate: let the hash path handle it
         }
@@ -3971,15 +3966,15 @@ class ChunkedSortedAggregateOperator final : public Operator {
         for (const auto* col : key_cols) {
             open_key_.push_back(scalar_from_column(*col, row));
         }
-        std::fill(cur_slots_.begin(), cur_slots_.end(), AggSlot{});
+        std::ranges::fill(cur_slots_, AggSlot{});
         open_ = true;
     }
 
     // Whether `row` continues the currently open group. Only called at run
     // anchors (group boundaries and chunk starts), so the scalar build is
     // paid per group, not per row.
-    auto row_matches_open(const std::vector<const ColumnValue*>& key_cols, std::size_t row) const
-        -> bool {
+    [[nodiscard]] auto row_matches_open(const std::vector<const ColumnValue*>& key_cols,
+                                        std::size_t row) const -> bool {
         for (std::size_t i = 0; i < key_cols.size(); ++i) {
             if (scalar_from_column(*key_cols[i], row) != open_key_[i]) {
                 return false;
@@ -4212,22 +4207,20 @@ class ChunkedSortedAggregateOperator final : public Operator {
 };
 
 }  // namespace
-auto build_operator(const ir::Node& node, const TableRegistry& registry,
-                    const ScalarRegistry* scalars, const ExternRegistry* externs,
-                    ModelResult* model_out) -> std::expected<OperatorPtr, std::string>;
 
 auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     MaterializeOperator sink{std::move(op)};
     return sink.run();
 }
 
+namespace {
+
 template <typename Fn>
-static auto build_unary_materializing_operator(const ir::Node& child_node,
-                                               const TableRegistry& registry,
-                                               const ScalarRegistry* scalars,
-                                               const ExternRegistry* externs,
-                                               ModelResult* model_out, Fn fn)
-    -> std::expected<OperatorPtr, std::string> {
+
+auto build_unary_materializing_operator(const ir::Node& child_node, const TableRegistry& registry,
+                                        const ScalarRegistry* scalars,
+                                        const ExternRegistry* externs, ModelResult* model_out,
+                                        Fn fn) -> std::expected<OperatorPtr, std::string> {
     auto child_op = build_operator(child_node, registry, scalars, externs, model_out);
     if (!child_op.has_value()) {
         return std::unexpected(std::move(child_op.error()));
@@ -4243,11 +4236,17 @@ static auto build_unary_materializing_operator(const ir::Node& child_node,
     return std::make_unique<TableSourceOperator>(std::move(result.value()));
 }
 
+}  // namespace
+
+namespace {
+
 template <typename Fn>
-static auto build_binary_materializing_operator(
-    const ir::Node& left_node, const ir::Node& right_node, const TableRegistry& registry,
-    const ScalarRegistry* scalars, const ExternRegistry* externs, ModelResult* model_out, Fn fn)
-    -> std::expected<OperatorPtr, std::string> {
+
+auto build_binary_materializing_operator(const ir::Node& left_node, const ir::Node& right_node,
+                                         const TableRegistry& registry,
+                                         const ScalarRegistry* scalars,
+                                         const ExternRegistry* externs, ModelResult* model_out,
+                                         Fn fn) -> std::expected<OperatorPtr, std::string> {
     auto left_op = build_operator(left_node, registry, scalars, externs, model_out);
     if (!left_op.has_value()) {
         return std::unexpected(std::move(left_op.error()));
@@ -4271,9 +4270,8 @@ static auto build_binary_materializing_operator(
     return std::make_unique<TableSourceOperator>(std::move(result.value()));
 }
 
-static auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* scalars,
-                             const ExternRegistry* externs)
-    -> std::expected<ExternArgs, std::string> {
+auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* scalars,
+                      const ExternRegistry* externs) -> std::expected<ExternArgs, std::string> {
     ExternArgs args;
     args.reserve(exprs.size());
     for (const auto& arg : exprs) {
@@ -4285,6 +4283,8 @@ static auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarReg
     }
     return args;
 }
+
+}  // namespace
 
 auto invoke_extern_call(const ir::ExternCallNode& ec, const ScalarRegistry* scalars,
                         const ExternRegistry* externs) -> std::expected<ExternValue, std::string> {

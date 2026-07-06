@@ -16,6 +16,7 @@ Diagnostics:
       - performance-*
       - readability-*
     Remove:
+      - cppcoreguidelines-pro-bounds-avoid-unchecked-container-access
       - cppcoreguidelines-pro-bounds-pointer-arithmetic
       - cppcoreguidelines-pro-bounds-constant-array-index
       - cppcoreguidelines-avoid-do-while

@@ -1,11 +1,7 @@
-#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/pipeline.hpp>
-#include <ibex/runtime/rng.hpp>
-#include <ibex/runtime/safe_arith.hpp>
-#include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -17,7 +13,6 @@
 #include <ctime>
 #include <mutex>
 #include <optional>
-#include <pdqsort.h>
 #include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
@@ -40,6 +35,8 @@
 
 namespace ibex::runtime {
 
+namespace {
+
 // Process-wide allocator tuning to flatten the large-buffer page-fault cliff.
 //
 // Every result column is backed by std::vector<T>, so any column above glibc's
@@ -50,7 +47,7 @@ namespace ibex::runtime {
 // allocations from the main arena and never trimming the heap top lets freed
 // buffers recycle already-faulted pages across the warmup/timed iterations.
 // glibc-only; a no-op elsewhere. Opt out via IBEX_NO_MALLOC_TUNING.
-static void tune_allocator_once() {
+void tune_allocator_once() {
 #ifdef __GLIBC__
     static std::once_flag flag;
     std::call_once(flag, [] {
@@ -63,6 +60,8 @@ static void tune_allocator_once() {
     });
 #endif
 }
+
+}  // namespace
 
 auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
                            const std::unordered_map<std::string, std::size_t>& index) -> bool {
@@ -91,7 +90,7 @@ auto format_tables(const TableRegistry& registry) -> std::string {
     for (const auto& entry : registry) {
         names.emplace_back(entry.first);
     }
-    std::sort(names.begin(), names.end());
+    std::ranges::sort(names);
     std::string out;
     for (std::size_t i = 0; i < names.size(); ++i) {
         if (i > 0) {
@@ -164,8 +163,10 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
         std::vector<ir::OrderKey> new_ordering;
         for (const auto& key : *input.ordering) {
             auto it = rename_map.find(key.name);
-            new_ordering.push_back({.name = (it != rename_map.end()) ? it->second : key.name,
-                                    .ascending = key.ascending});
+            new_ordering.push_back({
+                .name = (it != rename_map.end()) ? it->second : key.name,
+                .ascending = key.ascending,
+            });
         }
         output.ordering = std::move(new_ordering);
     }
@@ -1173,9 +1174,11 @@ void Table::add_column(std::string name, ColumnValue column) {
         return;
     }
     std::size_t pos = columns.size();
-    columns.push_back(ColumnEntry{.name = std::move(name),
-                                  .column = std::make_shared<ColumnValue>(std::move(column)),
-                                  .validity = std::nullopt});
+    columns.push_back(ColumnEntry{
+        .name = std::move(name),
+        .column = std::make_shared<ColumnValue>(std::move(column)),
+        .validity = std::nullopt,
+    });
     index[columns.back().name] = pos;
 }
 
@@ -1186,9 +1189,11 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
         return;
     }
     std::size_t pos = columns.size();
-    columns.push_back(ColumnEntry{.name = std::move(name),
-                                  .column = std::make_shared<ColumnValue>(std::move(column)),
-                                  .validity = std::move(validity)});
+    columns.push_back(ColumnEntry{
+        .name = std::move(name),
+        .column = std::make_shared<ColumnValue>(std::move(column)),
+        .validity = std::move(validity),
+    });
     index[columns.back().name] = pos;
 }
 
@@ -1230,7 +1235,10 @@ void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> col
     }
     std::size_t pos = columns.size();
     columns.push_back(ColumnEntry{
-        .name = std::move(name), .column = std::move(column), .validity = std::move(validity)});
+        .name = std::move(name),
+        .column = std::move(column),
+        .validity = std::move(validity),
+    });
     index[columns.back().name] = pos;
 }
 
@@ -1314,10 +1322,12 @@ auto aggregate_series(std::string_view name, const ColumnValue& column, double p
     // Reduce the series via the shared aggregate kernel on a one-column table.
     Table t;
     t.add_column("__series", column);
-    ir::AggSpec spec{.func = *func,
-                     .column = ir::ColumnRef{.name = "__series"},
-                     .alias = "__agg",
-                     .param = param};
+    ir::AggSpec spec{
+        .func = *func,
+        .column = ir::ColumnRef{.name = "__series"},
+        .alias = "__agg",
+        .param = param,
+    };
     auto agg = aggregate_table(t, {}, std::vector<ir::AggSpec>{std::move(spec)});
     if (!agg.has_value()) {
         return std::unexpected(agg.error());

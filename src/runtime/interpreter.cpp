@@ -16,7 +16,6 @@
 #include <robin_hood.h>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -64,7 +63,8 @@ void tune_allocator_once() {
 }  // namespace
 
 auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
-                           const std::unordered_map<std::string, std::size_t>& index) -> bool {
+                           const robin_hood::unordered_map<std::string, std::size_t>& index)
+    -> bool {
     return std::ranges::all_of(keys, [index](const auto& key) { return index.contains(key.name); });
 }
 
@@ -140,7 +140,7 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
 
 auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames)
     -> std::expected<Table, std::string> {
-    std::unordered_map<std::string, std::string> rename_map;
+    robin_hood::unordered_map<std::string, std::string> rename_map;
     rename_map.reserve(renames.size());
     for (const auto& spec : renames) {
         const auto* entry = input.find_entry(spec.old_name);

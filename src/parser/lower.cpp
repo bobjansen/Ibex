@@ -9,7 +9,7 @@
 #include <charconv>
 #include <functional>
 #include <memory>
-#include <unordered_map>
+#include <robin_hood.h>
 #include <unordered_set>
 
 namespace ibex::parser {
@@ -55,7 +55,7 @@ auto to_ir_schema_fields(const SchemaType& schema) -> std::vector<ir::SchemaFiel
 /// return type is a DataFrame/TimeFrame carrying a schema contributes its
 /// declared output schema, keyed by the extern name. Used so a typed reader call
 /// (`read_typed(...)`) lowers to an ExternCall with a statically Known schema.
-auto build_source_schemas(const std::unordered_map<std::string, const ExternDecl*>& decls)
+auto build_source_schemas(const robin_hood::unordered_map<std::string, const ExternDecl*>& decls)
     -> ir::SourceSchemas {
     ir::SourceSchemas sources;
     for (const auto& [name, decl] : decls) {
@@ -309,8 +309,8 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
 /// Clone `expr` while substituting any IdentifierExpr whose name appears in
 /// `subs` with a clone of the bound replacement. Used to inline an aggregate
 /// UDF body's parameter references with the call's argument expressions.
-auto substitute_params(const Expr& expr, const std::unordered_map<std::string, const Expr*>& subs)
-    -> ExprPtr {
+auto substitute_params(const Expr& expr,
+                       const robin_hood::unordered_map<std::string, const Expr*>& subs) -> ExprPtr {
     return std::visit(
         [&](const auto& node) -> ExprPtr {
             using T = std::decay_t<decltype(node)>;
@@ -540,7 +540,7 @@ auto compile_values_equal(const CompileTimeValue& lhs, const CompileTimeValue& r
 }
 
 auto eval_compile_expr(const Expr& expr,
-                       const std::unordered_map<std::string, CompileTimeValue>& env)
+                       const robin_hood::unordered_map<std::string, CompileTimeValue>& env)
     -> std::expected<CompileTimeValue, LowerError> {
     return std::visit(
         [&](const auto& node) -> std::expected<CompileTimeValue, LowerError> {
@@ -669,7 +669,7 @@ auto eval_compile_expr(const Expr& expr,
 }
 
 auto render_alias_template(const std::string& alias_template,
-                           const std::unordered_map<std::string, CompileTimeValue>& env)
+                           const robin_hood::unordered_map<std::string, CompileTimeValue>& env)
     -> std::expected<std::string, LowerError> {
     std::string rendered;
     rendered.reserve(alias_template.size());
@@ -703,7 +703,7 @@ auto render_alias_template(const std::string& alias_template,
 }
 
 auto substitute_map_expr(const Expr& expr,
-                         const std::unordered_map<std::string, CompileTimeValue>& env)
+                         const robin_hood::unordered_map<std::string, CompileTimeValue>& env)
     -> std::expected<ExprPtr, LowerError> {
     return std::visit(
         [&](const auto& node) -> std::expected<ExprPtr, LowerError> {
@@ -847,7 +847,7 @@ auto build_optimization_context(const EffectAnalysis& analysis) -> ir::Optimizat
     context.callee_summaries.reserve(analysis.user_functions.size() + analysis.externs.size() +
                                      analysis.builtins.size());
 
-    const auto append = [&](const std::unordered_map<std::string, CallableSummary>& src) {
+    const auto append = [&](const robin_hood::unordered_map<std::string, CallableSummary>& src) {
         for (const auto& [name, callable] : src) {
             ir::CallableSummary dst;
             dst.effects = to_ir_effect_summary(callable.effects);
@@ -868,13 +868,14 @@ auto build_optimization_context(const EffectAnalysis& analysis) -> ir::Optimizat
 class Lowerer {
    public:
     explicit Lowerer(
-        std::unordered_map<std::string, ir::NodePtr>* bindings,
-        std::unordered_map<std::string, std::vector<std::string>> initial_compile_time_lists = {},
+        robin_hood::unordered_map<std::string, ir::NodePtr>* bindings,
+        robin_hood::unordered_map<std::string, std::vector<std::string>>
+            initial_compile_time_lists = {},
         std::unordered_set<std::string> initial_table_externs = {},
         std::unordered_set<std::string> initial_sink_externs = {},
-        std::unordered_map<std::string, const ExternDecl*> initial_table_extern_decls = {},
+        robin_hood::unordered_map<std::string, const ExternDecl*> initial_table_extern_decls = {},
         ir::SourceSchemas initial_source_schemas = {},
-        std::unordered_map<std::string, const FunctionDecl*> initial_functions = {})
+        robin_hood::unordered_map<std::string, const FunctionDecl*> initial_functions = {})
         : bindings_(bindings),
           compile_time_lists_(std::move(initial_compile_time_lists)),
           table_externs_(std::move(initial_table_externs)),
@@ -884,7 +885,7 @@ class Lowerer {
           functions_(std::move(initial_functions)) {}
 
     [[nodiscard]] auto table_extern_decls() const
-        -> const std::unordered_map<std::string, const ExternDecl*>& {
+        -> const robin_hood::unordered_map<std::string, const ExternDecl*>& {
         return table_extern_decls_;
     }
 
@@ -1297,7 +1298,7 @@ class Lowerer {
 
         const auto& params = decl_it->second->params;
         std::vector<const Expr*> bound(params.size(), nullptr);
-        std::unordered_map<std::string, std::size_t> param_index;
+        robin_hood::unordered_map<std::string, std::size_t> param_index;
         param_index.reserve(params.size());
         for (std::size_t i = 0; i < params.size(); ++i) {
             param_index.emplace(params[i].name, i);
@@ -1435,7 +1436,7 @@ class Lowerer {
     auto expand_one_map_field(const MapField& map_field)
         -> std::expected<std::vector<Field>, LowerError> {
         std::vector<Field> expanded;
-        std::unordered_map<std::string, CompileTimeValue> env;
+        robin_hood::unordered_map<std::string, CompileTimeValue> env;
         auto step = [&](auto&& self, std::size_t binding_idx) -> std::expected<void, LowerError> {
             if (binding_idx == map_field.bindings.size()) {
                 if (map_field.where_expr) {
@@ -2201,7 +2202,7 @@ class Lowerer {
             }
             bound[pos] = narg.value.get();
         }
-        std::unordered_map<std::string, const Expr*> subs;
+        robin_hood::unordered_map<std::string, const Expr*> subs;
         for (std::size_t i = 0; i < fn.params.size(); ++i) {
             const Expr* arg = bound[i] != nullptr ? bound[i] : fn.params[i].default_value.get();
             if (arg == nullptr) {
@@ -2267,7 +2268,7 @@ class Lowerer {
             }
             bound[pos] = narg.value.get();
         }
-        std::unordered_map<std::string, ir::Expr> scope;
+        robin_hood::unordered_map<std::string, ir::Expr> scope;
         for (std::size_t i = 0; i < fn.params.size(); ++i) {
             const Expr* arg = bound[i] != nullptr ? bound[i] : fn.params[i].default_value.get();
             if (arg == nullptr) {
@@ -2620,7 +2621,7 @@ class Lowerer {
             preagg_updates = std::move(group_by_result->preagg_updates);
         }
 
-        std::unordered_map<std::string, bool> group_keys;
+        robin_hood::unordered_map<std::string, bool> group_keys;
         for (const auto& key : group_by) {
             group_keys.emplace(key.name, true);
         }
@@ -2628,7 +2629,7 @@ class Lowerer {
         std::vector<ir::AggSpec> aggs;
         std::vector<ir::FieldSpec> updates;
         std::vector<std::string> final_columns;
-        std::unordered_map<std::string, bool> temp_columns;
+        robin_hood::unordered_map<std::string, bool> temp_columns;
         std::size_t temp_counter = 0;
 
         auto make_temp = [&]() -> std::string {
@@ -3780,17 +3781,17 @@ class Lowerer {
     }
 
     ir::Builder builder_;
-    std::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
-    std::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
+    robin_hood::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
+    robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     std::unordered_set<std::string> table_externs_;
     std::unordered_set<std::string> sink_externs_;
-    std::unordered_map<std::string, const ExternDecl*> table_extern_decls_;
+    robin_hood::unordered_map<std::string, const ExternDecl*> table_extern_decls_;
     ir::SourceSchemas binding_schemas_;
-    std::unordered_map<std::string, const FunctionDecl*> functions_;
+    robin_hood::unordered_map<std::string, const FunctionDecl*> functions_;
     // Scratch for inlining scalar UDF calls in clause expressions: a stack of
     // parameter substitutions (top = innermost inlined body) and a guard set to
     // reject recursive inlining.
-    std::vector<std::unordered_map<std::string, ir::Expr>> inline_scopes_;
+    std::vector<robin_hood::unordered_map<std::string, ir::Expr>> inline_scopes_;
     std::unordered_set<std::string> inlining_active_;
 };
 
@@ -3802,7 +3803,7 @@ auto lower(const Program& program) -> LowerResult {
         return std::unexpected(LowerError{.message = effects.error().format()});
     }
 
-    std::unordered_map<std::string, ir::NodePtr> bindings;
+    robin_hood::unordered_map<std::string, ir::NodePtr> bindings;
     Lowerer lowerer(&bindings);
     auto lowered = lowerer.lower_program(program);
     if (!lowered.has_value()) {

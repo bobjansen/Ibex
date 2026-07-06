@@ -3,9 +3,9 @@
 #include <ibex/ir/node.hpp>
 
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -60,7 +60,7 @@ class SchemaInfo {
 /// Maps a source/extern table name to its declared schema. An entry that is
 /// absent (or maps to Unknown) leaves the corresponding `ScanNode` /
 /// `ExternCallNode` Unknown. Empty by default — every source is Unknown.
-using SourceSchemas = std::unordered_map<std::string, SchemaInfo>;
+using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 
 /// Propagate column schemas bottom-up through the IR and return the schema of
 /// `node`'s result. Operators not yet modelled return `Unknown`, which is

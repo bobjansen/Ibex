@@ -3,9 +3,9 @@
 #include <fmt/core.h>
 
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -112,8 +112,8 @@ auto effect_summaries_equal(const EffectSummary& lhs, const EffectSummary& rhs) 
            lhs.io_write_resources == rhs.io_write_resources;
 }
 
-auto builtin_summaries() -> const std::unordered_map<std::string, CallableSummary>& {
-    static const std::unordered_map<std::string, CallableSummary> builtins = {
+auto builtin_summaries() -> const robin_hood::unordered_map<std::string, CallableSummary>& {
+    static const robin_hood::unordered_map<std::string, CallableSummary> builtins = {
         {"print", make_builtin_summary(kEffIoWrite, false, true)},
         {"seed_rng", make_builtin_summary(kEffState)},
         {"rand_uniform", make_builtin_summary(kEffNondet)},
@@ -396,11 +396,11 @@ class EffectAnalyzer {
     }
 
     const Program& program_;
-    std::unordered_map<std::string, const FunctionDecl*> user_functions_;
-    std::unordered_map<std::string, CallableSummary> externs_;
-    std::unordered_map<std::string, EffectSummary> direct_effects_;
-    std::unordered_map<std::string, std::unordered_set<std::string>> dep_graph_;
-    std::unordered_map<std::string, EffectSummary> inferred_effects_;
+    robin_hood::unordered_map<std::string, const FunctionDecl*> user_functions_;
+    robin_hood::unordered_map<std::string, CallableSummary> externs_;
+    robin_hood::unordered_map<std::string, EffectSummary> direct_effects_;
+    robin_hood::unordered_map<std::string, std::unordered_set<std::string>> dep_graph_;
+    robin_hood::unordered_map<std::string, EffectSummary> inferred_effects_;
 };
 
 }  // namespace
@@ -419,8 +419,8 @@ auto EffectAnalysis::find_callee(std::string_view name) const -> const CallableS
 }
 
 auto EffectAnalysis::merged_callee_summaries() const
-    -> std::unordered_map<std::string, CallableSummary> {
-    std::unordered_map<std::string, CallableSummary> out;
+    -> robin_hood::unordered_map<std::string, CallableSummary> {
+    robin_hood::unordered_map<std::string, CallableSummary> out;
     out.reserve(user_functions.size() + externs.size() + builtins.size());
     out.insert(user_functions.begin(), user_functions.end());
     out.insert(externs.begin(), externs.end());

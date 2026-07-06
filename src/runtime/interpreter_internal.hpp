@@ -24,10 +24,10 @@
 #include <expected>
 #include <functional>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -439,9 +439,9 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                                   ModelResult* model_out = nullptr)
     -> std::expected<Table, std::string>;
-[[nodiscard]] auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
-                                         const std::unordered_map<std::string, std::size_t>& index)
-    -> bool;
+[[nodiscard]] auto ordering_keys_present(
+    const std::vector<ir::OrderKey>& keys,
+    const robin_hood::unordered_map<std::string, std::size_t>& index) -> bool;
 [[nodiscard]] auto ordering_keys_for_table(const Table& input,
                                            const std::vector<ir::OrderKey>& keys)
     -> std::vector<ir::OrderKey>;
@@ -597,7 +597,8 @@ enum class FloatCleanMode : std::uint8_t {
                                     FloatCleanMode mode) -> std::expected<FillResult, std::string>;
 [[nodiscard]] auto eval_is_nan(const ir::CallExpr& call, const Table& input)
     -> std::expected<ColumnValue, std::string>;
-[[nodiscard]] auto scalar_builtins() -> const std::unordered_map<std::string_view, ScalarBuiltin>&;
+[[nodiscard]] auto scalar_builtins()
+    -> const robin_hood::unordered_map<std::string_view, ScalarBuiltin>&;
 [[nodiscard]] auto infer_expr_type(const ir::Expr& expr, const Table& input,
                                    const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ExprType, std::string>;

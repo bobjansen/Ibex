@@ -548,14 +548,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     break;
                 case ir::AggFunc::Ewma:
-                    append_scalar(*column, slot.double_value);
-                    break;
                 case ir::AggFunc::Quantile:
-                    append_scalar(*column, slot.double_value);
-                    break;
                 case ir::AggFunc::Skew:
-                    append_scalar(*column, slot.double_value);
-                    break;
                 case ir::AggFunc::Kurtosis:
                     append_scalar(*column, slot.double_value);
                     break;

@@ -228,9 +228,15 @@ configure_and_build() {
     local build_dir="$2"
     local log_file="$3"
 
+    # Compiler is overridable (IBEX_CC/IBEX_CXX) so callers on boxes without a
+    # bare `clang`/`clang++` on PATH can pass a versioned toolchain, e.g. the AWS
+    # runner passes clang-21/clang++-21. Both are set explicitly because the
+    # top-level CMakeLists only auto-derives CMAKE_C_COMPILER when CXX ends in
+    # exactly "clang++" (a versioned "clang++-21" wouldn't match).
     if ! cmake -S "$src_dir" -B "$build_dir" \
         -G Ninja \
-        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_C_COMPILER="${IBEX_CC:-clang}" \
+        -DCMAKE_CXX_COMPILER="${IBEX_CXX:-clang++}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         ${IBEX_LIGHTGBM_SRC:+-DFETCHCONTENT_SOURCE_DIR_LIGHTGBM="$IBEX_LIGHTGBM_SRC"} \

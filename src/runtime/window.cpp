@@ -78,40 +78,96 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
 //   • finite: fed into the accumulator as usual.
 // When no input element is null the result carries no validity bitmap (nullopt)
 // and the numbers are bit-identical to the null-unaware path.
-auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Duration duration)
+auto rolling_window_spec(const ir::CallExpr& call, std::optional<ir::Duration> block_default)
+    -> std::expected<WindowSpec, std::string> {
+    // Lowering attaches the per-call window as a sentinel named arg (mirroring
+    // rep's __array_len): __window_n for a row count, __window_ns for a duration
+    // already normalised to nanoseconds. A per-call window overrides the block.
+    for (const auto& na : call.named_args) {
+        const bool is_n = na.name == "__window_n";
+        const bool is_ns = na.name == "__window_ns";
+        if (!is_n && !is_ns)
+            continue;
+        const auto* lit = na.value ? std::get_if<ir::Literal>(&na.value->node) : nullptr;
+        const auto* iv = lit ? std::get_if<std::int64_t>(&lit->value) : nullptr;
+        if (iv == nullptr) {
+            return std::unexpected(call.callee + ": malformed window argument");
+        }
+        if (is_n) {
+            if (*iv <= 0)
+                return std::unexpected(call.callee + ": count window must be a positive integer");
+            return WindowSpec{CountWindow{*iv}};
+        }
+        return WindowSpec{ir::Duration{*iv}};
+    }
+    if (block_default.has_value())
+        return WindowSpec{*block_default};
+    return std::unexpected(
+        call.callee + ": requires a window clause or an explicit window argument, e.g. " +
+        call.callee + "(col, 20) for 20 rows or " + call.callee + "(col, 5s) for a time window");
+}
+
+auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec)
     -> std::expected<ComputedColumn, std::string> {
-    const auto& time_col = *table.find(*table.time_index);
     std::size_t rows = table.rows();
 
-    // Map the time column to a contiguous int64 array and express duration in the same unit.
-    // Timestamp: nanoseconds (layout-compatible with int64, no copy needed).
-    // Date: days (int32, must be widened into a temporary buffer).
+    // A count window spans the last `count_n` rows and needs no time index.
+    // A duration window spans [t - dur, t] and requires a TimeFrame.
+    const bool is_count = std::holds_alternative<CountWindow>(spec);
+    const std::size_t count_n =
+        is_count ? static_cast<std::size_t>(std::get<CountWindow>(spec).n) : 0;
+
+    // Duration-window setup — skipped entirely for count windows. Maps the time
+    // column to a contiguous int64 array and expresses the duration in the same
+    // unit. Timestamp: nanoseconds (layout-compatible with int64, no copy).
+    // Date: days (int32, widened into a temporary buffer).
+    const ColumnValue* time_col_ptr = nullptr;
     const std::int64_t* time_vals = nullptr;
     std::vector<std::int64_t> time_vals_buf;  // only allocated for the Date path
     std::int64_t dur_val = 0;
-    if (const auto* ts_col = std::get_if<Column<Timestamp>>(&time_col)) {
-        // Timestamp is {int64_t nanos} — pointer-cast avoids an 8 MB copy.
-        static_assert(sizeof(Timestamp) == sizeof(std::int64_t) &&
-                      alignof(Timestamp) == alignof(std::int64_t));
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-        time_vals = reinterpret_cast<const std::int64_t*>(ts_col->data());
-        dur_val = duration.count();
-    } else {
-        const auto& date_col = std::get<Column<Date>>(time_col);
-        time_vals_buf.resize(rows);
-        for (std::size_t i = 0; i < rows; ++i)
-            time_vals_buf[i] = date_col[i].days;
-        time_vals = time_vals_buf.data();
-        static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
-        dur_val = duration.count() / kNsPerDay;
+    ir::Duration duration{0};
+    if (!is_count) {
+        if (!table.time_index.has_value()) {
+            return std::unexpected(call.callee +
+                                   ": duration window requires a TimeFrame — use a count window "
+                                   "(e.g. " +
+                                   call.callee + "(col, 20)) or as_timeframe()");
+        }
+        duration = std::get<ir::Duration>(spec);
+        time_col_ptr = &*table.find(*table.time_index);
+        if (const auto* ts_col = std::get_if<Column<Timestamp>>(time_col_ptr)) {
+            // Timestamp is {int64_t nanos} — pointer-cast avoids an 8 MB copy.
+            static_assert(sizeof(Timestamp) == sizeof(std::int64_t) &&
+                          alignof(Timestamp) == alignof(std::int64_t));
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            time_vals = reinterpret_cast<const std::int64_t*>(ts_col->data());
+            dur_val = duration.count();
+        } else {
+            const auto& date_col = std::get<Column<Date>>(*time_col_ptr);
+            time_vals_buf.resize(rows);
+            for (std::size_t i = 0; i < rows; ++i)
+                time_vals_buf[i] = date_col[i].days;
+            time_vals = time_vals_buf.data();
+            static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
+            dur_val = duration.count() / kNsPerDay;
+        }
     }
 
-    // Two-pointer helper: advances lo to the first row still inside the window.
-    // Because the TimeFrame is sorted ascending, lo never decreases across rows.
-    auto advance_lo = [&](std::size_t& lo, std::size_t i) {
-        std::int64_t threshold = time_vals[i] - dur_val;
-        while (lo < i && time_vals[lo] < threshold)
-            ++lo;
+    // Spec-aware window bounds, shared by both rolling mechanisms.
+    //
+    // should_drop(lo, i): is row `lo` outside the window ending at row `i`?
+    //   Both bounds are monotonic (the TimeFrame is sorted ascending), so the
+    //   two-pointer `lo` only ever advances.
+    auto should_drop = [&](std::size_t lo, std::size_t i) -> bool {
+        if (is_count)
+            return (i - lo) >= count_n;
+        return time_vals[lo] < time_vals[i] - dur_val;
+    };
+    // win_lo(i): the first in-window row index for the window ending at `i`.
+    auto win_lo = [&](std::size_t i) -> std::size_t {
+        if (is_count)
+            return i + 1 >= count_n ? i + 1 - count_n : 0;
+        return window_lo(*time_col_ptr, i, duration);
     };
 
     if (call.callee == "rolling_count") {
@@ -119,7 +175,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
         result.resize(rows);
         std::size_t lo = 0;
         for (std::size_t i = 0; i < rows; ++i) {
-            advance_lo(lo, i);
+            while (lo < i && should_drop(lo, i))
+                ++lo;
             result[i] = static_cast<std::int64_t>(i - lo + 1);
         }
         return ComputedColumn{std::move(result), std::nullopt};
@@ -183,8 +240,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
                         add(i);
-                        std::int64_t threshold = time_vals[i] - dur_val;
-                        while (lo < i && time_vals[lo] < threshold) {
+                        while (lo < i && should_drop(lo, i)) {
                             drop(lo);
                             ++lo;
                         }
@@ -246,8 +302,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
                         add(i);
-                        std::int64_t threshold = time_vals[i] - dur_val;
-                        while (lo < i && time_vals[lo] < threshold) {
+                        while (lo < i && should_drop(lo, i)) {
                             drop(lo);
                             ++lo;
                         }
@@ -348,8 +403,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::size_t lo_ptr = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
                         add(i);
-                        std::int64_t threshold = time_vals[i] - dur_val;
-                        while (lo_ptr < i && time_vals[lo_ptr] < threshold) {
+                        while (lo_ptr < i && should_drop(lo_ptr, i)) {
                             drop(lo_ptr);
                             ++lo_ptr;
                         }
@@ -424,8 +478,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
                         add(i);
-                        std::int64_t threshold = time_vals[i] - dur_val;
-                        while (lo < i && time_vals[lo] < threshold) {
+                        while (lo < i && should_drop(lo, i)) {
                             drop(lo);
                             ++lo;
                         }
@@ -507,8 +560,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
                         r = (beta * r) + val(i);  // add col[i] at weight 1
-                        std::int64_t threshold = time_vals[i] - dur_val;
-                        while (lo < i && time_vals[lo] < threshold) {
+                        while (lo < i && should_drop(lo, i)) {
                             r -= bpow(i - lo) * val(lo);
                             ++lo;
                         }
@@ -550,7 +602,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::size_t lo = win_lo(i);
                         // Collect finite, non-null values; flag any valid NaN.
                         window.clear();
                         bool has_nan = false;
@@ -600,7 +652,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::size_t lo = win_lo(i);
                         window.clear();
                         bool has_nan = false;
                         for (std::size_t j = lo; j <= i; ++j) {
@@ -666,7 +718,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = window_lo(time_col, i, duration);
+                        std::size_t lo = win_lo(i);
                         window.clear();
                         bool has_nan = false;
                         for (std::size_t j = lo; j <= i; ++j) {
@@ -735,11 +787,11 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, ir::Durati
                 result.resize(rows);
                 std::optional<ValidityBitmap> out_valid;
                 for (std::size_t i = 0; i < rows; ++i) {
-                    std::size_t win_lo = window_lo(time_col, i, duration);
+                    std::size_t lo_idx = win_lo(i);
                     T best{};
                     bool seen = false;
                     bool has_nan = false;
-                    for (std::size_t j = win_lo; j <= i; ++j) {
+                    for (std::size_t j = lo_idx; j <= i; ++j) {
                         if (!valid_at(j))
                             continue;  // NULL: skip, payload undefined
                         if constexpr (std::is_floating_point_v<T>) {

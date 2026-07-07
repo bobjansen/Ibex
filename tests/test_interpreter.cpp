@@ -2118,6 +2118,91 @@ TEST_CASE("rolling_mean with 1ns window") {
     REQUIRE((*m)[2] == Catch::Approx(25.0));
 }
 
+TEST_CASE("per-call count window: rolling_mean(val, 2) needs no TimeFrame", "[rolling][window]") {
+    // A count window is valid on a plain frame with no time index and no
+    // enclosing `window` clause.
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30, 40});
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { m = rolling_mean(val, 2) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    CHECK((*m)[0] == Catch::Approx(10.0));  // {10}       (expanding at start)
+    CHECK((*m)[1] == Catch::Approx(15.0));  // {10,20}
+    CHECK((*m)[2] == Catch::Approx(25.0));  // {20,30}
+    CHECK((*m)[3] == Catch::Approx(35.0));  // {30,40}
+}
+
+TEST_CASE("per-call count window: rolling_sum and rolling_count", "[rolling][window]") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{1, 2, 3, 4, 5});
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { s = rolling_sum(val, 3), c = rolling_count(3) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
+    const auto* c = std::get_if<Column<std::int64_t>>(result->find("c"));
+    REQUIRE(s != nullptr);
+    REQUIRE(c != nullptr);
+    CHECK((*s)[0] == 1);   // {1}
+    CHECK((*s)[1] == 3);   // {1,2}
+    CHECK((*s)[2] == 6);   // {1,2,3}
+    CHECK((*s)[3] == 9);   // {2,3,4}
+    CHECK((*s)[4] == 12);  // {3,4,5}
+    CHECK((*c)[0] == 1);
+    CHECK((*c)[1] == 2);
+    CHECK((*c)[2] == 3);
+    CHECK((*c)[3] == 3);
+    CHECK((*c)[4] == 3);
+}
+
+TEST_CASE("per-call duration window matches the `window` block form", "[rolling][window]") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    // rolling_mean(val, 1ns) as a per-call arg must equal `window 1ns`.
+    auto ir = require_ir("data[update { m = rolling_mean(val, 1ns) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    CHECK((*m)[0] == Catch::Approx(10.0));
+    CHECK((*m)[1] == Catch::Approx(15.0));
+    CHECK((*m)[2] == Catch::Approx(25.0));
+}
+
+TEST_CASE("per-call duration window without a TimeFrame is an error", "[rolling][window]") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { m = rolling_mean(val, 5s) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+}
+
+TEST_CASE("rolling with no window clause and no per-call window is an error", "[rolling][window]") {
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+}
+
 TEST_CASE("rolling_mean skips NULL elements; their payload is never read", "[rolling][null]") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10), ts_from_nanos(20),

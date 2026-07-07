@@ -79,7 +79,7 @@ class Builder {
 
     [[nodiscard]] auto update(std::vector<FieldSpec> fields,
                               std::vector<TupleFieldSpec> tuple_fields = {},
-                              std::vector<ColumnRef> group_by = {}) -> NodePtr {
+                              std::vector<ColumnRef> group_by = {}) -> std::unique_ptr<UpdateNode> {
         return std::make_unique<UpdateNode>(next_id(), std::move(fields), std::move(tuple_fields),
                                             std::move(group_by));
     }

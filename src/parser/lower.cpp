@@ -1,4 +1,5 @@
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/effects.hpp>
@@ -378,6 +379,7 @@ auto extract_string_list(const Expr& expr) -> std::optional<std::vector<std::str
 auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vector<std::string>> {
     using ir::NodeKind;
 
+    // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
     switch (node.kind()) {
         case NodeKind::Project: {
             const auto& project = static_cast<const ir::ProjectNode&>(node);
@@ -516,7 +518,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
         case NodeKind::Model:
             return std::nullopt;
     }
-
+    // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     return std::nullopt;
 }
 
@@ -2401,6 +2403,66 @@ class Lowerer {
                     }
                     return ir::Expr{.node = std::move(lowered_rep)};
                 }
+            }
+            // Rolling aggregates accept an optional trailing per-call window arg:
+            //   rolling_mean(px, 20)  -> last-20-rows count window
+            //   rolling_mean(px, 60s) -> 60-second duration window
+            // The IR Literal has no duration alternative, so we peel the window
+            // arg off the positionals and re-attach it as a sentinel named arg
+            // (__window_n / __window_ns), mirroring rep's __array_len. This keeps
+            // the positional args (col, plus alpha/p) exactly as before.
+            if (ir::is_rolling_func(call->callee)) {
+                std::size_t base = 1;  // most rolling funcs take just `col`
+                if (call->callee == "rolling_ewma" || call->callee == "rolling_quantile") {
+                    base = 2;  // col + alpha/p precede the window
+                } else if (call->callee == "rolling_count") {
+                    base = 0;  // takes no column
+                }
+                std::optional<ir::NamedArg> window_named;
+                std::size_t n_positional = call->args.size();
+                if (call->args.size() > base) {
+                    if (const auto* lit = std::get_if<LiteralExpr>(&call->args.back()->node)) {
+                        if (const auto* iv = std::get_if<std::int64_t>(&lit->value)) {
+                            window_named = ir::NamedArg{
+                                .name = "__window_n",
+                                .value =
+                                    ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = *iv}})};
+                            n_positional = call->args.size() - 1;
+                        } else if (const auto* dl = std::get_if<DurationLiteral>(&lit->value)) {
+                            auto dur = parse_duration(dl->text);
+                            if (!dur.has_value()) {
+                                return std::unexpected(dur.error());
+                            }
+                            window_named = ir::NamedArg{
+                                .name = "__window_ns",
+                                .value = ir::make_expr_ptr(
+                                    ir::Expr{.node = ir::Literal{.value = dur->count()}})};
+                            n_positional = call->args.size() - 1;
+                        }
+                    }
+                }
+                ir::CallExpr rolling;
+                rolling.callee = call->callee;
+                rolling.args.reserve(n_positional);
+                for (std::size_t i = 0; i < n_positional; ++i) {
+                    auto la = lower_expr_to_ir(*call->args[i]);
+                    if (!la.has_value()) {
+                        return std::unexpected(la.error());
+                    }
+                    rolling.args.push_back(ir::make_expr_ptr(std::move(la.value())));
+                }
+                if (window_named.has_value()) {
+                    rolling.named_args.push_back(std::move(*window_named));
+                }
+                for (const auto& narg : call->named_args) {
+                    auto lv = lower_expr_to_ir(*narg.value);
+                    if (!lv.has_value()) {
+                        return std::unexpected(lv.error());
+                    }
+                    rolling.named_args.push_back(ir::NamedArg{
+                        .name = narg.name, .value = ir::make_expr_ptr(std::move(lv.value()))});
+                }
+                return ir::Expr{.node = std::move(rolling)};
             }
             ir::CallExpr lowered_call;
             lowered_call.callee = call->callee;

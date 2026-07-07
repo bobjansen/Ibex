@@ -121,6 +121,10 @@ ceiling — ~28GB at 16M): ≤4M → `c7i.2xlarge` (16GB), ≤16M → `r7i.2xlar
 (64GB), ≤32M → `r7i.4xlarge` (128GB). `--type` overrides. Each size is its own
 instance, so 16M and 32M can run concurrently.
 
+Scale runs (>4M) also default to **on-demand** — they're long enough that a spot
+reclaim near the end is worse than the ~$0.50 extra (the short 4M run stays spot,
+where a reclaim is cheap to retry). Force either with `--on-demand` / `--spot`.
+
 Key options: `--base/--target REF`, `--suite a,b,c`, `--repeats N` (default 5),
 `--iters N`, `--data-rows N` (default 4000000), `--serial` (disable
 interleaving), `--taskset CPUSET` (default `2-3`), `--type` (default: auto),

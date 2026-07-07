@@ -26,7 +26,8 @@
 #   --type   INSTANCE     EC2 instance type   (default: c7i.2xlarge)
 #   --key    KEY_PAIR     EC2 key pair for SSH debugging (optional)
 #   --region REGION       override region
-#   --on-demand           on-demand instead of spot
+#   --on-demand           force on-demand   (default for scale runs, >4M rows)
+#   --spot                force spot         (default for 4M runs)
 #
 # Environment: S3_BUCKET / AWS_REGION / IBEX_AMI are loaded from .config.
 #
@@ -59,7 +60,7 @@ DATA_ROWS=4000000
 INTERLEAVE=1
 TASKSET_CPUS="2-3"
 KEY_NAME=""
-ON_DEMAND=0
+ON_DEMAND=-1   # -1 = auto (spot for small, on-demand for scale); 0/1 = forced
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -76,6 +77,7 @@ while [[ $# -gt 0 ]]; do
         --key)       KEY_NAME="$2";      shift 2 ;;
         --region)    REGION="$2";        shift 2 ;;
         --on-demand) ON_DEMAND=1;        shift ;;
+        --spot)      ON_DEMAND=0;        shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -94,6 +96,19 @@ if [[ -z "$INSTANCE_TYPE" ]]; then
     elif (( DATA_ROWS <= 16000000 )); then INSTANCE_TYPE="r7i.2xlarge"   # 64 GB
     elif (( DATA_ROWS <= 32000000 )); then INSTANCE_TYPE="r7i.4xlarge"   # 128 GB
     else                                   INSTANCE_TYPE="r7i.8xlarge"   # 256 GB
+    fi
+fi
+
+# Market: spot is cheapest and fine for the short 4M run (a reclaim is cheap to
+# retry), but a scale run is long and reclaim-costly — losing an hour-long 32M
+# build+bench near the end hurts. So default scale runs to on-demand; --on-demand
+# / --spot force either way.
+if (( ON_DEMAND < 0 )); then
+    if (( DATA_ROWS > 4000000 )); then
+        ON_DEMAND=1
+        echo "note: scale run (${DATA_ROWS} rows) → on-demand to avoid spot reclaim; pass --spot to override." >&2
+    else
+        ON_DEMAND=0
     fi
 fi
 

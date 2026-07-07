@@ -125,8 +125,13 @@ Scale runs (>4M) also default to **on-demand** — they're long enough that a sp
 reclaim near the end is worse than the ~$0.50 extra (the short 4M run stays spot,
 where a reclaim is cheap to retry). Force either with `--on-demand` / `--spot`.
 
-Key options: `--base/--target REF`, `--suite a,b,c`, `--repeats N` (default 5),
-`--iters N`, `--data-rows N` (default 4000000), `--serial` (disable
+Sampling defaults are lean (`--repeats 3 --iters 5`) because the dedicated box
+barely drifts — that's enough to pin a verdict. Bump them only if a specific
+delta looks marginal; the cost is real at scale (the suite runs
+`(1+iters)×repeats×2` times).
+
+Key options: `--base/--target REF`, `--suite a,b,c`, `--repeats N` (default 3),
+`--iters N` (default 5), `--data-rows N` (default 4000000), `--serial` (disable
 interleaving), `--taskset CPUSET` (default `2-3`), `--type` (default: auto),
 `--on-demand`. A 4M run is typically 15-30 min and well under $0.20; a 32M run
 is slower and on a bigger box, so budget more.

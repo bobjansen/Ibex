@@ -526,8 +526,26 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
     -> std::expected<std::optional<BroadcastAggregateColumn>, std::string>;
 
 // window.cpp — rolling aggregates and resampling.
-[[nodiscard]] auto apply_rolling_func(const ir::CallExpr& call, const Table& table,
-                                      ir::Duration duration)
+
+/// A rolling window specified by a fixed number of preceding rows (inclusive of
+/// the current row). Needs no time index — valid on any ordered frame.
+struct CountWindow {
+    std::int64_t n;
+};
+
+/// The window a rolling aggregate spans: either a time `Duration` (requires a
+/// TimeFrame) or a `CountWindow` of the last N rows.
+using WindowSpec = std::variant<ir::Duration, CountWindow>;
+
+/// Resolve the effective window for a rolling call. Reads the sentinel named
+/// args attached by lowering (`__window_n` → count, `__window_ns` → duration in
+/// nanoseconds). If neither is present, falls back to `block_default` (the
+/// enclosing `window` clause); if that is also absent, returns an error.
+[[nodiscard]] auto rolling_window_spec(const ir::CallExpr& call,
+                                       std::optional<ir::Duration> block_default)
+    -> std::expected<WindowSpec, std::string>;
+
+[[nodiscard]] auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec)
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto resample_table(const Table& input, ir::Duration bucket_dur,
                                   const std::vector<ir::ColumnRef>& extra_group_by,

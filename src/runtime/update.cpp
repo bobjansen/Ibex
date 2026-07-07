@@ -1015,7 +1015,13 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     for (const auto& field : fields) {
         if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
             if (is_rolling_func(call->callee)) {
-                auto col = apply_rolling_func(*call, output, duration);
+                // A per-call window arg (rolling_mean(px, 20) / (px, 5s)) overrides
+                // the enclosing `window` clause's duration.
+                auto spec = rolling_window_spec(*call, duration);
+                if (!spec) {
+                    return std::unexpected(spec.error());
+                }
+                auto col = apply_rolling_func(*call, output, *spec);
                 if (!col) {
                     return std::unexpected(col.error());
                 }
@@ -1407,7 +1413,24 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 continue;
             }
             if (is_rolling_func(call->callee)) {
-                return std::unexpected(call->callee + ": requires a window clause");
+                // No enclosing `window` clause here — only a per-call window arg
+                // can supply the span. A count window needs no TimeFrame; a
+                // duration window is rejected downstream if the frame isn't one.
+                auto spec = rolling_window_spec(*call, std::nullopt);
+                if (!spec) {
+                    return std::unexpected(spec.error());
+                }
+                auto col = apply_rolling_func(*call, output, *spec);
+                if (!col) {
+                    return std::unexpected(col.error());
+                }
+                if (col->validity.has_value()) {
+                    output.add_column(field.alias, std::move(col->column),
+                                      std::move(*col->validity));
+                } else {
+                    output.add_column(field.alias, std::move(col->column));
+                }
+                continue;
             }
             if (is_cum_func(call->callee)) {
                 auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");

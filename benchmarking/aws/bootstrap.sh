@@ -210,9 +210,15 @@ if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
     uv run --project /ibex /ibex/benchmarking/data/gen_data.py \
         /ibex/benchmarking/data --rows "${IBEX_DATA_ROWS:-4000000}"
 
-    COMPARE_ENV=()
+    # compare_ibex_git.sh defaults to the bare clang/clang++ names, which don't
+    # exist on this box (llvm.sh installs only versioned binaries) — point it at
+    # the same clang-${CLANG_VERSION} the normal build_ibex uses.
+    COMPARE_ENV=(
+        IBEX_CC="clang-${CLANG_VERSION}"
+        IBEX_CXX="clang++-${CLANG_VERSION}"
+    )
     [[ -d /ibex/build-release/_deps/lightgbm-src ]] \
-        && COMPARE_ENV=(IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src)
+        && COMPARE_ENV+=(IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src)
 
     COMPARE_ARGS=(--base "${IBEX_BASE}" --target "${IBEX_TARGET}"
         --repeats "${IBEX_REPEATS:-5}" --iters "${IBEX_ITERS:-7}" --warmup "${IBEX_WARMUP:-1}")

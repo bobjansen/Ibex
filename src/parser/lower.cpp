@@ -1646,14 +1646,12 @@ class Lowerer {
             if (!update.has_value()) {
                 return std::unexpected(update.error());
             }
-            // Guarded update `where <predicate> update { ... }`: attach the
-            // lowered predicate to the UpdateNode (lower_update always returns one).
             if (state.update->guard) {
                 auto guard = lower_expr_to_ir(*state.update->guard);
                 if (!guard.has_value()) {
                     return std::unexpected(guard.error());
                 }
-                static_cast<ir::UpdateNode&>(*update.value()).set_guard(std::move(guard.value()));
+                update.value()->set_guard(std::move(guard.value()));
             }
             update.value()->add_child(std::move(node));
             node = std::move(update.value());
@@ -2025,7 +2023,7 @@ class Lowerer {
 
     auto lower_update(const ByClause* by, const std::vector<Field>& clause_fields,
                       const std::vector<TupleField>& tuple_fields, const ExprPtr& merge_expr)
-        -> std::expected<ir::NodePtr, LowerError> {
+        -> std::expected<std::unique_ptr<ir::UpdateNode>, LowerError> {
         // `update = expr`: merge all columns of the result table.
         if (merge_expr) {
             auto src = lower_expr(*merge_expr);
@@ -3733,12 +3731,9 @@ class Lowerer {
         if (node.kind() == target) {
             return true;
         }
-        for (const auto& child : node.children()) {
-            if (contains_node_kind(*child, target)) {
-                return true;
-            }
-        }
-        return false;
+        return std::ranges::any_of(node.children(), [target](const auto& child) {
+            return contains_node_kind(*child, target);
+        });
     }
 
     /// Walk an IR tree and return the Duration of the first ResampleNode found.

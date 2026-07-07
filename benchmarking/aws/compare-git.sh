@@ -46,8 +46,9 @@ bench_load_config "$SCRIPT_DIR"
 REGION="${AWS_REGION:-us-east-1}"
 # c7i.2xlarge: 8 vCPU Sapphire Rapids (fixed clock → stable timings, same core
 # as run.sh's r7i so numbers stay comparable) + 16GB (ample for the 4M-row
-# benchmark and two -j8 ibex builds with Arrow/Parquet off).
-INSTANCE_TYPE="c7i.2xlarge"
+# benchmark and two -j8 ibex builds with Arrow/Parquet off). Empty means
+# "auto-size from --data-rows" (see below); an explicit --type always wins.
+INSTANCE_TYPE=""
 BASE_REF="HEAD~1"
 TARGET_REF="HEAD"
 SUITE=""
@@ -80,6 +81,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET not set — run aws/setup.sh first}"
+
+[[ "$DATA_ROWS" =~ ^[0-9]+$ ]] || { echo "ERROR: --data-rows must be an integer (e.g. 16000000)" >&2; exit 1; }
+
+# Auto-size the box from the fact-table row count unless --type overrides. The
+# in-memory reshape/group benchmarks are the memory ceiling: ~28GB at 16M rows,
+# scaling ~linearly (see run.sh), so a 16GB box OOMs above ~4M. Pick RAM with
+# headroom; all are the same Sapphire Rapids core so per-core timings stay
+# comparable across sizes.
+if [[ -z "$INSTANCE_TYPE" ]]; then
+    if   (( DATA_ROWS <=  4000000 )); then INSTANCE_TYPE="c7i.2xlarge"   # 16 GB
+    elif (( DATA_ROWS <= 16000000 )); then INSTANCE_TYPE="r7i.2xlarge"   # 64 GB
+    elif (( DATA_ROWS <= 32000000 )); then INSTANCE_TYPE="r7i.4xlarge"   # 128 GB
+    else                                   INSTANCE_TYPE="r7i.8xlarge"   # 256 GB
+    fi
+fi
 
 # ── Resolve refs + push preflight ─────────────────────────────────────────────
 REPO_URL=$(bench_repo_url "$IBEX_ROOT")
@@ -165,7 +181,9 @@ echo "(build of both commits + repeats; typically 15-30 min)"
 echo ""
 
 # ── Poll S3 ───────────────────────────────────────────────────────────────────
-TIMEOUT=5400  # 90 min — two builds + repeats should finish well inside this
+TIMEOUT=10800  # 3h — headroom for large --data-rows (full suite x repeats x2 at
+               # 32M is much slower than 4M). The instance self-terminates on its
+               # own; this only bounds how long we poll for the download.
 START=$(date +%s)
 DOTS=0
 

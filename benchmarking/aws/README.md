@@ -109,10 +109,23 @@ terminates. The report (per-query base/target/delta + verdict, plus a summary
 with geometric-mean speedup) is printed locally and saved to
 `benchmarking/results/compare_aws_<timestamp>.txt`.
 
+Run at scale to check the wins hold as the working set leaves cache:
+
+```bash
+./benchmarking/aws/compare-git.sh --base 2dcbd58 --target HEAD --data-rows 16000000
+./benchmarking/aws/compare-git.sh --base 2dcbd58 --target HEAD --data-rows 32000000
+```
+
+`--data-rows` auto-sizes the instance (the reshape/group benchmarks are the RAM
+ceiling — ~28GB at 16M): ≤4M → `c7i.2xlarge` (16GB), ≤16M → `r7i.2xlarge`
+(64GB), ≤32M → `r7i.4xlarge` (128GB). `--type` overrides. Each size is its own
+instance, so 16M and 32M can run concurrently.
+
 Key options: `--base/--target REF`, `--suite a,b,c`, `--repeats N` (default 5),
-`--iters N`, `--serial` (disable interleaving), `--taskset CPUSET` (default
-`2-3`), `--type` (default `c7i.2xlarge`), `--on-demand`. Typically 15-30 min
-and well under $0.20.
+`--iters N`, `--data-rows N` (default 4000000), `--serial` (disable
+interleaving), `--taskset CPUSET` (default `2-3`), `--type` (default: auto),
+`--on-demand`. A 4M run is typically 15-30 min and well under $0.20; a 32M run
+is slower and on a bigger box, so budget more.
 
 > Locally, `benchmarking/compare_ibex_git.sh --interleave` gives the same
 > drift-cancelling A/B without EC2 — just noisier on a shared/thermal-throttling

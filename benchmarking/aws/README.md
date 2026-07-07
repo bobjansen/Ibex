@@ -9,7 +9,8 @@ pull the results back as a CSV. Three layers:
 | `build-ami.sh`       | local       | Bakes a reusable AMI (toolchain + R + uv + a warm ibex/Arrow build). Repeatable. |
 | `run.sh`             | local       | One instance runs the **whole** suite. |
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
-| `bootstrap.sh`       | on instance | Provision (if needed) → build ibex → run suite → upload → self-terminate. |
+| `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |
+| `bootstrap.sh`       | on instance | Provision (if needed) → build ibex → run suite (or compare) → upload → self-terminate. |
 | `lib.sh`             | sourced     | Shared helpers (config, AMI resolution, user-data builder). |
 
 All scripts read `S3_BUCKET` / `AWS_REGION` / `IBEX_AMI` from `.config` (written
@@ -85,6 +86,37 @@ Engine groups (each = one instance):
 | `sqlite`          | sqlite (off by default) |
 
 Default set: `ibex,python,r,duckdb,datafusion,clickhouse`.
+
+## 3c. Compare two git commits (low-noise A/B)
+
+`compare-git.sh` answers "did this commit change ibex's performance?" on a
+dedicated, idle, fixed-clock box — the noise floor a laptop or WSL2 can't reach.
+It runs the same `compare_ibex_git.sh` A/B as locally, but on EC2: both commits
+are built and timed on the **one** instance, repeats **interleaved** (base and
+target alternate, so slow machine drift cancels instead of biasing whichever
+side runs second).
+
+```bash
+git push                                            # both commits must be on origin
+./benchmarking/aws/compare-git.sh                   # HEAD~1 vs HEAD, all suites
+./benchmarking/aws/compare-git.sh --base v0.3.0 --target HEAD
+./benchmarking/aws/compare-git.sh --suite sort,groupagg,join --repeats 7
+```
+
+The instance regenerates the (untracked) 4M-row benchmark CSVs so both commits
+read identical inputs, runs the comparison, uploads the report, and self-
+terminates. The report (per-query base/target/delta + verdict, plus a summary
+with geometric-mean speedup) is printed locally and saved to
+`benchmarking/results/compare_aws_<timestamp>.txt`.
+
+Key options: `--base/--target REF`, `--suite a,b,c`, `--repeats N` (default 5),
+`--iters N`, `--serial` (disable interleaving), `--taskset CPUSET` (default
+`2-3`), `--type` (default `c7i.2xlarge`), `--on-demand`. Typically 15-30 min
+and well under $0.20.
+
+> Locally, `benchmarking/compare_ibex_git.sh --interleave` gives the same
+> drift-cancelling A/B without EC2 — just noisier on a shared/thermal-throttling
+> box.
 
 ## Watching a run
 

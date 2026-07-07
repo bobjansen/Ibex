@@ -30,6 +30,10 @@ Options:
   --warmup <N>              Warmup iterations for ibex_bench (default: 1)
   --iters <N>               Timed iterations for ibex_bench (default: 7)
   --repeats <N>             Repeats per side; report median (default: 3)
+  --interleave              Alternate base/target per repeat instead of running
+                            all base repeats then all target repeats. Cancels
+                            slow machine drift (thermal, background load) that
+                            otherwise biases whichever side runs second.
   --taskset <cpuset>        Pin benchmark runs with taskset -c
   --numa-node <N>           Pin benchmark runs with numactl node/memory bind
   --ibex-suite <name,...>   Pass suite selection to bench_ibex.sh/ibex_bench
@@ -57,6 +61,7 @@ TARGET_STATE="WORKTREE"
 WARMUP=1
 ITERS=7
 REPEATS=3
+INTERLEAVE=0
 KEEP_TEMP=0
 TASKSET_CPUSET=""
 NUMA_NODE=""
@@ -78,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --warmup) WARMUP="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
         --repeats) REPEATS="$2"; shift 2 ;;
+        --interleave) INTERLEAVE=1; shift ;;
         --taskset) TASKSET_CPUSET="$2"; shift 2 ;;
         --numa-node) NUMA_NODE="$2"; shift 2 ;;
         --ibex-suite) IBEX_SUITE="$2"; shift 2 ;;
@@ -147,7 +153,10 @@ if [[ "$NEEDS_CSV" -eq 1 && ! -f "$CSV" ]]; then
     exit 1
 fi
 
-TMP_ROOT="$(mktemp -d /tmp/ibex-perfcmp.XXXXXX)"
+# IBEX_PERFCMP_TMPDIR relocates the (large) temp build trees off the default
+# /tmp — useful when /tmp is a small tmpfs (e.g. WSL2) or to land builds on a
+# roomier disk. Defaults to /tmp to preserve prior behaviour.
+TMP_ROOT="$(mktemp -d "${IBEX_PERFCMP_TMPDIR:-/tmp}/ibex-perfcmp.XXXXXX")"
 BASE_WT=""
 TARGET_WT=""
 PIN_DESC="<none>"
@@ -224,6 +233,7 @@ configure_and_build() {
         -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_BUILD_TYPE=Release \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
+        ${IBEX_LIGHTGBM_SRC:+-DFETCHCONTENT_SOURCE_DIR_LIGHTGBM="$IBEX_LIGHTGBM_SRC"} \
         -DIBEX_BUILD_PARQUET=OFF \
         -DIBEX_BUILD_PYTHON_BRIDGE=OFF >"$log_file" 2>&1; then
         cat "$log_file" >&2
@@ -306,21 +316,20 @@ aggregate_median() {
     ' | sort -t$'\t' -k1,1 -k2,2 > "$out_tsv"
 }
 
-run_repeated_bench_and_aggregate() {
-    local side="$1"
-    local src_dir="$2"
-    local build_dir="$3"
-    local out_tsv="$4"
-    local log_file="$5"
-    local -a repeats=()
+# Run one timed repeat of $side into its per-repeat tsv.
+run_side_repeat() {
+    local side="$1" src_dir="$2" build_dir="$3" r="$4" log_file="$5"
+    echo "  -> $side repeat $r/$REPEATS" >&2
+    run_bench_once "$src_dir" "$build_dir" "$TMP_ROOT/${side}.repeat${r}.tsv" "$log_file"
+}
 
-    configure_and_build "$src_dir" "$build_dir" "$log_file"
-    local r repeat_out
+# Collapse a side's per-repeat tsvs into its median tsv.
+aggregate_side() {
+    local side="$1" out_tsv="$2"
+    local -a repeats=()
+    local r
     for ((r = 1; r <= REPEATS; ++r)); do
-        repeat_out="$TMP_ROOT/${side}.repeat${r}.tsv"
-        echo "  -> $side repeat $r/$REPEATS" >&2
-        run_bench_once "$src_dir" "$build_dir" "$repeat_out" "$log_file"
-        repeats+=("$repeat_out")
+        repeats+=("$TMP_ROOT/${side}.repeat${r}.tsv")
     done
     aggregate_median "$out_tsv" "${repeats[@]}"
 }
@@ -341,7 +350,7 @@ TARGET_LOG="$TMP_ROOT/log-target.txt"
 
 echo "Benchmarking base:   $BASE_LABEL" >&2
 echo "Benchmarking target: $TARGET_LABEL" >&2
-echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS" >&2
+echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS, interleave=$([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off)" >&2
 echo "Pinning: $PIN_DESC" >&2
 echo "Ibex suite: ${IBEX_SUITE:-all}" >&2
 if [[ -n "$MERGE_VALIDITY_ROWS" ]]; then
@@ -354,8 +363,30 @@ if [[ -n "$FILTER_MICRO_ROWS" ]]; then
     echo "filter_micro rows: $FILTER_MICRO_ROWS" >&2
 fi
 
-run_repeated_bench_and_aggregate "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_TSV" "$BASE_LOG"
-run_repeated_bench_and_aggregate "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_TSV" "$TARGET_LOG"
+# Build both sides up front so --interleave can alternate their timed repeats
+# with no build in between.
+echo "Building base ..." >&2
+configure_and_build "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_LOG"
+echo "Building target ..." >&2
+configure_and_build "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_LOG"
+
+if [[ "$INTERLEAVE" -eq 1 ]]; then
+    echo "Interleaving base/target repeats" >&2
+    for ((r = 1; r <= REPEATS; ++r)); do
+        run_side_repeat "base"   "$BASE_DIR"   "$BASE_BUILD_DIR"   "$r" "$BASE_LOG"
+        run_side_repeat "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$r" "$TARGET_LOG"
+    done
+else
+    for ((r = 1; r <= REPEATS; ++r)); do
+        run_side_repeat "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$r" "$BASE_LOG"
+    done
+    for ((r = 1; r <= REPEATS; ++r)); do
+        run_side_repeat "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$r" "$TARGET_LOG"
+    done
+fi
+
+aggregate_side "base" "$BASE_TSV"
+aggregate_side "target" "$TARGET_TSV"
 
 # Verdict rule: flag a per-query delta only if its magnitude exceeds NOISE_K
 # times the larger of the two sides' IQRs. Otherwise treat as noise.

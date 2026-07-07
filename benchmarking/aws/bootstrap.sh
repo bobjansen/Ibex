@@ -173,6 +173,61 @@ if [[ "${IBEX_PROVISION_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+# ── Compare mode (compare-git.sh) ─────────────────────────────────────────────
+# A/B two git commits of the SAME ibex code on this clean box, to get low-noise
+# perf verdicts that a laptop/WSL2 can't. Delegates to compare_ibex_git.sh,
+# which builds both commits in throwaway trees and times ibex_bench on each;
+# here we just regenerate the (untracked) benchmark CSVs, run it, upload the
+# report and self-terminate. compare_ibex_git.sh does its own build, so this
+# path deliberately skips build_ibex — but it reuses the baked lightgbm source
+# so the two throwaway builds don't each re-clone it.
+#
+#   IBEX_BASE / IBEX_TARGET — commits to compare (both must be on origin)
+#   IBEX_REPEATS, IBEX_ITERS, IBEX_WARMUP — passed through
+#   IBEX_SUITE       — optional --ibex-suite selection
+#   IBEX_INTERLEAVE  — "1" (default) alternates base/target repeats
+#   IBEX_TASKSET     — optional core pinning (e.g. "2-3")
+#   IBEX_DATA_ROWS   — fact-table row count for gen_data.py (default 4000000)
+#   IBEX_RESULT_KEY  — S3 key the report text is uploaded to
+if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
+    REPORT=/ibex/benchmarking/results/compare_report.txt
+    mkdir -p /ibex/benchmarking/results
+
+    finish_compare() {
+        local code=$?
+        if [[ -f "$REPORT" ]] && aws s3 cp "$REPORT" \
+            "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}"; then
+            echo "Report uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (exit ${code})"
+        else
+            echo "WARNING: no report uploaded (exit ${code})"
+        fi
+        shutdown -h now
+    }
+    trap finish_compare EXIT
+
+    # The fixed benchmark CSVs are not tracked in git — regenerate them at the
+    # default 4M so both commits read identical inputs.
+    uv run --project /ibex /ibex/benchmarking/data/gen_data.py \
+        /ibex/benchmarking/data --rows "${IBEX_DATA_ROWS:-4000000}"
+
+    COMPARE_ENV=()
+    [[ -d /ibex/build-release/_deps/lightgbm-src ]] \
+        && COMPARE_ENV=(IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src)
+
+    COMPARE_ARGS=(--base "${IBEX_BASE}" --target "${IBEX_TARGET}"
+        --repeats "${IBEX_REPEATS:-5}" --iters "${IBEX_ITERS:-7}" --warmup "${IBEX_WARMUP:-1}")
+    [[ -n "${IBEX_SUITE:-}" ]] && COMPARE_ARGS+=(--ibex-suite "${IBEX_SUITE}")
+    [[ "${IBEX_INTERLEAVE:-1}" == "1" ]] && COMPARE_ARGS+=(--interleave)
+    [[ -n "${IBEX_TASKSET:-}" ]] && COMPARE_ARGS+=(--taskset "${IBEX_TASKSET}")
+
+    # tee: live progress on the serial console AND a captured report to upload.
+    env "${COMPARE_ENV[@]}" \
+        bash /ibex/benchmarking/compare_ibex_git.sh "${COMPARE_ARGS[@]}" 2>&1 \
+        | tee "$REPORT"
+
+    exit 0  # finish_compare (EXIT trap) uploads the report and terminates
+fi
+
 # ── Normal run: build + suite ──────────────────────────────────────────────────
 build_ibex
 

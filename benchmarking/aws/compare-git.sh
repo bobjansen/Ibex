@@ -17,8 +17,8 @@
 #   --base   REF          base commit   (default: HEAD~1; must be pushed)
 #   --target REF          target commit (default: HEAD;   must be pushed)
 #   --suite  a,b,c        ibex suite selection (default: all suites)
-#   --repeats N           repeats per side, median-reduced (default: 5)
-#   --iters   N           timed iterations per repeat       (default: 7)
+#   --repeats N           repeats per side, median-reduced (default: 3)
+#   --iters   N           timed iterations per repeat       (default: 5)
 #   --warmup  N           warmup iterations                 (default: 1)
 #   --data-rows N         fact-table rows for gen_data.py   (default: 4000000)
 #   --serial              disable interleaving (all base repeats, then target)
@@ -53,8 +53,13 @@ INSTANCE_TYPE=""
 BASE_REF="HEAD~1"
 TARGET_REF="HEAD"
 SUITE=""
-REPEATS=5
-ITERS=7
+# Leaner than compare_ibex_git.sh's local defaults on purpose: a dedicated EC2
+# box barely drifts (IQRs are typically <1%), so 3 interleaved repeats × 5 iters
+# = 15 samples/side already pins the verdict. The heavier local defaults exist
+# to fight WSL2 noise, which isn't present here — and each extra pass is costly
+# at scale (the suite runs (1+iters)×repeats×2 times).
+REPEATS=3
+ITERS=5
 WARMUP=1
 DATA_ROWS=4000000
 INTERLEAVE=1

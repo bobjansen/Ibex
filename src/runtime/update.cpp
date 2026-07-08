@@ -659,7 +659,10 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size
     auto run = [&](auto* dst, auto lp, auto ls, auto rp, auto rs) {
         using V = std::decay_t<decltype(ls)>;
         auto pick = [is_min](V a, V b) -> V {
-            return is_min ? (b < a ? b : a) : (b > a ? b : a);
+            if (is_min) {
+                return b < a ? b : a;
+            }
+            return b > a ? b : a;
         };
         if (lp && rp) {
             for (std::size_t i = 0; i < rows; ++i)
@@ -739,19 +742,19 @@ struct SimdKernel {
 // so wrap each to pin the double overload without an explicit cast per row.
 const std::array<SimdKernel, 13> kSimdKernels = {
     {
-        {"log", _ZGVdN4v_log, [](double x) { return std::log(x); }},
-        {"log2", _ZGVdN4v_log2, [](double x) { return std::log2(x); }},
-        {"log10", _ZGVdN4v_log10, [](double x) { return std::log10(x); }},
-        {"exp", _ZGVdN4v_exp, [](double x) { return std::exp(x); }},
-        {"sin", _ZGVdN4v_sin, [](double x) { return std::sin(x); }},
-        {"cos", _ZGVdN4v_cos, [](double x) { return std::cos(x); }},
-        {"tan", _ZGVdN4v_tan, [](double x) { return std::tan(x); }},
-        {"asin", _ZGVdN4v_asin, [](double x) { return std::asin(x); }},
-        {"acos", _ZGVdN4v_acos, [](double x) { return std::acos(x); }},
-        {"atan", _ZGVdN4v_atan, [](double x) { return std::atan(x); }},
-        {"sinh", _ZGVdN4v_sinh, [](double x) { return std::sinh(x); }},
-        {"cosh", _ZGVdN4v_cosh, [](double x) { return std::cosh(x); }},
-        {"tanh", _ZGVdN4v_tanh, [](double x) { return std::tanh(x); }},
+        {.name = "log", .vec = _ZGVdN4v_log, .scalar = [](double x) { return std::log(x); }},
+        {.name = "log2", .vec = _ZGVdN4v_log2, .scalar = [](double x) { return std::log2(x); }},
+        {.name = "log10", .vec = _ZGVdN4v_log10, .scalar = [](double x) { return std::log10(x); }},
+        {.name = "exp", .vec = _ZGVdN4v_exp, .scalar = [](double x) { return std::exp(x); }},
+        {.name = "sin", .vec = _ZGVdN4v_sin, .scalar = [](double x) { return std::sin(x); }},
+        {.name = "cos", .vec = _ZGVdN4v_cos, .scalar = [](double x) { return std::cos(x); }},
+        {.name = "tan", .vec = _ZGVdN4v_tan, .scalar = [](double x) { return std::tan(x); }},
+        {.name = "asin", .vec = _ZGVdN4v_asin, .scalar = [](double x) { return std::asin(x); }},
+        {.name = "acos", .vec = _ZGVdN4v_acos, .scalar = [](double x) { return std::acos(x); }},
+        {.name = "atan", .vec = _ZGVdN4v_atan, .scalar = [](double x) { return std::atan(x); }},
+        {.name = "sinh", .vec = _ZGVdN4v_sinh, .scalar = [](double x) { return std::sinh(x); }},
+        {.name = "cosh", .vec = _ZGVdN4v_cosh, .scalar = [](double x) { return std::cosh(x); }},
+        {.name = "tanh", .vec = _ZGVdN4v_tanh, .scalar = [](double x) { return std::tanh(x); }},
     },
 };
 namespace {

@@ -16,7 +16,6 @@
 // Seeding: reseed() resets all three thread-local engines to the given seed.
 
 #include <cstdint>
-#include <random>
 #include <zorro.hpp>
 
 namespace ibex::runtime {

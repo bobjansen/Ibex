@@ -178,7 +178,7 @@ class StreamBuffered : public std::enable_shared_from_this<StreamBuffered> {
 template <typename ProducerFn>
 [[nodiscard]] ExternFn make_buffered_source(ProducerFn producer) {
     struct State {
-        std::optional<ExternFn> source_fn{};
+        std::optional<ExternFn> source_fn;
         ProducerFn producer;
     };
     auto state = std::make_shared<State>(State{{}, std::move(producer)});
@@ -187,7 +187,7 @@ template <typename ProducerFn>
         if (!state->source_fn) {
             std::size_t cap = 256;
             if (!args.empty()) {
-                if (const auto* v = std::get_if<std::int64_t>(&args[0])) {
+                if (const auto* v = std::get_if<std::int64_t>(args.data())) {
                     if (*v <= 0) {
                         return std::unexpected("StreamBuffered capacity must be > 0");
                     }

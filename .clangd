@@ -30,6 +30,8 @@ Diagnostics:
       - cppcoreguidelines-avoid-magic-numbers
       - readability-magic-numbers
       - readability-braces-around-statements
+    CheckOptions:
+      bugprone-easily-swappable-parameters.ModelImplicitConversions: false
   UnusedIncludes: Strict
 
 InlayHints:

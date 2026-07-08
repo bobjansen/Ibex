@@ -287,7 +287,7 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
                     }
                     out.add_column(out_col_names[r], std::move(out_col));
                 } else {
-                    using ElemT = typename ColT::value_type;
+                    using ElemT = ColT::value_type;
                     Column<ElemT> out_col;
                     out_col.reserve(n_data_cols);
                     for (std::size_t ci : data_idxs) {

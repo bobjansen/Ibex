@@ -88,7 +88,7 @@ What dispatches a function call today:
   infer→fast→per-row), `windowed_update_table` (own rolling dispatch, delegates
   the rest to `evaluate_field_column`), the `select` path, and `eval_value_vec`
   (the vectorised value/predicate evaluator, now the single value-IR evaluator
-  after the `FilterExpr` unification — see `plans/unify-filter-expr-plan.md`).
+  after the `FilterExpr` unification — see `plans/done/unify-filter-expr-plan.md`).
 
 So one kind is a registry; the other three are predicate ladders copied N times.
 
@@ -254,7 +254,7 @@ Incremental, each stage shippable and behaviour-preserving:
 
 - `project_scalar_builtin_registry` (memory) — the `Scalar` slice that this
   generalises; records the `is_null`/`coalesce` null deferral.
-- `plans/unify-filter-expr-plan.md` — unified the value **IR** and made
+- `plans/done/unify-filter-expr-plan.md` — unified the value **IR** and made
   `eval_value_vec` the single value evaluator; this plan unifies the **function
   dispatch** that runs on top of it. Complementary.
 - `plans/non-row-local-filter-plan.md` — the row-local / non-row-local language

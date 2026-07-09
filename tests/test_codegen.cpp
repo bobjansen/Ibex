@@ -321,6 +321,40 @@ TEST_CASE("emitter: window node - multiple rolling ops", "[codegen]") {
     CHECK(contains(out, "rolling_mean"));
 }
 
+TEST_CASE("emitter: window node - by-clause is emitted, not rejected", "[codegen]") {
+    ir::Builder b;
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    auto price_arg = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "price"}});
+    auto upd = b.update(
+        {ir::FieldSpec{.alias = "m",
+                       .expr = ir::Expr{ir::CallExpr{
+                           .callee = "rolling_mean", .args = {price_arg}, .named_args = {}}}}},
+        {}, {ir::ColumnRef{.name = "symbol"}});
+    upd->add_child(make_source(b, "ticks.csv"));
+    auto win = b.window(ir::Duration(min_ns));
+    win->add_child(std::move(upd));
+
+    auto out = emit_to_string(*win);
+    CHECK(contains(out, "ibex::ops::windowed_update("));
+    CHECK(contains(out, "\"symbol\""));
+}
+
+TEST_CASE("emitter: window node - tuple fields are still rejected", "[codegen]") {
+    ir::Builder b;
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    std::vector<ir::TupleFieldSpec> tuple_fields;
+    tuple_fields.push_back(ir::TupleFieldSpec{
+        .aliases = {"x", "y"},
+        .source = make_source(b, "extra.csv"),
+    });
+    auto upd = b.update({}, std::move(tuple_fields));
+    upd->add_child(make_source(b, "ticks.csv"));
+    auto win = b.window(ir::Duration(min_ns));
+    win->add_child(std::move(upd));
+
+    REQUIRE_THROWS(emit_to_string(*win));
+}
+
 // --- Update ------------------------------------------------------------------
 
 TEST_CASE("emitter: update node - simple expression", "[codegen]") {

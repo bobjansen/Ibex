@@ -460,10 +460,10 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 throw std::runtime_error("ibex_compile: WindowNode must have an UpdateNode child");
             }
             const auto& upd = static_cast<const ir::UpdateNode&>(window_child);
-            if (!upd.tuple_fields().empty() || !upd.group_by().empty()) {
+            if (!upd.tuple_fields().empty()) {
                 throw std::runtime_error(
-                    "ibex_compile: windowed update with tuple fields or by-clause is not "
-                    "supported in the compiled path");
+                    "ibex_compile: windowed update with tuple fields is not supported in the "
+                    "compiled path");
             }
             auto source = emit_node(require_single_child(upd, "UpdateNode (window payload)"));
             auto var = fresh_var();
@@ -477,6 +477,14 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 first = false;
                 *out_ << "ibex::ops::make_field(\"" << escape_string(f.alias) << "\", "
                       << emit_expr(f.expr) << ")";
+            }
+            *out_ << "},\n        {";
+            bool first_group = true;
+            for (const auto& key : upd.group_by()) {
+                if (!first_group)
+                    *out_ << ", ";
+                first_group = false;
+                *out_ << '"' << escape_string(key.name) << '"';
             }
             *out_ << "});\n";
             return var;

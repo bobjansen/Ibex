@@ -214,10 +214,11 @@ auto columns(const runtime::Table& t) -> runtime::Table {
 }
 
 auto windowed_update(const runtime::Table& t, ir::Duration duration,
-                     const std::vector<ir::FieldSpec>& fields) -> runtime::Table {
+                     const std::vector<ir::FieldSpec>& fields,
+                     const std::vector<std::string>& group_by) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);
-    auto upd_node = b.update(fields);
+    auto upd_node = b.update(fields, {}, to_col_refs(group_by));
     upd_node->add_child(std::move(scan_node));
     auto win_node = b.window(duration);
     win_node->add_child(std::move(upd_node));

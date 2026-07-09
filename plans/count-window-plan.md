@@ -105,6 +105,18 @@ no type-inference change.
 
 - `window N rows { ... }` block syntax (lexer keyword) — deferred; per-call
   subsumes the common case.
-- Codegen (`ibex_compile`) support for per-call windows.
 - Monotonic-deque `rolling_min`/`rolling_max` (still O(n·w)); count windows
   inherit the same complexity.
+
+## Codegen parity (done)
+
+Per-call windows needed no emitter changes: `CallExpr` named args
+(`__window_n`/`__window_ns`) are already passed through generically via
+`ops::fn_call`, and `ops::update`/`ops::windowed_update` delegate straight to
+`interpret()`, so the compiled path runs the exact same window.cpp code as the
+REPL. The one real gap was `window ..., update {...}, by ...`: the emitter
+explicitly rejected any windowed update with a `by`-clause. Fixed by threading
+`group_by` through `ops::windowed_update` (mirroring plain `ops::update`).
+Windowed `update` with tuple-field sources (`(a, b) = Table {...}`) is still
+rejected — the interpreter's `WindowNode` handling doesn't support that
+combination either, so this is parity, not a gap.

@@ -15,8 +15,11 @@ tracks now is removing the remaining materialization boundaries and finding
 fusion opportunities that actually move the benchmark.
 
 Since this plan was last revised, the canonicalizer grew from 8 rules to 21,
-a fused `TopK` node landed (heap-select for `Head/Tail(Order)`), and grouped
-`update + by` became functional. Those changes are folded into the tables below.
+a fused `TopK` node landed (heap-select for `Head/Tail(Order)`), grouped
+`update + by` became functional, and `read_parquet` gained a row-group/batch
+streaming source (`ChunkedParquetSourceOperator`, Phase 4 of
+`plans/bigger-than-ram-plan.md`). Those changes are folded into the tables
+below.
 
 ## Coverage Today
 
@@ -25,7 +28,7 @@ a fused `TopK` node landed (heap-select for `Head/Tail(Order)`), and grouped
 | Node Kind   | Handling |
 |-------------|----------|
 | `Scan`      | `TableSourceOperator` (handled by caller) |
-| `ExternCall`| `TableSourceOperator` from `chunked_table_func` when registered |
+| `ExternCall`| `TableSourceOperator` from `chunked_table_func` when registered — covers `read_csv`, Kafka/Avro sources, `read_adbc`, and `read_parquet` (`ChunkedParquetSourceOperator`, 65536-row Arrow batches via `set_batch_size`) |
 | `Filter`    | `ChunkedFilterOperator` — per-chunk mask + gather |
 | `Project`   | `ChunkedProjectOperator` — per-chunk column selection |
 | `Rename`    | `ChunkedRenameOperator` — per-chunk metadata edit |
@@ -33,7 +36,7 @@ a fused `TopK` node landed (heap-select for `Head/Tail(Order)`), and grouped
 | `Order`     | `ChunkedOrderOperator` — buffer + validate sortedness; re-emit chunks if sorted, fall back to `order_table` on concat otherwise |
 | `AsTimeframe` | `ChunkedAsTimeframeOperator` — buffer + validate; re-emit chunks with `time_index` stamped if sorted, fall back to concat + `order_table` (SPEC §9.1) |
 | `Update`    | `ChunkedUpdateOperator` — row-local field expressions, no tuple_fields, no group_by |
-| `Aggregate` | `ChunkedSortedAggregateOperator` when the input chunks are sorted on the group keys (streams group-at-a-time, bounded memory, output emitted in key order); otherwise falls back to `ChunkedAggregateOperator` — hash-based, streaming for the supported subset (Count, Sum, Min, Max, Mean on numeric) with fast paths for single categorical key and single string key (transparent `string_view` lookup, SSO-friendly) bypassing the generic `ScalarValue` variant key |
+| `Aggregate` | `ChunkedSortedAggregateOperator` when the input chunks are sorted on the group keys (streams group-at-a-time, bounded memory, output emitted in key order); otherwise falls back to `ChunkedAggregateOperator` — hash-based, streaming for Count/Sum/Min/Max/Mean/Std/Skew/Kurtosis/First/Last (numeric; String/Categorical First/Last only on the hash operator) with fast paths for single categorical key and single string key (transparent `string_view` lookup, SSO-friendly) bypassing the generic `ScalarValue` variant key |
 | `TopK`      | `ChunkedOrderedLimitOperator` — bounded heap-select (O(n log k)) for `Head/Tail(Order)`, global and grouped, `KeepMode::First`/`Last` |
 | `Head`      | `ChunkedHeadOperator` — global and grouped, short-circuits child on reach; `count == 0` early-exit |
 | `Tail`      | Materializing via `tail_table` (the streaming shapes — `Tail(Order)` and `Tail(Filter)` — are now rewritten to `TopK` / `FilterTail` upstream) |
@@ -173,6 +176,19 @@ fold std+skew+kurtosis into one pass; (2) the per-row work isn't vectorized.
 (Polars exploiting sortedness ~6× single-threaded also validates this whole
 sorted-aggregate direction.)
 
+**Chunked `read_parquet` — done (`bigger-than-ram-plan.md` Phase 4, partial).**
+`read_parquet` previously went through `parquet::arrow::FileReader::ReadTable`
+— the whole file decoded into one Arrow table before Ibex saw a row — and was
+registered only via `register_table`. `ChunkedParquetSourceOperator` now
+streams 65536-row Arrow batches via `FileReader::GetRecordBatchReader`/
+`set_batch_size` (independent of the file's own row-group sizing) and
+registers alongside the whole-file path via `register_chunked_table`,
+matching the `read_adbc` precedent. Purely additive — no behavior change on
+paths that don't reach it. Local A/B at 8M rows: ~6.4× lower peak RSS, ~1.7×
+faster. Still open: column pruning, row-group-statistics pushdown, and
+directory/Hive-partitioned datasets — tracked in `bigger-than-ram-plan.md`,
+not here.
+
 ## Next Steps
 
 Ordered roughly by expected payoff-to-effort. Confirm each against
@@ -196,10 +212,16 @@ remaining materializing aggregates:
 
 ### 2. Document and harden the external chunked-source contract
 
-`ExternRegistry::register_chunked_table(...)` is the runtime entrypoint, and
-the Kafka examples (`examples/kafka_ticks.ibex`, `kafka_ohlc.ibex`, plus the
-Avro variants) now drive multi-chunk sources through the native operators in
-addition to `read_csv`. The contract is still not written down as a
+`ExternRegistry::register_chunked_table(...)` is the runtime entrypoint.
+Four independent sources now drive multi-chunk data through the native
+operators: `read_csv`, the Kafka/Avro examples (`examples/kafka_ticks.ibex`,
+`kafka_ohlc.ibex`), the `adbc` plugin (`AdbcSourceOperator`, pulling one
+Arrow `RecordBatch` at a time — the reference implementation for a
+well-behaved chunked source, zero-copy where layouts match, path to
+PostgreSQL/DuckDB/Snowflake/BigQuery), and now `read_parquet`
+(`ChunkedParquetSourceOperator`, streaming 65536-row Arrow batches via
+`FileReader::GetRecordBatchReader`/`set_batch_size`, independent of the
+file's own row-group sizing). The contract is still not written down as a
 first-class API. Specify:
 
 - stable schema across chunks
@@ -208,16 +230,14 @@ first-class API. Specify:
 - EOF and error signaling
 
 and add tests that drive a synthetic multi-chunk extern source through native
-operators (not just the Kafka demos). Once stable, an `adbc` plugin reads
-Arrow `RecordBatch` objects as Ibex chunks with zero-copy where layouts match
-— path to PostgreSQL, DuckDB, Snowflake, BigQuery.
+operators (not just the Kafka/Parquet/ADBC demos).
 
-The `adbc` plugin has since landed and is already a well-behaved chunked
-source (`AdbcSourceOperator`, `register_chunked_table`). What's still open —
-out-of-core sort/join for inputs too big for RAM, row-group-streaming and
-pushdown-aware Parquet, and chunked ADBC/Parquet write sinks — is tracked
-separately in `plans/bigger-than-ram-plan.md`, which builds directly on this
-plan's coverage table.
+What's still open on the bigger-than-RAM side — out-of-core sort/join for
+inputs too big for RAM, column pruning + row-group-statistics pushdown and
+directory/Hive-partitioned Parquet datasets (row-group *streaming* itself is
+now done), and chunked ADBC/Parquet write sinks — is tracked separately in
+`plans/bigger-than-ram-plan.md`, which builds directly on this plan's
+coverage table.
 
 ### 3. Materialization hardening
 
@@ -274,5 +294,5 @@ Benchmark gates compare against `build-release/` only, since debug runs
   AsTimeframe on sorted input, Head/Tail via TopK/FilterHead/FilterTail, and
   single-key joins)
 - external readers can stream chunks into native operators — **partial**
-  (`read_csv` and the Kafka sources stream; the source contract is not yet
-  documented — see Next Steps §3)
+  (`read_csv`, the Kafka/Avro sources, `read_adbc`, and `read_parquet` all
+  stream; the source contract is not yet documented — see Next Steps §2)

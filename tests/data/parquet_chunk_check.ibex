@@ -1,0 +1,13 @@
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// 200,000 rows crosses the chunked reader's 65536-row batch boundary a few
+// times. idx is a deterministic 1..N sequence (rank() on a constant column,
+// tie-broken by original row order), so sum()/count() over the round-tripped
+// file catch a dropped, duplicated, or corrupted row at a batch boundary.
+let base = Table(200000)[update { one = rep([1], length_out = 200000) }];
+let indexed = base[update { idx = rank(one, method = first) }];
+write_parquet(indexed, "tests/data/parquet_chunk_check_out.parquet");
+
+let back = read_parquet("tests/data/parquet_chunk_check_out.parquet");
+back[select { total = sum(idx), cnt = count() }];

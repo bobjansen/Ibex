@@ -234,6 +234,73 @@ if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
     exit 0  # finish_compare (EXIT trap) uploads the report and terminates
 fi
 
+# ── Compare-plugin mode (compare-plugin-git.sh) ────────────────────────────────
+# A/B two git commits for a plugin-backed extern function (read_parquet,
+# read_adbc, ...) on this clean box. Delegates to compare_plugin_git.sh, which
+# builds both commits (with the given plugin target, e.g. Arrow/Parquet ON —
+# unlike IBEX_COMPARE_MODE above, which builds with it OFF) and drives the
+# real REPL + --plugin-path, since ibex_bench never loads a plugin. Skips
+# build_ibex (compare_plugin_git.sh does its own builds).
+#
+#   IBEX_BASE / IBEX_TARGET     — commits to compare (both must be on origin)
+#   IBEX_QUERY                  — repo-relative query template (__INPUT__ token)
+#   IBEX_PLUGIN_TARGETS         — comma-separated cmake target(s) for the plugin .so
+#   IBEX_CONFIGURE_ARGS         — space-separated extra `cmake -D...` args
+#   IBEX_PARQUET_ROWS           — rows for gen_parquet_data.py (default 8000000)
+#   IBEX_REPEATS, IBEX_ITERS, IBEX_WARMUP, IBEX_INNER_RUNS — passed through
+#   IBEX_INTERLEAVE              — "1" (default) alternates base/target repeats
+#   IBEX_TASKSET                 — optional core pinning (e.g. "2-3")
+#   IBEX_RESULT_KEY               — S3 key the report text is uploaded to
+if [[ "${IBEX_COMPARE_PLUGIN_MODE:-0}" == "1" ]]; then
+    REPORT=/ibex/benchmarking/results/compare_plugin_report.txt
+    mkdir -p /ibex/benchmarking/results
+
+    finish_compare_plugin() {
+        local code=$?
+        if [[ -f "$REPORT" ]] && aws s3 cp "$REPORT" \
+            "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}"; then
+            echo "Report uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (exit ${code})"
+        else
+            echo "WARNING: no report uploaded (exit ${code})"
+        fi
+        shutdown -h now
+    }
+    trap finish_compare_plugin EXIT
+
+    # The Parquet fixture is not tracked in git (benchmarking/data/** is
+    # gitignored) — regenerate it once so both commits read the identical file.
+    uv run --project /ibex /ibex/benchmarking/gen_parquet_data.py \
+        /ibex/benchmarking/data --rows "${IBEX_PARQUET_ROWS:-8000000}"
+
+    # compare_plugin_git.sh defaults to the bare clang/clang++ names, which
+    # don't exist on this box (llvm.sh installs only versioned binaries).
+    COMPARE_ENV=(
+        IBEX_CC="clang-${CLANG_VERSION}"
+        IBEX_CXX="clang++-${CLANG_VERSION}"
+    )
+
+    COMPARE_ARGS=(
+        --base "${IBEX_BASE}" --target "${IBEX_TARGET}"
+        --query "/ibex/${IBEX_QUERY}"
+        --input "/ibex/benchmarking/data/prices.parquet"
+        --plugin-target "${IBEX_PLUGIN_TARGETS}"
+        --repeats "${IBEX_REPEATS:-3}" --iters "${IBEX_ITERS:-5}"
+        --warmup "${IBEX_WARMUP:-1}" --inner-runs "${IBEX_INNER_RUNS:-1}"
+    )
+    for arg in ${IBEX_CONFIGURE_ARGS:-}; do
+        COMPARE_ARGS+=(--configure-arg "$arg")
+    done
+    [[ "${IBEX_INTERLEAVE:-1}" == "0" ]] && COMPARE_ARGS+=(--serial)
+    [[ -n "${IBEX_TASKSET:-}" ]] && COMPARE_ARGS+=(--taskset "${IBEX_TASKSET}")
+
+    # tee: live progress on the serial console AND a captured report to upload.
+    env "${COMPARE_ENV[@]}" \
+        bash /ibex/benchmarking/compare_plugin_git.sh "${COMPARE_ARGS[@]}" 2>&1 \
+        | tee "$REPORT"
+
+    exit 0  # finish_compare_plugin (EXIT trap) uploads the report and terminates
+fi
+
 # ── Normal run: build + suite ──────────────────────────────────────────────────
 build_ibex
 

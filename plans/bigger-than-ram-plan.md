@@ -50,7 +50,7 @@ suggested sequence follows expected workload payoff.
 | 1 | Spill infrastructure: memory budget tracking + disk-backed temp chunks | chunked-execution substrate (done) |
 | 2 | External (disk-backed) sort — unblocks `Order`, `AsTimeframe`, `Tail` on unsorted input | 1 |
 | 3 | Out-of-core join (grace hash join) | 1 |
-| 4 | Chunked, pushdown-aware Parquet: row-group streaming, column pruning, stats pushdown, directory/Hive datasets | 1 (for the case where a single row group still doesn't fit; independent otherwise) |
+| 4 | Chunked, pushdown-aware Parquet: row-group streaming (**done**), column pruning, stats pushdown, directory/Hive datasets | 1 (for the case where a single row group still doesn't fit; independent otherwise) |
 | 5 | ADBC + Parquet chunked sinks (write path) | none of the above strictly, but pointless without 4 for the Parquet half |
 | 6 | Planner-driven adaptive operator selection (spill only when the budget is actually crossed) | 1–3 |
 | 7 (stretch) | Parallel spill I/O | 1 + `runtime-multithreading-plan.md` |
@@ -146,11 +146,47 @@ pushing predicates into the SQL text sent to `read_adbc` is a planner
 concern (tier-2 pushdown in `project_execution_roadmap` memory), not
 something this phase needs to solve for ADBC.
 
-- **Row-group streaming**: convert `read_parquet` from
-  `FileReader::ReadTable` to `FileReader::GetRecordBatchReader` (or
-  row-group-at-a-time `ReadRowGroup`), registering via
-  `register_chunked_table` the same way `read_adbc` already does — reuse
-  `ibex::interop::import_table_from_arrow` per batch rather than per file.
+- **Row-group streaming — done** (`libs/parquet/parquet.hpp`/`.cpp`,
+  branch `chunked-parquet-read`). `ChunkedParquetSourceOperator` calls
+  `FileReader::set_batch_size(65536)` (matching
+  `libs/csv/csv.cpp`'s `kChunkedCsvRowsPerChunk`) + `GetRecordBatchReader()`,
+  giving bounded chunk size independent of the file's own row-group sizing —
+  important since a naively-written Parquet file can have one giant row
+  group. Registered via `register_chunked_table` alongside the untouched
+  whole-file `read_parquet()`/`register_table` path, exactly like `read_adbc`
+  — purely additive, zero behavior change on paths that don't reach it.
+  One deviation from the original plan text: rather than routing through
+  `ibex::interop::import_table_from_arrow` (the Arrow C Data Interface
+  bridge ADBC uses), each batch is wrapped via `arrow::Table::FromRecordBatches`
+  and run through a `populate_from_arrow_table<Sink>` helper extracted from
+  the existing whole-file conversion code — `Table::add_column` and
+  `Chunk::add_column` share a signature, so the same tested per-column-type
+  switch now serves both paths with zero duplication, and no new Arrow C
+  Data Interface surface was needed. Pre-existing, unchanged-by-this-work
+  limitation: none of the column converters track nulls (a null silently
+  becomes `0`/`0.0`/`""`), so this stays validity-neutral and doesn't trip
+  `MaterializeOperator`'s "no validity bitmaps on multi-chunk streams"
+  restriction — worth fixing later but out of scope here.
+
+  Verified both correctness (new `tests/data/parquet_chunk_check.ibex`
+  e2e case: 200,000 deterministic rows crossing the 65536-row batch
+  boundary ~3×, `sum`/`count` closed-form check) and performance. Since
+  `ibex_bench`/`compare_ibex_git.sh` never load plugins at all (scan mode
+  hardcodes a direct C++ `read_csv()` call, and compare builds go
+  `-DIBEX_BUILD_PARQUET=OFF`), a new reusable harness was needed:
+  `benchmarking/compare_plugin_git.sh` + `benchmarking/aws/compare-plugin-git.sh`
+  drive the real REPL (`tools/ibex --plugin-path ...`) instead, A/B'd across
+  two git worktrees. Results at 8M rows (filter + grouped aggregate over
+  `prices.parquet`), local WSL2 and clean AWS `c7i.2xlarge` agreeing closely:
+
+  | | avg wall-clock | peak RSS |
+  |---|---|---|
+  | old (whole-file `ReadTable`) | local 545ms / AWS 785ms | local 727MB / AWS 727MB |
+  | new (chunked) | local 318ms / AWS 455ms | local 113MB / AWS 112MB |
+
+  **~6.4–6.5× lower peak RSS, ~1.7× faster**, no regression. This harness is
+  reusable for any future plugin-backed extern function (`read_adbc`,
+  `kafka_recv`, ...), not just this checkpoint.
 - **Column projection pushdown**: thread the set of columns actually
   referenced by the query down into the Parquet reader so unread columns are
   never decoded. This is the same problem R20 (column pruning above

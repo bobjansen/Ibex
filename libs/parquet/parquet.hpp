@@ -16,6 +16,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 
 #include <arrow/api.h>
 #include <arrow/filesystem/filesystem.h>
@@ -379,6 +380,75 @@ inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& 
     }
 }
 
+/// Populate `sink` (an `ibex::runtime::Table` or `ibex::runtime::Chunk` —
+/// both expose a matching `add_column(name, ColumnValue, optional<ValidityBitmap>)`)
+/// from an already-read Arrow table. Shared by the whole-file `read_parquet()`
+/// path and the row-group/batch streaming `ChunkedParquetSourceOperator` so a
+/// single, tested conversion path handles both.
+template <typename Sink>
+inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table, Sink& sink) {
+    for (int i = 0; i < table->num_columns(); ++i) {
+        const auto& field = table->field(i);
+        const auto& col = table->column(i);
+        switch (col->type()->id()) {
+            case arrow::Type::INT8:
+            case arrow::Type::INT16:
+            case arrow::Type::INT32:
+            case arrow::Type::INT64:
+            case arrow::Type::UINT8:
+            case arrow::Type::UINT16:
+            case arrow::Type::UINT32:
+            case arrow::Type::UINT64: {
+                std::vector<std::int64_t> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                append_int_column(col, values);
+                sink.add_column(field->name(), ibex::Column<std::int64_t>{std::move(values)});
+                break;
+            }
+            case arrow::Type::FLOAT:
+            case arrow::Type::DOUBLE: {
+                std::vector<double> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                append_double_column(col, values);
+                sink.add_column(field->name(), ibex::Column<double>{std::move(values)});
+                break;
+            }
+            case arrow::Type::STRING:
+            case arrow::Type::LARGE_STRING: {
+                std::vector<std::string> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                append_string_column(col, values);
+                sink.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
+                break;
+            }
+            case arrow::Type::DATE32: {
+                std::vector<ibex::Date> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                append_date32_column(col, values);
+                sink.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
+                break;
+            }
+            case arrow::Type::DATE64: {
+                std::vector<ibex::Date> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                append_date64_column(col, values);
+                sink.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
+                break;
+            }
+            case arrow::Type::TIMESTAMP: {
+                std::vector<ibex::Timestamp> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                append_timestamp_column(col, col->type(), values);
+                sink.add_column(field->name(), ibex::Column<ibex::Timestamp>{std::move(values)});
+                break;
+            }
+            default:
+                throw std::runtime_error("read_parquet: unsupported column type for " +
+                                         field->name());
+        }
+    }
+}
+
 }  // namespace
 
 inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
@@ -400,69 +470,103 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
     }
 
     ibex::runtime::Table out;
-    for (int i = 0; i < table->num_columns(); ++i) {
-        const auto& field = table->field(i);
-        const auto& col = table->column(i);
-        switch (col->type()->id()) {
-            case arrow::Type::INT8:
-            case arrow::Type::INT16:
-            case arrow::Type::INT32:
-            case arrow::Type::INT64:
-            case arrow::Type::UINT8:
-            case arrow::Type::UINT16:
-            case arrow::Type::UINT32:
-            case arrow::Type::UINT64: {
-                std::vector<std::int64_t> values;
-                values.reserve(static_cast<std::size_t>(col->length()));
-                append_int_column(col, values);
-                out.add_column(field->name(), ibex::Column<std::int64_t>{std::move(values)});
-                break;
-            }
-            case arrow::Type::FLOAT:
-            case arrow::Type::DOUBLE: {
-                std::vector<double> values;
-                values.reserve(static_cast<std::size_t>(col->length()));
-                append_double_column(col, values);
-                out.add_column(field->name(), ibex::Column<double>{std::move(values)});
-                break;
-            }
-            case arrow::Type::STRING:
-            case arrow::Type::LARGE_STRING: {
-                std::vector<std::string> values;
-                values.reserve(static_cast<std::size_t>(col->length()));
-                append_string_column(col, values);
-                out.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
-                break;
-            }
-            case arrow::Type::DATE32: {
-                std::vector<ibex::Date> values;
-                values.reserve(static_cast<std::size_t>(col->length()));
-                append_date32_column(col, values);
-                out.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
-                break;
-            }
-            case arrow::Type::DATE64: {
-                std::vector<ibex::Date> values;
-                values.reserve(static_cast<std::size_t>(col->length()));
-                append_date64_column(col, values);
-                out.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
-                break;
-            }
-            case arrow::Type::TIMESTAMP: {
-                std::vector<ibex::Timestamp> values;
-                values.reserve(static_cast<std::size_t>(col->length()));
-                append_timestamp_column(col, col->type(), values);
-                out.add_column(field->name(), ibex::Column<ibex::Timestamp>{std::move(values)});
-                break;
-            }
-            default:
-                throw std::runtime_error("read_parquet: unsupported column type for " +
-                                         field->name());
+    populate_from_arrow_table(table, out);
+    return out;
+}
+
+namespace {
+
+/// Number of rows per streamed batch for `ChunkedParquetSourceOperator`.
+/// Matches `libs/csv/csv.cpp`'s `kChunkedCsvRowsPerChunk` so chunk sizing is
+/// consistent across sources. `parquet::arrow::FileReader::set_batch_size`
+/// controls this independent of the file's own row-group sizing, so chunk
+/// size stays bounded even against a file written with one giant row group.
+constexpr std::int64_t kParquetRowsPerChunk = 65536;
+
+}  // namespace
+
+/// Row-group/batch streaming source for `read_parquet`, registered via
+/// `ExternRegistry::register_chunked_table` alongside the whole-file
+/// `read_parquet()` above. Emits one `ibex::runtime::Chunk` per
+/// `kParquetRowsPerChunk`-row Arrow batch instead of materializing the whole
+/// file, so peak memory during a read is bounded by chunk size rather than
+/// file size.
+class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
+   public:
+    static auto create(std::string path) -> std::expected<ibex::runtime::OperatorPtr, std::string> {
+        try {
+            auto op =
+                std::unique_ptr<ChunkedParquetSourceOperator>(new ChunkedParquetSourceOperator());
+            op->init(std::move(path));
+            return ibex::runtime::OperatorPtr(std::move(op));
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string(e.what()));
         }
     }
 
-    return out;
-}
+    ChunkedParquetSourceOperator(const ChunkedParquetSourceOperator&) = delete;
+    ChunkedParquetSourceOperator& operator=(const ChunkedParquetSourceOperator&) = delete;
+    ChunkedParquetSourceOperator(ChunkedParquetSourceOperator&&) noexcept = delete;
+    ChunkedParquetSourceOperator& operator=(ChunkedParquetSourceOperator&&) noexcept = delete;
+    ~ChunkedParquetSourceOperator() override = default;
+
+    [[nodiscard]] auto next()
+        -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> override {
+        std::shared_ptr<arrow::RecordBatch> batch;
+        auto st = batches_->ReadNext(&batch);
+        if (!st.ok()) {
+            return std::unexpected("read_parquet: failed to read batch: " + path_ + " (" +
+                                   st.ToString() + ")");
+        }
+        if (batch == nullptr) {
+            return std::optional<ibex::runtime::Chunk>{};
+        }
+
+        auto table_result = arrow::Table::FromRecordBatches(batch->schema(), {batch});
+        if (!table_result.ok()) {
+            return std::unexpected("read_parquet: failed to wrap batch: " + path_ + " (" +
+                                   table_result.status().ToString() + ")");
+        }
+
+        try {
+            ibex::runtime::Chunk chunk;
+            populate_from_arrow_table(table_result.ValueOrDie(), chunk);
+            return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string(e.what()));
+        }
+    }
+
+   private:
+    ChunkedParquetSourceOperator() = default;
+
+    void init(std::string path) {
+        path_ = std::move(path);
+        auto input = open_parquet_input(path_);
+
+        auto reader_result =
+            parquet::arrow::OpenFile(std::move(input), arrow::default_memory_pool());
+        if (!reader_result.ok()) {
+            throw std::runtime_error("read_parquet: failed to read: " + path_ + " (" +
+                                     reader_result.status().ToString() + ")");
+        }
+        reader_ = std::move(reader_result).ValueOrDie();
+        reader_->set_batch_size(kParquetRowsPerChunk);
+
+        auto batches_result = reader_->GetRecordBatchReader();
+        if (!batches_result.ok()) {
+            throw std::runtime_error("read_parquet: failed to open batch stream: " + path_ + " (" +
+                                     batches_result.status().ToString() + ")");
+        }
+        batches_ = std::move(batches_result).ValueOrDie();
+    }
+
+    std::string path_;
+    // reader_ must outlive batches_'s use of it (Arrow doc: "FileReaders must
+    // outlive their RecordBatchReaders").
+    std::unique_ptr<parquet::arrow::FileReader> reader_;
+    std::unique_ptr<arrow::RecordBatchReader> batches_;
+};
 
 namespace {
 

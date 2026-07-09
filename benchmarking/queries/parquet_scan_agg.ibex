@@ -1,0 +1,7 @@
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+read_parquet("__INPUT__")[filter price > 500.0][
+    select { avg_price = mean(price), total_qty = sum(qty) },
+    by symbol,
+    order symbol
+];

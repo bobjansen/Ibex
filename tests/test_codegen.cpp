@@ -28,7 +28,7 @@ static auto emit_to_string(const ir::Node& root) -> std::string {
 
 // Check that a string contains a substring.
 static auto contains(const std::string& haystack, const std::string& needle) -> bool {
-    return haystack.find(needle) != std::string::npos;
+    return haystack.contains(needle);
 }
 
 // Helper: create a leaf ExternCallNode representing a table data source.

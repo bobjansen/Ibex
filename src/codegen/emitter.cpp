@@ -45,7 +45,7 @@ auto format_double(double v) -> std::string {
     ss << v;
     std::string s = ss.str();
     // Ensure it looks like a double literal (has . or e)
-    if (s.find('.') == std::string::npos && s.find('e') == std::string::npos) {
+    if (!s.contains('.') && !s.contains('e')) {
         s += ".0";
     }
     return s;
@@ -201,7 +201,7 @@ void Emitter::collect_extern_calls(const ir::Node& node) {
             *out_ << emit_raw_expr(arg);
         }
         *out_ << ");\n";
-        cached_vars_[&node] = var;
+        cached_vars_[&node] = std::move(var);
         return;
     }
     for (const auto& child : node.children()) {
@@ -1266,7 +1266,7 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                 }
                 s += ", ";
                 s += node.pct ? "true" : "false";
-                s += ")";
+                s += ')';
                 return s;
             }
             throw std::runtime_error("ibex_compile: unknown expression type");

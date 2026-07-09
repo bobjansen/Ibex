@@ -14,26 +14,38 @@ namespace {
 
 // Counter for synthesizing fresh NodeIds during a canonicalize pass. Seeded at
 // canonicalize() entry to (max id in tree + 1) so it never collides with
-// existing IDs in the input.
-thread_local std::uint64_t g_next_id = 0;
-
-auto fresh_id() -> NodeId {
-    return NodeId{g_next_id++};
+// existing IDs in the input. Function-local static (not a namespace-scope
+// global) so it doesn't trip cppcoreguidelines-avoid-non-const-global-variables;
+// mirrors the scalars_ptr() fix in src/runtime/ops.cpp.
+auto next_id_counter() -> std::uint64_t& {
+    thread_local std::uint64_t next_id = 0;
+    return next_id;
 }
 
-auto collect_max_id(const Node& n, std::uint64_t& m) -> void {
+auto fresh_id() -> NodeId {
+    return NodeId{next_id_counter()++};
+}
+
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast)
+// Node kind is checked immediately before every downcast below; see the
+// same convention in interpreter.cpp / chunked.cpp / emitter.cpp.
+
+// Takes Node& (not const Node&): every call site already has mutable access
+// (root is an owned NodePtr), and ProgramNode only exposes a nullable
+// main-node accessor on the mutable side.
+auto collect_max_id(Node& n, std::uint64_t& m) -> void {
     m = std::max(m, n.id().value);
-    for (const auto& c : n.children()) {
+    for (const auto& c : n.mutable_children()) {
         collect_max_id(*c, m);
     }
     if (n.kind() == NodeKind::Program) {
-        const auto& prog = static_cast<const ProgramNode&>(n);
-        for (const auto& p : prog.preamble()) {
+        auto& prog = static_cast<ProgramNode&>(n);
+        for (const auto& p : prog.mutable_preamble()) {
             if (p) {
                 collect_max_id(*p, m);
             }
         }
-        const auto& main_ptr = const_cast<ProgramNode&>(prog).mutable_main_node();
+        auto& main_ptr = prog.mutable_main_node();
         if (main_ptr) {
             collect_max_id(*main_ptr, m);
         }
@@ -58,8 +70,7 @@ auto keys_preserved_by_project(const std::vector<OrderKey>& keys, const ProjectN
     for (const auto& col : proj.columns()) {
         out.insert(col.name);
     }
-    return std::all_of(keys.begin(), keys.end(),
-                       [&](const OrderKey& k) { return out.contains(k.name); });
+    return std::ranges::all_of(keys, [&](const OrderKey& k) { return out.contains(k.name); });
 }
 
 // Returns true when every group_by column appears in the projection output.
@@ -70,8 +81,7 @@ auto group_by_preserved_by_project(const std::vector<ColumnRef>& group_by, const
     for (const auto& col : proj.columns()) {
         out.insert(col.name);
     }
-    return std::all_of(group_by.begin(), group_by.end(),
-                       [&](const ColumnRef& c) { return out.contains(c.name); });
+    return std::ranges::all_of(group_by, [&](const ColumnRef& c) { return out.contains(c.name); });
 }
 
 // Remap an Order key list through a Rename: any key whose name matches a
@@ -425,7 +435,7 @@ struct TryResult {
 // empty input without a custom node.
 auto try_simplify_predicate(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& filter = static_cast<FilterNode&>(*node);
     Expr pred = filter.take_predicate();
@@ -436,11 +446,11 @@ auto try_simplify_predicate(NodePtr node) -> TryResult {
         NodePtr filter_owned = std::move(node);
         NodePtr x = take_unique_child(*filter_owned);
         if (*b) {
-            return {true, std::move(x)};
+            return {.changed = true, .node = std::move(x)};
         }
         auto h = std::make_unique<HeadNode>(filter_id, 0, std::vector<ColumnRef>{});
         h->add_child(std::move(x));
-        return {true, std::move(h)};
+        return {.changed = true, .node = std::move(h)};
     }
     if (!changed) {
         // Put the predicate back unchanged.
@@ -449,21 +459,21 @@ auto try_simplify_predicate(NodePtr node) -> TryResult {
         NodePtr x = take_unique_child(*filter_owned);
         auto restored = std::make_unique<FilterNode>(filter_id, std::move(pred));
         restored->add_child(std::move(x));
-        return {false, std::move(restored)};
+        return {.changed = false, .node = std::move(restored)};
     }
     const auto filter_id = node->id();
     NodePtr filter_owned = std::move(node);
     NodePtr x = take_unique_child(*filter_owned);
     auto rebuilt = std::make_unique<FilterNode>(filter_id, std::move(pred));
     rebuilt->add_child(std::move(x));
-    return {true, std::move(rebuilt)};
+    return {.changed = true, .node = std::move(rebuilt)};
 }
 
 // R1: Filter(Order(x)) → Order(Filter(x))
 auto try_filter_past_order(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Order) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     NodePtr filter = std::move(node);
     NodePtr order = take_unique_child(*filter);
@@ -471,19 +481,19 @@ auto try_filter_past_order(NodePtr node) -> TryResult {
     filter->add_child(std::move(x));
     filter = rewrite_root(std::move(filter));
     order->add_child(std::move(filter));
-    return {true, std::move(order)};
+    return {.changed = true, .node = std::move(order)};
 }
 
 // R2: Project(Order(x)) → Order(Project(x)) when all keys are preserved.
 auto try_project_past_order(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Project || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Order) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto& proj = static_cast<const ProjectNode&>(*node);
     const auto& order = static_cast<const OrderNode&>(*node->children().front());
     if (!keys_preserved_by_project(order.keys(), proj)) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     NodePtr project = std::move(node);
     NodePtr order_n = take_unique_child(*project);
@@ -491,14 +501,14 @@ auto try_project_past_order(NodePtr node) -> TryResult {
     project->add_child(std::move(x));
     project = rewrite_root(std::move(project));
     order_n->add_child(std::move(project));
-    return {true, std::move(order_n)};
+    return {.changed = true, .node = std::move(order_n)};
 }
 
 // R3: Order(Rename(x)) → Rename(Order(x)) with keys remapped new→old.
 auto try_order_past_rename(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Order || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Rename) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& order_n = static_cast<OrderNode&>(*node);
     const auto& rename = static_cast<const RenameNode&>(*node->children().front());
@@ -510,14 +520,14 @@ auto try_order_past_rename(NodePtr node) -> TryResult {
     new_order->add_child(std::move(x));
     new_order = rewrite_root(std::move(new_order));
     rename_owned->add_child(std::move(new_order));
-    return {true, std::move(rename_owned)};
+    return {.changed = true, .node = std::move(rename_owned)};
 }
 
 // R9: Rename(Rename(x)) → single Rename with composed mappings.
 auto try_rename_compose(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Rename || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Rename) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto& outer = static_cast<const RenameNode&>(*node);
     const auto& inner = static_cast<const RenameNode&>(*node->children().front());
@@ -527,34 +537,34 @@ auto try_rename_compose(NodePtr node) -> TryResult {
     NodePtr inner_owned = take_unique_child(*outer_owned);
     NodePtr x = take_unique_child(*inner_owned);
     if (composed.empty()) {
-        return {true, std::move(x)};
+        return {.changed = true, .node = std::move(x)};
     }
     auto merged = std::make_unique<RenameNode>(merged_id, std::move(composed));
     merged->add_child(std::move(x));
-    return {true, std::move(merged)};
+    return {.changed = true, .node = std::move(merged)};
 }
 
 // R10: Drop a Rename whose entries are empty or all identity.
 auto try_rename_drop_identity(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Rename || node->children().empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto& rn = static_cast<const RenameNode&>(*node);
     const bool all_identity =
         std::all_of(rn.renames().begin(), rn.renames().end(),
                     [](const RenameSpec& rs) { return rs.new_name == rs.old_name; });
     if (!rn.renames().empty() && !all_identity) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     NodePtr rename_owned = std::move(node);
-    return {true, take_unique_child(*rename_owned)};
+    return {.changed = true, .node = take_unique_child(*rename_owned)};
 }
 
 // R11: Filter(Rename(x)) → Rename(Filter'(x)) with predicate column refs remapped.
 auto try_filter_past_rename(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Rename) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& filter = static_cast<FilterNode&>(*node);
     const auto& rename = static_cast<const RenameNode&>(*node->children().front());
@@ -573,7 +583,7 @@ auto try_filter_past_rename(NodePtr node) -> TryResult {
     new_filter->add_child(std::move(x));
     NodePtr bubbled = rewrite_root(std::move(new_filter));
     rename_owned->add_child(std::move(bubbled));
-    return {true, rewrite_root(std::move(rename_owned))};
+    return {.changed = true, .node = rewrite_root(std::move(rename_owned))};
 }
 
 // R13/R14: Head(Head(x)) / Tail(Tail(x)) → single node with tighter bound.
@@ -581,7 +591,7 @@ auto try_limit_collapse(NodePtr node) -> TryResult {
     const auto kind = node->kind();
     if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty() ||
         node->children().front()->kind() != kind) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto outer_count = (kind == NodeKind::Head)
                                  ? static_cast<const HeadNode&>(*node).count_literal()
@@ -598,7 +608,7 @@ auto try_limit_collapse(NodePtr node) -> TryResult {
                                : static_cast<const TailNode&>(inner).group_by();
     if (!outer_gb.empty() || !inner_gb.empty() || !outer_count.has_value() ||
         !inner_count.has_value()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto merged_count = std::min(*outer_count, *inner_count);
     const auto merged_id = node->id();
@@ -612,21 +622,21 @@ auto try_limit_collapse(NodePtr node) -> TryResult {
         merged = std::make_unique<TailNode>(merged_id, merged_count, std::vector<ColumnRef>{});
     }
     merged->add_child(std::move(x));
-    return {true, std::move(merged)};
+    return {.changed = true, .node = std::move(merged)};
 }
 
 // R15: Drop Order keys pinned to constants by an immediate Filter child.
 auto try_order_drop_pinned_keys(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Order || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Filter) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto& order_n = static_cast<const OrderNode&>(*node);
     const auto& filter = static_cast<const FilterNode&>(*node->children().front());
     robin_hood::unordered_set<std::string> pinned;
     collect_equality_pinned_cols(filter.predicate(), pinned);
     if (pinned.empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     std::vector<OrderKey> surviving;
     surviving.reserve(order_n.keys().size());
@@ -636,17 +646,17 @@ auto try_order_drop_pinned_keys(NodePtr node) -> TryResult {
         }
     }
     if (surviving.size() == order_n.keys().size()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto order_id = node->id();
     NodePtr order_owned = std::move(node);
     NodePtr filter_owned = take_unique_child(*order_owned);
     if (surviving.empty()) {
-        return {true, std::move(filter_owned)};
+        return {.changed = true, .node = std::move(filter_owned)};
     }
     auto new_order = std::make_unique<OrderNode>(order_id, std::move(surviving));
     new_order->add_child(std::move(filter_owned));
-    return {true, std::move(new_order)};
+    return {.changed = true, .node = std::move(new_order)};
 }
 
 // R12: Filter(Update(x)) → Update(Filter(x)) when Update is row-local and
@@ -654,7 +664,7 @@ auto try_order_drop_pinned_keys(NodePtr node) -> TryResult {
 auto try_filter_past_update(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Update) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& filter = static_cast<FilterNode&>(*node);
     const auto& upd = static_cast<const UpdateNode&>(*node->children().front());
@@ -663,7 +673,7 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
         std::all_of(upd.fields().begin(), upd.fields().end(),
                     [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
     if (!update_eligible) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     robin_hood::unordered_set<std::string> pred_cols;
     collect_filter_column_refs(filter.predicate(), pred_cols);
@@ -671,7 +681,7 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
         std::none_of(upd.fields().begin(), upd.fields().end(),
                      [&](const FieldSpec& f) { return pred_cols.contains(f.alias); });
     if (!predicate_independent) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     Expr pred = filter.take_predicate();
     const auto filter_id = node->id();
@@ -682,7 +692,7 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
     new_filter->add_child(std::move(x));
     NodePtr bubbled = rewrite_root(std::move(new_filter));
     update_owned->add_child(std::move(bubbled));
-    return {true, std::move(update_owned)};
+    return {.changed = true, .node = std::move(update_owned)};
 }
 
 // R18: Filter(Aggregate(x)) → Aggregate(Filter(x)) when the predicate only
@@ -699,14 +709,14 @@ auto try_project_collapse(NodePtr node) -> TryResult {
     const auto kind = node->kind();
     if ((kind != NodeKind::Project && kind != NodeKind::FilterProject) ||
         node->children().empty() || node->children().front()->kind() != NodeKind::Project) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& outer_kids = node->mutable_children();
     NodePtr inner = std::move(outer_kids.front());
     outer_kids.clear();
     NodePtr grandchild = take_unique_child(*inner);
     node->add_child(std::move(grandchild));
-    return {true, std::move(node)};
+    return {.changed = true, .node = std::move(node)};
 }
 
 // R20: Aggregate(gb, aggs, x) → Aggregate(gb, aggs, Project(needed, x)) where
@@ -716,7 +726,7 @@ auto try_project_collapse(NodePtr node) -> TryResult {
 // prevents an infinite loop (the inserted Project would re-trigger the rule).
 auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Aggregate || node->children().empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     // Peek past any leading Order nodes: once this rule inserts a Project, R2
     // (project-past-order) pushes it *below* the Order, leaving the Aggregate's
@@ -729,7 +739,7 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     const auto child_kind = descendant->kind();
     if (child_kind == NodeKind::Project || child_kind == NodeKind::FilterProject ||
         child_kind == NodeKind::FilterUpdateProject) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& agg = static_cast<AggregateNode&>(*node);
     std::vector<ColumnRef> needed;
@@ -744,14 +754,14 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
         if (a.column.name.empty()) {
             // count(*) / unbound input — can't safely prune since the agg
             // doesn't name a specific column.
-            return {false, std::move(node)};
+            return {.changed = false, .node = std::move(node)};
         }
         if (seen.insert(a.column.name).second) {
             needed.push_back(a.column);
         }
     }
     if (needed.empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     NodePtr agg_owned = std::move(node);
     NodePtr child = take_unique_child(*agg_owned);
@@ -761,7 +771,7 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     // R5 Project(Filter) → FilterProject) fire before the Aggregate sees it.
     NodePtr proj_canon = rewrite_root(std::move(proj));
     agg_owned->add_child(std::move(proj_canon));
-    return {true, std::move(agg_owned)};
+    return {.changed = true, .node = std::move(agg_owned)};
 }
 
 // R19: Filter(p1, Filter(p2, x)) → Filter(p1 AND p2, x). Merges adjacent
@@ -770,7 +780,7 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
 auto try_filter_merge(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Filter) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& outer = static_cast<FilterNode&>(*node);
     auto& inner = static_cast<FilterNode&>(*node->children().front());
@@ -785,20 +795,20 @@ auto try_filter_merge(NodePtr node) -> TryResult {
     NodePtr x = take_unique_child(*inner_owned);
     auto merged = std::make_unique<FilterNode>(outer_id, std::move(combined));
     merged->add_child(std::move(x));
-    return {true, std::move(merged)};
+    return {.changed = true, .node = std::move(merged)};
 }
 
 auto try_filter_past_aggregate(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Aggregate) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& filter = static_cast<FilterNode&>(*node);
     const auto& agg = static_cast<const AggregateNode&>(*node->children().front());
     if (agg.children().empty() || agg.group_by().empty()) {
         // No group_by ⇒ exactly one output row; predicate either keeps it or
         // drops it, but that's a HAVING-style filter — not pushable.
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     robin_hood::unordered_set<std::string> gb_names;
     gb_names.reserve(agg.group_by().size());
@@ -811,7 +821,7 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
         std::all_of(pred_cols.begin(), pred_cols.end(),
                     [&](const std::string& c) { return gb_names.contains(c); });
     if (!only_group_by) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     Expr pred = filter.take_predicate();
     const auto filter_id = node->id();
@@ -822,14 +832,14 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
     new_filter->add_child(std::move(x));
     NodePtr bubbled = rewrite_root(std::move(new_filter));
     agg_owned->add_child(std::move(bubbled));
-    return {true, std::move(agg_owned)};
+    return {.changed = true, .node = std::move(agg_owned)};
 }
 
 // R5: Project(Filter(x)) → FilterProject(x).
 auto try_fuse_filter_project(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Project || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Filter) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& proj = static_cast<ProjectNode&>(*node);
     std::vector<ColumnRef> cols = proj.columns();
@@ -838,21 +848,21 @@ auto try_fuse_filter_project(NodePtr node) -> TryResult {
     auto& filter = static_cast<FilterNode&>(*filter_owned);
     if (filter.children().empty()) {
         project_owned->add_child(std::move(filter_owned));
-        return {false, std::move(project_owned)};
+        return {.changed = false, .node = std::move(project_owned)};
     }
     NodePtr x = take_unique_child(filter);
     Expr pred = filter.take_predicate();
     auto fused =
         std::make_unique<FilterProjectNode>(project_owned->id(), std::move(pred), std::move(cols));
     fused->add_child(std::move(x));
-    return {true, std::move(fused)};
+    return {.changed = true, .node = std::move(fused)};
 }
 
 // R6: Project(Update(Filter(x))) → FilterUpdateProject(x) when update is row-local.
 auto try_fuse_filter_update_project(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Project || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Update) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& proj = static_cast<ProjectNode&>(*node);
     auto& upd = static_cast<UpdateNode&>(*node->children().front());
@@ -861,11 +871,11 @@ auto try_fuse_filter_update_project(NodePtr node) -> TryResult {
         std::all_of(upd.fields().begin(), upd.fields().end(),
                     [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
     if (!update_eligible || upd.children().front()->kind() != NodeKind::Filter) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     auto& filter = static_cast<FilterNode&>(*upd.children().front());
     if (filter.children().empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     std::vector<ColumnRef> proj_cols = proj.columns();
     std::vector<FieldSpec> fields = upd.fields();
@@ -878,7 +888,7 @@ auto try_fuse_filter_update_project(NodePtr node) -> TryResult {
     auto fused = std::make_unique<FilterUpdateProjectNode>(project_owned->id(), std::move(pred),
                                                            std::move(fields), std::move(proj_cols));
     fused->add_child(std::move(x));
-    return {true, std::move(fused)};
+    return {.changed = true, .node = std::move(fused)};
 }
 
 // R7/R8: Head(Filter(x)) → FilterHead(x), Tail(Filter(x)) → FilterTail(x)
@@ -887,19 +897,19 @@ auto try_fuse_filter_limit(NodePtr node) -> TryResult {
     const auto kind = node->kind();
     if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Filter) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto& group_by = (kind == NodeKind::Head)
                                ? static_cast<const HeadNode&>(*node).group_by()
                                : static_cast<const TailNode&>(*node).group_by();
     if (!group_by.empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto count = (kind == NodeKind::Head)
                            ? static_cast<const HeadNode&>(*node).count_literal()
                            : static_cast<const TailNode&>(*node).count_literal();
     if (!count.has_value()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto fused_id = node->id();
     NodePtr limit_owned = std::move(node);
@@ -907,7 +917,7 @@ auto try_fuse_filter_limit(NodePtr node) -> TryResult {
     auto& filter = static_cast<FilterNode&>(*filter_owned);
     if (filter.children().empty()) {
         limit_owned->add_child(std::move(filter_owned));
-        return {false, std::move(limit_owned)};
+        return {.changed = false, .node = std::move(limit_owned)};
     }
     NodePtr x = take_unique_child(filter);
     Expr pred = filter.take_predicate();
@@ -918,7 +928,7 @@ auto try_fuse_filter_limit(NodePtr node) -> TryResult {
         fused = std::make_unique<FilterTailNode>(fused_id, std::move(pred), *count);
     }
     fused->add_child(std::move(x));
-    return {true, std::move(fused)};
+    return {.changed = true, .node = std::move(fused)};
 }
 
 // R16: Head(Order(x)) → TopK(..., First), Tail(Order(x)) → TopK(..., Last).
@@ -929,13 +939,13 @@ auto try_fuse_topk(NodePtr node) -> TryResult {
     const auto kind = node->kind();
     if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty() ||
         node->children().front()->kind() != NodeKind::Order) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto count = (kind == NodeKind::Head)
                            ? static_cast<const HeadNode&>(*node).count_literal()
                            : static_cast<const TailNode&>(*node).count_literal();
     if (!count.has_value()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     std::vector<ColumnRef> group_by = (kind == NodeKind::Head)
                                           ? static_cast<const HeadNode&>(*node).group_by()
@@ -948,25 +958,25 @@ auto try_fuse_topk(NodePtr node) -> TryResult {
     auto& order_n = static_cast<OrderNode&>(*order_owned);
     if (order_n.children().empty()) {
         limit_owned->add_child(std::move(order_owned));
-        return {false, std::move(limit_owned)};
+        return {.changed = false, .node = std::move(limit_owned)};
     }
     std::vector<OrderKey> keys = order_n.keys();
     NodePtr x = take_unique_child(order_n);
     auto fused = std::make_unique<TopKNode>(fused_id, std::move(keys), *count, std::move(group_by),
                                             keep_mode);
     fused->add_child(std::move(x));
-    return {true, std::move(fused)};
+    return {.changed = true, .node = std::move(fused)};
 }
 
 // R4: Head/Tail past Project or Rename.
 auto try_limit_past_metadata(NodePtr node) -> TryResult {
     const auto kind = node->kind();
     if ((kind != NodeKind::Head && kind != NodeKind::Tail) || node->children().empty()) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto child_kind = node->children().front()->kind();
     if (child_kind != NodeKind::Project && child_kind != NodeKind::Rename) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto& group_by = (kind == NodeKind::Head)
                                ? static_cast<const HeadNode&>(*node).group_by()
@@ -982,7 +992,7 @@ auto try_limit_past_metadata(NodePtr node) -> TryResult {
         safe = true;
     }
     if (!safe) {
-        return {false, std::move(node)};
+        return {.changed = false, .node = std::move(node)};
     }
     const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count_expr()
                                                 : static_cast<const TailNode&>(*node).count_expr();
@@ -999,7 +1009,7 @@ auto try_limit_past_metadata(NodePtr node) -> TryResult {
     new_limit->add_child(std::move(x));
     new_limit = rewrite_root(std::move(new_limit));
     wrapper->add_child(std::move(new_limit));
-    return {true, std::move(wrapper)};
+    return {.changed = true, .node = std::move(wrapper)};
 }
 
 using RuleFn = TryResult (*)(NodePtr);
@@ -1081,6 +1091,7 @@ auto canon(NodePtr node) -> NodePtr {
     }
     return rewrite_root(std::move(node));
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 
@@ -1088,7 +1099,7 @@ auto canonicalize(NodePtr root) -> NodePtr {
     if (root) {
         std::uint64_t max_id = 0;
         collect_max_id(*root, max_id);
-        g_next_id = max_id + 1;
+        next_id_counter() = max_id + 1;
     }
     return canon(std::move(root));
 }

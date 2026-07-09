@@ -16,14 +16,21 @@ namespace {
 // Scratch table name used when we wrap an in-memory table in a one-node IR plan.
 // It is intentionally internal and never exposed to users.
 constexpr const char* kSrcKey = "__ibex__";
-const runtime::ScalarRegistry* g_scalars = nullptr;
+
+// Function-local static (not a namespace-scope global) so the pointer set by
+// set_scalars() can still be mutated from a single place without tripping
+// cppcoreguidelines-avoid-non-const-global-variables.
+auto scalars_ptr() -> const runtime::ScalarRegistry*& {
+    static const runtime::ScalarRegistry* scalars = nullptr;
+    return scalars;
+}
 
 auto delegate(ir::NodePtr node, const runtime::Table& src) -> runtime::Table {
     // Route all convenience ops (filter/project/order/...) through the same
     // interpreter entry point so behavior stays aligned with the query engine.
     runtime::TableRegistry reg;
     reg.emplace(kSrcKey, src);
-    auto result = runtime::interpret(*node, reg, g_scalars, nullptr);
+    auto result = runtime::interpret(*node, reg, scalars_ptr(), nullptr);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -31,7 +38,7 @@ auto delegate(ir::NodePtr node, const runtime::Table& src) -> runtime::Table {
 }
 
 auto delegate_with_registry(ir::NodePtr node, const runtime::TableRegistry& reg) -> runtime::Table {
-    auto result = runtime::interpret(*node, reg, g_scalars, nullptr);
+    auto result = runtime::interpret(*node, reg, scalars_ptr(), nullptr);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -52,11 +59,11 @@ auto to_col_refs(const std::vector<std::string>& names) -> std::vector<ir::Colum
 // ─── Core ops ─────────────────────────────────────────────────────────────────
 
 void set_scalars(const runtime::ScalarRegistry* scalars) {
-    g_scalars = scalars;
+    scalars_ptr() = scalars;
 }
 
 auto eval_row_count(const ir::Expr& expr) -> std::size_t {
-    auto count = runtime::evaluate_row_count_expr(expr, g_scalars, nullptr);
+    auto count = runtime::evaluate_row_count_expr(expr, scalars_ptr(), nullptr);
     if (!count) {
         throw std::runtime_error(count.error());
     }
@@ -315,7 +322,8 @@ auto model_r_squared(const runtime::ModelResult& m) -> double {
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Inner, keys, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Inner, keys, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -325,7 +333,8 @@ auto inner_join(const runtime::Table& left, const runtime::Table& right,
 auto left_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Left, keys, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Left, keys, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -335,7 +344,8 @@ auto left_join(const runtime::Table& left, const runtime::Table& right,
 auto right_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Right, keys, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Right, keys, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -345,7 +355,8 @@ auto right_join(const runtime::Table& left, const runtime::Table& right,
 auto outer_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Outer, keys, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Outer, keys, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -354,7 +365,8 @@ auto outer_join(const runtime::Table& left, const runtime::Table& right,
 
 auto semi_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<std::string>& keys) -> runtime::Table {
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Semi, keys, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Semi, keys, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -363,7 +375,8 @@ auto semi_join(const runtime::Table& left, const runtime::Table& right,
 
 auto anti_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<std::string>& keys) -> runtime::Table {
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Anti, keys, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Anti, keys, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -371,7 +384,8 @@ auto anti_join(const runtime::Table& left, const runtime::Table& right,
 }
 
 auto cross_join(const runtime::Table& left, const runtime::Table& right) -> runtime::Table {
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Cross, {}, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Cross, {}, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -381,7 +395,8 @@ auto cross_join(const runtime::Table& left, const runtime::Table& right) -> runt
 auto asof_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<std::string>& keys) -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
-    auto result = runtime::join_tables(left, right, ir::JoinKind::Asof, keys, nullptr, g_scalars);
+    auto result =
+        runtime::join_tables(left, right, ir::JoinKind::Asof, keys, nullptr, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -391,7 +406,7 @@ auto asof_join(const runtime::Table& left, const runtime::Table& right,
 auto join_with_predicate(const runtime::Table& left, const runtime::Table& right, ir::JoinKind kind,
                          const std::vector<std::string>& keys, const ir::Expr& predicate)
     -> runtime::Table {
-    auto result = runtime::join_tables(left, right, kind, keys, &predicate, g_scalars);
+    auto result = runtime::join_tables(left, right, kind, keys, &predicate, scalars_ptr());
     if (!result) {
         throw std::runtime_error(result.error());
     }

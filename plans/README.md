@@ -19,6 +19,7 @@ cross-plan links reference these paths) — this index is the organization layer
 
 | Plan | Notes |
 |---|---|
+| [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | New. Out-of-core execution: spill infrastructure (Phase 1, prerequisite), external sort, out-of-core join, chunked/pushdown Parquet, ADBC+Parquet chunked sinks, planner-driven adaptive spill selection. No code yet |
 | [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Kernel-level parallelism (`IBEX_THREADS`, `parallel_for`), single-threaded default. No code yet. **File untracked — commit it** |
 | [julia-integration-plan.md](julia-integration-plan.md) | Ibex.jl package, `ibex"""..."""` macro, Arrow/Tables.jl interop, DataFrames.jl benchmark baseline |
 | [short-mode-plan.md](short-mode-plan.md) | Prefix-abbreviated golf mode (`t[s{s,p}]`) behind an explicit mode gate + formatter round-trip. Design sketch only |
@@ -51,3 +52,10 @@ cross-plan links reference these paths) — this index is the organization layer
 - **runtime-multithreading** is the answer to the remaining polars
   multi-thread gaps in **benchmark-perf-priorities** (single-thread ibex
   already wins 37/41 vs polars-st).
+- **bigger-than-ram** builds directly on **chunked-execution**: every
+  "materializing" row in that plan's coverage table (unsorted `Order`/
+  `AsTimeframe`, non-streaming `Tail`, general `Join`) is a target phase
+  here, and its Next Steps §2 (harden the external chunked-source contract)
+  and this plan's Phase 4 (chunked Parquet) are the same work from two
+  angles. Its Phase 7 (parallel spill I/O) is explicitly sequenced after
+  **runtime-multithreading**, not coupled to it.

@@ -212,6 +212,13 @@ operators (not just the Kafka demos). Once stable, an `adbc` plugin reads
 Arrow `RecordBatch` objects as Ibex chunks with zero-copy where layouts match
 — path to PostgreSQL, DuckDB, Snowflake, BigQuery.
 
+The `adbc` plugin has since landed and is already a well-behaved chunked
+source (`AdbcSourceOperator`, `register_chunked_table`). What's still open —
+out-of-core sort/join for inputs too big for RAM, row-group-streaming and
+pushdown-aware Parquet, and chunked ADBC/Parquet write sinks — is tracked
+separately in `plans/bigger-than-ram-plan.md`, which builds directly on this
+plan's coverage table.
+
 ### 3. Materialization hardening
 
 `MaterializeOperator` assumes identical schema and shared categorical

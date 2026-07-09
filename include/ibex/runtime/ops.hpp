@@ -97,7 +97,8 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto columns(const runtime::Table& t) -> runtime::Table;
 
 [[nodiscard]] auto windowed_update(const runtime::Table& t, ir::Duration duration,
-                                   const std::vector<ir::FieldSpec>& fields) -> runtime::Table;
+                                   const std::vector<ir::FieldSpec>& fields,
+                                   const std::vector<std::string>& group_by = {}) -> runtime::Table;
 
 [[nodiscard]] auto melt(const runtime::Table& t, const std::vector<std::string>& id_cols,
                         const std::vector<std::string>& measure_cols) -> runtime::Table;

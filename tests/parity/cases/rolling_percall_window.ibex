@@ -1,0 +1,6 @@
+let t = Table {
+    ts = [0, 1000000000, 2000000000, 3000000000, 4000000000, 5000000000, 6000000000, 7000000000, 8000000000, 9000000000],
+    px = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+};
+let tf = as_timeframe(t, "ts");
+tf[update { cw = rolling_mean(px, 3), dw = rolling_sum(px, 3s), e = rolling_ewma(px, 0.3, 4) }][select { ts, px, cw, dw, e }];

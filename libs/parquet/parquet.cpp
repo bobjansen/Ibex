@@ -29,6 +29,20 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
                                  }
                              });
 
+    registry->register_chunked_table(
+        "read_parquet",
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::OperatorPtr, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("read_parquet() expects 1 argument");
+            }
+            const auto* path = std::get_if<std::string>(&args[0]);
+            if (path == nullptr) {
+                return std::unexpected("read_parquet() expects a string path");
+            }
+            return ChunkedParquetSourceOperator::create(*path);
+        });
+
     registry->register_scalar_table_consumer(
         "write_parquet", ibex::runtime::ScalarKind::Int,
         [](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)

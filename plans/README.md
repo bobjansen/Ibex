@@ -14,13 +14,13 @@ cross-plan links reference these paths) — this index is the organization layer
 | [function-kind-registry-plan.md](function-kind-registry-plan.md) | Stage 1 of 6 done | Scalar slice unified. Next: fold Generators (`rand_*`, `rep`), then Transforms, then Aggregates into one `FnKind` registry; settle the null/validity wrinkle; collapse the four field-evaluator ladders |
 | [count-window-plan.md](count-window-plan.md) | Implemented (interpreter + codegen) | Per-call count/duration windows work (`__window_n`/`__window_ns` in lower.cpp + window.cpp), and the compiled path (`ibex_compile`) is at parity — it was already generic via `ops::fn_call`/named-args passthrough; the one real gap was `window ..., update {...}, by ...` (grouped rolling), which the emitter rejected outright — `ops::windowed_update` now threads `group_by` through like plain `update` does. Verified via `tests/parity/run_parity.sh` (new `window_by`/`rolling_percall_window` cases) + new `test_codegen.cpp` cases. Open: `window N rows` block syntax, monotonic-deque rolling min/max, tuple-field `update` inside `window` (interpreter doesn't support that combo either, so codegen correctly still rejects it). **File untracked — commit it** |
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
+| [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 
 ## Proposed — no implementation yet
 
 | Plan | Notes |
 |---|---|
-| [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | New. Out-of-core execution: spill infrastructure (Phase 1, prerequisite), external sort, out-of-core join, chunked/pushdown Parquet, ADBC+Parquet chunked sinks, planner-driven adaptive spill selection. No code yet |
-| [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Kernel-level parallelism (`IBEX_THREADS`, `parallel_for`), single-threaded default. No code yet. **File untracked — commit it** |
+| [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Kernel-level parallelism (`IBEX_THREADS`, `parallel_for`), single-threaded default. No code yet. |
 | [julia-integration-plan.md](julia-integration-plan.md) | Ibex.jl package, `ibex"""..."""` macro, Arrow/Tables.jl interop, DataFrames.jl benchmark baseline |
 | [short-mode-plan.md](short-mode-plan.md) | Prefix-abbreviated golf mode (`t[s{s,p}]`) behind an explicit mode gate + formatter round-trip. Design sketch only |
 

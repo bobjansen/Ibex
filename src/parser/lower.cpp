@@ -2707,9 +2707,7 @@ class Lowerer {
         robin_hood::unordered_map<std::string, bool> temp_columns;
         std::size_t temp_counter = 0;
 
-        auto make_temp = [&]() -> std::string {
-            return "_agg" + std::to_string(temp_counter++);
-        };
+        auto make_temp = [&]() -> std::string { return "_agg" + std::to_string(temp_counter++); };
 
         std::function<const IdentifierExpr*(const Expr&)> extract_column_ident;
         extract_column_ident = [&](const Expr& expr) -> const IdentifierExpr* {
@@ -3184,9 +3182,7 @@ class Lowerer {
         LoweredAggList lowered;
         std::size_t temp_counter = 0;
 
-        auto make_temp = [&]() -> std::string {
-            return "_agg" + std::to_string(temp_counter++);
-        };
+        auto make_temp = [&]() -> std::string { return "_agg" + std::to_string(temp_counter++); };
 
         std::function<const IdentifierExpr*(const Expr&)> extract_column_ident;
         extract_column_ident = [&](const Expr& expr) -> const IdentifierExpr* {

@@ -1659,9 +1659,7 @@ template <typename Fn>
 auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
                                  std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
     -> int {
-    auto run_and_touch = [&]() {
-        g_bench_sink ^= run_once();
-    };
+    auto run_and_touch = [&]() { g_bench_sink ^= run_once(); };
 
     for (std::size_t i = 0; i < warmup_iters; ++i) {
         run_and_touch();

@@ -206,9 +206,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
     const auto* src_entry = table.find_entry(col_ref->name);
     const ValidityBitmap* sv =
         (src_entry != nullptr && src_entry->validity.has_value()) ? &*src_entry->validity : nullptr;
-    auto valid_at = [sv](std::size_t j) noexcept -> bool {
-        return sv == nullptr || (*sv)[j];
-    };
+    auto valid_at = [sv](std::size_t j) noexcept -> bool { return sv == nullptr || (*sv)[j]; };
 
     if (call.callee == "rolling_mean") {
         return std::visit(

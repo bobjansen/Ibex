@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Auto-fix the two low-risk, high-signal clang-tidy checks: missing includes
-# (misc-include-cleaner) and local const-correctness (misc-const-correctness).
-# Then normalizes const placement to this repo's west-const style (clang-tidy's
-# fixit always writes east-const, e.g. `bool const v`) and re-sorts any
-# newly-inserted ibex/ headers into the angle-bracket project block, since
-# misc-include-cleaner's fixit inserts them quoted (e.g. "ibex/ir/node.hpp").
+# Auto-fix three low-risk, high-signal clang-tidy checks: missing includes
+# (misc-include-cleaner), local const-correctness (misc-const-correctness),
+# and brace-init field names (modernize-use-designated-initializers). Then
+# normalizes const placement to this repo's west-const style (clang-tidy's
+# fixit always writes east-const, e.g. `bool const v`), fixes designated-
+# initializer spacing/wrapping, and re-sorts any newly-inserted ibex/ headers
+# into the angle-bracket project block, since misc-include-cleaner's fixit
+# inserts them quoted (e.g. "ibex/ir/node.hpp").
 #
 # usage: scripts/tidy-fix.sh <files...>
 #
 # Requires build/compile_commands.json (run the normal cmake -B build config
-# first). Only applies fixes for the two checks above — this is not a general
+# first). Only applies fixes for the checks above — this is not a general
 # "run all lints" script; see .clang-tidy for the full check list.
+#
+# misc-const-correctness has a known false-positive pattern: it misses
+# mutations that only happen inside a by-reference lambda capture, or inside
+# an `if constexpr` branch. Both have been hit in this codebase (window.cpp)
+# and would have been compile errors had the fix landed unreviewed. ALWAYS
+# rebuild + run tests after running this script, before committing.
 
 set -euo pipefail
 
@@ -76,7 +84,7 @@ head -n -1 "$REPO_ROOT/.clang-format" > "$STYLE_FILE"  # drop trailing '...'
 echo "QualifierAlignment: Left" >> "$STYLE_FILE"
 echo "..." >> "$STYLE_FILE"
 
-echo "Fixing includes + const-correctness in: $*"
+echo "Fixing includes, const-correctness, and designated initializers in: $*"
 # --header-filter='' restricts *fixes* (not just diagnostics) to the main
 # file being processed — without it, clang-tidy will silently rewrite
 # whatever project headers happen to get transitively included. Deliberately
@@ -85,7 +93,7 @@ echo "Fixing includes + const-correctness in: $*"
 # produces flatly wrong fixits, e.g. suggesting `const` on a variable
 # mutated two lines later, once the AST was built past a #include error).
 "$CLANG_TIDY_BIN" -p "$BUILD_DIR" --header-filter='' \
-    --checks='-*,misc-include-cleaner,misc-const-correctness' \
+    --checks='-*,misc-include-cleaner,misc-const-correctness,modernize-use-designated-initializers' \
     --fix "$@"
 
 for f in "$@"; do
@@ -97,4 +105,5 @@ for f in "$@"; do
     "$CLANG_FORMAT_BIN" -style="file:$STYLE_FILE" -i "$f"
 done
 
-echo "Done. Review the diff — this only applied misc-include-cleaner and misc-const-correctness."
+echo "Done. Review the diff, then REBUILD AND RUN TESTS before committing —"
+echo "misc-const-correctness has real known false positives (see script header)."

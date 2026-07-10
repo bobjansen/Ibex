@@ -1527,42 +1527,78 @@ struct BuiltinDoc {
 };
 
 constexpr BuiltinDoc kBuiltinDocs[] = {
-    {"mean", "mean(col) -> Float64", "Aggregate mean over each group.",
-     "trades[select { avg = mean(price) }, by symbol]"},
-    {"sum", "sum(col) -> same numeric type", "Aggregate sum over each group.",
-     "trades[select { total = sum(price) }, by symbol]"},
-    {"count", "count() -> Int64", "Count rows in the current group.",
-     "trades[select { n = count() }, by symbol]"},
-    {"min", "min(col) -> same type", "Aggregate minimum.", "trades[select { lo = min(price) }]"},
-    {"max", "max(col) -> same type", "Aggregate maximum.", "trades[select { hi = max(price) }]"},
-    {"first", "first(col) -> same type", "First value in group encounter order.",
-     "trades[select { first_px = first(price) }, by symbol]"},
-    {"last", "last(col) -> same type", "Last value in group encounter order.",
-     "trades[select { last_px = last(price) }, by symbol]"},
-    {"median", "median(col) -> Float64", "Aggregate median.",
-     "trades[select { med = median(price) }, by symbol]"},
-    {"std", "std(col) -> Float64", "Sample standard deviation.",
-     "trades[select { vol = std(price) }, by symbol]"},
-    {"quantile", "quantile(col, p) -> Float64", "Linear interpolated aggregate quantile.",
-     "trades[select { p95 = quantile(price, 0.95) }, by symbol]"},
-    {"scalar", "scalar(table, column) -> scalar", "Extract a scalar value from a one-row table.",
-     "scalar(summary, \"avg\")"},
-    {"columns", "columns(table) -> DataFrame", "Return a metadata table of column names.",
-     "let cols = columns(trades);"},
-    {"as_timeframe", "as_timeframe(table, \"timestamp_col\") -> TimeFrame",
-     "Mark a table as time-indexed and sorted by its timestamp/date column.",
-     "let tf = as_timeframe(trades, \"ts\");"},
-    {"lag", "lag(col, n) -> Series<T>", "Value n rows before the current row.",
-     "trades[update { prev = lag(price, 1) }, by symbol]"},
-    {"lead", "lead(col, n) -> Series<T>", "Value n rows after the current row.",
-     "trades[update { next = lead(price, 1) }, by symbol]"},
-    {"rank", "rank(expr, method = dense, ascending = true) -> Series<Int64>",
-     "Row rank, optionally partitioned by surrounding by clause.",
-     "scores[update { r = rank(score, method = dense, ascending = false) }, by dept]"},
-    {"round", "round(value, mode) -> Int64",
-     "Round Float64 using nearest/bankers/floor/ceil/trunc.", "round(2.5, bankers)"},
-    {"print", "print(value) -> value", "Print a human-readable value in scripts and REPL sessions.",
-     "print(trades[select { n = count() }])"},
+    {.name = "mean",
+     .signature = "mean(col) -> Float64",
+     .summary = "Aggregate mean over each group.",
+     .example = "trades[select { avg = mean(price) }, by symbol]"},
+    {.name = "sum",
+     .signature = "sum(col) -> same numeric type",
+     .summary = "Aggregate sum over each group.",
+     .example = "trades[select { total = sum(price) }, by symbol]"},
+    {.name = "count",
+     .signature = "count() -> Int64",
+     .summary = "Count rows in the current group.",
+     .example = "trades[select { n = count() }, by symbol]"},
+    {.name = "min",
+     .signature = "min(col) -> same type",
+     .summary = "Aggregate minimum.",
+     .example = "trades[select { lo = min(price) }]"},
+    {.name = "max",
+     .signature = "max(col) -> same type",
+     .summary = "Aggregate maximum.",
+     .example = "trades[select { hi = max(price) }]"},
+    {.name = "first",
+     .signature = "first(col) -> same type",
+     .summary = "First value in group encounter order.",
+     .example = "trades[select { first_px = first(price) }, by symbol]"},
+    {.name = "last",
+     .signature = "last(col) -> same type",
+     .summary = "Last value in group encounter order.",
+     .example = "trades[select { last_px = last(price) }, by symbol]"},
+    {.name = "median",
+     .signature = "median(col) -> Float64",
+     .summary = "Aggregate median.",
+     .example = "trades[select { med = median(price) }, by symbol]"},
+    {.name = "std",
+     .signature = "std(col) -> Float64",
+     .summary = "Sample standard deviation.",
+     .example = "trades[select { vol = std(price) }, by symbol]"},
+    {.name = "quantile",
+     .signature = "quantile(col, p) -> Float64",
+     .summary = "Linear interpolated aggregate quantile.",
+     .example = "trades[select { p95 = quantile(price, 0.95) }, by symbol]"},
+    {.name = "scalar",
+     .signature = "scalar(table, column) -> scalar",
+     .summary = "Extract a scalar value from a one-row table.",
+     .example = "scalar(summary, \"avg\")"},
+    {.name = "columns",
+     .signature = "columns(table) -> DataFrame",
+     .summary = "Return a metadata table of column names.",
+     .example = "let cols = columns(trades);"},
+    {.name = "as_timeframe",
+     .signature = "as_timeframe(table, \"timestamp_col\") -> TimeFrame",
+     .summary = "Mark a table as time-indexed and sorted by its timestamp/date column.",
+     .example = "let tf = as_timeframe(trades, \"ts\");"},
+    {.name = "lag",
+     .signature = "lag(col, n) -> Series<T>",
+     .summary = "Value n rows before the current row.",
+     .example = "trades[update { prev = lag(price, 1) }, by symbol]"},
+    {.name = "lead",
+     .signature = "lead(col, n) -> Series<T>",
+     .summary = "Value n rows after the current row.",
+     .example = "trades[update { next = lead(price, 1) }, by symbol]"},
+    {.name = "rank",
+     .signature = "rank(expr, method = dense, ascending = true) -> Series<Int64>",
+     .summary = "Row rank, optionally partitioned by surrounding by clause.",
+     .example = "scores[update { r = rank(score, method = dense, ascending = false) }, by dept]"},
+    {.name = "round",
+     .signature = "round(value, mode) -> Int64",
+     .summary = "Round Float64 using nearest/bankers/floor/ceil/trunc.",
+     .example = "round(2.5, bankers)"},
+    {.name = "print",
+     .signature = "print(value) -> value",
+     .summary = "Print a human-readable value in scripts and REPL sessions.",
+     .example = "print(trades[select { n = count() }])"},
 };
 
 auto find_builtin_doc(std::string_view name) -> const BuiltinDoc* {
@@ -3317,7 +3353,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
                      robin_hood::unordered_set<std::string>& loaded_plugins,
                      runtime::ExternRegistry& externs) -> PluginLoadResult {
     if (loaded_plugins.contains(stem)) {
-        return {PluginLoadStatus::Loaded, ""};
+        return {.status = PluginLoadStatus::Loaded, .message = ""};
     }
 #ifdef _WIN32
     std::string filename = stem + ".dll";
@@ -3369,14 +3405,14 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
         fn(&externs);
         loaded_plugins.insert(stem);
         spdlog::debug("loaded plugin: {}", full_path.string());
-        return {PluginLoadStatus::Loaded, ""};
+        return {.status = PluginLoadStatus::Loaded, .message = ""};
     }
     if (!last_candidate.empty()) {
-        return {PluginLoadStatus::LoadError,
-                fmt::format("failed to load '{}': {}", last_candidate,
-                            last_error.empty() ? "unknown error" : last_error)};
+        return {.status = PluginLoadStatus::LoadError,
+                .message = fmt::format("failed to load '{}': {}", last_candidate,
+                                       last_error.empty() ? "unknown error" : last_error)};
     }
-    return {PluginLoadStatus::NotFound, ""};
+    return {.status = PluginLoadStatus::NotFound, .message = ""};
 }
 
 /// Locate <name>.ibex in the plugin search paths and return its contents.

@@ -143,6 +143,8 @@ const std::vector<Guard>& fusion_guards() {
          "Aggregate on group-sorted input must stream, not hash"},
         {"agg_sorted_stream_highcard", "agg_sorted_hash_highcard", 4.0,
          "High-cardinality sorted aggregate must stream, not build a full hash table"},
+        {"agg_firstlast_stream_highcard", "agg_firstlast_hash_highcard", 4.0,
+         "High-cardinality sorted First/Last must stream, not build a full hash table"},
     };
     return guards;
 }
@@ -363,6 +365,17 @@ auto main(int argc, char** argv) -> int {
          "ku = kurtosis(v) }]"},
         {"agg_moments_hash",
          "grouped_sorted[by g, select { g, sd = std(v), sk = skew(v), ku = kurtosis(v) }]"},
+        // First/Last — widened streaming set. Numeric First/Last stream on both
+        // the sorted (group-at-a-time) and hash operators; `_stream` vs `_hash`
+        // isolates the same payoff as the moments cases above: no hash-table
+        // build when the input already arrives sorted on the group key.
+        {"agg_firstlast_stream_1k",
+         "grouped_sorted[order g asc][by g, select { g, fi = first(v), la = last(v) }]"},
+        {"agg_firstlast_hash_1k",
+         "grouped_sorted[by g, select { g, fi = first(v), la = last(v) }]"},
+        {"agg_firstlast_stream_highcard",
+         "sorted[order k asc][by k, select { k, fi = first(v), la = last(v) }]"},
+        {"agg_firstlast_hash_highcard", "sorted[by k, select { k, fi = first(v), la = last(v) }]"},
     };
 
     std::map<std::string, double> mins;

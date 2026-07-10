@@ -185,13 +185,32 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             const ColumnValue& column = *agg_columns[i];
             if (agg.func == ir::AggFunc::First) {
                 if (!slot.has_value) {
-                    slot.first_value = scalar_from_column(column, row);
+                    ScalarValue value = scalar_from_column(column, row);
+                    // append_agg_values_flat reads int_value/double_value for a
+                    // numeric slot.kind (fast, no ScalarValue on the hot path
+                    // elsewhere); keep this row-wise path's slot consistent with
+                    // that contract instead of only writing first_value, which
+                    // finalize would silently ignore for numeric columns.
+                    if (const auto* iv = std::get_if<std::int64_t>(&value)) {
+                        slot.int_value = *iv;
+                    } else if (const auto* dv = std::get_if<double>(&value)) {
+                        slot.double_value = *dv;
+                    } else {
+                        slot.first_value = std::move(value);
+                    }
                 }
                 slot.has_value = true;
                 continue;
             }
             if (agg.func == ir::AggFunc::Last) {
-                slot.last_value = scalar_from_column(column, row);
+                ScalarValue value = scalar_from_column(column, row);
+                if (const auto* iv = std::get_if<std::int64_t>(&value)) {
+                    slot.int_value = *iv;
+                } else if (const auto* dv = std::get_if<double>(&value)) {
+                    slot.double_value = *dv;
+                } else {
+                    slot.last_value = std::move(value);
+                }
                 slot.has_value = true;
                 continue;
             }

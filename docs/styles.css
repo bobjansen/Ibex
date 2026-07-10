@@ -397,6 +397,56 @@ h3 {
   margin: 0;
 }
 
+.getting-started-page .wide-examples,
+.getting-started-page .tour-item {
+  grid-template-columns: 1fr;
+}
+
+.getting-started-page .tour-item {
+  gap: 0.8rem;
+}
+
+.getting-started-page .tour-text {
+  max-width: 88ch;
+}
+
+.getting-started-page .lead,
+.getting-started-page .section-sub {
+  max-width: 88ch;
+}
+
+.page-contents {
+  background: rgba(255, 250, 240, 0.72);
+  border: 1px solid rgba(216, 208, 196, 0.9);
+  border-radius: 16px;
+  padding: 1.2rem;
+}
+
+.contents-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.contents-grid a {
+  display: block;
+  border: 1px solid rgba(10, 127, 121, 0.16);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.66);
+  color: var(--ink);
+  font-size: 0.88rem;
+  font-weight: 600;
+  line-height: 1.35;
+  padding: 0.65rem 0.75rem;
+  text-decoration: none;
+}
+
+.contents-grid a:hover {
+  border-color: rgba(10, 127, 121, 0.35);
+  color: var(--accent);
+}
+
 /* ── Code blocks ─────────────────────────────────────────────────────────── */
 
 pre {
@@ -582,6 +632,10 @@ table.bench {
   }
 
   .bench-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .contents-grid {
     grid-template-columns: 1fr;
   }
 

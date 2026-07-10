@@ -1,5 +1,9 @@
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/repl/repl.hpp>
@@ -9,7 +13,9 @@
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
 
+#include <fmt/base.h>
 #include <fmt/core.h>
+#include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -19,8 +25,17 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
+#include <iterator>
+#include <memory>
+#include <string.h>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -499,14 +514,14 @@ auto should_record_history(std::string_view line) -> bool {
 }
 
 auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
-    std::unique_ptr<char, decltype(&std::free)> raw{::readline(prompt.c_str()), &std::free};
+    const std::unique_ptr<char, decltype(&std::free)> raw{::readline(prompt.c_str()), &std::free};
     if (raw == nullptr) {
         return false;
     }
 
     out.assign(raw.get());
     if (should_record_history(out)) {
-        HIST_ENTRY* previous = history_length > 0 ? ::history_get(history_length) : nullptr;
+        HIST_ENTRY const* previous = history_length > 0 ? ::history_get(history_length) : nullptr;
         if (previous == nullptr || previous->line == nullptr || out != previous->line) {
             ::add_history(raw.get());
         }
@@ -1366,7 +1381,7 @@ auto is_cast_callee(std::string_view callee) -> bool {
 /// Applies a scalar type cast. `callee` must be a cast name (checked by is_cast_callee).
 auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
     -> std::expected<runtime::ScalarValue, std::string> {
-    bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
+    const bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
     if (to_int) {
         if (std::holds_alternative<std::int64_t>(val)) {
             return val;
@@ -1397,14 +1412,14 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
 /// Applies an element-wise column type cast.
 auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
     -> std::expected<runtime::ColumnValue, std::string> {
-    bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
+    const bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
     if (to_int) {
         if (std::holds_alternative<Column<std::int64_t>>(col)) {
             return col;
         }
         if (std::holds_alternative<Column<double>>(col)) {
             const auto& src = std::get<Column<double>>(col);
-            for (double v : src) {
+            for (const double v : src) {
                 if (v != std::trunc(v)) {
                     return std::unexpected(std::string(callee) +
                                            "(): cannot cast non-integer Float column to Int (use "
@@ -1473,7 +1488,7 @@ auto apply_scalar_round(double v, std::string_view mode)
 auto apply_column_round(const Column<double>& src, std::string_view mode) -> Column<std::int64_t> {
     Column<std::int64_t> dst;
     dst.reserve(src.size());
-    for (double v : src) {
+    for (const double v : src) {
         std::int64_t r{};
         if (mode == "nearest") {
             r = static_cast<std::int64_t>(std::llround(v));
@@ -1898,12 +1913,12 @@ bool starts_with_command(std::string_view text, std::string_view command) {
 }
 
 std::string parse_load_path(std::string_view text) {
-    std::string_view view = trim(text);
+    const std::string_view view = trim(text);
     if (view.empty()) {
         return {};
     }
     if (view.front() == '"' || view.front() == '\'') {
-        char quote = view.front();
+        const char quote = view.front();
         auto end = view.find(quote, 1);
         if (end != std::string_view::npos) {
             return std::string(view.substr(1, end - 1));
@@ -2403,13 +2418,15 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             std::holds_alternative<bool>(right.value())) {
             return std::unexpected("boolean arithmetic not supported");
         }
-        bool left_double = std::holds_alternative<double>(left.value());
-        bool right_double = std::holds_alternative<double>(right.value());
+        const bool left_double = std::holds_alternative<double>(left.value());
+        const bool right_double = std::holds_alternative<double>(right.value());
         if (left_double || right_double) {
-            double lhs = left_double ? std::get<double>(left.value())
-                                     : static_cast<double>(std::get<std::int64_t>(left.value()));
-            double rhs = right_double ? std::get<double>(right.value())
-                                      : static_cast<double>(std::get<std::int64_t>(right.value()));
+            const double lhs = left_double
+                                   ? std::get<double>(left.value())
+                                   : static_cast<double>(std::get<std::int64_t>(left.value()));
+            const double rhs = right_double
+                                   ? std::get<double>(right.value())
+                                   : static_cast<double>(std::get<std::int64_t>(right.value()));
             switch (binary->op) {
                 case parser::BinaryOp::Add:
                     return runtime::ScalarValue{lhs + rhs};
@@ -3076,11 +3093,11 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     for (const auto& stmt : fn.body) {
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
-            bool type_is_scalar =
+            const bool type_is_scalar =
                 let_stmt.type.has_value() && let_stmt.type->kind == parser::Type::Kind::Scalar;
-            bool type_is_table = let_stmt.type.has_value() &&
-                                 (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
-                                  let_stmt.type->kind == parser::Type::Kind::TimeFrame);
+            const bool type_is_table = let_stmt.type.has_value() &&
+                                       (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
+                                        let_stmt.type->kind == parser::Type::Kind::TimeFrame);
             if (type_is_scalar) {
                 auto value = eval_scalar_expr(*let_stmt.value, local_tables, local_scalars,
                                               local_columns, local_models, functions,
@@ -3283,7 +3300,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
 
 /// Derive the plugin filename stem from a source_path like "csv.hpp" -> "csv".
 auto plugin_stem(const std::string& source_path) -> std::string {
-    std::filesystem::path p(source_path);
+    const std::filesystem::path p(source_path);
     return p.stem().string();
 }
 
@@ -3305,7 +3322,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
 #ifdef _WIN32
     std::string filename = stem + ".dll";
 #else
-    std::string filename = stem + ".so";
+    const std::string filename = stem + ".so";
 #endif
     std::string last_error;
     std::string last_candidate;
@@ -3366,7 +3383,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
 /// Returns std::nullopt when the file is not found in any search path.
 auto find_library_source(const std::string& name, const std::vector<std::string>& search_paths)
     -> std::optional<std::string> {
-    std::string filename = name + ".ibex";
+    const std::string filename = name + ".ibex";
     for (const auto& dir : search_paths) {
         auto full_path = std::filesystem::path(dir) / filename;
         std::ifstream in{full_path};
@@ -3497,10 +3514,10 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
             if (let_stmt.type.has_value()) {
-                bool expect_scalar = let_stmt.type->kind == parser::Type::Kind::Scalar;
-                bool expect_table = let_stmt.type->kind == parser::Type::Kind::DataFrame ||
-                                    let_stmt.type->kind == parser::Type::Kind::TimeFrame;
-                bool expect_column = let_stmt.type->kind == parser::Type::Kind::Series;
+                const bool expect_scalar = let_stmt.type->kind == parser::Type::Kind::Scalar;
+                const bool expect_table = let_stmt.type->kind == parser::Type::Kind::DataFrame ||
+                                          let_stmt.type->kind == parser::Type::Kind::TimeFrame;
+                const bool expect_column = let_stmt.type->kind == parser::Type::Kind::Series;
                 if (expect_scalar) {
                     auto value =
                         eval_scalar_expr(*let_stmt.value, tables, scalars, columns, models,
@@ -3735,7 +3752,8 @@ auto run_file(const std::string& path, const ReplConfig& config, runtime::Extern
         fmt::print("error: failed to open '{}'\n", path);
         return false;
     }
-    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
     return execute_script(source, registry, config);
 }
 
@@ -4032,7 +4050,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 fmt::print("error: unknown table '{}'\n", name);
                 continue;
             }
-            std::size_t count = parse_optional_size(count_text, 10);
+            const std::size_t count = parse_optional_size(count_text, 10);
             print_table(it->second, count);
             continue;
         }
@@ -4098,7 +4116,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 fmt::print("error: unknown table '{}'\n", name);
                 continue;
             }
-            std::size_t count = parse_optional_size(count_text, 10);
+            const std::size_t count = parse_optional_size(count_text, 10);
             describe_table(it->second, count);
             continue;
         }
@@ -4121,8 +4139,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 report_timing();
                 continue;
             }
-            std::string source((std::istreambuf_iterator<char>(input)),
-                               std::istreambuf_iterator<char>());
+            const std::string source((std::istreambuf_iterator<char>(input)),
+                                     std::istreambuf_iterator<char>());
             auto parsed = parser::parse(source);
             if (!parsed) {
                 fmt::print("error: {}\n", parsed.error().format());

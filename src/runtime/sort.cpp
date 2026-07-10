@@ -3,22 +3,31 @@
 // head/tail selection.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
 #include <limits>
 #include <numeric>
 #include <optional>
 #include <pdqsort.h>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -87,12 +96,12 @@ void radix_sort_by_key(std::vector<std::uint64_t> src_keys, std::vector<Idx>& id
 #if defined(__GNUC__) || defined(__clang__)
             constexpr std::size_t kPrefetchDist = 8;
             if (i + kPrefetchDist < rows) {
-                std::size_t pb = ((*src_k)[i + kPrefetchDist] >> shift) & 0xFFU;
+                const std::size_t pb = ((*src_k)[i + kPrefetchDist] >> shift) & 0xFFU;
                 __builtin_prefetch(&(*dst_k)[cnt[pb]], 1, 1);
                 __builtin_prefetch(&(*dst_i)[cnt[pb]], 1, 1);
             }
 #endif
-            std::size_t bucket = ((*src_k)[i] >> shift) & 0xFFU;
+            const std::size_t bucket = ((*src_k)[i] >> shift) & 0xFFU;
             (*dst_k)[cnt[bucket]] = (*src_k)[i];
             (*dst_i)[cnt[bucket]] = (*src_i)[i];
             ++cnt[bucket];

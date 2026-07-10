@@ -1,4 +1,7 @@
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/pipeline.hpp>
+
+#include <utility>
 
 namespace ibex::runtime {
 

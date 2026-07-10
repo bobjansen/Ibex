@@ -1,8 +1,20 @@
 #include "runtime_internal.hpp"
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
 #include <cctype>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <variant>
+#include <vector>
 
 namespace ibex::runtime {
 

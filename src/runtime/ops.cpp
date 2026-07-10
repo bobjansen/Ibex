@@ -1,13 +1,21 @@
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/table_format.hpp>
 
-#include <fmt/format.h>
-
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <ostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace ibex::ops {
 

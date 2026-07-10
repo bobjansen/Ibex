@@ -4,12 +4,15 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <initializer_list>
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 

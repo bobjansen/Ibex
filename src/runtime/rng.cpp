@@ -1,10 +1,13 @@
 #include <ibex/runtime/rng.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <random>
 #include <thread>
+
+#include "zorro.hpp"
 
 namespace ibex::runtime {
 

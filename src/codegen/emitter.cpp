@@ -1,13 +1,18 @@
 #include <ibex/codegen/emitter.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace ibex::codegen {
 
@@ -16,7 +21,7 @@ namespace {
 auto escape_string(const std::string& s) -> std::string {
     std::string out;
     out.reserve(s.size());
-    for (char c : s) {
+    for (const char c : s) {
         if (c == '"')
             out += "\\\"";
         else if (c == '\\')
@@ -58,11 +63,11 @@ auto format_double(double v) -> std::string {
 auto Emitter::indent_code(const std::string& code, size_t spaces) -> std::string {
     if (spaces <= 0 || code.empty())
         return code;
-    std::string prefix(spaces, ' ');
+    const std::string prefix(spaces, ' ');
     std::string result;
     result.reserve(code.size() + (prefix.size() * 16));
     bool at_start = true;
-    for (char c : code) {
+    for (const char c : code) {
         if (at_start && c != '\n') {
             result += prefix;
             at_start = false;
@@ -149,7 +154,7 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
         out_ = saved_out;
 
         // Re-indent query code by 4 extra spaces so it sits inside the loop body.
-        std::string query_code = indent_code(query_buf.str(), 4);
+        const std::string query_code = indent_code(query_buf.str(), 4);
 
         // Warmup loop
         out << "\n    // Warmup\n";

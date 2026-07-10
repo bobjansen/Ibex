@@ -1,8 +1,19 @@
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <optional>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "model_internal.hpp"
@@ -226,7 +237,7 @@ auto build_model_matrix(const Table& input, const ir::ModelFormula& formula)
                     return std::unexpected(std::move(message));
                 }
                 std::vector<double> v(n);
-                bool ok = std::visit(
+                const bool ok = std::visit(
                     [&](const auto& c) -> bool {
                         using T = std::decay_t<decltype(c)>;
                         if constexpr (std::is_same_v<T, Column<double>>) {
@@ -279,7 +290,7 @@ auto extract_response(const Table& input, const std::string& name)
     }
     const std::size_t n = input.rows();
     std::vector<double> y(n);
-    bool ok = std::visit(
+    const bool ok = std::visit(
         [&](const auto& c) -> bool {
             using T = std::decay_t<decltype(c)>;
             if constexpr (std::is_same_v<T, Column<double>>) {
@@ -390,7 +401,7 @@ auto build_model_result(const std::vector<std::string>& col_names,
     }
 
     double y_mean = 0.0;
-    for (double v : y) {
+    for (const double v : y) {
         y_mean += v;
     }
     y_mean /= static_cast<double>(n);
@@ -504,7 +515,7 @@ auto assemble_plugin_model_result(FittedModel fitted, const std::vector<std::str
         }
         std::vector<double> resid(n, 0.0);
         double y_mean = 0.0;
-        for (double v : y) {
+        for (const double v : y) {
             y_mean += v;
         }
         y_mean /= (n > 0) ? static_cast<double>(n) : 1.0;

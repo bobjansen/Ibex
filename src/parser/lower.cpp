@@ -1,16 +1,32 @@
+#include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/schema.hpp>
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/lower.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
 #include <functional>
+#include <iterator>
 #include <memory>
+#include <optional>
 #include <robin_hood.h>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace ibex::parser {
 
@@ -677,12 +693,12 @@ auto render_alias_template(const std::string& alias_template,
     for (std::size_t i = 0; i < alias_template.size(); ++i) {
         if (alias_template[i] == '$' && i + 1 < alias_template.size() &&
             alias_template[i + 1] == '{') {
-            std::size_t end = alias_template.find('}', i + 2);
+            const std::size_t end = alias_template.find('}', i + 2);
             if (end == std::string::npos) {
                 return std::unexpected(
                     LowerError{.message = "unterminated ${...} in map field alias"});
             }
-            std::string key = alias_template.substr(i + 2, end - (i + 2));
+            const std::string key = alias_template.substr(i + 2, end - (i + 2));
             auto it = env.find(key);
             if (it == env.end()) {
                 return std::unexpected(
@@ -1148,7 +1164,7 @@ class Lowerer {
                                                                  col_def.name +
                                                                  "' elements must be literals"});
                 }
-                int elem_tag = static_cast<int>(lit->value.index());
+                const int elem_tag = static_cast<int>(lit->value.index());
                 // Map LiteralExpr variant index to our type tag:
                 // LiteralExpr::value = variant<int64, double, bool, string, DurationLiteral, Date,
                 // Timestamp> DurationLiteral (index 4) is not a valid column element type.
@@ -1158,7 +1174,7 @@ class Lowerer {
                                               "' duration literals are not valid column elements"});
                 }
                 // Remap: DurationLiteral is index 4, so Date=5→4, Timestamp=6→5
-                int mapped_tag = elem_tag < 4 ? elem_tag : elem_tag - 1;
+                const int mapped_tag = elem_tag < 4 ? elem_tag : elem_tag - 1;
                 if (type_tag == -1) {
                     type_tag = mapped_tag;
                 } else if (type_tag != mapped_tag) {
@@ -2805,7 +2821,7 @@ class Lowerer {
                     }
                     return ir::Expr{.node = std::move(lowered_call)};
                 }
-                std::string alias = make_temp();
+                const std::string alias = make_temp();
                 if (call->callee == "count") {
                     if (!call->args.empty()) {
                         return std::unexpected(LowerError{.message = "count() takes no arguments"});
@@ -3069,7 +3085,7 @@ class Lowerer {
             node = std::move(update);
         }
 
-        bool needs_project = !updates.empty();
+        const bool needs_project = !updates.empty();
         if (needs_project) {
             std::vector<ir::ColumnRef> columns;
             columns.reserve(final_columns.size());

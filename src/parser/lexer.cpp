@@ -1,7 +1,10 @@
 #include <ibex/parser/lexer.hpp>
 
 #include <cctype>
+#include <cstddef>
 #include <robin_hood.h>
+#include <string_view>
+#include <vector>
 
 namespace ibex::parser {
 
@@ -100,7 +103,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         if (at_end()) {
             return '\0';
         }
-        char ch = source[i++];
+        const char ch = source[i++];
         if (ch == '\n') {
             line += 1;
             column = 1;
@@ -120,7 +123,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
 
     const auto skip_whitespace_and_comments = [&]() {
         while (!at_end()) {
-            char ch = peek();
+            const char ch = peek();
             if (ch == ' ' || ch == '\r' || ch == '\t' || ch == '\n') {
                 advance();
                 continue;
@@ -159,16 +162,16 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
             break;
         }
 
-        std::size_t token_start = i;
-        std::size_t token_line = line;
-        std::size_t token_column = column;
-        char ch = advance();
+        const std::size_t token_start = i;
+        const std::size_t token_line = line;
+        const std::size_t token_column = column;
+        const char ch = advance();
 
         if (is_ident_start(static_cast<unsigned char>(ch))) {
             while (is_ident_cont(static_cast<unsigned char>(peek()))) {
                 advance();
             }
-            std::string_view text = source.substr(token_start, i - token_start);
+            const std::string_view text = source.substr(token_start, i - token_start);
             if (text == "true" || text == "false") {
                 add_token(TokenKind::BoolLiteral, token_start, i - token_start, token_line,
                           token_column);
@@ -206,13 +209,13 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
             }
 
             if (!is_float) {
-                std::size_t unit_start = i;
+                const std::size_t unit_start = i;
                 if (is_ident_start(static_cast<unsigned char>(peek()))) {
                     while (is_ident_cont(static_cast<unsigned char>(peek()))) {
                         advance();
                     }
                 }
-                std::string_view unit = source.substr(unit_start, i - unit_start);
+                const std::string_view unit = source.substr(unit_start, i - unit_start);
                 if (!unit.empty() && is_duration_unit(unit)) {
                     add_token(TokenKind::DurationLiteral, token_start, i - token_start, token_line,
                               token_column);

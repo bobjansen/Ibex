@@ -6277,10 +6277,11 @@ TEST_CASE("filter on string column", "[filter][types]") {
     REQUIRE(col[1] == "Charlie");
 }
 
-TEST_CASE("filter by bare column reference returns not-a-boolean-expression error",
-          "[filter][types]") {
-    // Exercises compute_mask<FilterColumn> (the else branch - bare column reference
-    // is not a boolean predicate; interpreter returns an error).
+TEST_CASE("filter by bare boolean column reference keeps true rows", "[filter][types]") {
+    // Exercises compute_mask<FilterColumn>'s fallback branch: a bare column
+    // reference to a Bool column is a valid predicate (e.g. `filter is_active`,
+    // analogous to SQL `WHERE is_active`), not just structurally boolean nodes
+    // (compare/logical/is-null).
     runtime::Table table;
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
     table.add_column("is_active", Column<bool>{true, false, true});
@@ -6289,6 +6290,26 @@ TEST_CASE("filter by bare column reference returns not-a-boolean-expression erro
     registry.emplace("t", table);
 
     auto ir = require_ir("t[filter is_active];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& col = std::get<Column<std::int64_t>>(*result->find("val"));
+    REQUIRE(col[0] == 10);
+    REQUIRE(col[1] == 30);
+}
+
+TEST_CASE("filter on non-boolean column still returns not-a-boolean-expression error",
+          "[filter][types]") {
+    // Exercises compute_mask<FilterColumn>'s fallback branch: a bare non-Bool
+    // column reference is still rejected.
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[filter val];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("not a boolean expression") != std::string::npos);

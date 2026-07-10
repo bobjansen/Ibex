@@ -4,7 +4,10 @@
 // and the RNG/rep column generators.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/rng.hpp>
@@ -19,11 +22,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
 #include <optional>
 #include <random>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -104,7 +111,7 @@ auto eval_date_part(std::string_view name, const ExprValue& v)
         if (!date_ok) {
             return std::unexpected(std::string(name) + ": argument must be Timestamp");
         }
-        year_month_day ymd{sys_days{days{dv->days}}};
+        const year_month_day ymd{sys_days{days{dv->days}}};
         if (name == "year") {
             return ExprValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
         }
@@ -114,10 +121,10 @@ auto eval_date_part(std::string_view name, const ExprValue& v)
         return ExprValue{static_cast<std::int64_t>(static_cast<unsigned>(ymd.day()))};
     }
     if (const auto* tv = std::get_if<Timestamp>(&v)) {
-        sys_time<nanoseconds> tp{nanoseconds{tv->nanos}};
+        const sys_time<nanoseconds> tp{nanoseconds{tv->nanos}};
         auto day_pt = floor<days>(tp);
-        year_month_day ymd{day_pt};
-        hh_mm_ss<nanoseconds> hms{tp - day_pt};
+        const year_month_day ymd{day_pt};
+        const hh_mm_ss<nanoseconds> hms{tp - day_pt};
         if (name == "year") {
             return ExprValue{static_cast<std::int64_t>(static_cast<int>(ymd.year()))};
         }
@@ -844,12 +851,12 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             }
             return std::get<double>(v);
         };
-        bool want_double = bin->op == ir::ArithmeticOp::Div ||
-                           std::holds_alternative<double>(left.value()) ||
-                           std::holds_alternative<double>(right.value());
+        const bool want_double = bin->op == ir::ArithmeticOp::Div ||
+                                 std::holds_alternative<double>(left.value()) ||
+                                 std::holds_alternative<double>(right.value());
         if (want_double) {
-            double lhs = to_double(left.value());
-            double rhs = to_double(right.value());
+            const double lhs = to_double(left.value());
+            const double rhs = to_double(right.value());
             switch (bin->op) {
                 case ir::ArithmeticOp::Add:
                     return lhs + rhs;
@@ -953,7 +960,7 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
 auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* scalars,
                                   const ExternRegistry* externs)
     -> std::expected<std::size_t, std::string> {
-    Table empty;
+    const Table empty;
     auto value = eval_expr(expr, empty, 0, scalars, externs);
     if (!value) {
         return std::unexpected("row count expression: " + value.error());
@@ -1137,7 +1144,7 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
     if (!col_ref) {
         return std::unexpected(fname + ": first argument must be a column name");
     }
-    Table empty;
+    const Table empty;
     auto offset_value = eval_expr(*call.args[1], empty, 0, scalars, externs);
     if (!offset_value) {
         return std::unexpected(fname + ": " + offset_value.error());
@@ -1350,12 +1357,12 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
                     "fill_null: fill value type does not match column type for '" + col_ref->name +
                     "'");
             }
-            T fill_val = *maybe_fill;
+            const T fill_val = *maybe_fill;
 
             ColT result;
             result.reserve(rows);
             for (std::size_t i = 0; i < rows; ++i) {
-                bool is_null_row = has_validity && !(*entry->validity)[i];
+                const bool is_null_row = has_validity && !(*entry->validity)[i];
                 result.push_back(is_null_row ? fill_val : col[i]);
             }
             // All rows are now valid (nulls replaced).
@@ -1458,7 +1465,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
             bool have_val = false;
             T next_val{};
             for (std::size_t ri = 0; ri < rows; ++ri) {
-                std::size_t i = rows - 1 - ri;
+                const std::size_t i = rows - 1 - ri;
                 if (validity[i]) {
                     vals[i] = col[i];
                     next_val = col[i];
@@ -1985,9 +1992,9 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
                     ColT result;
                     result.reserve(out_len);
                     for (std::size_t i = 0; i < out_len; ++i) {
-                        std::size_t pos_in_pattern = pattern_len > 0 ? (i % pattern_len) : 0;
-                        std::size_t pos_in_each_seq = pos_in_pattern % (arr_len * n_each);
-                        std::size_t src_idx = pos_in_each_seq / n_each;
+                        const std::size_t pos_in_pattern = pattern_len > 0 ? (i % pattern_len) : 0;
+                        const std::size_t pos_in_each_seq = pos_in_pattern % (arr_len * n_each);
+                        const std::size_t src_idx = pos_in_each_seq / n_each;
                         if constexpr (std::is_same_v<T, std::string>) {
                             result.push_back(std::string_view{elements[src_idx]});
                         } else {
@@ -2011,21 +2018,21 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
         return std::visit(
             [&](const auto& col) -> ColumnValue {
                 using ColT = std::decay_t<decltype(col)>;
-                std::size_t src_len = col.size();
+                const std::size_t src_len = col.size();
                 if (src_len == 0) {
                     return ColT{};
                 }
                 // pattern_len = src_len * each * times (the logical full sequence)
-                std::size_t pattern_len = src_len * n_each * n_times;
+                const std::size_t pattern_len = src_len * n_each * n_times;
                 ColT result;
                 result.reserve(out_len);
                 for (std::size_t i = 0; i < out_len; ++i) {
                     // Position within the repeating pattern (cycled via %)
-                    std::size_t pos_in_pattern = pattern_len > 0 ? (i % pattern_len) : 0;
+                    const std::size_t pos_in_pattern = pattern_len > 0 ? (i % pattern_len) : 0;
                     // Within one "times" cycle: position in (each-repeated sequence)
-                    std::size_t pos_in_each_seq = pos_in_pattern % (src_len * n_each);
+                    const std::size_t pos_in_each_seq = pos_in_pattern % (src_len * n_each);
                     // Index into original column
-                    std::size_t src_idx = pos_in_each_seq / n_each;
+                    const std::size_t src_idx = pos_in_each_seq / n_each;
                     result.push_back(col[src_idx]);
                 }
                 return result;

@@ -1,12 +1,20 @@
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
+#include <ibex/parser/parser.hpp>
 
 #include <fmt/core.h>
+#include <fmt/format.h>
 
+#include <cstddef>
+#include <expected>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace ibex::parser {
 

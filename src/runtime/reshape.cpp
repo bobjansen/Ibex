@@ -1,8 +1,19 @@
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <expected>
+#include <limits>
+#include <optional>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -32,7 +43,7 @@ auto extract_numeric(const Table& input)
     for (const auto& entry : input.columns) {
         std::vector<double> col;
         col.reserve(rows);
-        bool ok = std::visit(
+        const bool ok = std::visit(
             [&](const auto& c) -> bool {
                 using T = std::decay_t<decltype(c)>;
                 if constexpr (std::is_same_v<T, Column<double>>) {
@@ -226,8 +237,8 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
         return std::unexpected("transpose: no data columns to transpose");
     }
 
-    std::size_t first_type = input.columns[data_idxs[0]].column->index();
-    for (std::size_t idx : data_idxs) {
+    const std::size_t first_type = input.columns[data_idxs[0]].column->index();
+    for (const std::size_t idx : data_idxs) {
         if (input.columns[idx].column->index() != first_type) {
             return std::unexpected(
                 "transpose: all data columns must have the same type (found mixed types)");
@@ -268,7 +279,7 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
 
     Table out;
     Column<std::string> row_labels;
-    for (std::size_t i : data_idxs) {
+    for (const std::size_t i : data_idxs) {
         row_labels.push_back(input.columns[i].name);
     }
     out.add_column("column", std::move(row_labels));
@@ -281,7 +292,7 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
                               std::is_same_v<ColT, Column<Categorical>>) {
                     Column<std::string> out_col;
                     out_col.reserve(n_data_cols);
-                    for (std::size_t ci : data_idxs) {
+                    for (const std::size_t ci : data_idxs) {
                         const auto& src = std::get<ColT>(*input.columns[ci].column);
                         out_col.push_back(src[r]);
                     }
@@ -290,7 +301,7 @@ auto transpose_table(const Table& input) -> std::expected<Table, std::string> {
                     using ElemT = ColT::value_type;
                     Column<ElemT> out_col;
                     out_col.reserve(n_data_cols);
-                    for (std::size_t ci : data_idxs) {
+                    for (const std::size_t ci : data_idxs) {
                         const auto& src = std::get<ColT>(*input.columns[ci].column);
                         out_col.push_back(src[r]);
                     }
@@ -555,7 +566,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
         id_indices.push_back(it->second);
     }
 
-    robin_hood::unordered_set<std::string> id_set(id_columns.begin(), id_columns.end());
+    const robin_hood::unordered_set<std::string> id_set(id_columns.begin(), id_columns.end());
     std::vector<std::size_t> measure_indices;
     std::vector<std::string> measure_names;
     if (measure_columns.empty()) {
@@ -583,7 +594,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
         return std::unexpected("melt: no measure columns to melt");
     }
 
-    std::size_t first_type = input.columns[measure_indices[0]].column->index();
+    const std::size_t first_type = input.columns[measure_indices[0]].column->index();
     for (std::size_t i = 1; i < measure_indices.size(); ++i) {
         if (input.columns[measure_indices[i]].column->index() != first_type) {
             return std::unexpected("melt: all measure columns must have the same type");
@@ -596,7 +607,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
 
     Table output;
 
-    for (std::size_t id_idx : id_indices) {
+    for (const std::size_t id_idx : id_indices) {
         const auto& entry = input.columns[id_idx];
         auto col = std::visit(
             [&](const auto& src_col) -> ColumnValue {
@@ -810,7 +821,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
             ValidityBitmap validity;
             validity.reserve(out_rows);
             for (std::size_t r = 0; r < rows; ++r) {
-                bool valid = (*entry.validity)[r];
+                const bool valid = (*entry.validity)[r];
                 for (std::size_t m = 0; m < n_measures; ++m) {
                     validity.push_back(valid);
                 }
@@ -1070,8 +1081,8 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     }
 
     std::size_t pivot_idx = pivot_it->second;
-    std::size_t value_idx = value_it->second;
-    std::size_t rows = input.rows();
+    const std::size_t value_idx = value_it->second;
+    const std::size_t rows = input.rows();
 
     std::vector<std::string> pivot_values;
     const auto& pivot_col = *input.columns[pivot_idx].column;
@@ -1144,7 +1155,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 
     if (pivot_values.empty()) {
         Table output;
-        for (std::size_t ki : key_indices) {
+        for (const std::size_t ki : key_indices) {
             const auto& entry = input.columns[ki];
             output.add_column(entry.name, *entry.column);
             if (entry.validity.has_value()) {
@@ -1154,7 +1165,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         return output;
     }
 
-    std::size_t n_pivots = pivot_values.size();
+    const std::size_t n_pivots = pivot_values.size();
 
     constexpr std::int64_t kNullKey = std::numeric_limits<std::int64_t>::min();
     const std::size_t n_keys = key_indices.size();
@@ -1358,7 +1369,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     Table output;
 
     for (std::size_t k = 0; k < row_keys.size(); ++k) {
-        std::size_t ki = key_indices[k];
+        const std::size_t ki = key_indices[k];
         const auto& entry = input.columns[ki];
         auto col = make_empty_like(*entry.column);
         std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
@@ -1376,11 +1387,11 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         bool has_nulls = false;
 
         for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
-            std::size_t cell_key = (or_idx * n_pivots) + pi;
+            const std::size_t cell_key = (or_idx * n_pivots) + pi;
             const std::size_t input_row = cell_rows[cell_key];
             if (input_row != kMissingCell) {
                 append_value(col, *value_entry.column, input_row);
-                bool val_null = is_null(value_entry, input_row);
+                const bool val_null = is_null(value_entry, input_row);
                 validity.set(or_idx, !val_null);
                 if (val_null) {
                     has_nulls = true;

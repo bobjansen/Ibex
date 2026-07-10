@@ -3,20 +3,27 @@
 // and the broadcast (update+by mixed aggregate) path.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
 #include <limits>
 #include <optional>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -231,9 +238,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     x = std::get<double>(scalar_from_column(column, row));
                 }
                 slot.count += 1;
-                double delta = x - slot.double_value;
+                const double delta = x - slot.double_value;
                 slot.double_value += delta / static_cast<double>(slot.count);
-                double delta2 = x - slot.double_value;
+                const double delta2 = x - slot.double_value;
                 slot.m2 += delta * delta2;
                 continue;
             }
@@ -913,7 +920,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             std::vector<std::size_t> offsets(n_groups + 1);
             std::vector<std::size_t> cursor(n_groups);
             std::vector<double> buf;
-            for (std::size_t ai : collect_aggs) {
+            for (const std::size_t ai : collect_aggs) {
                 const ColumnValue& col = *agg_columns[ai];
                 const ValidityBitmap* vb = agg_validity[ai];
                 std::ranges::fill(offsets, std::size_t{0});
@@ -978,12 +985,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     } else if (f == ir::AggFunc::Skew) {
                         if (n >= 3) {
                             double mean = 0.0;
-                            for (double* it = lo; it != hi; ++it)
+                            for (const double* it = lo; it != hi; ++it)
                                 mean += *it;
                             mean /= static_cast<double>(n);
                             double m2 = 0.0;
                             double m3 = 0.0;
-                            for (double* it = lo; it != hi; ++it) {
+                            for (const double* it = lo; it != hi; ++it) {
                                 const double d = *it - mean;
                                 m2 += d * d;
                                 m3 += d * d * d;
@@ -997,12 +1004,12 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     } else {  // Kurtosis
                         if (n >= 4) {
                             double mean = 0.0;
-                            for (double* it = lo; it != hi; ++it)
+                            for (const double* it = lo; it != hi; ++it)
                                 mean += *it;
                             mean /= static_cast<double>(n);
                             double m2 = 0.0;
                             double m4 = 0.0;
-                            for (double* it = lo; it != hi; ++it) {
+                            for (const double* it = lo; it != hi; ++it) {
                                 const double d = *it - mean;
                                 const double d2 = d * d;
                                 m2 += d2;
@@ -1149,7 +1156,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     out_cat.push_code(code);
                 }
             } else {
-                for (int i : order) {
+                for (const int i : order) {
                     auto* column = output->find(group_by.front().name);
                     if (column == nullptr) {
                         return std::unexpected("missing group-by column in output");
@@ -1269,7 +1276,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             std::vector<AggSlot> flat_slots_dbl;
             flat_slots_dbl.reserve(rows * (n_aggs_dbl == 0 ? 1 : n_aggs_dbl));
             for (std::size_t row = 0; row < rows; ++row) {
-                double key = col[row];
+                const double key = col[row];
                 auto it = index.find(key);
                 std::size_t slot_index = 0;
                 if (it == index.end()) {
@@ -1340,7 +1347,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 std::string_view prev_key;
                 std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
                 for (std::size_t row = 0; row < rows; ++row) {
-                    std::string_view key{src_chars + src_off[row], src_off[row + 1] - src_off[row]};
+                    const std::string_view key{src_chars + src_off[row],
+                                               src_off[row + 1] - src_off[row]};
                     std::uint32_t gid{};
                     if (key == prev_key) {
                         gid = prev_gid;
@@ -1375,8 +1383,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 if (column == nullptr) {
                     return std::unexpected("missing group-by column in output");
                 }
-                std::string_view key_sv{dict_chars.data() + dict_offsets[g],
-                                        dict_offsets[g + 1] - dict_offsets[g]};
+                const std::string_view key_sv{dict_chars.data() + dict_offsets[g],
+                                              dict_offsets[g + 1] - dict_offsets[g]};
                 if (auto* str_col = std::get_if<Column<std::string>>(column)) {
                     str_col->push_back(key_sv);
                 } else {
@@ -1453,7 +1461,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     std::string_view prev_key;
                     std::uint32_t prev_code = std::numeric_limits<std::uint32_t>::max();
                     for (std::size_t row = 0; row < rows; ++row) {
-                        std::string_view key{col[row]};
+                        const std::string_view key{col[row]};
                         std::uint32_t code{};
                         if (key == prev_key) {
                             code = prev_code;
@@ -1896,8 +1904,8 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
                 if (!rhs) {
                     return std::unexpected(rhs.error());
                 }
-                ColumnValue lhs_col = broadcast_scalar_column(*lhs, 1);
-                ColumnValue rhs_col = broadcast_scalar_column(*rhs, 1);
+                const ColumnValue lhs_col = broadcast_scalar_column(*lhs, 1);
+                const ColumnValue rhs_col = broadcast_scalar_column(*rhs, 1);
                 auto result = arith_vec(node.op, lhs_col, rhs_col, 1);
                 if (!result) {
                     return std::unexpected(result.error());

@@ -1,16 +1,23 @@
 // Arrow C Data Interface requires C-style arrays for ABI compatibility.
 // NOLINTBEGIN(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::interop {

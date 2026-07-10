@@ -1,17 +1,26 @@
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/lexer.hpp>
 #include <ibex/parser/parser.hpp>
 
 #include <fmt/core.h>
+#include <fmt/format.h>
 
+#include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
+#include <system_error>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace ibex::parser {
 
@@ -263,7 +272,7 @@ class Parser {
         if (!consume(TokenKind::Identifier, "expected effect name")) {
             return std::nullopt;
         }
-        std::string effect_name{previous().lexeme};
+        const std::string effect_name{previous().lexeme};
         auto kind = effect_kind_from_name(effect_name);
         if (!kind.has_value()) {
             error_ = make_error(previous(), "unknown effect kind '" + effect_name + "'");
@@ -386,7 +395,7 @@ class Parser {
 
     auto parse_let_stmt() -> std::optional<Stmt> {
         const std::size_t start_line = previous().line;
-        bool is_mut = match(TokenKind::KeywordMut);
+        const bool is_mut = match(TokenKind::KeywordMut);
 
         // Tuple destructuring: let (a, b, ...) = expr;
         if (match(TokenKind::LParen)) {
@@ -845,7 +854,7 @@ class Parser {
             if ((name == "date" || name == "timestamp" || name == "ts") &&
                 check(TokenKind::StringLiteral)) {
                 advance();
-                std::string literal = unescape_string(previous().lexeme);
+                const std::string literal = unescape_string(previous().lexeme);
                 if (name == "date") {
                     auto value = parse_date_literal(literal);
                     if (!value.has_value()) {
@@ -964,7 +973,7 @@ class Parser {
             return make_literal(*value);
         }
         if (match(TokenKind::BoolLiteral)) {
-            bool value = previous().lexeme == "true";
+            const bool value = previous().lexeme == "true";
             return make_literal(value);
         }
         if (match(TokenKind::StringLiteral)) {
@@ -2074,7 +2083,7 @@ class Parser {
     }
 
     static auto parse_double(std::string_view text) -> std::optional<double> {
-        std::string tmp(text);
+        const std::string tmp(text);
         char* end = nullptr;
         double value = std::strtod(tmp.c_str(), &end);
         if (end == tmp.c_str()) {
@@ -2090,9 +2099,9 @@ class Parser {
         std::string result;
         result.reserve(text.size() - 2);
         for (std::size_t idx = 1; idx + 1 < text.size(); ++idx) {
-            char ch = text[idx];
+            const char ch = text[idx];
             if (ch == '\\' && idx + 1 < text.size() - 1) {
-                char next = text[idx + 1];
+                const char next = text[idx + 1];
                 switch (next) {
                     case 'n':
                         result.push_back('\n');
@@ -2131,9 +2140,9 @@ class Parser {
         std::string result;
         result.reserve(text.size() - 2);
         for (std::size_t idx = 1; idx + 1 < text.size(); ++idx) {
-            char ch = text[idx];
+            const char ch = text[idx];
             if (ch == '\\' && idx + 1 < text.size() - 1) {
-                char next = text[idx + 1];
+                const char next = text[idx + 1];
                 switch (next) {
                     case '`':
                         result.push_back('`');
@@ -2257,13 +2266,13 @@ class Parser {
             return std::nullopt;
         }
         using namespace std::chrono;
-        year_month_day ymd{std::chrono::year{*year},
-                           std::chrono::month{static_cast<unsigned>(*month)},
-                           std::chrono::day{static_cast<unsigned>(*day)}};
+        const year_month_day ymd{std::chrono::year{*year},
+                                 std::chrono::month{static_cast<unsigned>(*month)},
+                                 std::chrono::day{static_cast<unsigned>(*day)}};
         if (!ymd.ok()) {
             return std::nullopt;
         }
-        sys_days days_since = sys_days{ymd};
+        const sys_days days_since = sys_days{ymd};
         auto days = days_since.time_since_epoch().count();
         if (days < std::numeric_limits<std::int32_t>::min() ||
             days > std::numeric_limits<std::int32_t>::max()) {
@@ -2301,11 +2310,11 @@ class Parser {
         std::int64_t nanos = 0;
         if (pos < text.size() && text[pos] == '.') {
             pos += 1;
-            std::size_t start = pos;
+            const std::size_t start = pos;
             while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos])) != 0) {
                 pos += 1;
             }
-            std::size_t digits = pos - start;
+            const std::size_t digits = pos - start;
             if (digits == 0 || digits > 9) {
                 return std::nullopt;
             }
@@ -2326,13 +2335,13 @@ class Parser {
             return std::nullopt;
         }
         using namespace std::chrono;
-        year_month_day ymd{std::chrono::year{*year},
-                           std::chrono::month{static_cast<unsigned>(*month)},
-                           std::chrono::day{static_cast<unsigned>(*day)}};
+        const year_month_day ymd{std::chrono::year{*year},
+                                 std::chrono::month{static_cast<unsigned>(*month)},
+                                 std::chrono::day{static_cast<unsigned>(*day)}};
         if (!ymd.ok()) {
             return std::nullopt;
         }
-        sys_days day_point{ymd};
+        const sys_days day_point{ymd};
 
         constexpr std::int64_t kNanosPerSecond = 1'000'000'000;
         constexpr std::int64_t kNanosPerDay = 86'400 * kNanosPerSecond;

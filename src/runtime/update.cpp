@@ -3,24 +3,33 @@
 // grouped, windowed, and guarded update paths.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
-#include <ibex/runtime/rng.hpp>  // zorro libmvec extern decls for the SIMD transcendental fast path
 #include <ibex/runtime/safe_arith.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
 #include <optional>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
+
+#include "zorro.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
@@ -64,7 +73,7 @@ auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const Scalar
         return std::nullopt;
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        ScalarValue value = scalar_from_literal(*lit);
+        const ScalarValue value = scalar_from_literal(*lit);
         return FastOperand{
             .is_column = false,
             .column = nullptr,
@@ -224,7 +233,7 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
 
     if (output_kind == ExprType::Double) {
         if (!left->is_column && !right->is_column) {
-            double value =
+            const double value =
                 apply_double_op(bin->op, get_double_value(*left, 0), get_double_value(*right, 0));
             Column<double> out;
             out.assign(rows, value);
@@ -239,11 +248,11 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
         const double* rp = (right->is_column && right->kind == ExprType::Double)
                                ? std::get<Column<double>>(*right->column).data()
                                : nullptr;
-        double ls = left->is_column ? 0.0 : get_double_value(*left, 0);
-        double rs = right->is_column ? 0.0 : get_double_value(*right, 0);
+        const double ls = left->is_column ? 0.0 : get_double_value(*left, 0);
+        const double rs = right->is_column ? 0.0 : get_double_value(*right, 0);
         // Only take the SIMD path when every used operand resolved to a raw pointer.
-        bool left_ok = !left->is_column || lp != nullptr;
-        bool right_ok = !right->is_column || rp != nullptr;
+        const bool left_ok = !left->is_column || lp != nullptr;
+        const bool right_ok = !right->is_column || rp != nullptr;
         if (left_ok && right_ok) {
             // Dispatch on op once, outside the loop, so each kernel is branch-free.
             switch (bin->op) {
@@ -288,8 +297,8 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
                                      : nullptr;
         std::int64_t ls = left->is_column ? 0 : get_int_value(*left, 0);
         std::int64_t rs = right->is_column ? 0 : get_int_value(*right, 0);
-        bool left_ok = !left->is_column || lp != nullptr;
-        bool right_ok = !right->is_column || rp != nullptr;
+        const bool left_ok = !left->is_column || lp != nullptr;
+        const bool right_ok = !right->is_column || rp != nullptr;
         if (left_ok && right_ok) {
             switch (bin->op) {
                 case ir::ArithmeticOp::Add:
@@ -872,8 +881,8 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
             // v = nextafter(0.5, 0)). For |v| >= 2^52 v is already integral, frac
             // is 0, and the result is v — matching llround.
             run([](double v) {
-                double t = std::trunc(v);
-                double frac = v - t;
+                const double t = std::trunc(v);
+                const double frac = v - t;
                 return static_cast<std::int64_t>(std::fabs(frac) >= 0.5 ? t + std::copysign(1.0, v)
                                                                         : t);
             });
@@ -1005,7 +1014,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                            ir::Duration duration, const ScalarRegistry* scalars,
                            const ExternRegistry* externs) -> std::expected<Table, std::string> {
     Table output = std::move(input);
-    std::size_t rows = output.rows();
+    const std::size_t rows = output.rows();
     if (!output.time_index.has_value()) {
         return std::unexpected("window: requires a TimeFrame");
     }

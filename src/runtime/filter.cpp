@@ -4,7 +4,10 @@
 // filter_table / filter+project / filter+limit entry points.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 
@@ -16,9 +19,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
+#include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -450,13 +458,13 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                 return result;
             }
             if (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne) {
-                uint8_t v = (op == ir::CompareOp::Ne) ? 1 : 0;
+                const uint8_t v = (op == ir::CompareOp::Ne) ? 1 : 0;
                 std::fill(mp, mp + n, v);
                 result.apply_validity(validity, n);
                 return result;
             }
             for (std::size_t i = 0; i < n; ++i) {
-                std::string_view cv = (*cat_col)[i];
+                const std::string_view cv = (*cat_col)[i];
                 switch (op) {
                     case ir::CompareOp::Lt:
                         mp[i] = cv < *s;
@@ -1793,13 +1801,13 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                     for (std::size_t i = 0; i < n; ++i) {
                         if (is_and) {
                             // definitively false if either side is a known false
-                            uint8_t a_false = lval[i] & (1U - lp[i]);
-                            uint8_t b_false = rval[i] & (1U - rp[i]);
+                            const uint8_t a_false = lval[i] & (1U - lp[i]);
+                            const uint8_t b_false = rval[i] & (1U - rp[i]);
                             (*left->valid)[i] = (lval[i] & rval[i]) | a_false | b_false;
                         } else {
                             // definitively true if either side is a known true
-                            uint8_t a_true = lval[i] & lp[i];
-                            uint8_t b_true = rval[i] & rp[i];
+                            const uint8_t a_true = lval[i] & lp[i];
+                            const uint8_t b_true = rval[i] & rp[i];
                             (*left->valid)[i] = (lval[i] & rval[i]) | a_true | b_true;
                         }
                     }
@@ -1957,7 +1965,7 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                     uint32_t cur = 0;
                     std::size_t j = 0;
                     for_each_selected([&](std::size_t si) {
-                        uint32_t len = src_off[si + 1] - src_off[si];
+                        const uint32_t len = src_off[si + 1] - src_off[si];
                         std::memcpy(dst_char + cur, src_char + src_off[si], len);
                         cur += len;
                         dst_off[++j] = cur;

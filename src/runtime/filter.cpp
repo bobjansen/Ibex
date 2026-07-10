@@ -1834,8 +1834,24 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 }
                 return std::unexpected("filter: 'is null' operand must be a column reference");
             } else {
-                // ColumnRef, Literal, BinaryExpr, CallExpr, RankExpr — not boolean
-                return std::unexpected("filter: not a boolean expression");
+                // ColumnRef, Literal, BinaryExpr, CallExpr, RankExpr are not
+                // structurally boolean (compare/logical/is-null), but may still
+                // evaluate to a Bool-typed column — e.g. a bare boolean column
+                // reference (`filter is_manual`) or a Bool-returning scalar
+                // builtin (`filter is_nan(x)`). Evaluate and check the result
+                // type before giving up.
+                auto val = eval_value_vec(expr, table, scalars, n);
+                if (!val)
+                    return std::unexpected(val.error());
+                const auto* bcol = std::get_if<Column<bool>>(&deref_col(*val));
+                if (bcol == nullptr)
+                    return std::unexpected("filter: not a boolean expression");
+                Mask m;
+                m.value.resize(n);
+                for (std::size_t i = 0; i < n; ++i)
+                    m.value[i] = static_cast<uint8_t>((*bcol)[i]);
+                m.apply_validity(val->get_validity(), n);
+                return m;
             }
         },
         expr.node);

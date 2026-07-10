@@ -112,7 +112,7 @@ struct KeyHash {
             seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
         };
         for (const auto& value : key.values) {
-            std::size_t h = std::visit(
+            const std::size_t h = std::visit(
                 [](const auto& v) { return std::hash<std::decay_t<decltype(v)>>{}(v); }, value);
             hash_combine(h);
         }

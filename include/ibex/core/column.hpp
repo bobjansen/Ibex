@@ -596,13 +596,13 @@ class Column<bool> {
 
     Column(const std::vector<bool>& bools) {
         reserve(bools.size());
-        for (bool v : bools)
+        for (const bool v : bools)
             push_back(v);
     }
 
     Column(std::initializer_list<bool> init) {
         reserve(init.size());
-        for (bool v : init)
+        for (const bool v : init)
             push_back(v);
     }
 
@@ -620,7 +620,7 @@ class Column<bool> {
     auto operator=(const std::vector<bool>& bools) -> Column& {
         clear();
         reserve(bools.size());
-        for (bool v : bools)
+        for (const bool v : bools)
             push_back(v);
         return *this;
     }

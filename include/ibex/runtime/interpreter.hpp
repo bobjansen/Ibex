@@ -82,14 +82,14 @@ class ValidityBitmap {
 
     ValidityBitmap(const std::vector<bool>& values) {
         reserve(values.size());
-        for (bool v : values) {
+        for (const bool v : values) {
             push_back(v);
         }
     }
 
     ValidityBitmap(std::initializer_list<bool> init) {
         reserve(init.size());
-        for (bool v : init) {
+        for (const bool v : init) {
             push_back(v);
         }
     }

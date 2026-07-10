@@ -2,26 +2,35 @@
 // rank evaluation, extern-call execution, and build_operator plan construction.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <expected>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <pdqsort.h>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -87,7 +96,7 @@ class ChunkedFilterOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 return std::optional<Chunk>{};
             }
-            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto filtered = filter_table(t, *predicate_, scalars_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
@@ -121,7 +130,7 @@ class ChunkedProjectOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        Table t = chunk_to_table(std::move(*chunk_res.value()));
+        const Table t = chunk_to_table(std::move(*chunk_res.value()));
         auto projected = project_table(t, *columns_);
         if (!projected.has_value()) {
             return std::unexpected(std::move(projected.error()));
@@ -154,7 +163,7 @@ class ChunkedFilterProjectOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 return std::optional<Chunk>{};
             }
-            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto out = filter_project_table(t, *predicate_, *columns_, scalars_);
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
@@ -204,7 +213,7 @@ class ChunkedFilterHeadOperator final : public Operator {
                 done_ = true;
                 return std::optional<Chunk>{};
             }
-            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto out = filter_table_limit(t, *predicate_, remaining_, scalars_);
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
@@ -256,7 +265,7 @@ class ChunkedFilterTailOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 break;
             }
-            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto filtered = filter_table(t, *predicate_, scalars_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
@@ -388,7 +397,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 return std::optional<Chunk>{};
             }
-            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto filtered = filter_project_table(t, *predicate_, gather_columns_, scalars_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
@@ -518,8 +527,8 @@ class ChunkedHeadOperator final : public Operator {
             Chunk chunk = std::move(*chunk_res.value());
             if (count_ == 0) {
                 done_ = true;
-                Table t = chunk_to_table(std::move(chunk));
-                std::vector<std::size_t> idx;
+                const Table t = chunk_to_table(std::move(chunk));
+                const std::vector<std::size_t> idx;
                 return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
             }
 
@@ -549,7 +558,7 @@ class ChunkedHeadOperator final : public Operator {
             return std::optional<Chunk>{std::move(chunk)};
         }
 
-        Table t = chunk_to_table(std::move(chunk));
+        const Table t = chunk_to_table(std::move(chunk));
         std::vector<std::size_t> idx(remaining_);
         std::ranges::iota(idx, std::size_t{0});
         remaining_ = 0;
@@ -665,7 +674,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     // the column's storage) rather than the std::string that scalar_at_for_order
     // allocates on every access — without this, sorting 4M rows by a string key
     // performs hundreds of millions of heap allocations.
-    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63;
+    constexpr std::uint64_t kSignFlip = std::uint64_t{1} << 63U;
     enum class FlatKind : std::uint8_t { I64, F64, Str };
     struct FlatCol {
         FlatKind kind = FlatKind::I64;
@@ -740,17 +749,17 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             case FlatKind::I64: {
                 auto l = fc.u64[lhs];
                 auto r = fc.u64[rhs];
-                return l < r ? -1 : (l > r ? 1 : 0);
+                return (l > r) - (l < r);
             }
             case FlatKind::F64: {
                 auto l = fc.f64[lhs];
                 auto r = fc.f64[rhs];
-                return l < r ? -1 : (r < l ? 1 : 0);
+                return (l > r) - (l < r);
             }
             case FlatKind::Str: {
                 const auto& l = fc.str[lhs];
                 const auto& r = fc.str[rhs];
-                return l < r ? -1 : (r < l ? 1 : 0);
+                return (l > r) - (l < r);
             }
         }
         return 0;
@@ -895,7 +904,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 if (ln) {
                     continue;
                 }
-                int cmp = flat_cmp(fc, lhs, rhs);
+                const int cmp = flat_cmp(fc, lhs, rhs);
                 if (cmp != 0) {
                     return cmp < 0;
                 }
@@ -916,7 +925,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 return lhs < rhs;
             }
             for (const auto& fc : order_flat) {
-                int cmp = flat_cmp(fc, lhs, rhs);
+                const int cmp = flat_cmp(fc, lhs, rhs);
                 if (cmp != 0) {
                     return fc.ascending ? (cmp < 0) : (cmp > 0);
                 }
@@ -1023,7 +1032,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
 
     Column<double> out;
     out.reserve(rows);
-    for (double value : rank_values) {
+    for (const double value : rank_values) {
         out.push_back(value);
     }
     ComputedColumn result{.column = std::move(out), .validity = std::nullopt};
@@ -1202,8 +1211,8 @@ class ChunkedOrderOperator final : public Operator {
                     if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
                         handled = true;
                         for (std::size_t i = 1; i < rows; ++i) {
-                            bool bad = asc ? (col[i].nanos < col[i - 1].nanos)
-                                           : (col[i].nanos > col[i - 1].nanos);
+                            const bool bad = asc ? (col[i].nanos < col[i - 1].nanos)
+                                                 : (col[i].nanos > col[i - 1].nanos);
                             if (bad) {
                                 sorted = false;
                                 break;
@@ -1212,8 +1221,8 @@ class ChunkedOrderOperator final : public Operator {
                     } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
                         handled = true;
                         for (std::size_t i = 1; i < rows; ++i) {
-                            bool bad = asc ? (col[i].days < col[i - 1].days)
-                                           : (col[i].days > col[i - 1].days);
+                            const bool bad = asc ? (col[i].days < col[i - 1].days)
+                                                 : (col[i].days > col[i - 1].days);
                             if (bad) {
                                 sorted = false;
                                 break;
@@ -1223,7 +1232,7 @@ class ChunkedOrderOperator final : public Operator {
                                          std::is_same_v<ColT, Column<double>>) {
                         handled = true;
                         for (std::size_t i = 1; i < rows; ++i) {
-                            bool bad = asc ? (col[i] < col[i - 1]) : (col[i] > col[i - 1]);
+                            const bool bad = asc ? (col[i] < col[i - 1]) : (col[i] > col[i - 1]);
                             if (bad) {
                                 sorted = false;
                                 break;
@@ -1269,7 +1278,7 @@ class ChunkedOrderOperator final : public Operator {
             const auto& col = *chunk.columns[key_idx[i]].column;
             auto sa = scalar_from_column(col, a);
             auto sb = scalar_from_column(col, b);
-            int c = compare_scalar_for_order(sa, sb);
+            const int c = compare_scalar_for_order(sa, sb);
             if (c != 0) {
                 return resolved_keys_[i].ascending ? c : -c;
             }
@@ -1285,7 +1294,7 @@ class ChunkedOrderOperator final : public Operator {
         for (std::size_t i = 0; i < resolved_keys_.size(); ++i) {
             const auto& col = *chunk.columns[key_idx[i]].column;
             auto sb = scalar_from_column(col, row);
-            int c = compare_scalar_for_order(cached[i], sb);
+            const int c = compare_scalar_for_order(cached[i], sb);
             if (c != 0) {
                 return resolved_keys_[i].ascending ? c : -c;
             }
@@ -1615,9 +1624,9 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 break;
             }
 
-            Table t = chunk_to_table(std::move(*chunk_res.value()));
+            const Table t = chunk_to_table(std::move(*chunk_res.value()));
             if (!empty_template_.has_value()) {
-                std::vector<std::size_t> idx;
+                const std::vector<std::size_t> idx;
                 empty_template_ = gather_rows(t, idx);
             }
             auto err = process_chunk(t);
@@ -1661,9 +1670,9 @@ class ChunkedOrderedLimitOperator final : public Operator {
         return snapshot;
     }
 
-    auto row_comes_first(const Entry& lhs, const Entry& rhs) const -> bool {
+    [[nodiscard]] auto row_comes_first(const Entry& lhs, const Entry& rhs) const -> bool {
         for (std::size_t i = 0; i < lhs.key.values.size(); ++i) {
-            int cmp = compare_scalar_for_order(lhs.key.values[i], rhs.key.values[i]);
+            const int cmp = compare_scalar_for_order(lhs.key.values[i], rhs.key.values[i]);
             if (cmp == 0) {
                 continue;
             }
@@ -1672,15 +1681,15 @@ class ChunkedOrderedLimitOperator final : public Operator {
         return lhs.sequence < rhs.sequence;
     }
 
-    auto entry_preferred(const Entry& lhs, const Entry& rhs) const -> bool {
+    [[nodiscard]] auto entry_preferred(const Entry& lhs, const Entry& rhs) const -> bool {
         return keep_mode_ == KeepMode::First ? row_comes_first(lhs, rhs)
                                              // NOLINTNEXTLINE(readability-suspicious-call-argument)
                                              : row_comes_first(rhs, lhs);
     }
 
     template <typename T>
-    auto single_key_better(const T& lhs, std::size_t lhs_sequence, const Entry& rhs,
-                           bool ascending) const -> bool {
+    [[nodiscard]] auto single_key_better(const T& lhs, std::size_t lhs_sequence, const Entry& rhs,
+                                         bool ascending) const -> bool {
         const auto* rhs_key = std::get_if<T>(&rhs.key.values.front());
         if (rhs_key == nullptr) {
             invariant_violation("ChunkedOrderedLimitOperator: single-key type mismatch");
@@ -1840,13 +1849,16 @@ class ChunkedOrderedLimitOperator final : public Operator {
             for (std::size_t col = 0; col < out.columns.size(); ++col) {
                 auto& out_col = out.mutable_column(col);
                 append_scalar(out_col, entry.row.values[col]);
+                auto& out_entry = out.columns[col];
                 if (entry.row.valid[col] == 0U) {
-                    if (!out.columns[col].validity.has_value()) {
-                        out.columns[col].validity = ValidityBitmap(column_size(out_col) - 1, true);
+                    if (!out_entry.validity.has_value()) {
+                        out_entry.validity = ValidityBitmap(column_size(out_col) - 1, true);
                     }
-                    out.columns[col].validity->push_back(false);
-                } else if (out.columns[col].validity.has_value()) {
-                    out.columns[col].validity->push_back(true);
+                    ValidityBitmap* const validity = &*out_entry.validity;
+                    validity->push_back(false);
+                } else if (out_entry.validity.has_value()) {
+                    ValidityBitmap* const validity = &*out_entry.validity;
+                    validity->push_back(true);
                 }
             }
         }
@@ -1955,7 +1967,7 @@ class ChunkedDistinctOperator final : public Operator {
         std::vector<std::size_t> idx;
         idx.reserve(rows);
         for (std::size_t row = 0; row < rows; ++row) {
-            std::string_view value = col[row];
+            const std::string_view value = col[row];
             if (seen_strings_.contains(value)) {
                 continue;
             }
@@ -2004,7 +2016,7 @@ class ChunkedDistinctOperator final : public Operator {
         std::vector<std::size_t> idx;
         idx.reserve(rows);
         for (std::size_t row = 0; row < rows; ++row) {
-            std::string_view value = col[row];
+            const std::string_view value = col[row];
             if (seen_strings_.contains(value)) {
                 continue;
             }
@@ -2110,21 +2122,21 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 
         if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
             right_kind_ = ExprType::Int;
-            for (long row : *col) {
+            for (const long row : *col) {
                 right_i64_.insert(row);
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<double>>(key)) {
             right_kind_ = ExprType::Double;
-            for (double row : *col) {
+            for (const double row : *col) {
                 right_f64_.insert(row);
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<bool>>(key)) {
             right_kind_ = ExprType::Bool;
-            for (bool row : *col) {
+            for (const bool row : *col) {
                 right_bool_.insert(row);
             }
             return std::nullopt;
@@ -2343,7 +2355,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                     return std::optional<Chunk>{};
                 }
                 left_materialized_drained_ = true;
-                left_chunk = std::move(*left_materialized_);
+                left_chunk = std::move(left_materialized_).value_or(Table{});
                 left_materialized_.reset();
             } else {
                 auto chunk_res = left_->next();
@@ -2670,7 +2682,12 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (rkey == nullptr) {
             return std::unexpected("join key not found in right table: " + keys_->front());
         }
-        const std::size_t n_left = left_table_->rows();
+        if (!left_table_.has_value()) {
+            return std::unexpected(
+                "ChunkedInnerJoinOperator: swapped mode without a materialized left table");
+        }
+        const Table& left_table = *left_table_;
+        const std::size_t n_left = left_table.rows();
         const std::size_t n_right = right_.rows();
 
         std::vector<std::size_t> match_counts(n_left, 0);
@@ -2783,8 +2800,8 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
 
         Table left_copy;
-        left_copy.columns.reserve(left_table_->columns.size());
-        for (const auto& c : left_table_->columns) {
+        left_copy.columns.reserve(left_table.columns.size());
+        for (const auto& c : left_table.columns) {
             left_copy.add_column(c.name, *c.column);
             left_copy.columns.back().validity = c.validity;
         }
@@ -2841,7 +2858,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         }
 
-        for (std::size_t idx : right_emit_idx_) {
+        for (const std::size_t idx : right_emit_idx_) {
             const auto& rc = right_.columns[idx];
             std::string name = rc.name;
             while (out_names.contains(name)) {
@@ -2924,7 +2941,7 @@ class ChunkedAggregateOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 break;
             }
-            Chunk chunk = std::move(*chunk_res.value());
+            const Chunk chunk = std::move(*chunk_res.value());
             if (auto err = process_chunk(chunk)) {
                 return std::unexpected(*err);
             }
@@ -2969,7 +2986,7 @@ class ChunkedAggregateOperator final : public Operator {
             if (entry == nullptr) {
                 return "aggregate column not found: " + agg.column.name;
             }
-            ExprType kind = expr_type_for_column(*entry->column);
+            const ExprType kind = expr_type_for_column(*entry->column);
             const bool first_or_last =
                 agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last;
             // First/Last also accept String (which covers Column<std::string> and
@@ -3024,7 +3041,7 @@ class ChunkedAggregateOperator final : public Operator {
                 if (plan_[i].func == ir::AggFunc::Count) {
                     continue;
                 }
-                ExprType kind = expr_type_for_column(*agg_entries[i]->column);
+                const ExprType kind = expr_type_for_column(*agg_entries[i]->column);
                 if (kind != plan_[i].kind) {
                     return "ChunkedAggregateOperator: aggregate column type changed across chunks";
                 }
@@ -3063,7 +3080,7 @@ class ChunkedAggregateOperator final : public Operator {
         std::string_view prev_key;
         std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
         for (std::size_t row = 0; row < rows; ++row) {
-            std::string_view key{src_chars + src_off[row], src_off[row + 1] - src_off[row]};
+            const std::string_view key{src_chars + src_off[row], src_off[row + 1] - src_off[row]};
             std::uint32_t gid{};
             if (key == prev_key) {
                 gid = prev_gid;
@@ -3298,14 +3315,16 @@ class ChunkedAggregateOperator final : public Operator {
             }
 
             const auto& entry = *agg_entries[agg_i];
-            const bool has_nulls = entry.validity.has_value();
+            const ValidityBitmap* validity =
+                entry.validity.has_value() ? &*entry.validity : nullptr;
+            const bool has_nulls = validity != nullptr;
 
             if (plan_[agg_i].kind == ExprType::Double) {
                 const double* data = std::get<Column<double>>(*entry.column).data();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.double_value += data[row];
@@ -3314,7 +3333,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Mean:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.sum += data[row];
@@ -3324,27 +3343,27 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Min:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            double v = data[row];
+                            const double v = data[row];
                             slot.double_value = slot.has_value ? std::min(slot.double_value, v) : v;
                             slot.has_value = true;
                         }
                         break;
                     case ir::AggFunc::Max:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            double v = data[row];
+                            const double v = data[row];
                             slot.double_value = slot.has_value ? std::max(slot.double_value, v) : v;
                             slot.has_value = true;
                         }
                         break;
                     case ir::AggFunc::Stddev:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_stddev(slot_for(gids[row]), data[row]);
                         }
@@ -3352,14 +3371,14 @@ class ChunkedAggregateOperator final : public Operator {
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_moments(slot_for(gids[row]), data[row]);
                         }
                         break;
                     case ir::AggFunc::First:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             if (!slot.has_value) {
@@ -3370,7 +3389,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Last:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.double_value = data[row];
@@ -3385,7 +3404,7 @@ class ChunkedAggregateOperator final : public Operator {
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.int_value += data[row];
@@ -3394,7 +3413,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Mean:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.sum += static_cast<double>(data[row]);
@@ -3404,7 +3423,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Min:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             std::int64_t v = data[row];
@@ -3414,7 +3433,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Max:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             std::int64_t v = data[row];
@@ -3424,7 +3443,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Stddev:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_stddev(slot_for(gids[row]), static_cast<double>(data[row]));
                         }
@@ -3432,14 +3451,14 @@ class ChunkedAggregateOperator final : public Operator {
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_moments(slot_for(gids[row]), static_cast<double>(data[row]));
                         }
                         break;
                     case ir::AggFunc::First:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             if (!slot.has_value) {
@@ -3450,7 +3469,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Last:
                         for (std::size_t row = 0; row < rows; ++row) {
-                            if (has_nulls && !(*entry.validity)[row])
+                            if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.int_value = data[row];
@@ -3476,7 +3495,7 @@ class ChunkedAggregateOperator final : public Operator {
                 };
                 if (plan_[agg_i].func == ir::AggFunc::First) {
                     for (std::size_t row = 0; row < rows; ++row) {
-                        if (has_nulls && !(*entry.validity)[row])
+                        if (has_nulls && !(*validity)[row])
                             continue;
                         auto& slot = slot_for(gids[row]);
                         if (!slot.has_value) {
@@ -3486,7 +3505,7 @@ class ChunkedAggregateOperator final : public Operator {
                     }
                 } else {
                     for (std::size_t row = 0; row < rows; ++row) {
-                        if (has_nulls && !(*entry.validity)[row])
+                        if (has_nulls && !(*validity)[row])
                             continue;
                         auto& slot = slot_for(gids[row]);
                         slot.last_value = value_at(row);
@@ -3706,8 +3725,8 @@ class ChunkedAggregateOperator final : public Operator {
         auto operator()(const CatKey& k) const noexcept -> std::size_t {
             std::size_t h = 0;
             for (auto c : k.codes) {
-                h ^= robin_hood::hash<Column<Categorical>::code_type>{}(c) + 0x9e3779b9 + (h << 6) +
-                     (h >> 2);
+                h ^= robin_hood::hash<Column<Categorical>::code_type>{}(c) + 0x9e3779b9 +
+                     (h << 6U) + (h >> 2U);
             }
             return h;
         }
@@ -3918,7 +3937,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             if (entry == nullptr) {
                 return false;  // reported as a proper error by init_plan
             }
-            ExprType kind = expr_type_for_column(*entry->column);
+            const ExprType kind = expr_type_for_column(*entry->column);
             return kind != ExprType::Int && kind != ExprType::Double;
         });
     }
@@ -3937,7 +3956,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             if (entry == nullptr) {
                 return "aggregate column not found: " + agg.column.name;
             }
-            ExprType kind = expr_type_for_column(*entry->column);
+            const ExprType kind = expr_type_for_column(*entry->column);
             if (kind != ExprType::Int && kind != ExprType::Double) {
                 return "ChunkedSortedAggregateOperator: non-numeric aggregation not supported";
             }

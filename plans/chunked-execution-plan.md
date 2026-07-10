@@ -189,6 +189,34 @@ faster. Still open: column pruning, row-group-statistics pushdown, and
 directory/Hive-partitioned datasets — tracked in `bigger-than-ram-plan.md`,
 not here.
 
+**Streaming `first`/`last` — done.** Both chunked aggregate operators now
+handle First/Last instead of forcing the whole node onto the materializing
+path. Numeric columns stream on both operators via the existing
+`int_value`/`double_value` `AggSlot` fields (same slots Sum/Min/Max already
+use — First keeps the first value seen per group, Last keeps overwriting).
+String/Categorical only stream on the hash `ChunkedAggregateOperator`, via the
+`first_value`/`last_value` `ScalarValue` fields (mirroring the materializing
+accumulator's fast path); output columns are built with `make_empty_like`-style
+type preservation so a Categorical input stays Categorical, not a plain
+string. `ChunkedSortedAggregateOperator` has no group-at-a-time string
+accumulator, so it detects a non-numeric First/Last column up front (before
+committing to the sorted strategy) and routes the whole node to the hash
+operator instead — the same "replay the first chunk" fallback mechanism
+already used for unsorted input. Benchmarked via `ibex_fusion_bench`
+(`agg_firstlast_stream_*`/`agg_firstlast_hash_*`, 2M rows): moderate
+cardinality (1000 groups) streams in ~2.5ms vs ~44ms hashed (**~18×**); high
+cardinality (2M groups) is ~85ms vs ~900ms (**~10.5×**) — same shape as the
+moments win, since the payoff is skipping the hash-table build entirely on
+group-sorted input. Surfaced and fixed a latent, unrelated bug in the
+*materializing* path while writing the streamed-vs-materializing parity test:
+`aggregate.cpp`'s row-wise fallback (used whenever a query mixes `first`/
+`last` with a non-fast-path aggregate like `median`, or has nullable agg
+inputs) only ever wrote `first_value`/`last_value`, but finalize reads
+`int_value`/`double_value` for numeric columns — so `first(numeric_col)`
+alongside e.g. `median(x)` in the same query silently returned 0. Fixed by
+making the row-wise accumulator populate both, matching what the
+already-correct numeric fast path (`update_state_numeric`) does.
+
 ## Next Steps
 
 Ordered roughly by expected payoff-to-effort. Confirm each against
@@ -196,15 +224,9 @@ Ordered roughly by expected payoff-to-effort. Confirm each against
 
 ### 1. Finish widening the streaming Aggregate function set
 
-Count/Sum/Min/Max/Mean/Std/Skew/Kurtosis now stream (see Recently Landed). The
-remaining materializing aggregates:
+Count/Sum/Min/Max/Mean/Std/Skew/Kurtosis/First/Last now stream (see Recently
+Landed). The remaining materializing aggregates:
 
-- `first`/`last` — O(1) and trivial *for numeric columns*, but the value type
-  must be preserved (string/categorical/date), and `build_operator` can't gate
-  by column type (no schema there). Path: let the operators handle any type
-  (numeric via `int/double` slots, others via the existing `first_value`/
-  `last_value` `ScalarValue` fields, mirroring the materializing accumulator)
-  so func-gating stays safe.
 - `median`/`quantile` — need all values per group (O(group) state), so not a
   bounded-memory stream; leave on the materializing path.
 - `ewma` — depends on within-group row order; streamable only with care, low

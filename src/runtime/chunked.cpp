@@ -2970,7 +2970,14 @@ class ChunkedAggregateOperator final : public Operator {
                 return "aggregate column not found: " + agg.column.name;
             }
             ExprType kind = expr_type_for_column(*entry->column);
-            if (kind != ExprType::Int && kind != ExprType::Double) {
+            const bool first_or_last =
+                agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last;
+            // First/Last also accept String (which covers Column<std::string> and
+            // Column<Categorical> — expr_type_for_column collapses both to
+            // String); every other function stays numeric-only.
+            const bool supported = kind == ExprType::Int || kind == ExprType::Double ||
+                                   (first_or_last && kind == ExprType::String);
+            if (!supported) {
                 return "ChunkedAggregateOperator: non-numeric aggregation not supported";
             }
             agg_entries[i] = entry;
@@ -2986,6 +2993,8 @@ class ChunkedAggregateOperator final : public Operator {
                     p.kind = ExprType::Int;
                 } else {
                     p.kind = expr_type_for_column(*agg_entries[i]->column);
+                    p.categorical =
+                        std::holds_alternative<Column<Categorical>>(*agg_entries[i]->column);
                 }
                 plan_.push_back(p);
             }
@@ -3348,10 +3357,30 @@ class ChunkedAggregateOperator final : public Operator {
                             agg_update_moments(slot_for(gids[row]), data[row]);
                         }
                         break;
+                    case ir::AggFunc::First:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            if (!slot.has_value) {
+                                slot.double_value = data[row];
+                                slot.has_value = true;
+                            }
+                        }
+                        break;
+                    case ir::AggFunc::Last:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            slot.double_value = data[row];
+                            slot.has_value = true;
+                        }
+                        break;
                     default:
                         break;
                 }
-            } else {
+            } else if (plan_[agg_i].kind == ExprType::Int) {
                 const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
@@ -3408,8 +3437,61 @@ class ChunkedAggregateOperator final : public Operator {
                             agg_update_moments(slot_for(gids[row]), static_cast<double>(data[row]));
                         }
                         break;
+                    case ir::AggFunc::First:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            if (!slot.has_value) {
+                                slot.int_value = data[row];
+                                slot.has_value = true;
+                            }
+                        }
+                        break;
+                    case ir::AggFunc::Last:
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            if (has_nulls && !(*entry.validity)[row])
+                                continue;
+                            auto& slot = slot_for(gids[row]);
+                            slot.int_value = data[row];
+                            slot.has_value = true;
+                        }
+                        break;
                     default:
                         break;
+                }
+            } else {
+                // ExprType::String — First/Last only (the type gate in
+                // process_chunk rejects every other function here). Covers
+                // both Column<std::string> and Column<Categorical>; the two
+                // share ScalarValue{std::string} as the wire format via
+                // append_scalar, which pushes into a Categorical dictionary
+                // when the target column is Categorical.
+                const bool categorical = plan_[agg_i].categorical;
+                const auto value_at = [&](std::size_t row) -> std::string {
+                    if (categorical) {
+                        return std::string(std::get<Column<Categorical>>(*entry.column)[row]);
+                    }
+                    return std::string(std::get<Column<std::string>>(*entry.column)[row]);
+                };
+                if (plan_[agg_i].func == ir::AggFunc::First) {
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        if (has_nulls && !(*entry.validity)[row])
+                            continue;
+                        auto& slot = slot_for(gids[row]);
+                        if (!slot.has_value) {
+                            slot.first_value = value_at(row);
+                            slot.has_value = true;
+                        }
+                    }
+                } else {
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        if (has_nulls && !(*entry.validity)[row])
+                            continue;
+                        auto& slot = slot_for(gids[row]);
+                        slot.last_value = value_at(row);
+                        slot.has_value = true;
+                    }
                 }
             }
         }
@@ -3450,6 +3532,18 @@ class ChunkedAggregateOperator final : public Operator {
                         column = Column<double>{};
                     } else {
                         column = Column<std::int64_t>{};
+                    }
+                    break;
+                case ir::AggFunc::First:
+                case ir::AggFunc::Last:
+                    if (plan_[i].kind == ExprType::Double) {
+                        column = Column<double>{};
+                    } else if (plan_[i].kind == ExprType::Int) {
+                        column = Column<std::int64_t>{};
+                    } else if (plan_[i].categorical) {
+                        column = Column<Categorical>{};
+                    } else {
+                        column = Column<std::string>{};
                     }
                     break;
                 default:
@@ -3528,6 +3622,24 @@ class ChunkedAggregateOperator final : public Operator {
                     case ir::AggFunc::Kurtosis:
                         append_scalar(column, agg_finalize_kurtosis(slot));
                         break;
+                    case ir::AggFunc::First:
+                        if (plan_[i].kind == ExprType::Double) {
+                            append_scalar(column, slot.double_value);
+                        } else if (plan_[i].kind == ExprType::Int) {
+                            append_scalar(column, slot.int_value);
+                        } else {
+                            append_scalar(column, slot.first_value);
+                        }
+                        break;
+                    case ir::AggFunc::Last:
+                        if (plan_[i].kind == ExprType::Double) {
+                            append_scalar(column, slot.double_value);
+                        } else if (plan_[i].kind == ExprType::Int) {
+                            append_scalar(column, slot.int_value);
+                        } else {
+                            append_scalar(column, slot.last_value);
+                        }
+                        break;
                     default:
                         break;
                 }
@@ -3556,6 +3668,10 @@ class ChunkedAggregateOperator final : public Operator {
     struct SlotPlan {
         ir::AggFunc func = ir::AggFunc::Sum;
         ExprType kind = ExprType::Int;
+        // Only meaningful when kind == String: disambiguates Column<Categorical>
+        // from Column<std::string> for First/Last output construction, since
+        // expr_type_for_column collapses both to ExprType::String.
+        bool categorical = false;
     };
 
     struct CatKey {
@@ -3736,7 +3852,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             input_eof_ = true;
             return {};
         }
-        if (!sorted_on_group_by(first)) {
+        if (!sorted_on_group_by(first) || needs_hash_fallback(first)) {
             fallback_ = std::make_unique<ChunkedAggregateOperator>(
                 std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
                 group_by_, aggregations_);
@@ -3788,6 +3904,23 @@ class ChunkedSortedAggregateOperator final : public Operator {
             }
         }
         return nullptr;
+    }
+
+    // Non-numeric First/Last (string/categorical) has no group-at-a-time
+    // implementation here — route it to the hash operator, which handles any
+    // type. Numeric First/Last streams natively (see accumulate_typed).
+    [[nodiscard]] auto needs_hash_fallback(const Chunk& first) const -> bool {
+        return std::ranges::any_of(*aggregations_, [&](const ir::AggSpec& agg) {
+            if (agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) {
+                return false;
+            }
+            const ColumnEntry* entry = find_entry(first, agg.column.name);
+            if (entry == nullptr) {
+                return false;  // reported as a proper error by init_plan
+            }
+            ExprType kind = expr_type_for_column(*entry->column);
+            return kind != ExprType::Int && kind != ExprType::Double;
+        });
     }
 
     auto init_plan(const Chunk& first) -> std::optional<std::string> {
@@ -4102,6 +4235,32 @@ class ChunkedSortedAggregateOperator final : public Operator {
                         continue;
                     }
                     agg_update_moments(slot, static_cast<double>(data[row]));
+                }
+                break;
+            case ir::AggFunc::First:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row) || slot.has_value) {
+                        continue;
+                    }
+                    if constexpr (std::is_same_v<T, double>) {
+                        slot.double_value = data[row];
+                    } else {
+                        slot.int_value = data[row];
+                    }
+                    slot.has_value = true;
+                }
+                break;
+            case ir::AggFunc::Last:
+                for (std::size_t row = start; row < end; ++row) {
+                    if (!valid(row)) {
+                        continue;
+                    }
+                    if constexpr (std::is_same_v<T, double>) {
+                        slot.double_value = data[row];
+                    } else {
+                        slot.int_value = data[row];
+                    }
+                    slot.has_value = true;
                 }
                 break;
             default:
@@ -4535,11 +4694,18 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 case ir::AggFunc::Stddev:
                 case ir::AggFunc::Skew:
                 case ir::AggFunc::Kurtosis:
+                case ir::AggFunc::First:
+                case ir::AggFunc::Last:
+                    // First/Last: the operators themselves gate by column type
+                    // (numeric, string, categorical stream; Date/Timestamp fall
+                    // to the hash operator's error path — unreachable in
+                    // practice since aggregation on those types is rejected
+                    // upstream of the chunked path entirely, same as every
+                    // other agg func).
                     break;
                 default:
-                    // Median/Quantile need all values; First/Last need
-                    // type-preserving output; Ewma is row-order coupled — these
-                    // stay on the materializing path.
+                    // Median/Quantile need all values; Ewma is row-order
+                    // coupled — these stay on the materializing path.
                     streamable = false;
                     break;
             }

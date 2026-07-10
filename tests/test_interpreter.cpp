@@ -6395,6 +6395,32 @@ TEST_CASE("update: direct bool column copy preserves values", "[update][bool]") 
     REQUIRE((*copied)[3] == true);
 }
 
+TEST_CASE("update: bare bool literal does not crash", "[update][bool]") {
+    // Regression test: a bare Bool literal isn't a ColumnRef (so it misses the
+    // column-copy fast path) and isn't Compare/Logical/IsNull (so it misses the
+    // vectorized path), so it falls into the generic per-row loop in
+    // update_table_window. That loop's Bool branch only checked for an
+    // int64_t-holding ExprValue, but eval_expr returns a bool-holding ExprValue
+    // for a Bool literal — the mismatch previously tripped an
+    // invariant_violation abort instead of a graceful error.
+    runtime::Table table;
+    table.add_column("val", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { flag = true }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = std::get_if<Column<bool>>(result->find("flag"));
+    REQUIRE(col != nullptr);
+    REQUIRE(col->size() == 3);
+    REQUIRE((*col)[0] == true);
+    REQUIRE((*col)[1] == true);
+    REQUIRE((*col)[2] == true);
+}
+
 // --- Matrix Operations --------------------------------------------------------
 
 TEST_CASE("cov: diagonal equals variance", "[cov][matrix]") {

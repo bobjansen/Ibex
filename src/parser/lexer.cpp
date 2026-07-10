@@ -90,9 +90,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
     std::size_t line = 1;
     std::size_t column = 1;
 
-    const auto at_end = [&]() -> bool {
-        return i >= source.size();
-    };
+    const auto at_end = [&]() -> bool { return i >= source.size(); };
     const auto peek = [&](std::size_t offset = 0) -> char {
         if (i + offset >= source.size()) {
             return '\0';

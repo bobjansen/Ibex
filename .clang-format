@@ -52,7 +52,7 @@ SpaceAfterTemplateKeyword: true
 SpacesBeforeTrailingComments: 2
 
 # C++20/23
-AllowShortLambdasOnASingleLine: Inline
+AllowShortLambdasOnASingleLine: All
 BinPackArguments: true
 BinPackParameters: true
 

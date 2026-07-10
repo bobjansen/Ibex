@@ -155,15 +155,15 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
 
         // abs: numeric -> same numeric type.
         m.emplace("abs", ScalarBuiltin{
-                             1,
-                             1,
-                             [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                             .min_args = 1,
+                             .max_args = 1,
+                             .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
                                  if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
                                      return a[0];
                                  }
                                  return std::unexpected("abs: argument must be numeric");
                              },
-                             [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                             .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
                                  if (const auto* i = std::get_if<std::int64_t>(a.data())) {
                                      return ExprValue{std::int64_t{std::abs(*i)}};
                                  }
@@ -179,20 +179,21 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         // stringified and concatenated, so literal segments (string args) carry
         // through verbatim and embedded values are formatted in place. Always
         // yields String.
-        m.emplace("__interp", ScalarBuiltin{
-                                  0,
-                                  -1,
-                                  [](std::string_view, const std::vector<ExprType>&) -> IT {
-                                      return ExprType::String;
-                                  },
-                                  [](std::string_view, const std::vector<ExprValue>& a) -> IV {
-                                      std::string out;
-                                      for (const auto& v : a) {
-                                          out += expr_value_to_string(v);
-                                      }
-                                      return ExprValue{std::move(out)};
-                                  },
-                              });
+        m.emplace("__interp",
+                  ScalarBuiltin{
+                      .min_args = 0,
+                      .max_args = -1,
+                      .infer = [](std::string_view, const std::vector<ExprType>&) -> IT {
+                          return ExprType::String;
+                      },
+                      .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                          std::string out;
+                          for (const auto& v : a) {
+                              out += expr_value_to_string(v);
+                          }
+                          return ExprValue{std::move(out)};
+                      },
+                  });
 
         // sqrt / log / exp: numeric -> Float64.
         const ScalarBuiltin transcendental{
@@ -262,15 +263,15 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         // numeric type (Int is already integral, so it passes through). Use
         // round(x, ceil|floor|trunc) for a Float -> Int64 conversion.
         const ScalarBuiltin integral{
-            1,
-            1,
-            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+            .min_args = 1,
+            .max_args = 1,
+            .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
                     return a[0];
                 }
                 return std::unexpected(std::string(name) + ": argument must be numeric");
             },
-            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+            .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
                 if (std::holds_alternative<std::int64_t>(a[0])) {
                     return a[0];
                 }
@@ -292,15 +293,15 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
 
         // Float64 / Float32: cast Int or Float to Float64.
         const ScalarBuiltin to_float{
-            1,
-            1,
-            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+            .min_args = 1,
+            .max_args = 1,
+            .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
                     return ExprType::Double;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Float");
             },
-            [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+            .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
                 if (auto d = expr_value_to_double(a[0])) {
                     return ExprValue{*d};
                 }
@@ -312,15 +313,15 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
 
         // Int64 / Int32 / Int: cast Int or whole-valued Float to Int64.
         const ScalarBuiltin to_int{
-            1,
-            1,
-            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+            .min_args = 1,
+            .max_args = 1,
+            .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
                     return ExprType::Int;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
             },
-            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+            .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
                 if (const auto* i = std::get_if<std::int64_t>(a.data())) {
                     return ExprValue{*i};
                 }
@@ -341,9 +342,9 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
 
         // year / month / day / hour / minute / second: Date|Timestamp -> Int.
         const ScalarBuiltin date_part{
-            1,
-            1,
-            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+            .min_args = 1,
+            .max_args = 1,
+            .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 const bool date_ok = (name == "year" || name == "month" || name == "day");
                 if (a[0] == ExprType::Timestamp || (date_ok && a[0] == ExprType::Date)) {
                     return ExprType::Int;
@@ -352,7 +353,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
                                        (date_ok ? ": argument must be Date or Timestamp"
                                                 : ": argument must be Timestamp"));
             },
-            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+            .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
                 return eval_date_part(name, a[0]);
             },
         };
@@ -364,28 +365,29 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         m.emplace("second", date_part);
 
         // is_nan: Float64 -> Bool.
-        m.emplace("is_nan", ScalarBuiltin{
-                                1,
-                                1,
-                                [](std::string_view, const std::vector<ExprType>& a) -> IT {
-                                    if (a[0] == ExprType::Double) {
-                                        return ExprType::Bool;
-                                    }
-                                    return std::unexpected("is_nan: argument must be Float64");
-                                },
-                                [](std::string_view, const std::vector<ExprValue>& a) -> IV {
-                                    if (const auto* d = std::get_if<double>(a.data())) {
-                                        return ExprValue{std::isnan(*d)};
-                                    }
-                                    return std::unexpected("is_nan: argument must be Float64");
-                                },
-                            });
+        m.emplace("is_nan",
+                  ScalarBuiltin{
+                      .min_args = 1,
+                      .max_args = 1,
+                      .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                          if (a[0] == ExprType::Double) {
+                              return ExprType::Bool;
+                          }
+                          return std::unexpected("is_nan: argument must be Float64");
+                      },
+                      .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                          if (const auto* d = std::get_if<double>(a.data())) {
+                              return ExprValue{std::isnan(*d)};
+                          }
+                          return std::unexpected("is_nan: argument must be Float64");
+                      },
+                  });
 
         // pmin / pmax: 2+ comparable args of one type (Int/Float widen to Float).
         const ScalarBuiltin pminmax{
-            2,
-            -1,
-            [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+            .min_args = 2,
+            .max_args = -1,
+            .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 std::optional<ExprType> result;
                 for (ExprType t : a) {
                     if (!result) {
@@ -409,7 +411,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
                 }
                 return *result;
             },
-            [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+            .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
                 const bool want_min = (name == "pmin");
                 auto better = [&](const ExprValue& cand,
                                   const ExprValue& best) -> std::expected<bool, std::string> {
@@ -1389,7 +1391,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
 
     // If there's no validity bitmap, no nulls exist — return the column unchanged.
     if (!entry->validity.has_value()) {
-        return FillResult{*entry->column, std::nullopt};
+        return FillResult{.column = *entry->column, .validity = std::nullopt};
     }
 
     std::size_t rows = input.rows();
@@ -1446,7 +1448,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
 
     // If there's no validity bitmap, no nulls exist — return the column unchanged.
     if (!entry->validity.has_value()) {
-        return FillResult{*entry->column, std::nullopt};
+        return FillResult{.column = *entry->column, .validity = std::nullopt};
     }
 
     std::size_t rows = input.rows();
@@ -1540,7 +1542,7 @@ auto eval_float_clean(const ir::CallExpr& call, const Table& input, FloatCleanMo
     if (!changed && !entry->validity.has_value()) {
         validity.reset();
     }
-    return FillResult{ColumnValue{std::move(result)}, std::move(validity)};
+    return FillResult{.column = ColumnValue{std::move(result)}, .validity = std::move(validity)};
 }
 
 auto eval_is_nan(const ir::CallExpr& call, const Table& input)

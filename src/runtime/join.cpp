@@ -268,7 +268,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         out_names.insert(name);
         output.add_column(name, make_empty_like(*entry.column));
-        right_out.push_back(RightOut{entry.column.get(), output.columns.size() - 1});
+        right_out.push_back(
+            RightOut{.column = entry.column.get(), .out_index = output.columns.size() - 1});
     }
 
     const bool preserve_left_only =
@@ -430,7 +431,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     name += "_right";
                 }
                 batch_left_names.insert(name);
-                nlj_right.push_back({entry.column.get(), std::move(name)});
+                nlj_right.push_back({.column = entry.column.get(), .batch_name = std::move(name)});
             }
         }
 

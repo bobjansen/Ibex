@@ -2,6 +2,9 @@
 // windows (apply_rolling_func) and timeframe resampling (resample_table).
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
@@ -11,10 +14,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <set>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -35,7 +43,7 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
         std::size_t lo = 0;
         std::size_t hi = row;
         while (lo < hi) {
-            std::size_t mid = lo + ((hi - lo) / 2);
+            const std::size_t mid = lo + ((hi - lo) / 2);
             if ((*ts_col)[mid].nanos < threshold) {
                 lo = mid + 1;
             } else {
@@ -52,7 +60,7 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
     std::size_t lo = 0;
     std::size_t hi = row;
     while (lo < hi) {
-        std::size_t mid = lo + ((hi - lo) / 2);
+        const std::size_t mid = lo + ((hi - lo) / 2);
         if (date_col[mid].days < threshold) {
             lo = mid + 1;
         } else {
@@ -179,7 +187,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 ++lo;
             result[i] = static_cast<std::int64_t>(i - lo + 1);
         }
-        return ComputedColumn{std::move(result), std::nullopt};
+        return ComputedColumn{.column = std::move(result), .validity = std::nullopt};
     }
 
     if (call.args.empty()) {
@@ -255,7 +263,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             out_valid->set(i, false);
                         }
                     }
-                    return ComputedColumn{std::move(result), std::move(out_valid)};
+                    return ComputedColumn{.column = std::move(result),
+                                          .validity = std::move(out_valid)};
                 }
             },
             *src);
@@ -274,6 +283,9 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     std::optional<ValidityBitmap> out_valid;
                     T sum{};
                     std::size_t val_cnt = 0;  // non-null, non-NaN elements in window
+                    // Mutated in add/drop below via a by-reference lambda capture; the
+                    // checker doesn't see through that.
+                    // NOLINTNEXTLINE(misc-const-correctness)
                     std::size_t nan_cnt = 0;  // valid-but-NaN (Float only; Int never NaN)
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
@@ -420,7 +432,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                             : (*lo.rbegin() + *hi.begin()) / 2.0;
                         }
                     }
-                    return ComputedColumn{std::move(result), std::move(out_valid)};
+                    return ComputedColumn{.column = std::move(result),
+                                          .validity = std::move(out_valid)};
                 }
             },
             *src);
@@ -456,7 +469,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             return;
                         }
                         ++cnt;
-                        double delta = x - mean;
+                        const double delta = x - mean;
                         mean += delta / static_cast<double>(cnt);
                         m2 += delta * (x - mean);
                     };
@@ -468,7 +481,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             --nan_cnt;
                             return;
                         }
-                        double mean_old = mean;
+                        const double mean_old = mean;
                         --cnt;
                         mean = cnt == 0 ? 0.0
                                         : (((static_cast<double>(cnt) + 1.0) * mean_old) - y) /
@@ -497,7 +510,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                     : std::sqrt(std::max(0.0, m2) / static_cast<double>(cnt - 1));
                         }
                     }
-                    return ComputedColumn{std::move(result), std::move(out_valid)};
+                    return ComputedColumn{.column = std::move(result),
+                                          .validity = std::move(out_valid)};
                 }
             },
             *src);
@@ -566,7 +580,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         }
                         result[i] = (alpha * r) + ((1.0 - alpha) * bpow(i - lo) * val(lo));
                     }
-                    return ComputedColumn{std::move(result), std::nullopt};
+                    return ComputedColumn{.column = std::move(result), .validity = std::nullopt};
                 }
             },
             *src);
@@ -602,7 +616,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = win_lo(i);
+                        const std::size_t lo = win_lo(i);
                         // Collect finite, non-null values; flag any valid NaN.
                         window.clear();
                         bool has_nan = false;
@@ -627,14 +641,15 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             continue;
                         }
                         std::ranges::sort(window);
-                        std::size_t n = window.size();
-                        double idx = p * static_cast<double>(n - 1);
+                        const std::size_t n = window.size();
+                        const double idx = p * static_cast<double>(n - 1);
                         auto idx_lo = static_cast<std::size_t>(idx);
-                        std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
-                        double frac = idx - static_cast<double>(idx_lo);
+                        const std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
+                        const double frac = idx - static_cast<double>(idx_lo);
                         result[i] = window[idx_lo] + (frac * (window[idx_hi] - window[idx_lo]));
                     }
-                    return ComputedColumn{std::move(result), std::move(out_valid)};
+                    return ComputedColumn{.column = std::move(result),
+                                          .validity = std::move(out_valid)};
                 }
             },
             *src);
@@ -652,7 +667,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = win_lo(i);
+                        const std::size_t lo = win_lo(i);
                         window.clear();
                         bool has_nan = false;
                         for (std::size_t j = lo; j <= i; ++j) {
@@ -675,19 +690,19 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             out_valid->set(i, false);
                             continue;
                         }
-                        std::size_t n = window.size();
+                        const std::size_t n = window.size();
                         if (n < 3) {
                             result[i] = 0.0;
                             continue;
                         }
                         double mean = 0.0;
-                        for (double v : window)
+                        for (const double v : window)
                             mean += v;
                         mean /= static_cast<double>(n);
                         double m2 = 0.0;
                         double m3 = 0.0;
-                        for (double v : window) {
-                            double d = v - mean;
+                        for (const double v : window) {
+                            const double d = v - mean;
                             m2 += d * d;
                             m3 += d * d * d;
                         }
@@ -699,7 +714,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
                         }
                     }
-                    return ComputedColumn{std::move(result), std::move(out_valid)};
+                    return ComputedColumn{.column = std::move(result),
+                                          .validity = std::move(out_valid)};
                 }
             },
             *src);
@@ -718,7 +734,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        std::size_t lo = win_lo(i);
+                        const std::size_t lo = win_lo(i);
                         window.clear();
                         bool has_nan = false;
                         for (std::size_t j = lo; j <= i; ++j) {
@@ -741,20 +757,20 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             out_valid->set(i, false);
                             continue;
                         }
-                        std::size_t n = window.size();
+                        const std::size_t n = window.size();
                         if (n < 4) {
                             result[i] = 0.0;
                             continue;
                         }
                         double mean = 0.0;
-                        for (double v : window)
+                        for (const double v : window)
                             mean += v;
                         mean /= static_cast<double>(n);
                         double m2 = 0.0;
                         double m4 = 0.0;
-                        for (double v : window) {
-                            double d = v - mean;
-                            double d2 = d * d;
+                        for (const double v : window) {
+                            const double d = v - mean;
+                            const double d2 = d * d;
                             m2 += d2;
                             m4 += d2 * d2;
                         }
@@ -767,7 +783,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                         (((dn + 1.0) * dn * m4 / (m2 * m2)) - (3.0 * (dn - 1.0)));
                         }
                     }
-                    return ComputedColumn{std::move(result), std::move(out_valid)};
+                    return ComputedColumn{.column = std::move(result),
+                                          .validity = std::move(out_valid)};
                 }
             },
             *src);
@@ -787,9 +804,12 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 result.resize(rows);
                 std::optional<ValidityBitmap> out_valid;
                 for (std::size_t i = 0; i < rows; ++i) {
-                    std::size_t lo_idx = win_lo(i);
+                    const std::size_t lo_idx = win_lo(i);
                     T best{};
                     bool seen = false;
+                    // Mutated below inside the `if constexpr (is_floating_point_v<T>)`
+                    // branch; the checker misses mutations that only occur there.
+                    // NOLINTNEXTLINE(misc-const-correctness)
                     bool has_nan = false;
                     for (std::size_t j = lo_idx; j <= i; ++j) {
                         if (!valid_at(j))

@@ -1,7 +1,9 @@
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
-#include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -11,11 +13,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <expected>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -1173,7 +1180,7 @@ void Table::add_column(std::string name, ColumnValue column) {
         columns[it->second].validity.reset();
         return;
     }
-    std::size_t pos = columns.size();
+    const std::size_t pos = columns.size();
     columns.push_back(ColumnEntry{
         .name = std::move(name),
         .column = std::make_shared<ColumnValue>(std::move(column)),
@@ -1188,7 +1195,7 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
         columns[it->second].validity = std::move(validity);
         return;
     }
-    std::size_t pos = columns.size();
+    const std::size_t pos = columns.size();
     columns.push_back(ColumnEntry{
         .name = std::move(name),
         .column = std::make_shared<ColumnValue>(std::move(column)),
@@ -1233,7 +1240,7 @@ void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> col
         columns[it->second].validity = std::move(validity);
         return;
     }
-    std::size_t pos = columns.size();
+    const std::size_t pos = columns.size();
     columns.push_back(ColumnEntry{
         .name = std::move(name),
         .column = std::move(column),

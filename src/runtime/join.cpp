@@ -1,12 +1,22 @@
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <expected>
+#include <functional>
 #include <optional>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -28,7 +38,7 @@ struct KeyHash {
             seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
         };
         for (const auto& value : key.values) {
-            std::size_t h = std::visit(
+            const std::size_t h = std::visit(
                 [](const auto& v) { return std::hash<std::decay_t<decltype(v)>>{}(v); }, value);
             hash_combine(h);
         }
@@ -329,7 +339,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
 
             for (std::size_t c = 0; c < left.columns.size(); ++c) {
-                bool is_key = key_set.contains(left.columns[c].name);
+                const bool is_key = key_set.contains(left.columns[c].name);
                 if (is_key && !key_right_idx.empty()) {
                     // Key columns for unmatched right rows: fill from the right table.
                     const auto* right_key_col = right.find(left.columns[c].name);
@@ -548,7 +558,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             li.reserve(n_left);
             std::vector<std::size_t> ri;  // always kNull for semi/anti
             for (std::size_t l = 0; l < n_left; ++l) {
-                bool has_match = (match_counts[l] > 0);
+                const bool has_match = (match_counts[l] > 0);
                 if ((semi_join && has_match) || (anti_join && !has_match)) {
                     li.push_back(l);
                 }

@@ -1,7 +1,11 @@
 #include <ibex/ir/canonicalize.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 
 #include <algorithm>
+#include <memory>
+#include <robin_hood.h>
+#include <string>
 #include <utility>
 
 namespace ibex::ir {

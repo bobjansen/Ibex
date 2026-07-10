@@ -1,11 +1,16 @@
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 

@@ -1,12 +1,20 @@
 #include <ibex/ir/canonicalize.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/optimizer.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
+#include <memory>
 #include <optional>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace ibex::ir {
 

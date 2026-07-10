@@ -1,3 +1,5 @@
+#include <ibex/core/time.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_format.hpp>
 
 #include <fmt/format.h>
@@ -8,7 +10,14 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <ostream>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::runtime {
@@ -50,7 +59,7 @@ auto normalize_float_text(std::string text) -> std::string {
     while (idx < exponent.size() && exponent[idx] == '0') {
         ++idx;
     }
-    std::string digits = idx < exponent.size() ? exponent.substr(idx) : "0";
+    const std::string digits = idx < exponent.size() ? exponent.substr(idx) : "0";
 
     std::string out = std::move(mantissa);
     out.push_back('e');
@@ -65,19 +74,19 @@ auto normalize_float_text(std::string text) -> std::string {
 
 auto format_date(Date date) -> std::string {
     using namespace std::chrono;
-    sys_days day = sys_days{days{date.days}};
-    year_month_day ymd{day};
+    const sys_days day = sys_days{days{date.days}};
+    const year_month_day ymd{day};
     return fmt::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
                        static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
 }
 
 auto format_timestamp(Timestamp ts) -> std::string {
     using namespace std::chrono;
-    sys_time<nanoseconds> tp{nanoseconds{ts.nanos}};
+    const sys_time<nanoseconds> tp{nanoseconds{ts.nanos}};
     auto day = floor<days>(tp);
-    year_month_day ymd{day};
+    const year_month_day ymd{day};
     auto tod = tp - day;
-    hh_mm_ss<nanoseconds> hms{tod};
+    const hh_mm_ss<nanoseconds> hms{tod};
     return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
                        static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()),
                        hms.hours().count(), hms.minutes().count(), hms.seconds().count(),
@@ -104,7 +113,7 @@ auto quote_and_escape(std::string_view text) -> std::string {
     std::string out;
     out.reserve(text.size() + 2);
     out.push_back('"');
-    for (char ch : text) {
+    for (const char ch : text) {
         switch (ch) {
             case '\\':
                 out.append("\\\\");

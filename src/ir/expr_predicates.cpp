@@ -1,5 +1,9 @@
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 
+#include <robin_hood.h>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <variant>
 

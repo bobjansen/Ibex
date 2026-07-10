@@ -560,7 +560,7 @@ class ChunkedHeadOperator final : public Operator {
 
         const Table t = chunk_to_table(std::move(chunk));
         std::vector<std::size_t> idx(remaining_);
-        std::ranges::iota(idx, std::size_t{0});
+        std::iota(idx.begin(), idx.end(), std::size_t{0});
         remaining_ = 0;
         done_ = true;
         return std::optional<Chunk>{table_to_chunk(gather_rows(t, idx))};
@@ -889,7 +889,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         }
     } else {
         idx.resize(rows);
-        std::ranges::iota(idx, 0);
+        std::iota(idx.begin(), idx.end(), std::size_t{0});
         // pdqsort is unstable, but the comparator's `lhs < rhs` tiebreak makes the
         // order total, so the result matches a stable sort.
         pdqsort(idx.begin(), idx.end(), [&](std::size_t lhs, std::size_t rhs) {
@@ -2122,7 +2122,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 
         if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
             right_kind_ = ExprType::Int;
-            for (const long row : *col) {
+            for (const std::int64_t row : *col) {
                 right_i64_.insert(row);
             }
             return std::nullopt;

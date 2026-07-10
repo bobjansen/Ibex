@@ -1,0 +1,11 @@
+InheritParentConfig: true
+Checks: >
+  -misc-use-anonymous-namespace,
+  -cppcoreguidelines-avoid-do-while,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-special-member-functions,
+  -cert-err58-cpp,
+  -bugprone-exception-escape,
+  -readability-function-cognitive-complexity

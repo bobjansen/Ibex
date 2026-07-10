@@ -7971,3 +7971,296 @@ TEST_CASE("Streaming stddev accumulates moments across chunk boundaries") {
     REQUIRE(sd != nullptr);
     REQUIRE((*sd)[0] == Catch::Approx(1.5811388301));  // std([1,2,3,4,5]) = sqrt(2.5)
 }
+
+// ── Widened streaming aggregates: First / Last ───────────────────────────────
+//
+// Numeric First/Last stream natively in both ChunkedSortedAggregateOperator
+// (group-at-a-time, via accumulate_typed's int_value/double_value slots) and
+// ChunkedAggregateOperator (hash, same slots). String/Categorical First/Last
+// only stream on the hash operator (via AggSlot::first_value/last_value); the
+// sorted operator detects that case and falls back to the hash operator
+// instead of erroring, since it has no group-at-a-time string accumulator.
+
+TEST_CASE("Sorted aggregate streams first/last on numeric input") {
+    runtime::Table t;
+    t.add_column("sym", Column<std::string>{"A", "A", "A", "B", "B", "C"});
+    t.add_column("v", Column<std::int64_t>{10, 20, 30, 5, 6, 100});
+    t.add_column("d", Column<double>{1.5, 2.5, 3.5, 9.0, 8.0, 4.0});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[order sym asc][by sym, select { sym, fi = first(v), la = last(v), fd = first(d), "
+        "ld = last(d) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* sym = std::get_if<Column<std::string>>(result->find("sym"));
+    const auto* fi = std::get_if<Column<std::int64_t>>(result->find("fi"));
+    const auto* la = std::get_if<Column<std::int64_t>>(result->find("la"));
+    const auto* fd = std::get_if<Column<double>>(result->find("fd"));
+    const auto* ld = std::get_if<Column<double>>(result->find("ld"));
+    REQUIRE(sym != nullptr);
+    REQUIRE(fi != nullptr);
+    REQUIRE(la != nullptr);
+    REQUIRE(fd != nullptr);
+    REQUIRE(ld != nullptr);
+
+    REQUIRE((*sym)[0] == "A");
+    REQUIRE((*fi)[0] == 10);
+    REQUIRE((*la)[0] == 30);
+    REQUIRE((*fd)[0] == Catch::Approx(1.5));
+    REQUIRE((*ld)[0] == Catch::Approx(3.5));
+
+    REQUIRE((*sym)[1] == "B");
+    REQUIRE((*fi)[1] == 5);
+    REQUIRE((*la)[1] == 6);
+    REQUIRE((*fd)[1] == Catch::Approx(9.0));
+    REQUIRE((*ld)[1] == Catch::Approx(8.0));
+
+    REQUIRE((*sym)[2] == "C");
+    REQUIRE((*fi)[2] == 100);
+    REQUIRE((*la)[2] == 100);
+}
+
+TEST_CASE("Sorted first/last carries state across a chunk boundary") {
+    // Group "B" straddles the chunk boundary: first(v) must keep the value
+    // seen in chunk 0 (not be overwritten by chunk 1), while last(v) must
+    // advance to the value seen in chunk 1.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    externs.register_chunked_table("sorted_fl_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto c0 = make_str_int_chunk("sym", {"A", "A", "B"}, "v", {1, 2, 10});
+        auto c1 = make_str_int_chunk("sym", {"B", "B", "C"}, "v", {20, 30, 4});
+        const std::vector<ir::OrderKey> ord{ir::OrderKey{.name = "sym", .ascending = true}};
+        c0.ordering = ord;
+        c1.ordering = ord;
+        chunks.push_back(std::move(c0));
+        chunks.push_back(std::move(c1));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn sorted_fl_src() -> DataFrame from \"x.hpp\"; "
+        "sorted_fl_src()[by sym, select { sym, fi = first(v), la = last(v) }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* sym = std::get_if<Column<std::string>>(result->find("sym"));
+    const auto* fi = std::get_if<Column<std::int64_t>>(result->find("fi"));
+    const auto* la = std::get_if<Column<std::int64_t>>(result->find("la"));
+    REQUIRE(sym != nullptr);
+    REQUIRE(fi != nullptr);
+    REQUIRE(la != nullptr);
+    REQUIRE((*sym)[0] == "A");
+    REQUIRE((*fi)[0] == 1);
+    REQUIRE((*la)[0] == 2);
+    REQUIRE((*sym)[1] == "B");
+    REQUIRE((*fi)[1] == 10);  // seen in chunk 0, must not be overwritten
+    REQUIRE((*la)[1] == 30);  // seen in chunk 1
+    REQUIRE((*sym)[2] == "C");
+    REQUIRE((*fi)[2] == 4);
+    REQUIRE((*la)[2] == 4);
+}
+
+TEST_CASE("Sorted first/last skips nulls") {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 1, 1});
+    Column<std::int64_t> v{0, 5, 6, 0};
+    runtime::ValidityBitmap valid;
+    valid.push_back(false);  // leading null — first must skip it
+    valid.push_back(true);   // 5
+    valid.push_back(true);   // 6
+    valid.push_back(false);  // trailing null — last must skip it
+    t.add_column("v", std::move(v), std::move(valid));
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[order k asc][by k, select { k, fi = first(v), la = last(v) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+
+    const auto* fi = std::get_if<Column<std::int64_t>>(result->find("fi"));
+    const auto* la = std::get_if<Column<std::int64_t>>(result->find("la"));
+    REQUIRE(fi != nullptr);
+    REQUIRE(la != nullptr);
+    REQUIRE((*fi)[0] == 5);  // skips the leading null
+    REQUIRE((*la)[0] == 6);  // skips the trailing null
+}
+
+TEST_CASE("Non-numeric first/last on sorted input falls back to the hash operator") {
+    // Input IS sorted on the group key, but the First/Last column is a string:
+    // ChunkedSortedAggregateOperator has no string accumulator, so
+    // needs_hash_fallback() must route this to ChunkedAggregateOperator
+    // instead of erroring out.
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 2, 2, 2});
+    t.add_column("who", Column<std::string>{"alice", "bob", "carol", "dan", "eve"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[order k asc][by k, select { k, fi = first(who), la = last(who) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* k = std::get_if<Column<std::int64_t>>(result->find("k"));
+    const auto* fi = std::get_if<Column<std::string>>(result->find("fi"));
+    const auto* la = std::get_if<Column<std::string>>(result->find("la"));
+    REQUIRE(k != nullptr);
+    REQUIRE(fi != nullptr);
+    REQUIRE(la != nullptr);
+    REQUIRE((*k)[0] == 1);
+    REQUIRE((*fi)[0] == "alice");
+    REQUIRE((*la)[0] == "bob");
+    REQUIRE((*k)[1] == 2);
+    REQUIRE((*fi)[1] == "carol");
+    REQUIRE((*la)[1] == "eve");
+}
+
+TEST_CASE("Categorical first/last streams via the hash aggregate operator") {
+    Column<Categorical> grade;
+    grade.push_back("gold");
+    grade.push_back("silver");
+    grade.push_back("bronze");
+    grade.push_back("gold");
+
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("grade", std::move(grade));
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[by k, select { k, fi = first(grade), la = last(grade) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* fi = std::get_if<Column<Categorical>>(result->find("fi"));
+    const auto* la = std::get_if<Column<Categorical>>(result->find("la"));
+    REQUIRE(fi != nullptr);
+    REQUIRE(la != nullptr);
+    REQUIRE((*fi)[0] == "gold");
+    REQUIRE((*la)[0] == "silver");
+    REQUIRE((*fi)[1] == "bronze");
+    REQUIRE((*la)[1] == "gold");
+}
+
+TEST_CASE("String first/last accumulates across chunk boundaries on the hash path") {
+    // No ordering advertised → the hash ChunkedAggregateOperator handles it;
+    // group 2 spans both chunks, exercising cross-chunk carryover of
+    // flat_slots_'s first_value/last_value.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    auto make_k_who_chunk = [](std::vector<std::int64_t> ks,
+                               std::vector<std::string> whos) -> runtime::Chunk {
+        runtime::Chunk chunk;
+        runtime::ColumnEntry ke;
+        ke.name = "k";
+        ke.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+        auto& kc = std::get<Column<std::int64_t>>(*ke.column);
+        for (auto v : ks) {
+            kc.push_back(v);
+        }
+        chunk.columns.push_back(std::move(ke));
+
+        runtime::ColumnEntry we;
+        we.name = "who";
+        we.column = std::make_shared<runtime::ColumnValue>(Column<std::string>{});
+        auto& wc = std::get<Column<std::string>>(*we.column);
+        for (const auto& v : whos) {
+            wc.push_back(v);
+        }
+        chunk.columns.push_back(std::move(we));
+        return chunk;
+    };
+
+    externs.register_chunked_table("fl_str_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_k_who_chunk({1, 2}, {"x1", "y1"}));
+        chunks.push_back(make_k_who_chunk({2, 1}, {"y2", "x2"}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn fl_str_src() -> DataFrame from \"x.hpp\"; "
+        "fl_str_src()[by k, select { k, fi = first(who), la = last(who) }][order k asc];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto* k = std::get_if<Column<std::int64_t>>(result->find("k"));
+    const auto* fi = std::get_if<Column<std::string>>(result->find("fi"));
+    const auto* la = std::get_if<Column<std::string>>(result->find("la"));
+    REQUIRE(k != nullptr);
+    REQUIRE(fi != nullptr);
+    REQUIRE(la != nullptr);
+    REQUIRE((*k)[0] == 1);
+    REQUIRE((*fi)[0] == "x1");  // seen in chunk 0
+    REQUIRE((*la)[0] == "x2");  // seen in chunk 1, must overwrite
+    REQUIRE((*k)[1] == 2);
+    REQUIRE((*fi)[1] == "y1");
+    REQUIRE((*la)[1] == "y2");
+}
+
+TEST_CASE("Streaming first/last match the materializing path (parity)") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{2, 1, 2, 1, 1, 2});
+    t.add_column("x", Column<std::int64_t>{20, 1, 21, 2, 3, 22});
+    t.add_column("who", Column<std::string>{"p", "a", "q", "b", "c", "r"});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // Streamed: by-itself, first/last is streamable (routes to the hash
+    // operator since there is no `order`).
+    auto streamed = runtime::interpret(
+        *require_ir("t[by g, select { g, fi = first(x), la = last(x), fw = first(who), "
+                    "lw = last(who) }][order g asc];"),
+        registry);
+    // Materialized: adding median forces the whole aggregate node onto the
+    // materializing path, which computes first/last via its own independent
+    // fast-path code (aggregate.cpp).
+    auto materialized = runtime::interpret(
+        *require_ir("t[by g, select { g, fi = first(x), la = last(x), fw = first(who), "
+                    "lw = last(who), md = median(x) }][order g asc];"),
+        registry);
+    REQUIRE(streamed.has_value());
+    REQUIRE(materialized.has_value());
+    REQUIRE(streamed->rows() == 2);
+    REQUIRE(materialized->rows() == 2);
+
+    const auto* fi_s = std::get_if<Column<std::int64_t>>(streamed->find("fi"));
+    const auto* fi_m = std::get_if<Column<std::int64_t>>(materialized->find("fi"));
+    const auto* la_s = std::get_if<Column<std::int64_t>>(streamed->find("la"));
+    const auto* la_m = std::get_if<Column<std::int64_t>>(materialized->find("la"));
+    const auto* fw_s = std::get_if<Column<std::string>>(streamed->find("fw"));
+    const auto* fw_m = std::get_if<Column<std::string>>(materialized->find("fw"));
+    const auto* lw_s = std::get_if<Column<std::string>>(streamed->find("lw"));
+    const auto* lw_m = std::get_if<Column<std::string>>(materialized->find("lw"));
+    REQUIRE(fi_s != nullptr);
+    REQUIRE(fi_m != nullptr);
+    REQUIRE(la_s != nullptr);
+    REQUIRE(la_m != nullptr);
+    REQUIRE(fw_s != nullptr);
+    REQUIRE(fw_m != nullptr);
+    REQUIRE(lw_s != nullptr);
+    REQUIRE(lw_m != nullptr);
+    for (std::size_t i = 0; i < 2; ++i) {
+        REQUIRE((*fi_s)[i] == (*fi_m)[i]);
+        REQUIRE((*la_s)[i] == (*la_m)[i]);
+        REQUIRE((*fw_s)[i] == (*fw_m)[i]);
+        REQUIRE((*lw_s)[i] == (*lw_m)[i]);
+    }
+}

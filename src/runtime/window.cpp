@@ -790,8 +790,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
             *src);
     }
 
-    // rolling_min / rolling_max — O(n·w), monotonic deque not yet implemented.
-    bool is_min = call.callee == "rolling_min";
+    // rolling_min / rolling_max — monotonic deque, O(n) amortised.
+    const bool is_min = call.callee == "rolling_min";
     return std::visit(
         [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
             using ColT = std::decay_t<decltype(col)>;
@@ -803,33 +803,52 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 ColT result;
                 result.resize(rows);
                 std::optional<ValidityBitmap> out_valid;
+                // Array-backed monotonic deque of candidate-extremum row indices,
+                // increasing in index and monotonic in value (front = current
+                // best). Each index is pushed at most once across the whole
+                // scan, so a single `rows`-sized reservation covers every
+                // push_back/pop_back — no per-row work or reallocation, unlike
+                // std::deque's node churn. `dq_head` advances past indices that
+                // slide out of the window; only `dq_head..dq.size()` is live.
+                std::vector<std::size_t> dq;
+                dq.reserve(rows);
+                std::size_t dq_head = 0;
+                std::size_t nan_cnt = 0;  // valid-but-NaN elements currently in window
+                std::size_t lo = 0;
                 for (std::size_t i = 0; i < rows; ++i) {
-                    const std::size_t lo_idx = win_lo(i);
-                    T best{};
-                    bool seen = false;
-                    // Mutated below inside the `if constexpr (is_floating_point_v<T>)`
-                    // branch; the checker misses mutations that only occur there.
-                    // NOLINTNEXTLINE(misc-const-correctness)
-                    bool has_nan = false;
-                    for (std::size_t j = lo_idx; j <= i; ++j) {
-                        if (!valid_at(j))
-                            continue;  // NULL: skip, payload undefined
+                    if (valid_at(i)) {
+                        // Mutated below inside the `if constexpr (is_floating_point_v<T>)`
+                        // branch; the checker misses mutations that only occur there.
+                        // NOLINTNEXTLINE(misc-const-correctness)
+                        bool is_nan_i = false;
                         if constexpr (std::is_floating_point_v<T>) {
-                            if (std::isnan(col[j])) {
-                                has_nan = true;
-                                continue;
-                            }
+                            is_nan_i = std::isnan(col[i]);
                         }
-                        if (!seen || (is_min ? (col[j] < best) : (col[j] > best))) {
-                            best = col[j];
-                            seen = true;
+                        if (is_nan_i) {
+                            ++nan_cnt;
+                        } else {
+                            while (dq_head < dq.size() && (is_min ? (col[dq.back()] >= col[i])
+                                                                  : (col[dq.back()] <= col[i])))
+                                dq.pop_back();
+                            dq.push_back(i);
                         }
                     }
-                    if (has_nan) {
+                    while (lo < i && should_drop(lo, i)) {
+                        if (valid_at(lo)) {
+                            if constexpr (std::is_floating_point_v<T>) {
+                                if (std::isnan(col[lo]))
+                                    --nan_cnt;
+                            }
+                        }
+                        if (dq_head < dq.size() && dq[dq_head] == lo)
+                            ++dq_head;
+                        ++lo;
+                    }
+                    if (nan_cnt > 0) {
                         if constexpr (std::is_floating_point_v<T>)
                             result[i] = std::numeric_limits<T>::quiet_NaN();
-                    } else if (seen) {
-                        result[i] = best;
+                    } else if (dq_head < dq.size()) {
+                        result[i] = col[dq[dq_head]];
                     } else {
                         result[i] = T{};  // window of only nulls -> null
                         if (!out_valid)

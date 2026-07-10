@@ -22,12 +22,8 @@ auto is_simple_identifier(std::string_view name) -> bool {
     if (name.empty()) {
         return false;
     }
-    auto is_alpha = [](unsigned char ch) -> bool {
-        return std::isalpha(ch) != 0;
-    };
-    auto is_alnum = [](unsigned char ch) -> bool {
-        return std::isalnum(ch) != 0;
-    };
+    auto is_alpha = [](unsigned char ch) -> bool { return std::isalpha(ch) != 0; };
+    auto is_alnum = [](unsigned char ch) -> bool { return std::isalnum(ch) != 0; };
     auto first = static_cast<unsigned char>(name.front());
     if (!is_alpha(first) && first != '_') {
         return false;

@@ -2736,9 +2736,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) {
-                return data[r];
-            };
+            auto key_at = [&](std::size_t r) { return data[r]; };
             do_phase1(key_at, i64_heads_);
             do_phase2(key_at, i64_heads_, li, ri);
         } else if (key_kind_ == ExprType::Double) {
@@ -2746,18 +2744,14 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) {
-                return data[r];
-            };
+            auto key_at = [&](std::size_t r) { return data[r]; };
             do_phase1(key_at, f64_heads_);
             do_phase2(key_at, f64_heads_, li, ri);
         } else if (key_kind_ == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            auto key_at = [&](std::size_t r) {
-                return (*col)[r];
-            };
+            auto key_at = [&](std::size_t r) { return (*col)[r]; };
             do_phase1(key_at, bool_heads_);
             do_phase2(key_at, bool_heads_, li, ri);
         } else if (key_kind_ == ExprType::Date) {
@@ -2765,9 +2759,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) {
-                return data[r];
-            };
+            auto key_at = [&](std::size_t r) { return data[r]; };
             do_phase1(key_at, date_heads_);
             do_phase2(key_at, date_heads_, li, ri);
         } else if (key_kind_ == ExprType::Timestamp) {
@@ -2775,9 +2767,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) {
-                return data[r];
-            };
+            auto key_at = [&](std::size_t r) { return data[r]; };
             do_phase1(key_at, ts_heads_);
             do_phase2(key_at, ts_heads_, li, ri);
         } else if (key_kind_ == ExprType::String) {
@@ -2789,9 +2779,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 do_phase1(key_at, string_heads_);
                 do_phase2(key_at, string_heads_, li, ri);
             } else if (const auto* c_str = std::get_if<Column<std::string>>(rkey)) {
-                auto key_at = [&](std::size_t r) {
-                    return (*c_str)[r];
-                };
+                auto key_at = [&](std::size_t r) { return (*c_str)[r]; };
                 do_phase1(key_at, string_heads_);
                 do_phase2(key_at, string_heads_, li, ri);
             } else {
@@ -4182,9 +4170,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     static void accumulate_typed(AggSlot& slot, ir::AggFunc func, const T* data,
                                  const ColumnEntry& entry, bool has_nulls, std::size_t start,
                                  std::size_t end) {
-        const auto valid = [&](std::size_t row) {
-            return !has_nulls || (*entry.validity)[row];
-        };
+        const auto valid = [&](std::size_t row) { return !has_nulls || (*entry.validity)[row]; };
         switch (func) {
             case ir::AggFunc::Sum:
                 for (std::size_t row = start; row < end; ++row) {

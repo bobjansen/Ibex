@@ -401,29 +401,19 @@ struct NumericUpdateNode {
 // compile time. Mirrors apply_round() exactly. Returns nullptr for bad modes.
 auto lookup_round_int_fn(std::string_view mode) -> std::int64_t (*)(double) {
     if (mode == "nearest") {
-        return [](double v) {
-            return static_cast<std::int64_t>(std::llround(v));
-        };
+        return [](double v) { return static_cast<std::int64_t>(std::llround(v)); };
     }
     if (mode == "bankers") {
-        return [](double v) {
-            return static_cast<std::int64_t>(std::llrint(v));
-        };
+        return [](double v) { return static_cast<std::int64_t>(std::llrint(v)); };
     }
     if (mode == "floor") {
-        return [](double v) {
-            return static_cast<std::int64_t>(std::floor(v));
-        };
+        return [](double v) { return static_cast<std::int64_t>(std::floor(v)); };
     }
     if (mode == "ceil") {
-        return [](double v) {
-            return static_cast<std::int64_t>(std::ceil(v));
-        };
+        return [](double v) { return static_cast<std::int64_t>(std::ceil(v)); };
     }
     if (mode == "trunc") {
-        return [](double v) {
-            return static_cast<std::int64_t>(std::trunc(v));
-        };
+        return [](double v) { return static_cast<std::int64_t>(std::trunc(v)); };
     }
     return nullptr;
 }

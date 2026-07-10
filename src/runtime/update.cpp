@@ -1611,7 +1611,10 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                                 "value");
                         }
                     } else if constexpr (std::is_same_v<ValueType, bool>) {
-                        if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
+                        if (const auto* bool_value = std::get_if<bool>(&value.value())) {
+                            col.push_back(*bool_value);
+                        } else if (const auto* int_value =
+                                       std::get_if<std::int64_t>(&value.value())) {
                             col.push_back(*int_value != 0);
                         } else {
                             invariant_violation(

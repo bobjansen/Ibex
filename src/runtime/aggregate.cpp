@@ -1659,33 +1659,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 }
 
 auto parse_aggregate_func(std::string_view name) -> std::optional<ir::AggFunc> {
-    if (name == "sum")
-        return ir::AggFunc::Sum;
-    if (name == "mean")
-        return ir::AggFunc::Mean;
-    if (name == "min")
-        return ir::AggFunc::Min;
-    if (name == "max")
-        return ir::AggFunc::Max;
-    if (name == "count")
-        return ir::AggFunc::Count;
-    if (name == "first")
-        return ir::AggFunc::First;
-    if (name == "last")
-        return ir::AggFunc::Last;
-    if (name == "median")
-        return ir::AggFunc::Median;
-    if (name == "std")
-        return ir::AggFunc::Stddev;
-    if (name == "ewma")
-        return ir::AggFunc::Ewma;
-    if (name == "quantile")
-        return ir::AggFunc::Quantile;
-    if (name == "skew")
-        return ir::AggFunc::Skew;
-    if (name == "kurtosis")
-        return ir::AggFunc::Kurtosis;
-    return std::nullopt;
+    // Registry lookup filtered to the Aggregate kind: the name → AggFunc
+    // mapping lives on the builtin registry entries (expr.cpp), so the
+    // reducing-position checks (expr_contains_aggregate_call & friends) and
+    // the aggregate machinery share one source of truth.
+    const auto* fn = find_builtin(name);
+    if (fn == nullptr || fn->kind != ir::FnKind::Aggregate) {
+        return std::nullopt;
+    }
+    return fn->agg_func;
 }
 
 auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)

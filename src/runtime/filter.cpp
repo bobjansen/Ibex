@@ -1417,15 +1417,14 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
 
 }  // namespace
 
-// Forward declarations: the vectorized predicate evaluator below dispatches the
-// same way the select/update field evaluator does, rather than reimplementing
-// functions. Row-wise calls go to evaluate_field_column (which consults the one
-// scalar-function registry: casts, ceil/floor/trunc, round, math, date parts,
-// pmin/pmax, is_nan); the column-level lag/lead go to eval_lag_lead_column (the
-// same helper select/update uses). Neither is duplicated here.
-
-// Generator builtins (rand_*/rep) come from the function registry; eval_value_vec
-// treats a Generator call as a column leaf so it can be nested inside arithmetic.
+// The vectorized predicate evaluator below dispatches the same way the
+// select/update field evaluator does, rather than reimplementing functions.
+// Row-wise calls go to evaluate_field_column (which consults the builtin
+// registry's Scalar entries: casts, ceil/floor/trunc, round, math, date parts,
+// pmin/pmax, is_nan); whole-column builtins (Transform/Generator — rolling,
+// cum, lag/lead, fill, rand_*, rep) dispatch through the same registry's
+// column_eval, so eval_value_vec treats them as column leaves that can nest
+// inside arithmetic. Nothing is duplicated here.
 
 // Boolean predicate evaluator (comparisons, logical, is_null). eval_value_vec
 // routes boolean-producing nodes here so a Bool result can be used in value
@@ -1527,12 +1526,18 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 return res;
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 if (const auto* fn = find_builtin(node.callee);
-                    fn != nullptr && fn->kind == ir::FnKind::Generator) {
-                    // Generator (rand_* / rep) as a column leaf — lets a
-                    // generated column be nested inside arithmetic (e.g.
-                    // `t + rand_normal(0, 1)`), using the same vectorized
-                    // kernel as a bare generator field.
-                    auto col = fn->column_eval(node, table, n);
+                    fn != nullptr && fn->column_eval != nullptr) {
+                    // Whole-column builtin (Transform/Generator) as a column
+                    // leaf — lets rolling/cum/lag/fill and rand_*/rep nest
+                    // inside arithmetic (e.g. `px - rolling_mean(px, 20)` or
+                    // `t + rand_normal(0, 1)`), using the same kernels as a
+                    // bare field. Externs are not threaded into this evaluator
+                    // (same as scalar calls below); no enclosing `window`
+                    // clause reaches here, so rolling_* needs a per-call
+                    // window argument.
+                    const ColumnEvalCtx ctx{
+                        .scalars = scalars, .externs = nullptr, .window = std::nullopt};
+                    auto col = fn->column_eval(node, table, n, ctx);
                     if (!col) {
                         return std::unexpected(col.error());
                     }
@@ -1603,38 +1608,26 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                         },
                         deref_col(cols[0]));
                 }
-                if (node.callee != "lag" && node.callee != "lead") {
-                    // A scalar call (abs, sqrt, casts, round, pmin/pmax, date
-                    // parts, …). If any argument nests a non-row-local
-                    // sub-expression (RNG / lag / lead / a boolean node), the
-                    // per-row evaluator can't produce it — materialize those
-                    // arguments into columns first, then apply the scalar
-                    // function over them (e.g. `abs(rand_normal(0, 1))`).
-                    const bool args_need_vec = std::ranges::any_of(
-                        node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
-                    if (args_need_vec) {
-                        return eval_scalar_over_columns(node, table, scalars, n);
-                    }
-                    // Otherwise delegate to the row-wise field evaluator, which
-                    // dispatches through the shared scalar registry. Extern
-                    // scalar functions are not available in predicate position
-                    // (externs are not threaded into this vectorized evaluator).
-                    auto col = evaluate_field_column(expr, table, scalars, nullptr);
-                    if (!col) {
-                        return std::unexpected(col.error());
-                    }
-                    return ColResult{std::move(*col)};
+                // A scalar call (abs, sqrt, casts, round, pmin/pmax, date
+                // parts, …). If any argument nests a non-row-local
+                // sub-expression (a Transform/Generator call or a boolean
+                // node), the per-row evaluator can't produce it — materialize
+                // those arguments into columns first, then apply the scalar
+                // function over them (e.g. `abs(rand_normal(0, 1))`).
+                const bool args_need_vec = std::ranges::any_of(
+                    node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
+                if (args_need_vec) {
+                    return eval_scalar_over_columns(node, table, scalars, n);
                 }
-                // lag/lead are column-level shifts (each output row reads a
-                // different input row), so they cannot go through the row-wise
-                // registry. Delegate to the same helper select/update uses rather
-                // than reimplementing the shift here.
-                auto shifted =
-                    eval_lag_lead_column(node, table, node.callee == "lag", scalars, nullptr);
-                if (!shifted) {
-                    return std::unexpected(shifted.error());
+                // Otherwise delegate to the row-wise field evaluator, which
+                // dispatches through the shared scalar registry. Extern
+                // scalar functions are not available in predicate position
+                // (externs are not threaded into this vectorized evaluator).
+                auto col = evaluate_field_column(expr, table, scalars, nullptr);
+                if (!col) {
+                    return std::unexpected(col.error());
                 }
-                return ColResult{std::move(shifted->column), std::move(shifted->validity)};
+                return ColResult{std::move(*col)};
             } else if constexpr (std::is_same_v<T, ir::CompareExpr> ||
                                  std::is_same_v<T, ir::LogicalExpr> ||
                                  std::is_same_v<T, ir::IsNullExpr>) {

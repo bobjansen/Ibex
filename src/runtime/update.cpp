@@ -1016,79 +1016,6 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     }
     for (const auto& field : fields) {
         if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
-            if (is_rolling_func(call->callee)) {
-                // A per-call window arg (rolling_mean(px, 20) / (px, 5s)) overrides
-                // the enclosing `window` clause's duration.
-                auto spec = rolling_window_spec(*call, duration);
-                if (!spec) {
-                    return std::unexpected(spec.error());
-                }
-                auto col = apply_rolling_func(*call, output, *spec);
-                if (!col) {
-                    return std::unexpected(col.error());
-                }
-                if (col->validity.has_value()) {
-                    output.add_column(field.alias, std::move(col->column),
-                                      std::move(*col->validity));
-                } else {
-                    output.add_column(field.alias, std::move(col->column));
-                }
-                continue;
-            }
-            if (call->callee == "lag" || call->callee == "lead") {
-                auto res =
-                    eval_lag_lead_column(*call, output, call->callee == "lag", scalars, externs);
-                if (!res) {
-                    return std::unexpected(res.error());
-                }
-                if (res->validity.has_value()) {
-                    output.add_column(field.alias, std::move(res->column),
-                                      std::move(*res->validity));
-                } else {
-                    output.add_column(field.alias, std::move(res->column));
-                }
-                continue;
-            }
-            if (is_cum_func(call->callee)) {
-                auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");
-                if (!col)
-                    return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
-                continue;
-            }
-            if (is_fill_func(call->callee)) {
-                auto res = [&] -> std::expected<FillResult, std::string> {
-                    if (call->callee == "fill_null") {
-                        return eval_fill_null(*call, output);
-                    }
-                    if (call->callee == "fill_forward") {
-                        return eval_fill_forward(*call, output);
-                    }
-                    return eval_fill_backward(*call, output);
-                }();
-                if (!res)
-                    return std::unexpected(res.error());
-                if (res->validity)
-                    output.add_column(field.alias, std::move(res->column),
-                                      std::move(*res->validity));
-                else
-                    output.add_column(field.alias, std::move(res->column));
-                continue;
-            }
-            if (is_float_clean_func(call->callee)) {
-                auto res = eval_float_clean(*call, output,
-                                            call->callee == "null_if_nan"
-                                                ? FloatCleanMode::NullIfNan
-                                                : FloatCleanMode::NullIfNotFinite);
-                if (!res)
-                    return std::unexpected(res.error());
-                if (res->validity)
-                    output.add_column(field.alias, std::move(res->column),
-                                      std::move(*res->validity));
-                else
-                    output.add_column(field.alias, std::move(res->column));
-                continue;
-            }
             if (call->callee == "is_nan") {
                 auto col = eval_is_nan(*call, output);
                 if (!col)
@@ -1096,9 +1023,13 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+            // Whole-column builtins (Transform/Generator) dispatch through the
+            // registry. ctx.window carries the enclosing `window` clause's
+            // duration as the rolling_* fallback (a per-call window overrides).
             if (const auto* fn = find_builtin(call->callee);
-                fn != nullptr && fn->kind == ir::FnKind::Generator) {
-                auto col = fn->column_eval(*call, output, output.rows());
+                fn != nullptr && fn->column_eval != nullptr) {
+                const ColumnEvalCtx ctx{.scalars = scalars, .externs = externs, .window = duration};
+                auto col = fn->column_eval(*call, output, output.rows(), ctx);
                 if (!col)
                     return std::unexpected(col.error());
                 if (col->validity.has_value())
@@ -1398,80 +1329,6 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     std::size_t rows = output.rows();
     for (const auto& field : fields) {
         if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
-            if (call->callee == "lag" || call->callee == "lead") {
-                auto res =
-                    eval_lag_lead_column(*call, output, call->callee == "lag", scalars, externs);
-                if (!res) {
-                    return std::unexpected(res.error());
-                }
-                if (res->validity.has_value()) {
-                    output.add_column(field.alias, std::move(res->column),
-                                      std::move(*res->validity));
-                } else {
-                    output.add_column(field.alias, std::move(res->column));
-                }
-                continue;
-            }
-            if (is_rolling_func(call->callee)) {
-                // No enclosing `window` clause here — only a per-call window arg
-                // can supply the span. A count window needs no TimeFrame; a
-                // duration window is rejected downstream if the frame isn't one.
-                auto spec = rolling_window_spec(*call, std::nullopt);
-                if (!spec) {
-                    return std::unexpected(spec.error());
-                }
-                auto col = apply_rolling_func(*call, output, *spec);
-                if (!col) {
-                    return std::unexpected(col.error());
-                }
-                if (col->validity.has_value()) {
-                    output.add_column(field.alias, std::move(col->column),
-                                      std::move(*col->validity));
-                } else {
-                    output.add_column(field.alias, std::move(col->column));
-                }
-                continue;
-            }
-            if (is_cum_func(call->callee)) {
-                auto col = eval_cumsum_cumprod_column(*call, output, call->callee == "cumprod");
-                if (!col)
-                    return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
-                continue;
-            }
-            if (is_fill_func(call->callee)) {
-                auto res = [&] -> std::expected<FillResult, std::string> {
-                    if (call->callee == "fill_null") {
-                        return eval_fill_null(*call, output);
-                    }
-                    if (call->callee == "fill_forward") {
-                        return eval_fill_forward(*call, output);
-                    }
-                    return eval_fill_backward(*call, output);
-                }();
-                if (!res)
-                    return std::unexpected(res.error());
-                if (res->validity)
-                    output.add_column(field.alias, std::move(res->column),
-                                      std::move(*res->validity));
-                else
-                    output.add_column(field.alias, std::move(res->column));
-                continue;
-            }
-            if (is_float_clean_func(call->callee)) {
-                auto res = eval_float_clean(*call, output,
-                                            call->callee == "null_if_nan"
-                                                ? FloatCleanMode::NullIfNan
-                                                : FloatCleanMode::NullIfNotFinite);
-                if (!res)
-                    return std::unexpected(res.error());
-                if (res->validity)
-                    output.add_column(field.alias, std::move(res->column),
-                                      std::move(*res->validity));
-                else
-                    output.add_column(field.alias, std::move(res->column));
-                continue;
-            }
             if (call->callee == "is_nan") {
                 auto col = eval_is_nan(*call, output);
                 if (!col)
@@ -1479,9 +1336,14 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
+            // Whole-column builtins (Transform/Generator) dispatch through the
+            // registry. No enclosing `window` clause here, so ctx.window stays
+            // empty — only a per-call window arg can supply a rolling span.
             if (const auto* fn = find_builtin(call->callee);
-                fn != nullptr && fn->kind == ir::FnKind::Generator) {
-                auto col = fn->column_eval(*call, output, rows);
+                fn != nullptr && fn->column_eval != nullptr) {
+                const ColumnEvalCtx ctx{
+                    .scalars = scalars, .externs = externs, .window = std::nullopt};
+                auto col = fn->column_eval(*call, output, rows, ctx);
                 if (!col)
                     return std::unexpected(col.error());
                 if (col->validity.has_value())

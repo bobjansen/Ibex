@@ -250,12 +250,22 @@ struct BroadcastAggregateColumn {
     std::optional<ValidityBitmap> validity;
 };
 
+// Evaluation context threaded to whole-column builtins. Generators ignore it;
+// Transforms need the scalar/extern registries (lag/lead default arguments)
+// and, for rolling_*, the enclosing `window` clause's duration (a per-call
+// window argument overrides it; with neither the kernel errors).
+struct ColumnEvalCtx {
+    const ScalarRegistry* scalars = nullptr;
+    const ExternRegistry* externs = nullptr;
+    std::optional<ir::Duration> window;
+};
+
 // Builtin function registry entry (registry lives in expr.cpp; type inference
 // and evaluation dispatch through it). Generalizes the former scalar-only
 // registry per plans/function-kind-registry-plan.md: every builtin declares its
 // `kind` plus a kind-appropriate evaluator — `eval` for row-local Scalar
-// builtins, `column_eval` for whole-column kinds (Generator now; Transform to
-// follow). Exactly one of the two eval pointers is set.
+// builtins, `column_eval` for whole-column kinds (Generator and Transform;
+// Aggregate to follow). Exactly one of the two eval pointers is set.
 struct BuiltinFn {
     ir::FnKind kind = ir::FnKind::Scalar;
     int min_args = 1;
@@ -265,9 +275,11 @@ struct BuiltinFn {
     std::expected<ExprValue, std::string> (*eval)(std::string_view,
                                                   const std::vector<ExprValue>&){};
     // Whole-column evaluation (Generator/Transform): the raw call (for arg
-    // literals / named args), the input table, and the output row count.
+    // literals / named args), the input table, the output row count, and the
+    // evaluation context.
     std::expected<ComputedColumn, std::string> (*column_eval)(const ir::CallExpr&, const Table&,
-                                                              std::size_t rows){};
+                                                              std::size_t rows,
+                                                              const ColumnEvalCtx&){};
 };
 
 // ── Inline helpers shared by per-row/per-group loops in several TUs ──────────
@@ -594,16 +606,6 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
 
 // expr.cpp — builtin-function registry, type inference, per-row and per-field
 // expression evaluation, lag/lead/fill/cum transforms, RNG/rep generators.
-using ir::is_cum_func;
-using ir::is_rolling_func;
-
-constexpr auto is_fill_func(std::string_view name) -> bool {
-    return name == "fill_null" || name == "fill_forward" || name == "fill_backward";
-}
-
-constexpr auto is_float_clean_func(std::string_view name) -> bool {
-    return name == "null_if_nan" || name == "null_if_not_finite";
-}
 
 struct FillResult {
     ColumnValue column;

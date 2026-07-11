@@ -310,7 +310,7 @@ spill correct and tested first.
 - **`plans/runtime-multithreading-plan.md`** intersects only at Phase 7
   (stretch). Everything else in this plan is orthogonal to thread count —
   do not block spill correctness work on multithreading landing first.
-- **`plans/function-kind-registry-plan.md`** is unrelated in mechanism but
+- **`plans/done/function-kind-registry-plan.md`** is unrelated in mechanism but
   shares a design principle worth keeping consistent: both prefer a single
   reactive dispatch point (budget-crossed → spill; expression shape →
   FnKind) over scattered conditionals, so operator-selection code added in

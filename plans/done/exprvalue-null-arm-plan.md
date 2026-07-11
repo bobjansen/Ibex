@@ -1,5 +1,11 @@
 # ExprValue null arm: one null model for the per-row evaluator
 
+Status (2026-07-11): implemented. The per-row evaluator now carries `Null`,
+`NullPolicy` centralizes propagation, null-handling scalars compose through the
+scalar path, and aggregate scalar collapse/broadcast no longer reads undefined
+payloads. `ScalarValue` remains intentionally null-free at the REPL binding
+boundary.
+
 ## Motivation
 
 The per-row value type has no null. `ExprValue` is
@@ -173,17 +179,12 @@ Each stage shippable, suite green throughout:
 
 ## Open Questions
 
-- `Null` as `std::monostate` vs a named tag type (named reads better in
-  diagnostics; monostate avoids a definition).
-- Should `Propagate` be enforced for *extern* scalar functions too (extern
-  eval never sees null), or do externs need an opt-in `Handles`?
+- Extern scalar null handling policy is still the main future design choice:
+  today extern scalar calls inherit the null-propagating row-local path rather
+  than receiving `Null` values directly.
 - Does `rep()` of a null-bearing pattern (array literal with null, once
   literals can be null) need `Handles` at the Generator level? Currently
   unreachable — literals cannot be null.
-- Ordering with the FnKind-registry follow-ups: this plan supersedes the
-  "validity-aware ⇒ Transform" workaround; any new validity-aware builtin
-  added before this lands should follow the workaround, not pre-implement
-  half of this.
 
 ## Related
 

@@ -8,6 +8,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,7 @@
 #include <limits>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -69,6 +71,80 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
     }
     return lo;
 }
+
+class IndexRingDeque {
+   public:
+    explicit IndexRingDeque(std::size_t initial_capacity = 0) {
+        if (initial_capacity > 0) {
+            auto cap = next_power_of_two(initial_capacity);
+            if (!cap.has_value())
+                throw std::length_error("rolling_min/max deque capacity overflow");
+            buf_.resize(*cap);
+        }
+    }
+
+    [[nodiscard]] auto empty() const noexcept -> bool { return size_ == 0; }
+    [[nodiscard]] auto front() const noexcept -> std::size_t { return buf_[head_]; }
+    [[nodiscard]] auto back() const noexcept -> std::size_t {
+        return buf_[(head_ + size_ - 1) & mask()];
+    }
+
+    void pop_front() noexcept {
+        head_ = (head_ + 1) & mask();
+        --size_;
+        if (size_ == 0) {
+            head_ = 0;
+        }
+    }
+
+    void pop_back() noexcept {
+        --size_;
+        if (size_ == 0) {
+            head_ = 0;
+        }
+    }
+
+    void push_back(std::size_t value) {
+        if (size_ == buf_.size())
+            grow_and_linearize();
+        buf_[(head_ + size_) & mask()] = value;
+        ++size_;
+    }
+
+   private:
+    [[nodiscard]] static constexpr auto next_power_of_two(std::size_t n)
+        -> std::optional<std::size_t> {
+        constexpr auto max_power = std::size_t{1} << (std::numeric_limits<std::size_t>::digits - 1);
+        if (n > max_power)
+            return std::nullopt;
+        return std::bit_ceil(n);
+    }
+
+    [[nodiscard]] auto mask() const noexcept -> std::size_t { return buf_.size() - 1; }
+
+    void grow_and_linearize() {
+        const std::size_t old_cap = buf_.size();
+        if (old_cap == 0) {
+            buf_.resize(16);
+            return;
+        }
+        if (old_cap > (std::numeric_limits<std::size_t>::max() / 2)) {
+            throw std::length_error("rolling_min/max deque capacity overflow");
+        }
+        const std::size_t new_cap = old_cap * 2;
+        std::vector<std::size_t> next(new_cap);
+        const std::size_t first_count = std::min(size_, old_cap - head_);
+        std::copy_n(buf_.begin() + static_cast<std::ptrdiff_t>(head_), first_count, next.begin());
+        std::copy_n(buf_.begin(), size_ - first_count,
+                    next.begin() + static_cast<std::ptrdiff_t>(first_count));
+        buf_ = std::move(next);
+        head_ = 0;
+    }
+
+    std::vector<std::size_t> buf_;
+    std::size_t head_ = 0;
+    std::size_t size_ = 0;
+};
 
 }  // namespace
 
@@ -801,58 +877,56 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 ColT result;
                 result.resize(rows);
                 std::optional<ValidityBitmap> out_valid;
-                // Array-backed monotonic deque of candidate-extremum row indices,
-                // increasing in index and monotonic in value (front = current
-                // best). Each index is pushed at most once across the whole
-                // scan, so a single `rows`-sized reservation covers every
-                // push_back/pop_back — no per-row work or reallocation, unlike
-                // std::deque's node churn. `dq_head` advances past indices that
-                // slide out of the window; only `dq_head..dq.size()` is live.
-                std::vector<std::size_t> dq;
-                dq.reserve(rows);
-                std::size_t dq_head = 0;
-                std::size_t nan_cnt = 0;  // valid-but-NaN elements currently in window
-                std::size_t lo = 0;
-                for (std::size_t i = 0; i < rows; ++i) {
-                    if (valid_at(i)) {
-                        // Mutated below inside the `if constexpr (is_floating_point_v<T>)`
-                        // branch; the checker misses mutations that only occur there.
-                        // NOLINTNEXTLINE(misc-const-correctness)
-                        bool is_nan_i = false;
-                        if constexpr (std::is_floating_point_v<T>) {
-                            is_nan_i = std::isnan(col[i]);
-                        }
-                        if (is_nan_i) {
-                            ++nan_cnt;
-                        } else {
-                            while (dq_head < dq.size() && (is_min ? (col[dq.back()] >= col[i])
-                                                                  : (col[dq.back()] <= col[i])))
-                                dq.pop_back();
-                            dq.push_back(i);
-                        }
-                    }
-                    while (lo < i && should_drop(lo, i)) {
-                        if (valid_at(lo)) {
+                // Array-backed monotonic deque of candidate-extremum row indices.
+                // It reuses expired front slots, so memory tracks the live window
+                // width instead of total input rows.
+                try {
+                    IndexRingDeque dq(is_count ? std::min(count_n, rows) : 0);
+                    std::size_t nan_cnt = 0;  // valid-but-NaN elements currently in window
+                    std::size_t lo = 0;
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        if (valid_at(i)) {
+                            // Mutated below inside the `if constexpr (is_floating_point_v<T>)`
+                            // branch; the checker misses mutations that only occur there.
+                            // NOLINTNEXTLINE(misc-const-correctness)
+                            bool is_nan_i = false;
                             if constexpr (std::is_floating_point_v<T>) {
-                                if (std::isnan(col[lo]))
-                                    --nan_cnt;
+                                is_nan_i = std::isnan(col[i]);
+                            }
+                            if (is_nan_i) {
+                                ++nan_cnt;
+                            } else {
+                                while (!dq.empty() && (is_min ? (col[dq.back()] >= col[i])
+                                                              : (col[dq.back()] <= col[i])))
+                                    dq.pop_back();
+                                dq.push_back(i);
                             }
                         }
-                        if (dq_head < dq.size() && dq[dq_head] == lo)
-                            ++dq_head;
-                        ++lo;
+                        while (lo < i && should_drop(lo, i)) {
+                            if (valid_at(lo)) {
+                                if constexpr (std::is_floating_point_v<T>) {
+                                    if (std::isnan(col[lo]))
+                                        --nan_cnt;
+                                }
+                            }
+                            if (!dq.empty() && dq.front() == lo)
+                                dq.pop_front();
+                            ++lo;
+                        }
+                        if (nan_cnt > 0) {
+                            if constexpr (std::is_floating_point_v<T>)
+                                result[i] = std::numeric_limits<T>::quiet_NaN();
+                        } else if (!dq.empty()) {
+                            result[i] = col[dq.front()];
+                        } else {
+                            result[i] = T{};  // window of only nulls -> null
+                            if (!out_valid)
+                                out_valid.emplace(rows, true);
+                            out_valid->set(i, false);
+                        }
                     }
-                    if (nan_cnt > 0) {
-                        if constexpr (std::is_floating_point_v<T>)
-                            result[i] = std::numeric_limits<T>::quiet_NaN();
-                    } else if (dq_head < dq.size()) {
-                        result[i] = col[dq[dq_head]];
-                    } else {
-                        result[i] = T{};  // window of only nulls -> null
-                        if (!out_valid)
-                            out_valid.emplace(rows, true);
-                        out_valid->set(i, false);
-                    }
+                } catch (const std::length_error& e) {
+                    return std::unexpected(std::string(e.what()));
                 }
                 return ComputedColumn{std::move(result), std::move(out_valid)};
             }

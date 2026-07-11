@@ -2389,6 +2389,118 @@ TEST_CASE("rolling_min and rolling_max with 1ns window") {
     REQUIRE((*mx)[2] == 20);  // max(10,20)
 }
 
+TEST_CASE("rolling_min and rolling_max handle sparse and full time windows", "[rolling][window]") {
+    runtime::Table sparse;
+    sparse.add_column("ts",
+                      Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10), ts_from_nanos(20)});
+    sparse.add_column("val", Column<std::int64_t>{30, 10, 20});
+    sparse.time_index = "ts";
+
+    runtime::Table full;
+    Column<Timestamp> ts;
+    Column<std::int64_t> val;
+    for (std::int64_t i = 0; i < 64; ++i) {
+        ts.push_back(ts_from_nanos(i));
+        val.push_back(64 - i);
+    }
+    full.add_column("ts", std::move(ts));
+    full.add_column("val", std::move(val));
+    full.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("sparse", sparse);
+    registry.emplace("full", full);
+
+    auto sparse_ir =
+        require_ir("sparse[window 1ns, update { mn = rolling_min(val), mx = rolling_max(val) }];");
+    auto sparse_res = runtime::interpret(*sparse_ir, registry);
+    REQUIRE(sparse_res.has_value());
+    const auto* sparse_mn = std::get_if<Column<std::int64_t>>(sparse_res->find("mn"));
+    const auto* sparse_mx = std::get_if<Column<std::int64_t>>(sparse_res->find("mx"));
+    REQUIRE(sparse_mn != nullptr);
+    REQUIRE(sparse_mx != nullptr);
+    CHECK((*sparse_mn)[0] == 30);
+    CHECK((*sparse_mn)[1] == 10);
+    CHECK((*sparse_mn)[2] == 20);
+    CHECK((*sparse_mx)[0] == 30);
+    CHECK((*sparse_mx)[1] == 10);
+    CHECK((*sparse_mx)[2] == 20);
+
+    auto full_ir =
+        require_ir("full[window 1000ns, update { mn = rolling_min(val), mx = rolling_max(val) }];");
+    auto full_res = runtime::interpret(*full_ir, registry);
+    REQUIRE(full_res.has_value());
+    const auto* full_mn = std::get_if<Column<std::int64_t>>(full_res->find("mn"));
+    const auto* full_mx = std::get_if<Column<std::int64_t>>(full_res->find("mx"));
+    REQUIRE(full_mn != nullptr);
+    REQUIRE(full_mx != nullptr);
+    CHECK((*full_mn)[0] == 64);
+    CHECK((*full_mx)[0] == 64);
+    CHECK((*full_mn)[63] == 1);
+    CHECK((*full_mx)[63] == 64);
+}
+
+TEST_CASE("rolling_min and rolling_max return null for all-null time windows",
+          "[rolling][window][null]") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10)});
+    table.add_column("val", Column<double>{1e300, 2e300}, runtime::ValidityBitmap{false, false});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir =
+        require_ir("data[window 1ns, update { mn = rolling_min(val), mx = rolling_max(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* mn_entry = result->find_entry("mn");
+    const auto* mx_entry = result->find_entry("mx");
+    REQUIRE(mn_entry != nullptr);
+    REQUIRE(mx_entry != nullptr);
+    REQUIRE(mn_entry->validity.has_value());
+    REQUIRE(mx_entry->validity.has_value());
+    CHECK(runtime::is_null(*mn_entry, 0));
+    CHECK(runtime::is_null(*mn_entry, 1));
+    CHECK(runtime::is_null(*mx_entry, 0));
+    CHECK(runtime::is_null(*mx_entry, 1));
+}
+
+TEST_CASE("rolling_min and rolling_max reuse deque storage for small count windows",
+          "[rolling][window]") {
+    runtime::Table table;
+    Column<std::int64_t> val;
+    for (std::int64_t i = 0; i < 4096; ++i)
+        val.push_back((i * 37) % 101);
+    table.add_column("val", std::move(val));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { mn = rolling_min(val, 3), mx = rolling_max(val, 3) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* mn = std::get_if<Column<std::int64_t>>(result->find("mn"));
+    const auto* mx = std::get_if<Column<std::int64_t>>(result->find("mx"));
+    const auto* src = std::get_if<Column<std::int64_t>>(table.find("val"));
+    REQUIRE(mn != nullptr);
+    REQUIRE(mx != nullptr);
+    REQUIRE(src != nullptr);
+
+    for (std::size_t i = 0; i < src->size(); ++i) {
+        const std::size_t lo = i >= 2 ? i - 2 : 0;
+        std::int64_t expected_min = (*src)[lo];
+        std::int64_t expected_max = (*src)[lo];
+        for (std::size_t j = lo + 1; j <= i; ++j) {
+            expected_min = std::min(expected_min, (*src)[j]);
+            expected_max = std::max(expected_max, (*src)[j]);
+        }
+        CHECK((*mn)[i] == expected_min);
+        CHECK((*mx)[i] == expected_max);
+    }
+}
+
 // --- resample tests -----------------------------------------------------------
 
 TEST_CASE("resample basic OHLC - 3 two-minute buckets") {

@@ -998,8 +998,21 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std:
     return ColumnValue{std::move(out)};
 }
 
-// Like update_table but evaluates rolling aggregate expressions using the given window duration.
-// Non-rolling fields are evaluated via evaluate_field_column (same as regular update_table).
+namespace {
+
+// Append a computed field column, carrying its validity bitmap when present.
+auto add_computed_column(Table& table, const std::string& alias, ComputedColumn col) -> void {
+    if (col.validity.has_value()) {
+        table.add_column(alias, std::move(col.column), std::move(*col.validity));
+    } else {
+        table.add_column(alias, std::move(col.column));
+    }
+}
+
+}  // namespace
+
+// Like update_table but passes the window clause's duration to the shared
+// field evaluator, so rolling aggregates without a per-call window use it.
 auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                            ir::Duration duration, const ScalarRegistry* scalars,
                            const ExternRegistry* externs) -> std::expected<Table, std::string> {
@@ -1015,31 +1028,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
         }
     }
     for (const auto& field : fields) {
-        if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
-            if (call->callee == "is_nan") {
-                auto col = eval_is_nan(*call, output);
-                if (!col)
-                    return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
-                continue;
-            }
-            // Whole-column builtins (Transform/Generator) dispatch through the
-            // registry. ctx.window carries the enclosing `window` clause's
-            // duration as the rolling_* fallback (a per-call window overrides).
-            if (const auto* fn = find_builtin(call->callee);
-                fn != nullptr && fn->column_eval != nullptr) {
-                const ColumnEvalCtx ctx{.scalars = scalars, .externs = externs, .window = duration};
-                auto col = fn->column_eval(*call, output, output.rows(), ctx);
-                if (!col)
-                    return std::unexpected(col.error());
-                if (col->validity.has_value())
-                    output.add_column(field.alias, std::move(col->column),
-                                      std::move(*col->validity));
-                else
-                    output.add_column(field.alias, std::move(col->column));
-                continue;
-            }
-        } else if (std::holds_alternative<ir::RankExpr>(field.expr.node)) {
+        if (std::holds_alternative<ir::RankExpr>(field.expr.node)) {
             return std::unexpected("rank(): not supported inside windowed update");
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
@@ -1060,11 +1049,16 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
             }
             return std::unexpected("unknown column '" + col_ref->name + "'");
         }
-        auto col = evaluate_field_column(field.expr, output, scalars, externs);
+        // Shared field evaluator; ctx.window carries the enclosing `window`
+        // clause's duration as the rolling_* fallback (a per-call window
+        // overrides it).
+        auto col = evaluate_field(
+            field.expr, output,
+            ColumnEvalCtx{.scalars = scalars, .externs = externs, .window = duration});
         if (!col) {
             return std::unexpected(col.error());
         }
-        output.add_column(field.alias, std::move(col.value()));
+        add_computed_column(output, field.alias, std::move(*col));
     }
     normalize_time_index(output);
     return output;
@@ -1328,41 +1322,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     }
     std::size_t rows = output.rows();
     for (const auto& field : fields) {
-        if (const auto* call = std::get_if<ir::CallExpr>(&field.expr.node)) {
-            if (call->callee == "is_nan") {
-                auto col = eval_is_nan(*call, output);
-                if (!col)
-                    return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
-                continue;
-            }
-            // Whole-column builtins (Transform/Generator) dispatch through the
-            // registry. No enclosing `window` clause here, so ctx.window stays
-            // empty — only a per-call window arg can supply a rolling span.
-            if (const auto* fn = find_builtin(call->callee);
-                fn != nullptr && fn->column_eval != nullptr) {
-                const ColumnEvalCtx ctx{
-                    .scalars = scalars, .externs = externs, .window = std::nullopt};
-                auto col = fn->column_eval(*call, output, rows, ctx);
-                if (!col)
-                    return std::unexpected(col.error());
-                if (col->validity.has_value())
-                    output.add_column(field.alias, std::move(col->column),
-                                      std::move(*col->validity));
-                else
-                    output.add_column(field.alias, std::move(col->column));
-                continue;
-            }
-        } else if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {
+        if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {
             auto res = evaluate_rank_column(output, *rank, {});
             if (!res) {
                 return std::unexpected(res.error());
             }
-            if (res->validity.has_value()) {
-                output.add_column(field.alias, std::move(res->column), std::move(*res->validity));
-            } else {
-                output.add_column(field.alias, std::move(res->column));
-            }
+            add_computed_column(output, field.alias, std::move(*res));
             continue;
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
@@ -1383,140 +1348,18 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
             return std::unexpected("unknown column '" + col_ref->name + "'");
         }
-        auto inferred = infer_expr_type(field.expr, output, scalars, externs);
-        if (!inferred) {
-            return std::unexpected(inferred.error());
+        // Everything else — whole-column builtins, vectorized validity-aware
+        // fields, the numeric fast path, the per-row loop — goes through the
+        // shared field evaluator. No enclosing `window` clause here, so
+        // ctx.window stays empty (only a per-call window arg can supply a
+        // rolling span).
+        auto col = evaluate_field(
+            field.expr, output,
+            ColumnEvalCtx{.scalars = scalars, .externs = externs, .window = std::nullopt});
+        if (!col) {
+            return std::unexpected(col.error());
         }
-        // Validity-/boolean-aware fields (comparisons, logical, is_null,
-        // coalesce) and RNG-in-arithmetic go through the vectorized path. See
-        // evaluate_field_column for the same routing.
-        if (field_uses_vectorized_eval(field.expr)) {
-            auto res = eval_value_vec(field.expr, output, scalars, rows);
-            if (!res) {
-                return std::unexpected(res.error());
-            }
-            ColumnValue col;
-            if (auto* v = std::get_if<ColumnValue>(&res->data)) {
-                col = std::move(*v);
-            } else {
-                col = *std::get<const ColumnValue*>(res->data);
-            }
-            if (const auto* v = res->get_validity()) {
-                output.add_column(field.alias, std::move(col), *v);
-            } else {
-                output.add_column(field.alias, std::move(col));
-            }
-            continue;
-        }
-        if (auto fast =
-                try_fast_update_numeric_expr(field.expr, output, rows, inferred.value(), scalars);
-            fast.has_value()) {
-            auto validity = collect_expr_validity(field.expr, output, rows);
-            if (validity.has_value())
-                output.add_column(field.alias, std::move(fast.value()), std::move(*validity));
-            else
-                output.add_column(field.alias, std::move(fast.value()));
-            continue;
-        }
-        ColumnValue new_column;
-        switch (inferred.value()) {
-            case ExprType::Int:
-                new_column = Column<std::int64_t>{};
-                break;
-            case ExprType::Double:
-                new_column = Column<double>{};
-                break;
-            case ExprType::Bool:
-                new_column = Column<bool>{};
-                break;
-            case ExprType::String:
-                new_column = Column<std::string>{};
-                break;
-            case ExprType::Date:
-                new_column = Column<Date>{};
-                break;
-            case ExprType::Timestamp:
-                new_column = Column<Timestamp>{};
-                break;
-        }
-        std::visit([&](auto& col) { col.reserve(rows); }, new_column);
-        for (std::size_t row = 0; row < rows; ++row) {
-            auto value = eval_expr(field.expr, output, row, scalars, externs);
-            if (!value) {
-                return std::unexpected(value.error());
-            }
-            std::visit(
-                [&](auto& col) {
-                    using ColType = std::decay_t<decltype(col)>;
-                    using ValueType = ColType::value_type;
-                    if constexpr (std::is_same_v<ValueType, std::int64_t>) {
-                        if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-                            col.push_back(*int_value);
-                        } else if (const auto* double_value = std::get_if<double>(&value.value())) {
-                            col.push_back(static_cast<std::int64_t>(*double_value));
-                        } else {
-                            invariant_violation(
-                                "update_table_window: expected Int64-compatible expression value");
-                        }
-                    } else if constexpr (std::is_same_v<ValueType, double>) {
-                        if (const auto* int_value = std::get_if<std::int64_t>(&value.value())) {
-                            col.push_back(static_cast<double>(*int_value));
-                        } else if (const auto* double_value = std::get_if<double>(&value.value())) {
-                            col.push_back(*double_value);
-                        } else {
-                            invariant_violation(
-                                "update_table_window: expected Float64-compatible expression "
-                                "value");
-                        }
-                    } else if constexpr (std::is_same_v<ValueType, bool>) {
-                        if (const auto* bool_value = std::get_if<bool>(&value.value())) {
-                            col.push_back(*bool_value);
-                        } else if (const auto* int_value =
-                                       std::get_if<std::int64_t>(&value.value())) {
-                            col.push_back(*int_value != 0);
-                        } else {
-                            invariant_violation(
-                                "update_table_window: expected Bool-compatible expression value");
-                        }
-                    } else if constexpr (std::is_same_v<ValueType, std::string_view>) {
-                        // Column<std::string>::value_type is std::string_view; the
-                        // ExprValue holds an owned std::string (copied into the arena).
-                        if (const auto* v = std::get_if<std::string>(&value.value())) {
-                            col.push_back(*v);
-                        } else {
-                            invariant_violation(
-                                "update_table_window: expected String expression value");
-                        }
-                    } else if constexpr (std::is_same_v<ValueType, Date>) {
-                        if (const auto* v = std::get_if<Date>(&value.value())) {
-                            col.push_back(*v);
-                        } else if (const auto* int_value =
-                                       std::get_if<std::int64_t>(&value.value())) {
-                            col.push_back(int64_to_date_checked(*int_value));
-                        } else {
-                            invariant_violation(
-                                "update_table_window: expected Date-compatible expression value");
-                        }
-                    } else if constexpr (std::is_same_v<ValueType, Timestamp>) {
-                        if (const auto* v = std::get_if<Timestamp>(&value.value())) {
-                            col.push_back(*v);
-                        } else if (const auto* int_value =
-                                       std::get_if<std::int64_t>(&value.value())) {
-                            col.push_back(Timestamp{*int_value});
-                        } else {
-                            invariant_violation(
-                                "update_table_window: expected Timestamp-compatible expression "
-                                "value");
-                        }
-                    }
-                },
-                new_column);
-        }
-        auto validity = collect_expr_validity(field.expr, output, rows);
-        if (validity.has_value())
-            output.add_column(field.alias, std::move(new_column), std::move(*validity));
-        else
-            output.add_column(field.alias, std::move(new_column));
+        add_computed_column(output, field.alias, std::move(*col));
     }
     if (drop_ordering) {
         output.ordering.reset();

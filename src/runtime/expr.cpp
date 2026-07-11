@@ -1185,32 +1185,78 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
         expr.node);
 }
 
-// Evaluate a single field expression against a (potentially growing) table,
-// returning the resulting column. Handles fast-path binary ops and row-by-row eval.
-auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
-                           const ExternRegistry* externs)
-    -> std::expected<ColumnValue, std::string> {
+// The single field-expression evaluator (stage 6 of
+// plans/function-kind-registry-plan.md): every field/value dispatch runs
+// through here exactly once —
+//   1. a top-level whole-column builtin (Transform/Generator) via the
+//      registry's `column_eval`, with a row-count guard so a short generator
+//      (rep's length_out) errors instead of reading out of bounds; is_nan on
+//      a bare column rides alongside — its column kernel is validity-aware
+//      (null -> false), which the per-row Scalar entry cannot see;
+//   2. the vectorized, validity-aware path for anything containing a boolean
+//      node or a nested whole-column call (eval_expr is pure and has no null);
+//   3. the fused numeric fast path;
+//   4. the per-row eval_expr loop.
+// update_table and windowed_update_table (and through them the grouped,
+// guarded, and chunked variants) and evaluate_field_column all dispatch here.
+auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCtx& ctx)
+    -> std::expected<ComputedColumn, std::string> {
     std::size_t rows = input.rows();
-    auto inferred = infer_expr_type(expr, input, scalars, externs);
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "is_nan" && call->args.size() == 1 &&
+            std::holds_alternative<ir::ColumnRef>(call->args[0]->node)) {
+            auto col = eval_is_nan(*call, input);
+            if (!col) {
+                return std::unexpected(col.error());
+            }
+            return ComputedColumn{.column = std::move(*col), .validity = std::nullopt};
+        }
+        if (const auto* fn = find_builtin(call->callee);
+            fn != nullptr && fn->column_eval != nullptr) {
+            auto col = fn->column_eval(*call, input, rows, ctx);
+            if (!col) {
+                return col;
+            }
+            // A generator told to produce fewer rows than the frame (rep's
+            // length_out) must error, not leave a short column whose missing
+            // tail reads out of bounds. rows == 0 is the data-gen bootstrap:
+            // a generator field on an empty frame grows it.
+            const std::size_t got = std::visit([](const auto& c) { return c.size(); }, col->column);
+            if (rows != 0 && got != rows) {
+                return std::unexpected(call->callee + ": generates " + std::to_string(got) +
+                                       " rows but the frame has " + std::to_string(rows));
+            }
+            return col;
+        }
+    }
+    auto inferred = infer_expr_type(expr, input, ctx.scalars, ctx.externs);
     if (!inferred) {
         return std::unexpected(inferred.error());
     }
-    // Validity-/boolean-aware fields (comparisons, logical, is_null, coalesce)
-    // and RNG-in-arithmetic cannot be built per row (eval_expr is pure, and has
-    // no null). Evaluate them through the vectorized, validity-aware path.
+    // Validity-/boolean-aware fields (comparisons, logical, is_null) and
+    // nested whole-column calls cannot be built per row. Evaluate them
+    // through the vectorized, validity-aware path.
     if (field_uses_vectorized_eval(expr)) {
-        auto res = eval_value_vec(expr, input, scalars, rows);
+        auto res = eval_value_vec(expr, input, ctx.scalars, rows);
         if (!res) {
             return std::unexpected(res.error());
         }
+        ColumnValue col;
         if (auto* owned = std::get_if<ColumnValue>(&res->data)) {
-            return std::move(*owned);
+            col = std::move(*owned);
+        } else {
+            col = *std::get<const ColumnValue*>(res->data);
         }
-        return *std::get<const ColumnValue*>(res->data);
+        std::optional<ValidityBitmap> validity;
+        if (const auto* v = res->get_validity()) {
+            validity = *v;
+        }
+        return ComputedColumn{.column = std::move(col), .validity = std::move(validity)};
     }
-    if (auto fast = try_fast_update_numeric_expr(expr, input, rows, inferred.value(), scalars);
+    if (auto fast = try_fast_update_numeric_expr(expr, input, rows, inferred.value(), ctx.scalars);
         fast.has_value()) {
-        return std::move(fast.value());
+        return ComputedColumn{.column = std::move(fast.value()),
+                              .validity = collect_expr_validity(expr, input, rows)};
     }
     ColumnValue new_column;
     switch (inferred.value()) {
@@ -1235,7 +1281,7 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
     }
     std::visit([&](auto& col) { col.reserve(rows); }, new_column);
     for (std::size_t row = 0; row < rows; ++row) {
-        auto value = eval_expr(expr, input, row, scalars, externs);
+        auto value = eval_expr(expr, input, row, ctx.scalars, ctx.externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -1301,7 +1347,22 @@ auto evaluate_field_column(const ir::Expr& expr, const Table& input, const Scala
             },
             new_column);
     }
-    return new_column;
+    return ComputedColumn{.column = std::move(new_column),
+                          .validity = collect_expr_validity(expr, input, rows)};
+}
+
+// Thin wrapper preserving the column-only signature used by the vectorized
+// value evaluator's scalar-call delegation (filter.cpp), which handles
+// validity itself (or has none to propagate).
+auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
+                           const ExternRegistry* externs)
+    -> std::expected<ColumnValue, std::string> {
+    auto res = evaluate_field(
+        expr, input, ColumnEvalCtx{.scalars = scalars, .externs = externs, .window = std::nullopt});
+    if (!res) {
+        return std::unexpected(res.error());
+    }
+    return std::move(res->column);
 }
 
 // Produce a shifted copy of a column: lag(col, n)[i] = col[i-n], lead(col, n)[i] = col[i+n].

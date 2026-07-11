@@ -579,7 +579,9 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             });
         m.emplace("cumprod", m.at("cumsum"));
 
-        m.emplace("fill_null",
+        // fill_forward / fill_backward: genuinely ordered (LOCF / NOCB read
+        // neighbouring rows), so they stay Transform-kind, column-only.
+        m.emplace("fill_forward",
                   BuiltinFn{
                       .kind = ir::FnKind::Transform,
                       .min_args = 0,
@@ -594,15 +596,9 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                       .column_eval =
                           [](const ir::CallExpr& call, const Table& input, std::size_t,
                              const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
-                          auto res = [&] -> std::expected<FillResult, std::string> {
-                              if (call.callee == "fill_null") {
-                                  return eval_fill_null(call, input);
-                              }
-                              if (call.callee == "fill_forward") {
-                                  return eval_fill_forward(call, input);
-                              }
-                              return eval_fill_backward(call, input);
-                          }();
+                          auto res = call.callee == "fill_forward"
+                                         ? eval_fill_forward(call, input)
+                                         : eval_fill_backward(call, input);
                           if (!res) {
                               return std::unexpected(res.error());
                           }
@@ -610,13 +606,56 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                                 .validity = std::move(res->validity)};
                       },
                   });
-        m.emplace("fill_forward", m.at("fill_null"));
-        m.emplace("fill_backward", m.at("fill_null"));
+        m.emplace("fill_backward", m.at("fill_forward"));
+
+        // ── Null-handling scalars (plans/exprvalue-null-arm-plan.md, stage
+        // 3): row-local functions whose *purpose* is null, so their per-row
+        // eval opts into receiving Null (NullPolicy::Handles) instead of the
+        // central propagation. Each keeps its column kernel as a whole-column
+        // fast path for the top-level bare form; the per-row eval is the
+        // general form and the semantic reference — the two must agree.
+        m.emplace("fill_null",
+                  BuiltinFn{
+                      .kind = ir::FnKind::Scalar,
+                      .null_policy = NullPolicy::Handles,
+                      .min_args = 0,
+                      .max_args = -1,
+                      .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                          if (a.size() != 2) {
+                              return std::unexpected(std::string(name) +
+                                                     ": expected 2 arguments (col, value)");
+                          }
+                          const bool numeric_widen =
+                              a[0] == ExprType::Double && a[1] == ExprType::Int;
+                          if (a[1] != a[0] && !numeric_widen) {
+                              return std::unexpected(std::string(name) +
+                                                     ": fill value must match the column type");
+                          }
+                          return a[0];
+                      },
+                      .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                          if (std::holds_alternative<Null>(a[0])) {
+                              return a[1];
+                          }
+                          return a[0];
+                      },
+                      .column_eval =
+                          [](const ir::CallExpr& call, const Table& input, std::size_t,
+                             const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
+                          auto res = eval_fill_null(call, input);
+                          if (!res) {
+                              return std::unexpected(res.error());
+                          }
+                          return ComputedColumn{.column = std::move(res->column),
+                                                .validity = std::move(res->validity)};
+                      },
+                  });
 
         m.emplace(
             "null_if_nan",
             BuiltinFn{
-                .kind = ir::FnKind::Transform,
+                .kind = ir::FnKind::Scalar,
+                .null_policy = NullPolicy::Handles,
                 .min_args = 0,
                 .max_args = -1,
                 .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
@@ -627,6 +666,18 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                         return std::unexpected(std::string(name) + ": column must be Float64");
                     }
                     return ExprType::Double;
+                },
+                .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
+                    if (std::holds_alternative<Null>(a[0])) {
+                        return ExprValue{Null{}};  // already null: stays null
+                    }
+                    const auto* d = std::get_if<double>(a.data());
+                    if (d == nullptr) {
+                        return std::unexpected(std::string(name) + ": column must be Float64");
+                    }
+                    const bool to_null =
+                        name == "null_if_nan" ? std::isnan(*d) : !std::isfinite(*d);
+                    return to_null ? ExprValue{Null{}} : a[0];
                 },
                 .column_eval =
                     [](const ir::CallExpr& call, const Table& input, std::size_t,
@@ -644,15 +695,14 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             });
         m.emplace("null_if_not_finite", m.at("null_if_nan"));
 
-        // coalesce(a, b, ...): first non-null argument per row. Row-local by
-        // shape but validity-aware (the null wrinkle), so it is a Transform:
-        // the per-row ExprValue has no null. Kernel lives in filter.cpp
-        // because the arguments are arbitrary expressions evaluated through
-        // eval_value_vec.
+        // coalesce(a, b, ...): first non-null argument, per row. The column
+        // kernel lives in filter.cpp because its arguments are arbitrary
+        // expressions evaluated through eval_value_vec.
         m.emplace(
             "coalesce",
             BuiltinFn{
-                .kind = ir::FnKind::Transform,
+                .kind = ir::FnKind::Scalar,
+                .null_policy = NullPolicy::Handles,
                 .min_args = 0,
                 .max_args = -1,
                 .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
@@ -665,6 +715,14 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                         }
                     }
                     return a[0];
+                },
+                .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                    for (const auto& v : a) {
+                        if (!std::holds_alternative<Null>(v)) {
+                            return v;
+                        }
+                    }
+                    return ExprValue{Null{}};  // every argument null
                 },
                 .column_eval =
                     [](const ir::CallExpr& call, const Table& input, std::size_t rows,
@@ -1085,12 +1143,11 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 if (!v) {
                     return v;
                 }
-                // Null propagation, applied centrally: a Null argument
+                // NullPolicy::Propagate, applied centrally: a Null argument
                 // short-circuits the call to Null, so `eval` never sees one.
-                // (Null-HANDLING scalars — coalesce/fill_null/null_if_* —
-                // get a policy knob when they move here; see the null-arm
-                // plan.)
-                if (std::holds_alternative<Null>(*v)) {
+                // Handles entries (coalesce/fill_null/null_if_*) receive the
+                // Null and decide.
+                if (fn.null_policy == NullPolicy::Propagate && std::holds_alternative<Null>(*v)) {
                     return ExprValue{Null{}};
                 }
                 arg_values.push_back(std::move(*v));
@@ -1197,10 +1254,12 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
                 return field_uses_vectorized_eval(*node.left) ||
                        field_uses_vectorized_eval(*node.right);
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                // Whole-column builtins (Transform/Generator — anything with a
-                // `column_eval`) cannot be built per row.
+                // Column-ONLY builtins (Transform/Generator: no per-row eval)
+                // cannot be built per row. Hybrid null-handling scalars
+                // (fill_null/null_if_*/coalesce) evaluate per-row via their
+                // NullPolicy::Handles eval, so they don't force this path.
                 if (const auto* fn = find_builtin(node.callee);
-                    fn != nullptr && fn->column_eval != nullptr) {
+                    fn != nullptr && fn->column_eval != nullptr && fn->eval == nullptr) {
                     return true;
                 }
                 return std::ranges::any_of(
@@ -1229,7 +1288,7 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
     std::size_t rows = input.rows();
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
         if (const auto* fn = find_builtin(call->callee);
-            fn != nullptr && fn->column_eval != nullptr) {
+            fn != nullptr && use_column_kernel(*fn, *call)) {
             auto col = fn->column_eval(*call, input, rows, ctx);
             if (!col) {
                 return col;
@@ -1388,20 +1447,6 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
     return ComputedColumn{
         .column = std::move(new_column),
         .validity = any_null ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt};
-}
-
-// Thin wrapper preserving the column-only signature used by the vectorized
-// value evaluator's scalar-call delegation (filter.cpp), which handles
-// validity itself (or has none to propagate).
-auto evaluate_field_column(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
-                           const ExternRegistry* externs)
-    -> std::expected<ColumnValue, std::string> {
-    auto res = evaluate_field(
-        expr, input, ColumnEvalCtx{.scalars = scalars, .externs = externs, .window = std::nullopt});
-    if (!res) {
-        return std::unexpected(res.error());
-    }
-    return std::move(res->column);
 }
 
 // Produce a shifted copy of a column: lag(col, n)[i] = col[i-n], lead(col, n)[i] = col[i+n].

@@ -36,10 +36,10 @@ namespace ibex::ir {
 ///   Scalar    — row-local: `out[i] = f(args[i])` (arithmetic, casts, math,
 ///               date parts, pmin/pmax, is_nan, round, ...).
 ///   Transform — non-row-local: reads neighbours/order (rolling_*, cumsum/
-///               cumprod, lag/lead, fill_forward/fill_backward) or validity
-///               (fill_null, null_if_nan/null_if_not_finite, coalesce —
-///               row-local by shape, but the per-row path has no null; see
-///               the "null wrinkle" in the plan). `rank` is the RankExpr
+///               cumprod, lag/lead, fill_forward/fill_backward). The
+///               null-handling scalars (fill_null, null_if_*, coalesce) are
+///               Scalar: the per-row evaluator carries null natively
+///               (plans/exprvalue-null-arm-plan.md). `rank` is the RankExpr
 ///               node, classified at the node level.
 ///   Generator — produces a column from a sequence/pattern (rand_*, rep).
 ///   Aggregate — reduces a column or group (sum/mean/.../kurtosis).

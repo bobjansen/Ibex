@@ -491,6 +491,10 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const Table& table,
                                 const ScalarRegistry* scalars, std::size_t n)
     -> std::expected<Mask, std::string>;
+// coalesce kernel (validity-aware Transform; args evaluated via eval_value_vec).
+[[nodiscard]] auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
+                                        const ScalarRegistry* scalars, std::size_t rows)
+    -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto eval_value_vec(const ir::Expr& expr, const Table& table,
                                   const ScalarRegistry* scalars, std::size_t n)
     -> std::expected<ColResult, std::string>;

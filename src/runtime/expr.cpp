@@ -625,6 +625,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             BuiltinFn{
                 .min_args = 0,
                 .max_args = -1,
+                .null_policy = NullPolicy::Handles,
                 .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                     if (a.size() != 2) {
                         return std::unexpected(std::string(name) +
@@ -638,7 +639,6 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     return a[0];
                 },
                 .exec = ScalarExec{
-                    .null_policy = NullPolicy::Handles,
                     .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
                         if (std::holds_alternative<Null>(a[0])) {
                             return a[1];
@@ -662,6 +662,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             BuiltinFn{
                 .min_args = 0,
                 .max_args = -1,
+                .null_policy = NullPolicy::Handles,
                 .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                     if (a.size() != 1) {
                         return std::unexpected(std::string(name) + ": expected 1 argument");
@@ -672,7 +673,6 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     return ExprType::Double;
                 },
                 .exec = ScalarExec{
-                    .null_policy = NullPolicy::Handles,
                     .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
                         if (std::holds_alternative<Null>(a[0])) {
                             return ExprValue{Null{}};  // already null: stays null
@@ -709,6 +709,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             BuiltinFn{
                 .min_args = 0,
                 .max_args = -1,
+                .null_policy = NullPolicy::Handles,
                 .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
                     if (a.size() < 2) {
                         return std::unexpected("coalesce: expected at least 2 arguments");
@@ -721,7 +722,6 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     return a[0];
                 },
                 .exec = ScalarExec{
-                    .null_policy = NullPolicy::Handles,
                     .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
                         for (const auto& v : a) {
                             if (!std::holds_alternative<Null>(v)) {
@@ -1163,7 +1163,7 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 // short-circuits the call to Null, so `eval` never sees one.
                 // Handles entries (coalesce/fill_null/null_if_*) receive the
                 // Null and decide.
-                if (scalar_exec->null_policy == NullPolicy::Propagate &&
+                if (entry->null_policy == NullPolicy::Propagate &&
                     std::holds_alternative<Null>(*v)) {
                     return ExprValue{Null{}};
                 }

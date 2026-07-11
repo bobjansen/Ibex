@@ -241,11 +241,17 @@ build_ibex_with_compiler() {
         -DCMAKE_C_COMPILER="$cc" \
         -DCMAKE_CXX_COMPILER="$cxx" \
         -DIBEX_PARQUET_S3=OFF \
+        -DIBEX_BUILD_TESTS=OFF \
+        -DIBEX_BUILD_EXAMPLES=OFF \
+        -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+        -DIBEX_BUILD_PARQUET=OFF \
+        -DIBEX_BUILD_ADBC=OFF \
+        -DIBEX_BUILD_KAFKA=OFF \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         -DIBEX_ENABLE_LTO=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -S /ibex
-    ninja -C "$build_dir"
+    ninja -C "$build_dir" ibex_compile_bin ibex_runtime
 }
 
 # ── Provision-only mode (build-ami.sh) ─────────────────────────────────────────
@@ -429,6 +435,15 @@ if [[ "${IBEX_COMPARE_COMPILERS_MODE:-0}" == "1" ]]; then
 
     finish_compare_compilers() {
         local code=$?
+        if [[ ! -f "$REPORT" ]]; then
+            {
+                echo "compare-compilers failed before producing a benchmark report"
+                echo "exit_status=${code}"
+                echo
+                echo "Last 200 lines of /var/log/ibex-bench.log:"
+                tail -n 200 /var/log/ibex-bench.log 2>/dev/null || true
+            } > "$REPORT"
+        fi
         if [[ -f "$REPORT" ]] && aws s3 cp "$REPORT" \
             "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}"; then
             echo "Report uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (exit ${code})"

@@ -280,9 +280,9 @@ using ColumnEvalFn = std::expected<ComputedColumn, std::string> (*)(const ir::Ca
 // Row-local scalar. `kernel` is an optional whole-column fast path taken only
 // for the kernel-shaped call (every positional argument a bare column or
 // literal, see use_column_kernel); `eval` is the general form and the
-// semantic reference — the two must agree.
+// semantic reference — the two must agree. The entry's NullPolicy lives in
+// BuiltinFn's flat metadata (packing; see the sizeof note there), not here.
 struct ScalarExec {
-    NullPolicy null_policy = NullPolicy::Propagate;
     RowEvalFn eval{};
     ColumnEvalFn kernel{};
 };
@@ -308,12 +308,24 @@ struct AggregateExec {
 // Builtin function registry entry (registry lives in expr.cpp; type inference
 // and evaluation dispatch through it). Common metadata is flat; the
 // kind-specific execution surface is the `exec` variant.
+//
+// Layout matters: builtins() sits on per-row dispatch paths, and growing the
+// entry 40 -> 48 bytes measurably regressed unrelated benchmarks once before
+// (fill_forward +20% on AWS; see c18ea8f). Hence int16 arity and null_policy
+// packed into the flat region (null_policy is meaningful only when `exec`
+// holds a ScalarExec; ScalarExec can't carry the byte without padding the
+// variant to 32). The static_assert below pins the size.
 struct BuiltinFn {
-    int min_args = 1;
-    int max_args = 1;  // -1 == variadic
+    std::int16_t min_args = 1;
+    std::int16_t max_args = 1;  // -1 == variadic
+    NullPolicy null_policy = NullPolicy::Propagate;
     InferFn infer{};
     std::variant<ScalarExec, TransformExec, GeneratorExec, AggregateExec> exec;
 };
+
+static_assert(sizeof(BuiltinFn) <= 5 * sizeof(void*),
+              "BuiltinFn grew past 40 bytes — entry bloat regressed fill_forward +20% on AWS "
+              "once before (c18ea8f); shrink it or re-benchmark deliberately");
 
 static_assert(
     std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(ir::FnKind::Scalar),

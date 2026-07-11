@@ -1,5 +1,11 @@
 # Function-Kind Registry: one typed dispatch for all builtins
 
+Status (2026-07-11): implemented. Generators, transforms, aggregates,
+`coalesce`, and scalar dispatch now route through the unified `BuiltinFn` /
+`FnKind` registry, and the duplicated field-evaluator ladders have been
+collapsed onto the shared dispatch path. The null wrinkle was closed by
+`plans/done/exprvalue-null-arm-plan.md`.
+
 ## Motivation
 
 Ibex builtins are dispatched **ad hoc**. The scalar (row-local) builtins were

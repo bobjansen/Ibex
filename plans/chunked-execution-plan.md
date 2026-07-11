@@ -159,10 +159,11 @@ online central moments (Welford/Pébay; `m3`/`m4` added to `AggSlot`, shared
 the materializing Welford; `skew`/`kurtosis` match the two-pass materializing
 results to floating-point rounding (parity test: same query streamed vs forced
 materializing via an added `median`). Null thresholds match the materializing
-path (`std` needs ≥2, `skew` ≥3, `kurtosis` ≥4 non-null observations). Still
-materializing: `median`/`quantile` (need all values), `first`/`last` (need
-type-preserving output, can't be func-gated without schema), and `ewma`
-(row-order coupled). Benchmarked via `ibex_fusion_bench` (`agg_moments_stream`/
+path (`std` needs ≥2, `skew` ≥3, `kurtosis` ≥4 non-null observations). At the
+time this landed, `first`/`last` still materialized for type-preserving output;
+they now stream too (see the later section below). Still materializing:
+`median`/`quantile` (need all values) and `ewma` (row-order coupled).
+Benchmarked via `ibex_fusion_bench` (`agg_moments_stream`/
 `agg_moments_hash`) with a polars companion (`tools/bench_polars_agg.py`) on the
 same shape (2M rows, 1000 groups): streaming std+skew+kurtosis ≈ 28ms vs the
 hash path ≈ 66ms (no hashing of every row). polars is faster, and threading is

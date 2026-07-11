@@ -10,7 +10,7 @@ pull the results back as a CSV. Three layers:
 | `run.sh`             | local       | One instance runs the **whole** suite. |
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
 | `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |
-| `compare-compilers.sh` | local     | A/B latest **Clang vs GCC** on generated Ibex C++ for one commit. |
+| `compare-compilers.sh` | local     | A/B latest **Clang vs GCC** full Ibex builds for one commit. |
 | `bootstrap.sh`       | on instance | Provision (if needed) → build ibex → run suite (or compare) → upload → self-terminate. |
 | `lib.sh`             | sourced     | Shared helpers (config, AMI resolution, user-data builder). |
 
@@ -141,18 +141,18 @@ is slower and on a bigger box, so budget more.
 > drift-cancelling A/B without EC2 — just noisier on a shared/thermal-throttling
 > box.
 
-## 3d. Compare latest Clang vs latest GCC for generated C++
+## 3d. Compare latest Clang vs latest GCC
 
-`compare-compilers.sh` answers "does the C++ compiler matter for Ibex generated
-code?" for a single commit. The EC2 instance builds Ibex once in Release mode
-with `-DIBEX_ENABLE_MARCH_NATIVE=ON`, regenerates the benchmark CSVs, then uses
-the same generated query C++ and runtime archive while compiling the query
-translation units with:
+`compare-compilers.sh` answers "does the C++ compiler matter for Ibex?" for a
+single commit. The EC2 instance builds Ibex twice in Release mode with
+`-DIBEX_ENABLE_MARCH_NATIVE=ON`:
 
 - latest configured Clang (`clang++-21` from apt.llvm.org)
 - latest versioned GCC available from Ubuntu's toolchain apt source
 
-Both sides use aggressive native flags by default:
+It then regenerates the benchmark CSVs and compiles/links each generated query
+against the matching compiler's build tree. The generated query translation
+units use aggressive native flags by default:
 
 - Clang: `-O3 -DNDEBUG -std=gnu++23 -march=native -mtune=native -flto=thin -fuse-ld=lld` when supported
 - GCC: `-O3 -DNDEBUG -std=gnu++23 -march=native -mtune=native -flto=auto` when supported
@@ -174,8 +174,8 @@ ratios.
 
 Use this result to separate two questions:
 
-- Compiler sensitivity: large query-specific deltas point at codegen patterns
-  that one compiler optimizes and the other misses.
+- Compiler sensitivity: large query-specific deltas point at generated C++ or
+  runtime code patterns that one compiler optimizes and the other misses.
 - Ibex codegen quality: if both compilers are slow on the same query family,
   inspect the generated C++ shape rather than blaming one backend.
 

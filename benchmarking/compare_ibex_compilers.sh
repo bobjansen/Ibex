@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# compare_ibex_compilers.sh — compare generated Ibex C++ with two C++ compilers.
+# compare_ibex_compilers.sh — compare full Ibex builds with two C++ compilers.
 #
-# Builds/times the same compiled Ibex queries with Clang and GCC, reducing
-# repeated samples by median and reporting per-query deltas. The Ibex compiler
-# itself is expected to be built already; this script only controls the C++
-# compiler used for the generated query translation units.
+# Builds/times the same compiled Ibex queries with Clang-built and GCC-built
+# Ibex trees, reducing repeated samples by median and reporting per-query
+# deltas. The build trees are expected to exist already; this script compiles
+# each generated query with the matching compiler and links against the matching
+# runtime/core/ir archives.
 
 set -euo pipefail
 
@@ -13,7 +14,11 @@ usage() {
 Usage: compare_ibex_compilers.sh [options]
 
 Options:
-  --build-dir <dir>      Ibex build dir with tools/ibex_compile (default: build-release)
+  --build-dir <dir>      Back-compat alias for both compiler build dirs
+  --clang-build-dir <d>  Clang-built Ibex dir with tools/ibex_compile
+                         (default: build-release-clang, falling back to build-release)
+  --gcc-build-dir <d>    GCC-built Ibex dir with tools/ibex_compile
+                         (default: build-release-gcc)
   --clang-cxx <path>     Clang++ executable (default: clang++)
   --gcc-cxx <path>       G++ executable (default: g++)
   --clang-flags <flags>  Override generated-query Clang flags
@@ -36,7 +41,11 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 
-BUILD_DIR="$REPO_ROOT/build-release"
+CLANG_BUILD_DIR="$REPO_ROOT/build-release-clang"
+GCC_BUILD_DIR="$REPO_ROOT/build-release-gcc"
+if [[ ! -x "$CLANG_BUILD_DIR/tools/ibex_compile" && -x "$REPO_ROOT/build-release/tools/ibex_compile" ]]; then
+    CLANG_BUILD_DIR="$REPO_ROOT/build-release"
+fi
 CLANG_CXX="${CLANG_CXX:-clang++}"
 GCC_CXX="${GCC_CXX:-g++}"
 CLANG_FLAGS="${CLANG_FLAGS:-}"
@@ -56,7 +65,9 @@ CSV_EVENTS="$REPO_ROOT/benchmarking/data/events.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --build-dir) BUILD_DIR="$2"; shift 2 ;;
+        --build-dir) CLANG_BUILD_DIR="$2"; GCC_BUILD_DIR="$2"; shift 2 ;;
+        --clang-build-dir) CLANG_BUILD_DIR="$2"; shift 2 ;;
+        --gcc-build-dir) GCC_BUILD_DIR="$2"; shift 2 ;;
         --clang-cxx) CLANG_CXX="$2"; shift 2 ;;
         --gcc-cxx) GCC_CXX="$2"; shift 2 ;;
         --clang-flags) CLANG_FLAGS="$2"; shift 2 ;;
@@ -80,7 +91,8 @@ done
 [[ "$WARMUP" =~ ^[0-9]+$ ]] || { echo "error: --warmup must be a non-negative integer" >&2; exit 1; }
 [[ "$ITERS" =~ ^[1-9][0-9]*$ ]] || { echo "error: --iters must be a positive integer" >&2; exit 1; }
 [[ "$REPEATS" =~ ^[1-9][0-9]*$ ]] || { echo "error: --repeats must be a positive integer" >&2; exit 1; }
-[[ -x "$BUILD_DIR/tools/ibex_compile" ]] || { echo "error: ibex_compile not found at $BUILD_DIR/tools/ibex_compile" >&2; exit 1; }
+[[ -x "$CLANG_BUILD_DIR/tools/ibex_compile" ]] || { echo "error: clang ibex_compile not found at $CLANG_BUILD_DIR/tools/ibex_compile" >&2; exit 1; }
+[[ -x "$GCC_BUILD_DIR/tools/ibex_compile" ]] || { echo "error: gcc ibex_compile not found at $GCC_BUILD_DIR/tools/ibex_compile" >&2; exit 1; }
 [[ -f "$CSV" ]] || { echo "error: CSV not found: $CSV" >&2; exit 1; }
 command -v "$CLANG_CXX" >/dev/null 2>&1 || { echo "error: clang compiler not found: $CLANG_CXX" >&2; exit 1; }
 command -v "$GCC_CXX" >/dev/null 2>&1 || { echo "error: gcc compiler not found: $GCC_CXX" >&2; exit 1; }
@@ -132,7 +144,7 @@ if [[ -n "$TASKSET_CPUSET" ]]; then
 fi
 
 run_compiler_repeat() {
-    local side="$1" cxx="$2" flags="$3" repeat="$4"
+    local side="$1" build_dir="$2" cxx="$3" flags="$4" repeat="$5"
     local out_tsv="$TMP_ROOT/${side}.repeat${repeat}.tsv"
     local log_file="$TMP_ROOT/${side}.repeat${repeat}.log"
     local -a args=(
@@ -146,7 +158,7 @@ run_compiler_repeat() {
     [[ -f "$CSV_EVENTS" ]] && args+=(--csv-events "$CSV_EVENTS")
 
     echo "  -> $side repeat $repeat/$REPEATS" >&2
-    if ! env IBEX_ROOT="$REPO_ROOT" BUILD_DIR="$BUILD_DIR" CXX="$cxx" CXXFLAGS="$flags" \
+    if ! env IBEX_ROOT="$REPO_ROOT" BUILD_DIR="$build_dir" CXX="$cxx" CXXFLAGS="$flags" \
         "${PIN_PREFIX[@]}" bash "$REPO_ROOT/benchmarking/bench_ibex_compiled.sh" "${args[@]}" \
         >"$log_file" 2>&1; then
         cat "$log_file" >&2
@@ -299,26 +311,27 @@ render_report() {
 CLANG_VER="$("$CLANG_CXX" --version | head -1)"
 GCC_VER="$("$GCC_CXX" --version | head -1)"
 
-echo "Benchmarking generated Ibex C++ compilers" >&2
+echo "Benchmarking whole Ibex compiler/runtime builds" >&2
 echo "Clang: $CLANG_CXX ($CLANG_VER)" >&2
 echo "GCC  : $GCC_CXX ($GCC_VER)" >&2
 echo "Clang flags: $CLANG_FLAGS" >&2
 echo "GCC flags  : $GCC_FLAGS" >&2
-echo "Using build dir: $BUILD_DIR" >&2
+echo "Clang build dir: $CLANG_BUILD_DIR" >&2
+echo "GCC build dir  : $GCC_BUILD_DIR" >&2
 echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS, interleave=$([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off)" >&2
 echo "Pinning: $PIN_DESC" >&2
 
 if [[ "$INTERLEAVE" -eq 1 ]]; then
     for ((r = 1; r <= REPEATS; ++r)); do
-        run_compiler_repeat clang "$CLANG_CXX" "$CLANG_FLAGS" "$r"
-        run_compiler_repeat gcc "$GCC_CXX" "$GCC_FLAGS" "$r"
+        run_compiler_repeat clang "$CLANG_BUILD_DIR" "$CLANG_CXX" "$CLANG_FLAGS" "$r"
+        run_compiler_repeat gcc "$GCC_BUILD_DIR" "$GCC_CXX" "$GCC_FLAGS" "$r"
     done
 else
     for ((r = 1; r <= REPEATS; ++r)); do
-        run_compiler_repeat clang "$CLANG_CXX" "$CLANG_FLAGS" "$r"
+        run_compiler_repeat clang "$CLANG_BUILD_DIR" "$CLANG_CXX" "$CLANG_FLAGS" "$r"
     done
     for ((r = 1; r <= REPEATS; ++r)); do
-        run_compiler_repeat gcc "$GCC_CXX" "$GCC_FLAGS" "$r"
+        run_compiler_repeat gcc "$GCC_BUILD_DIR" "$GCC_CXX" "$GCC_FLAGS" "$r"
     done
 fi
 
@@ -337,7 +350,8 @@ REPORT_TEXT="$TMP_ROOT/report.txt"
     printf 'gcc_cxx=%s\n' "$GCC_CXX"
     printf 'clang_flags=%s\n' "$CLANG_FLAGS"
     printf 'gcc_flags=%s\n' "$GCC_FLAGS"
-    printf 'build_dir=%s\n' "$BUILD_DIR"
+    printf 'clang_build_dir=%s\n' "$CLANG_BUILD_DIR"
+    printf 'gcc_build_dir=%s\n' "$GCC_BUILD_DIR"
     printf 'warmup=%s\niters=%s\nrepeats=%s\ninterleave=%s\npinning=%s\n\n' \
         "$WARMUP" "$ITERS" "$REPEATS" "$INTERLEAVE" "$PIN_DESC"
     if command -v column >/dev/null 2>&1; then

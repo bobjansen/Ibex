@@ -157,6 +157,19 @@ find_latest_gxx() {
     fi
 }
 
+find_latest_gcc() {
+    local gxx gcc_candidate
+    gxx="$(find_latest_gxx)"
+    gcc_candidate="${gxx/g++/gcc}"
+    if [[ -x "$gcc_candidate" ]]; then
+        echo "$gcc_candidate"
+    elif command -v gcc >/dev/null 2>&1; then
+        command -v gcc
+    else
+        return 1
+    fi
+}
+
 find_latest_gxx_version() {
     local gxx
     gxx="$(find_latest_gxx)"
@@ -220,6 +233,19 @@ build_ibex() {
         -DCMAKE_BUILD_TYPE=Release \
         -S /ibex
     ninja -C /ibex/build-release
+}
+
+build_ibex_with_compiler() {
+    local build_dir="$1" cc="$2" cxx="$3"
+    cmake -B "$build_dir" -G Ninja \
+        -DCMAKE_C_COMPILER="$cc" \
+        -DCMAKE_CXX_COMPILER="$cxx" \
+        -DIBEX_PARQUET_S3=OFF \
+        -DIBEX_ENABLE_MARCH_NATIVE=ON \
+        -DIBEX_ENABLE_LTO=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -S /ibex
+    ninja -C "$build_dir"
 }
 
 # ── Provision-only mode (build-ami.sh) ─────────────────────────────────────────
@@ -388,9 +414,9 @@ if [[ "${IBEX_COMPARE_PLUGIN_MODE:-0}" == "1" ]]; then
 fi
 
 # ── Compare-compiler mode (compare-compilers.sh) ──────────────────────────────
-# Compare generated Ibex C++ compiled with latest Clang vs latest GCC on one
-# clean box. Ibex itself is built once with Clang; the generated query C++ is
-# then compiled/timed by both compilers using aggressive native optimization.
+# Compare full Ibex builds compiled with latest Clang vs latest GCC on one
+# clean box. Each side gets its own runtime/core/ir archives and generated
+# query executable built with the matching compiler.
 #
 #   IBEX_REPEATS, IBEX_ITERS, IBEX_WARMUP — passed through
 #   IBEX_INTERLEAVE  — "1" (default) alternates clang/gcc repeats
@@ -414,15 +440,20 @@ if [[ "${IBEX_COMPARE_COMPILERS_MODE:-0}" == "1" ]]; then
     trap finish_compare_compilers EXIT
 
     ensure_compiler_compare_toolchain
-    build_ibex
+    GCC_CC="$(find_latest_gcc)"
+    GCC_CXX="$(find_latest_gxx)"
+    build_ibex_with_compiler /ibex/build-release-clang \
+        "clang-${CLANG_VERSION}" "clang++-${CLANG_VERSION}"
+    build_ibex_with_compiler /ibex/build-release-gcc "$GCC_CC" "$GCC_CXX"
 
     uv run --project /ibex /ibex/benchmarking/data/gen_data.py \
         /ibex/benchmarking/data --rows "${IBEX_DATA_ROWS:-4000000}"
 
     COMPARE_ARGS=(
-        --build-dir /ibex/build-release
+        --clang-build-dir /ibex/build-release-clang
+        --gcc-build-dir /ibex/build-release-gcc
         --clang-cxx "clang++-${CLANG_VERSION}"
-        --gcc-cxx "$(find_latest_gxx)"
+        --gcc-cxx "$GCC_CXX"
         --repeats "${IBEX_REPEATS:-3}"
         --iters "${IBEX_ITERS:-7}"
         --warmup "${IBEX_WARMUP:-1}"

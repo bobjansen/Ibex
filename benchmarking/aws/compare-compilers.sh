@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# compare-compilers.sh — Clang vs GCC for Ibex generated C++ on one EC2 box.
+# compare-compilers.sh — Clang vs GCC full Ibex builds on one EC2 box.
 #
-# Launches a clean AWS instance, builds Ibex Release with native optimizations,
-# generates fixed benchmark CSVs, then compiles/times the generated query C++
-# with latest Clang and latest GCC on the same machine.
+# Launches a clean AWS instance, builds Ibex Release twice with native
+# optimizations (Clang and GCC), generates fixed benchmark CSVs, then
+# compiles/times generated query C++ against the matching build tree.
 
 set -euo pipefail
 

@@ -101,6 +101,24 @@ def main() -> None:
         args.iters,
     )
 
+    bench(
+        "tf_rolling_min_1m",
+        lambda: df.sort("ts").with_columns(
+            pl.col("price").rolling_min_by("ts", window_size="1m").alias("mn")
+        ),
+        args.warmup,
+        args.iters,
+    )
+
+    bench(
+        "tf_rolling_max_1m",
+        lambda: df.sort("ts").with_columns(
+            pl.col("price").rolling_max_by("ts", window_size="1m").alias("mx")
+        ),
+        args.warmup,
+        args.iters,
+    )
+
     # tf_resample_1m_ohlc: bucket ticks into 1-minute OHLC bars
     bench(
         "tf_resample_1m_ohlc",

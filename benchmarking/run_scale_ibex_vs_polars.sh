@@ -134,13 +134,14 @@ for rows in "${SIZES[@]}"; do
     csv_trades="$size_data_dir/trades.csv"
     csv_events="$size_data_dir/events.csv"
     csv_lookup="$size_data_dir/lookup.csv"
+    csv_users="$size_data_dir/users.csv"
 
     if [[ $SKIP_IBEX -eq 0 ]]; then
         echo "  → ibex"
         IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
             bash "$SCRIPT_DIR/bench_ibex.sh" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
-                --csv-events "$csv_events" --csv-lookup "$csv_lookup" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
                 --reshape-rows "$rows" \
                 --warmup "$WARMUP" --iters "$ITERS" \
                 --out "$size_result_dir/ibex.tsv"

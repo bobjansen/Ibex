@@ -241,6 +241,8 @@ inline auto chunked_agg_valid(ir::AggFunc func, const AggSlot& slot) -> bool {
         case ir::AggFunc::Sum:
         case ir::AggFunc::Min:
         case ir::AggFunc::Max:
+        case ir::AggFunc::First:
+        case ir::AggFunc::Last:
             return slot.has_value;
         case ir::AggFunc::Stddev:
             return slot.count >= 2;
@@ -261,6 +263,8 @@ inline auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
         case ir::AggFunc::Mean:
         case ir::AggFunc::Min:
         case ir::AggFunc::Max:
+        case ir::AggFunc::First:
+        case ir::AggFunc::Last:
         case ir::AggFunc::Stddev:
         case ir::AggFunc::Skew:
         case ir::AggFunc::Kurtosis:
@@ -393,6 +397,48 @@ inline auto append_scalar(ColumnValue& column, const ScalarValue& value) -> void
             }
         },
         column);
+}
+
+// An all-default-payload column of the given type; pair it with an all-false
+// ValidityBitmap to broadcast a null scalar (the payloads are never read).
+inline auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
+    switch (type) {
+        case ExprType::Int: {
+            Column<std::int64_t> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Double: {
+            Column<double> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Bool: {
+            Column<bool> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::String: {
+            Column<std::string> c;
+            for (std::size_t i = 0; i < rows; ++i) {
+                c.push_back(std::string_view{});
+            }
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Date: {
+            Column<Date> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Timestamp: {
+            Column<Timestamp> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+    }
+    Column<std::int64_t> c;  // unreachable; keeps MSVC C4715 quiet
+    c.resize(rows);
+    return ColumnValue{std::move(c)};
 }
 
 inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) -> ColumnValue {
@@ -589,12 +635,15 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
 [[nodiscard]] auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)
     -> std::expected<std::optional<ir::AggSpec>, std::string>;
 [[nodiscard]] auto expr_contains_aggregate_call(const ir::Expr& expr) -> bool;
+// The scalar-collapse pair returns ExprValue so a null aggregate result (an
+// all-null group has no mean/first/...) is carried as Null instead of a
+// garbage payload; callers broadcast Null as an all-invalid column.
 [[nodiscard]] auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
                                               const ScalarRegistry* scalars)
-    -> std::expected<ScalarValue, std::string>;
+    -> std::expected<ExprValue, std::string>;
 [[nodiscard]] auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input,
                                          const ScalarRegistry* scalars)
-    -> std::expected<ScalarValue, std::string>;
+    -> std::expected<ExprValue, std::string>;
 [[nodiscard]] auto expr_has_bare_column(const ir::Expr& expr) -> bool;
 [[nodiscard]] auto fold_aggregates_to_columns(ir::Expr& expr, const Table& group_input,
                                               Table& working, const ScalarRegistry* scalars,

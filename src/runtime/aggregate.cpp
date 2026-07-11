@@ -1758,10 +1758,12 @@ auto expr_contains_aggregate_call(const ir::Expr& expr) -> bool {
 /// Reduce a single aggregate call (e.g. `mean(price)`, `sum(p*w)`) over the
 /// per-group `input` to one scalar. Shared by the scalar-collapse path
 /// (`eval_aggregate_scalar`) and the mixed per-row/aggregate path
-/// (`fold_aggregates_to_columns`).
+/// (`fold_aggregates_to_columns`). Returns Null when the aggregate has no
+/// value (an all-null group) — read from the result's validity, never from
+/// the undefined payload.
 auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
                                 const ScalarRegistry* scalars)
-    -> std::expected<ScalarValue, std::string> {
+    -> std::expected<ExprValue, std::string> {
     auto func = parse_aggregate_func(node.callee);
     if (!func.has_value()) {
         return std::unexpected("update + by: non-aggregate function '" + node.callee +
@@ -1779,7 +1781,7 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
             return std::unexpected(agg.error());
         }
         const auto* entry = agg->find_entry("__agg_broadcast");
-        return scalar_from_column(*entry->column, 0);
+        return expr_from_scalar(scalar_from_column(*entry->column, 0));
     }
     if (node.args.empty()) {
         return std::unexpected(node.callee + "(): expected column argument");
@@ -1835,7 +1837,13 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
                 }
             },
             col_result->data);
-        working.add_column(agg_col_name, std::move(materialised));
+        // Carry the computed argument's validity — the null-aware aggregate
+        // kernels must skip its null cells, not accumulate their payloads.
+        if (const auto* v = col_result->get_validity()) {
+            working.add_column(agg_col_name, std::move(materialised), *v);
+        } else {
+            working.add_column(agg_col_name, std::move(materialised));
+        }
         effective_input = &working;
     }
     ir::AggSpec spec{
@@ -1852,7 +1860,10 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
     if (entry == nullptr || entry->column == nullptr || column_size(*entry->column) != 1) {
         return std::unexpected("update + by: internal error computing aggregate broadcast");
     }
-    return scalar_from_column(*entry->column, 0);
+    if (entry->validity.has_value() && !(*entry->validity)[0]) {
+        return ExprValue{Null{}};  // no valid observations in the group
+    }
+    return expr_from_scalar(scalar_from_column(*entry->column, 0));
 }
 
 /// Evaluate a compound aggregate expression to a single scalar. Each
@@ -1862,17 +1873,17 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
 /// ColumnRefs resolve only against `scalars` — a column reference outside
 /// an aggregate would not collapse to a per-group scalar.
 auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
-    -> std::expected<ScalarValue, std::string> {
+    -> std::expected<ExprValue, std::string> {
     return std::visit(
-        [&](const auto& node) -> std::expected<ScalarValue, std::string> {
+        [&](const auto& node) -> std::expected<ExprValue, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::Literal>) {
-                return std::visit([](const auto& v) -> ScalarValue { return v; }, node.value);
+                return std::visit([](const auto& v) -> ExprValue { return v; }, node.value);
             } else if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 if (scalars != nullptr) {
                     auto it = scalars->find(node.name);
                     if (it != scalars->end()) {
-                        return it->second;
+                        return expr_from_scalar(it->second);
                     }
                 }
                 return std::unexpected("update + by: non-aggregate column '" + node.name +
@@ -1886,13 +1897,18 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
                 if (!rhs) {
                     return std::unexpected(rhs.error());
                 }
-                const ColumnValue lhs_col = broadcast_scalar_column(*lhs, 1);
-                const ColumnValue rhs_col = broadcast_scalar_column(*rhs, 1);
+                // Null propagates through the scalar arithmetic, same as the
+                // per-row evaluator: a null aggregate nulls the compound.
+                if (std::holds_alternative<Null>(*lhs) || std::holds_alternative<Null>(*rhs)) {
+                    return ExprValue{Null{}};
+                }
+                const ColumnValue lhs_col = broadcast_scalar_column(*scalar_from_expr(*lhs), 1);
+                const ColumnValue rhs_col = broadcast_scalar_column(*scalar_from_expr(*rhs), 1);
                 auto result = arith_vec(node.op, lhs_col, rhs_col, 1);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
-                return scalar_from_column(*result, 0);
+                return expr_from_scalar(scalar_from_column(*result, 0));
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 return eval_aggregate_call_scalar(node, input, scalars);
             } else {
@@ -1958,7 +1974,19 @@ auto fold_aggregates_to_columns(ir::Expr& expr, const Table& group_input, Table&
                     while (working.find(name) != nullptr) {
                         name += '_';
                     }
-                    working.add_column(name, broadcast_scalar_column(*scalar, working.rows()));
+                    if (std::holds_alternative<Null>(*scalar)) {
+                        // A null aggregate (all-null group) broadcasts as an
+                        // all-invalid column of the call's inferred type.
+                        auto ty = infer_expr_type(expr, group_input, scalars, nullptr);
+                        if (!ty) {
+                            return std::unexpected(ty.error());
+                        }
+                        working.add_column(name, default_column_for(*ty, working.rows()),
+                                           ValidityBitmap(working.rows(), false));
+                    } else {
+                        working.add_column(name, broadcast_scalar_column(*scalar_from_expr(*scalar),
+                                                                         working.rows()));
+                    }
                     expr.node = ir::ColumnRef{.name = std::move(name)};
                     return {};
                 }
@@ -2078,8 +2106,21 @@ auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field,
     if (!scalar) {
         return std::unexpected(scalar.error());
     }
+    if (std::holds_alternative<Null>(*scalar)) {
+        // A null compound aggregate broadcasts as an all-invalid column of
+        // the expression's inferred type.
+        auto ty = infer_expr_type(field.expr, input, scalars, nullptr);
+        if (!ty) {
+            return std::unexpected(ty.error());
+        }
+        BroadcastAggregateColumn result{
+            .column = default_column_for(*ty, input.rows()),
+            .validity = ValidityBitmap(input.rows(), false),
+        };
+        return std::optional<BroadcastAggregateColumn>{std::move(result)};
+    }
     BroadcastAggregateColumn result{
-        .column = broadcast_scalar_column(*scalar, input.rows()),
+        .column = broadcast_scalar_column(*scalar_from_expr(*scalar), input.rows()),
         .validity = std::nullopt,
     };
     return std::optional<BroadcastAggregateColumn>{std::move(result)};

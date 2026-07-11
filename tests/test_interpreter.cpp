@@ -2026,6 +2026,51 @@ TEST_CASE("update + by partitions lag per group with null boundary",
     }
 }
 
+TEST_CASE("Int division is float division on every evaluation path",
+          "[interpreter][update][grouped]") {
+    // `/` yields Float64 regardless of operand types (only `%` stays
+    // integral). The fused numeric and per-row paths always did this; the
+    // vectorized arith_vec used to truncate Int/Int, so an aggregate-broadcast
+    // field (sum(x*x)/sum(x)) and a vectorized field (coalesce(a,b)/b) gave
+    // 3 where plain a/b gave 3.888...
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5, 6});
+    table.add_column("g", Column<std::int64_t>{1, 2, 1, 2, 1, 2});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    SECTION("aggregate-broadcast compound expression") {
+        // g=1: sum(x*x)=35, sum(x)=9 -> 3.888...; g=2: 56/12 -> 4.666...
+        auto ir = require_ir("data[update { w = sum(x*x) / sum(x) }, by g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* g = std::get_if<Column<std::int64_t>>(result->find("g"));
+        const auto* w = std::get_if<Column<double>>(result->find("w"));
+        REQUIRE(g != nullptr);
+        REQUIRE(w != nullptr);
+        for (std::size_t r = 0; r < w->size(); ++r) {
+            CHECK((*w)[r] == Catch::Approx((*g)[r] == 1 ? 35.0 / 9.0 : 56.0 / 12.0));
+        }
+    }
+    SECTION("vectorized value expression") {
+        // coalesce forces the vectorized evaluator; x/g must still be float.
+        auto ir = require_ir("data[update { d = coalesce(x, g) / g }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* x = std::get_if<Column<std::int64_t>>(result->find("x"));
+        const auto* g = std::get_if<Column<std::int64_t>>(result->find("g"));
+        const auto* d = std::get_if<Column<double>>(result->find("d"));
+        REQUIRE(x != nullptr);
+        REQUIRE(g != nullptr);
+        REQUIRE(d != nullptr);
+        for (std::size_t r = 0; r < d->size(); ++r) {
+            CHECK((*d)[r] ==
+                  Catch::Approx(static_cast<double>((*x)[r]) / static_cast<double>((*g)[r])));
+        }
+    }
+}
+
 TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][grouped]") {
     // Symbol A: ts = {1,2,3} val = {10,20,30}; window 1ns -> mean = {10, 15, 25}
     // Symbol B: ts = {1,2,3} val = {100,200,300}; window 1ns -> mean = {100, 150, 250}

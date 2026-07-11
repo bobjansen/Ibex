@@ -246,9 +246,25 @@ auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict
 // Dispatch arith_into over all numeric column-type combinations.
 auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n)
     -> std::expected<ColumnValue, std::string> {
-    // int64 × int64 → int64
+    // int64 × int64 → int64, except `/`: division yields Float64 regardless
+    // of operand types — matching type inference and the fused numeric and
+    // per-row paths (`20/0` → inf, not safe_idiv's 0). Only `%` stays
+    // integral. Previously this truncated, so `sum(x*x)/sum(x)` in an
+    // aggregate-broadcast field and `coalesce(a,b)/b` in a vectorized field
+    // disagreed with plain `a/b`.
     if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
+            if (op == ir::ArithmeticOp::Div) {
+                Column<double> out;
+                out.resize(n);
+                double* __restrict dp = out.data();
+                const std::int64_t* __restrict lp = l->data();
+                const std::int64_t* __restrict rp = r->data();
+                for (std::size_t i = 0; i < n; ++i) {
+                    dp[i] = static_cast<double>(lp[i]) / static_cast<double>(rp[i]);
+                }
+                return ColumnValue{std::move(out)};
+            }
             Column<std::int64_t> out;
             out.resize(n);
             arith_into(op, l->data(), r->data(), out.data(), n);

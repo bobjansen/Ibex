@@ -289,14 +289,26 @@ struct ColumnEvalCtx {
     std::optional<ir::Duration> window;
 };
 
+// How a Scalar builtin's per-row `eval` meets a Null argument
+// (plans/exprvalue-null-arm-plan.md, stage 3).
+enum class NullPolicy : std::uint8_t {
+    Propagate,  // default: any Null argument -> Null result; eval never sees Null
+    Handles,    // eval receives Null arguments and decides (coalesce, fill_null, ...)
+};
+
 // Builtin function registry entry (registry lives in expr.cpp; type inference
 // and evaluation dispatch through it). Generalizes the former scalar-only
 // registry per plans/function-kind-registry-plan.md: every builtin declares its
 // `kind` plus a kind-appropriate evaluator — `eval` for row-local Scalar
 // builtins, `column_eval` for whole-column kinds (Generator and Transform),
-// `agg_func` for reducing Aggregates. Exactly one of the three is set.
+// `agg_func` for reducing Aggregates. A Scalar entry may carry BOTH `eval`
+// and `column_eval`: the column kernel is then a whole-column fast path used
+// when the call is a top-level field / value leaf, and the per-row eval is
+// the general (and semantic-reference) form. Only column-ONLY entries
+// (eval == nullptr) force the enclosing expression onto the vectorized path.
 struct BuiltinFn {
     ir::FnKind kind = ir::FnKind::Scalar;
+    NullPolicy null_policy = NullPolicy::Propagate;
     int min_args = 1;
     int max_args = 1;  // -1 == variadic
     std::expected<ExprType, std::string> (*infer)(std::string_view, const std::vector<ExprType>&){};
@@ -671,6 +683,24 @@ enum class FloatCleanMode : std::uint8_t {
 [[nodiscard]] auto builtins() -> const robin_hood::unordered_map<std::string_view, BuiltinFn>&;
 // Registry lookup by callee name; nullptr when `name` is not a builtin.
 [[nodiscard]] auto find_builtin(std::string_view name) -> const BuiltinFn*;
+
+// Should this call go to the entry's whole-column kernel? Column-only entries
+// (no per-row eval) always do. Hybrid Scalar entries (fill_null/null_if_*/
+// coalesce keep their kernels as fast paths) use the kernel only for the
+// kernel-shaped call — every positional argument a bare column or literal;
+// computed arguments evaluate per-row via the NullPolicy::Handles eval.
+[[nodiscard]] inline auto use_column_kernel(const BuiltinFn& fn, const ir::CallExpr& call) -> bool {
+    if (fn.column_eval == nullptr) {
+        return false;
+    }
+    if (fn.eval == nullptr) {
+        return true;
+    }
+    return std::ranges::all_of(call.args, [](const auto& a) {
+        return std::holds_alternative<ir::ColumnRef>(a->node) ||
+               std::holds_alternative<ir::Literal>(a->node);
+    });
+}
 [[nodiscard]] auto infer_expr_type(const ir::Expr& expr, const Table& input,
                                    const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ExprType, std::string>;
@@ -683,14 +713,11 @@ enum class FloatCleanMode : std::uint8_t {
 [[nodiscard]] auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool;
 // The single field-expression evaluator: top-level whole-column builtin via
 // the registry, then vectorized / fast / per-row. All update paths and
-// evaluate_field_column dispatch through it (stage 6 of the plan).
+// the vectorized evaluator's scalar-call delegation dispatch through it
+// (stage 6 of the plan).
 [[nodiscard]] auto evaluate_field(const ir::Expr& expr, const Table& input,
                                   const ColumnEvalCtx& ctx)
     -> std::expected<ComputedColumn, std::string>;
-[[nodiscard]] auto evaluate_field_column(const ir::Expr& expr, const Table& input,
-                                         const ScalarRegistry* scalars,
-                                         const ExternRegistry* externs)
-    -> std::expected<ColumnValue, std::string>;
 [[nodiscard]] auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs)

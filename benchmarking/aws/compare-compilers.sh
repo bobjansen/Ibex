@@ -148,7 +148,7 @@ echo "Instance: $INSTANCE_ID"
 echo "Log     : aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --latest --output text"
 echo ""
 echo "Waiting for s3://${S3_BUCKET}/${RESULT_KEY} ..."
-echo "(build + generated-query compiler comparison; typically 20-40 min at 4M rows)"
+echo "(full Clang/GCC build + generated-query timing; typically 20-40 min at 4M rows)"
 echo ""
 
 TIMEOUT=14400

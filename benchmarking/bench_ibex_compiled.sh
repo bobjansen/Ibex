@@ -135,6 +135,7 @@ EOF
         -I"$IBEX_ROOT/libs/csv" \
         -I"$BUILD_DIR/_deps/fmt-src/include" \
         -I"$BUILD_DIR/_deps/fast_float-src/include" \
+        -I"$BUILD_DIR/_deps/robin_hood-src/src/include" \
         "$cpp_path" \
         -Wl,--start-group \
         "$BUILD_DIR/src/runtime/libibex_runtime.a" \

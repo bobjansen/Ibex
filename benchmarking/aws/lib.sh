@@ -16,6 +16,7 @@ bench_load_config() {
     local script_dir="$1"
     local config_file="$script_dir/.config"
     [[ -f "$config_file" ]] && source "$config_file"
+    return 0
 }
 
 # Persist a KEY=VALUE pair into .config, replacing any existing line for KEY.

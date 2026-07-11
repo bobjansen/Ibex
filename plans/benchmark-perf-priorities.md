@@ -173,6 +173,8 @@ vs mean_by_symbol 23 ms @16M; the ~27 ms delta is the 3 extra scatter passes.)
 
 - `order_head/tail_topk`: **0.11×** vs polars (~9× faster) — the fused TopK win.
 - `tf_rolling_median_1m` 0.50×, rolling_sum/mean ~0.70×, rolling_std 0.86×.
+  `rolling_min`/`rolling_max` now use monotonic-deque kernels (July 2026) and
+  should be protected in the next AWS comparison.
 - `rand_bernoulli` 0.30×, `rand_normal` 0.57×, cumprod, count_by_symbol_day,
   cross_join.
 - Scalar math builtins (`update {v = f(col)}`): abs/sqrt/log/exp/round/floor/ceil

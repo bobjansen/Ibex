@@ -2,6 +2,11 @@
 
 ## Goal
 
+Status (2026-07-11): implemented in the interpreter and codegen path. The
+original rolling-min/max follow-up is also done via the July monotonic-deque
+optimization. Remaining language follow-ups are `window N rows` block syntax
+and tuple-field `update` support inside `window`.
+
 Let rolling aggregates take an explicit per-call window as a trailing argument,
 in two flavours, discriminated by the literal kind:
 
@@ -105,8 +110,8 @@ no type-inference change.
 
 - `window N rows { ... }` block syntax (lexer keyword) — deferred; per-call
   subsumes the common case.
-- Monotonic-deque `rolling_min`/`rolling_max` (still O(n·w)); count windows
-  inherit the same complexity.
+- Tuple-field `update` inside `window`; the interpreter still rejects this
+  combination, and codegen preserves parity.
 
 ## Codegen parity (done)
 

@@ -654,6 +654,12 @@ enum class FloatCleanMode : std::uint8_t {
                                                 const ExternRegistry* externs)
     -> std::expected<std::size_t, std::string>;
 [[nodiscard]] auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool;
+// The single field-expression evaluator: top-level whole-column builtin via
+// the registry, then vectorized / fast / per-row. All update paths and
+// evaluate_field_column dispatch through it (stage 6 of the plan).
+[[nodiscard]] auto evaluate_field(const ir::Expr& expr, const Table& input,
+                                  const ColumnEvalCtx& ctx)
+    -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto evaluate_field_column(const ir::Expr& expr, const Table& input,
                                          const ScalarRegistry* scalars,
                                          const ExternRegistry* externs)

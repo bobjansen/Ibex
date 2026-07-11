@@ -264,8 +264,8 @@ struct ColumnEvalCtx {
 // and evaluation dispatch through it). Generalizes the former scalar-only
 // registry per plans/function-kind-registry-plan.md: every builtin declares its
 // `kind` plus a kind-appropriate evaluator — `eval` for row-local Scalar
-// builtins, `column_eval` for whole-column kinds (Generator and Transform;
-// Aggregate to follow). Exactly one of the two eval pointers is set.
+// builtins, `column_eval` for whole-column kinds (Generator and Transform),
+// `agg_func` for reducing Aggregates. Exactly one of the three is set.
 struct BuiltinFn {
     ir::FnKind kind = ir::FnKind::Scalar;
     int min_args = 1;
@@ -280,6 +280,13 @@ struct BuiltinFn {
     std::expected<ComputedColumn, std::string> (*column_eval)(const ir::CallExpr&, const Table&,
                                                               std::size_t rows,
                                                               const ColumnEvalCtx&){};
+    // Aggregate (N→1) evaluation key: the enum the aggregate machinery
+    // (AggSpec / aggregate_table, incl. its factorized fast paths) dispatches
+    // on. The kernels are enum-driven rather than per-function pointers, so
+    // the registry carries the mapping, not a wrapper.
+    // The "redundant" NSDMI keeps designated initializers that omit this
+    // field free of -Wmissing-designated-field-initializers.
+    std::optional<ir::AggFunc> agg_func{};  // NOLINT(readability-redundant-member-init)
 };
 
 // ── Inline helpers shared by per-row/per-group loops in several TUs ──────────

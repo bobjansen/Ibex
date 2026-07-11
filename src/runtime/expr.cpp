@@ -15,6 +15,7 @@
 #include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -686,6 +687,51 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                  "rolling_kurtosis",
              }) {
             m.emplace(fn, rolling_transform);
+        }
+
+        // ── Aggregates (N→1, per group): reduce a column to one scalar. The
+        // kernels (aggregate_table and its factorized fast paths) dispatch on
+        // ir::AggFunc, so each entry carries that enum as its evaluation key
+        // (`agg_func`); parse_aggregate_func is the registry lookup. Arity and
+        // argument shape are validated by the spec builders / kernels
+        // ("count() takes no arguments", "ewma(): expected two arguments", …).
+        const auto agg_infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+            if (name == "count") {
+                return ExprType::Int;
+            }
+            if (name == "sum" || name == "min" || name == "max" || name == "first" ||
+                name == "last") {
+                // Type-preserving reductions.
+                if (a.empty()) {
+                    return std::unexpected(std::string(name) + "(): expected column argument");
+                }
+                return a[0];
+            }
+            return ExprType::Double;  // mean/median/std/ewma/quantile/skew/kurtosis
+        };
+        const std::array<std::pair<std::string_view, ir::AggFunc>, 13> agg_funcs{{
+            {"sum", ir::AggFunc::Sum},
+            {"mean", ir::AggFunc::Mean},
+            {"min", ir::AggFunc::Min},
+            {"max", ir::AggFunc::Max},
+            {"count", ir::AggFunc::Count},
+            {"first", ir::AggFunc::First},
+            {"last", ir::AggFunc::Last},
+            {"median", ir::AggFunc::Median},
+            {"std", ir::AggFunc::Stddev},
+            {"ewma", ir::AggFunc::Ewma},
+            {"quantile", ir::AggFunc::Quantile},
+            {"skew", ir::AggFunc::Skew},
+            {"kurtosis", ir::AggFunc::Kurtosis},
+        }};
+        for (const auto& [name, func] : agg_funcs) {
+            m.emplace(name, BuiltinFn{
+                                .kind = ir::FnKind::Aggregate,
+                                .min_args = 0,
+                                .max_args = -1,
+                                .infer = agg_infer,
+                                .agg_func = func,
+                            });
         }
 
         return m;

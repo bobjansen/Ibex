@@ -137,6 +137,20 @@ Each stage shippable, suite green throughout:
    never return null scalars today); if/when it can, extend `ScalarValue`
    the same way and let the REPL print `null`. Until then, convert at the
    boundary and error on `Null` escaping into a scalar binding.
+   *Resolved (July 2026), with a corrected premise:* aggregates COULD
+   already return null — an all-null group has no mean — and three sinks
+   read the undefined payload instead: First/Last finalized to a valid
+   default 0 on empty groups, the compound scalar-collapse path
+   (`sum(x)/count() by g`) broadcast a valid garbage nan, and
+   `grouped_update_table`'s per-group gather dropped input validity so
+   nulls never reached the aggregates at all. All fixed: the
+   scalar-collapse pair now returns `ExprValue` (Null propagates through
+   scalar arithmetic; a Null broadcasts as an all-invalid column of the
+   inferred type), and the ScalarValue boundary keeps the null-free rule
+   with clear errors (`scalar()` on a null cell, `aggregate_series` on a
+   null result). ScalarValue itself deliberately still has no null arm —
+   extending it (REPL variables printing null) remains open and becomes
+   worthwhile only if null scalars need to be *bound*, not just crossed.
 
 ## Payoff
 

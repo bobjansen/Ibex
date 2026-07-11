@@ -1303,11 +1303,16 @@ auto extract_scalar(const Table& table, const std::string& column)
     if (table.rows() != 1) {
         return std::unexpected("scalar() requires exactly one row");
     }
-    const auto* col = table.find(column);
-    if (col == nullptr) {
+    const auto* entry = table.find_entry(column);
+    if (entry == nullptr || entry->column == nullptr) {
         return std::unexpected("column not found: " + column);
     }
-    return scalar_from_column(*col, 0);
+    // ScalarValue is null-free by design; a null cell has no scalar image.
+    if (entry->validity.has_value() && !(*entry->validity)[0]) {
+        return std::unexpected("scalar value of '" + column +
+                               "' is null; scalars cannot hold null");
+    }
+    return scalar_from_column(*entry->column, 0);
 }
 
 auto is_scalar_builtin(std::string_view name) -> bool {
@@ -1368,6 +1373,13 @@ auto aggregate_series(std::string_view name, const ColumnValue& column, double p
     const auto* entry = agg->find_entry("__agg");
     if (entry == nullptr || entry->column == nullptr) {
         return std::unexpected(std::string(name) + "(): produced no result");
+    }
+    // ScalarValue is null-free by design; an aggregate with no valid
+    // observations has no scalar image.
+    if (entry->validity.has_value() && !(*entry->validity)[0]) {
+        return std::unexpected(std::string(name) +
+                               "(): result is null (no valid observations); "
+                               "scalars cannot hold null");
     }
     return scalar_from_column(*entry->column, 0);
 }

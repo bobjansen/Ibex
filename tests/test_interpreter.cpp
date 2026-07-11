@@ -2138,6 +2138,79 @@ TEST_CASE("Int division is float division on every evaluation path",
     }
 }
 
+TEST_CASE("aggregates over an all-null column reduce to null, not garbage",
+          "[interpreter][aggregate][null]") {
+    // An aggregate with no valid observations has no value: first/last (which
+    // used to emit a valid default 0) and the compound scalar-collapse path
+    // (which used to read the null result's undefined payload and broadcast
+    // it as a valid nan) must all produce null. Mixed groups stay exact.
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.0, 0.0, 2.0, 0.0},
+                     std::vector<bool>{true, false, true, false});
+    table.add_column("g", Column<std::int64_t>{1, 2, 1, 2});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    SECTION("select: first/last/mean on the all-null slice") {
+        auto ir = require_ir("t[select { f = first(x), l = last(x), m = mean(x) }, by g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* g = std::get_if<Column<std::int64_t>>(result->find("g"));
+        REQUIRE(g != nullptr);
+        for (const auto* name : {"f", "l", "m"}) {
+            const auto* entry = result->find_entry(name);
+            REQUIRE(entry != nullptr);
+            REQUIRE(entry->validity.has_value());
+            for (std::size_t r = 0; r < g->size(); ++r) {
+                CHECK((*entry->validity)[r] == ((*g)[r] == 1));  // group 2 is all null
+            }
+        }
+    }
+    SECTION("grouped update: bare, compound, and mixed broadcast") {
+        auto ir =
+            require_ir("t[update { w = mean(x), v = sum(x) / count(), d = x - mean(x) }, by g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* g = std::get_if<Column<std::int64_t>>(result->find("g"));
+        REQUIRE(g != nullptr);
+        for (const auto* name : {"w", "v", "d"}) {
+            const auto* entry = result->find_entry(name);
+            REQUIRE(entry != nullptr);
+            REQUIRE(entry->validity.has_value());
+            for (std::size_t r = 0; r < g->size(); ++r) {
+                CHECK((*entry->validity)[r] == ((*g)[r] == 1));
+            }
+        }
+        const auto& w = std::get<Column<double>>(*result->find("w"));
+        const auto& v = std::get<Column<double>>(*result->find("v"));
+        for (std::size_t r = 0; r < g->size(); ++r) {
+            if ((*g)[r] == 1) {
+                CHECK(w[r] == Catch::Approx(1.5));  // mean{1, 2}
+                CHECK(v[r] == Catch::Approx(1.5));  // sum 3 / count 2
+            }
+        }
+    }
+    SECTION("extract_scalar refuses a null cell") {
+        auto ir = require_ir("t[select { f = first(x) }, by g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        // Reduce to the all-null group's single row, then extract.
+        runtime::Table one_row;
+        const auto* g = std::get_if<Column<std::int64_t>>(result->find("g"));
+        const auto* f_entry = result->find_entry("f");
+        REQUIRE(g != nullptr);
+        REQUIRE(f_entry != nullptr);
+        std::size_t null_row = (*g)[0] == 2 ? 0 : 1;
+        Column<double> f_col;
+        f_col.push_back(std::get<Column<double>>(*f_entry->column)[null_row]);
+        one_row.add_column("f", runtime::ColumnValue{std::move(f_col)},
+                           runtime::ValidityBitmap(1, false));
+        auto scalar = runtime::extract_scalar(one_row, "f");
+        REQUIRE_FALSE(scalar.has_value());
+        CHECK(scalar.error().find("null") != std::string::npos);
+    }
+}
+
 TEST_CASE("short generator errors instead of leaving a truncated column",
           "[interpreter][update][generator]") {
     // rep with length_out shorter than the frame used to add a short column

@@ -639,8 +639,6 @@ enum class FloatCleanMode : std::uint8_t {
     -> std::expected<FillResult, std::string>;
 [[nodiscard]] auto eval_float_clean(const ir::CallExpr& call, const Table& input,
                                     FloatCleanMode mode) -> std::expected<FillResult, std::string>;
-[[nodiscard]] auto eval_is_nan(const ir::CallExpr& call, const Table& input)
-    -> std::expected<ColumnValue, std::string>;
 [[nodiscard]] auto builtins() -> const robin_hood::unordered_map<std::string_view, BuiltinFn>&;
 // Registry lookup by callee name; nullptr when `name` is not a builtin.
 [[nodiscard]] auto find_builtin(std::string_view name) -> const BuiltinFn*;

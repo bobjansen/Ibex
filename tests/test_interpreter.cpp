@@ -5120,7 +5120,10 @@ TEST_CASE("fill_forward wrong argument count returns error", "[null][fill]") {
     CHECK(result.error().find("fill_forward") != std::string::npos);
 }
 
-TEST_CASE("is_nan returns Bool mask for Float64 columns", "[nan][clean]") {
+TEST_CASE("is_nan returns Bool mask for Float64 columns and propagates null", "[nan][clean]") {
+    // is_nan is an ordinary null-propagating scalar: NaN is a property of a
+    // *present* value, so is_nan(null) is null (unknown), not false. Asking
+    // "NaN or missing?" is spelled is_nan(x) || is_null(x).
     runtime::Table t;
     t.add_column("x", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(), 3.0, 0.0},
                  std::vector<bool>{true, true, true, false});
@@ -5134,12 +5137,15 @@ TEST_CASE("is_nan returns Bool mask for Float64 columns", "[nan][clean]") {
 
     const auto* entry = result->find_entry("bad");
     REQUIRE(entry != nullptr);
-    CHECK_FALSE(entry->validity.has_value());
     const auto& bad = std::get<Column<bool>>(*entry->column);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0] == true);
+    CHECK((*entry->validity)[1] == true);
+    CHECK((*entry->validity)[2] == true);
+    CHECK((*entry->validity)[3] == false);
     CHECK(bad[0] == false);
     CHECK(bad[1] == true);
     CHECK(bad[2] == false);
-    CHECK(bad[3] == false);
 }
 
 TEST_CASE("null_if_nan marks NaN values as null", "[nan][clean]") {

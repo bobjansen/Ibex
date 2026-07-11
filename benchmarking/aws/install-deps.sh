@@ -66,11 +66,30 @@ curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
 chmod +x /tmp/llvm.sh
 /tmp/llvm.sh "${CLANG_VERSION}"
 
+# Pull the newest GCC exposed by Ubuntu's toolchain repo. This keeps the
+# compiler comparison on the latest available GCC without hard-coding a version
+# into the benchmark harness.
+add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
+apt-get update -qq
+GCC_VERSION="$(apt-cache search --names-only '^g\+\+-[0-9]+$' \
+    | awk '{ sub(/^g\+\+-/, "", $1); print $1 }' \
+    | sort -n | tail -1)"
+if [[ -n "$GCC_VERSION" ]]; then
+    apt-get install -y "gcc-${GCC_VERSION}" "g++-${GCC_VERSION}"
+else
+    apt-get install -y gcc g++
+fi
+
 # Make the freshly installed Clang the unversioned default.
 update-alternatives --install /usr/bin/clang++ clang++ "/usr/bin/clang++-${CLANG_VERSION}" 100
 update-alternatives --install /usr/bin/clang   clang   "/usr/bin/clang-${CLANG_VERSION}"   100
+if [[ -n "$GCC_VERSION" ]]; then
+    update-alternatives --install /usr/bin/g++ g++ "/usr/bin/g++-${GCC_VERSION}" 100
+    update-alternatives --install /usr/bin/gcc gcc "/usr/bin/gcc-${GCC_VERSION}" 100
+fi
 
 echo "✓ C++ toolchain: $(clang++ --version | head -1)"
+echo "✓ GCC: $(g++ --version | head -1)"
 echo "✓ CMake: $(cmake --version | head -1)"
 echo "✓ Ninja: $(ninja --version)"
 echo ""

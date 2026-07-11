@@ -82,6 +82,21 @@ provision() {
     chmod +x /tmp/llvm.sh
     /tmp/llvm.sh "${CLANG_VERSION}"
 
+    # Latest GCC available to this Ubuntu image. The PPA is intentionally used
+    # only to widen apt's candidate set; the exact version is resolved at image
+    # build/run time so the compiler benchmark tracks the current toolchain.
+    add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
+    apt-get update -qq
+    local gcc_version
+    gcc_version="$(apt-cache search --names-only '^g\+\+-[0-9]+$' \
+        | awk '{ sub(/^g\+\+-/, "", $1); print $1 }' \
+        | sort -n | tail -1)"
+    if [[ -n "$gcc_version" ]]; then
+        apt-get install -y "gcc-${gcc_version}" "g++-${gcc_version}"
+    else
+        apt-get install -y gcc g++
+    fi
+
     # dplyr + tidyr aren't in apt; install from CRAN so the R bench's dplyr cells
     # (and reshape) run. Matches install-deps.sh.
     Rscript -e '
@@ -106,7 +121,7 @@ provision() {
     ln -sf /root/.local/bin/uvx /usr/local/bin/uvx 2>/dev/null || true
 
     mkdir -p /opt/ibex
-    date -u +"provisioned %Y-%m-%dT%H:%M:%SZ clang-${CLANG_VERSION} cmake-${CMAKE_VERSION}" > "$MARKER"
+    date -u +"provisioned %Y-%m-%dT%H:%M:%SZ clang-${CLANG_VERSION} gcc-${gcc_version:-default} cmake-${CMAKE_VERSION}" > "$MARKER"
 }
 
 if [[ -f "$MARKER" ]]; then
@@ -121,6 +136,75 @@ fi
 # /usr/local/bin symlinks), but be defensive for the baked case.
 export PATH="/usr/local/bin:/root/.local/bin:$PATH"
 
+find_latest_gxx() {
+    local best="" best_ver="" path base ver
+    for path in /usr/bin/g++-[0-9]*; do
+        [[ -x "$path" ]] || continue
+        base="$(basename "$path")"
+        ver="${base#g++-}"
+        [[ "$ver" =~ ^[0-9]+$ ]] || continue
+        if [[ -z "$best_ver" || "$ver" -gt "$best_ver" ]]; then
+            best_ver="$ver"
+            best="$path"
+        fi
+    done
+    if [[ -n "$best" ]]; then
+        echo "$best"
+    elif command -v g++ >/dev/null 2>&1; then
+        command -v g++
+    else
+        return 1
+    fi
+}
+
+find_latest_gxx_version() {
+    local gxx
+    gxx="$(find_latest_gxx)"
+    "$gxx" -dumpfullversion 2>/dev/null || "$gxx" -dumpversion
+}
+
+install_latest_gcc() {
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+        ca-certificates gnupg software-properties-common
+    add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
+    apt-get update -qq
+
+    local gcc_version
+    gcc_version="$(apt-cache search --names-only '^g\+\+-[0-9]+$' \
+        | awk '{ sub(/^g\+\+-/, "", $1); print $1 }' \
+        | sort -n | tail -1)"
+    if [[ -n "$gcc_version" ]]; then
+        apt-get install -y --no-install-recommends "gcc-${gcc_version}" "g++-${gcc_version}"
+    else
+        apt-get install -y --no-install-recommends gcc g++
+    fi
+}
+
+ensure_compiler_compare_toolchain() {
+    if ! command -v "clang++-${CLANG_VERSION}" >/dev/null 2>&1; then
+        echo "FATAL: clang++-${CLANG_VERSION} is missing; rebuild the AMI or rerun provisioning." >&2
+        exit 1
+    fi
+
+    # Older baked AMIs predate the GCC install added for compare-compilers.sh.
+    # Repair just this missing toolchain slice instead of forcing an AMI rebuild.
+    if ! find_latest_gxx >/dev/null 2>&1; then
+        echo "No g++ found on this AMI; installing latest available GCC toolchain."
+        install_latest_gcc
+    fi
+
+    local gxx
+    if ! gxx="$(find_latest_gxx)"; then
+        echo "FATAL: no g++ found after attempting GCC installation." >&2
+        exit 1
+    fi
+    echo "Compiler comparison toolchain:"
+    "clang++-${CLANG_VERSION}" --version | head -1
+    "$gxx" --version | head -1
+}
+
 # ── Build ibex (release) ──────────────────────────────────────────────────────
 # Reuses an existing build-release if the AMI baked one (incremental: ninja
 # rebuilds only the ibex objects that changed between the baked commit and this
@@ -131,6 +215,8 @@ build_ibex() {
         -DCMAKE_C_COMPILER="clang-${CLANG_VERSION}" \
         -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
         -DIBEX_PARQUET_S3=OFF \
+        -DIBEX_ENABLE_MARCH_NATIVE=ON \
+        -DIBEX_ENABLE_LTO=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -S /ibex
     ninja -C /ibex/build-release
@@ -299,6 +385,55 @@ if [[ "${IBEX_COMPARE_PLUGIN_MODE:-0}" == "1" ]]; then
         | tee "$REPORT"
 
     exit 0  # finish_compare_plugin (EXIT trap) uploads the report and terminates
+fi
+
+# ── Compare-compiler mode (compare-compilers.sh) ──────────────────────────────
+# Compare generated Ibex C++ compiled with latest Clang vs latest GCC on one
+# clean box. Ibex itself is built once with Clang; the generated query C++ is
+# then compiled/timed by both compilers using aggressive native optimization.
+#
+#   IBEX_REPEATS, IBEX_ITERS, IBEX_WARMUP — passed through
+#   IBEX_INTERLEAVE  — "1" (default) alternates clang/gcc repeats
+#   IBEX_TASKSET     — optional core pinning (e.g. "2-3")
+#   IBEX_DATA_ROWS   — fact-table row count for gen_data.py (default 4000000)
+#   IBEX_RESULT_KEY  — S3 key the report text is uploaded to
+if [[ "${IBEX_COMPARE_COMPILERS_MODE:-0}" == "1" ]]; then
+    REPORT=/ibex/benchmarking/results/compare_compilers_report.txt
+    mkdir -p /ibex/benchmarking/results
+
+    finish_compare_compilers() {
+        local code=$?
+        if [[ -f "$REPORT" ]] && aws s3 cp "$REPORT" \
+            "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}"; then
+            echo "Report uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (exit ${code})"
+        else
+            echo "WARNING: no report uploaded (exit ${code})"
+        fi
+        shutdown -h now
+    }
+    trap finish_compare_compilers EXIT
+
+    ensure_compiler_compare_toolchain
+    build_ibex
+
+    uv run --project /ibex /ibex/benchmarking/data/gen_data.py \
+        /ibex/benchmarking/data --rows "${IBEX_DATA_ROWS:-4000000}"
+
+    COMPARE_ARGS=(
+        --build-dir /ibex/build-release
+        --clang-cxx "clang++-${CLANG_VERSION}"
+        --gcc-cxx "$(find_latest_gxx)"
+        --repeats "${IBEX_REPEATS:-3}"
+        --iters "${IBEX_ITERS:-7}"
+        --warmup "${IBEX_WARMUP:-1}"
+        --out "$REPORT"
+    )
+    [[ "${IBEX_INTERLEAVE:-1}" == "1" ]] && COMPARE_ARGS+=(--interleave)
+    [[ -n "${IBEX_TASKSET:-}" ]] && COMPARE_ARGS+=(--taskset "${IBEX_TASKSET}")
+
+    bash /ibex/benchmarking/compare_ibex_compilers.sh "${COMPARE_ARGS[@]}"
+
+    exit 0  # finish_compare_compilers (EXIT trap) uploads the report and terminates
 fi
 
 # ── Normal run: build + suite ──────────────────────────────────────────────────

@@ -46,7 +46,10 @@ namespace ibex::ir {
 enum class FnKind : std::uint8_t { Scalar, Transform, Generator, Aggregate };
 
 /// Classify a built-in by name. Unknown names (extern / user functions) are
-/// treated as Scalar (row-local) — the safe default for the callers.
+/// treated as Scalar (row-local) — the safe default for the callers. The
+/// runtime builtin registry (builtins() in src/runtime/expr.cpp) checks at
+/// construction that this classifier agrees with every entry's execution
+/// payload, so the two cannot drift apart silently.
 [[nodiscard]] auto fn_kind(std::string_view name) -> FnKind;
 
 /// True if an Expr's output at row i depends only on its inputs at row i — no

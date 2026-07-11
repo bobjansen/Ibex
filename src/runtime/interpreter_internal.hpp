@@ -258,34 +258,82 @@ enum class NullPolicy : std::uint8_t {
     Handles,    // eval receives Null arguments and decides (coalesce, fill_null, ...)
 };
 
-// Builtin function registry entry (registry lives in expr.cpp; type inference
-// and evaluation dispatch through it). Generalizes the former scalar-only
-// registry per plans/function-kind-registry-plan.md: every builtin declares its
-// `kind` plus a kind-appropriate evaluator — `eval` for row-local Scalar
-// builtins, `column_eval` for whole-column kinds (Generator and Transform),
-// aggregate builtins are registry-visible for inference/classification, while
-// aggregate execution keeps its compact name-to-enum mapping in aggregate.cpp.
-// A Scalar entry may carry BOTH `eval`
-// and `column_eval`: the column kernel is then a whole-column fast path used
-// when the call is a top-level field / value leaf, and the per-row eval is
-// the general (and semantic-reference) form. Only column-ONLY entries
-// (eval == nullptr) force the enclosing expression onto the vectorized path.
-struct BuiltinFn {
-    ir::FnKind kind = ir::FnKind::Scalar;
+// Signatures shared by the registry payloads below.
+using InferFn = std::expected<ExprType, std::string> (*)(std::string_view,
+                                                         const std::vector<ExprType>&);
+// Row-local evaluation: args at row i -> value at row i.
+using RowEvalFn = std::expected<ExprValue, std::string> (*)(std::string_view,
+                                                            const std::vector<ExprValue>&);
+// Whole-column evaluation: the raw call (for arg literals / named args), the
+// input table, the output row count, and the evaluation context.
+using ColumnEvalFn = std::expected<ComputedColumn, std::string> (*)(const ir::CallExpr&,
+                                                                    const Table&, std::size_t rows,
+                                                                    const ColumnEvalCtx&);
+
+// ── Per-kind execution payloads ──────────────────────────────────────────────
+// One alternative per ir::FnKind, in enum order (fn_kind_of relies on it;
+// pinned by the static_asserts below BuiltinFn). What a builtin *can do* is
+// carried by which alternative it holds, so kind and capability cannot
+// disagree — the former flat struct encoded capability in pointer-nullness,
+// which every dispatch site had to re-test by convention.
+
+// Row-local scalar. `kernel` is an optional whole-column fast path taken only
+// for the kernel-shaped call (every positional argument a bare column or
+// literal, see use_column_kernel); `eval` is the general form and the
+// semantic reference — the two must agree.
+struct ScalarExec {
     NullPolicy null_policy = NullPolicy::Propagate;
+    RowEvalFn eval{};
+    ColumnEvalFn kernel{};
+};
+// Non-row-local (rolling_* / cumsum / cumprod / lag / lead / fill_forward /
+// fill_backward): output row i reads neighbouring rows, so evaluation is
+// whole-column only.
+struct TransformExec {
+    ColumnEvalFn column_eval{};
+};
+// Produces a column from parameters/pattern (rand_*, rep); input rows are not
+// read. Same payload shape as TransformExec, but a distinct alternative: the
+// planner treats the kinds differently (generators ignore input order).
+struct GeneratorExec {
+    ColumnEvalFn column_eval{};
+};
+// Reduces a column (or group) to one value. Execution routes through the
+// aggregate machinery keyed by ir::AggFunc; the registry is the single
+// name -> AggFunc mapping (parse_aggregate_func reads it).
+struct AggregateExec {
+    ir::AggFunc func{};
+};
+
+// Builtin function registry entry (registry lives in expr.cpp; type inference
+// and evaluation dispatch through it). Common metadata is flat; the
+// kind-specific execution surface is the `exec` variant.
+struct BuiltinFn {
     int min_args = 1;
     int max_args = 1;  // -1 == variadic
-    std::expected<ExprType, std::string> (*infer)(std::string_view, const std::vector<ExprType>&){};
-    // Scalar (row-local) evaluation: args at row i -> value at row i.
-    std::expected<ExprValue, std::string> (*eval)(std::string_view,
-                                                  const std::vector<ExprValue>&){};
-    // Whole-column evaluation (Generator/Transform): the raw call (for arg
-    // literals / named args), the input table, the output row count, and the
-    // evaluation context.
-    std::expected<ComputedColumn, std::string> (*column_eval)(const ir::CallExpr&, const Table&,
-                                                              std::size_t rows,
-                                                              const ColumnEvalCtx&){};
+    InferFn infer{};
+    std::variant<ScalarExec, TransformExec, GeneratorExec, AggregateExec> exec;
 };
+
+static_assert(
+    std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(ir::FnKind::Scalar),
+                                              decltype(BuiltinFn::exec)>,
+                   ScalarExec> &&
+        std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(ir::FnKind::Transform),
+                                                  decltype(BuiltinFn::exec)>,
+                       TransformExec> &&
+        std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(ir::FnKind::Generator),
+                                                  decltype(BuiltinFn::exec)>,
+                       GeneratorExec> &&
+        std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(ir::FnKind::Aggregate),
+                                                  decltype(BuiltinFn::exec)>,
+                       AggregateExec>,
+    "BuiltinFn::exec alternatives must mirror ir::FnKind order (fn_kind_of casts the index)");
+
+// The entry's kind, derived from the alternative it holds — cannot drift.
+[[nodiscard]] inline auto fn_kind_of(const BuiltinFn& fn) -> ir::FnKind {
+    return static_cast<ir::FnKind>(fn.exec.index());
+}
 
 // ── Inline helpers shared by per-row/per-group loops in several TUs ──────────
 
@@ -644,17 +692,43 @@ enum class FloatCleanMode : std::uint8_t {
 // Registry lookup by callee name; nullptr when `name` is not a builtin.
 [[nodiscard]] auto find_builtin(std::string_view name) -> const BuiltinFn*;
 
+// Column-ONLY builtins (Transform/Generator) have no per-row form; an
+// expression containing one must evaluate on the vectorized path.
+[[nodiscard]] inline auto is_column_only(const BuiltinFn& fn) -> bool {
+    return std::holds_alternative<TransformExec>(fn.exec) ||
+           std::holds_alternative<GeneratorExec>(fn.exec);
+}
+
+// The whole-column entry point for `fn`, or nullptr when it has none: a
+// Transform/Generator's column_eval, or a Scalar's optional kernel.
+// Aggregates never have one (they route through the aggregate machinery).
+[[nodiscard]] inline auto column_eval_of(const BuiltinFn& fn) -> ColumnEvalFn {
+    return std::visit(
+        [](const auto& exec) -> ColumnEvalFn {
+            using T = std::decay_t<decltype(exec)>;
+            if constexpr (std::is_same_v<T, ScalarExec>) {
+                return exec.kernel;
+            } else if constexpr (std::is_same_v<T, AggregateExec>) {
+                return nullptr;
+            } else {
+                return exec.column_eval;
+            }
+        },
+        fn.exec);
+}
+
 // Should this call go to the entry's whole-column kernel? Column-only entries
-// (no per-row eval) always do. Hybrid Scalar entries (fill_null/null_if_*/
+// (Transform/Generator) always do. Hybrid Scalar entries (fill_null/null_if_*/
 // coalesce keep their kernels as fast paths) use the kernel only for the
 // kernel-shaped call — every positional argument a bare column or literal;
 // computed arguments evaluate per-row via the NullPolicy::Handles eval.
 [[nodiscard]] inline auto use_column_kernel(const BuiltinFn& fn, const ir::CallExpr& call) -> bool {
-    if (fn.column_eval == nullptr) {
-        return false;
-    }
-    if (fn.eval == nullptr) {
+    if (is_column_only(fn)) {
         return true;
+    }
+    const auto* scalar = std::get_if<ScalarExec>(&fn.exec);
+    if (scalar == nullptr || scalar->kernel == nullptr) {
+        return false;
     }
     return std::ranges::all_of(call.args, [](const auto& a) {
         return std::holds_alternative<ir::ColumnRef>(a->node) ||

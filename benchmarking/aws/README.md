@@ -144,8 +144,11 @@ is slower and on a bigger box, so budget more.
 ## 3d. Compare latest Clang vs latest GCC
 
 `compare-compilers.sh` answers "does the C++ compiler matter for Ibex?" for a
-single commit. The EC2 instance builds Ibex twice in Release mode with
-`-DIBEX_ENABLE_MARCH_NATIVE=ON`:
+single commit. The EC2 instance builds the benchmark-relevant Ibex C++ targets
+twice in Release mode with `-DIBEX_ENABLE_MARCH_NATIVE=ON`: the compiler,
+runtime, IR, core, and their dependencies. Optional plugin/test/example/Python
+targets are skipped so the comparison is about the generated-query execution
+path, not Arrow/parquet/LightGBM build cost.
 
 - latest configured Clang (`clang++-21` from apt.llvm.org)
 - latest versioned GCC available from Ubuntu's toolchain apt source

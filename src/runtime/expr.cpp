@@ -1190,9 +1190,7 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
 // through here exactly once —
 //   1. a top-level whole-column builtin (Transform/Generator) via the
 //      registry's `column_eval`, with a row-count guard so a short generator
-//      (rep's length_out) errors instead of reading out of bounds; is_nan on
-//      a bare column rides alongside — its column kernel is validity-aware
-//      (null -> false), which the per-row Scalar entry cannot see;
+//      (rep's length_out) errors instead of reading out of bounds;
 //   2. the vectorized, validity-aware path for anything containing a boolean
 //      node or a nested whole-column call (eval_expr is pure and has no null);
 //   3. the fused numeric fast path;
@@ -1203,14 +1201,6 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
     -> std::expected<ComputedColumn, std::string> {
     std::size_t rows = input.rows();
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
-        if (call->callee == "is_nan" && call->args.size() == 1 &&
-            std::holds_alternative<ir::ColumnRef>(call->args[0]->node)) {
-            auto col = eval_is_nan(*call, input);
-            if (!col) {
-                return std::unexpected(col.error());
-            }
-            return ComputedColumn{.column = std::move(*col), .validity = std::nullopt};
-        }
         if (const auto* fn = find_builtin(call->callee);
             fn != nullptr && fn->column_eval != nullptr) {
             auto col = fn->column_eval(*call, input, rows, ctx);
@@ -1776,34 +1766,6 @@ auto eval_float_clean(const ir::CallExpr& call, const Table& input, FloatCleanMo
         validity.reset();
     }
     return FillResult{.column = ColumnValue{std::move(result)}, .validity = std::move(validity)};
-}
-
-auto eval_is_nan(const ir::CallExpr& call, const Table& input)
-    -> std::expected<ColumnValue, std::string> {
-    if (call.args.size() != 1) {
-        return std::unexpected("is_nan: expected 1 argument (col)");
-    }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
-    if (!col_ref) {
-        return std::unexpected("is_nan: argument must be a column name");
-    }
-    const auto* entry = input.find_entry(col_ref->name);
-    if (!entry) {
-        return std::unexpected("is_nan: unknown column '" + col_ref->name + "'");
-    }
-    const auto* src = std::get_if<Column<double>>(entry->column.get());
-    if (src == nullptr) {
-        return std::unexpected("is_nan: column must be Float64");
-    }
-
-    Column<bool> result;
-    result.resize(src->size());
-    const bool has_validity = entry->validity.has_value();
-    for (std::size_t i = 0; i < src->size(); ++i) {
-        const bool is_valid = !has_validity || (*entry->validity)[i];
-        result.set(i, is_valid && std::isnan((*src)[i]));
-    }
-    return ColumnValue{std::move(result)};
 }
 
 // ─── Vectorized RNG ───────────────────────────────────────────────────────────

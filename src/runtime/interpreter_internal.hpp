@@ -250,14 +250,24 @@ struct BroadcastAggregateColumn {
     std::optional<ValidityBitmap> validity;
 };
 
-// Row-wise scalar builtin registry entry (registry lives in expr.cpp; both
-// type inference and per-row evaluation dispatch through it).
-struct ScalarBuiltin {
+// Builtin function registry entry (registry lives in expr.cpp; type inference
+// and evaluation dispatch through it). Generalizes the former scalar-only
+// registry per plans/function-kind-registry-plan.md: every builtin declares its
+// `kind` plus a kind-appropriate evaluator — `eval` for row-local Scalar
+// builtins, `column_eval` for whole-column kinds (Generator now; Transform to
+// follow). Exactly one of the two eval pointers is set.
+struct BuiltinFn {
+    ir::FnKind kind = ir::FnKind::Scalar;
     int min_args = 1;
     int max_args = 1;  // -1 == variadic
     std::expected<ExprType, std::string> (*infer)(std::string_view, const std::vector<ExprType>&){};
+    // Scalar (row-local) evaluation: args at row i -> value at row i.
     std::expected<ExprValue, std::string> (*eval)(std::string_view,
                                                   const std::vector<ExprValue>&){};
+    // Whole-column evaluation (Generator/Transform): the raw call (for arg
+    // literals / named args), the input table, and the output row count.
+    std::expected<ComputedColumn, std::string> (*column_eval)(const ir::CallExpr&, const Table&,
+                                                              std::size_t rows){};
 };
 
 // ── Inline helpers shared by per-row/per-group loops in several TUs ──────────
@@ -582,10 +592,9 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
                                                 const ScalarRegistry* scalars)
     -> std::optional<ColumnValue>;
 
-// expr.cpp — scalar-builtin registry, type inference, per-row and per-field
+// expr.cpp — builtin-function registry, type inference, per-row and per-field
 // expression evaluation, lag/lead/fill/cum transforms, RNG/rep generators.
 using ir::is_cum_func;
-using ir::is_rng_func;
 using ir::is_rolling_func;
 
 constexpr auto is_fill_func(std::string_view name) -> bool {
@@ -619,8 +628,9 @@ enum class FloatCleanMode : std::uint8_t {
                                     FloatCleanMode mode) -> std::expected<FillResult, std::string>;
 [[nodiscard]] auto eval_is_nan(const ir::CallExpr& call, const Table& input)
     -> std::expected<ColumnValue, std::string>;
-[[nodiscard]] auto scalar_builtins()
-    -> const robin_hood::unordered_map<std::string_view, ScalarBuiltin>&;
+[[nodiscard]] auto builtins() -> const robin_hood::unordered_map<std::string_view, BuiltinFn>&;
+// Registry lookup by callee name; nullptr when `name` is not a builtin.
+[[nodiscard]] auto find_builtin(std::string_view name) -> const BuiltinFn*;
 [[nodiscard]] auto infer_expr_type(const ir::Expr& expr, const Table& input,
                                    const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ExprType, std::string>;

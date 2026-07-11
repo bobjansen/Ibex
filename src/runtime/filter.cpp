@@ -1424,8 +1424,8 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
 // pmin/pmax, is_nan); the column-level lag/lead go to eval_lag_lead_column (the
 // same helper select/update uses). Neither is duplicated here.
 
-// Vectorized RNG column generator (rand_normal/rand_uniform/...); eval_value_vec
-// treats an RNG call as a column leaf so RNG can be nested inside arithmetic.
+// Generator builtins (rand_*/rep) come from the function registry; eval_value_vec
+// treats a Generator call as a column leaf so it can be nested inside arithmetic.
 
 // Boolean predicate evaluator (comparisons, logical, is_null). eval_value_vec
 // routes boolean-producing nodes here so a Bool result can be used in value
@@ -1526,15 +1526,27 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 res.owned_validity = merge_validity(lhs->get_validity(), rhs->get_validity(), n);
                 return res;
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                if (ir::is_rng_func(node.callee)) {
-                    // RNG generator as a column leaf — lets RNG be nested inside
-                    // arithmetic (e.g. `t + rand_normal(0, 1)`), using the same
-                    // vectorized draw as a bare RNG field.
-                    auto col = apply_rng_func(node, n);
+                if (const auto* fn = find_builtin(node.callee);
+                    fn != nullptr && fn->kind == ir::FnKind::Generator) {
+                    // Generator (rand_* / rep) as a column leaf — lets a
+                    // generated column be nested inside arithmetic (e.g.
+                    // `t + rand_normal(0, 1)`), using the same vectorized
+                    // kernel as a bare generator field.
+                    auto col = fn->column_eval(node, table, n);
                     if (!col) {
                         return std::unexpected(col.error());
                     }
-                    return ColResult{std::move(*col)};
+                    // A generator may be told to produce fewer rows than the
+                    // frame (rep's length_out); inside an expression that
+                    // cannot line up row-for-row.
+                    const std::size_t got =
+                        std::visit([](const auto& c) { return c.size(); }, col->column);
+                    if (got != n) {
+                        return std::unexpected(node.callee + ": generates " + std::to_string(got) +
+                                               " rows but the expression needs " +
+                                               std::to_string(n));
+                    }
+                    return ColResult{std::move(col->column), std::move(col->validity)};
                 }
                 if (node.callee == "coalesce") {
                     // First non-null argument per row (validity-aware). Arguments

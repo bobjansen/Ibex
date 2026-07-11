@@ -1542,10 +1542,11 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 return res;
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 if (const auto* fn = find_builtin(node.callee);
-                    fn != nullptr && fn->column_eval != nullptr) {
-                    // Whole-column builtin (Transform/Generator) as a column
-                    // leaf — lets rolling/cum/lag/fill and rand_*/rep nest
-                    // inside arithmetic (e.g. `px - rolling_mean(px, 20)` or
+                    fn != nullptr && use_column_kernel(*fn, node)) {
+                    // Whole-column builtin (Transform/Generator, or a hybrid
+                    // null-handling scalar in kernel shape) as a column leaf —
+                    // lets rolling/cum/lag/fill and rand_*/rep nest inside
+                    // arithmetic (e.g. `px - rolling_mean(px, 20)` or
                     // `t + rand_normal(0, 1)`), using the same kernels as a
                     // bare field. Externs are not threaded into this evaluator
                     // (same as scalar calls below); no enclosing `window`
@@ -1580,15 +1581,18 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 if (args_need_vec) {
                     return eval_scalar_over_columns(node, table, scalars, n);
                 }
-                // Otherwise delegate to the row-wise field evaluator, which
-                // dispatches through the shared scalar registry. Extern
-                // scalar functions are not available in predicate position
-                // (externs are not threaded into this vectorized evaluator).
-                auto col = evaluate_field_column(expr, table, scalars, nullptr);
+                // Otherwise delegate to the shared field evaluator, which
+                // dispatches through the registry (per-row, incl. the
+                // null-handling scalars) and carries validity. Extern scalar
+                // functions are not available in predicate position (externs
+                // are not threaded into this vectorized evaluator).
+                auto col = evaluate_field(
+                    expr, table,
+                    ColumnEvalCtx{.scalars = scalars, .externs = nullptr, .window = std::nullopt});
                 if (!col) {
                     return std::unexpected(col.error());
                 }
-                return ColResult{std::move(*col)};
+                return ColResult{std::move(col->column), std::move(col->validity)};
             } else if constexpr (std::is_same_v<T, ir::CompareExpr> ||
                                  std::is_same_v<T, ir::LogicalExpr> ||
                                  std::is_same_v<T, ir::IsNullExpr>) {
@@ -1694,8 +1698,6 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
     ir::CallExpr rewritten;
     rewritten.callee = call.callee;
     rewritten.args.reserve(call.args.size());
-    ValidityBitmap merged(n, true);
-    bool any_invalid = false;
     int synth = 0;
     for (const auto& arg : call.args) {
         if (!field_uses_vectorized_eval(*arg)) {
@@ -1714,12 +1716,6 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
         }
         const std::string name = "__ibex_nl_" + std::to_string(synth++) + "__";
         if (const auto* v = c->get_validity()) {
-            for (std::size_t i = 0; i < n; ++i) {
-                if (!(*v)[i]) {
-                    merged.set(i, false);
-                    any_invalid = true;
-                }
-            }
             tmp.add_column(name, std::move(owned), *v);
         } else {
             tmp.add_column(name, std::move(owned));
@@ -1728,17 +1724,19 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
         ref.node = ir::ColumnRef{.name = name};
         rewritten.args.push_back(ir::make_expr_ptr(std::move(ref)));
     }
+    // The materialized columns carry their validity, and the shared field
+    // evaluator produces the exact result validity from it (propagation or a
+    // Handles eval) — no post-hoc AND of argument masks, which would wrongly
+    // re-null rows a null-handling function just filled.
     ir::Expr rewritten_expr;
     rewritten_expr.node = std::move(rewritten);
-    auto col = evaluate_field_column(rewritten_expr, tmp, scalars, nullptr);
+    auto col = evaluate_field(
+        rewritten_expr, tmp,
+        ColumnEvalCtx{.scalars = scalars, .externs = nullptr, .window = std::nullopt});
     if (!col) {
         return std::unexpected(col.error());
     }
-    ColResult res{std::move(*col)};
-    if (any_invalid) {
-        res.owned_validity = std::move(merged);
-    }
-    return res;
+    return ColResult{std::move(col->column), std::move(col->validity)};
 }
 }  // namespace
 

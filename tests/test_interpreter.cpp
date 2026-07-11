@@ -2059,6 +2059,40 @@ TEST_CASE("per-row evaluation propagates null without reading payloads",
     CHECK(a[2] == Catch::Approx(3.5));
 }
 
+TEST_CASE("null-handling scalars evaluate per-row with NullPolicy::Handles",
+          "[interpreter][update][null]") {
+    // fill_null / null_if_* / coalesce are Scalar entries whose eval opts
+    // into receiving Null (their column kernels remain as fast paths for the
+    // bare-column form and must agree). Two things this pins: a computed
+    // argument works (previously "argument must be a column name"), and
+    // validity survives a null-handler nested inside an ordinary scalar call
+    // (no post-hoc argument-mask AND re-nulling filled rows).
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.0, 2.0, 3.0}, std::vector<bool>{true, false, true});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir =
+        require_ir("t[update { filled = fill_null(x * 1.0, 9.0), af = abs(fill_null(x, 4.0)) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* filled_entry = result->find_entry("filled");
+    REQUIRE(filled_entry != nullptr);
+    CHECK_FALSE(filled_entry->validity.has_value());  // every null filled
+    const auto& filled = std::get<Column<double>>(*filled_entry->column);
+    CHECK(filled[0] == Catch::Approx(1.0));
+    CHECK(filled[1] == Catch::Approx(9.0));
+    CHECK(filled[2] == Catch::Approx(3.0));
+
+    const auto* af_entry = result->find_entry("af");
+    REQUIRE(af_entry != nullptr);
+    CHECK_FALSE(af_entry->validity.has_value());
+    const auto& af = std::get<Column<double>>(*af_entry->column);
+    CHECK(af[1] == Catch::Approx(4.0));
+}
+
 TEST_CASE("Int division is float division on every evaluation path",
           "[interpreter][update][grouped]") {
     // `/` yields Float64 regardless of operand types (only `%` stays

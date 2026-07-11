@@ -644,6 +644,35 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             });
         m.emplace("null_if_not_finite", m.at("null_if_nan"));
 
+        // coalesce(a, b, ...): first non-null argument per row. Row-local by
+        // shape but validity-aware (the null wrinkle), so it is a Transform:
+        // the per-row ExprValue has no null. Kernel lives in filter.cpp
+        // because the arguments are arbitrary expressions evaluated through
+        // eval_value_vec.
+        m.emplace(
+            "coalesce",
+            BuiltinFn{
+                .kind = ir::FnKind::Transform,
+                .min_args = 0,
+                .max_args = -1,
+                .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                    if (a.size() < 2) {
+                        return std::unexpected("coalesce: expected at least 2 arguments");
+                    }
+                    for (const auto& t : a) {
+                        if (t != a[0]) {
+                            return std::unexpected("coalesce: arguments must share one type");
+                        }
+                    }
+                    return a[0];
+                },
+                .column_eval =
+                    [](const ir::CallExpr& call, const Table& input, std::size_t rows,
+                       const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+                    return eval_coalesce_column(call, input, ctx.scalars, rows);
+                },
+            });
+
         // rolling_*: the per-call window arg was peeled into the __window_n /
         // __window_ns sentinel named args by lowering; the enclosing `window`
         // clause (if any) arrives via ctx.window as the fallback.
@@ -876,27 +905,6 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 arg_types.push_back(*t);
             }
             return fn.infer(call->callee, arg_types);
-        }
-        // coalesce(a, b, ...): first non-null argument, per row. Validity-aware,
-        // so it is evaluated via the vectorized path; here we infer the result
-        // type, requiring the arguments to share one type.
-        if (call->callee == "coalesce") {
-            if (call->args.size() < 2) {
-                return std::unexpected("coalesce: expected at least 2 arguments");
-            }
-            std::optional<ExprType> result;
-            for (const auto& arg : call->args) {
-                auto t = infer_expr_type(*arg, input, scalars, externs);
-                if (!t) {
-                    return t;
-                }
-                if (!result.has_value()) {
-                    result = *t;
-                } else if (*result != *t) {
-                    return std::unexpected("coalesce: arguments must share one type");
-                }
-            }
-            return *result;
         }
         // round(x, mode): mode is a bare identifier, so it is dispatched apart
         // from the value-based registry. Always yields Int64.
@@ -1143,10 +1151,9 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
 // aware path (eval_value_vec) instead of the per-row eval_expr, because somewhere
 // in the tree it has a node the per-row evaluator can't produce:
 //   - a boolean node (comparison / logical / is_null), or
-//   - a `coalesce` call (validity-aware, not yet in the registry — stage 5), or
 //   - a whole-column builtin: any registry entry with a `column_eval`
-//     (Transforms — rolling/cum/lag/lead/fill/null_if_* — and Generators —
-//     `rand_*` / `rep`).
+//     (Transforms — rolling/cum/lag/lead/fill/null_if_*/coalesce — and
+//     Generators — `rand_*` / `rep`).
 // Detecting these anywhere (not just at the top or under arithmetic) is what
 // lets a non-row-local call nest inside arithmetic OR inside a scalar call —
 // e.g. `(close - lag(close,1)) / lag(close,1)` and `abs(rand_normal(0,1))`.
@@ -1164,10 +1171,9 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
                        field_uses_vectorized_eval(*node.right);
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 // Whole-column builtins (Transform/Generator — anything with a
-                // `column_eval`) cannot be built per row; neither can coalesce
-                // (validity-aware, not yet in the registry — stage 5).
+                // `column_eval`) cannot be built per row.
                 if (const auto* fn = find_builtin(node.callee);
-                    (fn != nullptr && fn->column_eval != nullptr) || node.callee == "coalesce") {
+                    fn != nullptr && fn->column_eval != nullptr) {
                     return true;
                 }
                 return std::ranges::any_of(

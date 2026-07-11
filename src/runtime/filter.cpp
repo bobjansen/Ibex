@@ -1431,14 +1431,14 @@ auto dispatch_numeric_cmp_pair_kernel(const NumericCmpSpec& lhs_spec,
 // position (e.g. `update { flag = x > 5 }`, `update { miss = is_null(x) }`).
 
 // True if a field expression must go through the vectorized, validity-aware
-// path (a boolean node, coalesce, or a non-row-local call — RNG / lag / lead —
-// anywhere in the tree). Defined far below; eval_value_vec needs it to decide
-// which arguments of a scalar call to materialize.
+// path (a boolean node or a whole-column builtin call anywhere in the tree).
+// Defined far below; eval_value_vec needs it to decide which arguments of a
+// scalar call to materialize.
 
 namespace {
 
 // Evaluate a scalar call (abs, sqrt, casts, …) whose arguments nest a
-// non-row-local sub-expression (RNG / lag / lead): materialize those arguments
+// non-row-local sub-expression (a Transform/Generator): materialize those arguments
 // into columns, then apply the scalar function over them. Defined after
 // eval_value_vec (it recurses into it).
 auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
@@ -1553,61 +1553,6 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     }
                     return ColResult{std::move(col->column), std::move(col->validity)};
                 }
-                if (node.callee == "coalesce") {
-                    // First non-null argument per row (validity-aware). Arguments
-                    // must share one column type (checked at inference).
-                    if (node.args.size() < 2) {
-                        return std::unexpected("coalesce: expected at least 2 arguments");
-                    }
-                    std::vector<ColResult> cols;
-                    cols.reserve(node.args.size());
-                    for (const auto& a : node.args) {
-                        auto c = eval_value_vec(*a, table, scalars, n);
-                        if (!c) {
-                            return std::unexpected(c.error());
-                        }
-                        cols.push_back(std::move(*c));
-                    }
-                    return std::visit(
-                        [&](const auto& c0) -> std::expected<ColResult, std::string> {
-                            using Col = std::decay_t<decltype(c0)>;
-                            Col out;
-                            out.reserve(n);
-                            ValidityBitmap valid(n, true);
-                            bool any_invalid = false;
-                            for (std::size_t i = 0; i < n; ++i) {
-                                bool filled = false;
-                                for (const auto& cr : cols) {
-                                    const auto* vk = cr.get_validity();
-                                    if (vk == nullptr || (*vk)[i]) {
-                                        const auto* tc = std::get_if<Col>(&deref_col(cr));
-                                        if (tc == nullptr) {
-                                            return std::unexpected(
-                                                "coalesce: arguments must share one type");
-                                        }
-                                        out.push_back((*tc)[i]);
-                                        filled = true;
-                                        break;
-                                    }
-                                }
-                                if (!filled) {
-                                    if constexpr (std::is_same_v<Col, Column<Categorical>>) {
-                                        out.push_back(std::string_view{});
-                                    } else {
-                                        out.push_back(typename Col::value_type{});
-                                    }
-                                    valid.set(i, false);
-                                    any_invalid = true;
-                                }
-                            }
-                            ColResult r{ColumnValue{std::move(out)}};
-                            if (any_invalid) {
-                                r.owned_validity = std::move(valid);
-                            }
-                            return r;
-                        },
-                        deref_col(cols[0]));
-                }
                 // A scalar call (abs, sqrt, casts, round, pmin/pmax, date
                 // parts, …). If any argument nests a non-row-local
                 // sub-expression (a Transform/Generator call or a boolean
@@ -1644,6 +1589,77 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
             }
         },
         expr.node);
+}
+
+// coalesce(a, b, ...): first non-null argument, per row. Validity-aware — the
+// null wrinkle: row-local by shape, but the per-row evaluator has no null, so
+// it evaluates at column level. Lives here (not expr.cpp) because arguments
+// are arbitrary expressions evaluated via eval_value_vec. Registered as a
+// Transform in the builtin registry; arguments must share one column type
+// (checked at inference; re-checked here since kernels are also called with
+// unvalidated calls from the update ladders).
+auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
+                          const ScalarRegistry* scalars, std::size_t rows)
+    -> std::expected<ComputedColumn, std::string> {
+    if (call.args.size() < 2) {
+        return std::unexpected("coalesce: expected at least 2 arguments");
+    }
+    std::vector<ColResult> cols;
+    cols.reserve(call.args.size());
+    for (const auto& a : call.args) {
+        auto c = eval_value_vec(*a, input, scalars, rows);
+        if (!c) {
+            return std::unexpected(c.error());
+        }
+        cols.push_back(std::move(*c));
+    }
+    // Eager type check, mirroring registry inference (which the update ladders
+    // bypass): without it a mismatched later argument would only error when a
+    // null row actually reaches it.
+    const auto t0 = expr_type_for_column(deref_col(cols[0]));
+    for (std::size_t k = 1; k < cols.size(); ++k) {
+        if (expr_type_for_column(deref_col(cols[k])) != t0) {
+            return std::unexpected("coalesce: arguments must share one type");
+        }
+    }
+    return std::visit(
+        [&](const auto& c0) -> std::expected<ComputedColumn, std::string> {
+            using Col = std::decay_t<decltype(c0)>;
+            Col out;
+            out.reserve(rows);
+            ValidityBitmap valid(rows, true);
+            bool any_invalid = false;
+            for (std::size_t i = 0; i < rows; ++i) {
+                bool filled = false;
+                for (const auto& cr : cols) {
+                    const auto* vk = cr.get_validity();
+                    if (vk == nullptr || (*vk)[i]) {
+                        const auto* tc = std::get_if<Col>(&deref_col(cr));
+                        if (tc == nullptr) {
+                            return std::unexpected("coalesce: arguments must share one type");
+                        }
+                        out.push_back((*tc)[i]);
+                        filled = true;
+                        break;
+                    }
+                }
+                if (!filled) {
+                    if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                        out.push_back(std::string_view{});
+                    } else {
+                        out.push_back(typename Col::value_type{});
+                    }
+                    valid.set(i, false);
+                    any_invalid = true;
+                }
+            }
+            ComputedColumn r{.column = ColumnValue{std::move(out)}, .validity = std::nullopt};
+            if (any_invalid) {
+                r.validity = std::move(valid);
+            }
+            return r;
+        },
+        deref_col(cols[0]));
 }
 
 // Evaluate a scalar call whose arguments nest non-row-local sub-expressions

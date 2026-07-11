@@ -1316,21 +1316,21 @@ auto extract_scalar(const Table& table, const std::string& column)
 }
 
 auto is_scalar_builtin(std::string_view name) -> bool {
-    // The registry now also holds column-kind builtins (Generators); "scalar
+    // The registry also holds column-kind builtins (Generators); "scalar
     // builtin" means the row-local kind only, as before the generalization.
     const auto* fn = find_builtin(name);
-    return fn != nullptr && fn->kind == ir::FnKind::Scalar;
+    return fn != nullptr && std::holds_alternative<ScalarExec>(fn->exec);
 }
 
 auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& args)
     -> std::expected<ScalarValue, std::string> {
     const auto* found = find_builtin(name);
-    if (found == nullptr || found->kind != ir::FnKind::Scalar) {
+    const auto* scalar_exec = found != nullptr ? std::get_if<ScalarExec>(&found->exec) : nullptr;
+    if (scalar_exec == nullptr || scalar_exec->eval == nullptr) {
         return std::unexpected("not a scalar builtin: " + std::string(name));
     }
-    const auto& fn = *found;
     const auto argc = static_cast<int>(args.size());
-    if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
+    if (argc < found->min_args || (found->max_args >= 0 && argc > found->max_args)) {
         return std::unexpected(std::string(name) + ": wrong number of arguments");
     }
     // The registry's eval takes ExprValue (which adds a Null alternative);
@@ -1340,7 +1340,7 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     for (const auto& a : args) {
         expr_args.push_back(expr_from_scalar(a));
     }
-    auto result = fn.eval(name, expr_args);
+    auto result = scalar_exec->eval(name, expr_args);
     if (!result) {
         return std::unexpected(result.error());
     }

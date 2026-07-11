@@ -1554,7 +1554,7 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     // window argument.
                     const ColumnEvalCtx ctx{
                         .scalars = scalars, .externs = nullptr, .window = std::nullopt};
-                    auto col = fn->column_eval(node, table, n, ctx);
+                    auto col = column_eval_of(*fn)(node, table, n, ctx);
                     if (!col) {
                         return std::unexpected(col.error());
                     }

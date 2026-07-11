@@ -1705,33 +1705,17 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 }
 
 auto parse_aggregate_func(std::string_view name) -> std::optional<ir::AggFunc> {
-    if (name == "sum")
-        return ir::AggFunc::Sum;
-    if (name == "mean")
-        return ir::AggFunc::Mean;
-    if (name == "min")
-        return ir::AggFunc::Min;
-    if (name == "max")
-        return ir::AggFunc::Max;
-    if (name == "count")
-        return ir::AggFunc::Count;
-    if (name == "first")
-        return ir::AggFunc::First;
-    if (name == "last")
-        return ir::AggFunc::Last;
-    if (name == "median")
-        return ir::AggFunc::Median;
-    if (name == "std")
-        return ir::AggFunc::Stddev;
-    if (name == "ewma")
-        return ir::AggFunc::Ewma;
-    if (name == "quantile")
-        return ir::AggFunc::Quantile;
-    if (name == "skew")
-        return ir::AggFunc::Skew;
-    if (name == "kurtosis")
-        return ir::AggFunc::Kurtosis;
-    return std::nullopt;
+    // The registry (builtins() in expr.cpp) is the single name-to-AggFunc
+    // mapping: an aggregate is exactly an entry holding an AggregateExec.
+    const auto* fn = find_builtin(name);
+    if (fn == nullptr) {
+        return std::nullopt;
+    }
+    const auto* agg = std::get_if<AggregateExec>(&fn->exec);
+    if (agg == nullptr) {
+        return std::nullopt;
+    }
+    return agg->func;
 }
 
 auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)

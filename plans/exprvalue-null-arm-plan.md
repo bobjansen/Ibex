@@ -126,6 +126,12 @@ Each stage shippable, suite green throughout:
 4. **Planner reclaim + kernel cleanup.** Re-run the guarded-update /
    chunked / canonicalize paths over the reclassified functions; keep or
    delete the old column kernels per benchmark evidence.
+   *Decided (July 2026): the kernels stay.* On 1M rows (half null,
+   release build) kernel fill_null runs ~6.6 ms vs ~66 ms per-row — 10× —
+   so the `use_column_kernel` gate keeps the bare-column form on the
+   kernel and the per-row Handles eval covers the general forms.
+   Guarded-update subset evaluation of fill_null verified end-to-end;
+   chunked/canonicalize covered by the suite.
 5. **(Optional, separate decision) REPL/ScalarValue null.** `let x =
    first(col)` where the cell is null currently cannot happen (aggregates
    never return null scalars today); if/when it can, extend `ScalarValue`

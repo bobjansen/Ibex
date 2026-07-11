@@ -336,8 +336,10 @@ This is the shape to build reusable dataframe helpers on. See
 ### Null handling
 
 Ibex uses SQL-style **three-valued logic (3VL)**. Each column carries an
-Arrow-style validity bitmap; null propagates through arithmetic and
-comparisons. Use `is null` / `is not null` to test for nulls explicitly:
+Arrow-style validity bitmap; null propagates through arithmetic, comparisons,
+and value functions (*null in → null out*), except the functions built to
+handle null (`coalesce`, `fill_null`, `null_if_nan`/`null_if_not_finite`).
+Use `is null` / `is not null` to test for nulls explicitly:
 
 ```
 import "csv";

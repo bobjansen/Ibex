@@ -357,6 +357,16 @@ prices[update { vol_int = Int64(volume_f) }];
 prices[update { vol_int = Int64(round(volume_f, nearest)) }];
 ```
 
+#### Arithmetic Type Rules
+
+Mixed `Int64`/`Float64` arithmetic promotes to `Float64`. Division is the one
+operator with a fixed result type: `a / b` yields `Float64` regardless of
+operand types — `20 / 8` is `2.5`, and division by zero follows IEEE 754
+(`inf` / `-inf` / `nan`), never a trap. Only `%` stays integral for `Int64`
+operands (`x % 0` is `0` by the safe-arithmetic rule). These rules hold
+identically on every evaluation path, including aggregate-broadcast
+expressions such as `sum(x*x) / sum(x)`.
+
 ### 3.2 Compound Types
 
 ```
@@ -481,14 +491,22 @@ SQL-style **three-valued logic (3VL)**: every predicate can evaluate to `true`,
 
 #### Null Propagation
 
-Null propagates through arithmetic and comparison expressions:
+Null propagates through arithmetic, comparisons, and every value function —
+the rule is **null in → null out**:
 
 ```
-null + x     = null
-null * x     = null
-null > x     = null     // not false — the result is unknown
-null = null  = null     // equality with null is never true
+null + x       = null
+null * x       = null
+null > x       = null     // not false — the result is unknown
+null = null    = null     // equality with null is never true
+abs(null)      = null     // scalar functions propagate
+is_nan(null)   = null     // NaN is a property of a present value
+`px=${null}`   = null     // string interpolation propagates too
 ```
+
+The only functions that *consume* null — because handling null is their
+purpose — are `is null` / `is not null`, `coalesce`, `fill_null`, and
+`null_if_nan` / `null_if_not_finite`.
 
 A `filter` clause keeps only rows where the predicate evaluates to `true`.
 Rows where the predicate is `null` are **silently dropped** (not an error).
@@ -530,8 +548,9 @@ Nulls arise from:
 - **Left join** — unmatched right-side columns for a row with no join partner
 - **`dcast`** — missing pivot combinations are filled with null
 - **`melt`** — a null measure value in the input produces a null `value` cell
-- **Aggregate functions** — some functions return null for empty groups (e.g.
-  `ewma` on an empty group, `std` on a group with fewer than 2 non-null values)
+- **Aggregate functions** — every value-bearing aggregate returns null for a
+  group with no valid observations (`sum`, `mean`, `first`, `last`, …, plus
+  `std` on fewer than 2 non-null values); `count` never does
 
 #### Aggregate Functions and Null
 
@@ -542,9 +561,16 @@ sum(col)    // sums only non-null values; returns null for an all-null group
 count()     // counts all rows regardless of null
 mean(col)   // averages only non-null values
 median(col) // ignores null rows
+first(col)  // first non-null value; null for an all-null group
+last(col)   // last non-null value; null for an all-null group
 std(col)    // ignores null rows; returns null if fewer than 2 non-null values
 ewma(col, alpha)  // ignores null rows; returns null for an empty group
 ```
+
+A null aggregate result behaves like any other null downstream: it broadcasts
+as null in an `update ... by` field (including compound expressions such as
+`sum(x) / count()`), and extracting it with `scalar()` is a runtime error —
+scalars cannot hold null.
 
 IEEE floating-point `NaN`, `+Inf`, and `-Inf` values are **not** null. They are
 stored as ordinary `Float64` payloads and are therefore not skipped
@@ -574,8 +600,14 @@ df[update { price = fill_null(price, 0) }]
 df[update { label = fill_null(label, "unknown") }]
 ```
 
-The `value` literal must be type-compatible with `col`. After filling, the
-result column has no validity bitmap (all rows are valid).
+`value` may be any expression of the column's type (an `Int64` fill value
+widens for a `Float64` column). After filling, the result column has no
+validity bitmap (all rows are valid).
+
+The fill functions, the NaN cleaners below, and `coalesce` (Section 12.6) are
+ordinary row-wise functions: they compose inside larger expressions —
+`fill_null(price, 0) * qty`, `abs(null_if_nan(px))` — and inside guarded
+`where ... update` blocks.
 
 **`fill_forward(col)`** — last observation carried forward (LOCF):
 
@@ -613,9 +645,11 @@ Floating-point cleanup uses a separate set of `Float64`-only built-ins:
 
 | Function | Description |
 |----------|-------------|
-| `is_nan(col)` | Returns a `Bool` column: `true` where `col` stores `NaN`, otherwise `false` |
-| `null_if_nan(col)` | Preserves finite values and turns `NaN` cells into null |
-| `null_if_not_finite(col)` | Preserves finite values and turns `NaN`, `+Inf`, and `-Inf` cells into null |
+| `is_nan(x)` | Returns a `Bool` column: `true` where a valid cell stores `NaN`, `false` for other valid cells; a null cell stays null (null in → null out — "NaN or missing?" is `is_nan(x) \|\| x is null`) |
+| `null_if_nan(x)` | Preserves finite values and turns `NaN` cells into null; existing nulls stay null |
+| `null_if_not_finite(x)` | Preserves finite values and turns `NaN`, `+Inf`, and `-Inf` cells into null; existing nulls stay null |
+
+The argument may be any `Float64` expression, not just a bare column.
 
 Typical workflow:
 
@@ -2373,9 +2407,10 @@ subset of rows within this range.
 ### 9.4 Temporal Functions
 
 The following functions are available inside `window`-scoped blocks. Rolling
-functions require an active `window` clause; `lag` and `lead` do not.
+functions require a window — either an active `window` clause or a per-call
+window argument (below); `lag` and `lead` do not.
 
-**Rolling aggregates (require `window`):**
+**Rolling aggregates:**
 
 | Function                   | Description                                                         |
 |----------------------------|---------------------------------------------------------------------|
@@ -2387,9 +2422,32 @@ functions require an active `window` clause; `lag` and `lead` do not.
 | `rolling_median(col)`      | Median within window (`Float64`); O(n log w) via sliding two-heap  |
 | `rolling_std(col)`         | Sample standard deviation within window (`Float64`; 0.0 when fewer than 2 rows) |
 | `rolling_ewma(col, alpha)` | EWMA within window (`Float64`); `alpha` is a numeric literal        |
+| `rolling_quantile(col, p)` | Quantile `p` within window (`Float64`); `p` is a numeric literal    |
+| `rolling_skew(col)`        | Sample skewness within window (`Float64`)                           |
+| `rolling_kurtosis(col)`    | Excess kurtosis within window (`Float64`)                           |
 
 Rolling functions are **aggregate-like**: they produce one scalar per row
 (evaluated over the window) and are valid in both `select` and `update`.
+
+**Per-call windows.** A rolling call may carry its own window as a trailing
+argument, overriding (or standing in for) the enclosing `window` clause:
+
+```
+tf[update { m20 = rolling_mean(price, 20) }]     // last 20 rows (count window)
+tf[update { m5s = rolling_mean(price, 5s) }]     // 5-second duration window
+```
+
+A count window (`20`) needs no time index and is valid on any ordered frame; a
+duration window (`5s`) requires a `TimeFrame`. Interpreter only for now; the
+transpiler does not yet emit per-call windows.
+
+**Composition.** Rolling, shift, cumulative, and fill functions produce a
+column and compose inside arithmetic and scalar calls like any other value:
+`price - rolling_mean(price, 20)`, `(close - lag(close, 1)) / lag(close, 1)`,
+`cumsum(qty) * px`. Their own column argument must still be a bare column —
+materialize a computed input with a preceding `update` block. A rolling call
+nested inside a larger expression needs a per-call window; the enclosing
+`window` clause applies only to top-level rolling fields.
 
 **Positional shift (no `window` required):**
 
@@ -2832,7 +2890,9 @@ scalar(df: DataFrame<S>, col: Ident) -> T
 ```
 
 Extracts a single scalar from a one-row DataFrame. `col` names a column in `S`.
-It is a runtime error if the DataFrame has any row count other than 1.
+It is a runtime error if the DataFrame has any row count other than 1, or if
+the cell is null — scalar bindings cannot hold null (test with `is null` or
+fill with `coalesce` first).
 
 ### 12.3 Join Functions
 
@@ -2922,6 +2982,12 @@ assigned in `select`/`update` (e.g. `update { above = price > vwap, missing =
 is_null(sector) }`). `is_null`/`is_not_null`/`coalesce` are null-aware: they read
 the value's null bit rather than its (ignored) payload, so `coalesce(x, 0.0)`
 replaces nulls and `is_null(x)` is never itself null.
+
+**Null behaviour.** Every scalar function in the table above propagates null —
+a null argument yields a null result (`abs(null)` is null, `is_nan(null)` is
+null). The null-handling exceptions are `is_null`/`is_not_null`, `coalesce`,
+and the fill/clean functions of Section 3.5 (`fill_null`, `null_if_nan`,
+`null_if_not_finite`), whose purpose is to consume null.
 
 `round(x, mode)` converts a `Float64` scalar or `Series<Float64>` to `Int64` /
 `Series<Int64>`. The mode is a bare identifier (not a string):

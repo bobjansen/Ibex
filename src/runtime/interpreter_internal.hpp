@@ -232,48 +232,6 @@ inline auto agg_finalize_kurtosis(const AggSlot& slot) -> double {
            (((n + 1.0) * n * slot.m4 / (slot.m2 * slot.m2)) - (3.0 * (n - 1.0)));
 }
 
-// Whether a streamed aggregate slot has enough observations to be non-null.
-// Mirrors the materializing aggregate's `agg_result_is_valid`.
-inline auto chunked_agg_valid(ir::AggFunc func, const AggSlot& slot) -> bool {
-    switch (func) {
-        case ir::AggFunc::Mean:
-            return slot.count > 0;
-        case ir::AggFunc::Sum:
-        case ir::AggFunc::Min:
-        case ir::AggFunc::Max:
-        case ir::AggFunc::First:
-        case ir::AggFunc::Last:
-            return slot.has_value;
-        case ir::AggFunc::Stddev:
-            return slot.count >= 2;
-        case ir::AggFunc::Skew:
-            return slot.count >= 3;
-        case ir::AggFunc::Kurtosis:
-            return slot.count >= 4;
-        default:  // Count
-            return true;
-    }
-}
-
-// Whether a streamed aggregate carries a validity bitmap at all (Count never
-// produces nulls; the value-bearing aggs may).
-inline auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
-    switch (func) {
-        case ir::AggFunc::Sum:
-        case ir::AggFunc::Mean:
-        case ir::AggFunc::Min:
-        case ir::AggFunc::Max:
-        case ir::AggFunc::First:
-        case ir::AggFunc::Last:
-        case ir::AggFunc::Stddev:
-        case ir::AggFunc::Skew:
-        case ir::AggFunc::Kurtosis:
-            return true;
-        default:
-            return false;
-    }
-}
-
 struct AggState {
     std::vector<AggSlot> slots;
 };

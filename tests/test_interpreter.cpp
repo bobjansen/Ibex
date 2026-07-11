@@ -2138,6 +2138,83 @@ TEST_CASE("Int division is float division on every evaluation path",
     }
 }
 
+TEST_CASE("short generator errors instead of leaving a truncated column",
+          "[interpreter][update][generator]") {
+    // rep with length_out shorter than the frame used to add a short column
+    // whose missing tail read out-of-bounds garbage; now it errors. The
+    // rows == 0 data-gen bootstrap (growing an empty frame) stays allowed.
+    runtime::Table table;
+    table.add_column("x", Column<std::int64_t>{1, 2, 3, 4, 5});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    SECTION("length_out mismatch on a populated frame errors") {
+        auto ir = require_ir("t[update { r = rep(9, length_out=2) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("generates 2 rows") != std::string::npos);
+    }
+    SECTION("generator on an empty frame grows it") {
+        runtime::TableRegistry empty_registry;
+        empty_registry.emplace("e", runtime::Table{});
+        auto ir = require_ir("e[update { r = rep(9, length_out=3) }];");
+        auto result = runtime::interpret(*ir, empty_registry);
+        REQUIRE(result.has_value());
+        const auto* r = std::get_if<Column<std::int64_t>>(result->find("r"));
+        REQUIRE(r != nullptr);
+        CHECK(r->size() == 3);
+    }
+}
+
+TEST_CASE("is_nan accepts a computed argument", "[interpreter][update][nan]") {
+    // Previously the update path intercepted is_nan with a bare-column-only
+    // kernel, so is_nan(x * 1.0) errored "argument must be a column name".
+    // It now evaluates per-row through the scalar registry.
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.0, std::numeric_limits<double>::quiet_NaN(), 3.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { bad = is_nan(x * 1.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* bad = std::get_if<Column<bool>>(result->find("bad"));
+    REQUIRE(bad != nullptr);
+    CHECK((*bad)[0] == false);
+    CHECK((*bad)[1] == true);
+    CHECK((*bad)[2] == false);
+}
+
+TEST_CASE("windowed update keeps validity on plain computed fields",
+          "[interpreter][window][null]") {
+    // A computed field inside `window ... update` must carry input nulls the
+    // same way a regular update does. This used to silently drop validity:
+    // the windowed fallthrough evaluated fields through a column-only helper
+    // with no validity, so `val + 1` over a nullable column lost the null.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3)});
+    table.add_column("val", Column<double>{10.0, 0.0, 30.0}, std::vector<bool>{true, false, true});
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "as_timeframe(data, \"ts\")[window 2ns, update { m = rolling_count(), shifted = val + 1.0 "
+        "}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* entry = result->find_entry("shifted");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0] == true);
+    CHECK((*entry->validity)[1] == false);
+    CHECK((*entry->validity)[2] == true);
+    const auto& shifted = std::get<Column<double>>(*entry->column);
+    CHECK(shifted[0] == Catch::Approx(11.0));
+    CHECK(shifted[2] == Catch::Approx(31.0));
+}
+
 TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][grouped]") {
     // Symbol A: ts = {1,2,3} val = {10,20,30}; window 1ns -> mean = {10, 15, 25}
     // Symbol B: ts = {1,2,3} val = {100,200,300}; window 1ns -> mean = {100, 150, 250}

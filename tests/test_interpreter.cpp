@@ -2026,6 +2026,39 @@ TEST_CASE("update + by partitions lag per group with null boundary",
     }
 }
 
+TEST_CASE("per-row evaluation propagates null without reading payloads",
+          "[interpreter][update][null]") {
+    // The per-row evaluator represents a null cell as an ExprValue Null read
+    // from the validity bitmap (never touching the undefined payload) and
+    // propagates it: null in -> null out, through operators and scalar
+    // builtins alike. String interpolation is per-row-only, so it pins the
+    // path; abs() pins the registry-call propagation.
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.5, 0.0, 3.5}, std::vector<bool>{true, false, true});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { msg = `v=${x}`, a = abs(x), y = x + 1.0 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    for (const auto* name : {"msg", "a", "y"}) {
+        const auto* entry = result->find_entry(name);
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        CHECK((*entry->validity)[0] == true);
+        CHECK((*entry->validity)[1] == false);
+        CHECK((*entry->validity)[2] == true);
+    }
+    const auto& msg = std::get<Column<std::string>>(*result->find("msg"));
+    CHECK(msg[0] == "v=1.5");
+    CHECK(msg[2] == "v=3.5");
+    const auto& a = std::get<Column<double>>(*result->find("a"));
+    CHECK(a[0] == Catch::Approx(1.5));
+    CHECK(a[2] == Catch::Approx(3.5));
+}
+
 TEST_CASE("Int division is float division on every evaluation path",
           "[interpreter][update][grouped]") {
     // `/` yields Float64 regardless of operand types (only `%` stays

@@ -130,7 +130,36 @@ struct KeyEq {
 
 }  // namespace
 
-using ExprValue = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
+/// The per-row null: a cell whose value is missing (validity bit clear).
+/// plans/exprvalue-null-arm-plan.md — the alternative exists so the per-row
+/// evaluator can represent missing cells directly instead of computing on
+/// undefined payloads and masking afterwards. ScalarValue (REPL scalars,
+/// extern args) deliberately stays null-free; convert at the boundary with
+/// the helpers below.
+struct Null {
+    auto operator==(const Null&) const -> bool = default;
+};
+
+using ExprValue = std::variant<Null, std::int64_t, double, bool, std::string, Date, Timestamp>;
+
+/// ScalarValue -> ExprValue: always valid (ScalarValue is the null-free subset).
+inline auto expr_from_scalar(const ScalarValue& v) -> ExprValue {
+    return std::visit([](const auto& x) -> ExprValue { return x; }, v);
+}
+
+/// ExprValue -> ScalarValue: nullopt on Null (no scalar image). Callers at
+/// the REPL/extern boundary decide how to surface that.
+inline auto scalar_from_expr(const ExprValue& v) -> std::optional<ScalarValue> {
+    return std::visit(
+        [](const auto& x) -> std::optional<ScalarValue> {
+            if constexpr (std::is_same_v<std::decay_t<decltype(x)>, Null>) {
+                return std::nullopt;
+            } else {
+                return ScalarValue{x};
+            }
+        },
+        v);
+}
 
 struct AggSlot {
     ir::AggFunc func = ir::AggFunc::Sum;

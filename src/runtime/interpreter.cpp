@@ -763,20 +763,30 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
 
             // Pre-evaluate scalar args (literals — no row context needed).
-            ExternArgs source_args;
-            for (const auto& arg : sn.source_args()) {
-                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val)
-                    return std::unexpected(val.error());
-                source_args.push_back(std::move(val.value()));
-            }
-            ExternArgs sink_scalar_args;
-            for (const auto& arg : sn.sink_args()) {
-                auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val)
-                    return std::unexpected(val.error());
-                sink_scalar_args.push_back(std::move(val.value()));
-            }
+            // Externs take null-free ScalarValue arguments.
+            auto eval_scalar_args =
+                [&](const std::vector<ir::Expr>& exprs) -> std::expected<ExternArgs, std::string> {
+                ExternArgs out;
+                out.reserve(exprs.size());
+                for (const auto& arg : exprs) {
+                    auto val = eval_expr(arg, Table{}, 0, scalars, externs);
+                    if (!val)
+                        return std::unexpected(val.error());
+                    auto scalar = scalar_from_expr(val.value());
+                    if (!scalar.has_value())
+                        return std::unexpected("null argument in stream extern call");
+                    out.push_back(std::move(*scalar));
+                }
+                return out;
+            };
+            auto source_args_res = eval_scalar_args(sn.source_args());
+            if (!source_args_res)
+                return std::unexpected(source_args_res.error());
+            ExternArgs source_args = std::move(*source_args_res);
+            auto sink_args_res = eval_scalar_args(sn.sink_args());
+            if (!sink_args_res)
+                return std::unexpected(sink_args_res.error());
+            ExternArgs sink_scalar_args = std::move(*sink_args_res);
 
             const ir::Node& transform_ir = sn.transform_ir();
 
@@ -1318,9 +1328,22 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
         return std::unexpected(std::string(name) + ": wrong number of arguments");
     }
-    // ScalarValue and the interpreter's ExprValue are the same variant, so the
-    // already-evaluated scalar args pass straight into the registry's eval.
-    return fn.eval(name, args);
+    // The registry's eval takes ExprValue (which adds a Null alternative);
+    // REPL scalars are null-free, so this widening never fails.
+    std::vector<ExprValue> expr_args;
+    expr_args.reserve(args.size());
+    for (const auto& a : args) {
+        expr_args.push_back(expr_from_scalar(a));
+    }
+    auto result = fn.eval(name, expr_args);
+    if (!result) {
+        return std::unexpected(result.error());
+    }
+    auto scalar = scalar_from_expr(*result);
+    if (!scalar.has_value()) {
+        return std::unexpected(std::string(name) + ": returned null in scalar context");
+    }
+    return std::move(*scalar);
 }
 
 auto aggregate_series(std::string_view name, const ColumnValue& column, double param)

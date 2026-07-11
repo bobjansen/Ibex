@@ -1547,7 +1547,19 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         Table sub;
         for (const auto& entry : input.columns) {
             ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
-            sub.add_column(entry.name, std::move(gathered));
+            // Carry each input column's validity into the per-group slice —
+            // else an aggregate over a nullable column accumulates the null
+            // cells' undefined payloads instead of skipping them (mirrors
+            // grouped_windowed_update_table).
+            if (entry.validity.has_value()) {
+                ValidityBitmap vb(row_idx.size(), true);
+                for (std::size_t k = 0; k < row_idx.size(); ++k) {
+                    vb.set(k, (*entry.validity)[row_idx[k]]);
+                }
+                sub.add_column(entry.name, std::move(gathered), std::move(vb));
+            } else {
+                sub.add_column(entry.name, std::move(gathered));
+            }
         }
         sub.time_index = input.time_index;
 

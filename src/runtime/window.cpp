@@ -293,6 +293,42 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    if (sv == nullptr) {
+                        double sum = 0.0;
+                        std::size_t val_cnt = 0;
+                        std::size_t nan_cnt = 0;
+                        auto add = [&](std::size_t j) {
+                            auto v = static_cast<double>(col[j]);
+                            if (std::isnan(v)) {
+                                ++nan_cnt;
+                            } else {
+                                sum += v;
+                                ++val_cnt;
+                            }
+                        };
+                        auto drop = [&](std::size_t j) {
+                            auto v = static_cast<double>(col[j]);
+                            if (std::isnan(v)) {
+                                --nan_cnt;
+                            } else {
+                                sum -= v;
+                                --val_cnt;
+                            }
+                        };
+                        std::size_t lo = 0;
+                        for (std::size_t i = 0; i < rows; ++i) {
+                            add(i);
+                            while (lo < i && should_drop(lo, i)) {
+                                drop(lo);
+                                ++lo;
+                            }
+                            result[i] = nan_cnt > 0 ? std::numeric_limits<double>::quiet_NaN()
+                                                    : sum / static_cast<double>(val_cnt);
+                        }
+                        return ComputedColumn{.column = std::move(result),
+                                              .validity = std::nullopt};
+                    }
+
                     std::optional<ValidityBitmap> out_valid;  // built lazily on first null result
                     double sum = 0.0;
                     std::size_t val_cnt = 0;  // finite, non-null elements in the window

@@ -845,9 +845,16 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
           <h3>SQL-style three-valued logic, Arrow-style storage</h3>
           <p>
             Every column carries an Arrow-compatible validity bitmap alongside
-            its value buffer. Null propagates through arithmetic and
-            comparisons: <code>null&nbsp;*&nbsp;x&nbsp;=&nbsp;null</code>,
-            <code>null&nbsp;&gt;&nbsp;5&nbsp;=&nbsp;null</code>.
+            its value buffer. Null propagates through arithmetic, comparisons,
+            and every value function &mdash; <em>null in, null out</em>:
+            <code>null&nbsp;*&nbsp;x&nbsp;=&nbsp;null</code>,
+            <code>null&nbsp;&gt;&nbsp;5&nbsp;=&nbsp;null</code>,
+            <code>abs(null)&nbsp;=&nbsp;null</code>,
+            <code>is_nan(null)&nbsp;=&nbsp;null</code>. The only functions that
+            consume null are the ones built for it:
+            <code>is&nbsp;null</code>&nbsp;/&nbsp;<code>is&nbsp;not&nbsp;null</code>,
+            <code>coalesce</code>, <code>fill_null</code>, and
+            <code>null_if_nan</code>&nbsp;/&nbsp;<code>null_if_not_finite</code>.
             <code>filter</code> silently drops rows where the predicate is null.
           </p>
           <p>
@@ -860,11 +867,13 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
           <p>
             Nulls arise from joins with unmatched rows (left join: unmatched
             right columns; right join: unmatched left columns; outer join:
-            both sides), dcast (missing pivot combinations), and certain
-            aggregate functions (<code>std</code> on fewer than 2 non-null
-            values, <code>ewma</code> on an empty group,
+            both sides), dcast (missing pivot combinations), and aggregates
+            over groups with no valid observations &mdash; every value-bearing
+            aggregate (<code>sum</code>, <code>mean</code>, <code>first</code>,
+            <code>last</code>, &hellip;) returns null for an all-null group,
+            plus <code>std</code> on fewer than 2 non-null values,
             <code>skew</code> on fewer than 3, <code>kurtosis</code> on
-            fewer than 4).
+            fewer than 4. Only <code>count</code> never returns null.
           </p>
           <p>
             Floating-point <code>NaN</code> and <code>Inf</code> values are
@@ -1119,10 +1128,16 @@ tf[<span class="kw">update</span> { running_vol = <span class="fn-name">cumsum</
           </p>
           <p>
             For dirty <code>Float64</code> columns, Ibex also provides
-            <code>is_nan(col)</code>, <code>null_if_nan(col)</code>, and
-            <code>null_if_not_finite(col)</code>. These are the right way to
+            <code>is_nan(x)</code>, <code>null_if_nan(x)</code>, and
+            <code>null_if_not_finite(x)</code>. These are the right way to
             make grouped <code>mean</code> / <code>sum</code> ignore
-            <code>NaN</code> and infinities.
+            <code>NaN</code> and infinities. All of these (and
+            <code>coalesce</code>) are ordinary row-wise functions: they take
+            any expression, compose inside larger expressions
+            (<code>fill_null(price, 0) * qty</code>), and follow the null
+            rule &mdash; <code>is_nan(null)</code> is null, not false
+            (&ldquo;NaN or missing?&rdquo; is
+            <code>is_nan(x)&nbsp;||&nbsp;x&nbsp;is&nbsp;null</code>).
           </p>
         </div>
         <div class="tour-code">

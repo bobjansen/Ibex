@@ -109,7 +109,7 @@
     <div class="grid-2">
       <article class="card">
         <h3>Aggregate functions</h3>
-        <p>Use these inside <code>select { ... }</code> (often with <code>by</code>), e.g. <code>df[select { x = sum(col) }, by key]</code>.</p>
+        <p>Use these inside <code>select { ... }</code> (often with <code>by</code>), e.g. <code>df[select { x = sum(col) }, by key]</code>. Nulls are skipped; every value-bearing aggregate returns null for a group with no valid observations (<code>count</code> never does).</p>
         <table class="repl-table">
           <tbody>
             <tr><td><code>sum(col)</code></td><td>Sum of non-null values.</td></tr>
@@ -164,9 +164,13 @@
         <p>Most often used in <code>update { ... }</code>, e.g. <code>df[update { x = fill_forward(x) }]</code>.</p>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>fill_null(col, value)</code></td><td>Replace nulls in <code>col</code> with a constant <code>value</code>.</td></tr>
+            <tr><td><code>fill_null(x, value)</code></td><td>Replace nulls in <code>x</code> with <code>value</code> (any expression of the column's type).</td></tr>
             <tr><td><code>fill_forward(col)</code></td><td>Fill missing values using the last earlier non-missing value.</td></tr>
             <tr><td><code>fill_backward(col)</code></td><td>Fill missing values using the next later non-missing value.</td></tr>
+            <tr><td><code>coalesce(a, b, ...)</code></td><td>First non-null argument per row; arguments share one type.</td></tr>
+            <tr><td><code>null_if_nan(x)</code></td><td>Turn <code>NaN</code> cells into null; existing nulls stay null.</td></tr>
+            <tr><td><code>null_if_not_finite(x)</code></td><td>Turn <code>NaN</code>/<code>&plusmn;Inf</code> cells into null.</td></tr>
+            <tr><td><code>is_nan(x)</code></td><td><code>Bool</code>: true for a valid <code>NaN</code> cell; null cells stay null.</td></tr>
             <tr><td><code>rep(x, times=1, each=1, length_out=-1)</code></td><td>Repeat or cycle a value/column to build a full output column.</td></tr>
           </tbody>
         </table>

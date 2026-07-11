@@ -35,6 +35,52 @@
 
 namespace ibex::runtime {
 
+namespace {
+
+// An all-default-payload column of the given type; pair it with an all-false
+// ValidityBitmap to broadcast a null scalar (the payloads are never read).
+auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
+    switch (type) {
+        case ExprType::Int: {
+            Column<std::int64_t> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Double: {
+            Column<double> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Bool: {
+            Column<bool> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::String: {
+            Column<std::string> c;
+            for (std::size_t i = 0; i < rows; ++i) {
+                c.push_back(std::string_view{});
+            }
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Date: {
+            Column<Date> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+        case ExprType::Timestamp: {
+            Column<Timestamp> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
+    }
+    Column<std::int64_t> c;  // unreachable; keeps MSVC C4715 quiet
+    c.resize(rows);
+    return ColumnValue{std::move(c)};
+}
+
+}  // namespace
+
 // NOLINTNEXTLINE(readability-function-size)
 auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
                      const std::vector<ir::AggSpec>& aggregations)

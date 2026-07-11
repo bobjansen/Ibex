@@ -476,8 +476,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .infer = [](std::string_view name, const std::vector<ExprType>&) -> IT {
                 return rng_func_returns_int(name) ? ExprType::Int : ExprType::Double;
             },
-            .column_eval = [](const ir::CallExpr& call, const Table&,
-                              std::size_t rows) -> std::expected<ComputedColumn, std::string> {
+            .column_eval = [](const ir::CallExpr& call, const Table&, std::size_t rows,
+                              const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
                 auto col = apply_rng_func(call, rows);
                 if (!col) {
                     return std::unexpected(col.error());
@@ -501,24 +501,192 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         // rep(x, ...) / rep([e0, e1, ...], ...): yields the type of its first
         // positional argument (the array form lowers its elements to positional
         // args, so args[0] is the first element either way).
+        m.emplace("rep",
+                  BuiltinFn{
+                      .kind = ir::FnKind::Generator,
+                      .min_args = 1,
+                      .max_args = -1,
+                      .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                          return a[0];
+                      },
+                      .column_eval =
+                          [](const ir::CallExpr& call, const Table& input, std::size_t rows,
+                             const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
+                          auto col = apply_rep_func(call, input, rows);
+                          if (!col) {
+                              return std::unexpected(col.error());
+                          }
+                          return ComputedColumn{.column = std::move(*col),
+                                                .validity = std::nullopt};
+                      },
+                  });
+
+        // ── Transforms (N→N, ordered/validity-aware): the output row i depends
+        // on other rows (rolling/cum/lag/lead/fill_forward/fill_backward) or on
+        // column validity (fill_null, null_if_*), so they evaluate at column
+        // level via `column_eval`. As with Generators, arity and argument shape
+        // (e.g. "first argument must be a column name") are validated by the
+        // kernels, which carry the precise messages; `infer` only reports the
+        // result type so nested transforms type-check.
         m.emplace(
-            "rep",
+            "lag",
             BuiltinFn{
-                .kind = ir::FnKind::Generator,
-                .min_args = 1,
+                .kind = ir::FnKind::Transform,
+                .min_args = 0,
                 .max_args = -1,
-                .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                    if (a.empty()) {
+                        return std::unexpected(std::string(name) + ": expected 2 arguments");
+                    }
                     return a[0];
                 },
-                .column_eval = [](const ir::CallExpr& call, const Table& input,
-                                  std::size_t rows) -> std::expected<ComputedColumn, std::string> {
-                    auto col = apply_rep_func(call, input, rows);
+                .column_eval =
+                    [](const ir::CallExpr& call, const Table& input, std::size_t,
+                       const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+                    auto res = eval_lag_lead_column(call, input, call.callee == "lag", ctx.scalars,
+                                                    ctx.externs);
+                    if (!res) {
+                        return std::unexpected(res.error());
+                    }
+                    return ComputedColumn{.column = std::move(res->column),
+                                          .validity = std::move(res->validity)};
+                },
+            });
+        m.emplace("lead", m.at("lag"));
+
+        m.emplace(
+            "cumsum",
+            BuiltinFn{
+                .kind = ir::FnKind::Transform,
+                .min_args = 0,
+                .max_args = -1,
+                .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                    if (a.empty()) {
+                        return std::unexpected(std::string(name) + ": expected 1 argument");
+                    }
+                    return a[0];
+                },
+                .column_eval =
+                    [](const ir::CallExpr& call, const Table& input, std::size_t,
+                       const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
+                    auto col = eval_cumsum_cumprod_column(call, input, call.callee == "cumprod");
                     if (!col) {
                         return std::unexpected(col.error());
                     }
                     return ComputedColumn{.column = std::move(*col), .validity = std::nullopt};
                 },
             });
+        m.emplace("cumprod", m.at("cumsum"));
+
+        m.emplace("fill_null",
+                  BuiltinFn{
+                      .kind = ir::FnKind::Transform,
+                      .min_args = 0,
+                      .max_args = -1,
+                      .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                          if (a.empty()) {
+                              return std::unexpected(std::string(name) +
+                                                     ": expected at least 1 argument");
+                          }
+                          return a[0];
+                      },
+                      .column_eval =
+                          [](const ir::CallExpr& call, const Table& input, std::size_t,
+                             const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
+                          auto res = [&] -> std::expected<FillResult, std::string> {
+                              if (call.callee == "fill_null") {
+                                  return eval_fill_null(call, input);
+                              }
+                              if (call.callee == "fill_forward") {
+                                  return eval_fill_forward(call, input);
+                              }
+                              return eval_fill_backward(call, input);
+                          }();
+                          if (!res) {
+                              return std::unexpected(res.error());
+                          }
+                          return ComputedColumn{.column = std::move(res->column),
+                                                .validity = std::move(res->validity)};
+                      },
+                  });
+        m.emplace("fill_forward", m.at("fill_null"));
+        m.emplace("fill_backward", m.at("fill_null"));
+
+        m.emplace(
+            "null_if_nan",
+            BuiltinFn{
+                .kind = ir::FnKind::Transform,
+                .min_args = 0,
+                .max_args = -1,
+                .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                    if (a.size() != 1) {
+                        return std::unexpected(std::string(name) + ": expected 1 argument");
+                    }
+                    if (a[0] != ExprType::Double) {
+                        return std::unexpected(std::string(name) + ": column must be Float64");
+                    }
+                    return ExprType::Double;
+                },
+                .column_eval =
+                    [](const ir::CallExpr& call, const Table& input, std::size_t,
+                       const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
+                    auto res = eval_float_clean(call, input,
+                                                call.callee == "null_if_nan"
+                                                    ? FloatCleanMode::NullIfNan
+                                                    : FloatCleanMode::NullIfNotFinite);
+                    if (!res) {
+                        return std::unexpected(res.error());
+                    }
+                    return ComputedColumn{.column = std::move(res->column),
+                                          .validity = std::move(res->validity)};
+                },
+            });
+        m.emplace("null_if_not_finite", m.at("null_if_nan"));
+
+        // rolling_*: the per-call window arg was peeled into the __window_n /
+        // __window_ns sentinel named args by lowering; the enclosing `window`
+        // clause (if any) arrives via ctx.window as the fallback.
+        const BuiltinFn rolling_transform{
+            .kind = ir::FnKind::Transform,
+            .min_args = 0,
+            .max_args = -1,
+            .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                if (name == "rolling_count") {
+                    return ExprType::Int;
+                }
+                if (name == "rolling_sum" || name == "rolling_min" || name == "rolling_max") {
+                    if (a.empty()) {
+                        return std::unexpected(std::string(name) + ": expected 1 argument");
+                    }
+                    return a[0];
+                }
+                return ExprType::Double;
+            },
+            .column_eval =
+                [](const ir::CallExpr& call, const Table& input, std::size_t,
+                   const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+                auto spec = rolling_window_spec(call, ctx.window);
+                if (!spec) {
+                    return std::unexpected(spec.error());
+                }
+                return apply_rolling_func(call, input, *spec);
+            },
+        };
+        for (const auto* fn : {
+                 "rolling_sum",
+                 "rolling_mean",
+                 "rolling_min",
+                 "rolling_max",
+                 "rolling_count",
+                 "rolling_median",
+                 "rolling_std",
+                 "rolling_ewma",
+                 "rolling_quantile",
+                 "rolling_skew",
+                 "rolling_kurtosis",
+             }) {
+            m.emplace(fn, rolling_transform);
+        }
 
         return m;
     }();
@@ -703,101 +871,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             return ExprType::Int;
         }
-        // Null-fill functions (fill_null / fill_forward / fill_backward)
-        if (is_fill_func(call->callee)) {
-            if (call->args.empty()) {
-                return std::unexpected(std::string(call->callee) +
-                                       ": expected at least 1 argument");
-            }
-            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
-            if (!col_ref) {
-                return std::unexpected(std::string(call->callee) +
-                                       ": first argument must be a column name");
-            }
-            const auto* source = input.find(col_ref->name);
-            if (!source) {
-                return std::unexpected(std::string(call->callee) + ": unknown column '" +
-                                       col_ref->name + "'");
-            }
-            return expr_type_for_column(*source);
-        }
-        if (is_float_clean_func(call->callee)) {
-            if (call->args.size() != 1) {
-                return std::unexpected(std::string(call->callee) + ": expected 1 argument");
-            }
-            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
-            if (!col_ref) {
-                return std::unexpected(std::string(call->callee) +
-                                       ": argument must be a column name");
-            }
-            const auto* source = input.find(col_ref->name);
-            if (!source) {
-                return std::unexpected(std::string(call->callee) + ": unknown column '" +
-                                       col_ref->name + "'");
-            }
-            auto kind = expr_type_for_column(*source);
-            if (kind != ExprType::Double) {
-                return std::unexpected(std::string(call->callee) + ": column must be Float64");
-            }
-            return ExprType::Double;
-        }
-        // Cumulative functions (cumsum / cumprod)
-        if (is_cum_func(call->callee)) {
-            if (call->args.size() != 1) {
-                return std::unexpected(std::string(call->callee) + ": expected 1 argument");
-            }
-            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
-            if (!col_ref) {
-                return std::unexpected(std::string(call->callee) +
-                                       ": argument must be a column name");
-            }
-            const auto* source = input.find(col_ref->name);
-            if (!source) {
-                return std::unexpected(std::string(call->callee) + ": unknown column '" +
-                                       col_ref->name + "'");
-            }
-            return expr_type_for_column(*source);
-        }
-        // Built-in temporal shift functions
-        if (call->callee == "lag" || call->callee == "lead") {
-            if (call->args.size() != 2) {
-                return std::unexpected(call->callee + ": expected 2 arguments");
-            }
-            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
-            if (!col_ref) {
-                return std::unexpected(call->callee + ": first argument must be a column name");
-            }
-            const auto* source = input.find(col_ref->name);
-            if (!source) {
-                return std::unexpected(call->callee + ": unknown column '" + col_ref->name + "'");
-            }
-            return expr_type_for_column(*source);
-        }
-        // Built-in rolling aggregate functions
-        if (call->callee == "rolling_mean" || call->callee == "rolling_median" ||
-            call->callee == "rolling_std" || call->callee == "rolling_ewma" ||
-            call->callee == "rolling_quantile" || call->callee == "rolling_skew" ||
-            call->callee == "rolling_kurtosis") {
-            return ExprType::Double;
-        }
-        if (call->callee == "rolling_count") {
-            return ExprType::Int;
-        }
-        if (call->callee == "rolling_sum" || call->callee == "rolling_min" ||
-            call->callee == "rolling_max") {
-            if (call->args.size() != 1) {
-                return std::unexpected(call->callee + ": expected 1 argument");
-            }
-            const auto* col_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
-            if (!col_ref) {
-                return std::unexpected(call->callee + ": argument must be a column name");
-            }
-            const auto* source = input.find(col_ref->name);
-            if (!source) {
-                return std::unexpected(call->callee + ": unknown column '" + col_ref->name + "'");
-            }
-            return expr_type_for_column(*source);
-        }
+        // Transforms (rolling/cum/lag/lead/fill/null_if_*) infer through the
+        // registry entries above, same as Scalars and Generators.
         // Extern scalar function lookup
         if (externs == nullptr) {
             return std::unexpected("unknown function in expression: " + call->callee);
@@ -1022,11 +1097,10 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
 // aware path (eval_value_vec) instead of the per-row eval_expr, because somewhere
 // in the tree it has a node the per-row evaluator can't produce:
 //   - a boolean node (comparison / logical / is_null), or
-//   - a `coalesce` call (validity-aware), or
-//   - a non-row-local call: a Generator (`rand_*` / `rep`) or a `lag`/`lead`
-//     shift. (lag/lead are still matched by name: the other Transform-kind
-//     builtins — rolling/cum/fill — have no eval_value_vec leaf yet; they fold
-//     into the registry in stage 3 of plans/function-kind-registry-plan.md.)
+//   - a `coalesce` call (validity-aware, not yet in the registry — stage 5), or
+//   - a whole-column builtin: any registry entry with a `column_eval`
+//     (Transforms — rolling/cum/lag/lead/fill/null_if_* — and Generators —
+//     `rand_*` / `rep`).
 // Detecting these anywhere (not just at the top or under arithmetic) is what
 // lets a non-row-local call nest inside arithmetic OR inside a scalar call —
 // e.g. `(close - lag(close,1)) / lag(close,1)` and `abs(rand_normal(0,1))`.
@@ -1043,8 +1117,11 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
                 return field_uses_vectorized_eval(*node.left) ||
                        field_uses_vectorized_eval(*node.right);
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                if (ir::fn_kind(node.callee) == ir::FnKind::Generator || node.callee == "lag" ||
-                    node.callee == "lead" || node.callee == "coalesce") {
+                // Whole-column builtins (Transform/Generator — anything with a
+                // `column_eval`) cannot be built per row; neither can coalesce
+                // (validity-aware, not yet in the registry — stage 5).
+                if (const auto* fn = find_builtin(node.callee);
+                    (fn != nullptr && fn->column_eval != nullptr) || node.callee == "coalesce") {
                     return true;
                 }
                 return std::ranges::any_of(

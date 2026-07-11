@@ -11,7 +11,8 @@ namespace ibex::ir {
 
 auto fn_kind(std::string_view name) -> FnKind {
     if (is_rolling_func(name) || is_cum_func(name) || name == "lag" || name == "lead" ||
-        name == "fill_forward" || name == "fill_backward") {
+        name == "fill_null" || name == "fill_forward" || name == "fill_backward" ||
+        name == "null_if_nan" || name == "null_if_not_finite") {
         return FnKind::Transform;
     }
     if (is_rng_func(name) || name == "rep") {

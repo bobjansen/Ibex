@@ -4441,7 +4441,12 @@ auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* 
         if (!val.has_value()) {
             return std::unexpected(std::move(val.error()));
         }
-        args.push_back(std::move(val.value()));
+        // Externs take null-free ScalarValue arguments (see the null-arm plan).
+        auto scalar = scalar_from_expr(val.value());
+        if (!scalar.has_value()) {
+            return std::unexpected("null argument in extern function call");
+        }
+        args.push_back(std::move(*scalar));
     }
     return args;
 }
@@ -4643,11 +4648,12 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             bool args_ok = true;
             for (const auto& arg : ec.args()) {
                 auto val = eval_expr(arg, Table{}, 0, scalars, externs);
-                if (!val.has_value()) {
+                auto scalar = val.has_value() ? scalar_from_expr(val.value()) : std::nullopt;
+                if (!scalar.has_value()) {
                     args_ok = false;
                     break;
                 }
-                args.push_back(std::move(val.value()));
+                args.push_back(std::move(*scalar));
             }
             if (args_ok) {
                 auto op = fn->chunked_table_func(args);

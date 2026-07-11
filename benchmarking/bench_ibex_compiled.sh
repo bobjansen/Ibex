@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
-if [[ -f "${BUILD_DIR:-}" ]]; then
+if [[ -n "${BUILD_DIR:-}" ]]; then
     : # user-specified, keep it
 elif [[ -x "$IBEX_ROOT/build-release/tools/ibex_compile" ]]; then
     BUILD_DIR="$IBEX_ROOT/build-release"

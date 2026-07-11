@@ -98,7 +98,7 @@ auto expr_value_to_string(const ExprValue& v) -> std::string {
     if (const auto* ts = std::get_if<Timestamp>(&v)) {
         return format_timestamp(*ts);
     }
-    return {};
+    return "null";  // Null — matches the table display of a missing cell
 }
 
 namespace {
@@ -966,15 +966,20 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ExprValue, std::string> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
-        const auto* source = input.find(col->name);
-        if (source == nullptr) {
+        const auto* entry = input.find_entry(col->name);
+        if (entry == nullptr) {
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col->name); it != scalars->end()) {
-                    return it->second;
+                    return expr_from_scalar(it->second);
                 }
             }
             return std::unexpected("unknown column in expression: " + col->name +
                                    " (available: " + format_columns(input) + ")");
+        }
+        // A null cell is Null, read from the validity bitmap — its payload is
+        // undefined and never touched (plans/exprvalue-null-arm-plan.md).
+        if (entry->validity.has_value() && !(*entry->validity)[row]) {
+            return ExprValue{Null{}};
         }
         return std::visit(
             [&](const auto& column) -> ExprValue {
@@ -986,7 +991,7 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                     return column[row];
                 }
             },
-            *source);
+            *entry->column);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         return std::visit([](const auto& v) -> ExprValue { return v; }, lit->value);
@@ -999,6 +1004,11 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         auto right = eval_expr(*bin->right, input, row, scalars, externs);
         if (!right) {
             return right;
+        }
+        // Null propagates through every operator: null in -> null out.
+        if (std::holds_alternative<Null>(left.value()) ||
+            std::holds_alternative<Null>(right.value())) {
+            return ExprValue{Null{}};
         }
         if (std::holds_alternative<std::string>(left.value()) ||
             std::holds_alternative<std::string>(right.value())) {
@@ -1075,6 +1085,14 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                 if (!v) {
                     return v;
                 }
+                // Null propagation, applied centrally: a Null argument
+                // short-circuits the call to Null, so `eval` never sees one.
+                // (Null-HANDLING scalars — coalesce/fill_null/null_if_* —
+                // get a policy knob when they move here; see the null-arm
+                // plan.)
+                if (std::holds_alternative<Null>(*v)) {
+                    return ExprValue{Null{}};
+                }
                 arg_values.push_back(std::move(*v));
             }
             return fn.eval(call->callee, arg_values);
@@ -1093,6 +1111,9 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
             if (!arg) {
                 return arg;
             }
+            if (std::holds_alternative<Null>(arg.value())) {
+                return ExprValue{Null{}};
+            }
             auto d = expr_value_to_double(arg.value());
             if (!d) {
                 return std::unexpected("round: first argument must be numeric");
@@ -1109,21 +1130,27 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         if (fn->kind != ExternReturnKind::Scalar) {
             return std::unexpected("function not usable in expression: " + call->callee);
         }
-        std::vector<ExprValue> arg_values;
+        // Extern scalar functions take null-free ScalarValue arguments; a
+        // Null argument has no image there (externs never see null).
+        std::vector<ScalarValue> arg_values;
         arg_values.reserve(call->args.size());
         for (const auto& arg : call->args) {
             auto value = eval_expr(*arg, input, row, scalars, externs);
             if (!value) {
                 return value;
             }
-            arg_values.push_back(std::move(value.value()));
+            auto scalar = scalar_from_expr(value.value());
+            if (!scalar.has_value()) {
+                return std::unexpected(call->callee + ": null argument in extern function call");
+            }
+            arg_values.push_back(std::move(*scalar));
         }
         auto result = fn->func(arg_values);
         if (!result) {
             return std::unexpected(result.error());
         }
         if (auto* scalar = std::get_if<ScalarValue>(&result.value())) {
-            return *scalar;
+            return expr_from_scalar(*scalar);
         }
         return std::unexpected("function returned table in expression: " + call->callee);
     }
@@ -1270,10 +1297,31 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
             break;
     }
     std::visit([&](auto& col) { col.reserve(rows); }, new_column);
+    // Validity is produced inline: eval_expr returns Null for a null cell and
+    // propagation carries it to the row's result, so the bitmap is exact —
+    // no post-hoc collect_expr_validity mask, no computing on undefined
+    // payloads (plans/exprvalue-null-arm-plan.md, stage 2).
+    ValidityBitmap validity(rows, true);
+    bool any_null = false;
     for (std::size_t row = 0; row < rows; ++row) {
         auto value = eval_expr(expr, input, row, ctx.scalars, ctx.externs);
         if (!value) {
             return std::unexpected(value.error());
+        }
+        if (std::holds_alternative<Null>(value.value())) {
+            validity.set(row, false);
+            any_null = true;
+            std::visit(
+                [](auto& col) {
+                    using ColType = std::decay_t<decltype(col)>;
+                    if constexpr (std::is_same_v<typename ColType::value_type, std::string_view>) {
+                        col.push_back(std::string_view{});
+                    } else {
+                        col.push_back(typename ColType::value_type{});
+                    }
+                },
+                new_column);
+            continue;
         }
         std::visit(
             [&](auto& col) {
@@ -1337,8 +1385,9 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
             },
             new_column);
     }
-    return ComputedColumn{.column = std::move(new_column),
-                          .validity = collect_expr_validity(expr, input, rows)};
+    return ComputedColumn{
+        .column = std::move(new_column),
+        .validity = any_null ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt};
 }
 
 // Thin wrapper preserving the column-only signature used by the vectorized

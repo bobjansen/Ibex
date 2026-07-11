@@ -277,14 +277,15 @@ using ColumnEvalFn = std::expected<ComputedColumn, std::string> (*)(const ir::Ca
 // disagree — the former flat struct encoded capability in pointer-nullness,
 // which every dispatch site had to re-test by convention.
 
-// Row-local scalar. `kernel` is an optional whole-column fast path taken only
+// Row-local scalar. `eval` is the general form and the semantic reference. A
+// few entries also have an optional whole-column kernel fast path, taken only
 // for the kernel-shaped call (every positional argument a bare column or
-// literal, see use_column_kernel); `eval` is the general form and the
-// semantic reference — the two must agree. The entry's NullPolicy lives in
-// BuiltinFn's flat metadata (packing; see the sizeof note there), not here.
+// literal, see use_column_kernel); since only three builtins have one, the
+// kernel is not a pointer here but a one-byte ScalarKernel id in BuiltinFn's
+// flat metadata — like NullPolicy, it packs into padding instead of widening
+// the variant for every entry (see the sizeof note on BuiltinFn).
 struct ScalarExec {
     RowEvalFn eval{};
-    ColumnEvalFn kernel{};
 };
 // Non-row-local (rolling_* / cumsum / cumprod / lag / lead / fill_forward /
 // fill_backward): output row i reads neighbouring rows, so evaluation is
@@ -305,26 +306,38 @@ struct AggregateExec {
     ir::AggFunc func{};
 };
 
+// Whole-column fast-path kernel of a Scalar entry, as a one-byte id resolved
+// by scalar_kernel_fn (expr.cpp). None for the vast majority of scalars.
+enum class ScalarKernel : std::uint8_t {
+    None,
+    FillNull,    // fill_null
+    FloatClean,  // null_if_nan / null_if_not_finite (kernel branches on callee)
+    Coalesce,    // coalesce
+};
+[[nodiscard]] auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn;
+
 // Builtin function registry entry (registry lives in expr.cpp; type inference
 // and evaluation dispatch through it). Common metadata is flat; the
 // kind-specific execution surface is the `exec` variant.
 //
 // Layout matters: builtins() sits on per-row dispatch paths, and growing the
 // entry 40 -> 48 bytes measurably regressed unrelated benchmarks once before
-// (fill_forward +20% on AWS; see c18ea8f). Hence int16 arity and null_policy
-// packed into the flat region (null_policy is meaningful only when `exec`
-// holds a ScalarExec; ScalarExec can't carry the byte without padding the
-// variant to 32). The static_assert below pins the size.
+// (fill_forward +20% on AWS; see c18ea8f). Hence int16 arity, and null_policy
+// plus the scalar kernel id packed as bytes into the flat region rather than
+// widening ScalarExec (both are meaningful only when `exec` holds a
+// ScalarExec; either would pad the variant by 8 for every entry). The
+// static_assert below pins the size.
 struct BuiltinFn {
     std::int16_t min_args = 1;
     std::int16_t max_args = 1;  // -1 == variadic
     NullPolicy null_policy = NullPolicy::Propagate;
+    ScalarKernel scalar_kernel = ScalarKernel::None;
     InferFn infer{};
     std::variant<ScalarExec, TransformExec, GeneratorExec, AggregateExec> exec;
 };
 
-static_assert(sizeof(BuiltinFn) <= 5 * sizeof(void*),
-              "BuiltinFn grew past 40 bytes — entry bloat regressed fill_forward +20% on AWS "
+static_assert(sizeof(BuiltinFn) <= 4 * sizeof(void*),
+              "BuiltinFn grew past 32 bytes — entry bloat regressed fill_forward +20% on AWS "
               "once before (c18ea8f); shrink it or re-benchmark deliberately");
 
 static_assert(
@@ -716,10 +729,10 @@ enum class FloatCleanMode : std::uint8_t {
 // Aggregates never have one (they route through the aggregate machinery).
 [[nodiscard]] inline auto column_eval_of(const BuiltinFn& fn) -> ColumnEvalFn {
     return std::visit(
-        [](const auto& exec) -> ColumnEvalFn {
+        [&fn](const auto& exec) -> ColumnEvalFn {
             using T = std::decay_t<decltype(exec)>;
             if constexpr (std::is_same_v<T, ScalarExec>) {
-                return exec.kernel;
+                return scalar_kernel_fn(fn.scalar_kernel);
             } else if constexpr (std::is_same_v<T, AggregateExec>) {
                 return nullptr;
             } else {
@@ -738,8 +751,7 @@ enum class FloatCleanMode : std::uint8_t {
     if (is_column_only(fn)) {
         return true;
     }
-    const auto* scalar = std::get_if<ScalarExec>(&fn.exec);
-    if (scalar == nullptr || scalar->kernel == nullptr) {
+    if (!std::holds_alternative<ScalarExec>(fn.exec) || fn.scalar_kernel == ScalarKernel::None) {
         return false;
     }
     return std::ranges::all_of(call.args, [](const auto& a) {

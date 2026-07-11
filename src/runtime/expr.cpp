@@ -146,7 +146,52 @@ auto eval_date_part(std::string_view name, const ExprValue& v)
     return std::unexpected(std::string(name) + ": argument must be Date or Timestamp");
 }
 
+// ── Scalar whole-column kernels ──────────────────────────────────────────────
+// Fast paths for the three null-handling scalars, resolved from the one-byte
+// ScalarKernel id on their registry entries (see scalar_kernel_fn). Each must
+// agree with its entry's per-row eval — the eval is the semantic reference.
+
+auto fill_null_kernel(const ir::CallExpr& call, const Table& input, std::size_t /*rows*/,
+                      const ColumnEvalCtx& /*ctx*/) -> std::expected<ComputedColumn, std::string> {
+    auto res = eval_fill_null(call, input);
+    if (!res) {
+        return std::unexpected(res.error());
+    }
+    return ComputedColumn{.column = std::move(res->column), .validity = std::move(res->validity)};
+}
+
+auto float_clean_kernel(const ir::CallExpr& call, const Table& input, std::size_t /*rows*/,
+                        const ColumnEvalCtx& /*ctx*/)
+    -> std::expected<ComputedColumn, std::string> {
+    auto res = eval_float_clean(
+        call, input,
+        call.callee == "null_if_nan" ? FloatCleanMode::NullIfNan : FloatCleanMode::NullIfNotFinite);
+    if (!res) {
+        return std::unexpected(res.error());
+    }
+    return ComputedColumn{.column = std::move(res->column), .validity = std::move(res->validity)};
+}
+
+auto coalesce_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
+                     const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+    return eval_coalesce_column(call, input, ctx.scalars, rows);
+}
+
 }  // namespace
+
+auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
+    switch (kernel) {
+        case ScalarKernel::None:
+            return nullptr;
+        case ScalarKernel::FillNull:
+            return &fill_null_kernel;
+        case ScalarKernel::FloatClean:
+            return &float_clean_kernel;
+        case ScalarKernel::Coalesce:
+            return &coalesce_kernel;
+    }
+    return nullptr;  // unreachable; MSVC C4715
+}
 
 const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
     using IT = std::expected<ExprType, std::string>;
@@ -626,6 +671,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 .min_args = 0,
                 .max_args = -1,
                 .null_policy = NullPolicy::Handles,
+                .scalar_kernel = ScalarKernel::FillNull,
                 .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                     if (a.size() != 2) {
                         return std::unexpected(std::string(name) +
@@ -638,22 +684,12 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     }
                     return a[0];
                 },
-                .exec = ScalarExec{
-                    .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                .exec =
+                    ScalarExec{.eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
                         if (std::holds_alternative<Null>(a[0])) {
                             return a[1];
                         }
                         return a[0];
-                    },
-                    .kernel =
-                        [](const ir::CallExpr& call, const Table& input, std::size_t,
-                           const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
-                        auto res = eval_fill_null(call, input);
-                        if (!res) {
-                            return std::unexpected(res.error());
-                        }
-                        return ComputedColumn{.column = std::move(res->column),
-                                              .validity = std::move(res->validity)};
                     }},
             });
 
@@ -663,6 +699,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 .min_args = 0,
                 .max_args = -1,
                 .null_policy = NullPolicy::Handles,
+                .scalar_kernel = ScalarKernel::FloatClean,
                 .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                     if (a.size() != 1) {
                         return std::unexpected(std::string(name) + ": expected 1 argument");
@@ -672,70 +709,52 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     }
                     return ExprType::Double;
                 },
-                .exec = ScalarExec{
-                    .eval = [](std::string_view name, const std::vector<ExprValue>& a) -> IV {
-                        if (std::holds_alternative<Null>(a[0])) {
-                            return ExprValue{Null{}};  // already null: stays null
-                        }
-                        const auto* d = std::get_if<double>(a.data());
-                        if (d == nullptr) {
-                            return std::unexpected(std::string(name) + ": column must be Float64");
-                        }
-                        const bool to_null =
-                            name == "null_if_nan" ? std::isnan(*d) : !std::isfinite(*d);
-                        return to_null ? ExprValue{Null{}} : a[0];
-                    },
-                    .kernel =
-                        [](const ir::CallExpr& call, const Table& input, std::size_t,
-                           const ColumnEvalCtx&) -> std::expected<ComputedColumn, std::string> {
-                        auto res = eval_float_clean(call, input,
-                                                    call.callee == "null_if_nan"
-                                                        ? FloatCleanMode::NullIfNan
-                                                        : FloatCleanMode::NullIfNotFinite);
-                        if (!res) {
-                            return std::unexpected(res.error());
-                        }
-                        return ComputedColumn{.column = std::move(res->column),
-                                              .validity = std::move(res->validity)};
-                    }},
+                .exec = ScalarExec{.eval = [](std::string_view name,
+                                              const std::vector<ExprValue>& a) -> IV {
+                    if (std::holds_alternative<Null>(a[0])) {
+                        return ExprValue{Null{}};  // already null: stays null
+                    }
+                    const auto* d = std::get_if<double>(a.data());
+                    if (d == nullptr) {
+                        return std::unexpected(std::string(name) + ": column must be Float64");
+                    }
+                    const bool to_null =
+                        name == "null_if_nan" ? std::isnan(*d) : !std::isfinite(*d);
+                    return to_null ? ExprValue{Null{}} : a[0];
+                }},
             });
         m.emplace("null_if_not_finite", m.at("null_if_nan"));
 
         // coalesce(a, b, ...): first non-null argument, per row. The column
         // kernel lives in filter.cpp because its arguments are arbitrary
         // expressions evaluated through eval_value_vec.
-        m.emplace(
-            "coalesce",
-            BuiltinFn{
-                .min_args = 0,
-                .max_args = -1,
-                .null_policy = NullPolicy::Handles,
-                .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
-                    if (a.size() < 2) {
-                        return std::unexpected("coalesce: expected at least 2 arguments");
-                    }
-                    for (const auto& t : a) {
-                        if (t != a[0]) {
-                            return std::unexpected("coalesce: arguments must share one type");
-                        }
-                    }
-                    return a[0];
-                },
-                .exec = ScalarExec{
-                    .eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
-                        for (const auto& v : a) {
-                            if (!std::holds_alternative<Null>(v)) {
-                                return v;
-                            }
-                        }
-                        return ExprValue{Null{}};  // every argument null
-                    },
-                    .kernel =
-                        [](const ir::CallExpr& call, const Table& input, std::size_t rows,
-                           const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
-                        return eval_coalesce_column(call, input, ctx.scalars, rows);
-                    }},
-            });
+        m.emplace("coalesce",
+                  BuiltinFn{
+                      .min_args = 0,
+                      .max_args = -1,
+                      .null_policy = NullPolicy::Handles,
+                      .scalar_kernel = ScalarKernel::Coalesce,
+                      .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                          if (a.size() < 2) {
+                              return std::unexpected("coalesce: expected at least 2 arguments");
+                          }
+                          for (const auto& t : a) {
+                              if (t != a[0]) {
+                                  return std::unexpected("coalesce: arguments must share one type");
+                              }
+                          }
+                          return a[0];
+                      },
+                      .exec = ScalarExec{.eval = [](std::string_view,
+                                                    const std::vector<ExprValue>& a) -> IV {
+                          for (const auto& v : a) {
+                              if (!std::holds_alternative<Null>(v)) {
+                                  return v;
+                              }
+                          }
+                          return ExprValue{Null{}};  // every argument null
+                      }},
+                  });
 
         // rolling_*: the per-call window arg was peeled into the __window_n /
         // __window_ns sentinel named args by lowering; the enclosing `window`

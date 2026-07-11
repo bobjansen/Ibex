@@ -147,14 +147,14 @@ auto eval_date_part(std::string_view name, const ExprValue& v)
 
 }  // namespace
 
-const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtins() {
+const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
     using IT = std::expected<ExprType, std::string>;
     using IV = std::expected<ExprValue, std::string>;
-    static const robin_hood::unordered_map<std::string_view, ScalarBuiltin> table = [] {
-        robin_hood::unordered_map<std::string_view, ScalarBuiltin> m;
+    static const robin_hood::unordered_map<std::string_view, BuiltinFn> table = [] {
+        robin_hood::unordered_map<std::string_view, BuiltinFn> m;
 
         // abs: numeric -> same numeric type.
-        m.emplace("abs", ScalarBuiltin{
+        m.emplace("abs", BuiltinFn{
                              .min_args = 1,
                              .max_args = 1,
                              .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
@@ -180,7 +180,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         // through verbatim and embedded values are formatted in place. Always
         // yields String.
         m.emplace("__interp",
-                  ScalarBuiltin{
+                  BuiltinFn{
                       .min_args = 0,
                       .max_args = -1,
                       .infer = [](std::string_view, const std::vector<ExprType>&) -> IT {
@@ -196,7 +196,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
                   });
 
         // sqrt / log / exp: numeric -> Float64.
-        const ScalarBuiltin transcendental{
+        const BuiltinFn transcendental{
             .min_args = 1,
             .max_args = 1,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
@@ -262,7 +262,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         // ceil / floor / trunc: round to an integral value, preserving the
         // numeric type (Int is already integral, so it passes through). Use
         // round(x, ceil|floor|trunc) for a Float -> Int64 conversion.
-        const ScalarBuiltin integral{
+        const BuiltinFn integral{
             .min_args = 1,
             .max_args = 1,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
@@ -292,7 +292,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         m.emplace("trunc", integral);
 
         // Float64 / Float32: cast Int or Float to Float64.
-        const ScalarBuiltin to_float{
+        const BuiltinFn to_float{
             .min_args = 1,
             .max_args = 1,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
@@ -312,7 +312,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         m.emplace("Float32", to_float);
 
         // Int64 / Int32 / Int: cast Int or whole-valued Float to Int64.
-        const ScalarBuiltin to_int{
+        const BuiltinFn to_int{
             .min_args = 1,
             .max_args = 1,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
@@ -341,7 +341,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         m.emplace("Int", to_int);
 
         // year / month / day / hour / minute / second: Date|Timestamp -> Int.
-        const ScalarBuiltin date_part{
+        const BuiltinFn date_part{
             .min_args = 1,
             .max_args = 1,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
@@ -366,7 +366,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
 
         // is_nan: Float64 -> Bool.
         m.emplace("is_nan",
-                  ScalarBuiltin{
+                  BuiltinFn{
                       .min_args = 1,
                       .max_args = 1,
                       .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
@@ -384,7 +384,7 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
                   });
 
         // pmin / pmax: 2+ comparable args of one type (Int/Float widen to Float).
-        const ScalarBuiltin pminmax{
+        const BuiltinFn pminmax{
             .min_args = 2,
             .max_args = -1,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
@@ -463,9 +463,72 @@ const robin_hood::unordered_map<std::string_view, ScalarBuiltin>& scalar_builtin
         m.emplace("pmin", pminmax);
         m.emplace("pmax", pminmax);
 
+        // ── Generators (∅→N): produce a column from parameters/pattern; no
+        // input rows are read. They carry `column_eval` (no per-row `eval`);
+        // every field/value evaluator dispatches them through the registry
+        // instead of a bespoke `is_rng_func`/`callee == "rep"` branch. Arity
+        // and argument values are validated by the kernels (which have the
+        // precise messages), so min/max stay lenient here.
+        const BuiltinFn rng_generator{
+            .kind = ir::FnKind::Generator,
+            .min_args = 0,
+            .max_args = -1,
+            .infer = [](std::string_view name, const std::vector<ExprType>&) -> IT {
+                return rng_func_returns_int(name) ? ExprType::Int : ExprType::Double;
+            },
+            .column_eval = [](const ir::CallExpr& call, const Table&,
+                              std::size_t rows) -> std::expected<ComputedColumn, std::string> {
+                auto col = apply_rng_func(call, rows);
+                if (!col) {
+                    return std::unexpected(col.error());
+                }
+                return ComputedColumn{.column = std::move(*col), .validity = std::nullopt};
+            },
+        };
+        for (const auto* fn : {
+                 "rand_uniform",
+                 "rand_normal",
+                 "rand_student_t",
+                 "rand_gamma",
+                 "rand_exponential",
+                 "rand_bernoulli",
+                 "rand_poisson",
+                 "rand_int",
+             }) {
+            m.emplace(fn, rng_generator);
+        }
+
+        // rep(x, ...) / rep([e0, e1, ...], ...): yields the type of its first
+        // positional argument (the array form lowers its elements to positional
+        // args, so args[0] is the first element either way).
+        m.emplace(
+            "rep",
+            BuiltinFn{
+                .kind = ir::FnKind::Generator,
+                .min_args = 1,
+                .max_args = -1,
+                .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                    return a[0];
+                },
+                .column_eval = [](const ir::CallExpr& call, const Table& input,
+                                  std::size_t rows) -> std::expected<ComputedColumn, std::string> {
+                    auto col = apply_rep_func(call, input, rows);
+                    if (!col) {
+                        return std::unexpected(col.error());
+                    }
+                    return ComputedColumn{.column = std::move(*col), .validity = std::nullopt};
+                },
+            });
+
         return m;
     }();
     return table;
+}
+
+auto find_builtin(std::string_view name) -> const BuiltinFn* {
+    const auto& m = builtins();
+    auto it = m.find(name);
+    return it == m.end() ? nullptr : &it->second;
 }
 
 namespace {
@@ -582,8 +645,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
         // Pure row-wise scalar builtins: single source of truth (see
-        // scalar_builtins()). Both this pass and eval_expr dispatch here.
-        if (auto it = scalar_builtins().find(call->callee); it != scalar_builtins().end()) {
+        // builtins()). Both this pass and eval_expr dispatch here.
+        if (auto it = builtins().find(call->callee); it != builtins().end()) {
             const auto& fn = it->second;
             const auto argc = static_cast<int>(call->args.size());
             if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
@@ -735,31 +798,6 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             }
             return expr_type_for_column(*source);
         }
-        // rep() — returns the same type as its first positional argument
-        if (call->callee == "rep") {
-            if (call->args.empty()) {
-                return std::unexpected("rep: expected one positional argument (x)");
-            }
-            const auto& x = *call->args[0];
-            if (const auto* lit = std::get_if<ir::Literal>(&x.node)) {
-                if (std::holds_alternative<bool>(lit->value))
-                    return ExprType::Bool;
-                if (std::holds_alternative<std::int64_t>(lit->value))
-                    return ExprType::Int;
-                if (std::holds_alternative<double>(lit->value))
-                    return ExprType::Double;
-                if (std::holds_alternative<Date>(lit->value))
-                    return ExprType::Date;
-                if (std::holds_alternative<Timestamp>(lit->value))
-                    return ExprType::Timestamp;
-                return ExprType::String;
-            }
-            return infer_expr_type(x, input, scalars, externs);
-        }
-        // Vectorized RNG functions
-        if (is_rng_func(call->callee)) {
-            return rng_func_returns_int(call->callee) ? ExprType::Int : ExprType::Double;
-        }
         // Extern scalar function lookup
         if (externs == nullptr) {
             return std::unexpected("unknown function in expression: " + call->callee);
@@ -890,8 +928,12 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
         // Pure row-wise scalar builtins: single source of truth (see
-        // scalar_builtins()). Both this pass and infer_expr_type dispatch here.
-        if (auto it = scalar_builtins().find(call->callee); it != scalar_builtins().end()) {
+        // builtins()). Both this pass and infer_expr_type dispatch here.
+        // Column-kind builtins (Generators) have no per-row eval — they fall
+        // through to the same "unknown function" error as before they joined
+        // the registry (routing sends them to the vectorized path instead).
+        if (auto it = builtins().find(call->callee);
+            it != builtins().end() && it->second.eval != nullptr) {
             const auto& fn = it->second;
             const auto argc = static_cast<int>(call->args.size());
             if (argc < fn.min_args || (fn.max_args >= 0 && argc > fn.max_args)) {
@@ -976,14 +1018,15 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
     return std::unexpected("row count expression must evaluate to Int64");
 }
 
-// True if `expr` contains an RNG generator call (rand_normal/rand_uniform/...)
-// anywhere in its tree.
 // True if a field expression must be evaluated through the vectorized, validity-
 // aware path (eval_value_vec) instead of the per-row eval_expr, because somewhere
 // in the tree it has a node the per-row evaluator can't produce:
 //   - a boolean node (comparison / logical / is_null), or
 //   - a `coalesce` call (validity-aware), or
-//   - a non-row-local call: an RNG generator (`rand_*`) or a `lag`/`lead` shift.
+//   - a non-row-local call: a Generator (`rand_*` / `rep`) or a `lag`/`lead`
+//     shift. (lag/lead are still matched by name: the other Transform-kind
+//     builtins — rolling/cum/fill — have no eval_value_vec leaf yet; they fold
+//     into the registry in stage 3 of plans/function-kind-registry-plan.md.)
 // Detecting these anywhere (not just at the top or under arithmetic) is what
 // lets a non-row-local call nest inside arithmetic OR inside a scalar call —
 // e.g. `(close - lag(close,1)) / lag(close,1)` and `abs(rand_normal(0,1))`.
@@ -1000,8 +1043,8 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
                 return field_uses_vectorized_eval(*node.left) ||
                        field_uses_vectorized_eval(*node.right);
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
-                if (ir::is_rng_func(node.callee) || node.callee == "lag" || node.callee == "lead" ||
-                    node.callee == "coalesce") {
+                if (ir::fn_kind(node.callee) == ir::FnKind::Generator || node.callee == "lag" ||
+                    node.callee == "lead" || node.callee == "coalesce") {
                     return true;
                 }
                 return std::ranges::any_of(

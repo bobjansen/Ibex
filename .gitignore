@@ -2,6 +2,7 @@
 build/
 build-coverage/
 build-debug/
+build-gcc/
 build-release/
 cmake-build-*/
 out/

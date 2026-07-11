@@ -1096,18 +1096,16 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
-            if (is_rng_func(call->callee)) {
-                auto col = apply_rng_func(*call, output.rows());
+            if (const auto* fn = find_builtin(call->callee);
+                fn != nullptr && fn->kind == ir::FnKind::Generator) {
+                auto col = fn->column_eval(*call, output, output.rows());
                 if (!col)
                     return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
-                continue;
-            }
-            if (call->callee == "rep") {
-                auto col = apply_rep_func(*call, output, output.rows());
-                if (!col)
-                    return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
+                if (col->validity.has_value())
+                    output.add_column(field.alias, std::move(col->column),
+                                      std::move(*col->validity));
+                else
+                    output.add_column(field.alias, std::move(col->column));
                 continue;
             }
         } else if (std::holds_alternative<ir::RankExpr>(field.expr.node)) {
@@ -1481,18 +1479,16 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 output.add_column(field.alias, std::move(col.value()));
                 continue;
             }
-            if (is_rng_func(call->callee)) {
-                auto col = apply_rng_func(*call, rows);
+            if (const auto* fn = find_builtin(call->callee);
+                fn != nullptr && fn->kind == ir::FnKind::Generator) {
+                auto col = fn->column_eval(*call, output, rows);
                 if (!col)
                     return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
-                continue;
-            }
-            if (call->callee == "rep") {
-                auto col = apply_rep_func(*call, output, rows);
-                if (!col)
-                    return std::unexpected(col.error());
-                output.add_column(field.alias, std::move(col.value()));
+                if (col->validity.has_value())
+                    output.add_column(field.alias, std::move(col->column),
+                                      std::move(*col->validity));
+                else
+                    output.add_column(field.alias, std::move(col->column));
                 continue;
             }
         } else if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {

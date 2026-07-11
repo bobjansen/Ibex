@@ -37,10 +37,10 @@ namespace ibex::ir {
 ///               date parts, pmin/pmax, is_nan, round, ...).
 ///   Transform — non-row-local: reads neighbours/order (rolling_*, cumsum/
 ///               cumprod, lag/lead, fill_forward/fill_backward) or validity
-///               (fill_null, null_if_nan/null_if_not_finite — row-local by
-///               shape, but the per-row path has no null; see the "null
-///               wrinkle" in the plan). `rank` is the RankExpr node,
-///               classified at the node level.
+///               (fill_null, null_if_nan/null_if_not_finite, coalesce —
+///               row-local by shape, but the per-row path has no null; see
+///               the "null wrinkle" in the plan). `rank` is the RankExpr
+///               node, classified at the node level.
 ///   Generator — produces a column from a sequence/pattern (rand_*, rep).
 ///   Aggregate — reduces a column or group (sum/mean/.../kurtosis).
 enum class FnKind : std::uint8_t { Scalar, Transform, Generator, Aggregate };

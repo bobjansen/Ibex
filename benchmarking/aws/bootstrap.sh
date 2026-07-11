@@ -331,12 +331,11 @@ if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
     # compare_ibex_git.sh defaults to the bare clang/clang++ names, which don't
     # exist on this box (llvm.sh installs only versioned binaries) — point it at
     # the same clang-${CLANG_VERSION} the normal build_ibex uses.
-    COMPARE_ENV=(
-        IBEX_CC="clang-${CLANG_VERSION}"
-        IBEX_CXX="clang++-${CLANG_VERSION}"
-    )
-    [[ -d /ibex/build-release/_deps/lightgbm-src ]] \
-        && COMPARE_ENV+=(IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src)
+    export IBEX_CC="clang-${CLANG_VERSION}"
+    export IBEX_CXX="clang++-${CLANG_VERSION}"
+    if [[ -d /ibex/build-release/_deps/lightgbm-src ]]; then
+        export IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src
+    fi
 
     COMPARE_ARGS=(--base "${IBEX_BASE}" --target "${IBEX_TARGET}"
         --repeats "${IBEX_REPEATS:-5}" --iters "${IBEX_ITERS:-7}" --warmup "${IBEX_WARMUP:-1}")
@@ -350,6 +349,121 @@ if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
         | tee "$REPORT"
 
     exit 0  # finish_compare (EXIT trap) uploads the report and terminates
+fi
+
+# ── Bisect mode (bisect-git.sh) ────────────────────────────────────────────────
+# Run a performance git bisect on one clean box. Each candidate is compared
+# against the fixed known-good commit via compare_ibex_git.sh; the candidate is
+# marked bad when the selected query regresses beyond IBEX_BISECT_THRESHOLD_PCT.
+if [[ "${IBEX_BISECT_MODE:-0}" == "1" ]]; then
+    REPORT=/ibex/benchmarking/results/bisect_report.txt
+    mkdir -p /ibex/benchmarking/results
+
+    finish_bisect() {
+        local code=$?
+        if [[ ! -f "$REPORT" ]]; then
+            {
+                echo "bisect-git failed before producing a report"
+                echo "exit_status=${code}"
+                echo
+                echo "Last 200 lines of /var/log/ibex-bench.log:"
+                tail -n 200 /var/log/ibex-bench.log 2>/dev/null || true
+            } > "$REPORT"
+        fi
+        if aws s3 cp "$REPORT" \
+            "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}"; then
+            echo "Bisect report uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (exit ${code})"
+        else
+            echo "WARNING: bisect report upload failed (exit ${code})"
+        fi
+        shutdown -h now
+    }
+    trap finish_bisect EXIT
+
+    uv run --project /ibex /ibex/benchmarking/data/gen_data.py \
+        /ibex/benchmarking/data --rows "${IBEX_DATA_ROWS:-4000000}"
+
+    export IBEX_CC="clang-${CLANG_VERSION}"
+    export IBEX_CXX="clang++-${CLANG_VERSION}"
+    if [[ -d /ibex/build-release/_deps/lightgbm-src ]]; then
+        export IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src
+    fi
+
+    CHECK=/tmp/ibex-bisect-check.sh
+    cat > "$CHECK" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+candidate="$(git -C /ibex rev-parse HEAD)"
+short="${candidate:0:8}"
+step_dir="/ibex/benchmarking/results/bisect/${short}"
+mkdir -p "$step_dir"
+report="$step_dir/report.txt"
+
+echo
+echo "=== bisect candidate ${candidate} ==="
+
+args=(--base "${IBEX_GOOD}" --target "${candidate}"
+    --repeats "${IBEX_REPEATS:-7}"
+    --iters "${IBEX_ITERS:-9}"
+    --warmup "${IBEX_WARMUP:-1}"
+    --csv /ibex/benchmarking/data/prices.csv
+    --keep-temp)
+[[ -n "${IBEX_SUITE:-}" ]] && args+=(--ibex-suite "${IBEX_SUITE}")
+[[ "${IBEX_INTERLEAVE:-1}" == "1" ]] && args+=(--interleave)
+[[ -n "${IBEX_TASKSET:-}" ]] && args+=(--taskset "${IBEX_TASKSET}")
+
+bash /ibex/benchmarking/compare_ibex_git.sh "${args[@]}" > "$report" 2>&1
+cat "$report"
+
+query="${IBEX_BISECT_QUERY:-fill_forward}"
+threshold="${IBEX_BISECT_THRESHOLD_PCT:-10}"
+row="$(awk -v q="$query" '$2 == q { line=$0 } END { print line }' "$report")"
+if [[ -z "$row" ]]; then
+    echo "bisect: query '${query}' not found; skipping ${candidate}" >&2
+    exit 125
+fi
+
+delta_pct="$(awk -v q="$query" '$2 == q { gsub(/[+%]/, "", $6); print $6 }' "$report" | tail -1)"
+if awk -v d="$delta_pct" -v t="$threshold" 'BEGIN { exit (d >= t) ? 0 : 1 }'; then
+    echo "bisect decision: BAD (${query} delta_pct=${delta_pct}% >= ${threshold}%)"
+    exit 1
+fi
+
+echo "bisect decision: GOOD (${query} delta_pct=${delta_pct}% < ${threshold}%)"
+exit 0
+EOF
+    chmod +x "$CHECK"
+
+    {
+        echo "Ibex AWS performance bisect"
+        echo "good=${IBEX_GOOD}"
+        echo "bad=${IBEX_BAD}"
+        echo "suite=${IBEX_SUITE:-all}"
+        echo "query=${IBEX_BISECT_QUERY:-fill_forward}"
+        echo "threshold_pct=${IBEX_BISECT_THRESHOLD_PCT:-10}"
+        echo "repeats=${IBEX_REPEATS:-7}"
+        echo "iters=${IBEX_ITERS:-9}"
+        echo "warmup=${IBEX_WARMUP:-1}"
+        echo "interleave=${IBEX_INTERLEAVE:-1}"
+        echo "pinning=${IBEX_TASKSET:-<none>}"
+        echo
+
+        git -C /ibex bisect reset || true
+        git -C /ibex bisect start "${IBEX_BAD}" "${IBEX_GOOD}"
+        set +e
+        git -C /ibex bisect run "$CHECK"
+        bisect_code=$?
+        set -e
+        echo
+        echo "git bisect run exit_status=${bisect_code}"
+        echo
+        git -C /ibex bisect log || true
+        git -C /ibex bisect reset || true
+        exit "$bisect_code"
+    } 2>&1 | tee "$REPORT"
+
+    exit 0
 fi
 
 # ── Compare-plugin mode (compare-plugin-git.sh) ────────────────────────────────

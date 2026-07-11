@@ -10,6 +10,7 @@ pull the results back as a CSV. Three layers:
 | `run.sh`             | local       | One instance runs the **whole** suite. |
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
 | `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |
+| `bisect-git.sh`      | local       | Single-instance performance `git bisect` for one benchmark query. |
 | `compare-compilers.sh` | local     | A/B latest **Clang vs GCC** full Ibex builds for one commit. |
 | `bootstrap.sh`       | on instance | Provision (if needed) → build ibex → run suite (or compare) → upload → self-terminate. |
 | `lib.sh`             | sourced     | Shared helpers (config, AMI resolution, user-data builder). |
@@ -141,7 +142,34 @@ is slower and on a bigger box, so budget more.
 > drift-cancelling A/B without EC2 — just noisier on a shared/thermal-throttling
 > box.
 
-## 3d. Compare latest Clang vs latest GCC
+## 3d. Bisect a Performance Regression
+
+`bisect-git.sh` runs `git bisect` on one EC2 instance instead of launching a
+fresh machine for every candidate. For each candidate it compares the fixed
+known-good commit against that candidate with `compare_ibex_git.sh`, then marks
+the candidate bad when the selected query's `delta_pct` is at or above the
+threshold.
+
+Example for a fill-forward regression:
+
+```bash
+git push
+./benchmarking/aws/bisect-git.sh \
+  --good a778f43dd0d6ce15223867ee5be1cbc9664adc28 \
+  --bad HEAD \
+  --suite fill \
+  --query fill_forward \
+  --threshold-pct 10 \
+  --repeats 7 \
+  --iters 9 \
+  --on-demand
+```
+
+The final report is saved to
+`benchmarking/results/bisect_aws_<timestamp>.txt` and includes every candidate
+comparison plus the `git bisect log`.
+
+## 3e. Compare latest Clang vs latest GCC
 
 `compare-compilers.sh` answers "does the C++ compiler matter for Ibex?" for a
 single commit. The EC2 instance builds the benchmark-relevant Ibex C++ targets

@@ -1646,6 +1646,8 @@ def bench_pandas_tf(n_rows, warmup, iters):
     run("tf_rolling_count_1m", lambda: df["price"].rolling("60s").count())
     run("tf_rolling_sum_1m",   lambda: df["price"].rolling("60s").sum())
     run("tf_rolling_mean_5m",  lambda: df["price"].rolling("300s").mean())
+    run("tf_rolling_min_1m",   lambda: df["price"].rolling("60s").min())
+    run("tf_rolling_max_1m",   lambda: df["price"].rolling("60s").max())
     run("tf_rolling_median_1m",lambda: df["price"].rolling("60s").median())
     run("tf_rolling_std_1m",   lambda: df["price"].rolling("60s").std())
     # Pandas has no time-aware EWM with a window cap — use the standard
@@ -1696,6 +1698,10 @@ def bench_polars_tf(n_rows, warmup, iters):
         lambda: df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").sum()))
     run("tf_rolling_mean_5m",
         lambda: df.rolling(index_column="ts", period="5m").agg(m=pl.col("price").mean()))
+    run("tf_rolling_min_1m",
+        lambda: df.rolling(index_column="ts", period="60s").agg(mn=pl.col("price").min()))
+    run("tf_rolling_max_1m",
+        lambda: df.rolling(index_column="ts", period="60s").agg(mx=pl.col("price").max()))
     run("tf_rolling_median_1m",
         lambda: df.rolling(index_column="ts", period="60s").agg(med=pl.col("price").median()))
     run("tf_rolling_std_1m",

@@ -6,6 +6,7 @@ add_library(ibex_runtime STATIC
     filter.cpp
     interpreter.cpp
     join.cpp
+    lazy_table.cpp
     model.cpp
     ops.cpp
     pipeline.cpp

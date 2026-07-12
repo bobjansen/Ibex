@@ -16,6 +16,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <arrow/api.h>
@@ -28,6 +29,7 @@
 #include <cstring>
 #include <curl/curl.h>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
@@ -449,7 +451,113 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
     }
 }
 
+/// Build a zero-row Table carrying only the names and types of `schema` — what
+/// a lazy binding knows about the file before any column has been decoded.
+/// Mirrors the type mapping in `populate_from_arrow_table`, so a column the
+/// schema admits here is one that path can actually decode.
+inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtime::Table {
+    ibex::runtime::Table out;
+    for (const auto& field : schema.fields()) {
+        switch (field->type()->id()) {
+            case arrow::Type::INT8:
+            case arrow::Type::INT16:
+            case arrow::Type::INT32:
+            case arrow::Type::INT64:
+            case arrow::Type::UINT8:
+            case arrow::Type::UINT16:
+            case arrow::Type::UINT32:
+            case arrow::Type::UINT64:
+                out.add_column(field->name(), ibex::Column<std::int64_t>{});
+                break;
+            case arrow::Type::FLOAT:
+            case arrow::Type::DOUBLE:
+                out.add_column(field->name(), ibex::Column<double>{});
+                break;
+            case arrow::Type::STRING:
+            case arrow::Type::LARGE_STRING:
+                out.add_column(field->name(), ibex::Column<std::string>{});
+                break;
+            case arrow::Type::DATE32:
+            case arrow::Type::DATE64:
+                out.add_column(field->name(), ibex::Column<ibex::Date>{});
+                break;
+            case arrow::Type::TIMESTAMP:
+                out.add_column(field->name(), ibex::Column<ibex::Timestamp>{});
+                break;
+            default:
+                throw std::runtime_error("read_parquet: unsupported column type for " +
+                                         field->name());
+        }
+    }
+    return out;
+}
+
 }  // namespace
+
+/// Open `path` for deferred reading: take its schema and row count from the
+/// footer, and hand back a handle that decodes individual columns on demand.
+///
+/// This is what gives `let t = read_parquet(p)` projection pushdown. Binding
+/// touches metadata only; a query that references 4 of 16 columns decodes 4.
+inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
+    std::string path_string{path};
+    auto input = open_parquet_input(path);
+
+    auto reader_result = parquet::arrow::OpenFile(std::move(input), arrow::default_memory_pool());
+    if (!reader_result.ok()) {
+        throw std::runtime_error("read_parquet: failed to read: " + path_string + " (" +
+                                 reader_result.status().ToString() + ")");
+    }
+    // Shared rather than unique: the decode callback below outlives this scope
+    // and each call reads from the same open file.
+    std::shared_ptr<parquet::arrow::FileReader> reader = std::move(reader_result).ValueOrDie();
+
+    std::shared_ptr<arrow::Schema> arrow_schema;
+    auto st = reader->GetSchema(&arrow_schema);
+    if (!st.ok()) {
+        throw std::runtime_error("read_parquet: failed to read schema: " + path_string + " (" +
+                                 st.ToString() + ")");
+    }
+
+    const auto rows = static_cast<std::size_t>(reader->parquet_reader()->metadata()->num_rows());
+
+    // Column name -> field index, so a demand expressed in names can be turned
+    // into the indices Arrow's selective read wants.
+    auto indices = std::make_shared<std::map<std::string, int>>();
+    for (int i = 0; i < arrow_schema->num_fields(); ++i) {
+        indices->emplace(arrow_schema->field(i)->name(), i);
+    }
+
+    auto decode = [reader, indices, path_string](const std::vector<std::string>& names)
+        -> std::expected<ibex::runtime::Table, std::string> {
+        std::vector<int> column_indices;
+        column_indices.reserve(names.size());
+        for (const auto& name : names) {
+            auto it = indices->find(name);
+            if (it == indices->end()) {
+                return std::unexpected("read_parquet: no column '" + name + "' in " + path_string);
+            }
+            column_indices.push_back(it->second);
+        }
+
+        std::shared_ptr<arrow::Table> table;
+        auto read_status = reader->ReadTable(column_indices, &table);
+        if (!read_status.ok()) {
+            return std::unexpected("read_parquet: failed to read columns from " + path_string +
+                                   " (" + read_status.ToString() + ")");
+        }
+        try {
+            ibex::runtime::Table out;
+            populate_from_arrow_table(table, out);
+            return out;
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string(e.what()));
+        }
+    };
+
+    return std::make_shared<ibex::runtime::LazyTable>(schema_table_from_arrow(*arrow_schema), rows,
+                                                      std::move(decode));
+}
 
 inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
     std::string path_string{path};

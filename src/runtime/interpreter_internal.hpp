@@ -707,7 +707,7 @@ enum class FloatCleanMode : std::uint8_t {
 [[nodiscard]] auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input,
                                               bool is_prod)
     -> std::expected<ColumnValue, std::string>;
-[[nodiscard]] auto eval_fill_null(const ir::CallExpr& call, const Table& input)
+[[nodiscard, gnu::aligned(64)]] auto eval_fill_null(const ir::CallExpr& call, const Table& input)
     -> std::expected<FillResult, std::string>;
 [[nodiscard]] auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
     -> std::expected<FillResult, std::string>;

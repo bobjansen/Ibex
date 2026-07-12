@@ -1,0 +1,58 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q19 — Discounted Revenue
+//
+//  2-table equijoin + a compound &&/|| filter (three OR'd AND-blocks, each
+//  with several IN-lists expanded to OR-chains of equality since Ibex has no
+//  `in` operator yet). No group-by. `part`'s join key is renamed to
+//  `l_partkey` before the join so it's a plain equijoin (hash-join) rather
+//  than a theta join (`on <predicate>`, which is O(N*M) nested-loop and would
+//  be lineitem-rows x part-rows here).
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q19.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool,
+                    schema: String) -> DataFrame from "csv.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let lineitem_raw = read_csv("benchmarking/data/tpch/sf1/lineitem.tbl", "", "|", false,
+    "int,int,int,int,f64,f64,f64,f64,str,str,date,date,date,str,str,str,str");
+let lineitem = lineitem_raw[select {
+    l_partkey = col2, l_quantity = col5, l_extendedprice = col6, l_discount = col7,
+    l_shipinstruct = col14, l_shipmode = col15
+}];
+
+let part_raw = read_csv("benchmarking/data/tpch/sf1/part.tbl", "", "|", false,
+    "int,str,str,str,str,int,str,f64,str");
+let part = part_raw[select {
+    l_partkey = col1, p_brand = col4, p_size = col6, p_container = col7
+}];
+
+let joined = lineitem join part on l_partkey;
+
+let result = joined[
+    filter (l_shipinstruct == "DELIVER IN PERSON")
+        && (l_shipmode == "AIR" || l_shipmode == "AIR REG")
+        && (
+            (p_brand == "Brand#12"
+                && (p_container == "SM CASE" || p_container == "SM BOX"
+                    || p_container == "SM PACK" || p_container == "SM PKG")
+                && l_quantity >= 1.0 && l_quantity <= 11.0
+                && p_size >= 1 && p_size <= 5)
+            || (p_brand == "Brand#23"
+                && (p_container == "MED BAG" || p_container == "MED BOX"
+                    || p_container == "MED PKG" || p_container == "MED PACK")
+                && l_quantity >= 10.0 && l_quantity <= 20.0
+                && p_size >= 1 && p_size <= 10)
+            || (p_brand == "Brand#34"
+                && (p_container == "LG CASE" || p_container == "LG BOX"
+                    || p_container == "LG PACK" || p_container == "LG PKG")
+                && l_quantity >= 20.0 && l_quantity <= 30.0
+                && p_size >= 1 && p_size <= 15)
+        ),
+    select { revenue = sum(l_extendedprice * (1.0 - l_discount)) }
+];
+write_csv(result, "benchmarking/data/tpch/out/q19.csv");
+result;

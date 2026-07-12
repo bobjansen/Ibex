@@ -304,6 +304,7 @@ fi
 #   IBEX_REPEATS, IBEX_ITERS, IBEX_WARMUP — passed through
 #   IBEX_SUITE       — optional --ibex-suite selection
 #   IBEX_INTERLEAVE  — "1" (default) alternates base/target repeats
+#   IBEX_REPLICA_CONTROL — "1" adds the balanced same-source replica
 #   IBEX_TASKSET     — optional core pinning (e.g. "2-3")
 #   IBEX_DATA_ROWS   — fact-table row count for gen_data.py (default 4000000)
 #   IBEX_RESULT_KEY  — S3 key the report text is uploaded to
@@ -341,6 +342,7 @@ if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
         --repeats "${IBEX_REPEATS:-5}" --iters "${IBEX_ITERS:-7}" --warmup "${IBEX_WARMUP:-1}")
     [[ -n "${IBEX_SUITE:-}" ]] && COMPARE_ARGS+=(--ibex-suite "${IBEX_SUITE}")
     [[ "${IBEX_INTERLEAVE:-1}" == "1" ]] && COMPARE_ARGS+=(--interleave)
+    [[ "${IBEX_REPLICA_CONTROL:-0}" == "1" ]] && COMPARE_ARGS+=(--replica-control)
     [[ -n "${IBEX_TASKSET:-}" ]] && COMPARE_ARGS+=(--taskset "${IBEX_TASKSET}")
 
     # tee: live progress on the serial console AND a captured report to upload.

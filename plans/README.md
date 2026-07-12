@@ -1,7 +1,7 @@
 # Plans Index
 
 Status of every plan in this directory, grouped by lifecycle. Statuses verified
-against the source tree on 2026-07-11. Files stay in place unless a plan is
+against the source tree on 2026-07-12. Files stay in place unless a plan is
 complete enough to move under `plans/done/`.
 
 ## Active — open work items
@@ -27,6 +27,7 @@ complete enough to move under `plans/done/`.
 
 | Plan | Outcome | Residual items |
 |---|---|---|
+| [builtin-replica-control-hardening-plan.md](done/builtin-replica-control-hardening-plan.md) | `BuiltinFn` payloads are validated at registry construction; perf comparison builds canonicalize temporary paths, balance run positions, classify replica binary identity, and keep same-source replica measurements diagnostic | Controlled matched layout seeds remain deferred until the supported toolchain has a deliberate linker/compiler perturbation; one replica is not used as a statistical floor |
 | [schema-propagation-plan.md](done/schema-propagation-plan.md) | Stages 1–9 all done: `infer_schema`, `as` ascription, expression inference, static column-ref checks, exact/wildcard schemas, reader return schemas, let-binding schemas, time index | Follow-ups: named schema aliases (`type X = {...}`); time index from declared `TimeFrame<S>` sources. Static fn-arg contracts wait on whole-program schema flow |
 | [unify-filter-expr-plan.md](done/unify-filter-expr-plan.md) | `FilterExpr` deleted; predicates are boolean `ir::Expr`; vectorised filter path preserved (benchmarked, no regression) | Spec/allow booleans in value position (storable masks) — leaning yes, not yet spec'd |
 | [aggregate-udf-plan.md](done/aggregate-udf-plan.md) | Scalar UDF inlining (select/update/filter/agg args), `agg fn` via AST inlining, F1 grouped broadcast, F2 mixed scalar+Series params, F3.1 `let` bodies — all done with zero new IR nodes | Deferred by design: value-selection as a `where()` builtin (tier 2); statement-level control flow out of scope (see project_no_control_flow) |

@@ -25,7 +25,7 @@ ITERS=9
 WARMUP=1
 DATA_ROWS=4000000
 INTERLEAVE=1
-TASKSET_CPUS="2-3"
+TASKSET_CPUS="2"
 INSTANCE_TYPE=""
 KEY_NAME=""
 ON_DEMAND=1
@@ -45,7 +45,7 @@ Options:
   --warmup N             warmup iterations (default: 1)
   --data-rows N          fact-table rows for gen_data.py (default: 4000000)
   --serial               disable interleaving inside each comparison
-  --taskset CPUSET       pin benchmark runs (default: 2-3)
+  --taskset CPUSET       pin benchmark runs (default: 2)
   --type INSTANCE        EC2 instance type (default: auto from --data-rows)
   --key KEY_PAIR         EC2 key pair for SSH debugging (optional)
   --region REGION        override region

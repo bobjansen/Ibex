@@ -39,7 +39,7 @@
 #   --warmup  N                warmup iterations                 (default: 1)
 #   --inner-runs N             REPL invocations per timed iteration (default: 1)
 #   --serial                   disable interleaving (all base repeats, then target)
-#   --taskset CPUSET           pin the benchmark cores           (default: 2-3)
+#   --taskset CPUSET           pin the benchmark cores             (default: 2)
 #   --type   INSTANCE          EC2 instance type   (default: c7i.2xlarge)
 #   --key    KEY_PAIR          EC2 key pair for SSH debugging (optional)
 #   --region REGION            override region
@@ -73,7 +73,7 @@ ITERS=5
 WARMUP=1
 INNER_RUNS=1
 INTERLEAVE=1
-TASKSET_CPUS="2-3"
+TASKSET_CPUS="2"
 KEY_NAME=""
 ON_DEMAND=0
 

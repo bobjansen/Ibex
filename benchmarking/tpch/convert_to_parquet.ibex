@@ -1,0 +1,76 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  One-time conversion: dbgen's pipe-delimited SF-1 .tbl files -> Parquet.
+//
+//  Polars' own PDS-H benchmark scans Parquet (columnar, typed, no text
+//  parsing), not CSV. Comparing Ibex against it over CSV would attribute
+//  text-parsing cost to Ibex that Polars never pays in its own numbers, and
+//  that gap only grows at larger scale factors. This script runs once to
+//  produce a Parquet copy of the SF-1 tables that benchmarking/tpch/queries/
+//  read directly, with real column names/types (no col1/col2 + schema-string
+//  boilerplate needed once the source is self-describing Parquet).
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/convert_to_parquet.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool,
+                    schema: String) -> DataFrame from "csv.hpp";
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+
+let customer_raw = read_csv("benchmarking/data/tpch/sf1/customer.tbl", "", "|", false,
+    "int,str,str,int,str,f64,str,str");
+write_parquet(customer_raw[select {
+    c_custkey = col1, c_name = col2, c_address = col3, c_nationkey = col4,
+    c_phone = col5, c_acctbal = col6, c_mktsegment = col7, c_comment = col8
+}], "benchmarking/data/tpch/parquet/customer.parquet");
+
+let orders_raw = read_csv("benchmarking/data/tpch/sf1/orders.tbl", "", "|", false,
+    "int,int,str,f64,date,str,str,int,str");
+write_parquet(orders_raw[select {
+    o_orderkey = col1, o_custkey = col2, o_orderstatus = col3, o_totalprice = col4,
+    o_orderdate = col5, o_orderpriority = col6, o_clerk = col7, o_shippriority = col8,
+    o_comment = col9
+}], "benchmarking/data/tpch/parquet/orders.parquet");
+
+let lineitem_raw = read_csv("benchmarking/data/tpch/sf1/lineitem.tbl", "", "|", false,
+    "int,int,int,int,f64,f64,f64,f64,str,str,date,date,date,str,str,str,str");
+write_parquet(lineitem_raw[select {
+    l_orderkey = col1, l_partkey = col2, l_suppkey = col3, l_linenumber = col4,
+    l_quantity = col5, l_extendedprice = col6, l_discount = col7, l_tax = col8,
+    l_returnflag = col9, l_linestatus = col10, l_shipdate = col11, l_commitdate = col12,
+    l_receiptdate = col13, l_shipinstruct = col14, l_shipmode = col15, l_comment = col16
+}], "benchmarking/data/tpch/parquet/lineitem.parquet");
+
+let part_raw = read_csv("benchmarking/data/tpch/sf1/part.tbl", "", "|", false,
+    "int,str,str,str,str,int,str,f64,str");
+write_parquet(part_raw[select {
+    p_partkey = col1, p_name = col2, p_mfgr = col3, p_brand = col4, p_type = col5,
+    p_size = col6, p_container = col7, p_retailprice = col8, p_comment = col9
+}], "benchmarking/data/tpch/parquet/part.parquet");
+
+let partsupp_raw = read_csv("benchmarking/data/tpch/sf1/partsupp.tbl", "", "|", false,
+    "int,int,int,f64,str");
+write_parquet(partsupp_raw[select {
+    ps_partkey = col1, ps_suppkey = col2, ps_availqty = col3, ps_supplycost = col4,
+    ps_comment = col5
+}], "benchmarking/data/tpch/parquet/partsupp.parquet");
+
+let supplier_raw = read_csv("benchmarking/data/tpch/sf1/supplier.tbl", "", "|", false,
+    "int,str,str,int,str,f64,str");
+write_parquet(supplier_raw[select {
+    s_suppkey = col1, s_name = col2, s_address = col3, s_nationkey = col4,
+    s_phone = col5, s_acctbal = col6, s_comment = col7
+}], "benchmarking/data/tpch/parquet/supplier.parquet");
+
+let nation_raw = read_csv("benchmarking/data/tpch/sf1/nation.tbl", "", "|", false,
+    "int,str,int,str");
+write_parquet(nation_raw[select {
+    n_nationkey = col1, n_name = col2, n_regionkey = col3, n_comment = col4
+}], "benchmarking/data/tpch/parquet/nation.parquet");
+
+let region_raw = read_csv("benchmarking/data/tpch/sf1/region.tbl", "", "|", false,
+    "int,str,str");
+write_parquet(region_raw[select {
+    r_regionkey = col1, r_name = col2, r_comment = col3
+}], "benchmarking/data/tpch/parquet/region.parquet");

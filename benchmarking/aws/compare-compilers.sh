@@ -21,7 +21,7 @@ ITERS=7
 WARMUP=1
 DATA_ROWS=4000000
 INTERLEAVE=1
-TASKSET_CPUS="2-3"
+TASKSET_CPUS="2"
 KEY_NAME=""
 ON_DEMAND=-1
 
@@ -35,7 +35,7 @@ Options:
   --warmup N            warmup iterations inside each compiled binary (default: 1)
   --data-rows N         fact-table rows for gen_data.py (default: 4000000)
   --serial              disable interleaving (all clang repeats, then gcc)
-  --taskset CPUSET      pin the benchmark cores (default: 2-3)
+  --taskset CPUSET      pin the benchmark cores (default: 2)
   --type INSTANCE       EC2 instance type (default: auto from --data-rows)
   --key KEY_PAIR        EC2 key pair for SSH debugging (optional)
   --region REGION       override region

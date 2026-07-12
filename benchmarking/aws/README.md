@@ -96,7 +96,8 @@ dedicated, idle, fixed-clock box — the noise floor a laptop or WSL2 can't reac
 It runs the same `compare_ibex_git.sh` A/B as locally, but on EC2: both commits
 are built and timed on the **one** instance, repeats **interleaved** (base and
 target alternate, so slow machine drift cancels instead of biasing whichever
-side runs second).
+side runs second). Runs default to one logical CPU (`--taskset 2`) so the
+single-threaded Ibex process cannot migrate between cores during a sample.
 
 ```bash
 git push                                            # both commits must be on origin
@@ -203,7 +204,7 @@ Run it:
 git push
 ./benchmarking/aws/compare-compilers.sh
 ./benchmarking/aws/compare-compilers.sh --data-rows 16000000 --on-demand
-./benchmarking/aws/compare-compilers.sh --repeats 5 --iters 9 --taskset 2-3
+./benchmarking/aws/compare-compilers.sh --repeats 5 --iters 9 --taskset 2
 ```
 
 The report is printed locally and saved to

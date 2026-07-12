@@ -1,0 +1,190 @@
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/required_columns.hpp>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace ibex;
+
+namespace {
+
+auto col(std::string name) -> ir::ExprPtr {
+    return ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}});
+}
+
+auto refs(std::vector<std::string> names) -> std::vector<ir::ColumnRef> {
+    std::vector<ir::ColumnRef> out;
+    out.reserve(names.size());
+    for (auto& name : names) {
+        out.push_back(ir::ColumnRef{.name = std::move(name), .source = {0}});
+    }
+    return out;
+}
+
+auto make_scan(std::string name) -> ir::NodePtr {
+    return std::make_unique<ir::ScanNode>(ir::NodeId{1}, std::move(name));
+}
+
+/// `<column> > 0`
+auto gt_zero(std::string name) -> ir::Expr {
+    auto lit = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}});
+    return ir::Expr{.node = ir::CompareExpr{.op = ir::CompareOp::Gt,
+                                            .left = col(std::move(name)),
+                                            .right = std::move(lit)}};
+}
+
+auto with_child(ir::NodePtr parent, ir::NodePtr child) -> ir::NodePtr {
+    parent->add_child(std::move(child));
+    return parent;
+}
+
+}  // namespace
+
+TEST_CASE("required_columns: a bare scan demands every column", "[ir][required_columns]") {
+    auto plan = make_scan("t");
+    auto demand = ir::required_columns(*plan);
+
+    REQUIRE(demand.contains("t"));
+    CHECK(demand.at("t").all);
+}
+
+TEST_CASE("required_columns: project fixes the demand to its own columns",
+          "[ir][required_columns]") {
+    auto plan = with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{2}, refs({"a", "b"})),
+                           make_scan("t"));
+    auto demand = ir::required_columns(*plan);
+
+    REQUIRE(demand.contains("t"));
+    CHECK_FALSE(demand.at("t").all);
+    CHECK(demand.at("t").names == std::set<std::string>{"a", "b"});
+}
+
+TEST_CASE("required_columns: a filter adds the columns its predicate reads",
+          "[ir][required_columns]") {
+    auto plan = with_child(
+        std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})),
+        with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("b")), make_scan("t")));
+    auto demand = ir::required_columns(*plan);
+
+    // `b` is never in the output, but the scan must still supply it.
+    CHECK(demand.at("t").names == std::set<std::string>{"a", "b"});
+}
+
+TEST_CASE("required_columns: aggregate demands its group keys and aggregated columns",
+          "[ir][required_columns]") {
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(ir::AggSpec{
+        .func = ir::AggFunc::Sum, .column = ir::ColumnRef{.name = "amount"}, .alias = "total"});
+    auto plan = with_child(
+        std::make_unique<ir::AggregateNode>(ir::NodeId{2}, refs({"region"}), std::move(aggs)),
+        make_scan("t"));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK_FALSE(demand.at("t").all);
+    CHECK(demand.at("t").names == std::set<std::string>{"region", "amount"});
+}
+
+TEST_CASE("required_columns: count() alone demands no column", "[ir][required_columns]") {
+    // count() carries no ColumnRef, so an unfiltered row count reads nothing —
+    // the row count comes from the source's metadata.
+    std::vector<ir::AggSpec> aggs;
+    aggs.push_back(
+        ir::AggSpec{.func = ir::AggFunc::Count, .column = ir::ColumnRef{.name = ""}, .alias = "n"});
+    auto plan =
+        with_child(std::make_unique<ir::AggregateNode>(ir::NodeId{2}, refs({}), std::move(aggs)),
+                   make_scan("t"));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK_FALSE(demand.at("t").all);
+    CHECK(demand.at("t").names.empty());
+}
+
+TEST_CASE("required_columns: order adds its sort keys", "[ir][required_columns]") {
+    std::vector<ir::OrderKey> keys;
+    keys.push_back(ir::OrderKey{.name = "ts", .ascending = true});
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})),
+                   with_child(std::make_unique<ir::OrderNode>(ir::NodeId{2}, std::move(keys)),
+                              make_scan("t")));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK(demand.at("t").names == std::set<std::string>{"a", "ts"});
+}
+
+TEST_CASE("required_columns: update reads its inputs, not the names it produces",
+          "[ir][required_columns]") {
+    std::vector<ir::FieldSpec> fields;
+    fields.push_back(
+        ir::FieldSpec{.alias = "b", .expr = ir::Expr{.node = ir::ColumnRef{.name = "a"}}});
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"b"})),
+                   with_child(std::make_unique<ir::UpdateNode>(ir::NodeId{2}, std::move(fields)),
+                              make_scan("t")));
+    auto demand = ir::required_columns(*plan);
+
+    // `b` is produced by the update, so it is not demanded from the scan; `a` is.
+    CHECK(demand.at("t").names == std::set<std::string>{"a"});
+}
+
+TEST_CASE("required_columns: rename maps a demanded name back to its source name",
+          "[ir][required_columns]") {
+    std::vector<ir::RenameSpec> renames;
+    renames.push_back(ir::RenameSpec{.new_name = "b", .old_name = "a"});
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"b"})),
+                   with_child(std::make_unique<ir::RenameNode>(ir::NodeId{2}, std::move(renames)),
+                              make_scan("t")));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK(demand.at("t").names == std::set<std::string>{"a"});
+}
+
+TEST_CASE("required_columns: join demands its keys from both sides", "[ir][required_columns]") {
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{2}, ir::JoinKind::Inner,
+                                               std::vector<std::string>{"id"});
+    join->add_child(make_scan("left"));
+    join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{9}, "right"));
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})), std::move(join));
+    auto demand = ir::required_columns(*plan);
+
+    // The demand is the union across both sides; a name absent from one side's
+    // schema is simply not read there.
+    CHECK(demand.at("left").names == std::set<std::string>{"a", "id"});
+    CHECK(demand.at("right").names == std::set<std::string>{"a", "id"});
+}
+
+TEST_CASE("required_columns: distinct cannot be narrowed", "[ir][required_columns]") {
+    // Distinct de-duplicates over every input column: narrowing its input would
+    // change which rows survive, not just which columns come back.
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})),
+                   with_child(std::make_unique<ir::DistinctNode>(ir::NodeId{2}), make_scan("t")));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK(demand.at("t").all);
+}
+
+TEST_CASE("required_columns: an unmodelled node widens rather than under-reading",
+          "[ir][required_columns]") {
+    // Cov reads every numeric column and names none of them. The pass must not
+    // conclude the scan is unused.
+    auto plan = with_child(std::make_unique<ir::CovNode>(ir::NodeId{2}), make_scan("t"));
+    auto demand = ir::required_columns(*plan);
+
+    REQUIRE(demand.contains("t"));
+    CHECK(demand.at("t").all);
+}
+
+TEST_CASE("required_columns: a source the plan never scans is absent", "[ir][required_columns]") {
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{2}, refs({"a"})), make_scan("t"));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK_FALSE(demand.contains("other"));
+}

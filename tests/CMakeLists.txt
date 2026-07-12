@@ -12,6 +12,7 @@ set(IBEX_TEST_SOURCES
     test_ir_canonicalize.cpp
     test_ir_node.cpp
     test_ir_optimizer.cpp
+    test_ir_required_columns.cpp
     test_ir_schema.cpp
     test_kafka_common.cpp
     test_kafka_schema_registry.cpp
@@ -24,6 +25,7 @@ set(IBEX_TEST_SOURCES
     test_interrupt.cpp
     test_codegen.cpp
     test_join.cpp
+    test_lazy_table.cpp
     test_operator.cpp
 )
 if(NOT WIN32)

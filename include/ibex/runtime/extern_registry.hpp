@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <expected>
@@ -63,6 +64,12 @@ using ExternTableConsumerFn =
 using ExternChunkedTableFn =
     std::function<std::expected<OperatorPtr, std::string>(const ExternArgs&)>;
 
+/// Function signature for extern functions that produce a lazily-decoded table
+/// source (e.g. read_parquet). Returns a handle carrying the schema, from which
+/// the interpreter materializes only the columns a query references.
+using ExternLazyTableFn =
+    std::function<std::expected<LazyTablePtr, std::string>(const ExternArgs&)>;
+
 enum class ExternReturnKind : std::uint8_t {
     Scalar,
     Table,
@@ -109,6 +116,10 @@ struct ExternFunction {
     /// `chunked_table_func` are set, the interpreter prefers the chunked
     /// path.
     ExternChunkedTableFn chunked_table_func;
+    /// Set when the source can decode its columns selectively. A `let` binding
+    /// of such a function defers the read: it takes the schema now and lets each
+    /// query pull only the columns it needs (projection pushdown).
+    ExternLazyTableFn lazy_table_func;
     ExternReturnKind kind = ExternReturnKind::Scalar;
     std::optional<ScalarKind> scalar_kind;
     /// True when the first argument is a DataFrame rather than a scalar.
@@ -125,6 +136,7 @@ class ExternRegistry {
                                                         .func = std::move(func),
                                                         .table_consumer_func = {},
                                                         .chunked_table_func = {},
+                                                        .lazy_table_func = {},
                                                         .kind = ExternReturnKind::Scalar,
                                                         .scalar_kind = kind,
                                                     });
@@ -135,6 +147,7 @@ class ExternRegistry {
         registry_.insert_or_assign(std::move(name), ExternFunction{.func = std::move(func),
                                                                    .table_consumer_func = {},
                                                                    .chunked_table_func = {},
+                                                                   .lazy_table_func = {},
                                                                    .kind = ExternReturnKind::Table,
                                                                    .scalar_kind = std::nullopt});
     }
@@ -155,6 +168,24 @@ class ExternRegistry {
         }
         ExternFunction ef;
         ef.chunked_table_func = std::move(func);
+        ef.kind = ExternReturnKind::Table;
+        registry_.insert_or_assign(std::move(name), std::move(ef));
+    }
+
+    /// Register a lazily-decoded table source. Binding one of these reads only
+    /// the source's schema; each query then materializes just the columns it
+    /// references. Stored alongside any existing `register_table` entry for the
+    /// same name, which remains the fallback for callers that want the whole
+    /// table at once.
+    void register_lazy_table(std::string name, ExternLazyTableFn func) {
+        auto it = registry_.find(name);
+        if (it != registry_.end()) {
+            it->second.lazy_table_func = std::move(func);
+            it->second.kind = ExternReturnKind::Table;
+            return;
+        }
+        ExternFunction ef;
+        ef.lazy_table_func = std::move(func);
         ef.kind = ExternReturnKind::Table;
         registry_.insert_or_assign(std::move(name), std::move(ef));
     }

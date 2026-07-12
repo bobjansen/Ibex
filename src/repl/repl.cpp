@@ -2,6 +2,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
@@ -10,6 +11,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
@@ -66,6 +68,13 @@ namespace {
 using FunctionRegistry = robin_hood::unordered_map<std::string, parser::FunctionDecl>;
 using ExternDeclRegistry = robin_hood::unordered_map<std::string, parser::ExternDecl>;
 using ColumnRegistry = robin_hood::unordered_map<std::string, runtime::ColumnValue>;
+/// Table bindings whose source can decode columns selectively, held unread.
+///
+/// Kept beside `TableRegistry` rather than inside it: a lookup site that has
+/// not been taught about laziness then fails loudly with "unknown table"
+/// instead of quietly receiving a table missing the columns nobody asked for.
+/// A binding lives in exactly one of the two registries.
+using LazyTableRegistry = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
 using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResult>;
 using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vector<std::string>>;
 using FunctionSourceRegistry = robin_hood::unordered_map<std::string, std::string>;
@@ -896,14 +905,17 @@ void render_eval_value(const EvalValue& value) {
     }
 }
 
-void print_tables(const runtime::TableRegistry& tables) {
-    if (tables.empty()) {
+void print_tables(const runtime::TableRegistry& tables, const LazyTableRegistry& lazy_tables) {
+    if (tables.empty() && lazy_tables.empty()) {
         fmt::print("tables: <none>\n");
         return;
     }
     std::vector<std::string> names;
-    names.reserve(tables.size());
+    names.reserve(tables.size() + lazy_tables.size());
     for (const auto& entry : tables) {
+        names.push_back(entry.first);
+    }
+    for (const auto& entry : lazy_tables) {
         names.push_back(entry.first);
     }
     std::ranges::sort(names);
@@ -912,6 +924,21 @@ void print_tables(const runtime::TableRegistry& tables) {
         fmt::print(" {}", name);
     }
     fmt::print("\n");
+}
+
+/// Resolve a table name for a caller that needs the rows, not just the schema.
+/// A lazy binding is materialized in full: nothing about the caller bounds which
+/// columns it will look at.
+auto resolve_table(const std::string& name, const runtime::TableRegistry& tables,
+                   const LazyTableRegistry& lazy_tables)
+    -> std::expected<runtime::Table, std::string> {
+    if (auto it = tables.find(name); it != tables.end()) {
+        return it->second;
+    }
+    if (auto it = lazy_tables.find(name); it != lazy_tables.end()) {
+        return it->second->materialize();
+    }
+    return std::unexpected("unknown table '" + name + "'");
 }
 
 void print_scalars(const runtime::ScalarRegistry& scalars) {
@@ -954,13 +981,17 @@ std::string format_scalar_names(const runtime::ScalarRegistry& scalars) {
     return out;
 }
 
-std::string format_table_names(const runtime::TableRegistry& tables) {
-    if (tables.empty()) {
+std::string format_table_names(const runtime::TableRegistry& tables,
+                               const LazyTableRegistry& lazy_tables) {
+    if (tables.empty() && lazy_tables.empty()) {
         return "<none>";
     }
     std::vector<std::string> names;
-    names.reserve(tables.size());
+    names.reserve(tables.size() + lazy_tables.size());
     for (const auto& entry : tables) {
+        names.push_back(entry.first);
+    }
+    for (const auto& entry : lazy_tables) {
         names.push_back(entry.first);
     }
     std::sort(names.begin(), names.end());
@@ -1791,9 +1822,9 @@ void print_doc_text(const DeclarationDocRegistry& declaration_docs, const std::s
 }
 
 void print_doc(std::string_view name, const runtime::TableRegistry& tables,
-               const runtime::ScalarRegistry& scalars, const ColumnRegistry& columns,
-               const ModelRegistry& models, const FunctionRegistry& functions,
-               const ExternDeclRegistry& extern_decls,
+               const LazyTableRegistry& lazy_tables, const runtime::ScalarRegistry& scalars,
+               const ColumnRegistry& columns, const ModelRegistry& models,
+               const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
                const DeclarationDocRegistry& declaration_docs, const ImportRegistry& imports) {
     if (name.empty()) {
         fmt::print("usage: :doc <name>\n");
@@ -1804,6 +1835,12 @@ void print_doc(std::string_view name, const runtime::TableRegistry& tables,
         fmt::print("table {}\n", key);
         print_schema(it->second);
         fmt::print("rows: {}\n", it->second.rows());
+        return;
+    }
+    if (auto it = lazy_tables.find(key); it != lazy_tables.end()) {
+        fmt::print("table {}\n", key);
+        print_schema(it->second->schema());
+        fmt::print("rows: {}\n", it->second->rows());
         return;
     }
     if (auto it = scalars.find(key); it != scalars.end()) {
@@ -2182,16 +2219,17 @@ auto eval_model_scalar_accessor(const parser::CallExpr& call, const ModelRegistr
 }
 
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
-                     runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     ModelRegistry& models, const FunctionRegistry& functions,
-                     CompileTimeListRegistry& compile_time_lists,
+                     LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                     ColumnRegistry& columns, ModelRegistry& models,
+                     const FunctionRegistry& functions, CompileTimeListRegistry& compile_time_lists,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
                      runtime::ModelResult* model_out = nullptr)
     -> std::expected<runtime::Table, std::string>;
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
-                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      ModelRegistry& models, const FunctionRegistry& functions,
+                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                      ColumnRegistry& columns, ModelRegistry& models,
+                      const FunctionRegistry& functions,
                       CompileTimeListRegistry& compile_time_lists,
                       const ExternDeclRegistry& extern_decls,
                       const runtime::ExternRegistry& externs)
@@ -2203,20 +2241,31 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
 // ScalarValue or, for an element-wise result, a ColumnValue. Precondition:
 // ir::is_aggregate_func(callee) || runtime::is_scalar_builtin(callee).
 auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
-                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      ModelRegistry& models, const FunctionRegistry& functions,
+                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                      ColumnRegistry& columns, ModelRegistry& models,
+                      const FunctionRegistry& functions,
                       CompileTimeListRegistry& compile_time_lists,
                       const ExternDeclRegistry& extern_decls,
                       const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string>;
 
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
-                        runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        ModelRegistry& models, const FunctionRegistry& functions,
+                        LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                        ColumnRegistry& columns, ModelRegistry& models,
+                        const FunctionRegistry& functions,
                         CompileTimeListRegistry& compile_time_lists,
                         const ExternDeclRegistry& extern_decls,
                         const runtime::ExternRegistry& externs)
     -> std::expected<EvalValue, std::string>;
+
+auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
+                          LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                          ColumnRegistry& columns, ModelRegistry& models,
+                          const FunctionRegistry& functions,
+                          CompileTimeListRegistry& compile_time_lists,
+                          const ExternDeclRegistry& extern_decls,
+                          const runtime::ExternRegistry& externs)
+    -> std::optional<std::expected<runtime::LazyTablePtr, std::string>>;
 
 auto is_model_predict(std::string_view callee) -> bool {
     return callee == "predict" || callee == "model_predict";
@@ -2225,8 +2274,9 @@ auto is_model_predict(std::string_view callee) -> bool {
 // model_predict(m, newdata): look up the model binding `m`, evaluate `newdata`
 // as a table, and predict by reusing the model's native handle.
 auto eval_model_predict(parser::CallExpr& call, runtime::TableRegistry& tables,
-                        runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        ModelRegistry& models, const FunctionRegistry& functions,
+                        LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                        ColumnRegistry& columns, ModelRegistry& models,
+                        const FunctionRegistry& functions,
                         CompileTimeListRegistry& compile_time_lists,
                         const ExternDeclRegistry& extern_decls,
                         const runtime::ExternRegistry& externs)
@@ -2242,8 +2292,8 @@ auto eval_model_predict(parser::CallExpr& call, runtime::TableRegistry& tables,
     if (it == models.end()) {
         return std::unexpected(call.callee + ": unknown model binding '" + ident->name + "'");
     }
-    auto newdata = eval_table_expr(*call.args[1], tables, scalars, columns, models, functions,
-                                   compile_time_lists, extern_decls, externs);
+    auto newdata = eval_table_expr(*call.args[1], tables, lazy_tables, scalars, columns, models,
+                                   functions, compile_time_lists, extern_decls, externs);
     if (!newdata) {
         return std::unexpected(newdata.error());
     }
@@ -2251,15 +2301,15 @@ auto eval_model_predict(parser::CallExpr& call, runtime::TableRegistry& tables,
 }
 
 auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
-                     runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     ModelRegistry& models, const FunctionRegistry& functions,
-                     CompileTimeListRegistry& compile_time_lists,
+                     LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                     ColumnRegistry& columns, ModelRegistry& models,
+                     const FunctionRegistry& functions, CompileTimeListRegistry& compile_time_lists,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
                      runtime::ModelResult* model_out = nullptr)
     -> std::expected<EvalValue, std::string> {
     if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
-        return eval_expr_value(*group->expr, tables, scalars, columns, models, functions,
-                               compile_time_lists, extern_decls, externs, model_out);
+        return eval_expr_value(*group->expr, tables, lazy_tables, scalars, columns, models,
+                               functions, compile_time_lists, extern_decls, externs, model_out);
     }
     if (const auto* array = std::get_if<parser::ArrayLiteralExpr>(&expr.node)) {
         auto series = eval_series_literal(*array);
@@ -2272,8 +2322,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
     // produces a scalar string.
     if (const auto* call = std::get_if<parser::CallExpr>(&expr.node);
         call != nullptr && call->callee == "__interp") {
-        auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
-                                       compile_time_lists, extern_decls, externs);
+        auto scalar = eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models,
+                                       functions, compile_time_lists, extern_decls, externs);
         if (!scalar) {
             return std::unexpected(scalar.error());
         }
@@ -2282,8 +2332,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
     if (std::holds_alternative<parser::LiteralExpr>(expr.node) ||
         std::holds_alternative<parser::BinaryExpr>(expr.node) ||
         std::holds_alternative<parser::UnaryExpr>(expr.node)) {
-        auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
-                                       compile_time_lists, extern_decls, externs);
+        auto scalar = eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models,
+                                       functions, compile_time_lists, extern_decls, externs);
         if (!scalar) {
             return std::unexpected(scalar.error());
         }
@@ -2306,8 +2356,8 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             return EvalValue{std::move(table.value())};
         }
         if (is_model_predict(call->callee)) {
-            auto table = eval_model_predict(*call, tables, scalars, columns, models, functions,
-                                            compile_time_lists, extern_decls, externs);
+            auto table = eval_model_predict(*call, tables, lazy_tables, scalars, columns, models,
+                                            functions, compile_time_lists, extern_decls, externs);
             if (!table) {
                 return std::unexpected(table.error());
             }
@@ -2321,8 +2371,9 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             return EvalValue{std::move(scalar.value())};
         }
         if (is_cast_callee(call->callee) && call->args.size() == 1) {
-            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs);
+            auto inner =
+                eval_expr_value(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs);
             if (!inner) {
                 return std::unexpected(inner.error());
             }
@@ -2347,8 +2398,9 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!mode) {
                 return std::unexpected(mode.error());
             }
-            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs);
+            auto inner =
+                eval_expr_value(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs);
             if (!inner) {
                 return std::unexpected(inner.error());
             }
@@ -2371,8 +2423,9 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             if (call->args.size() != 1 || !call->named_args.empty()) {
                 return std::unexpected("print: expected exactly one argument");
             }
-            auto inner = eval_expr_value(*call->args[0], tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs);
+            auto inner =
+                eval_expr_value(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs);
             if (!inner) {
                 return std::unexpected(inner.error());
             }
@@ -2385,8 +2438,9 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             if (call->args.size() != 1 || !call->named_args.empty()) {
                 return std::unexpected("seed_rng: expected exactly one argument (seed: Int)");
             }
-            auto seed_val = eval_scalar_expr(*call->args[0], tables, scalars, columns, models,
-                                             functions, compile_time_lists, extern_decls, externs);
+            auto seed_val =
+                eval_scalar_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                 functions, compile_time_lists, extern_decls, externs);
             if (!seed_val) {
                 return std::unexpected(seed_val.error());
             }
@@ -2399,29 +2453,31 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
             return EvalValue{static_cast<std::int64_t>(seed)};
         }
         if (call->callee == "scalar") {
-            auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
-                                           compile_time_lists, extern_decls, externs);
+            auto scalar = eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models,
+                                           functions, compile_time_lists, extern_decls, externs);
             if (!scalar) {
                 return std::unexpected(scalar.error());
             }
             return EvalValue{std::move(scalar.value())};
         }
         if (functions.contains(call->callee)) {
-            return eval_function_call(*call, tables, scalars, columns, models, functions,
-                                      compile_time_lists, extern_decls, externs);
+            return eval_function_call(*call, tables, lazy_tables, scalars, columns, models,
+                                      functions, compile_time_lists, extern_decls, externs);
         }
         if (extern_decls.contains(call->callee)) {
             const auto& decl = extern_decls.at(call->callee);
             if (decl.return_type.kind == parser::Type::Kind::Scalar) {
-                auto scalar = eval_scalar_expr(expr, tables, scalars, columns, models, functions,
-                                               compile_time_lists, extern_decls, externs);
+                auto scalar =
+                    eval_scalar_expr(expr, tables, lazy_tables, scalars, columns, models, functions,
+                                     compile_time_lists, extern_decls, externs);
                 if (!scalar) {
                     return std::unexpected(scalar.error());
                 }
                 return EvalValue{std::move(scalar.value())};
             }
-            auto table = eval_table_expr(expr, tables, scalars, columns, models, functions,
-                                         compile_time_lists, extern_decls, externs, model_out);
+            auto table =
+                eval_table_expr(expr, tables, lazy_tables, scalars, columns, models, functions,
+                                compile_time_lists, extern_decls, externs, model_out);
             if (!table) {
                 return std::unexpected(table.error());
             }
@@ -2432,11 +2488,11 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
         // when applied element-wise to series arguments). Routed here rather than
         // treated as a table function.
         if (ir::is_aggregate_func(call->callee) || runtime::is_scalar_builtin(call->callee)) {
-            return eval_series_call(*call, tables, scalars, columns, models, functions,
+            return eval_series_call(*call, tables, lazy_tables, scalars, columns, models, functions,
                                     compile_time_lists, extern_decls, externs);
         }
     }
-    auto table = eval_table_expr(expr, tables, scalars, columns, models, functions,
+    auto table = eval_table_expr(expr, tables, lazy_tables, scalars, columns, models, functions,
                                  compile_time_lists, extern_decls, externs, model_out);
     if (!table) {
         return std::unexpected(table.error());
@@ -2445,8 +2501,9 @@ auto eval_expr_value(parser::Expr& expr, runtime::TableRegistry& tables,
 }
 
 auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
-                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      ModelRegistry& models, const FunctionRegistry& functions,
+                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                      ColumnRegistry& columns, ModelRegistry& models,
+                      const FunctionRegistry& functions,
                       CompileTimeListRegistry& compile_time_lists,
                       const ExternDeclRegistry& extern_decls,
                       const runtime::ExternRegistry& externs)
@@ -2476,12 +2533,12 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unknown scalar: " + ident->name);
     }
     if (const auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
-        return eval_scalar_expr(*group->expr, tables, scalars, columns, models, functions,
-                                compile_time_lists, extern_decls, externs);
+        return eval_scalar_expr(*group->expr, tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs);
     }
     if (const auto* unary = std::get_if<parser::UnaryExpr>(&expr.node)) {
-        auto value = eval_scalar_expr(*unary->expr, tables, scalars, columns, models, functions,
-                                      compile_time_lists, extern_decls, externs);
+        auto value = eval_scalar_expr(*unary->expr, tables, lazy_tables, scalars, columns, models,
+                                      functions, compile_time_lists, extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -2504,13 +2561,13 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("unsupported unary operand type");
     }
     if (const auto* binary = std::get_if<parser::BinaryExpr>(&expr.node)) {
-        auto left = eval_scalar_expr(*binary->left, tables, scalars, columns, models, functions,
-                                     compile_time_lists, extern_decls, externs);
+        auto left = eval_scalar_expr(*binary->left, tables, lazy_tables, scalars, columns, models,
+                                     functions, compile_time_lists, extern_decls, externs);
         if (!left) {
             return std::unexpected(left.error());
         }
-        auto right = eval_scalar_expr(*binary->right, tables, scalars, columns, models, functions,
-                                      compile_time_lists, extern_decls, externs);
+        auto right = eval_scalar_expr(*binary->right, tables, lazy_tables, scalars, columns, models,
+                                      functions, compile_time_lists, extern_decls, externs);
         if (!right) {
             return std::unexpected(right.error());
         }
@@ -2572,8 +2629,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             // renders strings unquoted, so the literals read verbatim.
             std::string out;
             for (auto& arg : call->args) {
-                auto value = eval_scalar_expr(*arg, tables, scalars, columns, models, functions,
-                                              compile_time_lists, extern_decls, externs);
+                auto value = eval_scalar_expr(*arg, tables, lazy_tables, scalars, columns, models,
+                                              functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -2592,8 +2649,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!column_name.has_value()) {
                 return std::unexpected("scalar() column must be identifier or string");
             }
-            auto table = eval_table_expr(*call->args[0], tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs);
+            auto table =
+                eval_table_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs);
             if (!table) {
                 return std::unexpected(table.error());
             }
@@ -2604,8 +2662,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return scalar.value();
         }
         if (functions.contains(call->callee)) {
-            auto value = eval_function_call(*call, tables, scalars, columns, models, functions,
-                                            compile_time_lists, extern_decls, externs);
+            auto value = eval_function_call(*call, tables, lazy_tables, scalars, columns, models,
+                                            functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -2636,17 +2694,17 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     return std::unexpected(call->callee + "() requires a DataFrame first argument");
                 }
                 auto table =
-                    eval_table_expr(*(*bound_args)[0].expr, tables, scalars, columns, models,
-                                    functions, compile_time_lists, extern_decls, externs);
+                    eval_table_expr(*(*bound_args)[0].expr, tables, lazy_tables, scalars, columns,
+                                    models, functions, compile_time_lists, extern_decls, externs);
                 if (!table) {
                     return std::unexpected(table.error());
                 }
                 runtime::ExternArgs scalar_args;
                 scalar_args.reserve(bound_args->size() - 1);
                 for (std::size_t i = 1; i < bound_args->size(); ++i) {
-                    auto value =
-                        eval_scalar_expr(*(*bound_args)[i].expr, tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs);
+                    auto value = eval_scalar_expr(*(*bound_args)[i].expr, tables, lazy_tables,
+                                                  scalars, columns, models, functions,
+                                                  compile_time_lists, extern_decls, externs);
                     if (!value) {
                         return std::unexpected(value.error());
                     }
@@ -2664,8 +2722,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             runtime::ExternArgs args;
             args.reserve(bound_args->size());
             for (const auto& arg : *bound_args) {
-                auto value = eval_scalar_expr(*arg.expr, tables, scalars, columns, models,
-                                              functions, compile_time_lists, extern_decls, externs);
+                auto value =
+                    eval_scalar_expr(*arg.expr, tables, lazy_tables, scalars, columns, models,
+                                     functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -2684,8 +2743,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (call->args.size() != 1) {
                 return std::unexpected(call->callee + "(): expects exactly one argument");
             }
-            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, models,
-                                          functions, compile_time_lists, extern_decls, externs);
+            auto value =
+                eval_scalar_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                 functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -2700,8 +2760,9 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (!mode) {
                 return std::unexpected(mode.error());
             }
-            auto value = eval_scalar_expr(*call->args[0], tables, scalars, columns, models,
-                                          functions, compile_time_lists, extern_decls, externs);
+            auto value =
+                eval_scalar_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                 functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -2715,8 +2776,8 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         // position the result must be a scalar — an element-wise series result
         // (e.g. pmax(s1, s2)) is an error here, but works via eval_expr_value.
         if (ir::is_aggregate_func(call->callee) || runtime::is_scalar_builtin(call->callee)) {
-            auto value = eval_series_call(*call, tables, scalars, columns, models, functions,
-                                          compile_time_lists, extern_decls, externs);
+            auto value = eval_series_call(*call, tables, lazy_tables, scalars, columns, models,
+                                          functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -2772,8 +2833,9 @@ auto column_from_scalars(const std::vector<runtime::ScalarValue>& vals)
 }
 
 auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
-                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                      ModelRegistry& models, const FunctionRegistry& functions,
+                      LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                      ColumnRegistry& columns, ModelRegistry& models,
+                      const FunctionRegistry& functions,
                       CompileTimeListRegistry& compile_time_lists,
                       const ExternDeclRegistry& extern_decls,
                       const runtime::ExternRegistry& externs)
@@ -2782,7 +2844,7 @@ auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     std::vector<EvalValue> arg_values;
     arg_values.reserve(call.args.size());
     for (auto& arg : call.args) {
-        auto v = eval_expr_value(*arg, tables, scalars, columns, models, functions,
+        auto v = eval_expr_value(*arg, tables, lazy_tables, scalars, columns, models, functions,
                                  compile_time_lists, extern_decls, externs);
         if (!v) {
             return std::unexpected(v.error());
@@ -2883,9 +2945,9 @@ auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
 }
 
 auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
-                     runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                     ModelRegistry& models, const FunctionRegistry& functions,
-                     CompileTimeListRegistry& compile_time_lists,
+                     LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                     ColumnRegistry& columns, ModelRegistry& models,
+                     const FunctionRegistry& functions, CompileTimeListRegistry& compile_time_lists,
                      const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs,
                      runtime::ModelResult* model_out)
     -> std::expected<runtime::Table, std::string> {
@@ -2902,8 +2964,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 }
                 value = EvalValue{std::move(series.value())};
             } else {
-                value = eval_expr_value(*col_def.expr, tables, scalars, columns, models, functions,
-                                        compile_time_lists, extern_decls, externs);
+                value =
+                    eval_expr_value(*col_def.expr, tables, lazy_tables, scalars, columns, models,
+                                    functions, compile_time_lists, extern_decls, externs);
             }
             if (!value) {
                 return std::unexpected(value.error());
@@ -2959,8 +3022,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         runtime::ExternArgs args;
         args.reserve(bound_args->size());
         for (const auto& arg : *bound_args) {
-            auto value = eval_scalar_expr(*arg.expr, tables, scalars, columns, models, functions,
-                                          compile_time_lists, extern_decls, externs);
+            auto value = eval_scalar_expr(*arg.expr, tables, lazy_tables, scalars, columns, models,
+                                          functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -2976,12 +3039,43 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("extern function returned scalar: " + call.callee);
     };
 
+    // An inline source — `read_parquet(p)[filter …, select …]` — is bound to a
+    // temp lazy binding and its base rewritten to that name, so it reaches
+    // `interpret` as an ordinary Scan and picks up the same projection pushdown
+    // a `let`-bound source gets.
+    //
+    // Both the temp binding and the rewritten base are undone on the way out:
+    // this Expr may be evaluated more than once (a function body called twice),
+    // and the second evaluation must not find a name the first one retired.
+    struct InlineSourceRewrite {
+        LazyTableRegistry* lazy_tables = nullptr;
+        parser::BlockExpr* block = nullptr;
+        std::unique_ptr<parser::Expr> original_base;
+        std::string temp_name;
+
+        InlineSourceRewrite() = default;
+        InlineSourceRewrite(const InlineSourceRewrite&) = delete;
+        auto operator=(const InlineSourceRewrite&) -> InlineSourceRewrite& = delete;
+        InlineSourceRewrite(InlineSourceRewrite&&) = delete;
+        auto operator=(InlineSourceRewrite&&) -> InlineSourceRewrite& = delete;
+
+        ~InlineSourceRewrite() {
+            if (lazy_tables != nullptr) {
+                lazy_tables->erase(temp_name);
+            }
+            if (block != nullptr) {
+                block->base = std::move(original_base);
+            }
+        }
+    } inline_source;
+
     if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
         if (block->base && std::holds_alternative<parser::CallExpr>(block->base->node)) {
             auto* call = std::get_if<parser::CallExpr>(&block->base->node);
             if (call != nullptr && functions.contains(call->callee)) {
-                auto value = eval_function_call(*call, tables, scalars, columns, models, functions,
-                                                compile_time_lists, extern_decls, externs);
+                auto value =
+                    eval_function_call(*call, tables, lazy_tables, scalars, columns, models,
+                                       functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -2993,6 +3087,22 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                         std::get<runtime::Table>(std::move(value.value())));
                 block->base =
                     std::make_unique<parser::Expr>(parser::Expr{parser::IdentifierExpr{temp_name}});
+            } else if (call != nullptr) {
+                if (auto lazy = try_bind_lazy_source(*block->base, tables, lazy_tables, scalars,
+                                                     columns, models, functions, compile_time_lists,
+                                                     extern_decls, externs)) {
+                    if (!*lazy) {
+                        return std::unexpected(lazy->error());
+                    }
+                    auto temp_name = make_temp_table_name();
+                    lazy_tables.insert_or_assign(temp_name, std::move(lazy->value()));
+                    inline_source.lazy_tables = &lazy_tables;
+                    inline_source.block = block;
+                    inline_source.temp_name = temp_name;
+                    inline_source.original_base = std::move(block->base);
+                    block->base = std::make_unique<parser::Expr>(
+                        parser::Expr{parser::IdentifierExpr{temp_name}});
+                }
             }
         }
     }
@@ -3001,16 +3111,16 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return eval_model_table_accessor(*call, models);
         }
         if (is_model_predict(call->callee)) {
-            return eval_model_predict(*call, tables, scalars, columns, models, functions,
-                                      compile_time_lists, extern_decls, externs);
+            return eval_model_predict(*call, tables, lazy_tables, scalars, columns, models,
+                                      functions, compile_time_lists, extern_decls, externs);
         }
         if (call->callee == "print") {
             if (call->args.size() != 1 || !call->named_args.empty()) {
                 return std::unexpected("print: expected exactly one argument");
             }
             auto inner =
-                eval_table_expr(*call->args[0], tables, scalars, columns, models, functions,
-                                compile_time_lists, extern_decls, externs, model_out);
+                eval_table_expr(*call->args[0], tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs, model_out);
             if (!inner) {
                 return std::unexpected(inner.error());
             }
@@ -3018,8 +3128,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return inner;
         }
         if (functions.contains(call->callee)) {
-            auto value = eval_function_call(*call, tables, scalars, columns, models, functions,
-                                            compile_time_lists, extern_decls, externs);
+            auto value = eval_function_call(*call, tables, lazy_tables, scalars, columns, models,
+                                            functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -3043,8 +3153,13 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (auto it = tables.find(ident->name); it != tables.end()) {
             return it->second;
         }
+        // A lazy binding named on its own — printed, passed to a function, written
+        // out — is consumed whole, so there is nothing to push down. Force it.
+        if (auto it = lazy_tables.find(ident->name); it != lazy_tables.end()) {
+            return it->second->materialize();
+        }
         return std::unexpected("unknown table: " + ident->name +
-                               " (available: " + format_table_names(tables) + ")");
+                               " (available: " + format_table_names(tables, lazy_tables) + ")");
     }
     parser::LowerContext context;
     context.compile_time_lists = compile_time_lists;
@@ -3079,10 +3194,18 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     for (const auto& entry : tables) {
         context.lexical_names.insert(entry.first);
     }
+    for (const auto& entry : lazy_tables) {
+        context.lexical_names.insert(entry.first);
+    }
     // Carry the exact schema of each in-scope table binding into the lowerer so
     // references to a let-bound table are checked statically in this expression.
+    // A lazy binding knows its schema without having decoded anything, so it is
+    // checked just as strictly as a materialized one.
     for (const auto& [name, table] : tables) {
         context.source_schemas.insert_or_assign(name, table_schema_info(table));
+    }
+    for (const auto& [name, lazy] : lazy_tables) {
+        context.source_schemas.insert_or_assign(name, table_schema_info(lazy->schema()));
     }
     // Scalar user functions are inlined when called inside clause expressions.
     for (const auto& [name, decl] : functions) {
@@ -3092,8 +3215,33 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     if (!lowered) {
         return std::unexpected(lowered.error().message);
     }
+
+    // Projection pushdown. Ask the plan which columns it actually reads from
+    // each source, and materialize only those from any lazy binding it scans.
+    // `interpret` then runs against a registry in which every scanned source is
+    // an ordinary Table — it never learns that a read was deferred.
+    const runtime::TableRegistry* eval_tables = &tables;
+    runtime::TableRegistry projected;
+    if (!lazy_tables.empty()) {
+        auto demand = ir::required_columns(*lowered.value());
+        projected = tables;
+        for (const auto& [name, lazy] : lazy_tables) {
+            auto needed = demand.find(name);
+            if (needed == demand.end()) {
+                continue;  // this plan never scans it
+            }
+            auto table =
+                needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
+            if (!table) {
+                return std::unexpected(table.error());
+            }
+            projected.insert_or_assign(name, std::move(table.value()));
+        }
+        eval_tables = &projected;
+    }
+
     runtime::ModelResult captured_model;
-    auto evaluated = runtime::interpret(*lowered.value(), tables, &scalars, &externs,
+    auto evaluated = runtime::interpret(*lowered.value(), *eval_tables, &scalars, &externs,
                                         model_out != nullptr ? &captured_model : nullptr);
     if (!evaluated) {
         return std::unexpected(evaluated.error());
@@ -3105,8 +3253,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
 }
 
 auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
-                        runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        ModelRegistry& models, const FunctionRegistry& functions,
+                        LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                        ColumnRegistry& columns, ModelRegistry& models,
+                        const FunctionRegistry& functions,
                         CompileTimeListRegistry& compile_time_lists,
                         const ExternDeclRegistry& extern_decls,
                         const runtime::ExternRegistry& externs)
@@ -3123,6 +3272,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
     }
 
     runtime::TableRegistry local_tables = tables;
+    // Lazy bindings are visible inside a function body too; the handles are
+    // shared, so a column the caller already decoded is not decoded again.
+    LazyTableRegistry local_lazy_tables = lazy_tables;
     runtime::ScalarRegistry local_scalars = scalars;
     ColumnRegistry local_columns = columns;
     ModelRegistry local_models = models;
@@ -3133,8 +3285,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         auto& arg = *(*bound_args)[i].expr;
         switch (param.type.kind) {
             case parser::Type::Kind::Scalar: {
-                auto value = eval_scalar_expr(arg, tables, scalars, columns, models, functions,
-                                              compile_time_lists, extern_decls, externs);
+                auto value = eval_scalar_expr(arg, tables, lazy_tables, scalars, columns, models,
+                                              functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -3153,8 +3305,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             }
             case parser::Type::Kind::DataFrame:
             case parser::Type::Kind::TimeFrame: {
-                auto value = eval_table_expr(arg, tables, scalars, columns, models, functions,
-                                             compile_time_lists, extern_decls, externs);
+                auto value = eval_table_expr(arg, tables, lazy_tables, scalars, columns, models,
+                                             functions, compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -3166,8 +3318,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 break;
             }
             case parser::Type::Kind::Series:
-                if (auto value = eval_expr_value(arg, tables, scalars, columns, models, functions,
-                                                 compile_time_lists, extern_decls, externs)) {
+                if (auto value =
+                        eval_expr_value(arg, tables, lazy_tables, scalars, columns, models,
+                                        functions, compile_time_lists, extern_decls, externs)) {
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                         if (auto err = validate_column_type(*col, param.type)) {
                             return std::unexpected(call.callee + ": type mismatch for parameter '" +
@@ -3205,8 +3358,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                                        (let_stmt.type->kind == parser::Type::Kind::DataFrame ||
                                         let_stmt.type->kind == parser::Type::Kind::TimeFrame);
             if (type_is_scalar) {
-                auto value = eval_scalar_expr(*let_stmt.value, local_tables, local_scalars,
-                                              local_columns, local_models, functions,
+                auto value = eval_scalar_expr(*let_stmt.value, local_tables, local_lazy_tables,
+                                              local_scalars, local_columns, local_models, functions,
                                               local_compile_time_lists, extern_decls, externs);
                 if (!value) {
                     return std::unexpected(value.error());
@@ -3225,9 +3378,10 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 local_models.erase(let_stmt.name);
             } else if (type_is_table) {
                 runtime::ModelResult model_value;
-                auto value = eval_table_expr(
-                    *let_stmt.value, local_tables, local_scalars, local_columns, local_models,
-                    functions, local_compile_time_lists, extern_decls, externs, &model_value);
+                auto value =
+                    eval_table_expr(*let_stmt.value, local_tables, local_lazy_tables, local_scalars,
+                                    local_columns, local_models, functions,
+                                    local_compile_time_lists, extern_decls, externs, &model_value);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -3261,8 +3415,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                     }
                     value = EvalValue{std::move(series.value())};
                 } else {
-                    value = eval_expr_value(*let_stmt.value, local_tables, local_scalars,
-                                            local_columns, local_models, functions,
+                    value = eval_expr_value(*let_stmt.value, local_tables, local_lazy_tables,
+                                            local_scalars, local_columns, local_models, functions,
                                             local_compile_time_lists, extern_decls, externs);
                 }
                 if (!value) {
@@ -3289,9 +3443,10 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 local_models.erase(let_stmt.name);
             } else {
                 runtime::ModelResult model_value;
-                auto value = eval_expr_value(
-                    *let_stmt.value, local_tables, local_scalars, local_columns, local_models,
-                    functions, local_compile_time_lists, extern_decls, externs, &model_value);
+                auto value =
+                    eval_expr_value(*let_stmt.value, local_tables, local_lazy_tables, local_scalars,
+                                    local_columns, local_models, functions,
+                                    local_compile_time_lists, extern_decls, externs, &model_value);
                 if (!value) {
                     return std::unexpected(value.error());
                 }
@@ -3330,9 +3485,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         }
         if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
             const auto& tlet = std::get<parser::TupleLetStmt>(stmt);
-            auto value = eval_expr_value(*tlet.value, local_tables, local_scalars, local_columns,
-                                         local_models, functions, local_compile_time_lists,
-                                         extern_decls, externs);
+            auto value = eval_expr_value(*tlet.value, local_tables, local_lazy_tables,
+                                         local_scalars, local_columns, local_models, functions,
+                                         local_compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -3351,9 +3506,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
             continue;
         }
         const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-        auto value = eval_expr_value(*expr_stmt.expr, local_tables, local_scalars, local_columns,
-                                     local_models, functions, local_compile_time_lists,
-                                     extern_decls, externs);
+        auto value = eval_expr_value(*expr_stmt.expr, local_tables, local_lazy_tables,
+                                     local_scalars, local_columns, local_models, functions,
+                                     local_compile_time_lists, extern_decls, externs);
         if (!value) {
             return std::unexpected(value.error());
         }
@@ -3503,9 +3658,56 @@ auto find_library_source(const std::string& name, const std::vector<std::string>
     return std::nullopt;
 }
 
+/// Bind `expr` lazily if it is a bare call to an extern table source that can
+/// decode its columns selectively (`read_parquet`). Reads the source's schema
+/// and nothing else; the columns are decoded later, per query, by whatever
+/// subset that query references.
+///
+/// Returns nullopt when `expr` is not such a call — the caller then evaluates it
+/// eagerly, exactly as before. Only an un-annotated `let` takes this path; a
+/// `let t: DataFrame<{...}> = ...` is checked against the declared schema first,
+/// and validating that is the eager path's job.
+auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
+                          LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                          ColumnRegistry& columns, ModelRegistry& models,
+                          const FunctionRegistry& functions,
+                          CompileTimeListRegistry& compile_time_lists,
+                          const ExternDeclRegistry& extern_decls,
+                          const runtime::ExternRegistry& externs)
+    -> std::optional<std::expected<runtime::LazyTablePtr, std::string>> {
+    auto* call = std::get_if<parser::CallExpr>(&expr.node);
+    if (call == nullptr) {
+        return std::nullopt;
+    }
+    const auto* fn = externs.find(call->callee);
+    if (fn == nullptr || !fn->lazy_table_func) {
+        return std::nullopt;
+    }
+    auto decl = extern_decls.find(call->callee);
+    if (decl == extern_decls.end()) {
+        return std::nullopt;
+    }
+
+    auto bound_args = bind_call_arguments(call->callee, *call, decl->second.params);
+    if (!bound_args) {
+        return std::unexpected(bound_args.error());
+    }
+    runtime::ExternArgs args;
+    args.reserve(bound_args->size());
+    for (const auto& arg : *bound_args) {
+        auto value = eval_scalar_expr(*arg.expr, tables, lazy_tables, scalars, columns, models,
+                                      functions, compile_time_lists, extern_decls, externs);
+        if (!value) {
+            return std::unexpected(value.error());
+        }
+        args.push_back(std::move(value.value()));
+    }
+    return fn->lazy_table_func(args);
+}
+
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,
-                        runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
-                        ModelRegistry& models, FunctionRegistry& functions,
+                        LazyTableRegistry& lazy_tables, runtime::ScalarRegistry& scalars,
+                        ColumnRegistry& columns, ModelRegistry& models, FunctionRegistry& functions,
                         CompileTimeListRegistry& compile_time_lists,
                         ExternDeclRegistry& extern_decls, runtime::ExternRegistry& externs,
                         const std::vector<std::string>& plugin_search_paths,
@@ -3610,11 +3812,11 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 build_statement_comment_groups(parsed->statements, import_comments);
             // Recursively execute the imported file's statements (which will typically
             // only contain extern fn and fn declarations).
-            if (!execute_statements(parsed->statements, tables, scalars, columns, models, functions,
-                                    compile_time_lists, extern_decls, externs, plugin_search_paths,
-                                    loaded_plugins, import_search_paths, nullptr,
-                                    &import_doc_groups, function_sources, declaration_docs, imports,
-                                    *source)) {
+            if (!execute_statements(parsed->statements, tables, lazy_tables, scalars, columns,
+                                    models, functions, compile_time_lists, extern_decls, externs,
+                                    plugin_search_paths, loaded_plugins, import_search_paths,
+                                    nullptr, &import_doc_groups, function_sources, declaration_docs,
+                                    imports, *source)) {
                 return false;
             }
             continue;
@@ -3625,15 +3827,34 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::LetStmt>(stmt)) {
             const auto& let_stmt = std::get<parser::LetStmt>(stmt);
+            if (!let_stmt.type.has_value()) {
+                if (auto lazy = try_bind_lazy_source(*let_stmt.value, tables, lazy_tables, scalars,
+                                                     columns, models, functions, compile_time_lists,
+                                                     extern_decls, externs)) {
+                    if (!*lazy) {
+                        fmt::print("error: {}\n", lazy->error());
+                        return false;
+                    }
+                    lazy_tables.insert_or_assign(let_stmt.name, std::move(lazy->value()));
+                    // A name lives in exactly one registry, so drop any binding
+                    // this one shadows.
+                    tables.erase(let_stmt.name);
+                    scalars.erase(let_stmt.name);
+                    columns.erase(let_stmt.name);
+                    models.erase(let_stmt.name);
+                    compile_time_lists.erase(let_stmt.name);
+                    continue;
+                }
+            }
             if (let_stmt.type.has_value()) {
                 const bool expect_scalar = let_stmt.type->kind == parser::Type::Kind::Scalar;
                 const bool expect_table = let_stmt.type->kind == parser::Type::Kind::DataFrame ||
                                           let_stmt.type->kind == parser::Type::Kind::TimeFrame;
                 const bool expect_column = let_stmt.type->kind == parser::Type::Kind::Series;
                 if (expect_scalar) {
-                    auto value =
-                        eval_scalar_expr(*let_stmt.value, tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs);
+                    auto value = eval_scalar_expr(*let_stmt.value, tables, lazy_tables, scalars,
+                                                  columns, models, functions, compile_time_lists,
+                                                  extern_decls, externs);
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
                         return false;
@@ -3647,6 +3868,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                    scalar_type_name(*st), scalar_value_type_name(value.value()));
                         return false;
                     }
+                    lazy_tables.erase(let_stmt.name);
                     scalars.insert_or_assign(let_stmt.name, std::move(value.value()));
                     compile_time_lists.erase(let_stmt.name);
                     models.erase(let_stmt.name);
@@ -3654,9 +3876,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 }
                 if (expect_table) {
                     runtime::ModelResult model_value;
-                    auto value = eval_table_expr(*let_stmt.value, tables, scalars, columns, models,
-                                                 functions, compile_time_lists, extern_decls,
-                                                 externs, &model_value);
+                    auto value = eval_table_expr(*let_stmt.value, tables, lazy_tables, scalars,
+                                                 columns, models, functions, compile_time_lists,
+                                                 extern_decls, externs, &model_value);
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
                         return false;
@@ -3667,6 +3889,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     }
                     auto table_value = std::move(value.value());
                     auto compile_time_list = extract_compile_time_string_list(table_value);
+                    lazy_tables.erase(let_stmt.name);
                     tables.insert_or_assign(let_stmt.name, std::move(table_value));
                     if (compile_time_list.has_value()) {
                         compile_time_lists.insert_or_assign(let_stmt.name,
@@ -3694,9 +3917,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         }
                         value = EvalValue{std::move(series.value())};
                     } else {
-                        value =
-                            eval_expr_value(*let_stmt.value, tables, scalars, columns, models,
-                                            functions, compile_time_lists, extern_decls, externs);
+                        value = eval_expr_value(*let_stmt.value, tables, lazy_tables, scalars,
+                                                columns, models, functions, compile_time_lists,
+                                                extern_decls, externs);
                     }
                     if (!value) {
                         fmt::print("error: {}\n", value.error());
@@ -3707,6 +3930,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             fmt::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }
+                        lazy_tables.erase(let_stmt.name);
                         columns.insert_or_assign(let_stmt.name, std::move(*col));
                         compile_time_lists.erase(let_stmt.name);
                         models.erase(let_stmt.name);
@@ -3722,6 +3946,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                             fmt::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }
+                        lazy_tables.erase(let_stmt.name);
                         columns.insert_or_assign(let_stmt.name, *table->columns.front().column);
                         compile_time_lists.erase(let_stmt.name);
                         models.erase(let_stmt.name);
@@ -3734,17 +3959,19 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
 
             runtime::ModelResult model_value;
             auto value =
-                eval_expr_value(*let_stmt.value, tables, scalars, columns, models, functions,
-                                compile_time_lists, extern_decls, externs, &model_value);
+                eval_expr_value(*let_stmt.value, tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs, &model_value);
             if (!value) {
                 fmt::print("error: {}\n", value.error());
                 return false;
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
+                lazy_tables.erase(let_stmt.name);
                 scalars.insert_or_assign(let_stmt.name, std::move(*scalar));
                 compile_time_lists.erase(let_stmt.name);
                 models.erase(let_stmt.name);
             } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
+                lazy_tables.erase(let_stmt.name);
                 columns.insert_or_assign(let_stmt.name, std::move(*col));
                 if (auto string_list = extract_compile_time_string_list(*let_stmt.value);
                     string_list.has_value()) {
@@ -3773,8 +4000,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
             const auto& tlet = std::get<parser::TupleLetStmt>(stmt);
-            auto value = eval_expr_value(*tlet.value, tables, scalars, columns, models, functions,
-                                         compile_time_lists, extern_decls, externs);
+            auto value = eval_expr_value(*tlet.value, tables, lazy_tables, scalars, columns, models,
+                                         functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 fmt::print("error: {}\n", value.error());
                 return false;
@@ -3797,8 +4024,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         }
         if (std::holds_alternative<parser::ExprStmt>(stmt)) {
             const auto& expr_stmt = std::get<parser::ExprStmt>(stmt);
-            auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs);
+            auto value =
+                eval_expr_value(*expr_stmt.expr, tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 fmt::print("error: {}\n", value.error());
                 return false;
@@ -3834,6 +4062,7 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
         return false;
     }
     auto tables = build_builtin_tables();
+    LazyTableRegistry lazy_tables;
     runtime::ScalarRegistry scalars;
     ColumnRegistry columns;
     ModelRegistry models;
@@ -3846,8 +4075,8 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
     auto comments = collect_script_comment_lines(source);
     auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
     robin_hood::unordered_set<std::string> loaded_plugins;
-    return execute_statements(parsed->statements, tables, scalars, columns, models, functions,
-                              compile_time_lists, extern_decls, registry,
+    return execute_statements(parsed->statements, tables, lazy_tables, scalars, columns, models,
+                              functions, compile_time_lists, extern_decls, registry,
                               config.plugin_search_paths, loaded_plugins,
                               config.import_search_paths, nullptr, &doc_comment_groups,
                               &function_sources, &declaration_docs, &imports, source);
@@ -3931,6 +4160,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     }
 
     auto tables = build_builtin_tables();
+    LazyTableRegistry lazy_tables;
     runtime::ScalarRegistry scalars;
     ColumnRegistry columns;
     ModelRegistry models;
@@ -3961,10 +4191,11 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             fmt::print("error: {}\n", parsed.error().format());
             return;
         }
-        execute_statements(parsed->statements, tables, scalars, columns, models, functions,
-                           compile_time_lists, extern_decls, registry, config.plugin_search_paths,
-                           loaded_plugins, config.import_search_paths, nullptr, nullptr,
-                           &function_sources, &declaration_docs, &imports, normalized);
+        execute_statements(parsed->statements, tables, lazy_tables, scalars, columns, models,
+                           functions, compile_time_lists, extern_decls, registry,
+                           config.plugin_search_paths, loaded_plugins, config.import_search_paths,
+                           nullptr, nullptr, &function_sources, &declaration_docs, &imports,
+                           normalized);
     };
 
     // Accumulates a statement whose delimiters span multiple input lines. Empty
@@ -4026,14 +4257,14 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             if (arg.empty()) {
                 print_help();
             } else {
-                print_doc(arg, tables, scalars, columns, models, functions, extern_decls,
-                          declaration_docs, imports);
+                print_doc(arg, tables, lazy_tables, scalars, columns, models, functions,
+                          extern_decls, declaration_docs, imports);
             }
             continue;
         }
         if (line_view.size() > 1 && line_view.front() == '?') {
             auto arg = trim(line_view.substr(1));
-            print_doc(arg, tables, scalars, columns, models, functions, extern_decls,
+            print_doc(arg, tables, lazy_tables, scalars, columns, models, functions, extern_decls,
                       declaration_docs, imports);
             continue;
         }
@@ -4057,7 +4288,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         }
         if (starts_with_command(line_view, ":doc")) {
             auto arg = trim(line_view.substr(std::string_view(":doc").size()));
-            print_doc(arg, tables, scalars, columns, models, functions, extern_decls,
+            print_doc(arg, tables, lazy_tables, scalars, columns, models, functions, extern_decls,
                       declaration_docs, imports);
             continue;
         }
@@ -4130,7 +4361,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 fmt::print("usage: :tables\n");
                 continue;
             }
-            print_tables(tables);
+            print_tables(tables, lazy_tables);
             continue;
         }
         if (starts_with_command(line_view, ":scalars")) {
@@ -4146,6 +4377,11 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             auto arg = trim(line_view.substr(std::string_view(":schema").size()));
             if (arg.empty()) {
                 fmt::print("usage: :schema <table>\n");
+                continue;
+            }
+            if (auto lazy = lazy_tables.find(std::string(arg)); lazy != lazy_tables.end()) {
+                // Known from the source's metadata — no column is decoded to answer this.
+                print_schema(lazy->second->schema());
                 continue;
             }
             auto it = tables.find(std::string(arg));
@@ -4169,13 +4405,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 fmt::print("usage: :head <table> [n]\n");
                 continue;
             }
-            auto it = tables.find(std::string(name));
-            if (it == tables.end()) {
-                fmt::print("error: unknown table '{}'\n", name);
+            auto table = resolve_table(std::string(name), tables, lazy_tables);
+            if (!table) {
+                fmt::print("error: {}\n", table.error());
                 continue;
             }
             const std::size_t count = parse_optional_size(count_text, 10);
-            print_table(it->second, count);
+            print_table(table.value(), count);
             continue;
         }
         // Accept the obvious typo `:peak` as an alias for `:peek`.
@@ -4189,8 +4425,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 fmt::print("usage: :peek <expr>\n");
                 continue;
             }
-            if (auto it = tables.find(rest); it != tables.end()) {
-                peek_table(it->second);
+            if (tables.contains(rest) || lazy_tables.contains(rest)) {
+                auto table = resolve_table(rest, tables, lazy_tables);
+                if (!table) {
+                    fmt::print("error: {}\n", table.error());
+                    continue;
+                }
+                peek_table(table.value());
                 continue;
             }
             auto normalized = normalize_input(rest);
@@ -4205,8 +4446,9 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 continue;
             }
             auto& expr_stmt = std::get<parser::ExprStmt>(parsed->statements.front());
-            auto value = eval_expr_value(*expr_stmt.expr, tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, registry);
+            auto value =
+                eval_expr_value(*expr_stmt.expr, tables, lazy_tables, scalars, columns, models,
+                                functions, compile_time_lists, extern_decls, registry);
             if (!value) {
                 fmt::print("error: {}\n", value.error());
                 continue;
@@ -4235,13 +4477,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 fmt::print("usage: :describe <table> [n]\n");
                 continue;
             }
-            auto it = tables.find(std::string(name));
-            if (it == tables.end()) {
-                fmt::print("error: unknown table '{}'\n", name);
+            auto table = resolve_table(std::string(name), tables, lazy_tables);
+            if (!table) {
+                fmt::print("error: {}\n", table.error());
                 continue;
             }
             const std::size_t count = parse_optional_size(count_text, 10);
-            describe_table(it->second, count);
+            describe_table(table.value(), count);
             continue;
         }
         if (line_view.starts_with(":load")) {
@@ -4280,7 +4522,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 print_comment_groups_ptr = &print_comment_groups;
             }
             if (!execute_statements(
-                    parsed->statements, tables, scalars, columns, models, functions,
+                    parsed->statements, tables, lazy_tables, scalars, columns, models, functions,
                     compile_time_lists, extern_decls, registry, config.plugin_search_paths,
                     loaded_plugins, config.import_search_paths, print_comment_groups_ptr,
                     &doc_comment_groups, &function_sources, &declaration_docs, &imports, source)) {

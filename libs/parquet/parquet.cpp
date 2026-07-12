@@ -29,6 +29,24 @@ extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
                                  }
                              });
 
+    registry->register_lazy_table(
+        "read_parquet",
+        [](const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("read_parquet() expects 1 argument");
+            }
+            const auto* path = std::get_if<std::string>(&args[0]);
+            if (path == nullptr) {
+                return std::unexpected("read_parquet() expects a string path");
+            }
+            try {
+                return read_parquet_lazy(*path);
+            } catch (const std::exception& e) {
+                return std::unexpected(std::string(e.what()));
+            }
+        });
+
     registry->register_chunked_table(
         "read_parquet",
         [](const ibex::runtime::ExternArgs& args)

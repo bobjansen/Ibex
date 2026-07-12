@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 
 #include <cstddef>
 #include <expected>
@@ -153,6 +154,10 @@ class MaterializeOperator {
         const std::size_t n_cols = result.columns.size();
 
         while (true) {
+            // Per-chunk interruption boundary for streamed pipelines.
+            if (interrupt_requested()) {
+                return std::unexpected(interrupt_message());
+            }
             auto chunk_res = child_->next();
             if (!chunk_res.has_value()) {
                 return std::unexpected(std::move(chunk_res.error()));

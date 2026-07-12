@@ -308,12 +308,22 @@ fi
 #   IBEX_TASKSET     — optional core pinning (e.g. "2-3")
 #   IBEX_DATA_ROWS   — fact-table row count for gen_data.py (default 4000000)
 #   IBEX_RESULT_KEY  — S3 key the report text is uploaded to
+#   IBEX_ARTIFACT_KEY — optional S3 key for exact binaries + build metadata
 if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
     REPORT=/ibex/benchmarking/results/compare_report.txt
+    ARTIFACT=/ibex/benchmarking/results/compare_artifacts.tar.gz
     mkdir -p /ibex/benchmarking/results
 
     finish_compare() {
         local code=$?
+        if [[ -n "${IBEX_ARTIFACT_KEY:-}" ]]; then
+            if [[ -f "$ARTIFACT" ]] && aws s3 cp "$ARTIFACT" \
+                "s3://${IBEX_S3_BUCKET}/${IBEX_ARTIFACT_KEY}" --region "${IBEX_REGION}"; then
+                echo "Artifacts uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_ARTIFACT_KEY}"
+            else
+                echo "WARNING: no artifact archive uploaded (exit ${code})"
+            fi
+        fi
         if [[ -f "$REPORT" ]] && aws s3 cp "$REPORT" \
             "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}"; then
             echo "Report uploaded to s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY} (exit ${code})"
@@ -344,11 +354,53 @@ if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
     [[ "${IBEX_INTERLEAVE:-1}" == "1" ]] && COMPARE_ARGS+=(--interleave)
     [[ "${IBEX_REPLICA_CONTROL:-0}" == "1" ]] && COMPARE_ARGS+=(--replica-control)
     [[ -n "${IBEX_TASKSET:-}" ]] && COMPARE_ARGS+=(--taskset "${IBEX_TASKSET}")
+    if [[ -n "${IBEX_ARTIFACT_KEY:-}" ]]; then
+        mkdir -p /ibex/perfcmp
+        export IBEX_PERFCMP_TMPDIR=/ibex/perfcmp
+        COMPARE_ARGS+=(--keep-temp)
+    fi
 
     # tee: live progress on the serial console AND a captured report to upload.
     env "${COMPARE_ENV[@]}" \
         bash /ibex/benchmarking/compare_ibex_git.sh "${COMPARE_ARGS[@]}" 2>&1 \
         | tee "$REPORT"
+
+    if [[ -n "${IBEX_ARTIFACT_KEY:-}" ]]; then
+        shopt -s nullglob
+        artifact_roots=(/ibex/perfcmp/ibex-perfcmp.*)
+        if [[ "${#artifact_roots[@]}" -ne 1 ]]; then
+            echo "ERROR: expected one retained comparison directory, found ${#artifact_roots[@]}" >&2
+            exit 1
+        fi
+        artifact_root="${artifact_roots[0]}"
+        artifact_files=(
+            build-base/tools/ibex_bench
+            build-target/tools/ibex_bench
+        )
+        if [[ -f "$artifact_root/build-ctrl/tools/ibex_bench" ]]; then
+            artifact_files+=(build-ctrl/tools/ibex_bench)
+        fi
+
+        {
+            echo "base=${IBEX_BASE}"
+            echo "target=${IBEX_TARGET}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            uname -a
+            lscpu
+            "${IBEX_CXX}" --version
+            cmake --version
+            sha256sum "${artifact_files[@]/#/$artifact_root/}"
+            file "${artifact_files[@]/#/$artifact_root/}"
+            for binary in "${artifact_files[@]/#/$artifact_root/}"; do
+                echo
+                echo "ldd $binary"
+                ldd "$binary"
+            done
+        } > "$artifact_root/artifact-manifest.txt" 2>&1
+
+        tar -C "$artifact_root" -czf "$ARTIFACT" \
+            artifact-manifest.txt "${artifact_files[@]}"
+    fi
 
     exit 0  # finish_compare (EXIT trap) uploads the report and terminates
 fi

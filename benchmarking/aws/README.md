@@ -104,6 +104,7 @@ git push                                            # both commits must be on or
 ./benchmarking/aws/compare-git.sh --base v0.3.0 --target HEAD
 ./benchmarking/aws/compare-git.sh --suite sort,groupagg,join --repeats 7
 ./benchmarking/aws/compare-git.sh --base v0.3.0 --target HEAD --replica-control
+./benchmarking/aws/compare-git.sh --base v0.3.0 --target HEAD --suite fill --artifacts
 ```
 
 The instance regenerates the (untracked) 4M-row benchmark CSVs so both commits
@@ -111,6 +112,11 @@ read identical inputs, runs the comparison, uploads the report, and self-
 terminates. The report (per-query base/target/delta + verdict, plus a summary
 with geometric-mean speedup) is printed locally and saved to
 `benchmarking/results/compare_aws_<timestamp>.txt`.
+
+Pass `--artifacts` to also download the exact unstripped `ibex_bench` binaries
+built on the instance, along with hashes, CPU/toolchain details, and dynamic
+library metadata. The archive is written beside the report as
+`benchmarking/results/compare_aws_<timestamp>_artifacts.tar.gz`.
 
 Run at scale to check the wins hold as the working set leaves cache:
 

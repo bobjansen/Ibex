@@ -23,6 +23,7 @@
 #   --data-rows N         fact-table rows for gen_data.py   (default: 4000000)
 #   --serial              disable interleaving (all base repeats, then target)
 #   --replica-control     build BASE twice and balance all three run positions
+#   --artifacts           download exact benchmark binaries + build metadata
 #   --taskset CPUSET      pin the benchmark cores           (default: 2-3)
 #   --type   INSTANCE     EC2 instance type   (default: c7i.2xlarge)
 #   --key    KEY_PAIR     EC2 key pair for SSH debugging (optional)
@@ -66,6 +67,7 @@ WARMUP=1
 DATA_ROWS=4000000
 INTERLEAVE=1
 REPLICA_CONTROL=0
+ARTIFACTS=0
 TASKSET_CPUS="2-3"
 KEY_NAME=""
 ON_DEMAND=-1   # -1 = auto (spot for small, on-demand for scale); 0/1 = forced
@@ -81,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --data-rows) DATA_ROWS="$2";     shift 2 ;;
         --serial)    INTERLEAVE=0;       shift ;;
         --replica-control) REPLICA_CONTROL=1; shift ;;
+        --artifacts) ARTIFACTS=1; shift ;;
         --taskset)   TASKSET_CPUS="$2";  shift 2 ;;
         --type)      INSTANCE_TYPE="$2"; shift 2 ;;
         --key)       KEY_NAME="$2";      shift 2 ;;
@@ -146,6 +149,10 @@ bench_require_pushed "$IBEX_ROOT" "$TARGET_COMMIT" "$BRANCH" "$REPO_URL" || exit
 
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%S)
 RESULT_KEY="benchmarks/compare_${TIMESTAMP}_${BASE_COMMIT:0:8}_${TARGET_COMMIT:0:8}/report.txt"
+ARTIFACT_KEY=""
+if [[ "$ARTIFACTS" -eq 1 ]]; then
+    ARTIFACT_KEY="${RESULT_KEY%/report.txt}/artifacts.tar.gz"
+fi
 
 # ── AMI + security group ──────────────────────────────────────────────────────
 AMI=$(bench_resolve_ami "$REGION")
@@ -158,6 +165,7 @@ echo "Repeats: $REPEATS (interleave $([[ "$INTERLEAVE" -eq 1 ]] && echo on || ec
 echo "AMI    : $AMI"
 echo "Type   : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || echo spot))"
 echo "Bucket : s3://$S3_BUCKET"
+[[ -n "$ARTIFACT_KEY" ]] && echo "Archive: s3://$S3_BUCKET/$ARTIFACT_KEY"
 echo ""
 
 # ── User-data: clone/update repo (checked out at target) → bootstrap.sh ───────
@@ -165,6 +173,7 @@ USER_DATA=$(bench_user_data "$REPO_URL" "$TARGET_COMMIT" \
     "IBEX_COMPARE_MODE=1" \
     "IBEX_S3_BUCKET=${S3_BUCKET}" \
     "IBEX_RESULT_KEY=${RESULT_KEY}" \
+    "IBEX_ARTIFACT_KEY=${ARTIFACT_KEY}" \
     "IBEX_REGION=${REGION}" \
     "IBEX_BASE=${BASE_COMMIT}" \
     "IBEX_TARGET=${TARGET_COMMIT}" \
@@ -257,6 +266,12 @@ done
 # ── Download + print the report ───────────────────────────────────────────────
 OUTPUT="$IBEX_ROOT/benchmarking/results/compare_aws_${TIMESTAMP}.txt"
 aws s3 cp "s3://${S3_BUCKET}/${RESULT_KEY}" "$OUTPUT" --region "$REGION"
+
+if [[ -n "$ARTIFACT_KEY" ]]; then
+    ARTIFACT_OUTPUT="${OUTPUT%.txt}_artifacts.tar.gz"
+    aws s3 cp "s3://${S3_BUCKET}/${ARTIFACT_KEY}" "$ARTIFACT_OUTPUT" --region "$REGION"
+    echo "Artifacts: ${ARTIFACT_OUTPUT#$IBEX_ROOT/}"
+fi
 
 ELAPSED=$(( ($(date +%s) - START) / 60 ))
 echo "Done in ${ELAPSED}m. Report: benchmarking/results/compare_aws_${TIMESTAMP}.txt"

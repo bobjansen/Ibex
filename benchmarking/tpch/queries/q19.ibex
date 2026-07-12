@@ -18,7 +18,14 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+// Both sides are narrowed to the columns the query uses before the join, as in
+// q03/q05. Projection pushdown only reaches a source through the statement that
+// scans it: `lineitem join part` on its own would demand every column of both,
+// since nothing in that statement says which ones the filter below will read.
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let lineitem = lineitem_raw[
+    select { l_partkey, l_quantity, l_extendedprice, l_discount, l_shipinstruct, l_shipmode }
+];
 let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
 let part = part_raw[select { l_partkey = p_partkey, p_brand, p_size, p_container }];
 

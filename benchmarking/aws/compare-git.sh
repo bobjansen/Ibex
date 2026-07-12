@@ -24,7 +24,7 @@
 #   --serial              disable interleaving (all base repeats, then target)
 #   --replica-control     build BASE twice and balance all three run positions
 #   --artifacts           download exact benchmark binaries + build metadata
-#   --taskset CPUSET      pin the benchmark cores           (default: 2-3)
+#   --taskset CPUSET      pin the benchmark cores             (default: 2)
 #   --type   INSTANCE     EC2 instance type   (default: c7i.2xlarge)
 #   --key    KEY_PAIR     EC2 key pair for SSH debugging (optional)
 #   --region REGION       override region
@@ -68,7 +68,7 @@ DATA_ROWS=4000000
 INTERLEAVE=1
 REPLICA_CONTROL=0
 ARTIFACTS=0
-TASKSET_CPUS="2-3"
+TASKSET_CPUS="2"
 KEY_NAME=""
 ON_DEMAND=-1   # -1 = auto (spot for small, on-demand for scale); 0/1 = forced
 

@@ -1702,7 +1702,7 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
 // fill_null(col, value): replace every null cell with the scalar `value`.
 // Accepts any column type; `value` must be a literal matching the column type.
 // Returns a column with no validity bitmap.
-auto eval_fill_null(const ir::CallExpr& call, const Table& input)
+[[gnu::aligned(64)]] auto eval_fill_null(const ir::CallExpr& call, const Table& input)
     -> std::expected<FillResult, std::string> {
     if (call.args.size() != 2) {
         return std::unexpected("fill_null: expected 2 arguments (col, value)");

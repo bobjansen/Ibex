@@ -22,6 +22,7 @@
 #   --warmup  N           warmup iterations                 (default: 1)
 #   --data-rows N         fact-table rows for gen_data.py   (default: 4000000)
 #   --serial              disable interleaving (all base repeats, then target)
+#   --replica-control     build BASE twice and balance all three run positions
 #   --taskset CPUSET      pin the benchmark cores           (default: 2-3)
 #   --type   INSTANCE     EC2 instance type   (default: c7i.2xlarge)
 #   --key    KEY_PAIR     EC2 key pair for SSH debugging (optional)
@@ -32,7 +33,8 @@
 # Environment: S3_BUCKET / AWS_REGION / IBEX_AMI are loaded from .config.
 #
 # Cost: a single suite comparison on c7i.2xlarge (~$0.36/hr on-demand) builds
-# two ibex trees + a handful of repeats — typically 15-30 min, well under $0.20.
+# two ibex trees (three with replica control) + a handful of repeats — typically
+# 15-30 min without the replica, well under $0.20.
 
 set -euo pipefail
 
@@ -57,12 +59,13 @@ SUITE=""
 # box barely drifts (IQRs are typically <1%), so 3 interleaved repeats × 5 iters
 # = 15 samples/side already pins the verdict. The heavier local defaults exist
 # to fight WSL2 noise, which isn't present here — and each extra pass is costly
-# at scale (the suite runs (1+iters)×repeats×2 times).
+# at scale (the suite runs (1+iters)×repeats×2 times, or ×3 with a replica).
 REPEATS=3
 ITERS=5
 WARMUP=1
 DATA_ROWS=4000000
 INTERLEAVE=1
+REPLICA_CONTROL=0
 TASKSET_CPUS="2-3"
 KEY_NAME=""
 ON_DEMAND=-1   # -1 = auto (spot for small, on-demand for scale); 0/1 = forced
@@ -77,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --warmup)    WARMUP="$2";        shift 2 ;;
         --data-rows) DATA_ROWS="$2";     shift 2 ;;
         --serial)    INTERLEAVE=0;       shift ;;
+        --replica-control) REPLICA_CONTROL=1; shift ;;
         --taskset)   TASKSET_CPUS="$2";  shift 2 ;;
         --type)      INSTANCE_TYPE="$2"; shift 2 ;;
         --key)       KEY_NAME="$2";      shift 2 ;;
@@ -86,6 +90,10 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
+    INTERLEAVE=1
+fi
 
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET not set — run aws/setup.sh first}"
 
@@ -146,7 +154,7 @@ SG_ID=$(bench_security_group "$REGION")
 echo "Base   : ${BASE_COMMIT:0:8} ($BASE_REF)"
 echo "Target : ${TARGET_COMMIT:0:8} ($TARGET_REF)"
 echo "Suite  : ${SUITE:-all}"
-echo "Repeats: $REPEATS (interleave $([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off)), iters $ITERS, warmup $WARMUP"
+echo "Repeats: $REPEATS (interleave $([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off), replica-control $([[ "$REPLICA_CONTROL" -eq 1 ]] && echo on || echo off)), iters $ITERS, warmup $WARMUP"
 echo "AMI    : $AMI"
 echo "Type   : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || echo spot))"
 echo "Bucket : s3://$S3_BUCKET"
@@ -166,6 +174,7 @@ USER_DATA=$(bench_user_data "$REPO_URL" "$TARGET_COMMIT" \
     "IBEX_WARMUP=${WARMUP}" \
     "IBEX_DATA_ROWS=${DATA_ROWS}" \
     "IBEX_INTERLEAVE=${INTERLEAVE}" \
+    "IBEX_REPLICA_CONTROL=${REPLICA_CONTROL}" \
     "IBEX_TASKSET=${TASKSET_CPUS}")
 
 # ── Launch instance ───────────────────────────────────────────────────────────

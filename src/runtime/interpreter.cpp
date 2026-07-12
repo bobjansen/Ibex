@@ -3,6 +3,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
@@ -259,6 +260,11 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     ModelResult* model_out) -> std::expected<Table, std::string> {
+    // Cooperative interruption boundary: a Ctrl+C during a long-running plan
+    // unwinds here between operators rather than killing the process.
+    if (interrupt_requested()) {
+        return std::unexpected(interrupt_message());
+    }
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
             const auto& scan = static_cast<const ir::ScanNode&>(node);

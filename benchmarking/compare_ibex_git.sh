@@ -34,6 +34,16 @@ Options:
                             all base repeats then all target repeats. Cancels
                             slow machine drift (thermal, background load) that
                             otherwise biases whichever side runs second.
+  --layout-control          Also build the BASE source a second time at a
+                            different path and run it as a third side. Two
+                            builds of identical source differ only in code/data
+                            layout (embedded paths shift section contents), so
+                            the base-vs-control spread is this box's layout
+                            noise floor. Per-query deltas that beat the IQR
+                            rule but not the floor get verdict "layout-noise"
+                            instead of regression/improvement. Requires
+                            --base <ref> (not WORKTREE). Costs one extra build
+                            and one extra run per repeat.
   --taskset <cpuset>        Pin benchmark runs with taskset -c
   --numa-node <N>           Pin benchmark runs with numactl node/memory bind
   --ibex-suite <name,...>   Pass suite selection to bench_ibex.sh/ibex_bench
@@ -62,6 +72,7 @@ WARMUP=1
 ITERS=7
 REPEATS=3
 INTERLEAVE=0
+LAYOUT_CONTROL=0
 KEEP_TEMP=0
 TASKSET_CPUSET=""
 NUMA_NODE=""
@@ -84,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --iters) ITERS="$2"; shift 2 ;;
         --repeats) REPEATS="$2"; shift 2 ;;
         --interleave) INTERLEAVE=1; shift ;;
+        --layout-control) LAYOUT_CONTROL=1; shift ;;
         --taskset) TASKSET_CPUSET="$2"; shift 2 ;;
         --numa-node) NUMA_NODE="$2"; shift 2 ;;
         --ibex-suite) IBEX_SUITE="$2"; shift 2 ;;
@@ -156,9 +168,16 @@ fi
 # IBEX_PERFCMP_TMPDIR relocates the (large) temp build trees off the default
 # /tmp — useful when /tmp is a small tmpfs (e.g. WSL2) or to land builds on a
 # roomier disk. Defaults to /tmp to preserve prior behaviour.
+if [[ "$LAYOUT_CONTROL" -eq 1 && "$BASE_STATE" == "WORKTREE" ]]; then
+    echo "error: --layout-control requires --base <ref>; it rebuilds the base source" >&2
+    echo "       at a second worktree path, which WORKTREE (uncommitted state) cannot do" >&2
+    exit 1
+fi
+
 TMP_ROOT="$(mktemp -d "${IBEX_PERFCMP_TMPDIR:-/tmp}/ibex-perfcmp.XXXXXX")"
 BASE_WT=""
 TARGET_WT=""
+CTRL_WT=""
 PIN_DESC="<none>"
 declare -a PIN_PREFIX=()
 if [[ -n "$NUMA_NODE" ]]; then
@@ -180,6 +199,9 @@ cleanup() {
     fi
     if [[ -n "$TARGET_WT" ]]; then
         git -C "$REPO_ROOT" worktree remove --force "$TARGET_WT" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$CTRL_WT" ]]; then
+        git -C "$REPO_ROOT" worktree remove --force "$CTRL_WT" >/dev/null 2>&1 || true
     fi
     if [[ "$KEEP_TEMP" -eq 0 ]]; then
         rm -rf "$TMP_ROOT"
@@ -345,18 +367,32 @@ TARGET_DIR="$(resolve_state_dir "$TARGET_STATE" "target")"
 BASE_LABEL="$(state_label "$BASE_STATE" "$BASE_DIR")"
 TARGET_LABEL="$(state_label "$TARGET_STATE" "$TARGET_DIR")"
 
+CTRL_DIR=""
+if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
+    # Same commit as base, second worktree: identical source, different path.
+    # Embedded path strings shift section contents, so the two binaries differ
+    # only in layout — their delta is the layout noise floor.
+    CTRL_WT="$TMP_ROOT/wt-layoutctl"
+    git -C "$REPO_ROOT" worktree add --detach "$CTRL_WT" "$BASE_STATE" >/dev/null
+    CTRL_DIR="$CTRL_WT"
+fi
+
 BASE_TSV="$TMP_ROOT/base.tsv"
 TARGET_TSV="$TMP_ROOT/target.tsv"
+CTRL_TSV="$TMP_ROOT/ctrl.tsv"
+FLOOR_TSV="$TMP_ROOT/floor.tsv"
 REPORT_TSV="$TMP_ROOT/report.tsv"
 SUMMARY_TSV="$TMP_ROOT/summary.tsv"
 BASE_BUILD_DIR="$TMP_ROOT/build-base"
 TARGET_BUILD_DIR="$TMP_ROOT/build-target"
+CTRL_BUILD_DIR="$TMP_ROOT/build-ctrl"
 BASE_LOG="$TMP_ROOT/log-base.txt"
 TARGET_LOG="$TMP_ROOT/log-target.txt"
+CTRL_LOG="$TMP_ROOT/log-ctrl.txt"
 
 echo "Benchmarking base:   $BASE_LABEL" >&2
 echo "Benchmarking target: $TARGET_LABEL" >&2
-echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS, interleave=$([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off)" >&2
+echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS, interleave=$([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off), layout-control=$([[ "$LAYOUT_CONTROL" -eq 1 ]] && echo on || echo off)" >&2
 echo "Pinning: $PIN_DESC" >&2
 echo "Ibex suite: ${IBEX_SUITE:-all}" >&2
 if [[ -n "$MERGE_VALIDITY_ROWS" ]]; then
@@ -369,18 +405,25 @@ if [[ -n "$FILTER_MICRO_ROWS" ]]; then
     echo "filter_micro rows: $FILTER_MICRO_ROWS" >&2
 fi
 
-# Build both sides up front so --interleave can alternate their timed repeats
+# Build all sides up front so --interleave can alternate their timed repeats
 # with no build in between.
 echo "Building base ..." >&2
 configure_and_build "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_LOG"
 echo "Building target ..." >&2
 configure_and_build "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_LOG"
+if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
+    echo "Building layout control (base source, second path) ..." >&2
+    configure_and_build "$CTRL_DIR" "$CTRL_BUILD_DIR" "$CTRL_LOG"
+fi
 
 if [[ "$INTERLEAVE" -eq 1 ]]; then
-    echo "Interleaving base/target repeats" >&2
+    echo "Interleaving repeats" >&2
     for ((r = 1; r <= REPEATS; ++r)); do
         run_side_repeat "base"   "$BASE_DIR"   "$BASE_BUILD_DIR"   "$r" "$BASE_LOG"
         run_side_repeat "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$r" "$TARGET_LOG"
+        if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
+            run_side_repeat "ctrl" "$CTRL_DIR" "$CTRL_BUILD_DIR" "$r" "$CTRL_LOG"
+        fi
     done
 else
     for ((r = 1; r <= REPEATS; ++r)); do
@@ -389,18 +432,53 @@ else
     for ((r = 1; r <= REPEATS; ++r)); do
         run_side_repeat "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$r" "$TARGET_LOG"
     done
+    if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
+        for ((r = 1; r <= REPEATS; ++r)); do
+            run_side_repeat "ctrl" "$CTRL_DIR" "$CTRL_BUILD_DIR" "$r" "$CTRL_LOG"
+        done
+    fi
 fi
 
 aggregate_side "base" "$BASE_TSV"
 aggregate_side "target" "$TARGET_TSV"
 
+# Per-query layout floor: |ctrl - base| medians. Identical source, so any
+# delta here is layout (plus residual run noise) — a target delta must beat
+# it before layout can be ruled out as the cause.
+if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
+    aggregate_side "ctrl" "$CTRL_TSV"
+    awk -F'\t' -v base_file="$BASE_TSV" '
+        BEGIN { OFS = "\t"; print "framework", "query", "floor_ms" }
+        FNR == 1 { next }
+        FILENAME == base_file { base[$1 "\t" $2] = $3 + 0.0; next }
+        {
+            k = $1 "\t" $2
+            if (k in base) {
+                d = $3 - base[k]
+                if (d < 0) d = -d
+                split(k, p, "\t")
+                printf "%s\t%s\t%.4f\n", p[1], p[2], d
+            }
+        }
+    ' "$BASE_TSV" "$CTRL_TSV" > "$FLOOR_TSV"
+else
+    printf "framework\tquery\tfloor_ms\n" > "$FLOOR_TSV"
+fi
+
 # Verdict rule: flag a per-query delta only if its magnitude exceeds NOISE_K
-# times the larger of the two sides' IQRs. Otherwise treat as noise.
+# times the larger of the two sides' IQRs. With --layout-control the delta
+# must ALSO beat the query's layout floor — a delta the layout lottery can
+# produce on identical source proves nothing about the code change.
 NOISE_K="${NOISE_K:-1.5}"
 
-awk -F'\t' -v noise_k="$NOISE_K" '
-    NR == FNR {
-        if (FNR == 1) next
+awk -F'\t' -v noise_k="$NOISE_K" -v floor_file="$FLOOR_TSV" -v base_file="$BASE_TSV" \
+    -v have_floor="$LAYOUT_CONTROL" '
+    FNR == 1 { next }
+    FILENAME == floor_file {
+        floor_ms[$1 "\t" $2] = $3 + 0.0
+        next
+    }
+    FILENAME == base_file {
         key = $1 "\t" $2
         base[key] = $3 + 0.0
         base_iqr[key] = $4 + 0.0
@@ -408,7 +486,6 @@ awk -F'\t' -v noise_k="$NOISE_K" '
         base_n[key] = $6 + 0
         next
     }
-    FNR == 1 { next }
     {
         key = $1 "\t" $2
         tgt[key] = $3 + 0.0
@@ -417,7 +494,7 @@ awk -F'\t' -v noise_k="$NOISE_K" '
     }
     END {
         OFS = "\t"
-        print "framework", "query", "base_ms", "target_ms", "delta_ms", "delta_pct", "speedup_x", "base_iqr_ms", "target_iqr_ms", "verdict", "base_samples", "target_samples", "rows"
+        print "framework", "query", "base_ms", "target_ms", "delta_ms", "delta_pct", "speedup_x", "base_iqr_ms", "target_iqr_ms", "verdict", "base_samples", "target_samples", "rows", "layout_floor_ms"
         for (k in base) {
             if (!(k in tgt)) continue
             b = base[k]
@@ -433,15 +510,21 @@ awk -F'\t' -v noise_k="$NOISE_K" '
             tn = (k in tgt_n) ? tgt_n[k] : 0
             noise = bi; if (ti > noise) noise = ti
             ad = d; if (ad < 0) ad = -ad
+            fl = (have_floor && (k in floor_ms)) ? floor_ms[k] : -1.0
             if (ad > noise_k * noise) {
-                verdict = (d > 0) ? "regression" : "improvement"
+                if (fl >= 0.0 && ad <= fl) {
+                    verdict = "layout-noise"
+                } else {
+                    verdict = (d > 0) ? "regression" : "improvement"
+                }
             } else {
                 verdict = "noise"
             }
-            print p[1], p[2], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.3f", sp), sprintf("%.4f", bi), sprintf("%.4f", ti), verdict, bn, tn, r
+            fl_out = (fl >= 0.0) ? sprintf("%.4f", fl) : "-"
+            print p[1], p[2], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.3f", sp), sprintf("%.4f", bi), sprintf("%.4f", ti), verdict, bn, tn, r, fl_out
         }
     }
-' "$BASE_TSV" "$TARGET_TSV" | sort -t$'\t' -k1,1 -k2,2 > "$REPORT_TSV"
+' "$FLOOR_TSV" "$BASE_TSV" "$TARGET_TSV" | sort -t$'\t' -k1,1 -k2,2 > "$REPORT_TSV"
 
 awk -F'\t' '
     function insert_sorted(kind, scope, value,    i) {

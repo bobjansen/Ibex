@@ -1,0 +1,67 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q5 — Local Supplier Volume
+//
+//  6-table equijoin chain + group-by + order. The real stress test: existing
+//  Ibex join benchmarks only exercise up to 4-table chains. Standard TPC-H
+//  qualification parameters: REGION='ASIA', DATE='1994-01-01'; the "+
+//  interval '1' year" bound is a fixed constant (1995-01-01), inlined as a
+//  literal Date.
+//
+//  The `c_nationkey = s_nationkey` predicate ("supplier is local to the
+//  customer") is NOT a join key in this chain — both columns are already
+//  present as ordinary columns after the customer/orders/lineitem/supplier
+//  joins, so it becomes a plain post-join `filter`, keeping every join in
+//  the chain an equijoin (hash-join) rather than a theta join.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q05.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool,
+                    schema: String) -> DataFrame from "csv.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let customer_raw = read_csv("benchmarking/data/tpch/sf1/customer.tbl", "", "|", false,
+    "int,str,str,int,str,f64,str,str");
+let customer = customer_raw[select { c_custkey = col1, c_nationkey = col4 }];
+
+let orders_raw = read_csv("benchmarking/data/tpch/sf1/orders.tbl", "", "|", false,
+    "int,int,str,f64,date,str,str,int,str");
+let orders = orders_raw[filter col5 >= date"1994-01-01" && col5 < date"1995-01-01"][
+    select { o_orderkey = col1, c_custkey = col2 }
+];
+
+let lineitem_raw = read_csv("benchmarking/data/tpch/sf1/lineitem.tbl", "", "|", false,
+    "int,int,int,int,f64,f64,f64,f64,str,str,date,date,date,str,str,str,str");
+let lineitem = lineitem_raw[select {
+    o_orderkey = col1, l_suppkey = col3, l_extendedprice = col6, l_discount = col7
+}];
+
+let supplier_raw = read_csv("benchmarking/data/tpch/sf1/supplier.tbl", "", "|", false,
+    "int,str,str,int,str,f64,str");
+let supplier = supplier_raw[select { l_suppkey = col1, s_nationkey = col4 }];
+
+let nation_raw = read_csv("benchmarking/data/tpch/sf1/nation.tbl", "", "|", false,
+    "int,str,int,str");
+let nation = nation_raw[select { s_nationkey = col1, n_name = col2, n_regionkey = col3 }];
+
+let region_raw = read_csv("benchmarking/data/tpch/sf1/region.tbl", "", "|", false,
+    "int,str,str");
+let region = region_raw[filter col2 == "ASIA"][select { n_regionkey = col1 }];
+
+let cust_orders = customer join orders on c_custkey;
+let with_lineitem = cust_orders join lineitem on o_orderkey;
+let with_supplier = with_lineitem join supplier on l_suppkey;
+let local_supplier = with_supplier[filter c_nationkey == s_nationkey];
+let with_nation = local_supplier join nation on s_nationkey;
+let joined = with_nation join region on n_regionkey;
+
+let result = joined[
+    select { revenue = sum(l_extendedprice * (1.0 - l_discount)) },
+    by { n_name }
+][
+    order { revenue desc }
+];
+write_csv(result, "benchmarking/data/tpch/out/q05.csv");
+result;

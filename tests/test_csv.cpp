@@ -345,6 +345,70 @@ TEST_CASE("Read CSV - schema hint parse failure throws") {
     REQUIRE_THROWS_AS(read_csv(path.string(), "", ",", true, "f64"), std::runtime_error);
 }
 
+TEST_CASE("Read CSV - schema hint 'date' parses YYYY-MM-DD into days-since-epoch") {
+    auto path = tmp("ibex_test_schema_hint_date.csv");
+    write_csv(path, "id,d\n1,1970-01-01\n2,1996-03-13\n3,2026-07-12\n");
+
+    auto table = read_csv(path.string(), "", ",", true, "d:date");
+    const auto* dates = std::get_if<ibex::Column<ibex::Date>>(table.find("d"));
+    REQUIRE(dates != nullptr);
+    REQUIRE((*dates)[0].days == 0);
+    REQUIRE((*dates)[1].days == 9568);   // matches parser.cpp's date"1996-03-13" literal
+    REQUIRE((*dates)[2].days == 20646);  // matches parser.cpp's date"2026-07-12" literal
+}
+
+TEST_CASE("Read CSV - schema hint 'date' parse failure throws") {
+    auto path = tmp("ibex_test_schema_hint_date_fail.csv");
+    write_csv(path, "d\nnot-a-date\n");
+
+    REQUIRE_THROWS_AS(read_csv(path.string(), "", ",", true, "date"), std::runtime_error);
+}
+
+TEST_CASE(
+    "ChunkedCsvSourceOperator - pipe-delimited, no-header, trailing-delimiter rows with a "
+    "date column (matches TPC-H dbgen .tbl layout)") {
+    auto path = tmp("ibex_test_chunked_tbl.csv");
+    // dbgen emits a trailing '|' on every row; the last field is therefore empty.
+    write_csv(path, "1|17|1996-03-13|\n2|36|1996-04-12|\n3|8|1996-01-29|\n");
+
+    ChunkedCsvSourceOperator op(
+        path.string(), {"id", "qty", "shipdate", "trailing"},
+        {CsvColumnKind::Int, CsvColumnKind::Int, CsvColumnKind::Date, CsvColumnKind::String}, '|',
+        /*rows_per_chunk=*/64);
+
+    auto first = op.next();
+    REQUIRE(first.has_value());
+    REQUIRE(first.value().has_value());
+    auto& chunk = *first.value();
+    REQUIRE(chunk.rows() == 3);
+
+    auto find_col = [&](const char* name) -> const ibex::runtime::ColumnValue* {
+        for (const auto& entry : chunk.columns) {
+            if (entry.name == name) {
+                return entry.column.get();
+            }
+        }
+        return nullptr;
+    };
+
+    const auto* id_col = std::get_if<ibex::Column<std::int64_t>>(find_col("id"));
+    REQUIRE(id_col != nullptr);
+    REQUIRE((*id_col)[0] == 1);
+    REQUIRE((*id_col)[2] == 3);
+
+    const auto* date_col = std::get_if<ibex::Column<ibex::Date>>(find_col("shipdate"));
+    REQUIRE(date_col != nullptr);
+    REQUIRE((*date_col)[0].days == 9568);  // 1996-03-13
+
+    const auto* trailing_col = std::get_if<ibex::Column<std::string>>(find_col("trailing"));
+    REQUIRE(trailing_col != nullptr);
+    REQUIRE((*trailing_col)[0].empty());
+
+    auto second = op.next();
+    REQUIRE(second.has_value());
+    REQUIRE_FALSE(second.value().has_value());
+}
+
 // ---------------------------------------------------------------------------
 // write_csv tests
 // ---------------------------------------------------------------------------
@@ -388,6 +452,24 @@ TEST_CASE("Write CSV - double column round-trip") {
     REQUIRE((*x)[1] == Catch::Approx(0.5));
     REQUIRE((*y)[0] == Catch::Approx(2.25));
     REQUIRE((*y)[1] == Catch::Approx(3.0));
+}
+
+TEST_CASE("Write CSV - double column preserves full precision for large-magnitude values") {
+    // `out << double` truncates to the stream's default 6-significant-digit
+    // precision (e.g. 3083843.06 -> "3.08384e+06"), which silently corrupts
+    // any sum/aggregate large enough to exceed 6 digits -- exactly the shape
+    // of TPC-H revenue totals. write_csv must round-trip exactly instead.
+    ibex::runtime::Table table;
+    table.add_column("revenue", ibex::Column<double>({3083843.06, 55908965222.827362}));
+
+    auto out_path = tmp("ibex_test_write_double_precision.csv");
+    write_csv(table, out_path.string());
+
+    auto reread = read_csv(out_path.string());
+    const auto* revenue = std::get_if<ibex::Column<double>>(reread.find("revenue"));
+    REQUIRE(revenue != nullptr);
+    REQUIRE((*revenue)[0] == Catch::Approx(3083843.06));
+    REQUIRE((*revenue)[1] == Catch::Approx(55908965222.827362));
 }
 
 TEST_CASE("Write CSV - fields with commas are quoted") {

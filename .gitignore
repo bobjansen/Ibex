@@ -29,6 +29,7 @@ ibex_benchmarks.egg-info/**
 bench_results/**
 benchmarking/data/**
 benchmarking/results/compiled/**
+benchmarking/results/*_artifacts.tar.gz
 *.csv
 *.tsv
 !examples/leetcode/data/*.csv

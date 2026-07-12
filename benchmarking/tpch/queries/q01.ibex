@@ -1,0 +1,41 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q1 — Pricing Summary Report
+//
+//  Single-table multi-column group-by with 8 aggregates + order. The
+//  "90 days before 1998-12-01" cutoff in the standard TPC-H query text is a
+//  fixed constant (not a variable), so it's inlined here as a literal Date
+//  rather than needing date-interval arithmetic.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q01.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool,
+                    schema: String) -> DataFrame from "csv.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let lineitem_raw = read_csv("benchmarking/data/tpch/sf1/lineitem.tbl", "", "|", false,
+    "int,int,int,int,f64,f64,f64,f64,str,str,date,date,date,str,str,str,str");
+let lineitem = lineitem_raw[select {
+    l_quantity = col5, l_extendedprice = col6, l_discount = col7, l_tax = col8,
+    l_returnflag = col9, l_linestatus = col10, l_shipdate = col11
+}];
+
+let result = lineitem[
+    filter l_shipdate <= date"1998-09-02",
+    select {
+        sum_qty = sum(l_quantity),
+        sum_base_price = sum(l_extendedprice),
+        sum_disc_price = sum(l_extendedprice * (1.0 - l_discount)),
+        sum_charge = sum(l_extendedprice * (1.0 - l_discount) * (1.0 + l_tax)),
+        avg_qty = mean(l_quantity),
+        avg_price = mean(l_extendedprice),
+        avg_disc = mean(l_discount),
+        count_order = count()
+    },
+    by { l_returnflag, l_linestatus },
+    order { l_returnflag, l_linestatus }
+];
+write_csv(result, "benchmarking/data/tpch/out/q01.csv");
+result;

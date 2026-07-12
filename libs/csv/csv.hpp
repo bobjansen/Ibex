@@ -35,6 +35,7 @@
 // parse into the build loop, so each value is parsed at most twice.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
@@ -42,6 +43,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -82,6 +84,7 @@ enum class CsvColumnKind : std::uint8_t {
     Double,
     String,
     Categorical,
+    Date,
 };
 
 struct CsvSchemaEntry {
@@ -154,6 +157,9 @@ inline auto csv_parse_column_kind(std::string_view type_str) -> CsvColumnKind {
     }
     if (type_str == "cat" || type_str == "categorical") {
         return CsvColumnKind::Categorical;
+    }
+    if (type_str == "date") {
+        return CsvColumnKind::Date;
     }
     throw std::runtime_error("read_csv: unknown schema type '" + std::string(type_str) + "'");
 }
@@ -404,6 +410,45 @@ inline auto csv_try_double(std::string_view sv, double& out) -> bool {
     return result.ec == std::errc() && result.ptr == end;
 }
 
+/// Parses a "YYYY-MM-DD" calendar date into days-since-epoch, matching the
+/// `date"YYYY-MM-DD"` literal semantics in the parser (proleptic Gregorian,
+/// signed days since 1970-01-01).
+inline auto csv_try_date(std::string_view sv, std::int32_t& out) -> bool {
+    if (sv.size() != 10 || sv[4] != '-' || sv[7] != '-') {
+        return false;
+    }
+    auto parse_int = [](std::string_view part) -> std::optional<int> {
+        int value = 0;
+        const char* end = part.data() + part.size();
+        auto result = std::from_chars(part.data(), end, value);
+        if (result.ec != std::errc() || result.ptr != end) {
+            return std::nullopt;
+        }
+        return value;
+    };
+    auto year = parse_int(sv.substr(0, 4));
+    auto month = parse_int(sv.substr(5, 2));
+    auto day = parse_int(sv.substr(8, 2));
+    if (!year || !month || !day) {
+        return false;
+    }
+    using namespace std::chrono;
+    const year_month_day ymd{std::chrono::year{*year},
+                             std::chrono::month{static_cast<unsigned>(*month)},
+                             std::chrono::day{static_cast<unsigned>(*day)}};
+    if (!ymd.ok()) {
+        return false;
+    }
+    const sys_days days_since = sys_days{ymd};
+    const auto days = days_since.time_since_epoch().count();
+    if (days < std::numeric_limits<std::int32_t>::min() ||
+        days > std::numeric_limits<std::int32_t>::max()) {
+        return false;
+    }
+    out = static_cast<std::int32_t>(days);
+    return true;
+}
+
 /// Pull-based chunked CSV source. Requires a fully-specified schema with
 /// no Infer columns, no null handling, no header. Parses rows from the
 /// mmapped source into per-chunk builders; Categorical columns share a
@@ -441,6 +486,7 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
         std::vector<ibex::Column<double>> double_cols(n_cols);
         std::vector<ibex::Column<std::string>> string_cols(n_cols);
         std::vector<std::vector<ibex::Column<ibex::Categorical>::code_type>> cat_codes(n_cols);
+        std::vector<ibex::Column<ibex::Date>> date_cols(n_cols);
 
         for (std::size_t c = 0; c < n_cols; ++c) {
             switch (col_kinds_[c]) {
@@ -455,6 +501,9 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
                     break;
                 case CsvColumnKind::Categorical:
                     cat_codes[c].reserve(rows_per_chunk_);
+                    break;
+                case CsvColumnKind::Date:
+                    date_cols[c].reserve(rows_per_chunk_);
                     break;
                 case CsvColumnKind::Infer:
                     return std::unexpected(
@@ -513,6 +562,17 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
                         cat_codes[c].push_back(code);
                         break;
                     }
+                    case CsvColumnKind::Date: {
+                        std::int32_t dv{};
+                        if (!csv_try_date(sv, dv)) {
+                            return std::unexpected(
+                                "read_csv: column '" + col_names_[c] + "' row " +
+                                std::to_string(total_rows_ + rows_read) +
+                                " failed to parse as date (expected YYYY-MM-DD)");
+                        }
+                        date_cols[c].push_back(ibex::Date{dv});
+                        break;
+                    }
                     case CsvColumnKind::Infer:
                         break;
                 }
@@ -547,6 +607,9 @@ class ChunkedCsvSourceOperator final : public ibex::runtime::Operator {
                     column = std::move(col);
                     break;
                 }
+                case CsvColumnKind::Date:
+                    column = std::move(date_cols[c]);
+                    break;
                 case CsvColumnKind::Infer:
                     break;
             }
@@ -843,6 +906,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             ibex::Column<std::int64_t> ints;
             ibex::Column<double> doubles;
             ibex::Column<std::string> strings;
+            ibex::Column<ibex::Date> dates;
             using code_type = ibex::Column<ibex::Categorical>::code_type;
             std::vector<std::string> dict;
             ibex::Column<ibex::Categorical>::index_map cat_index;
@@ -860,6 +924,9 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                         break;
                     case CsvColumnKind::String:
                         strings.reserve(n);
+                        break;
+                    case CsvColumnKind::Date:
+                        dates.reserve(n);
                         break;
                     case CsvColumnKind::Categorical:
                         cat_codes.reserve(n);
@@ -896,6 +963,16 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                     strings.push_back(sv);
                     return;
                 }
+                if (kind == CsvColumnKind::Date) {
+                    std::int32_t dv{};
+                    if (!csv_try_date(sv, dv)) {
+                        throw std::runtime_error("read_csv: column '" + std::string(name) +
+                                                 "' row " + std::to_string(row_index) +
+                                                 " failed to parse as date (expected YYYY-MM-DD)");
+                    }
+                    dates.push_back(ibex::Date{dv});
+                    return;
+                }
                 if (kind == CsvColumnKind::Categorical) {
                     const auto it = cat_index.find(sv);
                     if (it != cat_index.end()) {
@@ -918,6 +995,8 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                         return std::move(doubles);
                     case CsvColumnKind::String:
                         return std::move(strings);
+                    case CsvColumnKind::Date:
+                        return std::move(dates);
                     case CsvColumnKind::Categorical:
                         return ibex::Column<ibex::Categorical>(std::move(dict),
                                                                std::move(cat_codes));
@@ -1007,9 +1086,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
             }
         }
 
-        auto is_null = [&](std::size_t i) -> bool {
-            return need_null_check && !validity[i];
-        };
+        auto is_null = [&](std::size_t i) -> bool { return need_null_check && !validity[i]; };
 
         // Schema-hinted fast path: parse directly to the declared type, skip
         // inference probes, and throw on parse failure.
@@ -1050,6 +1127,29 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
                                                  std::to_string(i) + " failed to parse as f64");
                     }
                     col.push_back(dv);
+                }
+                if (has_nulls) {
+                    table.add_column(name, std::move(col), std::move(validity));
+                } else {
+                    table.add_column(name, std::move(col));
+                }
+                continue;
+            }
+            if (hint == CsvColumnKind::Date) {
+                ibex::Column<ibex::Date> col;
+                col.reserve(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (is_null(i)) {
+                        col.push_back(ibex::Date{});
+                        continue;
+                    }
+                    std::int32_t dv{};
+                    if (!csv_try_date(vals[i], dv)) {
+                        throw std::runtime_error("read_csv: column '" + name + "' row " +
+                                                 std::to_string(i) +
+                                                 " failed to parse as date (expected YYYY-MM-DD)");
+                    }
+                    col.push_back(ibex::Date{dv});
                 }
                 if (has_nulls) {
                     table.add_column(name, std::move(col), std::move(validity));
@@ -1288,6 +1388,17 @@ inline void csv_write_field(std::ostream& out, std::string_view value) {
     out.put('"');
 }
 
+/// Writes `value` using the shortest decimal representation that round-trips
+/// back to the same double (std::to_chars' default float format). Plain
+/// `out << value` truncates to the stream's default precision (6 significant
+/// digits), silently dropping precision on anything larger than ~5-6 digits
+/// (e.g. a financial sum like 3083843.06 would print as 3.08384e+06).
+inline void csv_write_double(std::ostream& out, double value) {
+    std::array<char, 32> buf{};
+    auto result = std::to_chars(buf.data(), buf.data() + buf.size(), value);
+    out.write(buf.data(), static_cast<std::streamsize>(result.ptr - buf.data()));
+}
+
 /// Write one cell of a column at row `r`, dispatching on the column variant.
 inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& entry,
                            std::size_t r) {
@@ -1300,7 +1411,7 @@ inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& 
             if constexpr (std::is_same_v<ColT, ibex::Column<std::int64_t>>) {
                 out << col[r];
             } else if constexpr (std::is_same_v<ColT, ibex::Column<double>>) {
-                out << col[r];
+                csv_write_double(out, col[r]);
             } else if constexpr (std::is_same_v<ColT, ibex::Column<std::string>>) {
                 csv_write_field(out, col[r]);
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Categorical>>) {

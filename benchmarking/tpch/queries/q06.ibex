@@ -1,0 +1,29 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q6 — Forecasting Revenue Change
+//
+//  Single-table filter + sum. Simplest query in the suite; used as the first
+//  smoke test for the whole pipeline (dbgen data + Date-typed CSV schema).
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q06.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_csv(path: String, nulls: String, delimiter: String, has_header: Bool,
+                    schema: String) -> DataFrame from "csv.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let lineitem_raw = read_csv("benchmarking/data/tpch/sf1/lineitem.tbl", "", "|", false,
+    "int,int,int,int,f64,f64,f64,f64,str,str,date,date,date,str,str,str,str");
+let lineitem = lineitem_raw[select {
+    l_quantity = col5, l_extendedprice = col6, l_discount = col7, l_shipdate = col11
+}];
+
+let result = lineitem[
+    filter l_shipdate >= date"1994-01-01" && l_shipdate < date"1995-01-01"
+        && l_discount >= 0.05 && l_discount <= 0.07
+        && l_quantity < 24.0,
+    select { revenue = sum(l_extendedprice * l_discount) }
+];
+write_csv(result, "benchmarking/data/tpch/out/q06.csv");
+result;

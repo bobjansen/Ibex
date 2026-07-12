@@ -303,7 +303,9 @@ struct GeneratorExec {
 // aggregate machinery keyed by ir::AggFunc; the registry is the single
 // name -> AggFunc mapping (parse_aggregate_func reads it).
 struct AggregateExec {
-    ir::AggFunc func{};
+    // Invalid sentinel makes an omitted aggregate mapping fail registry
+    // validation instead of silently becoming AggFunc::Sum (enum value zero).
+    ir::AggFunc func = static_cast<ir::AggFunc>(0xFFU);
 };
 
 // Whole-column fast-path kernel of a Scalar entry, as a one-byte id resolved

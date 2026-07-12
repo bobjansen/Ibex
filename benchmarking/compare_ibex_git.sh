@@ -30,20 +30,15 @@ Options:
   --warmup <N>              Warmup iterations for ibex_bench (default: 1)
   --iters <N>               Timed iterations for ibex_bench (default: 7)
   --repeats <N>             Repeats per side; report median (default: 3)
-  --interleave              Alternate base/target per repeat instead of running
-                            all base repeats then all target repeats. Cancels
-                            slow machine drift (thermal, background load) that
-                            otherwise biases whichever side runs second.
-  --layout-control          Also build the BASE source a second time at a
-                            different path and run it as a third side. Two
-                            builds of identical source differ only in code/data
-                            layout (embedded paths shift section contents), so
-                            the base-vs-control spread is this box's layout
-                            noise floor. Per-query deltas that beat the IQR
-                            rule but not the floor get verdict "layout-noise"
-                            instead of regression/improvement. Requires
-                            --base <ref> (not WORKTREE). Costs one extra build
-                            and one extra run per repeat.
+  --interleave              Run sides per repeat instead of in side-sized
+                            blocks, alternating their run positions to balance
+                            slow machine drift (thermal, background load).
+  --replica-control         Also build the BASE source a second time and run it
+                            as a third, position-balanced side. Reports the
+                            base-vs-replica delta as diagnostic metadata; it
+                            never clears a base-vs-target regression. Implies
+                            --interleave and requires --base <ref> (not
+                            WORKTREE). Costs one extra build/run per repeat.
   --taskset <cpuset>        Pin benchmark runs with taskset -c
   --numa-node <N>           Pin benchmark runs with numactl node/memory bind
   --ibex-suite <name,...>   Pass suite selection to bench_ibex.sh/ibex_bench
@@ -72,7 +67,7 @@ WARMUP=1
 ITERS=7
 REPEATS=3
 INTERLEAVE=0
-LAYOUT_CONTROL=0
+REPLICA_CONTROL=0
 KEEP_TEMP=0
 TASKSET_CPUSET=""
 NUMA_NODE=""
@@ -95,7 +90,7 @@ while [[ $# -gt 0 ]]; do
         --iters) ITERS="$2"; shift 2 ;;
         --repeats) REPEATS="$2"; shift 2 ;;
         --interleave) INTERLEAVE=1; shift ;;
-        --layout-control) LAYOUT_CONTROL=1; shift ;;
+        --replica-control) REPLICA_CONTROL=1; shift ;;
         --taskset) TASKSET_CPUSET="$2"; shift 2 ;;
         --numa-node) NUMA_NODE="$2"; shift 2 ;;
         --ibex-suite) IBEX_SUITE="$2"; shift 2 ;;
@@ -168,11 +163,23 @@ fi
 # IBEX_PERFCMP_TMPDIR relocates the (large) temp build trees off the default
 # /tmp — useful when /tmp is a small tmpfs (e.g. WSL2) or to land builds on a
 # roomier disk. Defaults to /tmp to preserve prior behaviour.
-if [[ "$LAYOUT_CONTROL" -eq 1 && "$BASE_STATE" == "WORKTREE" ]]; then
-    echo "error: --layout-control requires --base <ref>; it rebuilds the base source" >&2
+if [[ "$REPLICA_CONTROL" -eq 1 && "$BASE_STATE" == "WORKTREE" ]]; then
+    echo "error: --replica-control requires --base <ref>; it rebuilds the base source" >&2
     echo "       at a second worktree path, which WORKTREE (uncommitted state) cannot do" >&2
     exit 1
 fi
+if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
+    INTERLEAVE=1
+fi
+
+# Canonicalize compiler-generated source/build paths so temporary worktree
+# names do not become an uncontrolled input to the compared binaries. The
+# compare script already targets Clang/GCC-style toolchains; leave an explicit
+# off state for other compiler driver names rather than passing unknown flags.
+PREFIX_MAP_ENABLED=0
+case "$(basename "${IBEX_CXX:-clang++}")" in
+    clang++*|g++*|c++) PREFIX_MAP_ENABLED=1 ;;
+esac
 
 TMP_ROOT="$(mktemp -d "${IBEX_PERFCMP_TMPDIR:-/tmp}/ibex-perfcmp.XXXXXX")"
 BASE_WT=""
@@ -212,19 +219,22 @@ trap cleanup EXIT
 resolve_state_dir() {
     local state="$1"
     local slot="$2"
+    local -n result_dir="$3"
     if [[ "$state" == "WORKTREE" ]]; then
-        printf "%s" "$REPO_ROOT"
+        result_dir="$REPO_ROOT"
         return 0
     fi
     git -C "$REPO_ROOT" rev-parse --verify "$state^{commit}" >/dev/null
     local wt="$TMP_ROOT/wt-$slot"
-    git -C "$REPO_ROOT" worktree add --detach "$wt" "$state" >/dev/null
+    if ! git -C "$REPO_ROOT" worktree add --detach "$wt" "$state" >/dev/null; then
+        return 1
+    fi
     if [[ "$slot" == "base" ]]; then
         BASE_WT="$wt"
     else
         TARGET_WT="$wt"
     fi
-    printf "%s" "$wt"
+    result_dir="$wt"
 }
 
 state_label() {
@@ -249,6 +259,17 @@ configure_and_build() {
     local src_dir="$1"
     local build_dir="$2"
     local log_file="$3"
+    local -a canonical_path_args=()
+
+    if [[ "$PREFIX_MAP_ENABLED" -eq 1 ]]; then
+        local canonical_flags
+        canonical_flags="-ffile-prefix-map=$src_dir=/ibex-perfcmp/source"
+        canonical_flags+=" -ffile-prefix-map=$build_dir=/ibex-perfcmp/build"
+        canonical_path_args+=(
+            "-DCMAKE_C_FLAGS=$canonical_flags"
+            "-DCMAKE_CXX_FLAGS=$canonical_flags"
+        )
+    fi
 
     # Compiler is overridable (IBEX_CC/IBEX_CXX) so callers on boxes without a
     # bare `clang`/`clang++` on PATH can pass a versioned toolchain, e.g. the AWS
@@ -263,7 +284,8 @@ configure_and_build() {
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         ${IBEX_LIGHTGBM_SRC:+-DFETCHCONTENT_SOURCE_DIR_LIGHTGBM="$IBEX_LIGHTGBM_SRC"} \
         -DIBEX_BUILD_PARQUET=OFF \
-        -DIBEX_BUILD_PYTHON_BRIDGE=OFF >"$log_file" 2>&1; then
+        -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+        "${canonical_path_args[@]}" >"$log_file" 2>&1; then
         cat "$log_file" >&2
         return 1
     fi
@@ -362,17 +384,28 @@ aggregate_side() {
     aggregate_median "$out_tsv" "${repeats[@]}"
 }
 
-BASE_DIR="$(resolve_state_dir "$BASE_STATE" "base")"
-TARGET_DIR="$(resolve_state_dir "$TARGET_STATE" "target")"
+run_named_side_repeat() {
+    local side="$1" r="$2"
+    case "$side" in
+        base) run_side_repeat "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$r" "$BASE_LOG" ;;
+        target) run_side_repeat "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$r" "$TARGET_LOG" ;;
+        ctrl) run_side_repeat "ctrl" "$CTRL_DIR" "$CTRL_BUILD_DIR" "$r" "$CTRL_LOG" ;;
+        *) echo "error: internal unknown benchmark side: $side" >&2; return 1 ;;
+    esac
+}
+
+BASE_DIR=""
+TARGET_DIR=""
+resolve_state_dir "$BASE_STATE" "base" BASE_DIR
+resolve_state_dir "$TARGET_STATE" "target" TARGET_DIR
 BASE_LABEL="$(state_label "$BASE_STATE" "$BASE_DIR")"
 TARGET_LABEL="$(state_label "$TARGET_STATE" "$TARGET_DIR")"
 
 CTRL_DIR=""
-if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
-    # Same commit as base, second worktree: identical source, different path.
-    # Embedded path strings shift section contents, so the two binaries differ
-    # only in layout — their delta is the layout noise floor.
-    CTRL_WT="$TMP_ROOT/wt-layoutctl"
+if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
+    # Same commit as base, second worktree. Prefix maps canonicalize compiler-
+    # generated paths; binary identity is checked after both builds.
+    CTRL_WT="$TMP_ROOT/wt-replica"
     git -C "$REPO_ROOT" worktree add --detach "$CTRL_WT" "$BASE_STATE" >/dev/null
     CTRL_DIR="$CTRL_WT"
 fi
@@ -380,7 +413,7 @@ fi
 BASE_TSV="$TMP_ROOT/base.tsv"
 TARGET_TSV="$TMP_ROOT/target.tsv"
 CTRL_TSV="$TMP_ROOT/ctrl.tsv"
-FLOOR_TSV="$TMP_ROOT/floor.tsv"
+CONTROL_METRICS_TSV="$TMP_ROOT/control-metrics.tsv"
 REPORT_TSV="$TMP_ROOT/report.tsv"
 SUMMARY_TSV="$TMP_ROOT/summary.tsv"
 BASE_BUILD_DIR="$TMP_ROOT/build-base"
@@ -392,7 +425,8 @@ CTRL_LOG="$TMP_ROOT/log-ctrl.txt"
 
 echo "Benchmarking base:   $BASE_LABEL" >&2
 echo "Benchmarking target: $TARGET_LABEL" >&2
-echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS, interleave=$([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off), layout-control=$([[ "$LAYOUT_CONTROL" -eq 1 ]] && echo on || echo off)" >&2
+echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS, interleave=$([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off), replica-control=$([[ "$REPLICA_CONTROL" -eq 1 ]] && echo on || echo off)" >&2
+echo "Compiler path prefix map: $([[ "$PREFIX_MAP_ENABLED" -eq 1 ]] && echo on || echo off)" >&2
 echo "Pinning: $PIN_DESC" >&2
 echo "Ibex suite: ${IBEX_SUITE:-all}" >&2
 if [[ -n "$MERGE_VALIDITY_ROWS" ]]; then
@@ -411,19 +445,36 @@ echo "Building base ..." >&2
 configure_and_build "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_LOG"
 echo "Building target ..." >&2
 configure_and_build "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_LOG"
-if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
-    echo "Building layout control (base source, second path) ..." >&2
+CONTROL_BINARY_IDENTITY="not-requested"
+if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
+    echo "Building replica control (base source, second path) ..." >&2
     configure_and_build "$CTRL_DIR" "$CTRL_BUILD_DIR" "$CTRL_LOG"
+    if cmp -s "$BASE_BUILD_DIR/tools/ibex_bench" "$CTRL_BUILD_DIR/tools/ibex_bench"; then
+        CONTROL_BINARY_IDENTITY="identical"
+    else
+        CONTROL_BINARY_IDENTITY="different"
+    fi
+    echo "Replica binary identity: $CONTROL_BINARY_IDENTITY" >&2
 fi
 
 if [[ "$INTERLEAVE" -eq 1 ]]; then
-    echo "Interleaving repeats" >&2
+    echo "Interleaving repeats with balanced run positions" >&2
     for ((r = 1; r <= REPEATS; ++r)); do
-        run_side_repeat "base"   "$BASE_DIR"   "$BASE_BUILD_DIR"   "$r" "$BASE_LOG"
-        run_side_repeat "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$r" "$TARGET_LOG"
-        if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
-            run_side_repeat "ctrl" "$CTRL_DIR" "$CTRL_BUILD_DIR" "$r" "$CTRL_LOG"
+        declare -a repeat_sides=()
+        if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
+            case $(((r - 1) % 3)) in
+                0) repeat_sides=(base target ctrl) ;;
+                1) repeat_sides=(target ctrl base) ;;
+                2) repeat_sides=(ctrl base target) ;;
+            esac
+        elif ((r % 2 == 1)); then
+            repeat_sides=(base target)
+        else
+            repeat_sides=(target base)
         fi
+        for side in "${repeat_sides[@]}"; do
+            run_named_side_repeat "$side" "$r"
+        done
     done
 else
     for ((r = 1; r <= REPEATS; ++r)); do
@@ -432,23 +483,17 @@ else
     for ((r = 1; r <= REPEATS; ++r)); do
         run_side_repeat "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$r" "$TARGET_LOG"
     done
-    if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
-        for ((r = 1; r <= REPEATS; ++r)); do
-            run_side_repeat "ctrl" "$CTRL_DIR" "$CTRL_BUILD_DIR" "$r" "$CTRL_LOG"
-        done
-    fi
 fi
 
 aggregate_side "base" "$BASE_TSV"
 aggregate_side "target" "$TARGET_TSV"
 
-# Per-query layout floor: |ctrl - base| medians. Identical source, so any
-# delta here is layout (plus residual run noise) — a target delta must beat
-# it before layout can be ruled out as the cause.
-if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
+# Per-query same-source replica diagnostics. This is one observation, not a
+# bound on build-layout or runtime noise, so it never changes the target verdict.
+if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
     aggregate_side "ctrl" "$CTRL_TSV"
     awk -F'\t' -v base_file="$BASE_TSV" '
-        BEGIN { OFS = "\t"; print "framework", "query", "floor_ms" }
+        BEGIN { OFS = "\t"; print "framework", "query", "replica_delta_ms", "replica_iqr_ms" }
         FNR == 1 { next }
         FILENAME == base_file { base[$1 "\t" $2] = $3 + 0.0; next }
         {
@@ -457,25 +502,25 @@ if [[ "$LAYOUT_CONTROL" -eq 1 ]]; then
                 d = $3 - base[k]
                 if (d < 0) d = -d
                 split(k, p, "\t")
-                printf "%s\t%s\t%.4f\n", p[1], p[2], d
+                printf "%s\t%s\t%.4f\t%.4f\n", p[1], p[2], d, $4 + 0.0
             }
         }
-    ' "$BASE_TSV" "$CTRL_TSV" > "$FLOOR_TSV"
+    ' "$BASE_TSV" "$CTRL_TSV" > "$CONTROL_METRICS_TSV"
 else
-    printf "framework\tquery\tfloor_ms\n" > "$FLOOR_TSV"
+    printf "framework\tquery\treplica_delta_ms\treplica_iqr_ms\n" > "$CONTROL_METRICS_TSV"
 fi
 
 # Verdict rule: flag a per-query delta only if its magnitude exceeds NOISE_K
-# times the larger of the two sides' IQRs. With --layout-control the delta
-# must ALSO beat the query's layout floor — a delta the layout lottery can
-# produce on identical source proves nothing about the code change.
+# times the larger of the two sides' IQRs. Replica measurements are diagnostic
+# columns only; one same-source draw cannot exonerate a target delta.
 NOISE_K="${NOISE_K:-1.5}"
 
-awk -F'\t' -v noise_k="$NOISE_K" -v floor_file="$FLOOR_TSV" -v base_file="$BASE_TSV" \
-    -v have_floor="$LAYOUT_CONTROL" '
+awk -F'\t' -v noise_k="$NOISE_K" -v control_file="$CONTROL_METRICS_TSV" \
+    -v base_file="$BASE_TSV" -v have_control="$REPLICA_CONTROL" '
     FNR == 1 { next }
-    FILENAME == floor_file {
-        floor_ms[$1 "\t" $2] = $3 + 0.0
+    FILENAME == control_file {
+        replica_delta_ms[$1 "\t" $2] = $3 + 0.0
+        replica_iqr_ms[$1 "\t" $2] = $4 + 0.0
         next
     }
     FILENAME == base_file {
@@ -494,7 +539,7 @@ awk -F'\t' -v noise_k="$NOISE_K" -v floor_file="$FLOOR_TSV" -v base_file="$BASE_
     }
     END {
         OFS = "\t"
-        print "framework", "query", "base_ms", "target_ms", "delta_ms", "delta_pct", "speedup_x", "base_iqr_ms", "target_iqr_ms", "verdict", "base_samples", "target_samples", "rows", "layout_floor_ms"
+        print "framework", "query", "base_ms", "target_ms", "delta_ms", "delta_pct", "speedup_x", "base_iqr_ms", "target_iqr_ms", "verdict", "base_samples", "target_samples", "rows", "replica_delta_ms", "replica_iqr_ms", "replica_relation"
         for (k in base) {
             if (!(k in tgt)) continue
             b = base[k]
@@ -510,21 +555,20 @@ awk -F'\t' -v noise_k="$NOISE_K" -v floor_file="$FLOOR_TSV" -v base_file="$BASE_
             tn = (k in tgt_n) ? tgt_n[k] : 0
             noise = bi; if (ti > noise) noise = ti
             ad = d; if (ad < 0) ad = -ad
-            fl = (have_floor && (k in floor_ms)) ? floor_ms[k] : -1.0
             if (ad > noise_k * noise) {
-                if (fl >= 0.0 && ad <= fl) {
-                    verdict = "layout-noise"
-                } else {
-                    verdict = (d > 0) ? "regression" : "improvement"
-                }
+                verdict = (d > 0) ? "regression" : "improvement"
             } else {
                 verdict = "noise"
             }
-            fl_out = (fl >= 0.0) ? sprintf("%.4f", fl) : "-"
-            print p[1], p[2], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.3f", sp), sprintf("%.4f", bi), sprintf("%.4f", ti), verdict, bn, tn, r, fl_out
+            rd = (have_control && (k in replica_delta_ms)) ? replica_delta_ms[k] : -1.0
+            ri = (have_control && (k in replica_iqr_ms)) ? replica_iqr_ms[k] : -1.0
+            rd_out = (rd >= 0.0) ? sprintf("%.4f", rd) : "-"
+            ri_out = (ri >= 0.0) ? sprintf("%.4f", ri) : "-"
+            relation = (rd < 0.0) ? "-" : ((ad <= rd) ? "within-replica-delta" : "exceeds-replica-delta")
+            print p[1], p[2], sprintf("%.4f", b), sprintf("%.4f", t), sprintf("%+.4f", d), sprintf("%+.2f%%", pct), sprintf("%.3f", sp), sprintf("%.4f", bi), sprintf("%.4f", ti), verdict, bn, tn, r, rd_out, ri_out, relation
         }
     }
-' "$FLOOR_TSV" "$BASE_TSV" "$TARGET_TSV" | sort -t$'\t' -k1,1 -k2,2 > "$REPORT_TSV"
+' "$CONTROL_METRICS_TSV" "$BASE_TSV" "$TARGET_TSV" | sort -t$'\t' -k1,1 -k2,2 > "$REPORT_TSV"
 
 awk -F'\t' '
     function insert_sorted(kind, scope, value,    i) {
@@ -609,7 +653,10 @@ awk -F'\t' '
     }
 ' "$REPORT_TSV" > "$SUMMARY_TSV"
 
-printf "\nbase=%s\ntarget=%s\n\n" "$BASE_LABEL" "$TARGET_LABEL"
+printf "\nbase=%s\ntarget=%s\nprefix_map=%s\nreplica_binary=%s\n\n" \
+    "$BASE_LABEL" "$TARGET_LABEL" \
+    "$([[ "$PREFIX_MAP_ENABLED" -eq 1 ]] && echo on || echo off)" \
+    "$CONTROL_BINARY_IDENTITY"
 if command -v column >/dev/null 2>&1; then
     column -t -s $'\t' "$REPORT_TSV"
 else

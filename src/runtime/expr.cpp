@@ -193,6 +193,55 @@ auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
     return nullptr;  // unreachable; MSVC C4715
 }
 
+namespace {
+
+[[noreturn]] auto builtin_invariant(std::string_view name, std::string_view detail) -> void {
+    invariant_violation("builtins(): invalid entry for '" + std::string(name) +
+                        "': " + std::string(detail));
+}
+
+auto validate_builtin(std::string_view name, const BuiltinFn& fn) -> void {
+    if (fn.min_args < 0 || fn.max_args < -1 || (fn.max_args >= 0 && fn.max_args < fn.min_args)) {
+        builtin_invariant(name, "invalid arity range");
+    }
+    if (fn.infer == nullptr) {
+        builtin_invariant(name, "missing type-inference function");
+    }
+
+    if (const auto* scalar = std::get_if<ScalarExec>(&fn.exec)) {
+        if (scalar->eval == nullptr) {
+            builtin_invariant(name, "ScalarExec is missing its row evaluator");
+        }
+        if (fn.scalar_kernel != ScalarKernel::None &&
+            scalar_kernel_fn(fn.scalar_kernel) == nullptr) {
+            builtin_invariant(name, "scalar kernel id has no evaluator");
+        }
+        return;
+    }
+
+    if (fn.null_policy != NullPolicy::Propagate) {
+        builtin_invariant(name, "non-scalar entry has a scalar null policy");
+    }
+    if (fn.scalar_kernel != ScalarKernel::None) {
+        builtin_invariant(name, "non-scalar entry has a scalar kernel id");
+    }
+    if (const auto* transform = std::get_if<TransformExec>(&fn.exec);
+        transform != nullptr && transform->column_eval == nullptr) {
+        builtin_invariant(name, "TransformExec is missing its column evaluator");
+    }
+    if (const auto* generator = std::get_if<GeneratorExec>(&fn.exec);
+        generator != nullptr && generator->column_eval == nullptr) {
+        builtin_invariant(name, "GeneratorExec is missing its column evaluator");
+    }
+    if (const auto* aggregate = std::get_if<AggregateExec>(&fn.exec);
+        aggregate != nullptr && static_cast<std::uint8_t>(aggregate->func) >
+                                    static_cast<std::uint8_t>(ir::AggFunc::Kurtosis)) {
+        builtin_invariant(name, "AggregateExec has an invalid aggregate function id");
+    }
+}
+
+}  // namespace
+
 const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
     using IT = std::expected<ExprType, std::string>;
     using IV = std::expected<ExprValue, std::string>;
@@ -847,6 +896,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         // agree with the exec alternative each entry holds. Checked once, at
         // registry construction.
         for (const auto& [name, fn] : m) {
+            validate_builtin(name, fn);
             if (ir::fn_kind(name) != fn_kind_of(fn)) {
                 invariant_violation(
                     "builtins(): ir::fn_kind disagrees with the registry's exec "

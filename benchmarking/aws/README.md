@@ -103,6 +103,7 @@ git push                                            # both commits must be on or
 ./benchmarking/aws/compare-git.sh                   # HEAD~1 vs HEAD, all suites
 ./benchmarking/aws/compare-git.sh --base v0.3.0 --target HEAD
 ./benchmarking/aws/compare-git.sh --suite sort,groupagg,join --repeats 7
+./benchmarking/aws/compare-git.sh --base v0.3.0 --target HEAD --replica-control
 ```
 
 The instance regenerates the (untracked) 4M-row benchmark CSVs so both commits
@@ -130,13 +131,15 @@ where a reclaim is cheap to retry). Force either with `--on-demand` / `--spot`.
 Sampling defaults are lean (`--repeats 3 --iters 5`) because the dedicated box
 barely drifts — that's enough to pin a verdict. Bump them only if a specific
 delta looks marginal; the cost is real at scale (the suite runs
-`(1+iters)×repeats×2` times).
+`(1+iters)×repeats×2` times, or `×3` with replica control).
 
 Key options: `--base/--target REF`, `--suite a,b,c`, `--repeats N` (default 3),
-`--iters N` (default 5), `--data-rows N` (default 4000000), `--serial` (disable
-interleaving), `--taskset CPUSET` (default `2-3`), `--type` (default: auto),
-`--on-demand`. A 4M run is typically 15-30 min and well under $0.20; a 32M run
-is slower and on a bigger box, so budget more.
+`--iters N` (default 5), `--data-rows N` (default 4000000),
+`--replica-control` (third same-source build with balanced run positions),
+`--serial` (disable interleaving when no replica is requested), `--taskset
+CPUSET` (default `2-3`), `--type` (default: auto), `--on-demand`. A 4M run is
+typically 15-30 min and well under $0.20; a 32M run is slower and on a bigger
+box, so budget more.
 
 > Locally, `benchmarking/compare_ibex_git.sh --interleave` gives the same
 > drift-cancelling A/B without EC2 — just noisier on a shared/thermal-throttling

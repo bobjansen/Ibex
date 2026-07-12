@@ -558,76 +558,324 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
     return static_cast<std::uint32_t>(nodes.size() - 1);
 }
 
-auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
-                                std::size_t row) -> double;
+constexpr std::size_t kNumericUpdateBlockRows = 256;
+constexpr std::uint8_t kNumericEvalInt = 1U;
+constexpr std::uint8_t kNumericEvalDouble = 2U;
 
-auto eval_numeric_update_int(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
-                             std::size_t row) -> std::int64_t {
+// NumericUpdateNode is post-order. Evaluate it in small blocks so operator
+// dispatch happens per node/block and each inner loop can auto-vectorize.
+template <typename T>
+struct NumericBlockValue {
+    const T* data = nullptr;  // nullptr means broadcast `scalar`.
+    T scalar{};
+};
+
+auto mark_numeric_double_subtree(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
+                                 std::vector<std::uint8_t>& modes) -> void {
+    if ((modes[idx] & kNumericEvalDouble) != 0U) {
+        return;
+    }
+    modes[idx] |= kNumericEvalDouble;
     const auto& node = nodes[idx];
     switch (node.kind) {
-        case NumericUpdateNode::Kind::IntColumn:
-            return node.i64[row];
-        case NumericUpdateNode::Kind::IntLiteral:
-            return node.int_lit;
-        case NumericUpdateNode::Kind::Op: {
-            const auto lhs = eval_numeric_update_int(nodes, node.left, row);
-            const auto rhs = eval_numeric_update_int(nodes, node.right, row);
-            return apply_int_op(node.op, lhs, rhs);
-        }
-        case NumericUpdateNode::Kind::Min: {
-            const auto lhs = eval_numeric_update_int(nodes, node.left, row);
-            const auto rhs = eval_numeric_update_int(nodes, node.right, row);
-            return rhs < lhs ? rhs : lhs;
-        }
-        case NumericUpdateNode::Kind::Max: {
-            const auto lhs = eval_numeric_update_int(nodes, node.left, row);
-            const auto rhs = eval_numeric_update_int(nodes, node.right, row);
-            return rhs > lhs ? rhs : lhs;
-        }
-        case NumericUpdateNode::Kind::UnaryToInt:
-            return node.int_fn(eval_numeric_update_double(nodes, node.left, row));
-        case NumericUpdateNode::Kind::DoubleColumn:
-        case NumericUpdateNode::Kind::DoubleLiteral:
+        case NumericUpdateNode::Kind::Op:
+        case NumericUpdateNode::Kind::Min:
+        case NumericUpdateNode::Kind::Max:
+            mark_numeric_double_subtree(nodes, node.left, modes);
+            mark_numeric_double_subtree(nodes, node.right, modes);
+            break;
         case NumericUpdateNode::Kind::UnaryDouble:
-            invariant_violation("eval_numeric_update_int: unexpected double node");
+        case NumericUpdateNode::Kind::UnaryToInt:
+            mark_numeric_double_subtree(nodes, node.left, modes);
+            break;
+        case NumericUpdateNode::Kind::IntColumn:
+        case NumericUpdateNode::Kind::DoubleColumn:
+        case NumericUpdateNode::Kind::IntLiteral:
+        case NumericUpdateNode::Kind::DoubleLiteral:
+            break;
     }
-    invariant_violation("eval_numeric_update_int: unknown node kind");
 }
 
-auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
-                                std::size_t row) -> double {
+auto mark_numeric_int_subtree(const std::vector<NumericUpdateNode>& nodes, std::uint32_t idx,
+                              std::vector<std::uint8_t>& modes) -> void {
+    if ((modes[idx] & kNumericEvalInt) != 0U) {
+        return;
+    }
+    modes[idx] |= kNumericEvalInt;
     const auto& node = nodes[idx];
     switch (node.kind) {
-        case NumericUpdateNode::Kind::IntColumn:
-            return static_cast<double>(node.i64[row]);
-        case NumericUpdateNode::Kind::DoubleColumn:
-            return node.dbl[row];
-        case NumericUpdateNode::Kind::IntLiteral:
-            return static_cast<double>(node.int_lit);
-        case NumericUpdateNode::Kind::DoubleLiteral:
-            return node.dbl_lit;
-        case NumericUpdateNode::Kind::Op: {
-            const auto lhs = eval_numeric_update_double(nodes, node.left, row);
-            const auto rhs = eval_numeric_update_double(nodes, node.right, row);
-            return apply_double_op(node.op, lhs, rhs);
-        }
-        case NumericUpdateNode::Kind::Min: {
-            const auto lhs = eval_numeric_update_double(nodes, node.left, row);
-            const auto rhs = eval_numeric_update_double(nodes, node.right, row);
-            return rhs < lhs ? rhs : lhs;  // NaN-parity with the scalar pmin
-        }
-        case NumericUpdateNode::Kind::Max: {
-            const auto lhs = eval_numeric_update_double(nodes, node.left, row);
-            const auto rhs = eval_numeric_update_double(nodes, node.right, row);
-            return rhs > lhs ? rhs : lhs;
-        }
-        case NumericUpdateNode::Kind::UnaryDouble:
-            return node.dbl_fn(eval_numeric_update_double(nodes, node.left, row));
+        case NumericUpdateNode::Kind::Op:
+        case NumericUpdateNode::Kind::Min:
+        case NumericUpdateNode::Kind::Max:
+            mark_numeric_int_subtree(nodes, node.left, modes);
+            mark_numeric_int_subtree(nodes, node.right, modes);
+            break;
         case NumericUpdateNode::Kind::UnaryToInt:
-            return static_cast<double>(
-                node.int_fn(eval_numeric_update_double(nodes, node.left, row)));
+            // round-like nodes evaluate their input with the Double semantics of
+            // the old recursive evaluator, even when the child is Int-typed.
+            mark_numeric_double_subtree(nodes, node.left, modes);
+            break;
+        case NumericUpdateNode::Kind::IntColumn:
+        case NumericUpdateNode::Kind::IntLiteral:
+            break;
+        case NumericUpdateNode::Kind::DoubleColumn:
+        case NumericUpdateNode::Kind::DoubleLiteral:
+        case NumericUpdateNode::Kind::UnaryDouble:
+            invariant_violation("mark_numeric_int_subtree: unexpected double node");
     }
-    invariant_violation("eval_numeric_update_double: unknown node kind");
+}
+
+template <typename T, typename Fn>
+auto eval_numeric_binary_block(T* dst, NumericBlockValue<T> lhs, NumericBlockValue<T> rhs,
+                               std::size_t count, Fn&& fn) -> void {
+    if (lhs.data != nullptr && rhs.data != nullptr) {
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = fn(lhs.data[i], rhs.data[i]);
+        }
+    } else if (lhs.data != nullptr) {
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = fn(lhs.data[i], rhs.scalar);
+        }
+    } else if (rhs.data != nullptr) {
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = fn(lhs.scalar, rhs.data[i]);
+        }
+    } else {
+        std::fill_n(dst, count, fn(lhs.scalar, rhs.scalar));
+    }
+}
+
+auto eval_numeric_double_node_block(const NumericUpdateNode& node, std::uint32_t idx,
+                                    std::vector<NumericBlockValue<double>>& values, double* dst,
+                                    std::size_t row_offset, std::size_t count) -> void {
+    auto& value = values[idx];
+    switch (node.kind) {
+        case NumericUpdateNode::Kind::IntColumn:
+            for (std::size_t i = 0; i < count; ++i) {
+                dst[i] = static_cast<double>(node.i64[row_offset + i]);
+            }
+            value = NumericBlockValue<double>{.data = dst};
+            return;
+        case NumericUpdateNode::Kind::DoubleColumn:
+            value = NumericBlockValue<double>{.data = node.dbl + row_offset};
+            return;
+        case NumericUpdateNode::Kind::IntLiteral:
+            value = NumericBlockValue<double>{.scalar = static_cast<double>(node.int_lit)};
+            return;
+        case NumericUpdateNode::Kind::DoubleLiteral:
+            value = NumericBlockValue<double>{.scalar = node.dbl_lit};
+            return;
+        case NumericUpdateNode::Kind::Op: {
+            const auto lhs = values[node.left];
+            const auto rhs = values[node.right];
+            value = NumericBlockValue<double>{.data = dst};
+            switch (node.op) {
+                case ir::ArithmeticOp::Add:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](double a, double b) { return a + b; });
+                    return;
+                case ir::ArithmeticOp::Sub:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](double a, double b) { return a - b; });
+                    return;
+                case ir::ArithmeticOp::Mul:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](double a, double b) { return a * b; });
+                    return;
+                case ir::ArithmeticOp::Div:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](double a, double b) { return a / b; });
+                    return;
+                case ir::ArithmeticOp::Mod:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](double a, double b) { return std::fmod(a, b); });
+                    return;
+            }
+            invariant_violation("eval_numeric_double_node_block: unknown arithmetic op");
+        }
+        case NumericUpdateNode::Kind::Min:
+            eval_numeric_binary_block(dst, values[node.left], values[node.right], count,
+                                      [](double a, double b) { return b < a ? b : a; });
+            value = NumericBlockValue<double>{.data = dst};
+            return;
+        case NumericUpdateNode::Kind::Max:
+            eval_numeric_binary_block(dst, values[node.left], values[node.right], count,
+                                      [](double a, double b) { return b > a ? b : a; });
+            value = NumericBlockValue<double>{.data = dst};
+            return;
+        case NumericUpdateNode::Kind::UnaryDouble: {
+            const auto src = values[node.left];
+            if (src.data == nullptr) {
+                value = NumericBlockValue<double>{.scalar = node.dbl_fn(src.scalar)};
+            } else {
+                for (std::size_t i = 0; i < count; ++i) {
+                    dst[i] = node.dbl_fn(src.data[i]);
+                }
+                value = NumericBlockValue<double>{.data = dst};
+            }
+            return;
+        }
+        case NumericUpdateNode::Kind::UnaryToInt: {
+            const auto src = values[node.left];
+            if (src.data == nullptr) {
+                value = NumericBlockValue<double>{.scalar =
+                                                      static_cast<double>(node.int_fn(src.scalar))};
+            } else {
+                for (std::size_t i = 0; i < count; ++i) {
+                    dst[i] = static_cast<double>(node.int_fn(src.data[i]));
+                }
+                value = NumericBlockValue<double>{.data = dst};
+            }
+            return;
+        }
+    }
+    invariant_violation("eval_numeric_double_node_block: unknown node kind");
+}
+
+auto eval_numeric_int_node_block(const NumericUpdateNode& node, std::uint32_t idx,
+                                 std::vector<NumericBlockValue<std::int64_t>>& int_values,
+                                 const std::vector<NumericBlockValue<double>>& double_values,
+                                 std::int64_t* dst, std::size_t row_offset, std::size_t count)
+    -> void {
+    auto& value = int_values[idx];
+    switch (node.kind) {
+        case NumericUpdateNode::Kind::IntColumn:
+            value = NumericBlockValue<std::int64_t>{.data = node.i64 + row_offset};
+            return;
+        case NumericUpdateNode::Kind::IntLiteral:
+            value = NumericBlockValue<std::int64_t>{.scalar = node.int_lit};
+            return;
+        case NumericUpdateNode::Kind::Op: {
+            const auto lhs = int_values[node.left];
+            const auto rhs = int_values[node.right];
+            value = NumericBlockValue<std::int64_t>{.data = dst};
+            switch (node.op) {
+                case ir::ArithmeticOp::Add:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](std::int64_t a, std::int64_t b) { return a + b; });
+                    return;
+                case ir::ArithmeticOp::Sub:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](std::int64_t a, std::int64_t b) { return a - b; });
+                    return;
+                case ir::ArithmeticOp::Mul:
+                    eval_numeric_binary_block(dst, lhs, rhs, count,
+                                              [](std::int64_t a, std::int64_t b) { return a * b; });
+                    return;
+                case ir::ArithmeticOp::Div:
+                    eval_numeric_binary_block(
+                        dst, lhs, rhs, count,
+                        [](std::int64_t a, std::int64_t b) { return safe_idiv(a, b); });
+                    return;
+                case ir::ArithmeticOp::Mod:
+                    eval_numeric_binary_block(
+                        dst, lhs, rhs, count,
+                        [](std::int64_t a, std::int64_t b) { return safe_imod(a, b); });
+                    return;
+            }
+            invariant_violation("eval_numeric_int_node_block: unknown arithmetic op");
+        }
+        case NumericUpdateNode::Kind::Min:
+            eval_numeric_binary_block(dst, int_values[node.left], int_values[node.right], count,
+                                      [](std::int64_t a, std::int64_t b) { return b < a ? b : a; });
+            value = NumericBlockValue<std::int64_t>{.data = dst};
+            return;
+        case NumericUpdateNode::Kind::Max:
+            eval_numeric_binary_block(dst, int_values[node.left], int_values[node.right], count,
+                                      [](std::int64_t a, std::int64_t b) { return b > a ? b : a; });
+            value = NumericBlockValue<std::int64_t>{.data = dst};
+            return;
+        case NumericUpdateNode::Kind::UnaryToInt: {
+            const auto src = double_values[node.left];
+            if (src.data == nullptr) {
+                value = NumericBlockValue<std::int64_t>{.scalar = node.int_fn(src.scalar)};
+            } else {
+                for (std::size_t i = 0; i < count; ++i) {
+                    dst[i] = node.int_fn(src.data[i]);
+                }
+                value = NumericBlockValue<std::int64_t>{.data = dst};
+            }
+            return;
+        }
+        case NumericUpdateNode::Kind::DoubleColumn:
+        case NumericUpdateNode::Kind::DoubleLiteral:
+        case NumericUpdateNode::Kind::UnaryDouble:
+            invariant_violation("eval_numeric_int_node_block: unexpected double node");
+    }
+    invariant_violation("eval_numeric_int_node_block: unknown node kind");
+}
+
+auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std::uint32_t root,
+                                std::size_t rows, ExprType output_kind) -> ColumnValue {
+    std::vector<std::uint8_t> modes(nodes.size(), 0U);
+    if (output_kind == ExprType::Double) {
+        mark_numeric_double_subtree(nodes, root, modes);
+    } else {
+        mark_numeric_int_subtree(nodes, root, modes);
+    }
+
+    const bool needs_double = std::ranges::any_of(
+        modes, [](std::uint8_t mode) { return (mode & kNumericEvalDouble) != 0U; });
+    const bool needs_int = std::ranges::any_of(
+        modes, [](std::uint8_t mode) { return (mode & kNumericEvalInt) != 0U; });
+    std::vector<double> double_scratch(needs_double ? nodes.size() * kNumericUpdateBlockRows : 0U);
+    std::vector<std::int64_t> int_scratch(needs_int ? nodes.size() * kNumericUpdateBlockRows : 0U);
+    std::vector<NumericBlockValue<double>> double_values(nodes.size());
+    std::vector<NumericBlockValue<std::int64_t>> int_values(nodes.size());
+
+    if (output_kind == ExprType::Double) {
+        Column<double> out;
+        out.resize_for_overwrite(rows);
+        for (std::size_t offset = 0; offset < rows; offset += kNumericUpdateBlockRows) {
+            const std::size_t count = std::min(kNumericUpdateBlockRows, rows - offset);
+            for (std::uint32_t idx = 0; idx <= root; ++idx) {
+                if ((modes[idx] & kNumericEvalDouble) == 0U) {
+                    continue;
+                }
+                double* dst = idx == root ? out.data() + offset
+                                          : double_scratch.data() + static_cast<std::size_t>(idx) *
+                                                                        kNumericUpdateBlockRows;
+                eval_numeric_double_node_block(nodes[idx], idx, double_values, dst, offset, count);
+            }
+            const auto root_value = double_values[root];
+            double* out_block = out.data() + offset;
+            if (root_value.data == nullptr) {
+                std::fill_n(out_block, count, root_value.scalar);
+            } else if (root_value.data != out_block) {
+                std::copy_n(root_value.data, count, out_block);
+            }
+        }
+        return ColumnValue{std::move(out)};
+    }
+
+    Column<std::int64_t> out;
+    out.resize_for_overwrite(rows);
+    for (std::size_t offset = 0; offset < rows; offset += kNumericUpdateBlockRows) {
+        const std::size_t count = std::min(kNumericUpdateBlockRows, rows - offset);
+        for (std::uint32_t idx = 0; idx <= root; ++idx) {
+            if ((modes[idx] & kNumericEvalDouble) != 0U) {
+                double* dst =
+                    double_scratch.data() + static_cast<std::size_t>(idx) * kNumericUpdateBlockRows;
+                eval_numeric_double_node_block(nodes[idx], idx, double_values, dst, offset, count);
+            }
+            if ((modes[idx] & kNumericEvalInt) != 0U) {
+                std::int64_t* dst = idx == root
+                                        ? out.data() + offset
+                                        : int_scratch.data() + static_cast<std::size_t>(idx) *
+                                                                   kNumericUpdateBlockRows;
+                eval_numeric_int_node_block(nodes[idx], idx, int_values, double_values, dst, offset,
+                                            count);
+            }
+        }
+        const auto root_value = int_values[root];
+        std::int64_t* out_block = out.data() + offset;
+        if (root_value.data == nullptr) {
+            std::fill_n(out_block, count, root_value.scalar);
+        } else if (root_value.data != out_block) {
+            std::copy_n(root_value.data, count, out_block);
+        }
+    }
+    return ColumnValue{std::move(out)};
 }
 
 // SIMD fast path for the hot 2-argument `pmin`/`pmax` shape (e.g. the
@@ -635,7 +883,7 @@ auto eval_numeric_update_double(const std::vector<NumericUpdateNode>& nodes, std
 // branch-free array kernels. Only fires when both operands resolve to a raw
 // pointer/scalar of the *same* numeric category (both Double or both Int) — a
 // mixed int/double clip or a nested pmin(pmax(...)) falls through to the generic
-// NumericUpdateNode tree-walk. The compare order (`b < a ? b : a`) matches the
+// blocked NumericUpdateNode evaluator. The compare order (`b < a ? b : a`) matches the
 // scalar pmin builtin for NaN/tie parity.
 auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size_t rows,
                              ExprType output_kind, const ScalarRegistry* scalars)
@@ -979,23 +1227,7 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std:
         return std::nullopt;
     }
 
-    if (output_kind == ExprType::Double) {
-        Column<double> out;
-        out.resize_for_overwrite(rows);
-        double* dst = out.data();
-        for (std::size_t row = 0; row < rows; ++row) {
-            dst[row] = eval_numeric_update_double(nodes, *root, row);
-        }
-        return ColumnValue{std::move(out)};
-    }
-
-    Column<std::int64_t> out;
-    out.resize_for_overwrite(rows);
-    std::int64_t* dst = out.data();
-    for (std::size_t row = 0; row < rows; ++row) {
-        dst[row] = eval_numeric_update_int(nodes, *root, row);
-    }
-    return ColumnValue{std::move(out)};
+    return eval_numeric_update_blocks(nodes, *root, rows, output_kind);
 }
 
 namespace {

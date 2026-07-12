@@ -1267,6 +1267,64 @@ TEST_CASE("Interpret update fuses nested numeric arithmetic") {
     REQUIRE((*col)[2] == Catch::Approx(10.0));
 }
 
+TEST_CASE("Interpret blocked nested numeric update across block boundaries") {
+    constexpr std::size_t rows = 513;
+    Column<double> price;
+    Column<double> discount;
+    Column<double> tax;
+    Column<std::int64_t> quantity;
+    Column<std::int64_t> divisor;
+    price.reserve(rows);
+    discount.reserve(rows);
+    tax.reserve(rows);
+    quantity.reserve(rows);
+    divisor.reserve(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        price.push_back(10.0 + static_cast<double>(i % 31));
+        discount.push_back(static_cast<double>(i % 7) / 100.0);
+        tax.push_back(static_cast<double>(i % 5) / 100.0);
+        quantity.push_back(static_cast<std::int64_t>(i % 19));
+        divisor.push_back(i % 11 == 0 ? 0 : static_cast<std::int64_t>((i % 5) + 1));
+    }
+
+    runtime::Table table;
+    table.add_column("price", price);
+    table.add_column("discount", discount);
+    table.add_column("tax", tax);
+    table.add_column("quantity", quantity);
+    table.add_column("divisor", divisor);
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    auto ir = require_ir(
+        "t[update { revenue = price * (1.0 - discount) * (1.0 + tax), "
+        "mixed = (quantity + 2) * price, "
+        "int_expr = ((quantity % divisor) + 3) * (quantity - 1), "
+        "rounded = round((price * 2.0) + discount, nearest), "
+        "clipped = pmin(pmax(price + tax, -3.0), 35.0) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto& revenue = std::get<Column<double>>(*result->find("revenue"));
+    const auto& mixed = std::get<Column<double>>(*result->find("mixed"));
+    const auto& int_expr = std::get<Column<std::int64_t>>(*result->find("int_expr"));
+    const auto& rounded = std::get<Column<std::int64_t>>(*result->find("rounded"));
+    const auto& clipped = std::get<Column<double>>(*result->find("clipped"));
+    for (std::size_t i = 0; i < rows; ++i) {
+        const double p = price[i];
+        const double d = discount[i];
+        const double t = tax[i];
+        const std::int64_t q = quantity[i];
+        const std::int64_t div = divisor[i];
+        const std::int64_t expected_mod = div == 0 ? 0 : q % div;
+        CHECK(revenue[i] == Catch::Approx(p * (1.0 - d) * (1.0 + t)));
+        CHECK(mixed[i] == Catch::Approx(static_cast<double>(q + 2) * p));
+        CHECK(int_expr[i] == (expected_mod + 3) * (q - 1));
+        CHECK(rounded[i] == static_cast<std::int64_t>(std::llround((p * 2.0) + d)));
+        CHECK(clipped[i] == Catch::Approx(std::min(std::max(p + t, -3.0), 35.0)));
+    }
+}
+
 TEST_CASE("Interpret update fused numeric arithmetic preserves int div and mod semantics") {
     runtime::Table table;
     table.add_column("a", Column<std::int64_t>{10, std::numeric_limits<std::int64_t>::min(), 7});

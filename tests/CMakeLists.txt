@@ -21,6 +21,7 @@ set(IBEX_TEST_SOURCES
     test_repl.cpp
     test_lower.cpp
     test_interpreter.cpp
+    test_interrupt.cpp
     test_codegen.cpp
     test_join.cpp
     test_operator.cpp

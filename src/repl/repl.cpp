@@ -9,6 +9,7 @@
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
@@ -41,6 +42,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <signal.h>
 #endif
 #include <filesystem>
 #include <fstream>
@@ -87,6 +89,10 @@ struct CompletionContext {
     const ExternDeclRegistry* extern_decls = nullptr;
     const ImportRegistry* imports = nullptr;
 };
+
+/// Result of one prompt read. `Interrupted` means the user pressed Ctrl+C
+/// at the prompt: the line is discarded and the loop shows a fresh prompt.
+enum class ReadLineStatus : std::uint8_t { Line, Eof, Interrupted };
 
 #ifdef IBEX_HAS_READLINE
 constexpr std::string_view kColonCommands[] = {
@@ -501,8 +507,31 @@ auto repl_completion(const char* text, int start, int end) -> char** {
                         text);
 }
 
+/// Polled by readline roughly 10x/second while it waits for input (and right
+/// after a signal EINTRs the wait). On Ctrl+C, discard the pending line and
+/// set rl_done, which makes rl_read_key() hand back a synthetic newline so
+/// readline() returns the (emptied) line to the caller. rl_done is only
+/// honored on the rl_event_hook path — rl_signal_event_hook does not unblock
+/// rl_getc's internal read loop.
+auto interrupt_event_hook() -> int {
+    if (runtime::interrupt_requested()) {
+        rl_replace_line("", 0);
+        rl_done = 1;
+    }
+    return 0;
+}
+
 void configure_line_editing() {
     rl_attempted_completion_function = repl_completion;
+    rl_event_hook = interrupt_event_hook;
+#if defined(RL_READLINE_VERSION) && RL_READLINE_VERSION >= 0x0500
+    // The REPL owns SIGINT (see install_interrupt_handler): GNU readline must
+    // not install its own handlers, or it swallows the Ctrl+C and resumes the
+    // read. Guarded to real GNU readline — libedit's shim (macOS) reports 4.2;
+    // there Ctrl+C surfaces as a null return, which read_repl_line already
+    // treats as an interruption when the flag is set.
+    rl_catch_signals = 0;
+#endif
 }
 
 auto should_record_history(std::string_view line) -> bool {
@@ -513,10 +542,19 @@ auto should_record_history(std::string_view line) -> bool {
     return !line.empty() && line != ":q" && line != ":quit" && line != ":exit";
 }
 
-auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
+auto read_repl_line(const std::string& prompt, std::string& out) -> ReadLineStatus {
+    // Drop any Ctrl+C that landed between the end of the previous evaluation
+    // and this prompt — it has already done its job (or arrived too late).
+    runtime::clear_interrupt();
     const std::unique_ptr<char, decltype(&std::free)> raw{::readline(prompt.c_str()), &std::free};
+    if (runtime::consume_interrupt()) {
+        // Covers both the event-hook path (emptied line) and readline
+        // variants that surface the EINTR as a null return.
+        fmt::print("^C\n");
+        return ReadLineStatus::Interrupted;
+    }
     if (raw == nullptr) {
-        return false;
+        return ReadLineStatus::Eof;
     }
 
     out.assign(raw.get());
@@ -526,16 +564,27 @@ auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
             ::add_history(raw.get());
         }
     }
-    return true;
+    return ReadLineStatus::Line;
 }
 #else
 void configure_line_editing() {}
 
 void set_completion_context(CompletionContext) {}
 
-auto read_repl_line(const std::string& prompt, std::string& out) -> bool {
+auto read_repl_line(const std::string& prompt, std::string& out) -> ReadLineStatus {
+    runtime::clear_interrupt();
     fmt::print("{}", prompt);
-    return static_cast<bool>(std::getline(std::cin, out));
+    if (std::getline(std::cin, out)) {
+        return ReadLineStatus::Line;
+    }
+    if (runtime::consume_interrupt()) {
+        // The read was EINTR'd by Ctrl+C: clear the stream error and hand
+        // control back to the loop instead of treating it as EOF.
+        std::cin.clear();
+        fmt::print("^C\n");
+        return ReadLineStatus::Interrupted;
+    }
+    return ReadLineStatus::Eof;
 }
 
 auto resolve_history_path(const ReplConfig& /*config*/) -> std::string {
@@ -545,6 +594,27 @@ auto resolve_history_path(const ReplConfig& /*config*/) -> std::string {
 void load_history_file(const std::string& /*path*/, std::size_t /*limit*/) {}
 
 void save_history_file(const std::string& /*path*/, std::size_t /*limit*/) {}
+#endif
+
+#ifndef _WIN32
+/// Only sets the atomic flag; everything else is polled cooperatively at
+/// evaluation boundaries (see ibex/runtime/interrupt.hpp).
+void handle_sigint(int /*signum*/) {
+    runtime::request_interrupt();
+}
+
+void install_interrupt_handler() {
+    struct sigaction action{};
+    action.sa_handler = handle_sigint;
+    sigemptyset(&action.sa_mask);
+    // No SA_RESTART: blocking reads (the prompt, blocking externs) must
+    // return EINTR so a Ctrl+C is noticed promptly.
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, nullptr);
+}
+#else
+// Windows keeps default Ctrl+C behavior for now (process exit).
+void install_interrupt_handler() {}
 #endif
 
 std::string_view trim(std::string_view text);
@@ -3473,6 +3543,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
     }
     for (std::size_t stmt_index = 0; stmt_index < statements.size(); ++stmt_index) {
         auto& stmt = statements[stmt_index];
+        // Statement-level interruption boundary: a Ctrl+C during a multi
+        // statement batch (:load, script) stops before the next statement.
+        if (runtime::interrupt_requested()) {
+            fmt::print("error: interrupted\n");
+            return false;
+        }
         if (print_comment_groups != nullptr && stmt_index < print_comment_groups->size()) {
             print_comment_group((*print_comment_groups)[stmt_index]);
         }
@@ -3868,6 +3944,10 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     bool timing_enabled = false;
     bool load_comments_enabled = false;
     configure_line_editing();
+    // Interactive sessions own SIGINT: Ctrl+C interrupts the running
+    // evaluation (or clears the prompt) instead of killing the process.
+    // Scripts (run_file) keep the default disposition.
+    install_interrupt_handler();
     const std::string history_path = resolve_history_path(config);
     load_history_file(history_path, config.history_limit);
 
@@ -3905,7 +3985,15 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             .extern_decls = &extern_decls,
             .imports = &imports,
         });
-        if (!read_repl_line(pending.empty() ? config.prompt : continuation_prompt, line)) {
+        const auto status =
+            read_repl_line(pending.empty() ? config.prompt : continuation_prompt, line);
+        if (status == ReadLineStatus::Interrupted) {
+            // Ctrl+C at the prompt: discard the line and any multi-line
+            // continuation in progress, then show a fresh prompt.
+            pending.clear();
+            continue;
+        }
+        if (status == ReadLineStatus::Eof) {
             fmt::print("\n");
             if (!pending.empty()) {
                 submit_buffer(pending);  // surface the error in the unterminated buffer

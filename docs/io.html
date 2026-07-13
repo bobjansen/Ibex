@@ -354,9 +354,17 @@ python3 demo/kafka/ohlc_ws_client.py --port 8776</code></pre>
           and the same reader for disk, public HTTPS URLs, presigned URLs, or
           S3-compatible object storage.
         </p>
+        <p>
+          Ibex reads referenced Parquet columns directly into Ibex storage. For
+          a row-local filter over a single scan, it decodes predicate columns
+          first and late-materializes the other columns only for surviving row
+          indices. Reusing the same binding in multiple scan positions safely
+          falls back to ordinary column projection.
+        </p>
 <pre><code><span class="kw">import</span> <span class="str">"parquet"</span>;
 
 <span class="kw">let</span> prices = <span class="fn-name">read_parquet</span>(<span class="str">"data/prices.parquet"</span>);
+<span class="kw">let</span> liquid = prices[<span class="kw">filter</span> size &gt; 1000, <span class="kw">select</span> { ts, symbol, price }];
 <span class="kw">let</span> public_prices = <span class="fn-name">read_parquet</span>(<span class="str">"https://data.example.com/prices.parquet"</span>);
 <span class="kw">let</span> cloud = <span class="fn-name">read_parquet</span>(<span class="str">"s3://market-data/prices.parquet?region=us-east-1"</span>);</code></pre>
       </article>

@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -16,6 +17,7 @@ namespace {
 /// so a test can assert on what was read rather than only on what came back.
 struct FakeSource {
     std::vector<std::vector<std::string>> decode_calls;
+    std::vector<std::optional<runtime::Selection>> selections;
 
     auto schema() const -> runtime::Table {
         runtime::Table t;
@@ -25,27 +27,53 @@ struct FakeSource {
         return t;
     }
 
-    auto decode(const std::vector<std::string>& names)
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection)
         -> std::expected<runtime::Table, std::string> {
         decode_calls.push_back(names);
+        selections.push_back(selection == nullptr ? std::nullopt : std::optional{*selection});
+        const runtime::Selection all{0, 1, 2};
+        const auto& rows = selection == nullptr ? all : *selection;
         runtime::Table out;
         for (const auto& name : names) {
             if (name == "a") {
-                out.add_column("a", Column<std::int64_t>{std::vector<std::int64_t>{1, 2, 3}});
+                std::vector<std::int64_t> values;
+                for (auto row : rows) {
+                    values.push_back(static_cast<std::int64_t>(row + 1));
+                }
+                out.add_column("a", Column<std::int64_t>{std::move(values)});
             } else if (name == "b") {
-                out.add_column("b", Column<double>{std::vector<double>{1.5, 2.5, 3.5}});
+                std::vector<double> values;
+                for (auto row : rows) {
+                    values.push_back(static_cast<double>(row) + 1.5);
+                }
+                out.add_column("b", Column<double>{std::move(values)});
             } else if (name == "c") {
-                out.add_column("c", Column<std::string>{std::vector<std::string>{"x", "y", "z"}});
+                const std::vector<std::string> source{"x", "y", "z"};
+                std::vector<std::string> values;
+                for (auto row : rows) {
+                    values.push_back(source[row]);
+                }
+                out.add_column("c", Column<std::string>{std::move(values)});
             }
         }
+        out.logical_rows = rows.size();
         return out;
     }
 };
 
 auto make_lazy(FakeSource& source) -> runtime::LazyTable {
-    return runtime::LazyTable{source.schema(), 3, [&source](const std::vector<std::string>& names) {
-                                  return source.decode(names);
-                              }};
+    return runtime::LazyTable{
+        source.schema(), 3,
+        [&source](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        }};
+}
+
+auto greater_than(std::string name, std::int64_t value) -> ir::Expr {
+    return ir::Expr{.node = ir::CompareExpr{
+                        .op = ir::CompareOp::Gt,
+                        .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = name}}),
+                        .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = value}})}};
 }
 
 auto names_of(const runtime::Table& table) -> std::vector<std::string> {
@@ -144,14 +172,52 @@ TEST_CASE("LazyTable: materialize decodes every column", "[runtime][lazy_table]"
     CHECK(table->rows() == 3);
 }
 
+TEST_CASE("LazyTable: project_where decodes predicates before selected payload columns",
+          "[runtime][lazy_table]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    auto table = lazy.project_where({"a", "b"}, {greater_than("a", 1)});
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+    REQUIRE(source.decode_calls.size() == 2);
+    CHECK(source.decode_calls[0] == std::vector<std::string>{"a"});
+    CHECK_FALSE(source.selections[0].has_value());
+    CHECK(source.decode_calls[1] == std::vector<std::string>{"b"});
+    REQUIRE(source.selections[1].has_value());
+    CHECK(*source.selections[1] == runtime::Selection{1, 2});
+
+    const auto* a = std::get_if<Column<std::int64_t>>(table->find("a"));
+    const auto* b = std::get_if<Column<double>>(table->find("b"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK((*a)[0] == 2);
+    CHECK((*a)[1] == 3);
+    CHECK((*b)[0] == 2.5);
+    CHECK((*b)[1] == 3.5);
+}
+
+TEST_CASE("LazyTable: project_where never poisons the whole-column cache",
+          "[runtime][lazy_table]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    REQUIRE(lazy.project_where({"a", "b"}, {greater_than("a", 1)}));
+    auto whole = lazy.project({"a"});
+    REQUIRE(whole);
+    CHECK(whole->rows() == 3);
+    REQUIRE(source.decode_calls.size() == 3);
+    CHECK(source.decode_calls.back() == std::vector<std::string>{"a"});
+    CHECK_FALSE(source.selections.back().has_value());
+}
+
 TEST_CASE("LazyTable: a decode failure surfaces as an error", "[runtime][lazy_table]") {
     runtime::Table schema;
     schema.add_column("a", Column<std::int64_t>{});
     runtime::LazyTable lazy{
         std::move(schema), 3,
-        [](const std::vector<std::string>&) -> std::expected<runtime::Table, std::string> {
-            return std::unexpected("boom");
-        }};
+        [](const std::vector<std::string>&, const runtime::Selection*)
+            -> std::expected<runtime::Table, std::string> { return std::unexpected("boom"); }};
 
     auto table = lazy.project({"a"});
     REQUIRE_FALSE(table);

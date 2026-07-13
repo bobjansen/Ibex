@@ -1,5 +1,6 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
+#include <ibex/ir/scan_predicates.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -187,4 +188,63 @@ TEST_CASE("required_columns: a source the plan never scans is absent", "[ir][req
     auto demand = ir::required_columns(*plan);
 
     CHECK_FALSE(demand.contains("other"));
+}
+
+TEST_CASE("scan_predicates: splits row-local conjuncts directly above a scan",
+          "[ir][scan_predicates]") {
+    ir::Expr predicate{.node = ir::LogicalExpr{.op = ir::LogicalOp::And,
+                                               .left = ir::make_expr_ptr(gt_zero("a")),
+                                               .right = ir::make_expr_ptr(gt_zero("b"))}};
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"payload"})),
+                   with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, std::move(predicate)),
+                              make_scan("t")));
+
+    auto predicates = ir::scan_predicates(*plan);
+    REQUIRE(predicates.contains("t"));
+    CHECK(predicates.at("t").size() == 2);
+}
+
+TEST_CASE("scan_predicates: rejects a filter containing a non-local conjunct",
+          "[ir][scan_predicates]") {
+    ir::CallExpr lag;
+    lag.callee = "lag";
+    lag.args.push_back(col("a"));
+    ir::Expr non_local{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = std::move(lag)}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}};
+    ir::Expr predicate{.node = ir::LogicalExpr{.op = ir::LogicalOp::And,
+                                               .left = ir::make_expr_ptr(std::move(non_local)),
+                                               .right = ir::make_expr_ptr(gt_zero("b"))}};
+    auto plan = with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, std::move(predicate)),
+                           make_scan("t"));
+
+    auto predicates = ir::scan_predicates(*plan);
+    CHECK_FALSE(predicates.contains("t"));
+}
+
+TEST_CASE("scan_predicates: repeated source scans are not selected globally",
+          "[ir][scan_predicates]") {
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
+                                               std::vector<std::string>{"id"});
+    join->add_child(
+        with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")), make_scan("t")));
+    join->add_child(with_child(std::make_unique<ir::FilterNode>(ir::NodeId{4}, gt_zero("b")),
+                               std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t")));
+
+    CHECK_FALSE(ir::scan_predicates(*join).contains("t"));
+}
+
+TEST_CASE("scan_predicates: reaches a scan through a column-only projection",
+          "[ir][scan_predicates]") {
+    auto plan = with_child(
+        std::make_unique<ir::FilterNode>(ir::NodeId{3}, gt_zero("predicate")),
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{2}, refs({"predicate", "payload"})),
+                   make_scan("t")));
+
+    auto predicates = ir::scan_predicates(*plan);
+    REQUIRE(predicates.contains("t"));
+    CHECK(predicates.at("t").size() == 1);
 }

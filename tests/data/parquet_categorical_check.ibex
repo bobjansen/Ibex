@@ -1,0 +1,33 @@
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// read_parquet reads a fully dictionary-encoded string column back as a
+// Categorical. Arrow hands over one dictionary PER ROW GROUP, and the same
+// string can sit at a different code in each, so the reader has to remap every
+// row group's local codes into one unified dictionary.
+//
+// This file is built to make those dictionaries disagree. Parquet's default
+// max_row_group_length is 1048576 rows, so part A fills row group 0 exactly and
+// part B is row group 1:
+//
+//   row group 0 (part A) : alpha, beta, alpha, beta, …  -> dictionary [alpha, beta]
+//   row group 1 (part B) : gamma, beta, gamma, beta, …  -> dictionary [gamma, beta]
+//
+// "gamma" is local code 0 in row group 1, exactly where "alpha" sits in row
+// group 0. A reader that trusted the local codes would silently report every
+// gamma as an alpha — same row count, wrong values. The group counts below only
+// come out right if the remap is correct.
+let part_a = Table(1048576)[update { cat = rep(["alpha", "beta"], length_out = 1048576) }];
+let part_b = Table(200000)[update { cat = rep(["gamma", "beta"], length_out = 200000) }];
+let combined = rbind(part_a, part_b);
+write_parquet(combined, "tests/data/parquet_categorical_check_out.parquet");
+
+let back = read_parquet("tests/data/parquet_categorical_check_out.parquet");
+
+// Expected: alpha 524288, beta 624288 (524288 + 100000), gamma 100000.
+// A local-code (identity) remap instead reports alpha 624288 / gamma 0.
+back[select { n = count() }, by { cat }, order { cat }];
+
+// The same column via a filter, which takes the Categorical fast path
+// (the literal is resolved to a code once, then compared as an int).
+back[filter cat == "gamma", select { gamma_rows = count() }];

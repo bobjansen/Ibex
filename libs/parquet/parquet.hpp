@@ -23,6 +23,7 @@
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/io/api.h>
 #include <arrow/util/formatting.h>
+#include <bit>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -36,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -209,66 +211,109 @@ inline auto open_parquet_input(std::string_view path)
     return input_result.ValueOrDie();
 }
 
+/// Append one Arrow chunk's values to `out`, mapping each through `convert`.
+///
+/// Two things make this quicker than the per-row `push_back` it replaces. The
+/// destination is sized once, so there is no per-element capacity check or size
+/// bookkeeping to stop the compiler vectorizing. And the null test is hoisted
+/// out of the loop: Arrow already knows a chunk's null count, and a Parquet
+/// column with no nulls — the overwhelmingly common case, and every column in
+/// TPC-H — then runs a straight branchless loop over a contiguous buffer.
+///
+/// A null reads as the zero value, which is what the previous per-row code did.
+template <typename ArrowArray, typename Out, typename Convert>
+inline void append_converted(const arrow::Array& array, std::vector<Out>& out, Convert convert) {
+    const auto& typed = static_cast<const ArrowArray&>(array);
+    const auto count = static_cast<std::size_t>(typed.length());
+    const std::size_t base = out.size();
+    out.resize(base + count);
+    if (count == 0) {
+        return;
+    }
+
+    Out* dst = out.data() + base;
+    // Arrow offsets raw_values() by the array's own offset, so this stays
+    // correct for a sliced chunk.
+    const auto* src = typed.raw_values();
+
+    if (typed.null_count() == 0) {
+        for (std::size_t i = 0; i < count; ++i) {
+            dst[i] = convert(src[i]);
+        }
+        return;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = typed.IsNull(static_cast<std::int64_t>(i)) ? Out{} : convert(src[i]);
+    }
+}
+
+/// The same, for a chunk whose Arrow buffer already has the destination's exact
+/// layout — `std::int64_t`, `double`, and the single-field `ibex::Date` /
+/// `ibex::Timestamp` wrappers.
+///
+/// The all-valid case inserts straight from Arrow's buffer, which for a
+/// trivially copyable element is one memmove. Note it does NOT go through
+/// `resize`: resize value-initializes the new elements, so a resize-then-copy
+/// writes the destination twice — enough to cancel out the gain over the
+/// per-row `push_back` this replaces.
+template <typename ArrowArray, typename Out>
+inline void append_same_layout(const arrow::Array& array, std::vector<Out>& out) {
+    using Src = typename ArrowArray::value_type;
+    static_assert(sizeof(Src) == sizeof(Out), "same-layout copy needs equal width");
+    static_assert(std::is_trivially_copyable_v<Out>);
+
+    const auto& typed = static_cast<const ArrowArray&>(array);
+    const auto count = static_cast<std::size_t>(typed.length());
+    if (count == 0) {
+        return;
+    }
+    // Arrow offsets raw_values() by the array's own offset, so this stays
+    // correct for a sliced chunk.
+    const auto* src = typed.raw_values();
+
+    if (typed.null_count() == 0) {
+        const auto* values = reinterpret_cast<const Out*>(src);
+        out.insert(out.end(), values, values + count);
+        return;
+    }
+
+    const std::size_t base = out.size();
+    out.resize(base + count);
+    Out* dst = out.data() + base;
+    for (std::size_t i = 0; i < count; ++i) {
+        dst[i] = typed.IsNull(static_cast<std::int64_t>(i)) ? Out{} : std::bit_cast<Out>(src[i]);
+    }
+}
+
 inline void append_int_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
                               std::vector<std::int64_t>& out) {
+    const auto widen = [](auto value) { return static_cast<std::int64_t>(value); };
     for (const auto& chunk : chunked->chunks()) {
         switch (chunk->type_id()) {
-            case arrow::Type::INT64: {
-                auto arr = std::static_pointer_cast<arrow::Int64Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : arr->Value(i));
-                }
+            case arrow::Type::INT64:
+                append_same_layout<arrow::Int64Array>(*chunk, out);
                 break;
-            }
-            case arrow::Type::INT32: {
-                auto arr = std::static_pointer_cast<arrow::Int32Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : static_cast<std::int64_t>(arr->Value(i)));
-                }
+            case arrow::Type::INT32:
+                append_converted<arrow::Int32Array>(*chunk, out, widen);
                 break;
-            }
-            case arrow::Type::INT16: {
-                auto arr = std::static_pointer_cast<arrow::Int16Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : static_cast<std::int64_t>(arr->Value(i)));
-                }
+            case arrow::Type::INT16:
+                append_converted<arrow::Int16Array>(*chunk, out, widen);
                 break;
-            }
-            case arrow::Type::INT8: {
-                auto arr = std::static_pointer_cast<arrow::Int8Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : static_cast<std::int64_t>(arr->Value(i)));
-                }
+            case arrow::Type::INT8:
+                append_converted<arrow::Int8Array>(*chunk, out, widen);
                 break;
-            }
-            case arrow::Type::UINT64: {
-                auto arr = std::static_pointer_cast<arrow::UInt64Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : static_cast<std::int64_t>(arr->Value(i)));
-                }
+            case arrow::Type::UINT64:
+                append_converted<arrow::UInt64Array>(*chunk, out, widen);
                 break;
-            }
-            case arrow::Type::UINT32: {
-                auto arr = std::static_pointer_cast<arrow::UInt32Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : static_cast<std::int64_t>(arr->Value(i)));
-                }
+            case arrow::Type::UINT32:
+                append_converted<arrow::UInt32Array>(*chunk, out, widen);
                 break;
-            }
-            case arrow::Type::UINT16: {
-                auto arr = std::static_pointer_cast<arrow::UInt16Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : static_cast<std::int64_t>(arr->Value(i)));
-                }
+            case arrow::Type::UINT16:
+                append_converted<arrow::UInt16Array>(*chunk, out, widen);
                 break;
-            }
-            case arrow::Type::UINT8: {
-                auto arr = std::static_pointer_cast<arrow::UInt8Array>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0 : static_cast<std::int64_t>(arr->Value(i)));
-                }
+            case arrow::Type::UINT8:
+                append_converted<arrow::UInt8Array>(*chunk, out, widen);
                 break;
-            }
             default:
                 throw std::runtime_error("read_parquet: unsupported integer column type");
         }
@@ -279,24 +324,75 @@ inline void append_double_column(const std::shared_ptr<arrow::ChunkedArray>& chu
                                  std::vector<double>& out) {
     for (const auto& chunk : chunked->chunks()) {
         switch (chunk->type_id()) {
-            case arrow::Type::DOUBLE: {
-                auto arr = std::static_pointer_cast<arrow::DoubleArray>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0.0 : arr->Value(i));
-                }
+            case arrow::Type::DOUBLE:
+                append_same_layout<arrow::DoubleArray>(*chunk, out);
                 break;
-            }
-            case arrow::Type::FLOAT: {
-                auto arr = std::static_pointer_cast<arrow::FloatArray>(chunk);
-                for (int64_t i = 0; i < arr->length(); ++i) {
-                    out.push_back(arr->IsNull(i) ? 0.0 : static_cast<double>(arr->Value(i)));
-                }
+            case arrow::Type::FLOAT:
+                append_converted<arrow::FloatArray>(*chunk, out,
+                                                    [](float value) { return double{value}; });
                 break;
-            }
             default:
                 throw std::runtime_error("read_parquet: unsupported float column type");
         }
     }
+}
+
+/// Build a dictionary-encoded ibex column from an Arrow ChunkedArray of
+/// DictionaryArrays.
+///
+/// Arrow hands back one dictionary *per chunk* (per row group), and the same
+/// string may sit at a different code in each. Ibex's `Column<Categorical>` has
+/// a single dictionary, so each chunk's local codes are remapped into one
+/// unified dictionary. That remap is cheap precisely because this path is only
+/// taken for low-cardinality columns — the per-chunk dictionaries have a handful
+/// of entries, while the code vector has millions.
+inline auto build_categorical_column(const std::shared_ptr<arrow::ChunkedArray>& chunked)
+    -> ibex::Column<ibex::Categorical> {
+    std::vector<std::string> dict;
+    std::map<std::string, std::int32_t, std::less<>> index;
+    std::vector<std::int32_t> codes;
+    codes.reserve(static_cast<std::size_t>(chunked->length()));
+
+    auto intern = [&](std::string value) -> std::int32_t {
+        if (auto it = index.find(value); it != index.end()) {
+            return it->second;
+        }
+        auto code = static_cast<std::int32_t>(dict.size());
+        index.emplace(value, code);
+        dict.push_back(std::move(value));
+        return code;
+    };
+
+    for (const auto& chunk : chunked->chunks()) {
+        const auto& dict_array = static_cast<const arrow::DictionaryArray&>(*chunk);
+
+        const auto& values = *dict_array.dictionary();
+        if (values.type_id() != arrow::Type::STRING &&
+            values.type_id() != arrow::Type::LARGE_STRING) {
+            throw std::runtime_error("read_parquet: unsupported dictionary value type");
+        }
+        const auto& strings = static_cast<const arrow::StringArray&>(values);
+
+        std::vector<std::int32_t> local_to_global;
+        local_to_global.reserve(static_cast<std::size_t>(strings.length()));
+        for (int64_t i = 0; i < strings.length(); ++i) {
+            local_to_global.push_back(intern(strings.GetString(i)));
+        }
+
+        const auto& indices = *dict_array.indices();
+        if (indices.type_id() != arrow::Type::INT32) {
+            throw std::runtime_error("read_parquet: unsupported dictionary index type");
+        }
+        const auto& int_indices = static_cast<const arrow::Int32Array&>(indices);
+        for (int64_t i = 0; i < int_indices.length(); ++i) {
+            // Match the plain-string path, which reads a null as an empty string.
+            codes.push_back(int_indices.IsNull(i)
+                                ? intern(std::string{})
+                                : local_to_global[static_cast<std::size_t>(int_indices.Value(i))]);
+        }
+    }
+
+    return ibex::Column<ibex::Categorical>{std::move(dict), std::move(codes)};
 }
 
 inline void append_string_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
@@ -320,14 +416,12 @@ inline void append_string_column(const std::shared_ptr<arrow::ChunkedArray>& chu
 
 inline void append_date32_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
                                  std::vector<ibex::Date>& out) {
+    // Arrow DATE32 is int32 days since epoch, exactly ibex::Date's representation.
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() != arrow::Type::DATE32) {
             throw std::runtime_error("read_parquet: unsupported date32 column type");
         }
-        auto arr = std::static_pointer_cast<arrow::Date32Array>(chunk);
-        for (int64_t i = 0; i < arr->length(); ++i) {
-            out.push_back(arr->IsNull(i) ? ibex::Date{0} : ibex::Date{arr->Value(i)});
-        }
+        append_same_layout<arrow::Date32Array>(*chunk, out);
     }
 }
 
@@ -339,14 +433,9 @@ inline void append_date64_column(const std::shared_ptr<arrow::ChunkedArray>& chu
         if (chunk->type_id() != arrow::Type::DATE64) {
             throw std::runtime_error("read_parquet: unsupported date64 column type");
         }
-        auto arr = std::static_pointer_cast<arrow::Date64Array>(chunk);
-        for (int64_t i = 0; i < arr->length(); ++i) {
-            if (arr->IsNull(i)) {
-                out.push_back(ibex::Date{0});
-            } else {
-                out.push_back(ibex::Date{static_cast<std::int32_t>(arr->Value(i) / kMillisPerDay)});
-            }
-        }
+        append_converted<arrow::Date64Array>(*chunk, out, [](std::int64_t millis) {
+            return ibex::Date{static_cast<std::int32_t>(millis / kMillisPerDay)};
+        });
     }
 }
 
@@ -374,10 +463,14 @@ inline void append_timestamp_column(const std::shared_ptr<arrow::ChunkedArray>& 
         if (chunk->type_id() != arrow::Type::TIMESTAMP) {
             throw std::runtime_error("read_parquet: unsupported timestamp column type");
         }
-        auto arr = std::static_pointer_cast<arrow::TimestampArray>(chunk);
-        for (int64_t i = 0; i < arr->length(); ++i) {
-            out.push_back(arr->IsNull(i) ? ibex::Timestamp{0}
-                                         : ibex::Timestamp{arr->Value(i) * scale});
+        // A nanosecond column needs no rescaling, so it is already ibex::Timestamp's
+        // layout and copies wholesale.
+        if (scale == 1) {
+            append_same_layout<arrow::TimestampArray>(*chunk, out);
+        } else {
+            append_converted<arrow::TimestampArray>(*chunk, out, [scale](std::int64_t value) {
+                return ibex::Timestamp{value * scale};
+            });
         }
     }
 }
@@ -421,6 +514,10 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_string_column(col, values);
                 sink.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
+                break;
+            }
+            case arrow::Type::DICTIONARY: {
+                sink.add_column(field->name(), build_categorical_column(col));
                 break;
             }
             case arrow::Type::DATE32: {
@@ -477,6 +574,9 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
             case arrow::Type::LARGE_STRING:
                 out.add_column(field->name(), ibex::Column<std::string>{});
                 break;
+            case arrow::Type::DICTIONARY:
+                out.add_column(field->name(), ibex::Column<ibex::Categorical>{});
+                break;
             case arrow::Type::DATE32:
             case arrow::Type::DATE64:
                 out.add_column(field->name(), ibex::Column<ibex::Date>{});
@@ -492,6 +592,79 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
     return out;
 }
 
+/// Leaf indices of the string columns this file stores fully dictionary-encoded,
+/// which are the ones worth reading back as `Column<Categorical>`.
+///
+/// The file's own writer is the oracle here. Parquet builds a dictionary per
+/// column chunk and abandons it — falling back to PLAIN data pages — once the
+/// dictionary outgrows its page size limit. So "every data page in every row
+/// group is dictionary-encoded" is a cardinality test the writer already paid
+/// for: on TPC-H it selects l_returnflag, l_linestatus, l_shipinstruct,
+/// l_shipmode, p_brand, p_container … and rejects l_comment and p_name.
+///
+/// Getting this wrong is a performance choice, not a correctness one: a column
+/// read either way holds the same values.
+inline auto dictionary_column_indices(const parquet::FileMetaData& metadata) -> std::vector<int> {
+    std::vector<int> out;
+    for (int col = 0; col < metadata.num_columns(); ++col) {
+        if (metadata.schema()->Column(col)->physical_type() != parquet::Type::BYTE_ARRAY) {
+            continue;
+        }
+        bool fully_dictionary = metadata.num_row_groups() > 0;
+        for (int group = 0; group < metadata.num_row_groups() && fully_dictionary; ++group) {
+            auto chunk = metadata.RowGroup(group)->ColumnChunk(col);
+            if (!chunk->has_dictionary_page()) {
+                fully_dictionary = false;
+                break;
+            }
+            for (const auto& stats : chunk->encoding_stats()) {
+                // Only data pages count: the dictionary page is itself PLAIN-encoded,
+                // so a column's encoding list always mentions PLAIN.
+                const bool is_data = stats.page_type == parquet::PageType::DATA_PAGE ||
+                                     stats.page_type == parquet::PageType::DATA_PAGE_V2;
+                if (is_data && stats.encoding != parquet::Encoding::RLE_DICTIONARY &&
+                    stats.encoding != parquet::Encoding::PLAIN_DICTIONARY) {
+                    fully_dictionary = false;
+                    break;
+                }
+            }
+        }
+        if (fully_dictionary) {
+            out.push_back(col);
+        }
+    }
+    return out;
+}
+
+/// Open `input` as an Arrow-backed Parquet reader, reading every fully
+/// dictionary-encoded string column straight back as a dictionary rather than
+/// materializing one `std::string` per row.
+inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> input,
+                                const std::string& path)
+    -> std::unique_ptr<parquet::arrow::FileReader> {
+    parquet::arrow::FileReaderBuilder builder;
+    auto status = builder.Open(std::move(input));
+    if (!status.ok()) {
+        throw std::runtime_error("read_parquet: failed to read: " + path + " (" +
+                                 status.ToString() + ")");
+    }
+
+    auto properties = parquet::default_arrow_reader_properties();
+    for (int col : dictionary_column_indices(*builder.raw_reader()->metadata())) {
+        properties.set_read_dictionary(col, true);
+    }
+    builder.properties(properties);
+    builder.memory_pool(arrow::default_memory_pool());
+
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    status = builder.Build(&reader);
+    if (!status.ok()) {
+        throw std::runtime_error("read_parquet: failed to open: " + path + " (" +
+                                 status.ToString() + ")");
+    }
+    return reader;
+}
+
 }  // namespace
 
 /// Open `path` for deferred reading: take its schema and row count from the
@@ -503,14 +676,10 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
     std::string path_string{path};
     auto input = open_parquet_input(path);
 
-    auto reader_result = parquet::arrow::OpenFile(std::move(input), arrow::default_memory_pool());
-    if (!reader_result.ok()) {
-        throw std::runtime_error("read_parquet: failed to read: " + path_string + " (" +
-                                 reader_result.status().ToString() + ")");
-    }
     // Shared rather than unique: the decode callback below outlives this scope
     // and each call reads from the same open file.
-    std::shared_ptr<parquet::arrow::FileReader> reader = std::move(reader_result).ValueOrDie();
+    std::shared_ptr<parquet::arrow::FileReader> reader =
+        make_parquet_reader(std::move(input), path_string);
 
     std::shared_ptr<arrow::Schema> arrow_schema;
     auto st = reader->GetSchema(&arrow_schema);
@@ -563,12 +732,7 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
     std::string path_string{path};
     auto input = open_parquet_input(path);
 
-    auto reader_result = parquet::arrow::OpenFile(std::move(input), arrow::default_memory_pool());
-    if (!reader_result.ok()) {
-        throw std::runtime_error("read_parquet: failed to read: " + path_string + " (" +
-                                 reader_result.status().ToString() + ")");
-    }
-    std::unique_ptr<parquet::arrow::FileReader> reader = std::move(reader_result).ValueOrDie();
+    auto reader = make_parquet_reader(std::move(input), path_string);
 
     std::shared_ptr<arrow::Table> table;
     auto st = reader->ReadTable(&table);
@@ -652,13 +816,7 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
         path_ = std::move(path);
         auto input = open_parquet_input(path_);
 
-        auto reader_result =
-            parquet::arrow::OpenFile(std::move(input), arrow::default_memory_pool());
-        if (!reader_result.ok()) {
-            throw std::runtime_error("read_parquet: failed to read: " + path_ + " (" +
-                                     reader_result.status().ToString() + ")");
-        }
-        reader_ = std::move(reader_result).ValueOrDie();
+        reader_ = make_parquet_reader(std::move(input), path_);
         reader_->set_batch_size(kParquetRowsPerChunk);
 
         auto batches_result = reader_->GetRecordBatchReader();

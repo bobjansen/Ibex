@@ -115,7 +115,10 @@ if [[ "$SKIP_REPL" == false ]]; then
         || ! rg -n "^\| 0    \| 1   \| 3 " "$repl_out" >/dev/null \
         || ! rg -n "^\| null \| 10  \| null " "$repl_out" >/dev/null \
         || ! rg -n "^\| null \| 10  \| 20  " "$repl_out" >/dev/null \
-        || ! rg -n "\| null \| 20 \| null " "$repl_out" >/dev/null; then
+        || ! rg -n "\| null \| 20 \| null " "$repl_out" >/dev/null \
+        || ! rg -n "^\| null \| null \| 2 " "$repl_out" >/dev/null \
+        || ! rg -n "^\| 0    \| null \| 1 " "$repl_out" >/dev/null \
+        || ! rg -n "^\| null \| 0    \| 1 " "$repl_out" >/dev/null; then
         cat "$repl_out" >&2
         rm -f "$repl_out"
         exit 1

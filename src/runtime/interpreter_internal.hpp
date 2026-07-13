@@ -107,12 +107,13 @@ namespace {  // NOLINT(cert-dcl59-cpp,misc-anonymous-namespace-in-header) — de
 
 /// A grouping key: one ScalarValue per key column, plus which of them are null.
 ///
-/// The null bits are not decoration. A null cell carries the type's zero value
-/// (see the CSV reader's convention), so without `null_mask` a null key would
-/// compare equal to a genuine `0` / `""` and the two would silently merge into
-/// one group — the null group vanishing from the result entirely. Carrying the
-/// bits here means nulls group with each other and with nothing else, which is
-/// what SQL, Polars and pandas all do.
+/// The null bits carry the whole meaning of a null key — `values[i]` is not to be
+/// read where bit i is set, and KeyHash/KeyEq do not read it. A null cell's
+/// payload is whatever its producer happened to leave there (Arrow, for one,
+/// leaves it undefined), so a key that compared payloads would either merge nulls
+/// into a genuine `0` or scatter them across separate groups, depending on the
+/// producer. Reading only the mask makes a null equal to a null and to nothing
+/// else regardless — which is what SQL, Polars and pandas all do.
 ///
 /// A bitmask rather than a per-value flag: keys are compared and hashed in the
 /// hot loop, and this keeps both to a single extra word.
@@ -128,21 +129,37 @@ struct Key {
             null_mask |= std::uint64_t{1} << index;
         }
     }
+
+    [[nodiscard]] auto is_null(std::size_t index) const noexcept -> bool {
+        return index < 64 && (null_mask & (std::uint64_t{1} << index)) != 0;
+    }
 };
 
 /// Ibex supports at most this many key columns in one grouping key, because
 /// `Key::null_mask` is one bit per column. Callers must check.
 inline constexpr std::size_t kMaxKeyColumns = 64;
 
+/// Hash and equality skip the value of any slot the mask flags as null.
+///
+/// A null cell's payload is not merely uninteresting, it is *undefined*: Arrow
+/// leaves whatever was last in the buffer there (in one measurement, 1.1M of 3M
+/// null slots held stale non-zero doubles). If the key compared those payloads,
+/// two null keys would hash and compare differently and scatter into separate
+/// groups. Ignoring them is what makes a null equal to a null and to nothing
+/// else, without the key having to trust the producer to have blanked the cell.
 struct KeyHash {
     auto operator()(const Key& key) const -> std::size_t {
         std::size_t seed = 0;
         auto hash_combine = [&](std::size_t value) {
             seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
         };
-        for (const auto& value : key.values) {
-            const std::size_t h = std::visit(
-                [](const auto& v) { return std::hash<std::decay_t<decltype(v)>>{}(v); }, value);
+        for (std::size_t i = 0; i < key.values.size(); ++i) {
+            if (key.is_null(i)) {
+                continue;  // undefined payload — the mask already says "null"
+            }
+            const std::size_t h =
+                std::visit([](const auto& v) { return std::hash<std::decay_t<decltype(v)>>{}(v); },
+                           key.values[i]);
             hash_combine(h);
         }
         hash_combine(std::hash<std::uint64_t>{}(key.null_mask));
@@ -152,14 +169,25 @@ struct KeyHash {
 
 struct KeyEq {
     auto operator()(const Key& a, const Key& b) const -> bool {
-        return a.null_mask == b.null_mask && a.values == b.values;
+        if (a.null_mask != b.null_mask || a.values.size() != b.values.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < a.values.size(); ++i) {
+            if (a.is_null(i)) {
+                continue;  // both null here (masks are equal) — payloads irrelevant
+            }
+            if (a.values[i] != b.values[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
 /// Append one column's cell to a grouping key, recording it as null when the
 /// column's validity bit is clear. Every Key builder should go through this —
-/// pushing the raw scalar instead is exactly the bug that merges a null key into
-/// the zero group.
+/// pushing the raw scalar without the null bit is exactly the bug that merges a
+/// null key into the zero group.
 inline void push_key_value(Key& key, const ColumnEntry& entry, std::size_t row) {
     if (is_null(entry, row)) {
         key.set_null(key.values.size());

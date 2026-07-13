@@ -33,6 +33,9 @@ benchmarking/results/*_artifacts.tar.gz
 *.csv
 *.tsv
 !examples/leetcode/data/*.csv
+# Test fixtures: small CSVs that regression tests read (nulls cannot be written as
+# an Ibex array literal, so null-bearing test data has to come from a file).
+!tests/data/*.csv
 *.parquet
 *.so
 tests/data/iris

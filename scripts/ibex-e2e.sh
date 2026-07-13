@@ -97,6 +97,20 @@ if [[ "$SKIP_REPL" == false ]]; then
     fi
     rm -f "$repl_out"
 
+    echo "▸ REPL smoke (parquet plugin, nulls survive a CSV -> parquet -> read round-trip)"
+    repl_out="$(mktemp)"
+    printf ":load tests/data/parquet_nulls_check.ibex\n:quit\n" \
+        | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+    rm -f "$IBEX_ROOT/tests/data/parquet_nulls_check_out.parquet"
+    # 26.66667 is mean(i) with the two nulls skipped; reading them back as 0
+    # (which read_parquet used to do, silently) gives 16 instead.
+    if rg -n "error:" "$repl_out" >/dev/null || ! rg -n "26.66667" "$repl_out" >/dev/null; then
+        cat "$repl_out" >&2
+        rm -f "$repl_out"
+        exit 1
+    fi
+    rm -f "$repl_out"
+
     echo "▸ REPL smoke (parquet plugin, categorical cross-row-group dictionary remap)"
     repl_out="$(mktemp)"
     printf ":load tests/data/parquet_categorical_check.ibex\n:quit\n" \

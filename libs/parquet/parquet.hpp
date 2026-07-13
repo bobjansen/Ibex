@@ -1118,23 +1118,25 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                 // scratch ReadBatch, so our reads on an optional column must
                 // consume them too or the level decoder falls out of step.
                 // ReadBatch stops at page boundaries, so loop until the run
-                // is complete.
+                // is complete — and emit each partial batch before the next
+                // read: ByteArray values point into the current page's
+                // decompression buffer, which the next page's read reuses.
                 std::size_t got = 0;
                 while (got < run) {
                     std::int64_t values_read = 0;
                     const auto levels_read =
                         typed->ReadBatch(static_cast<std::int64_t>(run - got),
                                          optional ? definitions.get() : nullptr, nullptr,
-                                         values.get() + got, &values_read);
+                                         values.get(), &values_read);
                     if (levels_read <= 0 || values_read != levels_read) {
                         throw std::runtime_error(
                             "read_parquet: column ended or held an unexpected null while "
                             "reading selected rows");
                     }
+                    for (std::int64_t i = 0; i < levels_read; ++i) {
+                        emit(&values[static_cast<std::size_t>(i)]);
+                    }
                     got += static_cast<std::size_t>(levels_read);
-                }
-                for (std::size_t i = 0; i < run; ++i) {
-                    emit(&values[i]);
                 }
                 emitted += run;
                 selected_pos += run;

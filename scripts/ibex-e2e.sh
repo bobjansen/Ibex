@@ -97,6 +97,31 @@ if [[ "$SKIP_REPL" == false ]]; then
     fi
     rm -f "$repl_out"
 
+    echo "▸ REPL smoke (null keys: group-by / distinct / order / join)"
+    repl_out="$(mktemp)"
+    printf ":load tests/data/null_keys_check.ibex\n:quit\n" \
+        | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+    # The data pits nulls against a GENUINE 0 throughout, so each assertion below
+    # actually discriminates: the broken code merged the two everywhere.
+    #   group-by   : null group of 2 (broken: one 0-group of 4)
+    #   update+by  : null rows total 30, zero rows total 3 (broken: both 33)
+    #   join       : null-filled label on the left join (broken: matched "zero")
+    #   dcast      : null row key keeps its null-ness (broken: printed as 0)
+    #   asof join  : null equality key unmatched (broken: matched the k=0 right row)
+    if rg -n "error:" "$repl_out" >/dev/null \
+        || ! rg -n "^\| null \| 2 " "$repl_out" >/dev/null \
+        || ! rg -n "^\| 0    \| 2 " "$repl_out" >/dev/null \
+        || ! rg -n "^\| null \| 10  \| 30 " "$repl_out" >/dev/null \
+        || ! rg -n "^\| 0    \| 1   \| 3 " "$repl_out" >/dev/null \
+        || ! rg -n "^\| null \| 10  \| null " "$repl_out" >/dev/null \
+        || ! rg -n "^\| null \| 10  \| 20  " "$repl_out" >/dev/null \
+        || ! rg -n "\| null \| 20 \| null " "$repl_out" >/dev/null; then
+        cat "$repl_out" >&2
+        rm -f "$repl_out"
+        exit 1
+    fi
+    rm -f "$repl_out"
+
     echo "▸ REPL smoke (parquet plugin, nulls survive a CSV -> parquet -> read round-trip)"
     repl_out="$(mktemp)"
     printf ":load tests/data/parquet_nulls_check.ibex\n:quit\n" \

@@ -105,9 +105,34 @@ constexpr bool is_string_like_v =
 namespace {  // NOLINT(cert-dcl59-cpp,misc-anonymous-namespace-in-header) — deliberate per-TU
              // internal linkage, see comment above
 
+/// A grouping key: one ScalarValue per key column, plus which of them are null.
+///
+/// The null bits are not decoration. A null cell carries the type's zero value
+/// (see the CSV reader's convention), so without `null_mask` a null key would
+/// compare equal to a genuine `0` / `""` and the two would silently merge into
+/// one group — the null group vanishing from the result entirely. Carrying the
+/// bits here means nulls group with each other and with nothing else, which is
+/// what SQL, Polars and pandas all do.
+///
+/// A bitmask rather than a per-value flag: keys are compared and hashed in the
+/// hot loop, and this keeps both to a single extra word.
 struct Key {
     std::vector<ScalarValue> values;
+    std::uint64_t null_mask = 0;  ///< bit i set → values[i] is null
+
+    /// Mark key column `index` null. Beyond 64 key columns the bit is dropped,
+    /// which would merge nulls back into the zero group — so the callers that
+    /// build keys reject that case rather than answer wrongly.
+    void set_null(std::size_t index) noexcept {
+        if (index < 64) {
+            null_mask |= std::uint64_t{1} << index;
+        }
+    }
 };
+
+/// Ibex supports at most this many key columns in one grouping key, because
+/// `Key::null_mask` is one bit per column. Callers must check.
+inline constexpr std::size_t kMaxKeyColumns = 64;
 
 struct KeyHash {
     auto operator()(const Key& key) const -> std::size_t {
@@ -120,13 +145,52 @@ struct KeyHash {
                 [](const auto& v) { return std::hash<std::decay_t<decltype(v)>>{}(v); }, value);
             hash_combine(h);
         }
+        hash_combine(std::hash<std::uint64_t>{}(key.null_mask));
         return seed;
     }
 };
 
 struct KeyEq {
-    auto operator()(const Key& a, const Key& b) const -> bool { return a.values == b.values; }
+    auto operator()(const Key& a, const Key& b) const -> bool {
+        return a.null_mask == b.null_mask && a.values == b.values;
+    }
 };
+
+/// Append one column's cell to a grouping key, recording it as null when the
+/// column's validity bit is clear. Every Key builder should go through this —
+/// pushing the raw scalar instead is exactly the bug that merges a null key into
+/// the zero group.
+inline void push_key_value(Key& key, const ColumnEntry& entry, std::size_t row) {
+    if (is_null(entry, row)) {
+        key.set_null(key.values.size());
+    }
+    key.values.push_back(scalar_from_column(*entry.column, row));
+}
+
+/// Same, where the caller holds the column and its validity separately.
+/// `validity` may be null, meaning the column has no nulls.
+inline void push_key_value(Key& key, const ColumnValue& column, const ValidityBitmap* validity,
+                           std::size_t row) {
+    if (validity != nullptr && !(*validity)[row]) {
+        key.set_null(key.values.size());
+    }
+    key.values.push_back(scalar_from_column(column, row));
+}
+
+/// Collect the validity bitmap of each named column (null when it has no nulls),
+/// parallel to a `group_columns`-style vector. Lets a key builder record nulls
+/// without restructuring how it looks its columns up.
+inline auto collect_key_validity(const Table& table, const std::vector<ir::ColumnRef>& keys)
+    -> std::vector<const ValidityBitmap*> {
+    std::vector<const ValidityBitmap*> out;
+    out.reserve(keys.size());
+    for (const auto& key : keys) {
+        const auto* entry = table.find_entry(key.name);
+        out.push_back(entry != nullptr && entry->validity.has_value() ? &*entry->validity
+                                                                      : nullptr);
+    }
+    return out;
+}
 
 }  // namespace
 

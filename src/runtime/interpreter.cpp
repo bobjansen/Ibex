@@ -242,7 +242,7 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
         Key key;
         key.values.reserve(input.columns.size());
         for (const auto& entry : input.columns) {
-            key.values.push_back(scalar_from_column(*entry.column, row));
+            push_key_value(key, entry, row);
         }
         if (!seen.insert(std::move(key)).second) {
             continue;

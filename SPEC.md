@@ -2844,6 +2844,16 @@ let public_prices = read_parquet("https://data.example.com/prices.parquet");
 let prices = read_parquet("s3://market-data/prices.parquet?region=us-east-1");
 ```
 
+In the interactive runtime, binding `read_parquet` reads the file footer first
+and defers column data. Query plans decode only referenced columns. When a
+row-local filter sits directly above a source that is scanned once, predicate
+columns are decoded first and the surviving row indices are passed into the
+row-group decoder for late materialization of the remaining columns. The
+Parquet decoder appends directly to Ibex columns without constructing an
+intermediate Arrow table. Repeated scans of the same binding conservatively
+fall back to unfiltered projection pushdown, and the ordinary Filter node is
+retained so these optimizations do not change query semantics.
+
 The bundled CSV plugin also supports:
 
 ```

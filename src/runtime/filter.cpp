@@ -21,6 +21,7 @@
 #include <ctime>
 #include <expected>
 #include <functional>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -2081,6 +2082,30 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
 auto filter_table(const Table& input, const ir::Expr& predicate, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
     return filter_table_impl(input, predicate, nullptr, 0, scalars);
+}
+
+auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
+                      const ScalarRegistry* scalars)
+    -> std::expected<std::vector<std::size_t>, std::string> {
+    const std::size_t rows = input.rows();
+    std::vector<std::size_t> selected(rows);
+    std::iota(selected.begin(), selected.end(), std::size_t{0});
+
+    for (const auto& conjunct : conjuncts) {
+        auto mask = compute_mask(conjunct, input, scalars, rows);
+        if (!mask) {
+            return std::unexpected(mask.error());
+        }
+        const auto* valid = mask->valid ? mask->valid->data() : nullptr;
+        auto end = std::remove_if(selected.begin(), selected.end(), [&](std::size_t row) {
+            return mask->value[row] == 0 || (valid != nullptr && valid[row] == 0);
+        });
+        selected.erase(end, selected.end());
+        if (selected.empty()) {
+            break;
+        }
+    }
+    return selected;
 }
 
 auto filter_project_table(const Table& input, const ir::Expr& predicate,

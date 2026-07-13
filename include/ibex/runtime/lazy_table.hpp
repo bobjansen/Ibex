@@ -13,11 +13,15 @@
 
 namespace ibex::runtime {
 
+/// Ascending, zero-based row indices over a deferred source.
+using Selection = std::vector<std::size_t>;
+
 /// Decodes exactly the named columns from an underlying source. Supplied by
 /// whichever plugin backs the source (Parquet today); the names are always a
-/// subset of the schema the `LazyTable` was built with.
-using ColumnDecodeFn =
-    std::function<std::expected<Table, std::string>(const std::vector<std::string>&)>;
+/// subset of the schema the `LazyTable` was built with. A null selection means
+/// every source row; otherwise only the named source rows are materialized.
+using ColumnDecodeFn = std::function<std::expected<Table, std::string>(
+    const std::vector<std::string>&, const Selection*)>;
 
 /// A table source whose schema is known up front but whose column data is
 /// decoded only when a query asks for it, and cached once decoded.
@@ -44,6 +48,16 @@ class LazyTable {
     /// ignored, so a caller may pass the union of the columns demanded across
     /// several sources without first splitting it per source.
     [[nodiscard]] auto project(const std::set<std::string>& names)
+        -> std::expected<Table, std::string>;
+
+    /// Materialize `names` after applying row-local scan conjuncts. Predicate
+    /// columns are decoded first to compute a selection; all other columns are
+    /// decoded with that selection. This deliberately bypasses `cache_`: a
+    /// selected column must never masquerade as a cached whole-file column in a
+    /// later query.
+    [[nodiscard]] auto project_where(const std::set<std::string>& names,
+                                     const std::vector<ir::Expr>& conjuncts,
+                                     const ScalarRegistry* scalars = nullptr)
         -> std::expected<Table, std::string>;
 
     /// Materialize every column — the fallback for anything that consumes the

@@ -24,3 +24,7 @@ back[select { rows = count(), total = sum(i), average = mean(i) }];
 // (whose nulls would otherwise come back as an ordinary empty string).
 back[filter is_null(i), select { null_ints = count() }];
 back[filter is_null(s), select { null_strings = count() }];
+
+// Scan filtering decodes i first and passes its surviving row indices to d and
+// s. This checks selected numeric/string payloads, including a null payload.
+back[filter i >= 30, select { rows = count(), d_total = sum(d) }, by { s }, order { s }];

@@ -37,6 +37,7 @@
 #include <string.h>
 #include <string_view>
 #include <type_traits>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -532,7 +533,25 @@ auto interrupt_event_hook() -> int {
 
 void configure_line_editing() {
     rl_attempted_completion_function = repl_completion;
-    rl_event_hook = interrupt_event_hook;
+
+    // The event hook is installed ONLY for an interactive terminal, and that is
+    // load-bearing rather than an optimization.
+    //
+    // readline's event-hook wait loop calls `rl_gather_tyi()`, which returns 0
+    // both for "no input has arrived yet" and for "the input is at EOF" — it does
+    // not distinguish them. With a hook installed, readline therefore never
+    // reports EOF on a non-terminal stdin: it spins, calling the hook forever, at
+    // 100% CPU. A script piped or redirected into the REPL (a supported mode)
+    // would hang on its last line instead of exiting, burning a core.
+    //
+    // Nothing is lost by skipping it: the hook exists solely to make Ctrl+C
+    // interrupt an interactive *prompt*, and a redirected stdin has no prompt to
+    // interrupt. Ctrl+C during evaluation is handled elsewhere, by the
+    // interpreter's cooperative interrupt checks.
+    if (::isatty(STDIN_FILENO) != 0) {
+        rl_event_hook = interrupt_event_hook;
+    }
+
 #if defined(RL_READLINE_VERSION) && RL_READLINE_VERSION >= 0x0500
     // The REPL owns SIGINT (see install_interrupt_handler): GNU readline must
     // not install its own handlers, or it swallows the Ctrl+C and resumes the

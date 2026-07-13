@@ -55,3 +55,17 @@ long[dcast metric, select { value }, by { id }];
 let l = as_timeframe(read_csv("tests/data/null_keys_asof_left.csv", "NA"), "ts");
 let r = as_timeframe(read_csv("tests/data/null_keys_asof_right.csv", "NA"), "ts");
 l asof join r on {ts, k};
+
+// ── ALL-NULL / MIXED MULTI-COLUMN KEY ──
+// With every slot null, KeyHash skips every value and the seed collapses to
+// hash(null_mask) + golden — a fixed constant. That is required, not incidental:
+// all-null keys are equal under KeyEq (masks match, no payloads compared), so
+// they must hash alike, and they must not read the undefined payloads to do it.
+//
+//   a,b = (0,0) (null,null) (0,0) (null,null) (0,null) (null,0) (5,5)
+//
+// Expect 5 groups. The half-null keys {0,null} and {null,0} must stay DISTINCT
+// from each other, which only holds if the mask is position-sensitive rather
+// than a mere null count -- and neither may collapse into {0,0}.
+let m = read_csv("tests/data/null_keys_multi.csv", "NA");
+m[select { n = count() }, by { a, b }];

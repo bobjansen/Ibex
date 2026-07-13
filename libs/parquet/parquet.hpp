@@ -40,6 +40,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
+#include <parquet/statistics.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -790,6 +791,29 @@ inline auto all_decode_groups(const parquet::FileMetaData& metadata) -> DirectDe
                               .rows = static_cast<std::size_t>(metadata.num_rows())};
 }
 
+/// Column-chunk statistics prove the chunk holds no nulls. Writers (including
+/// parquet-cpp-arrow) mark columns optional even when every value is present,
+/// so this is the only way the null-free fast paths ever fire on real files.
+inline auto chunk_has_no_nulls(const parquet::FileMetaData& metadata, int group, int leaf_index)
+    -> bool {
+    const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
+    if (!chunk->is_stats_set()) {
+        return false;
+    }
+    const auto stats = chunk->statistics();
+    return stats != nullptr && stats->HasNullCount() && stats->null_count() == 0;
+}
+
+inline auto groups_have_no_nulls(const parquet::FileMetaData& metadata,
+                                 const DirectDecodeGroups& groups, int leaf_index) -> bool {
+    for (int group = groups.begin; group < groups.end; ++group) {
+        if (!chunk_has_no_nulls(metadata, group, leaf_index)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename DType, typename Emit>
 inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_index,
                                    const ibex::runtime::Selection* selection,
@@ -801,9 +825,9 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
                                   const DirectDecodeGroups& groups, ibex::Column<Out>& out,
                                   DirectValidity& validity, Convert&& convert) -> std::size_t {
     using Raw = typename DType::c_type;
-    if (selection != nullptr ||
-        reader.parquet_reader()->metadata()->schema()->Column(leaf_index)->max_definition_level() !=
-            0) {
+    const auto& metadata = *reader.parquet_reader()->metadata();
+    const bool optional = metadata.schema()->Column(leaf_index)->max_definition_level() != 0;
+    if (selection != nullptr || (optional && !groups_have_no_nulls(metadata, groups, leaf_index))) {
         return decode_physical_column<DType>(
             reader, leaf_index, selection, groups, [&](const Raw* value) {
                 validity.append(value != nullptr);
@@ -811,7 +835,6 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
             });
     }
 
-    const auto& metadata = *reader.parquet_reader()->metadata();
     std::size_t emitted = 0;
     const std::size_t output_start = out.size();
     std::unique_ptr<Raw[]> converted_values;
@@ -820,6 +843,10 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
         out.resize_for_overwrite(output_start + groups.rows);
     } else {
         converted_values.reset(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    }
+    std::unique_ptr<std::int16_t[]> definitions;
+    if (optional) {
+        definitions.reset(new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
     }
     for (int group = groups.begin; group < groups.end; ++group) {
         auto row_group = reader.parquet_reader()->RowGroup(group);
@@ -841,9 +868,12 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
                 destination = converted_values.get();
             }
             const std::int64_t levels_read =
-                typed->ReadBatch(request, nullptr, nullptr, destination, &values_read);
+                typed->ReadBatch(request, optional ? definitions.get() : nullptr, nullptr,
+                                 destination, &values_read);
             if (levels_read <= 0 || levels_read != values_read) {
-                throw std::runtime_error("read_parquet: dense column decoder made no progress");
+                throw std::runtime_error(
+                    "read_parquet: dense column decoder made no progress or found a null "
+                    "value that contradicts the column statistics");
             }
             const auto count = static_cast<std::size_t>(values_read);
             if constexpr (!SameLayout) {
@@ -917,6 +947,9 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
             throw std::runtime_error("read_parquet: nested columns are not supported");
         }
         const bool optional = descriptor->max_definition_level() != 0;
+        // Chunk statistics proving null_count == 0 let this group skip
+        // definition-level decoding and the per-row validity branch.
+        const bool use_defs = optional && !chunk_has_no_nulls(metadata, group, leaf_index);
         auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
         std::vector<std::int32_t> local_to_global;
 
@@ -928,7 +961,7 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
             const parquet::ByteArray* local_dictionary = nullptr;
             std::int32_t dictionary_size = 0;
             const std::int64_t levels_read = typed->ReadBatchWithDictionary(
-                request, optional ? definitions.get() : nullptr, nullptr, local_codes.get(),
+                request, use_defs ? definitions.get() : nullptr, nullptr, local_codes.get(),
                 &codes_read, &local_dictionary, &dictionary_size);
             if (levels_read <= 0) {
                 throw std::runtime_error("read_parquet: dictionary decoder made no progress");
@@ -946,9 +979,23 @@ inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int lea
                 throw std::runtime_error("read_parquet: dictionary page was not exposed");
             }
 
+            if (selection == nullptr && !use_defs) {
+                for (std::int64_t offset = 0; offset < codes_read; ++offset) {
+                    const auto local = local_codes[static_cast<std::size_t>(offset)];
+                    if (local < 0 || static_cast<std::size_t>(local) >= local_to_global.size()) {
+                        throw std::runtime_error("read_parquet: invalid dictionary index");
+                    }
+                    codes.push_back(local_to_global[static_cast<std::size_t>(local)]);
+                }
+                validity.append_valid(static_cast<std::size_t>(codes_read));
+                emitted += static_cast<std::size_t>(codes_read);
+                row += static_cast<std::size_t>(levels_read);
+                continue;
+            }
+
             std::size_t code_pos = 0;
             for (std::int64_t offset = 0; offset < levels_read; ++offset) {
-                const bool valid = !optional || definitions[static_cast<std::size_t>(offset)] == 1;
+                const bool valid = !use_defs || definitions[static_cast<std::size_t>(offset)] == 1;
                 const std::size_t source_row = group_start + row + static_cast<std::size_t>(offset);
                 bool keep = selection == nullptr;
                 if (selection != nullptr && selected_pos < selected_end &&
@@ -1031,11 +1078,23 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
         const bool optional = descriptor->max_definition_level() != 0;
         auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
 
-        // Flat required columns can seek over rejected rows without decoding
-        // them. Nullable columns stay on the level-aware path below because
-        // TypedColumnReader::Skip counts physical values rather than logical
-        // rows, and nulls have no physical value to skip.
-        if (selection != nullptr && !optional) {
+        // Null-free columns (required, or optional with chunk statistics
+        // proving null_count == 0) have a 1:1 mapping between logical rows
+        // and physical values, which unlocks two selected fast paths.
+        // Columns that may hold nulls stay on the level-aware path below
+        // because TypedColumnReader::Skip counts physical values rather than
+        // logical rows, and nulls have no physical value to skip.
+        const bool group_null_free = !optional || chunk_has_no_nulls(metadata, group, leaf_index);
+        const std::size_t group_selected = selected_end - selected_pos;
+        // Skip() only avoids decode work when a gap covers the rest of a data
+        // page; partial-page gaps are decoded into scratch anyway, so for
+        // scattered selections the per-call overhead makes it a net loss.
+        // Route needle-in-haystack selections through Skip and everything
+        // else through dense batch decode + gather.
+        const bool group_sparse =
+            group_selected > 0 &&
+            group_rows / group_selected > static_cast<std::size_t>(kDirectDecodeBatchRows);
+        if (selection != nullptr && group_null_free && group_sparse) {
             std::size_t source_row = group_start;
             while (selected_pos < selected_end) {
                 const std::size_t target = (*selection)[selected_pos];
@@ -1055,12 +1114,24 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                        run < static_cast<std::size_t>(kDirectDecodeBatchRows)) {
                     ++run;
                 }
-                std::int64_t values_read = 0;
-                const auto levels_read = typed->ReadBatch(static_cast<std::int64_t>(run), nullptr,
-                                                          nullptr, values.get(), &values_read);
-                if (levels_read != static_cast<std::int64_t>(run) || values_read != levels_read) {
-                    throw std::runtime_error(
-                        "read_parquet: column ended while reading selected rows");
+                // Skip() consumes definition levels through its internal
+                // scratch ReadBatch, so our reads on an optional column must
+                // consume them too or the level decoder falls out of step.
+                // ReadBatch stops at page boundaries, so loop until the run
+                // is complete.
+                std::size_t got = 0;
+                while (got < run) {
+                    std::int64_t values_read = 0;
+                    const auto levels_read =
+                        typed->ReadBatch(static_cast<std::int64_t>(run - got),
+                                         optional ? definitions.get() : nullptr, nullptr,
+                                         values.get() + got, &values_read);
+                    if (levels_read <= 0 || values_read != levels_read) {
+                        throw std::runtime_error(
+                            "read_parquet: column ended or held an unexpected null while "
+                            "reading selected rows");
+                    }
+                    got += static_cast<std::size_t>(levels_read);
                 }
                 for (std::size_t i = 0; i < run; ++i) {
                     emit(&values[i]);
@@ -1068,6 +1139,39 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                 emitted += run;
                 selected_pos += run;
                 source_row += run;
+            }
+            group_start += group_rows;
+            continue;
+        }
+        if (selection != nullptr && group_null_free) {
+            // Dense batch decode + gather of the selected offsets. Definition
+            // levels stay unread: nothing else consumes levels in this branch
+            // and the group is proven null-free. Once the selection is
+            // exhausted the rest of the group is never decoded.
+            std::size_t row = 0;
+            while (selected_pos < selected_end) {
+                if (row >= group_rows || !typed->HasNext()) {
+                    throw std::runtime_error(
+                        "read_parquet: column ended while reading selected rows");
+                }
+                const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
+                    static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+                std::int64_t values_read = 0;
+                const std::int64_t levels_read =
+                    typed->ReadBatch(request, nullptr, nullptr, values.get(), &values_read);
+                if (levels_read <= 0 || values_read != levels_read) {
+                    throw std::runtime_error(
+                        "read_parquet: column ended or held an unexpected null while reading "
+                        "selected rows");
+                }
+                const std::size_t batch_start = group_start + row;
+                const std::size_t batch_end = batch_start + static_cast<std::size_t>(levels_read);
+                while (selected_pos < selected_end && (*selection)[selected_pos] < batch_end) {
+                    emit(&values[(*selection)[selected_pos] - batch_start]);
+                    ++emitted;
+                    ++selected_pos;
+                }
+                row += static_cast<std::size_t>(levels_read);
             }
             group_start += group_rows;
             continue;

@@ -96,6 +96,25 @@ if [[ "$SKIP_REPL" == false ]]; then
         exit 1
     fi
     rm -f "$repl_out"
+
+    echo "▸ REPL smoke (parquet plugin, categorical cross-row-group dictionary remap)"
+    repl_out="$(mktemp)"
+    printf ":load tests/data/parquet_categorical_check.ibex\n:quit\n" \
+        | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+    rm -f "$IBEX_ROOT/tests/data/parquet_categorical_check_out.parquet"
+    # 524288 / 624288 / 100000 are the per-category counts; they only come out
+    # right if each row group's local dictionary codes were remapped into one
+    # unified dictionary (see the .ibex file). A local-code read reports the same
+    # row count with the wrong values, so counting rows alone would not catch it.
+    if rg -n "error:" "$repl_out" >/dev/null \
+        || ! rg -n "524288" "$repl_out" >/dev/null \
+        || ! rg -n "624288" "$repl_out" >/dev/null \
+        || ! rg -n "100000" "$repl_out" >/dev/null; then
+        cat "$repl_out" >&2
+        rm -f "$repl_out"
+        exit 1
+    fi
+    rm -f "$repl_out"
 fi
 
 if [[ "$SKIP_COMPILE" == false ]]; then

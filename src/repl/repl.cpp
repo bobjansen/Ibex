@@ -2286,6 +2286,42 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
                           const runtime::ExternRegistry& externs)
     -> std::optional<std::expected<runtime::LazyTablePtr, std::string>>;
 
+/// Undoes the inline-source rewrites made while evaluating one expression:
+/// restores the replaced sub-expressions and retires the temp lazy bindings.
+/// The AST must come back unchanged because the same Expr can be evaluated again
+/// (a user function called twice), and the second evaluation must not reference a
+/// temp name the first one dropped.
+struct InlineSourceRewrites {
+    LazyTableRegistry* lazy_tables = nullptr;
+    std::vector<std::pair<parser::ExprPtr*, parser::ExprPtr>> replaced;
+    std::vector<std::string> temp_names;
+
+    explicit InlineSourceRewrites(LazyTableRegistry* registry) : lazy_tables(registry) {}
+    InlineSourceRewrites(const InlineSourceRewrites&) = delete;
+    auto operator=(const InlineSourceRewrites&) -> InlineSourceRewrites& = delete;
+    InlineSourceRewrites(InlineSourceRewrites&&) = delete;
+    auto operator=(InlineSourceRewrites&&) -> InlineSourceRewrites& = delete;
+
+    ~InlineSourceRewrites() {
+        for (auto& [slot, original] : replaced) {
+            *slot = std::move(original);
+        }
+        if (lazy_tables != nullptr) {
+            for (const auto& name : temp_names) {
+                lazy_tables->erase(name);
+            }
+        }
+    }
+};
+
+auto rewrite_inline_sources(parser::Expr& expr, InlineSourceRewrites& rewrites,
+                            runtime::TableRegistry& tables, LazyTableRegistry& lazy_tables,
+                            runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                            ModelRegistry& models, const FunctionRegistry& functions,
+                            CompileTimeListRegistry& compile_time_lists,
+                            const ExternDeclRegistry& extern_decls,
+                            const runtime::ExternRegistry& externs) -> std::optional<std::string>;
+
 auto is_model_predict(std::string_view callee) -> bool {
     return callee == "predict" || callee == "model_predict";
 }
@@ -3058,36 +3094,6 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         return std::unexpected("extern function returned scalar: " + call.callee);
     };
 
-    // An inline source — `read_parquet(p)[filter …, select …]` — is bound to a
-    // temp lazy binding and its base rewritten to that name, so it reaches
-    // `interpret` as an ordinary Scan and picks up the same projection pushdown
-    // a `let`-bound source gets.
-    //
-    // Both the temp binding and the rewritten base are undone on the way out:
-    // this Expr may be evaluated more than once (a function body called twice),
-    // and the second evaluation must not find a name the first one retired.
-    struct InlineSourceRewrite {
-        LazyTableRegistry* lazy_tables = nullptr;
-        parser::BlockExpr* block = nullptr;
-        std::unique_ptr<parser::Expr> original_base;
-        std::string temp_name;
-
-        InlineSourceRewrite() = default;
-        InlineSourceRewrite(const InlineSourceRewrite&) = delete;
-        auto operator=(const InlineSourceRewrite&) -> InlineSourceRewrite& = delete;
-        InlineSourceRewrite(InlineSourceRewrite&&) = delete;
-        auto operator=(InlineSourceRewrite&&) -> InlineSourceRewrite& = delete;
-
-        ~InlineSourceRewrite() {
-            if (lazy_tables != nullptr) {
-                lazy_tables->erase(temp_name);
-            }
-            if (block != nullptr) {
-                block->base = std::move(original_base);
-            }
-        }
-    } inline_source;
-
     if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
         if (block->base && std::holds_alternative<parser::CallExpr>(block->base->node)) {
             auto* call = std::get_if<parser::CallExpr>(&block->base->node);
@@ -3106,24 +3112,33 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                                         std::get<runtime::Table>(std::move(value.value())));
                 block->base =
                     std::make_unique<parser::Expr>(parser::Expr{parser::IdentifierExpr{temp_name}});
-            } else if (call != nullptr) {
-                if (auto lazy = try_bind_lazy_source(*block->base, tables, lazy_tables, scalars,
-                                                     columns, models, functions, compile_time_lists,
-                                                     extern_decls, externs)) {
-                    if (!*lazy) {
-                        return std::unexpected(lazy->error());
-                    }
-                    auto temp_name = make_temp_table_name();
-                    lazy_tables.insert_or_assign(temp_name, std::move(lazy->value()));
-                    inline_source.lazy_tables = &lazy_tables;
-                    inline_source.block = block;
-                    inline_source.temp_name = temp_name;
-                    inline_source.original_base = std::move(block->base);
-                    block->base = std::make_unique<parser::Expr>(
-                        parser::Expr{parser::IdentifierExpr{temp_name}});
-                }
             }
         }
+    }
+
+    // Every inline source in this expression — `read_parquet(p)` wherever it
+    // appears, not merely as the outermost base — is bound to a temp lazy binding
+    // and replaced by that name, so it reaches `interpret` as an ordinary Scan and
+    // picks up the same projection pushdown a `let`-bound source gets.
+    //
+    // Walking the whole tree is the point. A query written as one expression puts
+    // its sources inside join operands:
+    //
+    //     (read_parquet(a)[select …] join read_parquet(b)[select …] on k)[filter …]
+    //
+    // Rewriting only the outermost base would leave those two reads eager, and the
+    // single-expression form — the one the optimizer can actually see through —
+    // would read every column of both tables and end up SLOWER than the same query
+    // split across `let`s.
+    //
+    // Every rewrite is undone on the way out: this Expr may be evaluated more than
+    // once (a function body called twice), and the second evaluation must not find
+    // a name the first one retired.
+    InlineSourceRewrites inline_sources{&lazy_tables};
+    if (auto err =
+            rewrite_inline_sources(expr, inline_sources, tables, lazy_tables, scalars, columns,
+                                   models, functions, compile_time_lists, extern_decls, externs)) {
+        return std::unexpected(*err);
     }
     if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
         if (is_model_table_accessor(call->callee)) {
@@ -3722,6 +3737,80 @@ auto try_bind_lazy_source(parser::Expr& expr, runtime::TableRegistry& tables,
         args.push_back(std::move(value.value()));
     }
     return fn->lazy_table_func(args);
+}
+
+/// Replace every inline lazy source in `expr` — `read_parquet(p)` in any table
+/// position — with a temp lazy binding, so the whole expression lowers to Scans
+/// and projection pushdown reaches all of them.
+///
+/// Recursion is over the positions where a *table* can appear: a block's base, a
+/// join's operands, a parenthesised group, an ascription, and a call's arguments
+/// (`write_csv(read_parquet(p)[…], out)`). A source nested in a join operand is
+/// the case that matters — see the caller.
+///
+/// Returns an error message on failure; nullopt on success. Every replacement is
+/// recorded in `rewrites`, which restores the AST when it goes out of scope.
+auto rewrite_inline_sources(parser::Expr& expr, InlineSourceRewrites& rewrites,
+                            runtime::TableRegistry& tables, LazyTableRegistry& lazy_tables,
+                            runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
+                            ModelRegistry& models, const FunctionRegistry& functions,
+                            CompileTimeListRegistry& compile_time_lists,
+                            const ExternDeclRegistry& extern_decls,
+                            const runtime::ExternRegistry& externs) -> std::optional<std::string> {
+    // Rewrite the expression `slot` points at, if it is a bare call to a lazy
+    // source; otherwise recurse into it.
+    auto visit_slot = [&](parser::ExprPtr& slot) -> std::optional<std::string> {
+        if (!slot) {
+            return std::nullopt;
+        }
+        if (std::holds_alternative<parser::CallExpr>(slot->node)) {
+            auto lazy = try_bind_lazy_source(*slot, tables, lazy_tables, scalars, columns, models,
+                                             functions, compile_time_lists, extern_decls, externs);
+            if (lazy.has_value()) {
+                if (!*lazy) {
+                    return lazy->error();
+                }
+                auto temp_name = make_temp_table_name();
+                lazy_tables.insert_or_assign(temp_name, std::move(lazy->value()));
+                rewrites.temp_names.push_back(temp_name);
+                rewrites.replaced.emplace_back(&slot, std::move(slot));
+                slot = std::make_unique<parser::Expr>(
+                    parser::Expr{parser::IdentifierExpr{std::move(temp_name)}});
+                return std::nullopt;
+            }
+        }
+        return rewrite_inline_sources(*slot, rewrites, tables, lazy_tables, scalars, columns,
+                                      models, functions, compile_time_lists, extern_decls, externs);
+    };
+
+    if (auto* block = std::get_if<parser::BlockExpr>(&expr.node)) {
+        return visit_slot(block->base);
+    }
+    if (auto* join = std::get_if<parser::JoinExpr>(&expr.node)) {
+        if (auto err = visit_slot(join->left)) {
+            return err;
+        }
+        return visit_slot(join->right);
+    }
+    if (auto* group = std::get_if<parser::GroupExpr>(&expr.node)) {
+        return visit_slot(group->expr);
+    }
+    if (auto* ascribe = std::get_if<parser::AscribeExpr>(&expr.node)) {
+        return visit_slot(ascribe->base);
+    }
+    if (auto* call = std::get_if<parser::CallExpr>(&expr.node)) {
+        for (auto& arg : call->args) {
+            if (auto err = visit_slot(arg)) {
+                return err;
+            }
+        }
+        for (auto& named : call->named_args) {
+            if (auto err = visit_slot(named.value)) {
+                return err;
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableRegistry& tables,

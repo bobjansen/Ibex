@@ -17,8 +17,18 @@ extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 // group 0. A reader that trusted the local codes would silently report every
 // gamma as an alpha — same row count, wrong values. The group counts below only
 // come out right if the remap is correct.
-let part_a = Table(1048576)[update { cat = rep(["alpha", "beta"], length_out = 1048576) }];
-let part_b = Table(200000)[update { cat = rep(["gamma", "beta"], length_out = 200000) }];
+let part_a = Table(1048576)[update {
+    cat = rep(["alpha", "beta"], length_out = 1048576),
+    payload = rep([10, 20], length_out = 1048576),
+    flag = rep([true, false], length_out = 1048576),
+    event_time = rep([ts"1994-01-01T00:00:00Z"], length_out = 1048576)
+}];
+let part_b = Table(200000)[update {
+    cat = rep(["gamma", "beta"], length_out = 200000),
+    payload = rep([30, 40], length_out = 200000),
+    flag = rep([true, false], length_out = 200000),
+    event_time = rep([ts"1995-01-01T00:00:00Z"], length_out = 200000)
+}];
 let combined = rbind(part_a, part_b);
 write_parquet(combined, "tests/data/parquet_categorical_check_out.parquet");
 
@@ -31,3 +41,10 @@ back[select { n = count() }, by { cat }, order { cat }];
 // The same column via a filter, which takes the Categorical fast path
 // (the literal is resolved to a code once, then compared as an int).
 back[filter cat == "gamma", select { gamma_rows = count() }];
+
+// The predicate column is decoded across both row groups first. payload is
+// then decoded with only gamma's row indices (all in row group 1).
+back[filter cat == "gamma", select { payload_total = sum(payload) }];
+
+// Selected Boolean and Timestamp payloads take their own physical decode paths.
+back[filter cat == "gamma", select { rows = count() }, by { flag, event_time }];

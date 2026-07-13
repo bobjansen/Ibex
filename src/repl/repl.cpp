@@ -3,6 +3,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
+#include <ibex/ir/scan_predicates.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
@@ -53,6 +54,7 @@
 #include <limits>
 #include <optional>
 #include <robin_hood.h>
+#include <set>
 #include <string>
 #include <system_error>
 #include <variant>
@@ -3258,14 +3260,26 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     runtime::TableRegistry projected;
     if (!lazy_tables.empty()) {
         auto demand = ir::required_columns(*lowered.value());
+        auto predicates = ir::scan_predicates(*lowered.value());
         projected = tables;
         for (const auto& [name, lazy] : lazy_tables) {
             auto needed = demand.find(name);
             if (needed == demand.end()) {
                 continue;  // this plan never scans it
             }
-            auto table =
-                needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
+            std::expected<runtime::Table, std::string> table;
+            if (auto pushed = predicates.find(name); pushed != predicates.end()) {
+                std::set<std::string> names = needed->second.names;
+                if (needed->second.all) {
+                    for (const auto& field : lazy->schema().columns) {
+                        names.insert(field.name);
+                    }
+                }
+                table = lazy->project_where(names, pushed->second, &scalars);
+            } else {
+                table =
+                    needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
+            }
             if (!table) {
                 return std::unexpected(table.error());
             }

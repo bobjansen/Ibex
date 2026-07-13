@@ -132,7 +132,9 @@ if [[ "$SKIP_REPL" == false ]]; then
     rm -f "$IBEX_ROOT/tests/data/parquet_nulls_check_out.parquet"
     # 26.66667 is mean(i) with the two nulls skipped; reading them back as 0
     # (which read_parquet used to do, silently) gives 16 instead.
-    if rg -n "error:" "$repl_out" >/dev/null || ! rg -n "26.66667" "$repl_out" >/dev/null; then
+    if rg -n "error:" "$repl_out" >/dev/null \
+        || ! rg -n "26.66667" "$repl_out" >/dev/null \
+        || ! rg -n "\| \"gamma\" \| 1    \| 3.5" "$repl_out" >/dev/null; then
         cat "$repl_out" >&2
         rm -f "$repl_out"
         exit 1
@@ -151,7 +153,9 @@ if [[ "$SKIP_REPL" == false ]]; then
     if rg -n "error:" "$repl_out" >/dev/null \
         || ! rg -n "524288" "$repl_out" >/dev/null \
         || ! rg -n "624288" "$repl_out" >/dev/null \
-        || ! rg -n "100000" "$repl_out" >/dev/null; then
+        || ! rg -n "100000" "$repl_out" >/dev/null \
+        || ! rg -n "3000000" "$repl_out" >/dev/null \
+        || ! rg -n "1995-01-01 00:00:00.000000000" "$repl_out" >/dev/null; then
         cat "$repl_out" >&2
         rm -f "$repl_out"
         exit 1

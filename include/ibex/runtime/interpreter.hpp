@@ -252,6 +252,15 @@ class ExternRegistry;
                              const ExternRegistry* externs = nullptr,
                              ModelResult* model_out = nullptr) -> std::expected<Table, std::string>;
 
+/// Evaluate row-local filter conjuncts and return the surviving row indices in
+/// ascending order. Null predicate values do not survive (the same three-valued
+/// logic used by a Filter node). This is the seam used by deferred file readers
+/// to late-materialize non-predicate columns without duplicating expression
+/// evaluation inside an I/O plugin.
+[[nodiscard]] auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
+                                    const ScalarRegistry* scalars = nullptr)
+    -> std::expected<std::vector<std::size_t>, std::string>;
+
 /// Predicts on new data with a previously fitted plugin model, reusing its
 /// native handle. Rebuilds the design matrix from `newdata` using the model's
 /// stored formula. Returns a single-column "prediction" table.

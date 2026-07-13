@@ -36,7 +36,10 @@
 #include <memory>
 #include <optional>
 #include <parquet/arrow/reader.h>
+#include <parquet/arrow/schema.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_reader.h>
+#include <parquet/file_reader.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -378,6 +381,19 @@ inline void append_double_column(const std::shared_ptr<arrow::ChunkedArray>& chu
     }
 }
 
+inline void append_bool_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
+                               ibex::Column<bool>& out) {
+    for (const auto& chunk : chunked->chunks()) {
+        if (chunk->type_id() != arrow::Type::BOOL) {
+            throw std::runtime_error("read_parquet: unsupported boolean column type");
+        }
+        const auto& values = static_cast<const arrow::BooleanArray&>(*chunk);
+        for (std::int64_t row = 0; row < values.length(); ++row) {
+            out.push_back(!values.IsNull(row) && values.Value(row));
+        }
+    }
+}
+
 /// Build a dictionary-encoded ibex column from an Arrow ChunkedArray of
 /// DictionaryArrays.
 ///
@@ -562,6 +578,13 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
                 emit(ibex::Column<double>{std::move(values)});
                 break;
             }
+            case arrow::Type::BOOL: {
+                ibex::Column<bool> values;
+                values.reserve(static_cast<std::size_t>(col->length()));
+                append_bool_column(col, values);
+                emit(std::move(values));
+                break;
+            }
             case arrow::Type::STRING:
             case arrow::Type::LARGE_STRING: {
                 // The string path already writes an empty string at a null row.
@@ -624,6 +647,9 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
             case arrow::Type::FLOAT:
             case arrow::Type::DOUBLE:
                 out.add_column(field->name(), ibex::Column<double>{});
+                break;
+            case arrow::Type::BOOL:
+                out.add_column(field->name(), ibex::Column<bool>{});
                 break;
             case arrow::Type::STRING:
             case arrow::Type::LARGE_STRING:
@@ -720,6 +746,598 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
     return reader;
 }
 
+constexpr std::int64_t kDirectDecodeBatchRows = 64 * 1024;
+
+struct DirectValidity {
+    explicit DirectValidity(std::size_t rows) : bits(rows, true) {}
+
+    void append(bool valid) {
+        if (!valid) {
+            bits.set(position, false);
+            has_null = true;
+        }
+        ++position;
+    }
+
+    void append_valid(std::size_t count) { position += count; }
+
+    auto finish() && -> std::optional<ibex::runtime::ValidityBitmap> {
+        if (!has_null) {
+            return std::nullopt;
+        }
+        return std::move(bits);
+    }
+
+    ibex::runtime::ValidityBitmap bits;
+    std::size_t position = 0;
+    bool has_null = false;
+};
+
+/// Consecutive Parquet row groups covered by one direct decode. Source row
+/// indices remain file-global so the same selection machinery works for both
+/// whole-file lazy reads and row-group streaming.
+struct DirectDecodeGroups {
+    int begin = 0;
+    int end = 0;
+    std::size_t source_start = 0;
+    std::size_t rows = 0;
+};
+
+inline auto all_decode_groups(const parquet::FileMetaData& metadata) -> DirectDecodeGroups {
+    return DirectDecodeGroups{.begin = 0,
+                              .end = metadata.num_row_groups(),
+                              .source_start = 0,
+                              .rows = static_cast<std::size_t>(metadata.num_rows())};
+}
+
+template <typename DType, typename Emit>
+inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_index,
+                                   const ibex::runtime::Selection* selection,
+                                   const DirectDecodeGroups& groups, Emit&& emit) -> std::size_t;
+
+template <typename DType, typename Out, bool SameLayout, typename Convert>
+inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_index,
+                                  const ibex::runtime::Selection* selection,
+                                  const DirectDecodeGroups& groups, ibex::Column<Out>& out,
+                                  DirectValidity& validity, Convert&& convert) -> std::size_t {
+    using Raw = typename DType::c_type;
+    if (selection != nullptr ||
+        reader.parquet_reader()->metadata()->schema()->Column(leaf_index)->max_definition_level() !=
+            0) {
+        return decode_physical_column<DType>(
+            reader, leaf_index, selection, groups, [&](const Raw* value) {
+                validity.append(value != nullptr);
+                out.push_back(value == nullptr ? Out{} : convert(*value));
+            });
+    }
+
+    const auto& metadata = *reader.parquet_reader()->metadata();
+    std::size_t emitted = 0;
+    const std::size_t output_start = out.size();
+    std::unique_ptr<Raw[]> converted_values;
+    if constexpr (SameLayout) {
+        static_assert(std::is_same_v<Raw, Out>);
+        out.resize_for_overwrite(output_start + groups.rows);
+    } else {
+        converted_values.reset(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    }
+    for (int group = groups.begin; group < groups.end; ++group) {
+        auto row_group = reader.parquet_reader()->RowGroup(group);
+        auto column = row_group->Column(leaf_index);
+        if (column->type() != DType::type_num) {
+            throw std::runtime_error("read_parquet: physical column type does not match schema");
+        }
+        auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
+        const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        std::size_t row = 0;
+        while (row < group_rows && typed->HasNext()) {
+            const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
+                static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+            std::int64_t values_read = 0;
+            Raw* destination = nullptr;
+            if constexpr (SameLayout) {
+                destination = out.span().data() + output_start + emitted;
+            } else {
+                destination = converted_values.get();
+            }
+            const std::int64_t levels_read =
+                typed->ReadBatch(request, nullptr, nullptr, destination, &values_read);
+            if (levels_read <= 0 || levels_read != values_read) {
+                throw std::runtime_error("read_parquet: dense column decoder made no progress");
+            }
+            const auto count = static_cast<std::size_t>(values_read);
+            if constexpr (!SameLayout) {
+                for (std::size_t i = 0; i < count; ++i) {
+                    out.push_back(convert(converted_values[i]));
+                }
+            }
+            validity.append_valid(count);
+            emitted += count;
+            row += static_cast<std::size_t>(levels_read);
+        }
+        if (row != group_rows) {
+            throw std::runtime_error("read_parquet: column ended before its row group");
+        }
+    }
+    return emitted;
+}
+
+inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int leaf_index,
+                                     const ibex::runtime::Selection* selection,
+                                     const DirectDecodeGroups& groups,
+                                     std::vector<std::string>& dictionary,
+                                     std::vector<std::int32_t>& codes, DirectValidity& validity)
+    -> std::size_t {
+    std::map<std::string, std::int32_t, std::less<>> index;
+    auto intern = [&](std::string value) {
+        auto [it, inserted] = index.try_emplace(value, 0);
+        if (inserted) {
+            it->second = static_cast<std::int32_t>(dictionary.size());
+            dictionary.push_back(std::move(value));
+        }
+        return it->second;
+    };
+
+    std::unique_ptr<std::int32_t[]> local_codes(
+        new std::int32_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::unique_ptr<std::int16_t[]> definitions(
+        new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    const auto& metadata = *reader.parquet_reader()->metadata();
+    std::size_t group_start = groups.source_start;
+    std::size_t selected_pos =
+        selection == nullptr
+            ? 0
+            : static_cast<std::size_t>(
+                  std::lower_bound(selection->begin(), selection->end(), group_start) -
+                  selection->begin());
+    std::size_t emitted = 0;
+
+    for (int group = groups.begin; group < groups.end; ++group) {
+        const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        std::size_t selected_end = selected_pos;
+        if (selection != nullptr) {
+            while (selected_end < selection->size() &&
+                   (*selection)[selected_end] < group_start + group_rows) {
+                ++selected_end;
+            }
+            if (selected_end == selected_pos) {
+                group_start += group_rows;
+                continue;
+            }
+        }
+
+        auto row_group = reader.parquet_reader()->RowGroup(group);
+        auto column =
+            row_group->ColumnWithExposeEncoding(leaf_index, parquet::ExposedEncoding::DICTIONARY);
+        if (column->GetExposedEncoding() != parquet::ExposedEncoding::DICTIONARY) {
+            throw std::runtime_error("read_parquet: dictionary column changed encoding");
+        }
+        const auto* descriptor = column->descr();
+        if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
+            throw std::runtime_error("read_parquet: nested columns are not supported");
+        }
+        const bool optional = descriptor->max_definition_level() != 0;
+        auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
+        std::vector<std::int32_t> local_to_global;
+
+        std::size_t row = 0;
+        while (row < group_rows && typed->HasNext()) {
+            const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
+                static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+            std::int64_t codes_read = 0;
+            const parquet::ByteArray* local_dictionary = nullptr;
+            std::int32_t dictionary_size = 0;
+            const std::int64_t levels_read = typed->ReadBatchWithDictionary(
+                request, optional ? definitions.get() : nullptr, nullptr, local_codes.get(),
+                &codes_read, &local_dictionary, &dictionary_size);
+            if (levels_read <= 0) {
+                throw std::runtime_error("read_parquet: dictionary decoder made no progress");
+            }
+            if (local_dictionary != nullptr) {
+                local_to_global.clear();
+                local_to_global.reserve(static_cast<std::size_t>(dictionary_size));
+                for (std::int32_t i = 0; i < dictionary_size; ++i) {
+                    const auto& value = local_dictionary[i];
+                    local_to_global.push_back(
+                        intern(std::string(reinterpret_cast<const char*>(value.ptr), value.len)));
+                }
+            }
+            if (local_to_global.empty() && codes_read != 0) {
+                throw std::runtime_error("read_parquet: dictionary page was not exposed");
+            }
+
+            std::size_t code_pos = 0;
+            for (std::int64_t offset = 0; offset < levels_read; ++offset) {
+                const bool valid = !optional || definitions[static_cast<std::size_t>(offset)] == 1;
+                const std::size_t source_row = group_start + row + static_cast<std::size_t>(offset);
+                bool keep = selection == nullptr;
+                if (selection != nullptr && selected_pos < selected_end &&
+                    (*selection)[selected_pos] == source_row) {
+                    keep = true;
+                    ++selected_pos;
+                }
+                if (keep) {
+                    validity.append(valid);
+                    if (!valid) {
+                        codes.push_back(intern(std::string{}));
+                    } else {
+                        const auto local = local_codes[code_pos];
+                        if (local < 0 ||
+                            static_cast<std::size_t>(local) >= local_to_global.size()) {
+                            throw std::runtime_error("read_parquet: invalid dictionary index");
+                        }
+                        codes.push_back(local_to_global[static_cast<std::size_t>(local)]);
+                    }
+                    ++emitted;
+                }
+                code_pos += static_cast<std::size_t>(valid);
+            }
+            if (code_pos != static_cast<std::size_t>(codes_read)) {
+                throw std::runtime_error("read_parquet: inconsistent definition levels");
+            }
+            row += static_cast<std::size_t>(levels_read);
+        }
+        if (row != group_rows) {
+            throw std::runtime_error("read_parquet: column ended before its row group");
+        }
+        group_start += group_rows;
+    }
+    return emitted;
+}
+
+template <typename DType, typename Emit>
+inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_index,
+                                   const ibex::runtime::Selection* selection,
+                                   const DirectDecodeGroups& groups, Emit&& emit) -> std::size_t {
+    using Raw = typename DType::c_type;
+
+    std::unique_ptr<Raw[]> values(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::unique_ptr<std::int16_t[]> definitions(
+        new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+
+    const auto& metadata = *reader.parquet_reader()->metadata();
+    std::size_t group_start = groups.source_start;
+    std::size_t selected_pos =
+        selection == nullptr
+            ? 0
+            : static_cast<std::size_t>(
+                  std::lower_bound(selection->begin(), selection->end(), group_start) -
+                  selection->begin());
+    std::size_t emitted = 0;
+
+    for (int group = groups.begin; group < groups.end; ++group) {
+        const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        std::size_t selected_end = selected_pos;
+        if (selection != nullptr) {
+            while (selected_end < selection->size() &&
+                   (*selection)[selected_end] < group_start + group_rows) {
+                ++selected_end;
+            }
+            if (selected_end == selected_pos) {
+                group_start += group_rows;
+                continue;
+            }
+        }
+
+        auto row_group = reader.parquet_reader()->RowGroup(group);
+        auto column = row_group->Column(leaf_index);
+        if (column->type() != DType::type_num) {
+            throw std::runtime_error("read_parquet: physical column type does not match schema");
+        }
+        const auto* descriptor = column->descr();
+        if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
+            throw std::runtime_error("read_parquet: nested columns are not supported");
+        }
+        const bool optional = descriptor->max_definition_level() != 0;
+        auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
+
+        // Flat required columns can seek over rejected rows without decoding
+        // them. Nullable columns stay on the level-aware path below because
+        // TypedColumnReader::Skip counts physical values rather than logical
+        // rows, and nulls have no physical value to skip.
+        if (selection != nullptr && !optional) {
+            std::size_t source_row = group_start;
+            while (selected_pos < selected_end) {
+                const std::size_t target = (*selection)[selected_pos];
+                const std::size_t gap = target - source_row;
+                if (gap != 0) {
+                    const auto skipped = typed->Skip(static_cast<std::int64_t>(gap));
+                    if (skipped != static_cast<std::int64_t>(gap)) {
+                        throw std::runtime_error(
+                            "read_parquet: column ended while skipping rejected rows");
+                    }
+                    source_row += gap;
+                }
+
+                std::size_t run = 1;
+                while (selected_pos + run < selected_end &&
+                       (*selection)[selected_pos + run] == target + run &&
+                       run < static_cast<std::size_t>(kDirectDecodeBatchRows)) {
+                    ++run;
+                }
+                std::int64_t values_read = 0;
+                const auto levels_read = typed->ReadBatch(static_cast<std::int64_t>(run), nullptr,
+                                                          nullptr, values.get(), &values_read);
+                if (levels_read != static_cast<std::int64_t>(run) || values_read != levels_read) {
+                    throw std::runtime_error(
+                        "read_parquet: column ended while reading selected rows");
+                }
+                for (std::size_t i = 0; i < run; ++i) {
+                    emit(&values[i]);
+                }
+                emitted += run;
+                selected_pos += run;
+                source_row += run;
+            }
+            group_start += group_rows;
+            continue;
+        }
+
+        std::size_t row = 0;
+        while (row < group_rows && typed->HasNext()) {
+            const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
+                static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+            std::int64_t values_read = 0;
+            const std::int64_t levels_read =
+                typed->ReadBatch(request, optional ? definitions.get() : nullptr, nullptr,
+                                 values.get(), &values_read);
+            if (levels_read <= 0) {
+                throw std::runtime_error("read_parquet: column decoder made no progress");
+            }
+
+            std::size_t raw_pos = 0;
+            for (std::int64_t offset = 0; offset < levels_read; ++offset) {
+                const bool valid = !optional || definitions[static_cast<std::size_t>(offset)] == 1;
+                const std::size_t source_row = group_start + row + static_cast<std::size_t>(offset);
+                bool keep = selection == nullptr;
+                if (selection != nullptr && selected_pos < selected_end &&
+                    (*selection)[selected_pos] == source_row) {
+                    keep = true;
+                    ++selected_pos;
+                }
+                if (keep) {
+                    emit(valid ? &values[raw_pos] : nullptr);
+                    ++emitted;
+                }
+                raw_pos += static_cast<std::size_t>(valid);
+            }
+            if (raw_pos != static_cast<std::size_t>(values_read)) {
+                throw std::runtime_error("read_parquet: inconsistent definition levels");
+            }
+            row += static_cast<std::size_t>(levels_read);
+        }
+        if (row != group_rows) {
+            throw std::runtime_error("read_parquet: column ended before its row group");
+        }
+        group_start += group_rows;
+    }
+    return emitted;
+}
+
+inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field& field,
+                          int leaf_index, const ibex::runtime::Selection* selection,
+                          const DirectDecodeGroups& groups, std::size_t output_rows)
+    -> ibex::runtime::ColumnEntry {
+    DirectValidity validity(output_rows);
+    ibex::runtime::ColumnEntry entry;
+    entry.name = field.name();
+
+    auto verify = [&](std::size_t emitted) {
+        if (emitted != output_rows || validity.position != output_rows) {
+            throw std::runtime_error("read_parquet: decoded column has the wrong row count");
+        }
+    };
+
+    switch (field.type()->id()) {
+        case arrow::Type::INT8:
+        case arrow::Type::INT16:
+        case arrow::Type::INT32:
+        case arrow::Type::UINT8:
+        case arrow::Type::UINT16:
+        case arrow::Type::UINT32: {
+            ibex::Column<std::int64_t> out;
+            out.reserve(output_rows);
+            const auto id = field.type()->id();
+            auto emitted = decode_numeric_column<parquet::Int32Type, std::int64_t, false>(
+                reader, leaf_index, selection, groups, out, validity, [&](std::int32_t value) {
+                    if (id == arrow::Type::UINT8 || id == arrow::Type::UINT16 ||
+                        id == arrow::Type::UINT32) {
+                        return static_cast<std::int64_t>(static_cast<std::uint32_t>(value));
+                    }
+                    return static_cast<std::int64_t>(value);
+                });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::INT64:
+        case arrow::Type::UINT64: {
+            ibex::Column<std::int64_t> out;
+            out.reserve(output_rows);
+            auto emitted = decode_numeric_column<parquet::Int64Type, std::int64_t, true>(
+                reader, leaf_index, selection, groups, out, validity,
+                [](std::int64_t value) { return value; });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::FLOAT: {
+            ibex::Column<double> out;
+            out.reserve(output_rows);
+            auto emitted = decode_numeric_column<parquet::FloatType, double, false>(
+                reader, leaf_index, selection, groups, out, validity,
+                [](float value) { return static_cast<double>(value); });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::DOUBLE: {
+            ibex::Column<double> out;
+            out.reserve(output_rows);
+            auto emitted = decode_numeric_column<parquet::DoubleType, double, true>(
+                reader, leaf_index, selection, groups, out, validity,
+                [](double value) { return value; });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::BOOL: {
+            ibex::Column<bool> out;
+            out.reserve(output_rows);
+            auto emitted = decode_physical_column<parquet::BooleanType>(
+                reader, leaf_index, selection, groups, [&](const bool* value) {
+                    validity.append(value != nullptr);
+                    out.push_back(value != nullptr && *value);
+                });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::STRING:
+        case arrow::Type::LARGE_STRING: {
+            std::vector<std::string> out;
+            out.reserve(output_rows);
+            auto emitted = decode_physical_column<parquet::ByteArrayType>(
+                reader, leaf_index, selection, groups, [&](const parquet::ByteArray* value) {
+                    validity.append(value != nullptr);
+                    if (value == nullptr) {
+                        out.emplace_back();
+                    } else {
+                        out.emplace_back(reinterpret_cast<const char*>(value->ptr), value->len);
+                    }
+                });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(
+                ibex::Column<std::string>{std::move(out)});
+            break;
+        }
+        case arrow::Type::DICTIONARY: {
+            std::vector<std::string> dictionary;
+            std::vector<std::int32_t> codes;
+            codes.reserve(output_rows);
+            auto emitted = decode_dictionary_column(reader, leaf_index, selection, groups,
+                                                    dictionary, codes, validity);
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(
+                ibex::Column<ibex::Categorical>{std::move(dictionary), std::move(codes)});
+            break;
+        }
+        case arrow::Type::DATE32: {
+            ibex::Column<ibex::Date> out;
+            out.reserve(output_rows);
+            auto emitted = decode_numeric_column<parquet::Int32Type, ibex::Date, false>(
+                reader, leaf_index, selection, groups, out, validity,
+                [](std::int32_t value) { return ibex::Date{value}; });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::DATE64: {
+            constexpr std::int64_t kMillisPerDay = 86'400'000;
+            ibex::Column<ibex::Date> out;
+            out.reserve(output_rows);
+            auto emitted = decode_numeric_column<parquet::Int64Type, ibex::Date, false>(
+                reader, leaf_index, selection, groups, out, validity, [](std::int64_t value) {
+                    return ibex::Date{static_cast<std::int32_t>(value / kMillisPerDay)};
+                });
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        case arrow::Type::TIMESTAMP: {
+            ibex::Column<ibex::Timestamp> out;
+            out.reserve(output_rows);
+            const auto unit = static_cast<const arrow::TimestampType&>(*field.type()).unit();
+            std::int64_t scale = 1;
+            if (unit == arrow::TimeUnit::SECOND) {
+                scale = 1'000'000'000;
+            } else if (unit == arrow::TimeUnit::MILLI) {
+                scale = 1'000'000;
+            } else if (unit == arrow::TimeUnit::MICRO) {
+                scale = 1'000;
+            }
+
+            const auto physical =
+                reader.parquet_reader()->metadata()->schema()->Column(leaf_index)->physical_type();
+            std::size_t emitted = 0;
+            if (physical == parquet::Type::INT96) {
+                emitted = decode_physical_column<parquet::Int96Type>(
+                    reader, leaf_index, selection, groups, [&](const parquet::Int96* value) {
+                        validity.append(value != nullptr);
+                        out.push_back(ibex::Timestamp{
+                            value == nullptr ? 0 : parquet::Int96GetNanoSeconds(*value)});
+                    });
+            } else {
+                emitted = decode_numeric_column<parquet::Int64Type, ibex::Timestamp, false>(
+                    reader, leaf_index, selection, groups, out, validity,
+                    [scale](std::int64_t value) { return ibex::Timestamp{value * scale}; });
+            }
+            verify(emitted);
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
+            break;
+        }
+        default:
+            throw std::runtime_error("read_parquet: unsupported column type for " + field.name());
+    }
+
+    entry.validity = std::move(validity).finish();
+    return entry;
+}
+
+inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow::Schema& schema,
+                                const std::vector<int>& field_indices,
+                                const ibex::runtime::Selection* selection, std::size_t source_rows,
+                                const DirectDecodeGroups& groups) -> ibex::runtime::Table {
+    if (selection != nullptr) {
+        if (!std::is_sorted(selection->begin(), selection->end()) ||
+            std::adjacent_find(selection->begin(), selection->end()) != selection->end() ||
+            (!selection->empty() && selection->back() >= source_rows)) {
+            throw std::runtime_error("read_parquet: invalid row selection");
+        }
+    }
+
+    if (groups.begin < 0 || groups.end < groups.begin ||
+        groups.end > reader.parquet_reader()->metadata()->num_row_groups() ||
+        groups.source_start + groups.rows > source_rows) {
+        throw std::runtime_error("read_parquet: invalid decode row-group range");
+    }
+
+    std::size_t output_rows = groups.rows;
+    if (selection != nullptr) {
+        const auto selection_begin =
+            std::lower_bound(selection->begin(), selection->end(), groups.source_start);
+        const auto selection_end =
+            std::lower_bound(selection_begin, selection->end(), groups.source_start + groups.rows);
+        output_rows = static_cast<std::size_t>(std::distance(selection_begin, selection_end));
+    }
+
+    ibex::runtime::Table out;
+    const auto& manifest = reader.manifest();
+    for (int field_index : field_indices) {
+        if (field_index < 0 || field_index >= schema.num_fields() ||
+            field_index >= static_cast<int>(manifest.schema_fields.size()) ||
+            !manifest.schema_fields[static_cast<std::size_t>(field_index)].is_leaf()) {
+            throw std::runtime_error("read_parquet: nested columns are not supported");
+        }
+        auto entry = direct_column(
+            reader, *schema.field(field_index),
+            manifest.schema_fields[static_cast<std::size_t>(field_index)].column_index, selection,
+            groups, output_rows);
+        out.add_column_shared(std::move(entry.name), std::move(entry.column),
+                              std::move(entry.validity));
+    }
+    out.logical_rows = output_rows;
+    return out;
+}
+
+inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow::Schema& schema,
+                                const std::vector<int>& field_indices,
+                                const ibex::runtime::Selection* selection, std::size_t source_rows)
+    -> ibex::runtime::Table {
+    return direct_decode_table(reader, schema, field_indices, selection, source_rows,
+                               all_decode_groups(*reader.parquet_reader()->metadata()));
+}
+
 }  // namespace
 
 /// Open `path` for deferred reading: take its schema and row count from the
@@ -752,7 +1370,9 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
         indices->emplace(arrow_schema->field(i)->name(), i);
     }
 
-    auto decode = [reader, indices, path_string](const std::vector<std::string>& names)
+    auto decode = [reader, indices, arrow_schema, rows, path_string](
+                      const std::vector<std::string>& names,
+                      const ibex::runtime::Selection* selection)
         -> std::expected<ibex::runtime::Table, std::string> {
         std::vector<int> column_indices;
         column_indices.reserve(names.size());
@@ -764,18 +1384,11 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
             column_indices.push_back(it->second);
         }
 
-        std::shared_ptr<arrow::Table> table;
-        auto read_status = reader->ReadTable(column_indices, &table);
-        if (!read_status.ok()) {
-            return std::unexpected("read_parquet: failed to read columns from " + path_string +
-                                   " (" + read_status.ToString() + ")");
-        }
         try {
-            ibex::runtime::Table out;
-            populate_from_arrow_table(table, out);
-            return out;
+            return direct_decode_table(*reader, *arrow_schema, column_indices, selection, rows);
         } catch (const std::exception& e) {
-            return std::unexpected(std::string(e.what()));
+            return std::unexpected("read_parquet: failed to read columns from " + path_string +
+                                   " (" + e.what() + ")");
         }
     };
 
@@ -789,35 +1402,31 @@ inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {
 
     auto reader = make_parquet_reader(std::move(input), path_string);
 
-    std::shared_ptr<arrow::Table> table;
-    auto st = reader->ReadTable(&table);
+    std::shared_ptr<arrow::Schema> schema;
+    auto st = reader->GetSchema(&schema);
     if (!st.ok()) {
-        throw std::runtime_error("read_parquet: failed to load table: " + path_string + " (" +
+        throw std::runtime_error("read_parquet: failed to read schema: " + path_string + " (" +
                                  st.ToString() + ")");
     }
-
-    ibex::runtime::Table out;
-    populate_from_arrow_table(table, out);
-    return out;
+    std::vector<int> fields(static_cast<std::size_t>(schema->num_fields()));
+    for (int i = 0; i < schema->num_fields(); ++i) {
+        fields[static_cast<std::size_t>(i)] = i;
+    }
+    const auto rows = static_cast<std::size_t>(reader->parquet_reader()->metadata()->num_rows());
+    try {
+        return direct_decode_table(*reader, *schema, fields, nullptr, rows);
+    } catch (const std::exception& e) {
+        throw std::runtime_error("read_parquet: failed to load table: " + path_string + " (" +
+                                 e.what() + ")");
+    }
 }
 
-namespace {
-
-/// Number of rows per streamed batch for `ChunkedParquetSourceOperator`.
-/// Matches `libs/csv/csv.cpp`'s `kChunkedCsvRowsPerChunk` so chunk sizing is
-/// consistent across sources. `parquet::arrow::FileReader::set_batch_size`
-/// controls this independent of the file's own row-group sizing, so chunk
-/// size stays bounded even against a file written with one giant row group.
-constexpr std::int64_t kParquetRowsPerChunk = 65536;
-
-}  // namespace
-
-/// Row-group/batch streaming source for `read_parquet`, registered via
+/// Row-group streaming source for `read_parquet`, registered via
 /// `ExternRegistry::register_chunked_table` alongside the whole-file
-/// `read_parquet()` above. Emits one `ibex::runtime::Chunk` per
-/// `kParquetRowsPerChunk`-row Arrow batch instead of materializing the whole
-/// file, so peak memory during a read is bounded by chunk size rather than
-/// file size.
+/// `read_parquet()` above. Each row group is decoded directly into an Ibex
+/// chunk, without an intermediate Arrow RecordBatch or Table. Categorical
+/// chunks are remapped onto shared dictionaries, preserving the streaming
+/// operator contract across row-group dictionary boundaries.
 class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
    public:
     static auto create(std::string path) -> std::expected<ibex::runtime::OperatorPtr, std::string> {
@@ -839,28 +1448,48 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
 
     [[nodiscard]] auto next()
         -> std::expected<std::optional<ibex::runtime::Chunk>, std::string> override {
-        std::shared_ptr<arrow::RecordBatch> batch;
-        auto st = batches_->ReadNext(&batch);
-        if (!st.ok()) {
-            return std::unexpected("read_parquet: failed to read batch: " + path_ + " (" +
-                                   st.ToString() + ")");
-        }
-        if (batch == nullptr) {
+        if (next_group_ >= group_count_) {
             return std::optional<ibex::runtime::Chunk>{};
         }
 
-        auto table_result = arrow::Table::FromRecordBatches(batch->schema(), {batch});
-        if (!table_result.ok()) {
-            return std::unexpected("read_parquet: failed to wrap batch: " + path_ + " (" +
-                                   table_result.status().ToString() + ")");
-        }
-
         try {
+            const int group = next_group_++;
+            const auto group_rows = static_cast<std::size_t>(
+                reader_->parquet_reader()->metadata()->RowGroup(group)->num_rows());
+            const DirectDecodeGroups groups{.begin = group,
+                                            .end = group + 1,
+                                            .source_start = next_source_row_,
+                                            .rows = group_rows};
+            next_source_row_ += group_rows;
+            auto table = direct_decode_table(*reader_, *schema_, field_indices_, nullptr,
+                                             source_rows_, groups);
+
+            for (std::size_t i = 0; i < table.columns.size(); ++i) {
+                auto* local =
+                    std::get_if<ibex::Column<ibex::Categorical>>(table.columns[i].column.get());
+                if (local == nullptr) {
+                    continue;
+                }
+                auto& state = *categorical_states_[i];
+                ibex::Column<ibex::Categorical> remapped{
+                    state.dictionary_ptr(), state.index_ptr(), {}};
+                remapped.reserve(local->size());
+                for (std::size_t row = 0; row < local->size(); ++row) {
+                    remapped.push_back((*local)[row]);
+                }
+                table.columns[i].column =
+                    std::make_shared<ibex::runtime::ColumnValue>(std::move(remapped));
+            }
+
             ibex::runtime::Chunk chunk;
-            populate_from_arrow_table(table_result.ValueOrDie(), chunk);
+            chunk.columns = std::move(table.columns);
+            if (chunk.columns.empty()) {
+                chunk.logical_rows = table.logical_rows;
+            }
             return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
         } catch (const std::exception& e) {
-            return std::unexpected(std::string(e.what()));
+            return std::unexpected("read_parquet: failed to read row group from " + path_ + " (" +
+                                   e.what() + ")");
         }
     }
 
@@ -872,21 +1501,35 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
         auto input = open_parquet_input(path_);
 
         reader_ = make_parquet_reader(std::move(input), path_);
-        reader_->set_batch_size(kParquetRowsPerChunk);
-
-        auto batches_result = reader_->GetRecordBatchReader();
-        if (!batches_result.ok()) {
-            throw std::runtime_error("read_parquet: failed to open batch stream: " + path_ + " (" +
-                                     batches_result.status().ToString() + ")");
+        auto st = reader_->GetSchema(&schema_);
+        if (!st.ok()) {
+            throw std::runtime_error("read_parquet: failed to read schema: " + path_ + " (" +
+                                     st.ToString() + ")");
         }
-        batches_ = std::move(batches_result).ValueOrDie();
+
+        const auto& metadata = *reader_->parquet_reader()->metadata();
+        group_count_ = metadata.num_row_groups();
+        source_rows_ = static_cast<std::size_t>(metadata.num_rows());
+        field_indices_.resize(static_cast<std::size_t>(schema_->num_fields()));
+        categorical_states_.resize(field_indices_.size());
+        for (int i = 0; i < schema_->num_fields(); ++i) {
+            const auto pos = static_cast<std::size_t>(i);
+            field_indices_[pos] = i;
+            if (schema_->field(i)->type()->id() == arrow::Type::DICTIONARY) {
+                categorical_states_[pos].emplace();
+            }
+        }
     }
 
     std::string path_;
-    // reader_ must outlive batches_'s use of it (Arrow doc: "FileReaders must
-    // outlive their RecordBatchReaders").
     std::unique_ptr<parquet::arrow::FileReader> reader_;
-    std::unique_ptr<arrow::RecordBatchReader> batches_;
+    std::shared_ptr<arrow::Schema> schema_;
+    std::vector<int> field_indices_;
+    std::vector<std::optional<ibex::Column<ibex::Categorical>>> categorical_states_;
+    std::size_t source_rows_ = 0;
+    std::size_t next_source_row_ = 0;
+    int next_group_ = 0;
+    int group_count_ = 0;
 };
 
 namespace {
@@ -1052,6 +1695,8 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
                 return arrow::field(entry.name, arrow::date32());
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
                 return arrow::field(entry.name, arrow::timestamp(arrow::TimeUnit::NANO));
+            } else if constexpr (std::is_same_v<ColT, ibex::Column<bool>>) {
+                return arrow::field(entry.name, arrow::boolean());
             } else {
                 // string, categorical → UTF-8
                 return arrow::field(entry.name, arrow::utf8());
@@ -1071,6 +1716,7 @@ inline auto column_to_arrow_field(const ibex::runtime::ColumnEntry& entry)
 ///   Categorical → Parquet UTF8 (dictionary decoded)
 ///   Date        → Parquet DATE32
 ///   Timestamp   → Parquet TIMESTAMP (nanoseconds, UTC)
+///   Bool        → Parquet BOOLEAN
 ///
 /// Returns the number of rows written.
 inline auto write_parquet(const ibex::runtime::Table& table, std::string_view path)

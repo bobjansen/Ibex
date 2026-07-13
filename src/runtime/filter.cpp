@@ -2084,15 +2084,86 @@ auto filter_table(const Table& input, const ir::Expr& predicate, const ScalarReg
     return filter_table_impl(input, predicate, nullptr, 0, scalars);
 }
 
-auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
-                      const ScalarRegistry* scalars)
-    -> std::expected<std::vector<std::size_t>, std::string> {
-    const std::size_t rows = input.rows();
-    std::vector<std::size_t> selected(rows);
-    std::iota(selected.begin(), selected.end(), std::size_t{0});
+namespace {
 
-    for (const auto& conjunct : conjuncts) {
-        auto mask = compute_mask(conjunct, input, scalars, rows);
+auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conjuncts,
+                           const ScalarRegistry* scalars, std::vector<std::size_t> selected)
+    -> std::expected<std::vector<std::size_t>, std::string> {
+    constexpr std::size_t kCompactionFactor = 4;
+    const std::size_t rows = input.rows();
+    if (selected.empty()) {
+        return selected;
+    }
+    auto referenced_names = [&](const ir::Expr& conjunct) {
+        robin_hood::unordered_set<std::string> referenced;
+        ir::collect_expr_column_refs(conjunct, referenced);
+        std::vector<std::string> names;
+        names.reserve(referenced.size());
+        for (const auto& entry : input.columns) {
+            if (referenced.contains(entry.name)) {
+                names.push_back(entry.name);
+            }
+        }
+        return names;
+    };
+
+    for (std::size_t conjunct_index = 0; conjunct_index < conjuncts.size();) {
+        const auto names = referenced_names(conjuncts[conjunct_index]);
+        if (!names.empty() && selected.size() <= rows / kCompactionFactor) {
+            std::size_t group_end = conjunct_index + 1;
+            while (group_end < conjuncts.size() &&
+                   referenced_names(conjuncts[group_end]) == names) {
+                ++group_end;
+            }
+
+            // Once earlier conjuncts have rejected most rows, evaluating a
+            // dense mask wastes work. Gather just this stage's columns into a
+            // compact table, evaluate consecutive bounds together, then map
+            // the local survivors back to input row indices.
+            Table stage;
+            for (const auto& name : names) {
+                const auto* entry = input.find_entry(name);
+                if (entry == nullptr) {
+                    continue;
+                }
+                auto column = gather_column(*entry->column, selected.data(), selected.size());
+                if (entry->validity.has_value()) {
+                    ValidityBitmap validity(selected.size(), true);
+                    for (std::size_t row = 0; row < selected.size(); ++row) {
+                        validity.set(row, (*entry->validity)[selected[row]]);
+                    }
+                    stage.add_column(name, std::move(column), std::move(validity));
+                } else {
+                    stage.add_column(name, std::move(column));
+                }
+            }
+            stage.logical_rows = selected.size();
+
+            using ConjunctDiff = std::vector<ir::Expr>::difference_type;
+            std::vector<ir::Expr> stage_conjuncts(
+                conjuncts.begin() + static_cast<ConjunctDiff>(conjunct_index),
+                conjuncts.begin() + static_cast<ConjunctDiff>(group_end));
+            std::vector<std::size_t> local(selected.size());
+            std::iota(local.begin(), local.end(), std::size_t{0});
+            auto local_selected =
+                filter_selection_impl(stage, stage_conjuncts, scalars, std::move(local));
+            if (!local_selected) {
+                return std::unexpected(local_selected.error());
+            }
+            std::vector<std::size_t> next;
+            next.reserve(local_selected->size());
+            for (std::size_t row : *local_selected) {
+                next.push_back(selected[row]);
+            }
+            selected = std::move(next);
+            conjunct_index = group_end;
+            if (selected.empty()) {
+                break;
+            }
+            continue;
+        }
+
+        auto mask = compute_mask(conjuncts[conjunct_index], input, scalars, rows);
         if (!mask) {
             return std::unexpected(mask.error());
         }
@@ -2104,8 +2175,19 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
         if (selected.empty()) {
             break;
         }
+        ++conjunct_index;
     }
     return selected;
+}
+
+}  // namespace
+
+auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
+                      const ScalarRegistry* scalars)
+    -> std::expected<std::vector<std::size_t>, std::string> {
+    std::vector<std::size_t> selected(input.rows());
+    std::iota(selected.begin(), selected.end(), std::size_t{0});
+    return filter_selection_impl(input, conjuncts, scalars, std::move(selected));
 }
 
 auto filter_project_table(const Table& input, const ir::Expr& predicate,

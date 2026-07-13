@@ -1,0 +1,26 @@
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// read_parquet used to drop null-ness entirely: a null row came back as 0 (or
+// as an empty string), with no validity bitmap attached. The values looked
+// plausible, so nothing failed loudly — aggregates just silently counted the
+// nulls as zeroes.
+//
+// Round-trip a null-bearing frame through Parquet and check the nulls are still
+// nulls on the way back. CSV is the source because Ibex array literals cannot
+// express a null.
+let src = read_csv("tests/data/parquet_nulls_check.csv", "NA");
+write_parquet(src, "tests/data/parquet_nulls_check_out.parquet");
+let back = read_parquet("tests/data/parquet_nulls_check_out.parquet");
+
+// i is 10, null, 30, 40, null.
+//   sum  = 80 either way (a null read as 0 adds nothing), so sum proves nothing.
+//   mean = 80/3 = 26.666… when nulls are skipped, but 80/5 = 16 if they became 0.
+// So the mean is the assertion that actually discriminates.
+back[select { rows = count(), total = sum(i), average = mean(i) }];
+
+// And the nulls must be visible to is_null: 2 in i, 1 in the String column s
+// (whose nulls would otherwise come back as an ordinary empty string).
+back[filter is_null(i), select { null_ints = count() }];
+back[filter is_null(s), select { null_strings = count() }];

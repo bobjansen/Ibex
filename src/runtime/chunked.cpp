@@ -622,12 +622,12 @@ class ChunkedHeadOperator final : public Operator {
             Key key;
             key.values.reserve(group_by_->size());
             for (const auto& ref : *group_by_) {
-                const auto* column = t.find(ref.name);
-                if (column == nullptr) {
+                const auto* entry = t.find_entry(ref.name);
+                if (entry == nullptr) {
                     return std::unexpected("head group-by column not found: " + ref.name +
                                            " (available: " + format_columns(t) + ")");
                 }
-                key.values.push_back(scalar_from_column(*column, row));
+                push_key_value(key, *entry, row);
             }
             auto& seen = seen_counts_[key];
             if (seen >= count_) {
@@ -905,7 +905,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                     Key key;
                     key.values.reserve(group_entries.size());
                     for (const auto* entry : group_entries)
-                        key.values.push_back(scalar_from_column(*entry->column, r));
+                        push_key_value(key, *entry, r);
                     auto [it, inserted] = group_index.emplace(std::move(key), ngroups);
                     if (inserted)
                         ++ngroups;
@@ -1943,7 +1943,11 @@ class ChunkedDistinctOperator final : public Operator {
                 return std::optional<Chunk>{table_to_chunk(std::move(t))};
             }
 
-            if (t.columns.size() == 1) {
+            // The single-column fast paths hash the raw value and cannot express
+            // "null", so a null would dedupe against a genuine 0 / "". A
+            // null-bearing column falls through to the Key path below, which
+            // carries the null bits.
+            if (t.columns.size() == 1 && !t.columns.front().validity.has_value()) {
                 auto out = process_single_column(std::move(t));
                 if (!out.has_value()) {
                     continue;
@@ -1958,7 +1962,7 @@ class ChunkedDistinctOperator final : public Operator {
                 Key key;
                 key.values.reserve(t.columns.size());
                 for (const auto& entry : t.columns) {
-                    key.values.push_back(scalar_from_column(*entry.column, row));
+                    push_key_value(key, entry, row);
                 }
                 if (!seen_.insert(std::move(key)).second) {
                     continue;
@@ -2424,6 +2428,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     enum class Mode : std::uint8_t { Stream, Swapped };
 
     static constexpr std::size_t kNil = std::numeric_limits<std::size_t>::max();
+
+    const ValidityBitmap* build_validity_ = nullptr;  // null → build key has no nulls
+    const ValidityBitmap* probe_validity_ = nullptr;  // reset per probe chunk
     // Build-on-right is preferred when right is small enough that probing
     // it from streaming left chunks is cache-friendly. Above this, we
     // materialize left to pick the smaller build side.
@@ -2508,6 +2515,14 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (key == nullptr) {
             return "join key not found in build side: " + key_name;
         }
+        // A null key matches nothing, not even another null (SQL / Polars). So a
+        // null-keyed build row is never indexed, and a null-keyed probe row is
+        // never looked up. Both halves are needed: a null cell holds the type's
+        // zero value, so a null probe key would otherwise find a genuine `0`.
+        const auto* build_entry = build_side.find_entry(key_name);
+        build_validity_ = build_entry != nullptr && build_entry->validity.has_value()
+                              ? &*build_entry->validity
+                              : nullptr;
         const std::size_t n = build_side.rows();
         chain_next_.assign(n, kNil);
 
@@ -2573,6 +2588,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         heads.reserve(n);
         const auto* data = col.data();
         for (std::size_t r = n; r-- > 0;) {
+            if (build_is_null(r)) {
+                continue;
+            }
             auto [it, inserted] = heads.try_emplace(data[r], r);
             if (!inserted) {
                 chain_next_[r] = it->second;
@@ -2582,7 +2600,17 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
     }
 
+    [[nodiscard]] auto build_is_null(std::size_t row) const noexcept -> bool {
+        return build_validity_ != nullptr && !(*build_validity_)[row];
+    }
+    [[nodiscard]] auto probe_is_null(std::size_t row) const noexcept -> bool {
+        return probe_validity_ != nullptr && !(*probe_validity_)[row];
+    }
+
     void insert_chain_sv(std::string_view sv, std::size_t r) {
+        if (build_is_null(r)) {
+            return;
+        }
         auto [it, inserted] = string_heads_.try_emplace(sv, r);
         if (!inserted) {
             chain_next_[r] = it->second;
@@ -2616,6 +2644,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             std::size_t* rp = ri.data();
             std::size_t out = 0;
             for (std::size_t l = 0; l < n; ++l) {
+                if (probe_is_null(l)) {
+                    continue;
+                }
                 auto it = heads.find(get(l));
                 if (it == heads.end()) {
                     continue;
@@ -2629,6 +2660,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             return out == n;
         }
         for (std::size_t l = 0; l < n; ++l) {
+            if (probe_is_null(l)) {
+                continue;
+            }
             auto it = heads.find(get(l));
             if (it == heads.end()) {
                 continue;
@@ -2648,6 +2682,10 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (key == nullptr) {
             return std::unexpected("join key not found in left chunk: " + keys_->front());
         }
+        const auto* probe_entry = left_chunk.find_entry(keys_->front());
+        probe_validity_ = probe_entry != nullptr && probe_entry->validity.has_value()
+                              ? &*probe_entry->validity
+                              : nullptr;
 
         std::vector<std::size_t> li;
         std::vector<std::size_t> ri;
@@ -2735,9 +2773,19 @@ class ChunkedInnerJoinOperator final : public Operator {
         std::vector<std::size_t> match_counts(n_left, 0);
         std::size_t total = 0;
 
+        // In swapped mode the index is on the left, so the right table is the
+        // probe side. Its null-keyed rows match nothing (see build_index).
+        const auto* right_entry = right_.find_entry(keys_->front());
+        probe_validity_ = right_entry != nullptr && right_entry->validity.has_value()
+                              ? &*right_entry->validity
+                              : nullptr;
+
         // Phase 1: count.
         auto walk_and_apply = [&](auto&& key_at, const auto& heads, auto&& apply) {
             for (std::size_t r = 0; r < n_right; ++r) {
+                if (probe_is_null(r)) {
+                    continue;
+                }
                 auto it = heads.find(key_at(r));
                 if (it == heads.end())
                     continue;
@@ -3314,7 +3362,7 @@ class ChunkedAggregateOperator final : public Operator {
             Key key;
             key.values.reserve(group_entries.size());
             for (const auto* e : group_entries) {
-                key.values.push_back(scalar_from_column(*e->column, row));
+                push_key_value(key, *e, row);
             }
             auto [it, inserted] = index_.emplace(std::move(key), n_groups_);
             if (inserted) {
@@ -3615,6 +3663,22 @@ class ChunkedAggregateOperator final : public Operator {
             }
         }
 
+        // The null group's key cell carries the type's zero value plus a clear
+        // validity bit. Only the generic Key path can produce one — the cat/str
+        // fast paths above are only taken for key columns with no nulls.
+        std::vector<ValidityBitmap> key_validity(group_by_->size());
+        std::uint64_t any_null_keys = 0;
+        if (!cat_fast_path_ && !str_fast_path_) {
+            for (const auto& key : group_order_) {
+                any_null_keys |= key.null_mask;
+            }
+            if (any_null_keys != 0) {
+                for (auto& bitmap : key_validity) {
+                    bitmap.assign(n_groups_, true);
+                }
+            }
+        }
+
         const AggSlot* fs = flat_slots_.data();
         for (std::size_t g = 0; g < n_groups_; ++g) {
             if (cat_fast_path_) {
@@ -3636,6 +3700,10 @@ class ChunkedAggregateOperator final : public Operator {
                 const Key& key = group_order_[g];
                 for (std::size_t ci = 0; ci < key.values.size(); ++ci) {
                     append_scalar(out.mutable_column(ci), key.values[ci]);
+                    if (any_null_keys != 0 && ci < kMaxKeyColumns &&
+                        (key.null_mask & (std::uint64_t{1} << ci)) != 0) {
+                        key_validity[ci].set(g, false);
+                    }
                 }
             }
             for (std::size_t i = 0; i < aggregations_->size(); ++i) {
@@ -3708,6 +3776,12 @@ class ChunkedAggregateOperator final : public Operator {
             }
             if (has_null) {
                 out.columns[group_by_->size() + i].validity = std::move(agg_validity[i]);
+            }
+        }
+
+        for (std::size_t ci = 0; ci < group_by_->size() && ci < kMaxKeyColumns; ++ci) {
+            if ((any_null_keys & (std::uint64_t{1} << ci)) != 0) {
+                out.columns[ci].validity = std::move(key_validity[ci]);
             }
         }
 

@@ -1373,10 +1373,27 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
         const auto& entry = input.columns[ki];
         auto col = make_empty_like(*entry.column);
         std::visit([out_rows](auto& c) { c.reserve(out_rows); }, col);
-        for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
-            append_value(col, *entry.column, first_input_row[or_idx]);
+        // encode_key already gives a null row key its own group (kNullKey), so the
+        // rows come out right; the validity has to be carried across too, or the
+        // null row key would print as the type's zero value.
+        ValidityBitmap validity;
+        bool has_nulls = false;
+        if (entry.validity.has_value()) {
+            validity.assign(out_rows, true);
         }
-        output.add_column(entry.name, std::move(col));
+        for (std::size_t or_idx = 0; or_idx < out_rows; ++or_idx) {
+            const std::size_t source_row = first_input_row[or_idx];
+            append_value(col, *entry.column, source_row);
+            if (entry.validity.has_value() && is_null(entry, source_row)) {
+                validity.set(or_idx, false);
+                has_nulls = true;
+            }
+        }
+        if (has_nulls) {
+            output.add_column(entry.name, std::move(col), std::move(validity));
+        } else {
+            output.add_column(entry.name, std::move(col));
+        }
     }
 
     const auto& value_entry = input.columns[value_idx];

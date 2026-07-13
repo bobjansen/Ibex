@@ -1,0 +1,57 @@
+extern fn read_csv(path: String, nulls: String) -> DataFrame from "csv.hpp";
+
+// Every operator that builds a key used to read the column's VALUE and ignore its
+// validity bit. A null cell holds the type's zero value, so a null key was
+// indistinguishable from a genuine 0 — group-by silently merged the two, and the
+// null group vanished from the result.
+//
+// Every case below pits a null against a GENUINE 0. That is the whole point: a
+// test using only non-zero key values passes against the broken code.
+//
+//   k = 0, null, 0, 5, null
+//   v = 1, 10,   2, 100, 20
+let t = read_csv("tests/data/null_keys_check.csv", "NA");
+
+// ── GROUP BY ── nulls are equal to each other, distinct from the genuine 0.
+// Expect 3 groups: 0 -> 2 rows, null -> 2 rows, 5 -> 1 row.
+// Broken: 2 groups, with 0 -> 4 (the two nulls absorbed).
+t[select { n = count() }, by { k }, order { k }];
+
+// ── UPDATE + BY ── the same grouping rule, broadcast back over the rows.
+// Expect group totals 0 -> 3, null -> 30, 5 -> 100.
+// Broken: the 0 and null rows all share 33.
+t[update { grp_total = sum(v) }, by { k }];
+
+// ── DISTINCT ── one null row survives.
+// Expect 3 rows: 0, null, 5.   Broken: 2 rows (0, 5).
+t[distinct k];
+
+// ── ORDER ── nulls last, and they stay last under `desc`: the null position does
+// not flip with the sort direction.
+t[order { k }];
+t[order { k desc }];
+
+// ── JOIN ── a null key matches nothing, not even another null (SQL; Polars
+// join_nulls=False). Deliberately unlike group-by above.
+let d = Table { k = [0, 5], label = ["zero", "five"] };
+
+// Inner: the two null-keyed rows drop out. Expect 3 rows.
+// Broken: 5 rows, each null wrongly matched to d's k=0 row.
+t join d on k;
+
+// Left: the null-keyed rows survive with a null-filled label. Expect 5 rows.
+t left join d on k;
+
+// ── DCAST ── the row key groups like a group-by, and the null row key keeps its
+// null-ness in the output rather than printing as 0.
+// Expect 3 rows: id = 0 (1, 2), null (10, 20), 5 (100, 200).
+// Broken: the null id merges into the 0 row.
+let long = read_csv("tests/data/null_keys_dcast.csv", "NA");
+long[dcast metric, select { value }, by { id }];
+
+// ── ASOF JOIN ── the equality key follows the equi-join rule: a null matches
+// nothing. The right table's only row has a GENUINE k=0, so a null-keyed left row
+// must come back unmatched (ref null) even though a real 0 matches it.
+let l = as_timeframe(read_csv("tests/data/null_keys_asof_left.csv", "NA"), "ts");
+let r = as_timeframe(read_csv("tests/data/null_keys_asof_right.csv", "NA"), "ts");
+l asof join r on {ts, k};

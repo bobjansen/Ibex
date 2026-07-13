@@ -141,6 +141,30 @@ if [[ "$SKIP_REPL" == false ]]; then
     fi
     rm -f "$repl_out"
 
+    if command -v uv >/dev/null 2>&1; then
+        echo "▸ REPL smoke (parquet plugin, sparse plain-string read across a compressed page boundary)"
+        # The fixture needs pyarrow to control encoding, compression, and page
+        # size (see gen_parquet_plain_page_boundary.py); ibex's write_parquet
+        # cannot. Without the emit-per-batch fix, row 1023 silently reads as
+        # text-002047 — the reused page decompression buffer's content.
+        uv run --project "$IBEX_ROOT" python "$IBEX_ROOT/tests/data/gen_parquet_plain_page_boundary.py" \
+            "$IBEX_ROOT/tests/data/parquet_plain_page_boundary_out.parquet"
+        repl_out="$(mktemp)"
+        printf ":load tests/data/parquet_plain_page_boundary_check.ibex\n:quit\n" \
+            | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+        rm -f "$IBEX_ROOT/tests/data/parquet_plain_page_boundary_out.parquet"
+        if rg -n "error:" "$repl_out" >/dev/null \
+            || ! rg -n '"text-001023"' "$repl_out" >/dev/null \
+            || ! rg -n '"text-001024"' "$repl_out" >/dev/null; then
+            cat "$repl_out" >&2
+            rm -f "$repl_out"
+            exit 1
+        fi
+        rm -f "$repl_out"
+    else
+        echo "▸ SKIP: sparse plain-string page-boundary check (uv not found; fixture needs pyarrow)"
+    fi
+
     echo "▸ REPL smoke (parquet plugin, categorical cross-row-group dictionary remap)"
     repl_out="$(mktemp)"
     printf ":load tests/data/parquet_categorical_check.ibex\n:quit\n" \

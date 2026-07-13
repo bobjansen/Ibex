@@ -96,8 +96,23 @@ set(ARROW_IPC ON CACHE BOOL "" FORCE)
 option(IBEX_PARQUET_S3 "Build the Parquet/Arrow stack with S3 filesystem support" ON)
 set(ARROW_S3 ${IBEX_PARQUET_S3} CACHE BOOL "" FORCE)
 set(ARROW_S3_MODULE OFF CACHE BOOL "" FORCE)
-set(ARROW_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)
-set(ARROW_RUNTIME_SIMD_LEVEL "NONE" CACHE STRING "" FORCE)
+# Arrow's SIMD kernels, selected by runtime CPU detection.
+#
+# ARROW_SIMD_LEVEL is the *compile-time baseline*, and DEFAULT resolves per
+# architecture (SSE4.2 on x86-64, NEON on ARM) — so it stays portable, unlike
+# pinning it to AVX2, which would compile those objects -march=haswell and give
+# the binary a hardware floor. ARROW_RUNTIME_SIMD_LEVEL=MAX then compiles the
+# AVX2/AVX-512 kernels as runtime-dispatched alternatives, picked only on CPUs
+# that actually have them.
+#
+# These were "NONE" from the plugin's first commit, with no recorded reason —
+# almost certainly just to sidestep the xsimd dependency below, which Arrow
+# needs as soon as SIMD is on and which nothing else fetches. Turning them back
+# on is worth ~5-11% end-to-end on PDS-H, since Parquet decode is what dominates
+# the scan-bound queries.
+set(xsimd_SOURCE "BUNDLED" CACHE STRING "" FORCE)
+set(ARROW_SIMD_LEVEL "DEFAULT" CACHE STRING "" FORCE)
+set(ARROW_RUNTIME_SIMD_LEVEL "MAX" CACHE STRING "" FORCE)
 set(BUILD_WARNING_LEVEL "PRODUCTION" CACHE STRING "" FORCE)
 set(BUILD_WARNING_FLAGS "-w" CACHE STRING "" FORCE)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")

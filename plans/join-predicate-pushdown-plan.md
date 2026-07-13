@@ -1,5 +1,18 @@
 # Predicate pushdown through joins
 
+> **STATUS (2026-07-13): DONE through stage 4** — implemented as the
+> schema-aware pass `ir::push_filters_into_joins` (option 1;
+> `src/ir/join_pushdown.cpp`), invoked from both `parser::lower` (before
+> canonicalize) and `parser::lower_expr` (REPL — which runs no other optimizer
+> passes, so this is its first). Inner pushes both sides (key-only conjuncts
+> pre-filter both), Left/Right push one-sided, Outer/Semi/Anti/Cross/Asof
+> refused. Enabler fix: `no_call_of_kind` / `collect_expr_column_refs`
+> (expr_predicates.cpp) did not traverse Compare/Logical/IsNull nodes, so
+> every boolean conjunct classified as non-row-local with zero refs.
+> q19.ibex rewritten to the single-expression form: 530 ms → 203 ms locally
+> (WSL2, same binary), answers verified. The `let`-split limitation below
+> still stands.
+
 ## Why
 
 q19 is the worst PDS-H query by a wide margin — **520 ms against single-threaded

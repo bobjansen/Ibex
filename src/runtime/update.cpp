@@ -1330,6 +1330,9 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         }
         group_columns.push_back(col);
     }
+    // Nulls in a group key form their own group; without this a null key would
+    // merge into the genuine zero/empty group.
+    const auto group_validity = collect_key_validity(input, group_by);
 
     const std::size_t rows = input.rows();
     if (rows == 0) {
@@ -1344,8 +1347,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     for (std::size_t r = 0; r < rows; ++r) {
         Key key;
         key.values.reserve(group_columns.size());
-        for (const auto* col : group_columns) {
-            key.values.push_back(scalar_from_column(*col, r));
+        for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+            push_key_value(key, *group_columns[ci], group_validity[ci], r);
         }
         auto [it, inserted] =
             group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));
@@ -1752,6 +1755,9 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         }
         group_columns.push_back(col);
     }
+    // Nulls in a group key form their own group; without this a null key would
+    // merge into the genuine zero/empty group.
+    const auto group_validity = collect_key_validity(input, group_by);
 
     const std::size_t rows = input.rows();
     if (rows == 0) {
@@ -1763,8 +1769,8 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     for (std::size_t r = 0; r < rows; ++r) {
         Key key;
         key.values.reserve(group_columns.size());
-        for (const auto* col : group_columns) {
-            key.values.push_back(scalar_from_column(*col, r));
+        for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+            push_key_value(key, *group_columns[ci], group_validity[ci], r);
         }
         auto [it, inserted] =
             group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));

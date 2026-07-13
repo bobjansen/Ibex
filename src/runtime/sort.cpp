@@ -182,7 +182,8 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
 
     // Fast pre-sorted check for single ascending Timestamp/Date/Int key — avoids building
     // the 8 MB flat_keys[0].u64 vector when the input is already sorted (common TimeFrame case).
-    if (resolved_keys.size() == 1 && resolved_keys[0].ascending) {
+    if (resolved_keys.size() == 1 && resolved_keys[0].ascending &&
+        !input.find_entry(resolved_keys[0].name)->validity.has_value()) {
         const auto* column = input.find(resolved_keys[0].name);
         if (column != nullptr) {
             bool already_sorted = false;
@@ -239,7 +240,26 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
         std::vector<double> f64;
         std::vector<std::string_view> str;  // views into original column storage
         bool ascending = true;
+        const ValidityBitmap* validity = nullptr;  // null when the key has no nulls
+
+        [[nodiscard]] auto is_null(std::size_t row) const noexcept -> bool {
+            return validity != nullptr && !(*validity)[row];
+        }
     };
+
+    // A null key sorts last, and stays last under `desc` — the null position does
+    // not flip with the direction. That cannot be folded into the flat key (a
+    // sentinel max value would migrate to the front on a descending sort), so a
+    // null-bearing key skips every radix/pre-sorted fast path below and takes the
+    // comparator, which ranks null-ness ahead of value.
+    bool has_null_keys = false;
+    for (const auto& key : resolved_keys) {
+        const auto* entry = input.find_entry(key.name);
+        if (entry != nullptr && entry->validity.has_value()) {
+            has_null_keys = true;
+            break;
+        }
+    }
 
     std::vector<FlatKey> flat_keys;
     flat_keys.reserve(resolved_keys.size());
@@ -249,8 +269,10 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
             return std::unexpected("order column not found: " + key.name +
                                    " (available: " + format_columns(input) + ")");
         }
+        const auto* entry = input.find_entry(key.name);
         FlatKey fk;
         fk.ascending = key.ascending;
+        fk.validity = entry != nullptr && entry->validity.has_value() ? &*entry->validity : nullptr;
         std::visit(
             [&](const auto& col) {
                 using ColT = std::decay_t<decltype(col)>;
@@ -295,7 +317,8 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     }
 
     // Fast path: single ascending I64 key — radix sort (pre-sorted case already handled above).
-    if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 && flat_keys[0].ascending) {
+    if (!has_null_keys && flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 &&
+        flat_keys[0].ascending) {
         auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
@@ -370,7 +393,8 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     // and LSD-radix from the least- to the most-significant key. Single ascending
     // numeric keys already returned via the fast paths above.
     const bool use_radix_multi =
-        flat_keys.size() >= 2 || (flat_keys.size() == 1 && flat_keys[0].kind != FlatKind::Str);
+        !has_null_keys &&
+        (flat_keys.size() >= 2 || (flat_keys.size() == 1 && flat_keys[0].kind != FlatKind::Str));
     if (use_radix_multi) {
         std::vector<std::vector<std::uint64_t>> codes;
         codes.reserve(flat_keys.size());
@@ -400,7 +424,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     // cardinality (categorical/dictionary-like, the common case), where the
     // distinct-sort is far cheaper than sorting every row. High-cardinality
     // columns exceed the cap and fall through to the comparison sort below.
-    if (flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::Str) {
+    if (!has_null_keys && flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::Str) {
         constexpr std::size_t kOrdinalCap = std::size_t{1} << 16;
         if (auto code = ordinal_encode(flat_keys[0].str, kOrdinalCap)) {
             apply_descending(*code, flat_keys[0].ascending);
@@ -415,6 +439,16 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     // order total (no real ties), so the result matches a stable sort.
     auto compare_row = [&](std::size_t lhs, std::size_t rhs) -> bool {
         for (const auto& fk : flat_keys) {
+            // Null-ness outranks value and ignores `ascending`: a non-null always
+            // precedes a null, so nulls land last on asc and desc alike.
+            const bool lhs_null = fk.is_null(lhs);
+            const bool rhs_null = fk.is_null(rhs);
+            if (lhs_null != rhs_null) {
+                return rhs_null;
+            }
+            if (lhs_null) {
+                continue;  // both null on this key — tie, fall through to the next
+            }
             switch (fk.kind) {
                 case FlatKind::I64: {
                     auto l = fk.u64[lhs];

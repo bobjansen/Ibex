@@ -106,6 +106,27 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
     }
 
+    // A key column's nulls have to become their own group. Every path below keys
+    // off the column's *value*, and a null slot holds the type's zero value, so
+    // without this a null key would silently merge into the genuine `0` / `""`
+    // group and the null group would vanish from the result.
+    //
+    // Only a key column that actually has nulls pays for this: when there are
+    // none — the overwhelmingly common case — the fast paths below run exactly
+    // as before.
+    std::vector<const ValidityBitmap*> group_validity;
+    group_validity.reserve(group_by.size());
+    bool has_null_keys = false;
+    for (const auto& key : group_by) {
+        const auto* entry = input.find_entry(key.name);
+        if (entry != nullptr && entry->validity.has_value()) {
+            group_validity.push_back(&*entry->validity);
+            has_null_keys = true;
+        } else {
+            group_validity.push_back(nullptr);
+        }
+    }
+
     std::vector<const ColumnValue*> agg_columns;
     agg_columns.reserve(aggregations.size());
     std::vector<const ColumnEntry*> agg_entries;
@@ -937,8 +958,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         for (std::size_t row = 0; row < rows; ++row) {
             Key key;
             key.values.reserve(group_columns.size());
-            for (const auto* col : group_columns) {
-                key.values.push_back(scalar_from_column(*col, row));
+            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                push_key_value(key, *group_columns[ci], group_validity[ci], row);
             }
 
             auto [it, inserted] = index.emplace(std::move(key), states.size());
@@ -1138,7 +1159,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         return output;
     }
 
-    if (group_by.size() == 1) {
+    // A null-bearing key falls through to the general factorized path below,
+    // which is the one place taught to give nulls their own code. These
+    // single-key fast paths key straight off the raw value and cannot express
+    // "null" — keeping them null-free is what lets them stay untouched.
+    if (group_by.size() == 1 && !has_null_keys) {
         const ColumnValue& key_column = *group_columns.front();
         if (group_cats.front() != nullptr) {
             const auto& col = *group_cats.front();
@@ -1460,6 +1485,9 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     // Categorical key columns are handled zero-copy: cat_raw points directly into
     // the column's existing codes array; cc.codes is left empty. code_at() picks
     // the right source so pass 1b and output reconstruction need no special-casing.
+    // Sentinel for "this key column has no nulls".
+    constexpr std::uint32_t kNoNullCode = std::numeric_limits<std::uint32_t>::max();
+
     struct ColCodes {
         std::vector<std::uint32_t> codes;  // codes[row]; empty for categorical
         std::uint32_t n_distinct{0};
@@ -1469,6 +1497,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         std::vector<std::uint32_t> str_offsets;
         std::vector<char> str_chars;
         bool is_str{false};
+        /// The code reserved for this column's nulls, or kNoNullCode when it has
+        /// none. Pass 1b treats it as an ordinary code — it counts toward
+        /// n_distinct and takes part in the Cartesian encoding — so nulls group
+        /// together, and stay distinct from every real value, for free.
+        std::uint32_t null_code{kNoNullCode};
+
+        [[nodiscard]] auto is_null_code(std::uint32_t code) const noexcept -> bool {
+            return code == null_code;
+        }
 
         [[nodiscard]] std::uint32_t code_at(std::size_t row) const noexcept {
             return cat_raw ? static_cast<std::uint32_t>(cat_raw[row]) : codes[row];
@@ -1483,6 +1520,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
     for (std::size_t ci = 0; ci < n_keys; ++ci) {
         ColCodes& cc = per_col[ci];
+        const ValidityBitmap* key_valid = group_validity[ci];
+        const auto is_null_row = [key_valid](std::size_t row) {
+            return key_valid != nullptr && !(*key_valid)[row];
+        };
         std::visit(
             [&](const auto& col) {
                 using ColType = std::decay_t<decltype(col)>;
@@ -1494,8 +1535,22 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     for (const auto& entry : dict) {
                         cc.vals.emplace_back(entry);
                     }
-                    // Zero-copy: borrow the column's own codes array.
-                    cc.cat_raw = col.codes_data();
+                    if (key_valid == nullptr) {
+                        // Zero-copy: borrow the column's own codes array.
+                        cc.cat_raw = col.codes_data();
+                    } else {
+                        // Nulls force a materialized code array: a null row's
+                        // dictionary code is the code of "" and would otherwise
+                        // collide with a genuine empty string.
+                        cc.null_code = cc.n_distinct++;
+                        cc.vals.emplace_back(std::string{});  // keep vals code-aligned
+                        cc.codes.resize(rows);
+                        for (std::size_t row = 0; row < rows; ++row) {
+                            cc.codes[row] = is_null_row(row)
+                                                ? cc.null_code
+                                                : static_cast<std::uint32_t>(col.code_at(row));
+                        }
+                    }
                 } else if constexpr (is_string_like_v<T>) {
                     cc.codes.resize(rows);
                     cc.is_str = true;
@@ -1507,6 +1562,21 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     std::string_view prev_key;
                     std::uint32_t prev_code = std::numeric_limits<std::uint32_t>::max();
                     for (std::size_t row = 0; row < rows; ++row) {
+                        if (is_null_row(row)) {
+                            if (cc.null_code == kNoNullCode) {
+                                cc.null_code = cc.n_distinct++;
+                                // str_offsets is indexed BY CODE, so the null code
+                                // needs its own (empty) slot or every later key's
+                                // dictionary entry shifts out of alignment.
+                                cc.str_offsets.push_back(
+                                    static_cast<std::uint32_t>(cc.str_chars.size()));
+                            }
+                            cc.codes[row] = cc.null_code;
+                            // Leave the run-length cache alone: a null must never
+                            // seed prev_key, or a following genuine "" would reuse
+                            // the null code.
+                            continue;
+                        }
                         const std::string_view key{col[row]};
                         std::uint32_t code{};
                         if (key == prev_key) {
@@ -1533,6 +1603,17 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     robin_hood::unordered_flat_map<T, std::uint32_t> map;
                     map.reserve(64);
                     for (std::size_t row = 0; row < rows; ++row) {
+                        if (is_null_row(row)) {
+                            if (cc.null_code == kNoNullCode) {
+                                cc.null_code = cc.n_distinct++;
+                                // vals is indexed BY CODE; keep it aligned. The
+                                // placeholder is never read — output reconstruction
+                                // checks is_null_code first.
+                                cc.vals.emplace_back(T{});
+                            }
+                            cc.codes[row] = cc.null_code;
+                            continue;
+                        }
                         T key = col[row];
                         auto it = map.find(key);
                         std::uint32_t code{};
@@ -1674,6 +1755,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     if (!output.has_value()) {
         return std::unexpected(output.error());
     }
+    // The null group's key cell carries the type's zero value plus a clear
+    // validity bit — the same shape a null takes anywhere else in a Table.
+    std::vector<ValidityBitmap> key_validity(n_keys);
+    for (std::size_t ci = 0; ci < n_keys; ++ci) {
+        if (per_col[ci].null_code != kNoNullCode) {
+            key_validity[ci].assign(n_groups_m, true);
+        }
+    }
+
     for (std::uint32_t g = 0; g < n_groups_m; ++g) {
         const std::uint32_t* gc =
             group_col_codes_flat.data() + (static_cast<std::size_t>(g) * n_keys);
@@ -1682,11 +1772,20 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             if (column == nullptr) {
                 return std::unexpected("missing group-by column in output");
             }
+            const bool is_null_group = per_col[ci].is_null_code(gc[ci]);
+            if (is_null_group) {
+                key_validity[ci].set(g, false);
+            }
+
             if (group_cats[ci] != nullptr && std::holds_alternative<Column<Categorical>>(*column)) {
                 auto& out_cat = std::get<Column<Categorical>>(*column);
-                out_cat.push_code(static_cast<Column<Categorical>::code_type>(gc[ci]));
+                // The null code has no dictionary entry, so park the row on code 0
+                // and let the validity bit carry the meaning.
+                out_cat.push_code(is_null_group
+                                      ? Column<Categorical>::code_type{0}
+                                      : static_cast<Column<Categorical>::code_type>(gc[ci]));
             } else if (per_col[ci].is_str) {
-                auto sv = per_col[ci].str_val_at(gc[ci]);
+                auto sv = is_null_group ? std::string_view{} : per_col[ci].str_val_at(gc[ci]);
                 if (auto* str_col = std::get_if<Column<std::string>>(column)) {
                     str_col->push_back(sv);
                 } else {
@@ -1698,6 +1797,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
         if (auto err = append_agg_values_flat(*output, &fs[g * n_aggs])) {
             return std::unexpected(*err);
+        }
+    }
+
+    for (std::size_t ci = 0; ci < n_keys; ++ci) {
+        if (per_col[ci].null_code == kNoNullCode) {
+            continue;
+        }
+        if (auto pos = output->index.find(group_by[ci].name); pos != output->index.end()) {
+            output->columns[pos->second].validity = std::move(key_validity[ci]);
         }
     }
 

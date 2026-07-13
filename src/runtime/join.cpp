@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
@@ -229,6 +228,46 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         left_keys.push_back(left_col);
         right_keys.push_back(right_col);
     }
+
+    // A null key matches nothing — not even another null (SQL: `NULL = NULL` is
+    // not true; Polars' join_nulls=False). This is deliberately unlike group-by,
+    // where nulls DO group together.
+    //
+    // Enforcing it takes both halves: a null-keyed row is never inserted into the
+    // hash index, and a null-keyed probe row is never looked up. The second half
+    // is not redundant — a null cell carries the type's zero value, so a null
+    // probe key would otherwise hit a genuine `0` on the other side.
+    std::vector<const ValidityBitmap*> left_key_validity;
+    std::vector<const ValidityBitmap*> right_key_validity;
+    bool has_null_keys = false;
+    for (const auto& key : keys) {
+        const auto* left_entry = left.find_entry(key);
+        const auto* right_entry = right.find_entry(key);
+        const auto* lv = left_entry != nullptr && left_entry->validity.has_value()
+                             ? &*left_entry->validity
+                             : nullptr;
+        const auto* rv = right_entry != nullptr && right_entry->validity.has_value()
+                             ? &*right_entry->validity
+                             : nullptr;
+        left_key_validity.push_back(lv);
+        right_key_validity.push_back(rv);
+        has_null_keys = has_null_keys || lv != nullptr || rv != nullptr;
+    }
+    const auto row_key_is_null = [](const std::vector<const ValidityBitmap*>& validity,
+                                    std::size_t row) {
+        for (const auto* bitmap : validity) {
+            if (bitmap != nullptr && !(*bitmap)[row]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto left_key_is_null = [&](std::size_t l) {
+        return has_null_keys && row_key_is_null(left_key_validity, l);
+    };
+    const auto right_key_is_null = [&](std::size_t r) {
+        return has_null_keys && row_key_is_null(right_key_validity, r);
+    };
 
     robin_hood::unordered_set<std::string> key_set(keys.begin(), keys.end());
 
@@ -674,7 +713,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     };
 
     // ── Single string/categorical key fast path ──────────────────────────
-    if (kind != ir::JoinKind::Asof && keys.size() == 1 &&
+    if (kind != ir::JoinKind::Asof && !has_null_keys && keys.size() == 1 &&
         (std::holds_alternative<Column<std::string>>(*left_keys[0]) ||
          std::holds_alternative<Column<Categorical>>(*left_keys[0]))) {
         if (n_left < n_right) {
@@ -791,7 +830,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
 
     // ── Single int64 key fast path ───────────────────────────────────────
-    if (kind != ir::JoinKind::Asof && keys.size() == 1 &&
+    if (kind != ir::JoinKind::Asof && !has_null_keys && keys.size() == 1 &&
         std::holds_alternative<Column<std::int64_t>>(*left_keys[0])) {
         const auto& left_ints = std::get<Column<std::int64_t>>(*left_keys[0]);
         const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
@@ -932,13 +971,29 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         std::vector<const ColumnValue*> right_eq_keys;
         left_eq_keys.reserve(keys.size() - 1);
         right_eq_keys.reserve(keys.size() - 1);
+        std::vector<const ValidityBitmap*> left_eq_validity;
+        std::vector<const ValidityBitmap*> right_eq_validity;
+        bool has_null_eq_keys = false;
         for (std::size_t i = 0; i < keys.size(); ++i) {
             if (i == time_pos) {
                 continue;
             }
             left_eq_keys.push_back(left_keys[i]);
             right_eq_keys.push_back(right_keys[i]);
+            left_eq_validity.push_back(left_key_validity[i]);
+            right_eq_validity.push_back(right_key_validity[i]);
+            has_null_eq_keys = has_null_eq_keys || left_key_validity[i] != nullptr ||
+                               right_key_validity[i] != nullptr;
         }
+        // As in an equi-join, a null equality key matches nothing — not even
+        // another null. A null-keyed right row is never a candidate, and a
+        // null-keyed left row is left unmatched.
+        const auto left_eq_is_null = [&](std::size_t l) {
+            return has_null_eq_keys && row_key_is_null(left_eq_validity, l);
+        };
+        const auto right_eq_is_null = [&](std::size_t r) {
+            return has_null_eq_keys && row_key_is_null(right_eq_validity, r);
+        };
 
         // Asof keeps every left row exactly once in input order, so the left
         // side is the identity permutation — only the matched right row per left
@@ -962,7 +1017,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 right_idx[l] = (pos == 0) ? kNull : pos - 1;
             }
             grouped_done = true;
-        } else if (left_eq_keys.size() == 1) {
+        } else if (left_eq_keys.size() == 1 && !has_null_eq_keys) {
             // Single equality key (the common asof-by case, e.g. by symbol):
             // factorise the key column into dense codes by hashing its native
             // values into a small dictionary (one entry per distinct key), bucket
@@ -1018,6 +1073,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_groups;
             right_groups.reserve(n_right);
             for (std::size_t r = 0; r < n_right; ++r) {
+                if (right_eq_is_null(r)) {
+                    continue;  // never a candidate for any left row
+                }
                 Key group;
                 group.values.reserve(right_eq_keys.size());
                 for (const auto* col : right_eq_keys) {
@@ -1030,6 +1088,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             right_pos.reserve(right_groups.size());
 
             for (std::size_t l = 0; l < n_left; ++l) {
+                if (left_eq_is_null(l)) {
+                    right_idx[l] = kNull;  // matches nothing, including another null
+                    continue;
+                }
                 Key group;
                 group.values.reserve(left_eq_keys.size());
                 for (const auto* col : left_eq_keys) {
@@ -1065,6 +1127,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> left_index;
         left_index.reserve(n_left);
         for (std::size_t l = 0; l < n_left; ++l) {
+            if (left_key_is_null(l)) {
+                continue;  // never matchable, so never indexed
+            }
             Key key;
             key.values.reserve(keys.size());
             for (const auto* col : left_keys) {
@@ -1074,6 +1139,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         auto for_each = [&](std::size_t r, auto&& emit_left_row) {
+            if (right_key_is_null(r)) {
+                return;  // matches nothing, including another null
+            }
             Key key;
             key.values.reserve(keys.size());
             for (const auto* col : right_keys) {
@@ -1096,6 +1164,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     right_index.reserve(n_right);
     bool unique_right = preserve_left_only;
     for (std::size_t r = 0; r < n_right; ++r) {
+        if (right_key_is_null(r)) {
+            continue;  // never matchable, so never indexed
+        }
         Key key;
         key.values.reserve(keys.size());
         for (const auto* col : right_keys) {
@@ -1111,6 +1182,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     if (unique_right) {
         std::vector<std::size_t> ri(n_left, kNull);
         for (std::size_t l = 0; l < n_left; ++l) {
+            if (left_key_is_null(l)) {
+                continue;  // stays kNull: unmatched
+            }
             Key key;
             key.values.reserve(keys.size());
             for (const auto* col : left_keys) {
@@ -1126,6 +1200,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
 
     auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
+        if (left_key_is_null(l)) {
+            return nullptr;  // matches nothing, including another null
+        }
         Key key;
         key.values.reserve(keys.size());
         for (const auto* col : left_keys) {

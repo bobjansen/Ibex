@@ -35,8 +35,14 @@ auto no_call_of_kind(const Expr& expr, BadKind bad) -> bool {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, ColumnRef> || std::is_same_v<T, Literal>) {
                 return true;
-            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
                 return no_call_of_kind(*n.left, bad) && no_call_of_kind(*n.right, bad);
+            } else if constexpr (std::is_same_v<T, LogicalExpr>) {
+                // `right` is null for unary Not.
+                return no_call_of_kind(*n.left, bad) &&
+                       (n.right == nullptr || no_call_of_kind(*n.right, bad));
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                return no_call_of_kind(*n.operand, bad);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 if (bad(fn_kind(n.callee))) {
                     return false;
@@ -80,9 +86,16 @@ void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::s
                 out.insert(n.name);
             } else if constexpr (std::is_same_v<T, Literal>) {
                 // nothing
-            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
                 collect_expr_column_refs(*n.left, out);
                 collect_expr_column_refs(*n.right, out);
+            } else if constexpr (std::is_same_v<T, LogicalExpr>) {
+                collect_expr_column_refs(*n.left, out);
+                if (n.right != nullptr) {  // null for unary Not
+                    collect_expr_column_refs(*n.right, out);
+                }
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                collect_expr_column_refs(*n.operand, out);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 for (const auto& arg : n.args) {
                     collect_expr_column_refs(*arg, out);

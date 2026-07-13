@@ -10,6 +10,13 @@
 //  the join so it's a plain equijoin (hash-join) rather than a theta join
 //  (`on <predicate>`, which is O(N*M) nested-loop).
 //
+//  The join and the filter are ONE expression on purpose: predicate pushdown
+//  through joins (src/ir/join_pushdown.cpp) only sees a Filter(Join(...))
+//  when both are in the same IR tree, and it moves the lineitem-only
+//  conjuncts (shipinstruct + shipmode) below the join — 6M rows shrink to
+//  ~214k before the hash join instead of after it. A `let joined = ... join
+//  ...;` split would materialize the full 6M-row join first.
+//
 //  Run:
 //    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
 //        benchmarking/tpch/queries/q19.ibex
@@ -18,20 +25,17 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-// Both sides are narrowed to the columns the query uses before the join, as in
-// q03/q05. Projection pushdown only reaches a source through the statement that
-// scans it: `lineitem join part` on its own would demand every column of both,
-// since nothing in that statement says which ones the filter below will read.
 let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let lineitem = lineitem_raw[
-    select { l_partkey, l_quantity, l_extendedprice, l_discount, l_shipinstruct, l_shipmode }
-];
 let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
-let part = part_raw[select { l_partkey = p_partkey, p_brand, p_size, p_container }];
 
-let joined = lineitem join part on l_partkey;
-
-let result = joined[
+let result = (
+    lineitem_raw[
+        select { l_partkey, l_quantity, l_extendedprice, l_discount, l_shipinstruct, l_shipmode }
+    ]
+    join
+    part_raw[select { l_partkey = p_partkey, p_brand, p_size, p_container }]
+    on l_partkey
+)[
     filter (l_shipinstruct == "DELIVER IN PERSON")
         && (l_shipmode == "AIR" || l_shipmode == "AIR REG")
         && (

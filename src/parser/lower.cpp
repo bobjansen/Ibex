@@ -1,6 +1,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/schema.hpp>
@@ -3879,10 +3880,14 @@ auto lower(const Program& program) -> LowerResult {
     }
     // Validate column references against statically known schemas before the
     // optimizer fuses nodes (the pass understands the un-fused operators).
-    if (auto err = ir::check_column_refs(*lowered.value(),
-                                         build_source_schemas(lowerer.table_extern_decls()))) {
+    const auto source_schemas = build_source_schemas(lowerer.table_extern_decls());
+    if (auto err = ir::check_column_refs(*lowered.value(), source_schemas)) {
         return std::unexpected(LowerError{.message = *err});
     }
+    // Schema-aware join pushdown runs before canonicalize: canonicalize is a
+    // pure structural rewrite that cannot tell which side of a join produces a
+    // column, and its rules expect the un-fused Filter(Join(...)) shape.
+    *lowered = ir::push_filters_into_joins(std::move(*lowered), source_schemas);
 
     const auto optimization_context = build_optimization_context(*effects);
     ir::OptimizationStats optimization_stats;
@@ -3905,6 +3910,10 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
                                              /*check_expressions=*/true)) {
             return std::unexpected(LowerError{.message = *err});
         }
+        // Join pushdown must precede the caller's `required_columns` pass so
+        // projection pushdown demands the pushed filters' columns from the
+        // right scans (the REPL runs that pass on the tree returned here).
+        *lowered = ir::push_filters_into_joins(std::move(*lowered), lowerer.source_schemas());
     }
     return lowered;
 }

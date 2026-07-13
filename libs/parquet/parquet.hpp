@@ -19,9 +19,11 @@
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <algorithm>
 #include <arrow/api.h>
 #include <arrow/filesystem/filesystem.h>
 #include <arrow/io/api.h>
+#include <arrow/util/bitmap_ops.h>
 #include <arrow/util/formatting.h>
 #include <bit>
 #include <cerrno>
@@ -32,6 +34,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/writer.h>
 #include <stdexcept>
@@ -242,6 +245,10 @@ inline void append_converted(const arrow::Array& array, std::vector<Out>& out, C
         }
         return;
     }
+    // Unlike `append_same_layout`, this keeps a per-row null check rather than
+    // converting first and zeroing after: `convert` does arithmetic (a timestamp
+    // rescale multiplies), and Arrow's values buffer is undefined at a null row,
+    // so converting one could overflow. A bit_cast never can.
     for (std::size_t i = 0; i < count; ++i) {
         dst[i] = typed.IsNull(static_cast<std::int64_t>(i)) ? Out{} : convert(src[i]);
     }
@@ -251,11 +258,16 @@ inline void append_converted(const arrow::Array& array, std::vector<Out>& out, C
 /// layout — `std::int64_t`, `double`, and the single-field `ibex::Date` /
 /// `ibex::Timestamp` wrappers.
 ///
-/// The all-valid case inserts straight from Arrow's buffer, which for a
-/// trivially copyable element is one memmove. Note it does NOT go through
-/// `resize`: resize value-initializes the new elements, so a resize-then-copy
-/// writes the destination twice — enough to cancel out the gain over the
-/// per-row `push_back` this replaces.
+/// This copies straight from Arrow's buffer, which for a trivially copyable
+/// element is one memmove. It runs over EVERY row, nulls included: Arrow leaves
+/// the values buffer undefined where a row is null, so `zero_null_slots` below
+/// stamps those back to zero afterwards. Copying first and fixing up after keeps
+/// a null-bearing column on the same bulk path as a dense one — there is no
+/// per-row branch either way.
+///
+/// It deliberately does NOT go through `resize`: resize value-initializes the
+/// new elements, so a resize-then-copy writes the destination twice, which is
+/// enough to cancel out the gain over the per-row `push_back` this replaces.
 template <typename ArrowArray, typename Out>
 inline void append_same_layout(const arrow::Array& array, std::vector<Out>& out) {
     using Src = typename ArrowArray::value_type;
@@ -269,20 +281,77 @@ inline void append_same_layout(const arrow::Array& array, std::vector<Out>& out)
     }
     // Arrow offsets raw_values() by the array's own offset, so this stays
     // correct for a sliced chunk.
-    const auto* src = typed.raw_values();
+    const auto* values = reinterpret_cast<const Out*>(typed.raw_values());
+    out.insert(out.end(), values, values + count);
+}
 
-    if (typed.null_count() == 0) {
-        const auto* values = reinterpret_cast<const Out*>(src);
-        out.insert(out.end(), values, values + count);
-        return;
+/// Ibex's convention (see the CSV reader) is that a null slot holds the type's
+/// zero value *and* has its validity bit clear. `append_same_layout` copies
+/// Arrow's undefined bytes into the null slots, so restore that invariant here.
+///
+/// Whole words of valid rows are skipped, so this costs one compare per 64 rows
+/// over the dense stretches, and touches memory only where a null actually is.
+template <typename T>
+inline void zero_null_slots(const ibex::runtime::ValidityBitmap& validity, std::vector<T>& values) {
+    using Word = ibex::runtime::ValidityBitmap::word_type;
+    constexpr std::size_t kBitsPerWord = 64;
+    constexpr Word kAllValid = ~Word{0};
+
+    const std::size_t count = values.size();
+    const auto* words = validity.words_data();
+    const std::size_t word_count = (count + kBitsPerWord - 1) / kBitsPerWord;
+
+    for (std::size_t w = 0; w < word_count; ++w) {
+        const Word bits = words[w];
+        if (bits == kAllValid) {
+            continue;
+        }
+        const std::size_t base = w * kBitsPerWord;
+        const std::size_t limit = std::min(kBitsPerWord, count - base);
+        for (std::size_t bit = 0; bit < limit; ++bit) {
+            if ((bits & (Word{1} << bit)) == 0) {
+                values[base + bit] = T{};
+            }
+        }
+    }
+}
+
+/// Lift an Arrow column's nulls into an Ibex validity bitmap, or nullopt when the
+/// column has none (the common case, which then costs nothing and carries no
+/// bitmap at all).
+///
+/// Both sides mark 1 = valid and index bit i as `i / 8`'s byte, bit `i % 8`,
+/// LSB-first — Ibex just views that as little-endian 64-bit words. So the bitmap
+/// transfers wholesale rather than a bit at a time, which is what keeps reading a
+/// null-bearing column as cheap as a dense one. `CopyBitmap` handles the
+/// bit-offsets that arise from a sliced chunk, or from a chunk boundary that does
+/// not land on a byte.
+inline auto validity_from_arrow(const arrow::ChunkedArray& chunked)
+    -> std::optional<ibex::runtime::ValidityBitmap> {
+    static_assert(std::endian::native == std::endian::little,
+                  "the wholesale bitmap copy assumes Arrow's LSB-first bitmap and "
+                  "ValidityBitmap's word layout agree, which holds on little-endian only");
+
+    if (chunked.null_count() == 0) {
+        return std::nullopt;
     }
 
-    const std::size_t base = out.size();
-    out.resize(base + count);
-    Out* dst = out.data() + base;
-    for (std::size_t i = 0; i < count; ++i) {
-        dst[i] = typed.IsNull(static_cast<std::int64_t>(i)) ? Out{} : std::bit_cast<Out>(src[i]);
+    ibex::runtime::ValidityBitmap validity;
+    validity.assign(static_cast<std::size_t>(chunked.length()), true);
+    auto* dest = reinterpret_cast<std::uint8_t*>(validity.words_data());
+
+    std::int64_t row = 0;
+    for (const auto& chunk : chunked.chunks()) {
+        const auto length = chunk->length();
+        const auto* bitmap = chunk->null_bitmap_data();
+        // A chunk with no nulls of its own may carry no bitmap; its rows stay
+        // valid from the assign() above.
+        if (chunk->null_count() != 0 && bitmap != nullptr) {
+            arrow::internal::CopyBitmap(bitmap, chunk->offset(), length, dest, row);
+        }
+        row += length;
     }
+    return validity;
 }
 
 inline void append_int_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
@@ -485,6 +554,25 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
     for (int i = 0; i < table->num_columns(); ++i) {
         const auto& field = table->field(i);
         const auto& col = table->column(i);
+
+        auto validity = validity_from_arrow(*col);
+
+        // Hand the column to the sink, carrying its nulls when it has any.
+        auto emit = [&](auto column) {
+            if (validity.has_value()) {
+                sink.add_column(field->name(), std::move(column), std::move(*validity));
+            } else {
+                sink.add_column(field->name(), std::move(column));
+            }
+        };
+        // Restore the zero-at-a-null-slot invariant that the bulk value copy
+        // does not maintain. A no-op when the column has no nulls.
+        auto fix_nulls = [&](auto& values) {
+            if (validity.has_value()) {
+                zero_null_slots(*validity, values);
+            }
+        };
+
         switch (col->type()->id()) {
             case arrow::Type::INT8:
             case arrow::Type::INT16:
@@ -497,7 +585,8 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
                 std::vector<std::int64_t> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_int_column(col, values);
-                sink.add_column(field->name(), ibex::Column<std::int64_t>{std::move(values)});
+                fix_nulls(values);
+                emit(ibex::Column<std::int64_t>{std::move(values)});
                 break;
             }
             case arrow::Type::FLOAT:
@@ -505,40 +594,45 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
                 std::vector<double> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_double_column(col, values);
-                sink.add_column(field->name(), ibex::Column<double>{std::move(values)});
+                fix_nulls(values);
+                emit(ibex::Column<double>{std::move(values)});
                 break;
             }
             case arrow::Type::STRING:
             case arrow::Type::LARGE_STRING: {
+                // The string path already writes an empty string at a null row.
                 std::vector<std::string> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_string_column(col, values);
-                sink.add_column(field->name(), ibex::Column<std::string>{std::move(values)});
+                emit(ibex::Column<std::string>{std::move(values)});
                 break;
             }
             case arrow::Type::DICTIONARY: {
-                sink.add_column(field->name(), build_categorical_column(col));
+                emit(build_categorical_column(col));
                 break;
             }
             case arrow::Type::DATE32: {
                 std::vector<ibex::Date> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_date32_column(col, values);
-                sink.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
+                fix_nulls(values);
+                emit(ibex::Column<ibex::Date>{std::move(values)});
                 break;
             }
             case arrow::Type::DATE64: {
                 std::vector<ibex::Date> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_date64_column(col, values);
-                sink.add_column(field->name(), ibex::Column<ibex::Date>{std::move(values)});
+                fix_nulls(values);
+                emit(ibex::Column<ibex::Date>{std::move(values)});
                 break;
             }
             case arrow::Type::TIMESTAMP: {
                 std::vector<ibex::Timestamp> values;
                 values.reserve(static_cast<std::size_t>(col->length()));
                 append_timestamp_column(col, col->type(), values);
-                sink.add_column(field->name(), ibex::Column<ibex::Timestamp>{std::move(values)});
+                fix_nulls(values);
+                emit(ibex::Column<ibex::Timestamp>{std::move(values)});
                 break;
             }
             default:

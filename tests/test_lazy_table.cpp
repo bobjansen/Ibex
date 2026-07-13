@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -72,6 +73,13 @@ auto make_lazy(FakeSource& source) -> runtime::LazyTable {
 auto greater_than(std::string name, std::int64_t value) -> ir::Expr {
     return ir::Expr{.node = ir::CompareExpr{
                         .op = ir::CompareOp::Gt,
+                        .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = name}}),
+                        .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = value}})}};
+}
+
+auto less_than(std::string name, double value) -> ir::Expr {
+    return ir::Expr{.node = ir::CompareExpr{
+                        .op = ir::CompareOp::Lt,
                         .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = name}}),
                         .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = value}})}};
 }
@@ -195,6 +203,93 @@ TEST_CASE("LazyTable: project_where decodes predicates before selected payload c
     CHECK((*a)[1] == 3);
     CHECK((*b)[0] == 2.5);
     CHECK((*b)[1] == 3.5);
+}
+
+TEST_CASE("LazyTable: project_where evaluates staged predicates before selected payload",
+          "[runtime][lazy_table]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    auto table = lazy.project_where(
+        {"a", "b", "c"}, {greater_than("a", 0), greater_than("a", 1), less_than("b", 3.0)});
+    REQUIRE(table);
+    CHECK(table->rows() == 1);
+    REQUIRE(source.decode_calls.size() == 2);
+    CHECK(source.decode_calls[0] == std::vector<std::string>{"a", "b"});
+    CHECK_FALSE(source.selections[0].has_value());
+    CHECK(source.decode_calls[1] == std::vector<std::string>{"c"});
+    REQUIRE(source.selections[1].has_value());
+    CHECK(*source.selections[1] == runtime::Selection{1});
+
+    const auto* a = std::get_if<Column<std::int64_t>>(table->find("a"));
+    const auto* b = std::get_if<Column<double>>(table->find("b"));
+    const auto* c = std::get_if<Column<std::string>>(table->find("c"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(c != nullptr);
+    CHECK((*a)[0] == 2);
+    CHECK((*b)[0] == 2.5);
+    CHECK((*c)[0] == "y");
+}
+
+TEST_CASE("LazyTable: project_where compacts later predicate evaluation but keeps decoding dense",
+          "[runtime][lazy_table]") {
+    runtime::Table schema;
+    schema.add_column("a", Column<std::int64_t>{});
+    schema.add_column("b", Column<double>{});
+    schema.add_column("c", Column<std::string>{});
+    std::vector<std::vector<std::string>> calls;
+    std::vector<std::optional<runtime::Selection>> selections;
+    runtime::LazyTable lazy{
+        std::move(schema), 64,
+        [&](const std::vector<std::string>& names,
+            const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
+            calls.push_back(names);
+            selections.push_back(selection == nullptr ? std::nullopt : std::optional{*selection});
+            runtime::Selection all(64);
+            std::iota(all.begin(), all.end(), std::size_t{0});
+            const auto& rows = selection == nullptr ? all : *selection;
+            runtime::Table out;
+            for (const auto& name : names) {
+                if (name == "a") {
+                    std::vector<std::int64_t> values;
+                    for (auto row : rows) {
+                        values.push_back(static_cast<std::int64_t>(row % 8));
+                    }
+                    out.add_column("a", Column<std::int64_t>{std::move(values)});
+                } else if (name == "b") {
+                    std::vector<double> values;
+                    runtime::ValidityBitmap validity(rows.size(), true);
+                    std::size_t position = 0;
+                    for (auto row : rows) {
+                        values.push_back(static_cast<double>(row));
+                        if (row == 15) {
+                            validity.set(position, false);
+                        }
+                        ++position;
+                    }
+                    out.add_column("b", Column<double>{std::move(values)}, std::move(validity));
+                } else if (name == "c") {
+                    std::vector<std::string> values;
+                    for (auto row : rows) {
+                        values.push_back(std::to_string(row));
+                    }
+                    out.add_column("c", Column<std::string>{std::move(values)});
+                }
+            }
+            out.logical_rows = rows.size();
+            return out;
+        }};
+
+    auto table = lazy.project_where({"c"}, {greater_than("a", 6), less_than("b", 20.0)});
+    REQUIRE(table);
+    CHECK(table->rows() == 1);
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[0] == std::vector<std::string>{"a", "b"});
+    CHECK_FALSE(selections[0].has_value());
+    CHECK(calls[1] == std::vector<std::string>{"c"});
+    REQUIRE(selections[1].has_value());
+    CHECK(*selections[1] == runtime::Selection{7});
 }
 
 TEST_CASE("LazyTable: project_where never poisons the whole-column cache",

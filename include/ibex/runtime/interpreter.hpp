@@ -256,7 +256,8 @@ class ExternRegistry;
 /// ascending order. Null predicate values do not survive (the same three-valued
 /// logic used by a Filter node). This is the seam used by deferred file readers
 /// to late-materialize non-predicate columns without duplicating expression
-/// evaluation inside an I/O plugin.
+/// evaluation inside an I/O plugin. Later conjuncts compact their referenced
+/// columns once earlier conjuncts have made the candidate set selective.
 [[nodiscard]] auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
                                     const ScalarRegistry* scalars = nullptr)
     -> std::expected<std::vector<std::size_t>, std::string>;

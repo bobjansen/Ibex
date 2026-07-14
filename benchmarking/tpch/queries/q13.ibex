@@ -1,0 +1,50 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q13 — Customer Distribution
+//
+//  Left outer join + a negated string pattern + TWO levels of aggregation:
+//  count the qualifying orders per customer, then count the customers per
+//  distinct order-count. The `c_count = 0` bucket (customers with no
+//  qualifying order at all) is the point of the query — at SF-1 it is by far
+//  the largest, at 50005 customers.
+//
+//  That bucket is why this needs `count(o_orderkey)` and not `count()`: after
+//  the left join an unmatched customer still occupies one row, with a null
+//  o_orderkey. `count()` would report 1 for them; `count(col)` counts non-null
+//  values and correctly reports 0 (SPEC 7.1).
+//
+//  The `not like '%special%requests%'` predicate filters *orders* before the
+//  join — it is part of the join condition in the SQL, not a post-join filter,
+//  so an unmatched customer must survive it and land in the 0 bucket.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q13.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
+    select { c_custkey }
+];
+
+let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let orders = orders_raw[filter !like(o_comment, "%special%requests%")][
+    select { c_custkey = o_custkey, o_orderkey }
+];
+
+// Per customer: how many qualifying orders? Unmatched customers count 0.
+let per_customer = (customer left join orders on c_custkey)[
+    select { c_count = count(o_orderkey) },
+    by { c_custkey }
+];
+
+// Per order-count: how many customers?
+let result = per_customer[
+    select { custdist = count() },
+    by { c_count }
+][
+    order { custdist desc, c_count desc }
+];
+write_csv(result, "benchmarking/data/tpch/out/q13.csv");
+result;

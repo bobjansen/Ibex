@@ -1,0 +1,69 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q9 — Product Type Profit Measure
+//
+//  6-table equijoin + a string pattern filter + a two-key join. The part
+//  filter is `p_name like '%green%'`, which is what `like(...)` exists for
+//  (SPEC 12.6, "String Pattern Matching"); before it, this query had no
+//  spelling in Ibex at all.
+//
+//  `partsupp` is joined on BOTH keys — `on { l_partkey, l_suppkey }` — since
+//  a supply cost is per (part, supplier) pair. A single-key join here would
+//  silently fan out the row count and inflate the profit.
+//
+//  The filtered `part` (~10.6k of 200k rows) leads the chain on purpose, so
+//  the 6M-row lineitem scan probes a small build side, and every later join
+//  works on the already-narrowed stream.
+//
+//  Group keys are `n_name` and the derived `o_year`; a `by` clause needs
+//  columns, so the year is materialized in an `update` before the group-by.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q09.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let part = part_raw[filter like(p_name, "%green%")][select { l_partkey = p_partkey }];
+
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+    select { l_partkey, l_suppkey, l_orderkey, l_quantity, l_extendedprice, l_discount }
+];
+
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
+    select { l_suppkey = s_suppkey, s_nationkey }
+];
+
+let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet")[
+    select { l_partkey = ps_partkey, l_suppkey = ps_suppkey, ps_supplycost }
+];
+
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
+    select { l_orderkey = o_orderkey, o_orderdate }
+];
+
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+    select { s_nationkey = n_nationkey, nation = n_name }
+];
+
+let green_lines = part join lineitem on l_partkey;
+let with_supplier = green_lines join supplier on l_suppkey;
+let with_partsupp = with_supplier join partsupp on { l_partkey, l_suppkey };
+let with_orders = with_partsupp join orders on l_orderkey;
+let profit = with_orders join nation on s_nationkey;
+
+let result = profit[
+    update {
+        o_year = year(o_orderdate),
+        amount = l_extendedprice * (1.0 - l_discount) - ps_supplycost * l_quantity
+    }
+][
+    select { sum_profit = sum(amount) },
+    by { nation, o_year }
+][
+    order { nation asc, o_year desc }
+];
+write_csv(result, "benchmarking/data/tpch/out/q09.csv");
+result;

@@ -248,3 +248,34 @@ TEST_CASE("scan_predicates: reaches a scan through a column-only projection",
     REQUIRE(predicates.contains("t"));
     CHECK(predicates.at("t").size() == 1);
 }
+
+TEST_CASE("scan_predicates: removes a fully applied fused filter while retaining projection",
+          "[ir][scan_predicates]") {
+    auto plan = std::make_unique<ir::FilterProjectNode>(ir::NodeId{2}, gt_zero("predicate"),
+                                                        refs({"payload"}));
+    plan->add_child(make_scan("t"));
+
+    auto rewritten = ir::remove_applied_scan_filters(std::move(plan), {"t"});
+    REQUIRE(rewritten->kind() == ir::NodeKind::Project);
+    const auto& project = static_cast<const ir::ProjectNode&>(*rewritten);
+    REQUIRE(project.columns().size() == 1);
+    CHECK(project.columns().front().name == "payload");
+    REQUIRE(rewritten->children().size() == 1);
+    REQUIRE(rewritten->children().front()->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("scan_predicates: does not remove a non-local filter", "[ir][scan_predicates]") {
+    ir::CallExpr lag;
+    lag.callee = "lag";
+    lag.args.push_back(col("a"));
+    ir::Expr predicate{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = std::move(lag)}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}};
+    auto plan = with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, std::move(predicate)),
+                           make_scan("t"));
+
+    auto rewritten = ir::remove_applied_scan_filters(std::move(plan), {"t"});
+    CHECK(rewritten->kind() == ir::NodeKind::Filter);
+}

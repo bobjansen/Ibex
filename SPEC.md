@@ -2969,6 +2969,7 @@ extern implementations. The recommended path for custom scalar logic is
 | `pmin(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `pmax(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `is_nan(x)`     | `Float64 -> Bool`                  |
+| `like(s, pattern)` | `(String, String) -> Bool` (SQL-LIKE matching, see below) |
 | `is_null(x)` / `is_not_null(x)` | `Any -> Bool` (tests the value's null bit; never null itself) |
 | `coalesce(a, b, ...)` | `T{1+} -> T` (first non-null argument per row; args share one type) |
 | `year(t)`       | `Date|Timestamp -> Int32`          |
@@ -3038,6 +3039,42 @@ round(-3.7, trunc)    // → -3
 // Typical use: round a Float column to Int before an explicit cast
 prices[update { vol_int = round(volume_f, bankers) }];
 ```
+
+#### String Pattern Matching — `like`
+
+`like(value, pattern)` is SQL-LIKE matching: `(String, String) -> Bool`. There is
+no infix `LIKE` keyword; it is an ordinary function call, and `NOT LIKE` is
+spelled with the existing `!` operator.
+
+```
+parts[filter like(p_name, "%green%")];
+parts[filter like(p_type, "%BRASS")];
+orders[filter !like(o_comment, "%special%requests%")];
+
+// Bool-valued, so it also works as a field
+parts[update { is_green = like(p_name, "%green%") }];
+```
+
+Semantics:
+
+- The pattern must match the **whole** value — `like(s, "green")` is equality,
+  not a substring test.
+- `%` matches zero or more code points; `_` matches exactly one code point (a
+  multi-byte UTF-8 character counts as one).
+- Matching is case-sensitive and locale-independent.
+- `\` escapes the next character, so `%` and `_` can be matched literally. Ibex
+  string literals process escapes too, so a literal percent sign is written
+  `like(s, "100\\%")` in source. A pattern ending in an unescaped `\` is an
+  error.
+- Null propagates, as it does for every ordinary scalar function: a null value
+  or a null pattern yields null, and a null predicate does not retain the row in
+  `filter` (so `!like(...)` does not resurrect it either).
+- Both arguments may be columns or scalars; a `String` column matched against a
+  literal pattern takes an optimized single-scan path, and a dictionary-encoded
+  (categorical) column is matched once per distinct value.
+
+Case-insensitive matching, regular expressions, and collation are deliberately
+out of scope.
 
 ### 12.6.1 Ranking
 

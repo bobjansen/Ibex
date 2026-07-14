@@ -273,3 +273,10 @@ TEST_CASE("schema: an unmodelled operator falls back to unknown", "[ir][schema]"
     // Even with a known child, transpose's output columns are data-dependent.
     REQUIRE_FALSE(ibex::ir::infer_schema(transpose, base_sources()).is_known());
 }
+
+TEST_CASE("schema: like infers a Bool column", "[ir][schema]") {
+    auto s = schema_of(R"(t[update { m = like(c, "%x%") }];)", base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(names(s) == std::vector<std::string>{"a", "b", "c", "m"});
+    REQUIRE(type_of(s, "m") == ColumnType::Bool);
+}

@@ -39,6 +39,7 @@
 #endif
 
 #include "interpreter_internal.hpp"
+#include "like.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -177,6 +178,136 @@ auto coalesce_kernel(const ir::CallExpr& call, const Table& input, std::size_t r
     return eval_coalesce_column(call, input, ctx.scalars, rows);
 }
 
+// One `like` argument in kernel shape: a String literal / lexical String scalar,
+// a dense String column, or a Categorical column. The string_view borrows the
+// literal or the registry entry, both of which outlive the call.
+struct LikeArg {
+    const Column<std::string>* dense = nullptr;
+    const Column<Categorical>* categorical = nullptr;
+    const ValidityBitmap* validity = nullptr;
+    std::string_view scalar;  // meaningful only when neither column is set
+};
+
+auto resolve_like_arg(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
+    -> std::expected<LikeArg, std::string> {
+    if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
+        const auto* text = std::get_if<std::string>(&lit->value);
+        if (text == nullptr) {
+            return std::unexpected("like: arguments must be String");
+        }
+        return LikeArg{.scalar = *text};
+    }
+    const auto* ref = std::get_if<ir::ColumnRef>(&expr.node);
+    if (ref == nullptr) {
+        return std::unexpected("like: arguments must be columns, string literals, or scalars");
+    }
+    if (const auto* entry = input.find_entry(ref->name); entry != nullptr) {
+        LikeArg arg;
+        arg.validity = entry->validity.has_value() ? &*entry->validity : nullptr;
+        if (const auto* dense = std::get_if<Column<std::string>>(entry->column.get())) {
+            arg.dense = dense;
+            return arg;
+        }
+        if (const auto* cat = std::get_if<Column<Categorical>>(entry->column.get())) {
+            arg.categorical = cat;
+            return arg;
+        }
+        return std::unexpected("like: column '" + ref->name + "' is not a String column");
+    }
+    if (scalars != nullptr) {
+        if (auto it = scalars->find(ref->name); it != scalars->end()) {
+            const auto* text = std::get_if<std::string>(&it->second);
+            if (text == nullptr) {
+                return std::unexpected("like: arguments must be String");
+            }
+            return LikeArg{.scalar = *text};
+        }
+    }
+    return std::unexpected("like: unknown column '" + ref->name + "'");
+}
+
+// like(value, pattern) over whole columns: compile the pattern once, then scan.
+// The per-row registry eval is the semantic reference; this only avoids
+// re-compiling the pattern and copying every value into an ExprValue.
+auto like_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
+                 const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+    if (call.args.size() != 2) {
+        return std::unexpected("like: expected 2 arguments (value, pattern)");
+    }
+    auto value = resolve_like_arg(*call.args[0], input, ctx.scalars);
+    if (!value) {
+        return std::unexpected(value.error());
+    }
+    auto pattern = resolve_like_arg(*call.args[1], input, ctx.scalars);
+    if (!pattern) {
+        return std::unexpected(pattern.error());
+    }
+
+    Column<bool> out;
+    out.resize(rows);
+    const bool scalar_pattern = pattern->dense == nullptr && pattern->categorical == nullptr;
+
+    if (scalar_pattern) {
+        auto compiled = compile_like_pattern(pattern->scalar);
+        if (!compiled) {
+            return std::unexpected(compiled.error());
+        }
+        if (value->categorical != nullptr) {
+            // The dictionary is the work: match each distinct value once, then
+            // map the answer through the codes.
+            const auto& dict = value->categorical->dictionary();
+            std::vector<bool> dict_match(dict.size(), false);
+            for (std::size_t d = 0; d < dict.size(); ++d) {
+                dict_match[d] = like_match(*compiled, dict[d]);
+            }
+            const auto* codes = value->categorical->codes_data();
+            for (std::size_t i = 0; i < rows; ++i) {
+                out.set(i, dict_match[static_cast<std::size_t>(codes[i])]);
+            }
+        } else if (value->dense != nullptr) {
+            for (std::size_t i = 0; i < rows; ++i) {
+                out.set(i, like_match(*compiled, (*value->dense)[i]));
+            }
+        } else {
+            const bool matched = like_match(*compiled, value->scalar);
+            out.resize(rows, matched);
+        }
+    } else {
+        // Pattern column: compile per row, caching the last one — dynamic
+        // patterns in practice repeat (a joined-in pattern column, a grouped
+        // key), and a cache miss only costs the compile it would have done.
+        const auto value_at = [&value](std::size_t i) -> std::string_view {
+            if (value->dense != nullptr) {
+                return (*value->dense)[i];
+            }
+            if (value->categorical != nullptr) {
+                return (*value->categorical)[i];
+            }
+            return value->scalar;
+        };
+        std::string_view cached_text;
+        LikePattern cached;
+        bool have_cached = false;
+        for (std::size_t i = 0; i < rows; ++i) {
+            const std::string_view pattern_text =
+                pattern->dense != nullptr ? (*pattern->dense)[i] : (*pattern->categorical)[i];
+            if (!have_cached || pattern_text != cached_text) {
+                auto compiled = compile_like_pattern(pattern_text);
+                if (!compiled) {
+                    return std::unexpected(compiled.error());
+                }
+                cached = std::move(*compiled);
+                cached_text = pattern_text;
+                have_cached = true;
+            }
+            out.set(i, like_match(cached, value_at(i)));
+        }
+    }
+
+    return ComputedColumn{.column = ColumnValue{std::move(out)},
+                          .validity = merge_validity(value->validity, pattern->validity, rows)};
+}
+
 }  // namespace
 
 auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
@@ -189,6 +320,8 @@ auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
             return &float_clean_kernel;
         case ScalarKernel::Coalesce:
             return &coalesce_kernel;
+        case ScalarKernel::Like:
+            return &like_kernel;
     }
     return nullptr;  // unreachable; MSVC C4715
 }
@@ -482,6 +615,35 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           return std::unexpected("is_nan: argument must be Float64");
                       }},
                   });
+
+        // like(value, pattern): SQL-LIKE matching, String x String -> Bool. The
+        // column kernel (compile the pattern once, scan) is the fast path for
+        // the bare column-and-literal form; this eval is the semantic reference
+        // and handles computed arguments.
+        m.emplace("like", BuiltinFn{
+                              .min_args = 2,
+                              .max_args = 2,
+                              .scalar_kernel = ScalarKernel::Like,
+                              .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                                  if (a[0] != ExprType::String || a[1] != ExprType::String) {
+                                      return std::unexpected("like: both arguments must be String");
+                                  }
+                                  return ExprType::Bool;
+                              },
+                              .exec = ScalarExec{.eval = [](std::string_view,
+                                                            const std::vector<ExprValue>& a) -> IV {
+                                  const auto* value = std::get_if<std::string>(a.data());
+                                  const auto* pattern = std::get_if<std::string>(&a[1]);
+                                  if (value == nullptr || pattern == nullptr) {
+                                      return std::unexpected("like: both arguments must be String");
+                                  }
+                                  auto compiled = compile_like_pattern(*pattern);
+                                  if (!compiled) {
+                                      return std::unexpected(compiled.error());
+                                  }
+                                  return ExprValue{like_match(*compiled, *value)};
+                              }},
+                          });
 
         // pmin / pmax: 2+ comparable args of one type (Int/Float widen to Float).
         const BuiltinFn pminmax{

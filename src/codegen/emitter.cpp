@@ -1281,6 +1281,28 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
                 s += node.pct ? "true" : "false";
                 s += ')';
                 return s;
+            } else if constexpr (std::is_same_v<T, ir::CompareExpr>) {
+                // Boolean-valued nodes are legal in value position too — the
+                // interpreter evaluates `flag = x > 1` or `plain = !like(name,
+                // "%green%")` into a Bool column. The ops::filter_* helpers are
+                // the generic ir::Expr constructors for these nodes despite the
+                // name, so a field and a predicate emit the same tree.
+                return "ibex::ops::filter_cmp(ibex::ir::CompareOp::" + emit_compare_op(node.op) +
+                       ", " + emit_expr(*node.left) + ", " + emit_expr(*node.right) + ")";
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                if (node.op == ir::LogicalOp::And) {
+                    return "ibex::ops::filter_and(" + emit_expr(*node.left) + ", " +
+                           emit_expr(*node.right) + ")";
+                }
+                if (node.op == ir::LogicalOp::Or) {
+                    return "ibex::ops::filter_or(" + emit_expr(*node.left) + ", " +
+                           emit_expr(*node.right) + ")";
+                }
+                return "ibex::ops::filter_not(" + emit_expr(*node.left) + ")";
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return node.negated
+                           ? "ibex::ops::filter_is_not_null(" + emit_expr(*node.operand) + ")"
+                           : "ibex::ops::filter_is_null(" + emit_expr(*node.operand) + ")";
             }
             throw std::runtime_error("ibex_compile: unknown expression type");
         },

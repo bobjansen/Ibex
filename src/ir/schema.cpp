@@ -130,6 +130,9 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         if (call->callee == "rolling_count") {
             return ColumnType::Int64;
         }
+        if (call->callee == "like" || call->callee == "is_nan") {
+            return ColumnType::Bool;
+        }
         // `abs` and type-preserving columnar functions return their first
         // argument's type.
         if (call->callee == "abs" || call->callee == "cumsum" || call->callee == "cumprod" ||

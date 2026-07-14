@@ -632,3 +632,53 @@ TEST_CASE("emitter: rbind emits a brace-init ops::rbind over its children", "[co
     CHECK(contains(out, "read_csv(\"feb.csv\")"));
     CHECK(contains(out, "read_csv(\"mar.csv\")"));
 }
+
+// --- like ---------------------------------------------------------------------
+
+TEST_CASE("emitter: like in a filter predicate", "[codegen][like]") {
+    ir::Builder b;
+    auto filter =
+        b.filter(ops::filter_call("like", {ops::filter_col("p_name"), ops::filter_str("%green%")}));
+    filter->add_child(make_source(b, "part.csv"));
+
+    auto out = emit_to_string(*filter);
+    CHECK(contains(out, "ibex::ops::filter_call(\"like\""));
+    CHECK(contains(out, "\"%green%\""));
+}
+
+TEST_CASE("emitter: negated like in a filter predicate", "[codegen][like]") {
+    ir::Builder b;
+    auto filter = b.filter(ops::filter_not(ops::filter_call(
+        "like", {ops::filter_col("o_comment"), ops::filter_str("%special%requests%")})));
+    filter->add_child(make_source(b, "orders.csv"));
+
+    auto out = emit_to_string(*filter);
+    CHECK(contains(out, "ibex::ops::filter_not("));
+    CHECK(contains(out, "ibex::ops::filter_call(\"like\""));
+}
+
+TEST_CASE("emitter: like as an update field emits a value-position call", "[codegen][like]") {
+    ir::Builder b;
+    auto update = b.update(
+        {{"is_green", ops::fn_call("like", {ops::col_ref("p_name"), ops::str_lit("%green%")})}});
+    update->add_child(make_source(b, "part.csv"));
+
+    auto out = emit_to_string(*update);
+    CHECK(contains(out, "ibex::ops::fn_call(\"like\""));
+    CHECK(contains(out, "\"%green%\""));
+}
+
+TEST_CASE("emitter: a boolean-valued field emits its predicate node", "[codegen]") {
+    // Boolean nodes are legal in value position (`flag = !like(...)`), and the
+    // interpreter builds a Bool column from them — codegen must emit the same
+    // tree rather than rejecting the field.
+    ir::Builder b;
+    auto update =
+        b.update({{"plain", ops::filter_not(ops::fn_call(
+                                "like", {ops::col_ref("p_name"), ops::str_lit("%green%")}))}});
+    update->add_child(make_source(b, "part.csv"));
+
+    auto out = emit_to_string(*update);
+    CHECK(contains(out, "ibex::ops::filter_not("));
+    CHECK(contains(out, "ibex::ops::fn_call(\"like\""));
+}

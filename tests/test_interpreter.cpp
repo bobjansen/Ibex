@@ -9131,3 +9131,257 @@ TEST_CASE("Interpret an IN-list over a categorical column with nulls") {
     CHECK((*qty)[0] == 1);
     CHECK((*qty)[1] == 3);
 }
+
+// ── like(value, pattern) ─────────────────────────────────────────────────────
+// SQL-LIKE matching: the pattern must cover the whole value, `%` matches zero
+// or more code points, `_` exactly one, `\` escapes the next character.
+
+namespace {
+
+// Run `like(v, <pattern>)` over a dense String column. The pattern is written
+// as it would be in Ibex source, so it also passes through the lexer's own
+// string escapes (a literal `%` is `\\%` here, as it is in a .ibex file).
+auto like_over(const std::vector<std::string>& values, const std::string& pattern)
+    -> std::vector<bool> {
+    Column<std::string> col;
+    for (const auto& v : values) {
+        col.push_back(v);
+    }
+    runtime::Table t;
+    t.add_column("v", std::move(col));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    const std::string source = "t[update { m = like(v, \"" + pattern + "\") }];";
+    auto ir = require_ir(source.c_str());
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<bool>>(result->find("m"));
+    REQUIRE(m != nullptr);
+
+    std::vector<bool> out;
+    out.reserve(m->size());
+    for (std::size_t i = 0; i < m->size(); ++i) {
+        out.push_back((*m)[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("like matches the whole value, not a substring", "[interpreter][like]") {
+    const std::vector<std::string> values{"green", "forest green", "green plate", "GREEN", ""};
+    CHECK(like_over(values, "green") == std::vector<bool>{true, false, false, false, false});
+    CHECK(like_over(values, "green%") == std::vector<bool>{true, false, true, false, false});
+    CHECK(like_over(values, "%green") == std::vector<bool>{true, true, false, false, false});
+    CHECK(like_over(values, "%green%") == std::vector<bool>{true, true, true, false, false});
+}
+
+TEST_CASE("like: % matches zero or more code points", "[interpreter][like]") {
+    const std::vector<std::string> values{"", "a", "ab", "ba"};
+    CHECK(like_over(values, "%") == std::vector<bool>{true, true, true, true});
+    CHECK(like_over(values, "%%") == std::vector<bool>{true, true, true, true});
+    CHECK(like_over(values, "a%") == std::vector<bool>{false, true, true, false});
+    CHECK(like_over(values, "%a") == std::vector<bool>{false, true, false, true});
+    // The empty pattern matches only the empty value.
+    CHECK(like_over(values, "") == std::vector<bool>{true, false, false, false});
+}
+
+TEST_CASE("like: ordered fragments must appear in order", "[interpreter][like]") {
+    const std::vector<std::string> values{
+        "no special requests here",  // both, in order
+        "special requests",          // adjacent, still in order
+        "requests are special",      // present but out of order
+        "special",                   // only the first fragment
+    };
+    CHECK(like_over(values, "%special%requests%") == std::vector<bool>{true, true, false, false});
+    // Anchored fragments: the tail must end the value.
+    CHECK(like_over(values, "special%requests") == std::vector<bool>{false, true, false, false});
+}
+
+TEST_CASE("like: _ matches exactly one code point, including multibyte", "[interpreter][like]") {
+    CHECK(like_over({"cat", "cot", "coat", "ct"}, "c_t") ==
+          std::vector<bool>{true, true, false, false});
+    // é is two UTF-8 bytes but one code point, so a single `_` covers it.
+    CHECK(like_over({"café", "cafe", "caf"}, "caf_") == std::vector<bool>{true, true, false});
+    CHECK(like_over({"héllo"}, "h_llo") == std::vector<bool>{true});
+    CHECK(like_over({"日本語"}, "_本_") == std::vector<bool>{true});
+    CHECK(like_over({"日本語"}, "___") == std::vector<bool>{true});
+    CHECK(like_over({"日本語"}, "____") == std::vector<bool>{false});
+}
+
+TEST_CASE("like: escaped wildcards match literally", "[interpreter][like]") {
+    // Ibex string literals process escapes too, so a literal `%` is `\\%` in
+    // source and reaches the matcher as `\%`.
+    CHECK(like_over({"100%", "1000", "100"}, "100\\\\%") == std::vector<bool>{true, false, false});
+    CHECK(like_over({"a_b", "axb"}, "a\\\\_b") == std::vector<bool>{true, false});
+    CHECK(like_over({"a\\b", "axb"}, "a\\\\\\\\b") == std::vector<bool>{true, false});
+    // An escape is only special before the character it escapes.
+    CHECK(like_over({"50%off", "50XXoff"}, "50\\\\%%") == std::vector<bool>{true, false});
+}
+
+TEST_CASE("like: matching is case-sensitive", "[interpreter][like]") {
+    CHECK(like_over({"BRASS", "brass", "Brass"}, "%BRASS") ==
+          std::vector<bool>{true, false, false});
+}
+
+TEST_CASE("like: a trailing escape is an invalid pattern", "[interpreter][like]") {
+    runtime::Table t;
+    t.add_column("v", Column<std::string>{"a"});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(R"(t[filter like(v, "abc\\")];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("trailing escape") != std::string::npos);
+}
+
+TEST_CASE("like propagates nulls from either argument", "[interpreter][like][null]") {
+    // Standard scalar propagation: null in -> null out. A null predicate is not
+    // true, so `filter` drops the row (and `!like(...)` drops it too).
+    runtime::Table t;
+    Column<std::string> names{"alpha", "beta", ""};
+    t.add_column("v", std::move(names), std::vector<bool>{true, true, false});
+    Column<std::string> pats{"%a%", "", "%a%"};
+    t.add_column("p", std::move(pats), std::vector<bool>{true, false, true});
+    t.add_column("id", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    SECTION("literal pattern: the null value yields a null result") {
+        auto ir = require_ir(R"(t[update { m = like(v, "%a%") }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("m");
+        REQUIRE(entry != nullptr);
+        const auto& m = std::get<Column<bool>>(*entry->column);
+        REQUIRE(entry->validity.has_value());
+        CHECK((*entry->validity)[0] == true);
+        CHECK((*entry->validity)[1] == true);
+        CHECK((*entry->validity)[2] == false);
+        CHECK(m[0] == true);
+        CHECK(m[1] == true);  // "beta" contains an 'a'
+    }
+
+    SECTION("pattern column: a null pattern yields a null result") {
+        auto ir = require_ir("t[update { m = like(v, p) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("m");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        CHECK((*entry->validity)[0] == true);
+        CHECK((*entry->validity)[1] == false);  // null pattern
+        CHECK((*entry->validity)[2] == false);  // null value
+        CHECK(std::get<Column<bool>>(*entry->column)[0] == true);
+    }
+
+    SECTION("filter drops null predicates, and so does its negation") {
+        auto keep = require_ir(R"(t[filter like(v, "%a%")];)");
+        auto kept = runtime::interpret(*keep, registry);
+        REQUIRE(kept.has_value());
+        CHECK(kept->rows() == 2);  // alpha, beta — the null row is not kept
+
+        auto drop = require_ir(R"(t[filter !like(v, "%a%")];)");
+        auto dropped = runtime::interpret(*drop, registry);
+        REQUIRE(dropped.has_value());
+        CHECK(dropped->rows() == 0);  // !null is null, which is not true either
+    }
+}
+
+TEST_CASE("like matches a categorical column through its dictionary", "[interpreter][like]") {
+    // Parquet hands back dictionary-encoded strings; the kernel matches each
+    // distinct value once and maps the answer through the codes.
+    std::vector<std::string> dict{"SMALL BRASS", "LARGE PLATED BRASS", "MEDIUM COPPER"};
+    Column<Categorical> types(dict);
+    for (const auto code : {0, 1, 2, 0}) {
+        types.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+    runtime::Table t;
+    t.add_column("p_type", std::move(types));
+    t.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
+
+    runtime::TableRegistry registry;
+    registry.emplace("part", std::move(t));
+
+    auto ir = require_ir(R"(part[filter like(p_type, "%BRASS")];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* id = std::get_if<Column<std::int64_t>>(result->find("id"));
+    REQUIRE(id != nullptr);
+    REQUIRE(id->size() == 3);
+    CHECK((*id)[0] == 1);
+    CHECK((*id)[1] == 2);
+    CHECK((*id)[2] == 4);
+
+    auto negated = require_ir(R"(part[filter !like(p_type, "SMALL%")];)");
+    auto rest = runtime::interpret(*negated, registry);
+    REQUIRE(rest.has_value());
+    CHECK(rest->rows() == 2);
+}
+
+TEST_CASE("like composes with the boolean operators", "[interpreter][like]") {
+    runtime::Table t;
+    t.add_column("name", Column<std::string>{"forest green", "green", "midnight blue"});
+    t.add_column("size", Column<std::int64_t>{1, 9, 1});
+
+    runtime::TableRegistry registry;
+    registry.emplace("part", std::move(t));
+
+    auto conjunction = require_ir(R"(part[filter like(name, "%green%") && size < 5];)");
+    auto both = runtime::interpret(*conjunction, registry);
+    REQUIRE(both.has_value());
+    CHECK(both->rows() == 1);
+
+    auto disjunction = require_ir(R"(part[filter like(name, "%blue%") || size == 9];)");
+    auto either = runtime::interpret(*disjunction, registry);
+    REQUIRE(either.has_value());
+    CHECK(either->rows() == 2);
+}
+
+TEST_CASE("like evaluates a computed pattern per row", "[interpreter][like]") {
+    // A pattern that is neither a bare column nor a literal (here: string
+    // interpolation) bypasses the column kernel and runs through the registry's
+    // per-row evaluator — the two must agree.
+    runtime::Table t;
+    t.add_column("v", Column<std::string>{"forest green", "midnight blue", "green"});
+    t.add_column("needle", Column<std::string>{"green", "green", "blue"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { m = like(v, `%${needle}%`) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<bool>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    CHECK((*m)[0] == true);
+    CHECK((*m)[1] == false);
+    CHECK((*m)[2] == false);
+}
+
+TEST_CASE("like rejects wrong arity and non-String arguments", "[interpreter][like]") {
+    runtime::Table t;
+    t.add_column("v", Column<std::string>{"a"});
+    t.add_column("n", Column<std::int64_t>{1});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto one_arg = require_ir(R"(t[filter like(v)];)");
+    auto arity = runtime::interpret(*one_arg, registry);
+    REQUIRE_FALSE(arity.has_value());
+    CHECK(arity.error().find("like") != std::string::npos);
+
+    auto int_value = require_ir(R"(t[filter like(n, "a%")];)");
+    auto wrong_value = runtime::interpret(*int_value, registry);
+    REQUIRE_FALSE(wrong_value.has_value());
+    CHECK(wrong_value.error().find("like") != std::string::npos);
+
+    auto int_pattern = require_ir("t[filter like(v, 1)];");
+    auto wrong_pattern = runtime::interpret(*int_pattern, registry);
+    REQUIRE_FALSE(wrong_pattern.has_value());
+    CHECK(wrong_pattern.error().find("like") != std::string::npos);
+}

@@ -205,6 +205,217 @@ inline void push_key_value(Key& key, const ColumnValue& column, const ValidityBi
     key.values.push_back(scalar_from_column(column, row));
 }
 
+/// A key column resolved once, so a row loop can read its values in place
+/// instead of boxing them into a Key.
+///
+/// Building a `Key` per row to probe a group index costs a heap-allocated
+/// vector plus a std::string copy for every string key column — on the order of
+/// one allocation per row, to answer a question about groups. Hashing and
+/// comparing the row where it sits lets a Key be built once per *group*, which
+/// is what the group index actually needs to keep.
+struct KeyCol {
+    enum class Kind : std::uint8_t { Int64, Double, Bool, Str, Cat, Date, Ts };
+    Kind kind{Kind::Int64};
+    const std::int64_t* i64{nullptr};
+    const double* f64{nullptr};
+    const Column<bool>* boolean{nullptr};
+    const Column<std::string>* str{nullptr};
+    const Column<Categorical>* cat{nullptr};
+    const Date* date{nullptr};
+    const Timestamp* ts{nullptr};
+    const ValidityBitmap* validity{nullptr};
+
+    [[nodiscard]] auto is_null(std::size_t row) const noexcept -> bool {
+        return validity != nullptr && !(*validity)[row];
+    }
+    /// Categorical compares by value, not by code: chunked callers may see a
+    /// different dictionary in a later chunk, and the Key it is compared
+    /// against holds a string either way.
+    [[nodiscard]] auto text(std::size_t row) const -> std::string_view {
+        if (kind == Kind::Str) {
+            return {(*str)[row]};
+        }
+        return {cat->dictionary()[static_cast<std::size_t>(cat->code_at(row))]};
+    }
+};
+
+inline auto make_key_col(const ColumnValue& column, const ValidityBitmap* validity)
+    -> std::optional<KeyCol> {
+    KeyCol key_col;
+    key_col.validity = validity;
+    if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
+        key_col.kind = KeyCol::Kind::Int64;
+        key_col.i64 = c_int->data();
+    } else if (const auto* c_dbl = std::get_if<Column<double>>(&column)) {
+        key_col.kind = KeyCol::Kind::Double;
+        key_col.f64 = c_dbl->data();
+    } else if (const auto* c_bool = std::get_if<Column<bool>>(&column)) {
+        key_col.kind = KeyCol::Kind::Bool;
+        key_col.boolean = c_bool;
+    } else if (const auto* c_str = std::get_if<Column<std::string>>(&column)) {
+        key_col.kind = KeyCol::Kind::Str;
+        key_col.str = c_str;
+    } else if (const auto* c_cat = std::get_if<Column<Categorical>>(&column)) {
+        key_col.kind = KeyCol::Kind::Cat;
+        key_col.cat = c_cat;
+    } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {
+        key_col.kind = KeyCol::Kind::Date;
+        key_col.date = c_date->data();
+    } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(&column)) {
+        key_col.kind = KeyCol::Kind::Ts;
+        key_col.ts = c_ts->data();
+    } else {
+        return std::nullopt;
+    }
+    return key_col;
+}
+
+inline auto make_key_col(const ColumnEntry& entry) -> std::optional<KeyCol> {
+    return make_key_col(*entry.column, entry.validity.has_value() ? &*entry.validity : nullptr);
+}
+
+inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> std::uint64_t {
+    std::uint64_t seed = 0;
+    const auto mix = [&seed](std::uint64_t value) {
+        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    };
+    for (std::size_t i = 0; i < cols.size(); ++i) {
+        const KeyCol& col = cols[i];
+        if (col.is_null(row)) {
+            // A null's payload is undefined, so hash its position instead —
+            // matching KeyEq, which compares the null mask and skips the value.
+            mix(0xd1b54a32d192ed03ULL + i);
+            continue;
+        }
+        switch (col.kind) {
+            case KeyCol::Kind::Int64:
+                mix(std::hash<std::int64_t>{}(col.i64[row]));
+                break;
+            case KeyCol::Kind::Double:
+                // std::hash<double> folds -0.0 onto 0.0, keeping it consistent
+                // with the `==` used to compare them below.
+                mix(std::hash<double>{}(col.f64[row]));
+                break;
+            case KeyCol::Kind::Bool:
+                mix(std::hash<bool>{}((*col.boolean)[row]));
+                break;
+            case KeyCol::Kind::Date:
+                mix(std::hash<std::int32_t>{}(col.date[row].days));
+                break;
+            case KeyCol::Kind::Ts:
+                mix(std::hash<std::int64_t>{}(col.ts[row].nanos));
+                break;
+            case KeyCol::Kind::Str:
+            case KeyCol::Kind::Cat:
+                mix(std::hash<std::string_view>{}(col.text(row)));
+                break;
+        }
+    }
+    return seed;
+}
+
+/// Does the group's stored key describe this row? Mirrors KeyEq: null matches
+/// only null, and a double compares with `==`, so NaN keys stay distinct and
+/// -0.0 still finds the 0.0 group — exactly as a boxed Key comparison did.
+inline auto key_equals_row(const Key& key, const std::vector<KeyCol>& cols, std::size_t row)
+    -> bool {
+    for (std::size_t i = 0; i < cols.size(); ++i) {
+        const KeyCol& col = cols[i];
+        const bool row_null = col.is_null(row);
+        if (row_null != key.is_null(i)) {
+            return false;
+        }
+        if (row_null) {
+            continue;
+        }
+        const ScalarValue& value = key.values[i];
+        switch (col.kind) {
+            case KeyCol::Kind::Int64:
+                if (std::get<std::int64_t>(value) != col.i64[row]) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Double:
+                if (!(std::get<double>(value) == col.f64[row])) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Bool:
+                if (std::get<bool>(value) != (*col.boolean)[row]) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Date:
+                if (std::get<Date>(value).days != col.date[row].days) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Ts:
+                if (std::get<Timestamp>(value).nanos != col.ts[row].nanos) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Str:
+            case KeyCol::Kind::Cat:
+                if (std::string_view{std::get<std::string>(value)} != col.text(row)) {
+                    return false;
+                }
+                break;
+        }
+    }
+    return true;
+}
+
+/// Open addressing over group ids, probed by a row's key hash: slot 0 is empty,
+/// otherwise it holds gid + 1. The caller keeps each group's key and that key's
+/// hash, so a probe compares hashes before touching the key at all.
+struct KeyRowIndex {
+    std::vector<std::uint32_t> slots;
+    std::vector<std::uint64_t> hashes;  ///< parallel to the caller's group keys
+
+    void rehash(std::size_t capacity) {
+        slots.assign(capacity, 0U);
+        const std::size_t mask = capacity - 1;
+        for (std::size_t group = 0; group < hashes.size(); ++group) {
+            std::size_t probe = static_cast<std::size_t>(hashes[group]) & mask;
+            while (slots[probe] != 0) {
+                probe = (probe + 1) & mask;
+            }
+            slots[probe] = static_cast<std::uint32_t>(group) + 1;
+        }
+    }
+
+    /// Find the row's group, or create one via `make_group()` — which must
+    /// append the row's key to the caller's group vector and return its gid.
+    template <typename MakeGroup>
+    auto find_or_insert(const std::vector<Key>& groups, const std::vector<KeyCol>& cols,
+                        std::size_t row, MakeGroup&& make_group) -> std::uint32_t {
+        if (slots.empty()) {
+            rehash(1024);
+        }
+        const std::uint64_t hash = hash_key_row(cols, row);
+        const std::size_t mask = slots.size() - 1;
+        std::size_t probe = static_cast<std::size_t>(hash) & mask;
+        while (true) {
+            const std::uint32_t slot = slots[probe];
+            if (slot == 0) {
+                const std::uint32_t gid = make_group();
+                hashes.push_back(hash);
+                slots[probe] = gid + 1;
+                if ((hashes.size() * 10) > (slots.size() * 7)) {
+                    rehash(slots.size() * 2);
+                }
+                return gid;
+            }
+            const std::uint32_t gid = slot - 1;
+            if (hashes[gid] == hash && key_equals_row(groups[gid], cols, row)) {
+                return gid;
+            }
+            probe = (probe + 1) & mask;
+        }
+    }
+};
+
 /// Collect the validity bitmap of each named column (null when it has no nulls),
 /// parallel to a `group_columns`-style vector. Lets a key builder record nulls
 /// without restructuring how it looks its columns up.

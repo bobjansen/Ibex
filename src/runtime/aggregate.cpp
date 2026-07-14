@@ -930,12 +930,28 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     // emit null when every input row is null for a group.
     // Also required for Median/Stddev/Ewma which need per-row sequential processing.
     if (has_nullable_agg_inputs || has_complex_agg) {
-        robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> index;
-        index.reserve(rows == 0 ? 1 : rows);
+        // Median/quantile/ewma land here, and this is the only grouping they
+        // get. It used to box a Key — a heap-allocated vector<ScalarValue> —
+        // for every row just to probe the index, so `median(price) by symbol`
+        // over 4M rows built 4M keys to discover 252 groups. Resolve the key
+        // columns once, hash each row where it sits, and build a Key only when
+        // a new group appears.
+        std::vector<KeyCol> key_cols;
+        key_cols.reserve(group_columns.size());
+        for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+            auto col = make_key_col(*group_columns[ci], group_validity[ci]);
+            if (!col.has_value()) {
+                return std::unexpected("group-by: unsupported key column type");
+            }
+            key_cols.push_back(*col);
+        }
+
+        // Sized for groups, not rows: the old reserves asked for one map entry,
+        // one Key and one AggState per row, which for the 4M-row median above
+        // reserved hundreds of megabytes to hold 252 groups.
+        KeyRowIndex index;
         std::vector<Key> group_order;
-        group_order.reserve(rows == 0 ? 1 : rows);
         std::vector<AggState> states;
-        states.reserve(rows == 0 ? 1 : rows);
 
         // Collect-aggregates (median/quantile/skew/kurtosis) gather every value
         // into a per-group buffer. Doing that per row (push_back into one growing
@@ -956,22 +972,21 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         }
 
         for (std::size_t row = 0; row < rows; ++row) {
-            Key key;
-            key.values.reserve(group_columns.size());
-            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-                push_key_value(key, *group_columns[ci], group_validity[ci], row);
-            }
-
-            auto [it, inserted] = index.emplace(std::move(key), states.size());
-            if (inserted) {
-                group_order.push_back(it->first);
+            const std::uint32_t gid = index.find_or_insert(group_order, key_cols, row, [&] {
+                Key key;
+                key.values.reserve(group_columns.size());
+                for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                    push_key_value(key, *group_columns[ci], group_validity[ci], row);
+                }
+                group_order.push_back(std::move(key));
                 states.push_back(make_state());
-            }
+                return static_cast<std::uint32_t>(states.size() - 1);
+            });
             if (!collect_aggs.empty()) {
-                row_gid[row] = static_cast<std::uint32_t>(it->second);
+                row_gid[row] = gid;
             }
 
-            if (auto err = update_state(states[it->second].slots.data(), row)) {
+            if (auto err = update_state(states[gid].slots.data(), row)) {
                 return std::unexpected(*err);
             }
         }
@@ -1633,14 +1648,26 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
     // ── Pass 1b: compound group ID assignment ────────────────────────────────
     // Cartesian strides: cell = code[0]*strides[0] + code[1]*strides[1] + …
+    //
+    // The cell identifies a key tuple only while the stride product fits in 64
+    // bits. Past that the multiply wraps: distinct tuples collide, and
+    // `total_cells` wraps with them — a product of exactly 2^64 (16 keys of 16
+    // distinct values, say) comes out as 0, passing the bound below and
+    // indexing a zero-length array. On overflow the cell is abandoned entirely
+    // and groups are identified by their codes.
     std::vector<std::uint64_t> strides(n_keys);
     std::uint64_t total_cells = 1;
+    bool cells_overflow = false;
     {
         std::uint64_t s = 1;
         for (int ci = static_cast<int>(n_keys) - 1; ci >= 0; --ci) {
             strides[static_cast<std::size_t>(ci)] = s;
-            s *= per_col[static_cast<std::size_t>(ci)]
-                     .n_distinct;  // uint64_t; wraps only at 2^64 distinct groups
+            const std::uint64_t distinct = per_col[static_cast<std::size_t>(ci)].n_distinct;
+            if (distinct != 0 && s > std::numeric_limits<std::uint64_t>::max() / distinct) {
+                cells_overflow = true;
+                break;
+            }
+            s *= distinct;
         }
         total_cells = s;
     }
@@ -1655,7 +1682,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
     std::vector<std::uint32_t> group_col_codes_flat;
     std::uint32_t n_groups_m = 0;
 
-    if (total_cells <= 4'000'000ULL) {
+    if (!cells_overflow && total_cells <= 4'000'000ULL) {
         // Fast path: plain array lookup — no hashing at all in the hot loop.
         std::vector<std::uint32_t> cell_to_gid(static_cast<std::size_t>(total_cells),
                                                std::numeric_limits<std::uint32_t>::max());
@@ -1726,23 +1753,70 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
         }
     } else {
-        // Fallback: hash map on the uint64_t Cartesian cell key.
-        robin_hood::unordered_flat_map<std::uint64_t, std::uint32_t> cell_to_gid;
-        cell_to_gid.reserve(1024);
+        // Fallback: identify a group by its code tuple, hashed and then verified
+        // against the codes already stored for the candidate group. Keying the
+        // map on the Cartesian cell instead — as this did — is only sound while
+        // that cell is unique, and it silently is not once the strides wrap.
+        std::vector<std::uint32_t> slots(1024, 0U);  // 0 empty, else gid + 1
+        std::vector<std::uint64_t> hashes;
         flat_slots.reserve(1024 * (n_aggs == 0 ? 1 : n_aggs));
         group_col_codes_flat.reserve(1024 * n_keys);
-        for (std::size_t row = 0; row < rows; ++row) {
-            std::uint64_t cell = 0;
-            for (std::size_t ci = 0; ci < n_keys; ++ci)
-                cell += static_cast<std::uint64_t>(per_col[ci].code_at(row)) * strides[ci];
-            auto [it, inserted] = cell_to_gid.emplace(cell, n_groups_m);
-            if (inserted) {
-                ++n_groups_m;
-                flat_slots.insert(flat_slots.end(), tmpl.slots.begin(), tmpl.slots.end());
-                for (std::size_t ci = 0; ci < n_keys; ++ci)
-                    group_col_codes_flat.push_back(per_col[ci].code_at(row));
+        hashes.reserve(1024);
+
+        const auto hash_codes = [](const std::uint32_t* codes, std::size_t n) -> std::uint64_t {
+            std::uint64_t seed = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                seed ^= std::hash<std::uint32_t>{}(codes[i]) + 0x9e3779b97f4a7c15ULL + (seed << 6) +
+                        (seed >> 2);
             }
-            compound_gids[row] = it->second;
+            return seed;
+        };
+        const auto rehash = [&](std::size_t capacity) {
+            slots.assign(capacity, 0U);
+            const std::size_t mask = capacity - 1;
+            for (std::size_t group = 0; group < hashes.size(); ++group) {
+                std::size_t probe = static_cast<std::size_t>(hashes[group]) & mask;
+                while (slots[probe] != 0) {
+                    probe = (probe + 1) & mask;
+                }
+                slots[probe] = static_cast<std::uint32_t>(group) + 1;
+            }
+        };
+
+        std::vector<std::uint32_t> row_codes(n_keys);
+        for (std::size_t row = 0; row < rows; ++row) {
+            for (std::size_t ci = 0; ci < n_keys; ++ci) {
+                row_codes[ci] = per_col[ci].code_at(row);
+            }
+            const std::uint64_t hash = hash_codes(row_codes.data(), n_keys);
+            std::size_t mask = slots.size() - 1;
+            std::size_t probe = static_cast<std::size_t>(hash) & mask;
+            std::uint32_t gid = 0;
+            while (true) {
+                const std::uint32_t slot = slots[probe];
+                if (slot == 0) {
+                    gid = n_groups_m++;
+                    flat_slots.insert(flat_slots.end(), tmpl.slots.begin(), tmpl.slots.end());
+                    group_col_codes_flat.insert(group_col_codes_flat.end(), row_codes.begin(),
+                                                row_codes.end());
+                    hashes.push_back(hash);
+                    slots[probe] = gid + 1;
+                    if ((hashes.size() * 10) > (slots.size() * 7)) {
+                        rehash(slots.size() * 2);
+                    }
+                    break;
+                }
+                const std::uint32_t candidate = slot - 1;
+                if (hashes[candidate] == hash &&
+                    std::equal(row_codes.begin(), row_codes.end(),
+                               group_col_codes_flat.begin() +
+                                   static_cast<std::ptrdiff_t>(candidate * n_keys))) {
+                    gid = candidate;
+                    break;
+                }
+                probe = (probe + 1) & mask;
+            }
+            compound_gids[row] = gid;
         }
     }
 

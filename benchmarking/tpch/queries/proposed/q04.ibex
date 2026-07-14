@@ -1,0 +1,17 @@
+// Proposed TPC-H Q4 — correlated EXISTS.
+// Qualification parameter: 1993-07-01.
+import "parquet";
+
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+
+let result = orders[
+    filter o_orderdate >= date"1993-07-01" && o_orderdate < date"1993-10-01"
+        && exists (lineitem[
+            filter l_orderkey == outer(o_orderkey) && l_commitdate < l_receiptdate
+        ]),
+    select { order_count = count() },
+    by { o_orderpriority },
+    order { o_orderpriority }
+];
+result;

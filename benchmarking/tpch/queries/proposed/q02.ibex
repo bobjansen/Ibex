@@ -1,0 +1,28 @@
+// Proposed TPC-H Q2 — correlated scalar MIN.
+// Qualification parameters: 15, BRASS, EUROPE.
+import "parquet";
+
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let region = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
+
+let result = (part join partsupp on p_partkey == ps_partkey)
+    join supplier on ps_suppkey == s_suppkey
+    join nation on s_nationkey == n_nationkey
+    join region on n_regionkey == r_regionkey[
+        filter p_size == 15 && like(p_type, "%BRASS") && r_name == "EUROPE"
+            && ps_supplycost == scalar(
+                (partsupp join supplier on ps_suppkey == s_suppkey)
+                    join nation on s_nationkey == n_nationkey
+                    join region on n_regionkey == r_regionkey[
+                        filter ps_partkey == outer(p_partkey) && r_name == "EUROPE",
+                        select { minimum_supplycost = min(ps_supplycost) }
+                    ]
+            ),
+        select { s_acctbal, s_name, n_name, p_partkey, p_mfgr,
+                 s_address, s_phone, s_comment },
+        order { s_acctbal desc, n_name, s_name, p_partkey }, head 100
+    ];
+result;

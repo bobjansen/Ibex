@@ -1,0 +1,41 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// PDS-H / TPC-H Q16 — Parts/Supplier Relationship
+//
+// The SQL `NOT IN` becomes an anti join against suppliers whose comments match
+// `%Customer%Complaints%`.  `count(distinct ps_suppkey)` becomes a `distinct`
+// over the group keys plus supplier key, followed by an ordinary count.
+// Qualification parameters: Brand#45, MEDIUM POLISHED,
+// {49, 14, 23, 45, 19, 3, 36, 9}.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import "parquet";
+import "csv";
+
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet")[
+    filter p_brand != "Brand#45" && !like(p_type, "MEDIUM POLISHED%")
+        && (p_size == 49 || p_size == 14 || p_size == 23 || p_size == 45
+            || p_size == 19 || p_size == 3 || p_size == 36 || p_size == 9),
+    select { ps_partkey = p_partkey, p_brand, p_type, p_size }
+];
+
+let excluded_suppliers = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
+    filter like(s_comment, "%Customer%Complaints%"),
+    select { ps_suppkey = s_suppkey }
+];
+
+let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet")[
+    select { ps_partkey, ps_suppkey }
+] anti join excluded_suppliers on ps_suppkey;
+
+let unique_part_suppliers = (part join partsupp on ps_partkey)[
+    distinct { p_brand, p_type, p_size, ps_suppkey }
+];
+
+let result = unique_part_suppliers[
+    select { supplier_cnt = count() },
+    by { p_brand, p_type, p_size }
+][
+    order { supplier_cnt desc, p_brand, p_type, p_size }
+];
+write_csv(result, "benchmarking/data/tpch/out/q16.csv");
+result;

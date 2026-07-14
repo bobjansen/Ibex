@@ -8941,3 +8941,112 @@ TEST_CASE("Interpret multi-key grouped aggregation survives growing past its key
         REQUIRE((*total)[g] == static_cast<std::int64_t>(g) * 2);  // each id appears twice
     }
 }
+
+// ── Cartesian cell overflow ──────────────────────────────────────────────────
+//
+// Multi-key grouping encodes a row's key tuple as a single Cartesian cell,
+// `Σ code_i * stride_i`, where the strides are products of the per-column
+// distinct counts. That cell identifies a tuple only while the product fits in
+// 64 bits. Sixteen key columns of sixteen distinct values each multiply out to
+// exactly 2^64, so the product wraps to 0: distinct tuples collide on the same
+// cell, and the "how many cells are there" bound wraps with them, letting a
+// zero-length dense array be indexed by an arbitrary cell. Both grouping
+// implementations have to notice and fall back to identifying groups by their
+// codes.
+
+TEST_CASE("Interpret grouped aggregation survives a Cartesian cell overflow (categorical keys)") {
+    // 16 categorical key columns x 16 distinct values = 2^64 cells exactly.
+    constexpr std::size_t kKeys = 16;
+    constexpr std::size_t kRows = 16;
+
+    std::vector<std::string> dict;
+    dict.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        dict.push_back("v" + std::to_string(i));
+    }
+
+    runtime::Table table;
+    for (std::size_t k = 0; k < kKeys; ++k) {
+        Column<Categorical> col(dict);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            col.push_code(static_cast<Column<Categorical>::code_type>(row));
+        }
+        table.add_column("k" + std::to_string(k), std::move(col));
+    }
+    std::vector<std::int64_t> values;
+    values.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        values.push_back(static_cast<std::int64_t>(row) + 1);
+    }
+    table.add_column("v", Column<std::int64_t>{std::move(values)});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    std::string keys;
+    for (std::size_t k = 0; k < kKeys; ++k) {
+        keys += (k == 0 ? "k" : ", k") + std::to_string(k);
+    }
+    const std::string source = "t[select { total = sum(v) }, by { " + keys + " }];";
+    auto ir = require_ir(source.c_str());
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
+    REQUIRE(result.has_value());
+
+    // Every row is a distinct key tuple, so nothing may merge.
+    const auto* total = std::get_if<Column<std::int64_t>>(result->find("total"));
+    REQUIRE(total != nullptr);
+    REQUIRE(total->size() == kRows);
+    for (std::size_t g = 0; g < kRows; ++g) {
+        REQUIRE((*total)[g] == static_cast<std::int64_t>(g) + 1);
+    }
+}
+
+TEST_CASE("Interpret resampled aggregation survives a Cartesian cell overflow") {
+    // resample routes through aggregate_table, which is where the *other*
+    // Cartesian encoding lives — it prepends the time bucket to the group keys.
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    constexpr std::size_t kKeys = 16;
+    constexpr std::size_t kRows = 16;
+
+    runtime::Table table;
+    std::vector<Timestamp> stamps;
+    stamps.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        stamps.push_back(ts_from_nanos(static_cast<std::int64_t>(row) * min_ns));
+    }
+    table.add_column("ts", Column<Timestamp>{std::move(stamps)});
+    for (std::size_t k = 0; k < kKeys; ++k) {
+        std::vector<std::int64_t> codes;
+        codes.reserve(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            codes.push_back(static_cast<std::int64_t>(row));
+        }
+        table.add_column("k" + std::to_string(k), Column<std::int64_t>{std::move(codes)});
+    }
+    std::vector<double> values;
+    values.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        values.push_back(static_cast<double>(row) + 1.0);
+    }
+    table.add_column("v", Column<double>{std::move(values)});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("tf", std::move(table));
+
+    std::string keys;
+    for (std::size_t k = 0; k < kKeys; ++k) {
+        keys += (k == 0 ? "k" : ", k") + std::to_string(k);
+    }
+    const std::string source = "tf[resample 1m, select { total = sum(v) }, by { " + keys + " }];";
+    auto ir = require_ir(source.c_str());
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* total = std::get_if<Column<double>>(result->find("total"));
+    REQUIRE(total != nullptr);
+    REQUIRE(total->size() == kRows);  // one bucket per row, each a distinct key tuple
+    for (std::size_t g = 0; g < kRows; ++g) {
+        REQUIRE((*total)[g] == static_cast<double>(g) + 1.0);
+    }
+}

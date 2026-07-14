@@ -2998,163 +2998,6 @@ class ChunkedInnerJoinOperator final : public Operator {
 /// the Categorical dictionary pointer when applicable) and reused when
 /// building output; the chunked csv source shares dictionaries across
 /// chunks, matching MaterializeOperator's existing assumption.
-/// A key column resolved once per chunk, so the row loop can read values in
-/// place instead of boxing them.
-///
-/// The generic multi-key group-by used to build a `Key` — a heap-allocated
-/// vector<ScalarValue> — for every row just to probe the group index, copying
-/// each string key value into it. q10 groups 114k rows on seven columns, four
-/// of them strings (c_comment alone averages 73 chars), so it allocated a
-/// vector plus ~450k std::strings, hashed the copies, and freed them again, all
-/// to discover 37k groups. Hashing and comparing the row where it sits builds a
-/// Key exactly once per group instead.
-struct KeyCol {
-    enum class Kind : std::uint8_t { Int64, Double, Bool, Str, Cat, Date, Ts };
-    Kind kind{Kind::Int64};
-    const std::int64_t* i64{nullptr};
-    const double* f64{nullptr};
-    const Column<bool>* boolean{nullptr};
-    const Column<std::string>* str{nullptr};
-    const Column<Categorical>* cat{nullptr};
-    const Date* date{nullptr};
-    const Timestamp* ts{nullptr};
-    const ValidityBitmap* validity{nullptr};
-
-    [[nodiscard]] auto is_null(std::size_t row) const noexcept -> bool {
-        return validity != nullptr && !(*validity)[row];
-    }
-    // Categorical compares by value, not by code: a later chunk may carry a
-    // different dictionary, and the Key it is compared against holds a string.
-    [[nodiscard]] auto text(std::size_t row) const -> std::string_view {
-        if (kind == Kind::Str) {
-            return {(*str)[row]};
-        }
-        return {cat->dictionary()[static_cast<std::size_t>(cat->code_at(row))]};
-    }
-};
-
-auto make_key_col(const ColumnEntry& entry) -> std::optional<KeyCol> {
-    KeyCol key_col;
-    key_col.validity = entry.validity.has_value() ? &*entry.validity : nullptr;
-    const auto& column = *entry.column;
-    if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
-        key_col.kind = KeyCol::Kind::Int64;
-        key_col.i64 = c_int->data();
-    } else if (const auto* c_dbl = std::get_if<Column<double>>(&column)) {
-        key_col.kind = KeyCol::Kind::Double;
-        key_col.f64 = c_dbl->data();
-    } else if (const auto* c_bool = std::get_if<Column<bool>>(&column)) {
-        key_col.kind = KeyCol::Kind::Bool;
-        key_col.boolean = c_bool;
-    } else if (const auto* c_str = std::get_if<Column<std::string>>(&column)) {
-        key_col.kind = KeyCol::Kind::Str;
-        key_col.str = c_str;
-    } else if (const auto* c_cat = std::get_if<Column<Categorical>>(&column)) {
-        key_col.kind = KeyCol::Kind::Cat;
-        key_col.cat = c_cat;
-    } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {
-        key_col.kind = KeyCol::Kind::Date;
-        key_col.date = c_date->data();
-    } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(&column)) {
-        key_col.kind = KeyCol::Kind::Ts;
-        key_col.ts = c_ts->data();
-    } else {
-        return std::nullopt;
-    }
-    return key_col;
-}
-
-auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> std::uint64_t {
-    std::uint64_t seed = 0;
-    const auto mix = [&seed](std::uint64_t value) {
-        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    };
-    for (std::size_t i = 0; i < cols.size(); ++i) {
-        const KeyCol& col = cols[i];
-        if (col.is_null(row)) {
-            // A null's payload is undefined, so hash its position instead —
-            // matching KeyEq, which compares the null mask and skips the value.
-            mix(0xd1b54a32d192ed03ULL + i);
-            continue;
-        }
-        switch (col.kind) {
-            case KeyCol::Kind::Int64:
-                mix(std::hash<std::int64_t>{}(col.i64[row]));
-                break;
-            case KeyCol::Kind::Double:
-                // std::hash<double> already folds -0.0 onto 0.0, which keeps it
-                // consistent with the `==` used to compare them below.
-                mix(std::hash<double>{}(col.f64[row]));
-                break;
-            case KeyCol::Kind::Bool:
-                mix(std::hash<bool>{}((*col.boolean)[row]));
-                break;
-            case KeyCol::Kind::Date:
-                mix(std::hash<std::int32_t>{}(col.date[row].days));
-                break;
-            case KeyCol::Kind::Ts:
-                mix(std::hash<std::int64_t>{}(col.ts[row].nanos));
-                break;
-            case KeyCol::Kind::Str:
-            case KeyCol::Kind::Cat:
-                mix(std::hash<std::string_view>{}(col.text(row)));
-                break;
-        }
-    }
-    return seed;
-}
-
-/// Does the group's stored key describe this row? Mirrors KeyEq: null-vs-null
-/// matches, and a double compares with `==`, so NaN keys stay distinct and
-/// -0.0 still finds the 0.0 group — exactly as the boxed Key path did.
-auto key_equals_row(const Key& key, const std::vector<KeyCol>& cols, std::size_t row) -> bool {
-    for (std::size_t i = 0; i < cols.size(); ++i) {
-        const KeyCol& col = cols[i];
-        const bool row_null = col.is_null(row);
-        if (row_null != key.is_null(i)) {
-            return false;
-        }
-        if (row_null) {
-            continue;
-        }
-        const ScalarValue& value = key.values[i];
-        switch (col.kind) {
-            case KeyCol::Kind::Int64:
-                if (std::get<std::int64_t>(value) != col.i64[row]) {
-                    return false;
-                }
-                break;
-            case KeyCol::Kind::Double:
-                if (!(std::get<double>(value) == col.f64[row])) {
-                    return false;
-                }
-                break;
-            case KeyCol::Kind::Bool:
-                if (std::get<bool>(value) != (*col.boolean)[row]) {
-                    return false;
-                }
-                break;
-            case KeyCol::Kind::Date:
-                if (std::get<Date>(value).days != col.date[row].days) {
-                    return false;
-                }
-                break;
-            case KeyCol::Kind::Ts:
-                if (std::get<Timestamp>(value).nanos != col.ts[row].nanos) {
-                    return false;
-                }
-                break;
-            case KeyCol::Kind::Str:
-            case KeyCol::Kind::Cat:
-                if (std::string_view{std::get<std::string>(value)} != col.text(row)) {
-                    return false;
-                }
-                break;
-        }
-    }
-    return true;
-}
-
 class ChunkedAggregateOperator final : public Operator {
    public:
     ChunkedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
@@ -3348,6 +3191,75 @@ class ChunkedAggregateOperator final : public Operator {
         return gid;
     }
 
+    // ── Multi-key categorical index, keyed on the code tuple ──────────────────
+    //
+    // Groups are identified by the codes themselves (stored in
+    // multi_cat_codes_flat_), verified on every hit. The Cartesian cell is only
+    // a usable identity while the stride product fits in 64 bits; this does not
+    // care, and it survives dictionary growth without a rebuild.
+    static auto hash_codes(const Column<Categorical>::code_type* codes, std::size_t n)
+        -> std::uint64_t {
+        std::uint64_t seed = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto value = std::hash<std::int64_t>{}(static_cast<std::int64_t>(codes[i]));
+            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        }
+        return seed;
+    }
+
+    [[nodiscard]] auto codes_of_group(std::size_t group, std::size_t n_keys) const
+        -> const Column<Categorical>::code_type* {
+        return multi_cat_codes_flat_.data() + (group * n_keys);
+    }
+
+    void multi_cat_rehash_slots(std::size_t capacity, std::size_t n_keys) {
+        multi_cat_slots_.assign(capacity, 0U);
+        const std::size_t mask = capacity - 1;
+        for (std::size_t group = 0; group < n_groups_; ++group) {
+            std::size_t probe =
+                static_cast<std::size_t>(hash_codes(codes_of_group(group, n_keys), n_keys)) & mask;
+            while (multi_cat_slots_[probe] != 0) {
+                probe = (probe + 1) & mask;
+            }
+            multi_cat_slots_[probe] = static_cast<std::uint32_t>(group) + 1;
+        }
+    }
+
+    /// Rebuild the index from the groups already collected — used when the
+    /// dense array gives up, and to seed the table on first use.
+    void multi_cat_rehash_groups() {
+        const std::size_t n_keys = n_groups_ == 0 ? 0 : multi_cat_codes_flat_.size() / n_groups_;
+        std::size_t capacity = 1024;
+        while ((n_groups_ * 10) > (capacity * 7)) {
+            capacity *= 2;
+        }
+        multi_cat_rehash_slots(capacity, n_keys);
+    }
+
+    template <typename NewGroup>
+    auto multi_cat_find_or_insert(const Column<Categorical>::code_type* codes, std::size_t n_keys,
+                                  NewGroup&& new_group) -> std::uint32_t {
+        const std::uint64_t hash = hash_codes(codes, n_keys);
+        std::size_t mask = multi_cat_slots_.size() - 1;
+        std::size_t probe = static_cast<std::size_t>(hash) & mask;
+        while (true) {
+            const std::uint32_t slot = multi_cat_slots_[probe];
+            if (slot == 0) {
+                const std::uint32_t gid = new_group();
+                multi_cat_slots_[probe] = gid + 1;
+                if ((n_groups_ * 10) > (multi_cat_slots_.size() * 7)) {
+                    multi_cat_rehash_slots(multi_cat_slots_.size() * 2, n_keys);
+                }
+                return gid;
+            }
+            const std::uint32_t gid = slot - 1;
+            if (std::equal(codes, codes + n_keys, codes_of_group(gid, n_keys))) {
+                return gid;
+            }
+            probe = (probe + 1) & mask;
+        }
+    }
+
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_cat(const std::vector<const ColumnEntry*>& group_entries,
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
@@ -3395,16 +3307,31 @@ class ChunkedAggregateOperator final : public Operator {
                     dict_sizes[c] = 1;  // avoid stride collapse
             }
             // Strides: cell = c0*s0 + c1*s1 + … with s_{n-1} = 1.
+            //
+            // The cell only identifies a key tuple while the stride product
+            // fits in 64 bits. Past that the multiply wraps, distinct tuples
+            // collide, and `total_cells` itself wraps — a product of exactly
+            // 2^64 (16 keys of 16 values, say) lands on 0, which would pass the
+            // dense-array bound and index a zero-length array. Detect the
+            // overflow and let the hash path, which identifies groups by their
+            // codes rather than by a cell, take over.
             std::vector<std::uint64_t> strides(n_keys);
             std::uint64_t total_cells = 1;
+            bool cells_overflow = false;
             {
                 std::uint64_t s = 1;
                 for (int ci = static_cast<int>(n_keys) - 1; ci >= 0; --ci) {
                     strides[static_cast<std::size_t>(ci)] = s;
-                    s *= dict_sizes[static_cast<std::size_t>(ci)];
+                    const std::uint64_t size = dict_sizes[static_cast<std::size_t>(ci)];
+                    if (s > std::numeric_limits<std::uint64_t>::max() / size) {
+                        cells_overflow = true;
+                        break;
+                    }
+                    s *= size;
                 }
                 total_cells = s;
             }
+            const bool dense_possible = !cells_overflow && total_cells <= kDenseCellLimit;
 
             // Hoist raw code pointers out of the row loop.
             std::vector<const Column<Categorical>::code_type*> raws(n_keys);
@@ -3427,16 +3354,13 @@ class ChunkedAggregateOperator final : public Operator {
 
             // When the Cartesian cell space is bounded, index a dense array
             // (one load per row, no hashing). If a later chunk grows the dicts
-            // past the limit, migrate existing groups into the hash map once
-            // and stay there — dicts only grow, so total_cells never shrinks.
-            if (multi_dense_ && total_cells > kDenseCellLimit) {
-                multi_cat_cell_index_.clear();
-                multi_cat_cell_index_.reserve(n_groups_);
-                for (std::size_t g = 0; g < n_groups_; ++g)
-                    multi_cat_cell_index_.emplace(cell_of_group(g), static_cast<std::uint32_t>(g));
+            // past the limit — or past what 64 bits can encode — migrate the
+            // existing groups into the hash index once and stay there; dicts
+            // only grow, so the cell space never shrinks back.
+            if (multi_dense_ && !dense_possible) {
+                multi_cat_rehash_groups();
                 std::vector<std::uint32_t>().swap(multi_cat_cell_dense_);
                 multi_dense_ = false;
-                multi_cat_strides_ = strides;
             }
 
             if (multi_dense_) {
@@ -3477,27 +3401,20 @@ class ChunkedAggregateOperator final : public Operator {
                     }
                 }
             } else {
-                // Hash fallback for unbounded cell spaces. Rebuild on stride
-                // change (new dict entries) just like the dense path.
-                if (multi_cat_strides_ != strides) {
-                    multi_cat_cell_index_.clear();
-                    multi_cat_cell_index_.reserve(n_groups_);
-                    for (std::size_t g = 0; g < n_groups_; ++g)
-                        multi_cat_cell_index_.emplace(cell_of_group(g),
-                                                      static_cast<std::uint32_t>(g));
-                    multi_cat_strides_ = strides;
+                // Hash fallback for cell spaces that are unbounded, or that no
+                // longer fit in 64 bits. It identifies a group by its codes, not
+                // by a cell: correct however the strides behave, and it needs no
+                // rebuild when a new dictionary entry changes them.
+                if (multi_cat_slots_.empty()) {
+                    multi_cat_rehash_groups();
                 }
+                std::vector<Column<Categorical>::code_type> row_codes(n_keys);
                 for (std::size_t row = 0; row < rows; ++row) {
-                    std::uint64_t cell = 0;
-                    for (std::size_t c = 0; c < n_keys; ++c)
-                        cell += static_cast<std::uint64_t>(raws[c][row]) * strides[c];
-                    auto [it, inserted] =
-                        multi_cat_cell_index_.emplace(cell, static_cast<std::uint32_t>(n_groups_));
-                    if (inserted) {
-                        gids[row] = new_group(row);
-                    } else {
-                        gids[row] = it->second;
+                    for (std::size_t c = 0; c < n_keys; ++c) {
+                        row_codes[c] = raws[c][row];
                     }
+                    gids[row] = multi_cat_find_or_insert(row_codes.data(), n_keys,
+                                                         [&] { return new_group(row); });
                 }
             }
         }
@@ -3507,58 +3424,6 @@ class ChunkedAggregateOperator final : public Operator {
     }
 
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-    // Open addressing over group ids: slot 0 is empty, otherwise it holds
-    // gid + 1. Groups keep their key in `group_order_` and its hash in
-    // `group_hashes_`, so a probe compares against the group's own key rather
-    // than against a Key boxed up from the row.
-    void rehash_key_slots(std::size_t capacity) {
-        key_slots_.assign(capacity, 0U);
-        const std::size_t mask = capacity - 1;
-        for (std::size_t group = 0; group < group_hashes_.size(); ++group) {
-            std::size_t probe = static_cast<std::size_t>(group_hashes_[group]) & mask;
-            while (key_slots_[probe] != 0) {
-                probe = (probe + 1) & mask;
-            }
-            key_slots_[probe] = static_cast<std::uint32_t>(group) + 1;
-        }
-    }
-
-    auto find_or_insert_group(const std::vector<KeyCol>& cols,
-                              const std::vector<const ColumnEntry*>& group_entries, std::size_t row)
-        -> std::uint32_t {
-        if (key_slots_.empty()) {
-            rehash_key_slots(1024);
-        }
-        const std::uint64_t hash = hash_key_row(cols, row);
-        std::size_t mask = key_slots_.size() - 1;
-        std::size_t probe = static_cast<std::size_t>(hash) & mask;
-        while (true) {
-            const std::uint32_t slot = key_slots_[probe];
-            if (slot == 0) {
-                // New group: this is the one place a Key gets built, and it is
-                // built once per group rather than once per row.
-                Key key;
-                key.values.reserve(group_entries.size());
-                for (const auto* entry : group_entries) {
-                    push_key_value(key, *entry, row);
-                }
-                const std::uint32_t gid = alloc_group();
-                group_order_.push_back(std::move(key));
-                group_hashes_.push_back(hash);
-                key_slots_[probe] = gid + 1;
-                if ((group_hashes_.size() * 10) > (key_slots_.size() * 7)) {
-                    rehash_key_slots(key_slots_.size() * 2);
-                }
-                return gid;
-            }
-            const std::uint32_t gid = slot - 1;
-            if (group_hashes_[gid] == hash && key_equals_row(group_order_[gid], cols, row)) {
-                return gid;
-            }
-            probe = (probe + 1) & mask;
-        }
-    }
-
     auto process_rows_generic(const std::vector<const ColumnEntry*>& group_entries,
                               const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -3575,7 +3440,16 @@ class ChunkedAggregateOperator final : public Operator {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
         for (std::size_t row = 0; row < rows; ++row) {
-            gids[row] = find_or_insert_group(cols, group_entries, row);
+            gids[row] = key_index_.find_or_insert(group_order_, cols, row, [&] {
+                // The one place a Key gets built: once per group, not per row.
+                Key key;
+                key.values.reserve(group_entries.size());
+                for (const auto* entry : group_entries) {
+                    push_key_value(key, *entry, row);
+                }
+                group_order_.push_back(std::move(key));
+                return alloc_group();
+            });
         }
 
         accumulate_columns(gids, agg_entries, rows);
@@ -4061,8 +3935,7 @@ class ChunkedAggregateOperator final : public Operator {
     std::vector<std::uint32_t> gids_buf_;
 
     // Generic path (non-Categorical group keys).
-    std::vector<std::uint32_t> key_slots_;     // open addressing: 0 empty, else gid + 1
-    std::vector<std::uint64_t> group_hashes_;  // parallel to group_order_
+    KeyRowIndex key_index_;
     std::vector<Key> group_order_;
 
     // Sentinel for "no group assigned yet" in the dense index arrays.
@@ -4081,7 +3954,7 @@ class ChunkedAggregateOperator final : public Operator {
     // space stays under kDenseCellLimit; spills to the hash map otherwise.
     bool multi_dense_ = true;
     std::vector<std::uint32_t> multi_cat_cell_dense_;
-    robin_hood::unordered_flat_map<std::uint64_t, std::uint32_t> multi_cat_cell_index_;
+    std::vector<std::uint32_t> multi_cat_slots_;  // open addressing on the code tuple: gid + 1
     std::vector<Column<Categorical>::code_type> multi_cat_codes_flat_;  // n_groups_ × n_keys
     std::vector<std::uint64_t> multi_cat_strides_;  // last-seen strides for rebuild detection
 

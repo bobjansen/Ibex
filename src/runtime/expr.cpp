@@ -308,6 +308,115 @@ auto like_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
                           .validity = merge_validity(value->validity, pattern->validity, rows)};
 }
 
+// Int64/Int32/Int and Float64/Float32 over a bare column, literal, or lexical
+// scalar. The per-row eval boxes every cell into an ExprValue and re-runs the
+// registry dispatch per row; the cast is an identity or widening loop. This is
+// the path `count(col)` takes — it lowers to `sum(Int64(col is not null))`,
+// whose bool column lands here after the boolean arm is materialized.
+// Semantics mirror the per-row eval exactly: Bool -> 0/1 for Int, non-integer
+// Float -> Int errors, null cells propagate untouched (their payload is never
+// read, so a garbage NaN in a null slot cannot fail the integrality check).
+auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
+                         const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+    if (call.args.size() != 1) {
+        return std::unexpected(call.callee + "(): expected one argument");
+    }
+    const bool to_int = call.callee.front() == 'I';  // Int64/Int32/Int vs Float64/Float32
+
+    const ir::Expr& arg = *call.args[0];
+    const ColumnEntry* entry = nullptr;
+    if (const auto* ref = std::get_if<ir::ColumnRef>(&arg.node)) {
+        entry = input.find_entry(ref->name);
+        if (entry == nullptr) {
+            // A lexical scalar: convert once through the per-row eval (the
+            // semantic reference), then broadcast.
+            if (ctx.scalars != nullptr) {
+                if (auto it = ctx.scalars->find(ref->name); it != ctx.scalars->end()) {
+                    const auto& eval = std::get<ScalarExec>(find_builtin(call.callee)->exec).eval;
+                    auto value = eval(call.callee, {expr_from_scalar(it->second)});
+                    if (!value) {
+                        return std::unexpected(value.error());
+                    }
+                    return ComputedColumn{
+                        .column = broadcast_scalar_column(*scalar_from_expr(*value), rows),
+                        .validity = std::nullopt};
+                }
+            }
+            return std::unexpected(call.callee + "(): unknown column '" + ref->name + "'");
+        }
+    } else {
+        // Literal argument: convert once, broadcast.
+        const auto& lit = std::get<ir::Literal>(arg.node);
+        const auto& eval = std::get<ScalarExec>(find_builtin(call.callee)->exec).eval;
+        auto value = eval(call.callee, {expr_from_scalar(scalar_from_literal(lit))});
+        if (!value) {
+            return std::unexpected(value.error());
+        }
+        return ComputedColumn{.column = broadcast_scalar_column(*scalar_from_expr(*value), rows),
+                              .validity = std::nullopt};
+    }
+
+    const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
+    std::optional<ValidityBitmap> out_validity;
+    if (validity != nullptr) {
+        out_validity = *validity;
+    }
+    const ColumnValue& col = *entry->column;
+
+    if (to_int) {
+        if (const auto* ints = std::get_if<Column<std::int64_t>>(&col)) {
+            return ComputedColumn{.column = *ints, .validity = std::move(out_validity)};
+        }
+        if (const auto* bools = std::get_if<Column<bool>>(&col)) {
+            Column<std::int64_t> out;
+            out.resize(rows);
+            auto* op = out.data();
+            for (std::size_t i = 0; i < rows; ++i) {
+                op[i] = (*bools)[i] ? 1 : 0;
+            }
+            return ComputedColumn{.column = ColumnValue{std::move(out)},
+                                  .validity = std::move(out_validity)};
+        }
+        if (const auto* dbls = std::get_if<Column<double>>(&col)) {
+            Column<std::int64_t> out;
+            out.resize(rows);
+            auto* op = out.data();
+            const auto* dp = dbls->data();
+            for (std::size_t i = 0; i < rows; ++i) {
+                if (validity != nullptr && !(*validity)[i]) {
+                    op[i] = 0;  // null propagates via the bitmap; payload unread
+                    continue;
+                }
+                if (dp[i] != std::trunc(dp[i])) {
+                    return std::unexpected(call.callee +
+                                           "(): cannot cast non-integer Float to Int (use "
+                                           "floor(), ceil(), or round())");
+                }
+                op[i] = static_cast<std::int64_t>(dp[i]);
+            }
+            return ComputedColumn{.column = ColumnValue{std::move(out)},
+                                  .validity = std::move(out_validity)};
+        }
+        return std::unexpected(call.callee + "(): cannot cast non-numeric to Int");
+    }
+
+    if (const auto* dbls = std::get_if<Column<double>>(&col)) {
+        return ComputedColumn{.column = *dbls, .validity = std::move(out_validity)};
+    }
+    if (const auto* ints = std::get_if<Column<std::int64_t>>(&col)) {
+        Column<double> out;
+        out.resize(rows);
+        auto* op = out.data();
+        const auto* ip = ints->data();
+        for (std::size_t i = 0; i < rows; ++i) {
+            op[i] = static_cast<double>(ip[i]);
+        }
+        return ComputedColumn{.column = ColumnValue{std::move(out)},
+                              .validity = std::move(out_validity)};
+    }
+    return std::unexpected(call.callee + "(): cannot cast non-numeric to Float");
+}
+
 }  // namespace
 
 auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
@@ -322,6 +431,8 @@ auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
             return &coalesce_kernel;
         case ScalarKernel::Like:
             return &like_kernel;
+        case ScalarKernel::NumericCast:
+            return &numeric_cast_kernel;
     }
     return nullptr;  // unreachable; MSVC C4715
 }
@@ -523,10 +634,13 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         m.emplace("floor", integral);
         m.emplace("trunc", integral);
 
-        // Float64 / Float32: cast Int or Float to Float64.
+        // Float64 / Float32: cast Int or Float to Float64. The column kernel
+        // handles the bare column/literal/scalar shape; this eval is the
+        // semantic reference and handles computed arguments.
         const BuiltinFn to_float{
             .min_args = 1,
             .max_args = 1,
+            .scalar_kernel = ScalarKernel::NumericCast,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
                     return ExprType::Double;
@@ -543,10 +657,13 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         m.emplace("Float64", to_float);
         m.emplace("Float32", to_float);
 
-        // Int64 / Int32 / Int: cast Int or whole-valued Float to Int64.
+        // Int64 / Int32 / Int: cast Int or whole-valued Float to Int64. Column
+        // kernel as for Float64 — notably it vectorizes the 0/1 column that
+        // `count(col)` lowers to.
         const BuiltinFn to_int{
             .min_args = 1,
             .max_args = 1,
+            .scalar_kernel = ScalarKernel::NumericCast,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
                 // Bool casts to 0/1 — the standard SQL spelling for counting a
                 // predicate (`sum(Int64(is_not_null(x)))`, which is what

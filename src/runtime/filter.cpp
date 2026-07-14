@@ -2702,6 +2702,15 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
     selected.reserve(std::min<std::size_t>(rows, kBlock));
 
     std::array<std::uint8_t, kBlock> mask{};
+    // Left-pack each block's survivors here, then bulk-copy them out. Appending
+    // straight to `selected` under an `if (mask[i])` branches once per row on a
+    // predicate the predictor cannot learn — at l_returnflag's ~25% hit rate
+    // that alone cost more than the whole comparison (the same trap that made
+    // the mask path's push_back slower than the remove_if it replaced). The
+    // store below is unconditional and only the cursor moves, so there is no
+    // branch to miss; one slot of slack keeps the final rejected row in bounds.
+    std::array<std::size_t, kBlock + 1> hits{};
+
     for (std::size_t base = 0; base < rows; base += kBlock) {
         const std::size_t len = std::min(kBlock, rows - base);
         bool first = true;
@@ -2713,11 +2722,14 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
             apply_set_spec(spec, base, len, mask.data(), first);
             first = false;
         }
+
+        std::size_t kept = 0;
         for (std::size_t i = 0; i < len; ++i) {
-            if (mask[i] != 0) {
-                selected.push_back(base + i);
-            }
+            hits[kept] = base + i;
+            kept += static_cast<std::size_t>(mask[i] != 0);
         }
+        selected.insert(selected.end(), hits.begin(),
+                        hits.begin() + static_cast<std::ptrdiff_t>(kept));
     }
     return selected;
 }

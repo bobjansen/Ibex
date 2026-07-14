@@ -342,3 +342,32 @@ TEST_CASE("filter_selection: an OR across two columns is not a membership test",
     conjuncts.push_back(std::move(disjunction));
     CHECK(select(table, conjuncts) == std::vector<std::size_t>{0, 3, 4});
 }
+
+TEST_CASE("filter_selection: the fused pass left-packs across block boundaries",
+          "[filter][selection]") {
+    // Survivors are left-packed per 4096-row block and bulk-copied out, so the
+    // block seam is where a mispacked cursor would show up: rows are selected at
+    // an irregular stride (nothing lines up with the block size) and every
+    // boundary lands mid-run.
+    constexpr std::size_t kRows = 20000;
+    std::vector<std::int64_t> values;
+    values.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        values.push_back(static_cast<std::int64_t>(row % 7));  // keep 3 of every 7
+    }
+    runtime::Table table;
+    table.add_column("i", Column<std::int64_t>{std::move(values)});
+
+    std::vector<std::size_t> want;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        if (row % 7 >= 4) {
+            want.push_back(row);
+        }
+    }
+
+    CHECK(select(table, {cmp("i", ir::CompareOp::Ge, lit_i(4))}) == want);
+
+    // Everything, and nothing: the packing cursor's two extremes.
+    CHECK(select(table, {cmp("i", ir::CompareOp::Ge, lit_i(0))}).size() == kRows);
+    CHECK(select(table, {cmp("i", ir::CompareOp::Gt, lit_i(6))}).empty());
+}

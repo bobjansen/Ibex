@@ -1139,9 +1139,9 @@ auto type_to_string(const parser::Type& type) -> std::string {
     if (type.kind == parser::Type::Kind::Series) {
         std::string out = "Series";
         if (const auto* scalar = std::get_if<parser::ScalarType>(&type.arg)) {
-            out += "<";
+            out += '<';
             out += scalar_type_name(*scalar);
-            out += ">";
+            out += '>';
         }
         return out;
     }
@@ -1204,7 +1204,7 @@ auto effects_to_string(const std::optional<std::vector<parser::EffectSpec>>& eff
             out += "\")";
         }
     }
-    out += "}";
+    out += '}';
     return out;
 }
 
@@ -1236,7 +1236,7 @@ auto extern_signature(const parser::ExternDecl& decl) -> std::string {
     if (!decl.source_path.empty()) {
         out += " from \"";
         out += decl.source_path;
-        out += "\"";
+        out += '\"';
     }
     return out;
 }
@@ -1954,7 +1954,7 @@ auto column_bytes(const runtime::ColumnEntry& entry) -> std::size_t {
             } else if constexpr (std::is_same_v<ColType, Column<bool>>) {
                 return (col.size() + 7) / 8;
             } else {
-                using V = typename ColType::value_type;
+                using V = ColType::value_type;
                 return col.size() * sizeof(V);
             }
         },
@@ -2924,7 +2924,7 @@ auto eval_series_call(parser::CallExpr& call, runtime::TableRegistry& tables,
         if (arg_values.empty()) {
             return std::unexpected(call.callee + "(): expected a series argument");
         }
-        const auto* col = std::get_if<runtime::ColumnValue>(&arg_values[0]);
+        const auto* col = std::get_if<runtime::ColumnValue>(arg_values.data());
         if (col == nullptr) {
             return std::unexpected(call.callee + "(): argument must be a series (column)");
         }

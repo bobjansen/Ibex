@@ -5,20 +5,30 @@ exercise for the TPC-H queries that need a subquery, using the official SF-1
 qualification parameters from `benchmarking/data/tpch/dbgen/queries/`.
 
 **Shipped:** the *correlated* scalar aggregate — `scalar(...)` with an
-`outer(...)` capture — is implemented and specified (SPEC 5.7).  Q2 moved out of
-this directory to `../q02.ibex`.  Note that the drafts here take liberties the
-real language does not: `on p_partkey == ps_partkey` is a theta join (a nested
-loop), so the shipped queries rename keys to a shared name and join on that,
-and a `[...]` block binds to the operand immediately left of it, so a join chain
-needs parentheses before its clauses.  Read the drafts below for intent, not
-for syntax.
+`outer(...)` capture — is implemented and specified (SPEC 5.7).  Q2 and Q17 moved
+out of this directory.
+
+**Q4 also moved out, and it needed no new syntax at all.**  An equality-correlated
+`exists` *is* a semi join, and `not exists` *is* an anti join — both of which Ibex
+has always had.  `exists` is therefore an ergonomic feature, not a capability one:
+it buys readability, plus exactly one shape a semi join cannot express (Q21's
+correlated *inequality*, `l2.l_suppkey <> l1.l_suppkey`, where a semi join on the
+order key alone is vacuously true because every row matches itself).  See
+`plans/exists-subquery-plan.md`.
+
+Note that the drafts here take liberties the real language does not:
+`on p_partkey == ps_partkey` is a theta join (a nested loop), so the shipped
+queries rename keys to a shared name and join on that, and a `[...]` block binds
+to the operand immediately left of it, so a join chain needs parentheses before
+its clauses.  Read the drafts for intent, not for syntax.
 
 The remaining proposed additions are intentionally small:
 
 ```ibex
-// A table-producing expression in a boolean predicate.
+// A boolean subquery term.  Sugar for a semi/anti join in the common case;
+// genuinely new only for a correlated inequality (Q21).
 exists (lineitem[filter l_orderkey == outer(o_orderkey)])
-not exists (orders[filter o_custkey == outer(c_custkey)])
+!exists (orders[filter o_custkey == outer(c_custkey)])
 
 // An UNcorrelated scalar: exactly one row, exactly one column, evaluated once.
 // (The correlated form — with an outer(...) capture — already works.)
@@ -29,6 +39,9 @@ scalar(lineitem[select { average = mean(l_quantity) }])
 // anti join.
 ps_suppkey in (supplier[select { s_suppkey }])
 ```
+
+Ranked by queries unblocked per unit of work: uncorrelated `scalar` (Q11, Q22)
+and `in` / `not in` (Q18, Q20) come before `exists`.
 
 `outer(...)` is explicit by design: it makes the correlation boundary visible,
 allows an inner column to shadow an outer column, and avoids guessing which

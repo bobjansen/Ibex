@@ -853,10 +853,12 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
           </p>
           <p>
             The subquery is <strong>decorrelated</strong>, never run once per
-            outer row: it becomes one aggregate grouped by the captured column,
-            left-joined back onto the outer rows. When nothing matches an outer
-            row&rsquo;s key the value is null, and comparing against null keeps
-            no rows &mdash; SQL&rsquo;s scalar-subquery semantics.
+            outer row: a correlated one becomes an aggregate grouped by the
+            captured column, left-joined back onto the outer rows; an
+            uncorrelated one becomes a cross join against its single row. When
+            nothing matches an outer row&rsquo;s key the value is null, and
+            comparing against null keeps no rows &mdash; SQL&rsquo;s
+            scalar-subquery semantics.
           </p>
         </div>
         <div class="tour-code">
@@ -870,6 +872,12 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
             <span class="kw">select</span> { m = <span class="fn-name">min</span>(ps_supplycost) }
         ]
     )
+];
+
+<span class="cm">// Capture nothing and it is UNcorrelated: one value, the</span>
+<span class="cm">// same for every row, evaluated once and broadcast.</span>
+supply[
+    <span class="kw">filter</span> ps_supplycost &gt; <span class="fn-name">scalar</span>(supply[<span class="kw">select</span> { m = <span class="fn-name">mean</span>(ps_supplycost) }])
 ];
 
 <span class="cm">// The subquery is a filter, not a projection: its value</span>

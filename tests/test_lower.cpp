@@ -946,11 +946,6 @@ TEST_CASE("Lower rejects unsupported correlated-subquery shapes") {
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().message.find("must be an equality") != std::string::npos);
     }
-    SECTION("the subquery must capture something") {
-        auto result = lower_filter("p_partkey == " + subquery("ps_cost > 0.0", "m = min(ps_cost)"));
-        REQUIRE_FALSE(result.has_value());
-        REQUIRE(result.error().message.find("uncorrelated") != std::string::npos);
-    }
     SECTION("the subquery must select exactly one column") {
         auto result =
             lower_filter("p_partkey == " + subquery("ps_partkey == outer(p_partkey)",
@@ -991,4 +986,36 @@ TEST_CASE("Lower rejects unsupported correlated-subquery shapes") {
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().message.find("not statically known") != std::string::npos);
     }
+}
+
+TEST_CASE("Lower broadcasts an uncorrelated subquery with a cross join") {
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               R"(
+parts[filter p_partkey == scalar(supply[select { m = min(ps_cost) }])];
+)");
+    REQUIRE(result.has_value());
+
+    // No capture, so the subquery is one value for every row: an UNGROUPED
+    // aggregate, cross-joined. A left join would need keys it does not have,
+    // and a grouped aggregate could return more than one row and silently
+    // multiply the outer rows.
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Cross);
+    REQUIRE(join->keys().empty());
+
+    const auto* aggregate = as_node<ir::AggregateNode>(join->children()[1].get());
+    REQUIRE(aggregate != nullptr);
+    REQUIRE(aggregate->group_by().empty());
+    REQUIRE(aggregate->aggregations().size() == 1);
+    REQUIRE(aggregate->aggregations()[0].alias == "__ibex_scalar_0");
+
+    // Still a filter, so still not a wider table.
+    const auto* fused = as_node<ir::FilterProjectNode>(result->get());
+    REQUIRE(fused != nullptr);
+    std::vector<std::string> kept;
+    for (const auto& column : fused->columns()) {
+        kept.push_back(column.name);
+    }
+    REQUIRE(kept == std::vector<std::string>{"p_partkey", "p_name"});
 }

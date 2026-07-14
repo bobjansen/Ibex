@@ -1393,3 +1393,40 @@ r;
 )";
     REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
 }
+
+TEST_CASE("REPL correlated subquery reads a shared source once", "[repl][subquery]") {
+    // The outer query and the subquery both scan `supply`. A `let`-bound source
+    // is one binding named twice, not two reads: decorrelation must not clone
+    // the read into the subquery's plan. The counter is the proof.
+    int reads = 0;
+
+    ibex::runtime::ExternRegistry registry;
+    registry.register_table(
+        "load_supply",
+        [&reads](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            ++reads;
+            ibex::runtime::Table table;
+            table.add_column("ps_partkey", ibex::Column<std::int64_t>{1, 1, 2, 2});
+            table.add_column("ps_suppkey", ibex::Column<std::int64_t>{10, 11, 10, 12});
+            table.add_column("ps_cost", ibex::Column<double>{5.0, 3.0, 9.0, 8.0});
+            return ibex::runtime::ExternValue{std::move(table)};
+        });
+
+    const std::string source = R"(
+extern fn load_supply() -> DataFrame from "x.hpp";
+let parts = Table { p_partkey = [1, 2], p_name = ["nut", "bolt"] };
+let supply = load_supply();
+let cheapest = (
+    parts join supply[select { p_partkey = ps_partkey, ps_suppkey, ps_cost }] on p_partkey
+)[
+    filter ps_cost == scalar(
+        supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+    )
+];
+print(cheapest[select { n = count() }]);
+)";
+
+    REQUIRE(ibex::repl::execute_script(source, registry));
+    CHECK(reads == 1);
+}

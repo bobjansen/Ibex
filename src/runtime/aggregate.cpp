@@ -1907,8 +1907,17 @@ auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)
         return std::optional<ir::AggSpec>{};
     }
     if (call.callee == "count") {
+        if (call.args.size() > 1) {
+            return std::unexpected(
+                "count() takes at most one argument: count() counts rows, count(col) counts "
+                "non-null values");
+        }
         if (!call.args.empty()) {
-            return std::unexpected("count() takes no arguments");
+            // count(col) is a sum over a derived 0/1 column, which no AggSpec can
+            // name — decline the bare-aggregate fast path so the caller routes it
+            // through the fold path (eval_aggregate_call_scalar), which can
+            // materialise that column.
+            return std::optional<ir::AggSpec>{};
         }
         return std::optional<ir::AggSpec>{
             ir::AggSpec{.func = *func, .column = ir::ColumnRef{.name = ""}, .alias = alias}};
@@ -1999,19 +2008,40 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
         return std::unexpected("update + by: non-aggregate function '" + node.callee +
                                "' in aggregate-broadcast field expression");
     }
-    // count() takes no arguments.
     if (node.callee == "count") {
-        ir::AggSpec spec{
-            .func = *func,
-            .column = ir::ColumnRef{.name = ""},
-            .alias = "__agg_broadcast",
-        };
-        auto agg = aggregate_table(input, {}, std::vector<ir::AggSpec>{std::move(spec)});
-        if (!agg) {
-            return std::unexpected(agg.error());
+        if (node.args.size() > 1) {
+            return std::unexpected(
+                "count() takes at most one argument: count() counts rows, count(col) counts "
+                "non-null values");
         }
-        const auto* entry = agg->find_entry("__agg_broadcast");
-        return expr_from_scalar(scalar_from_column(*entry->column, 0));
+        if (node.args.empty()) {
+            ir::AggSpec spec{
+                .func = *func,
+                .column = ir::ColumnRef{.name = ""},
+                .alias = "__agg_broadcast",
+            };
+            auto agg = aggregate_table(input, {}, std::vector<ir::AggSpec>{std::move(spec)});
+            if (!agg) {
+                return std::unexpected(agg.error());
+            }
+            const auto* entry = agg->find_entry("__agg_broadcast");
+            return expr_from_scalar(scalar_from_column(*entry->column, 0));
+        }
+        // count(col) is the non-null count — the same rewrite lower.cpp applies
+        // (sum of a 0/1 column), repeated here because `update + by` parses its
+        // aggregates at run time rather than at lowering. The recursion lands in
+        // the computed-argument branch below, which materialises the flag column.
+        ir::Expr not_null;
+        not_null.node = ir::IsNullExpr{.operand = node.args[0], .negated = true};
+        ir::CallExpr cast;
+        cast.callee = "Int64";
+        cast.args.push_back(ir::make_expr_ptr(std::move(not_null)));
+        ir::Expr cast_expr;
+        cast_expr.node = std::move(cast);
+        ir::CallExpr sum_call;
+        sum_call.callee = "sum";
+        sum_call.args.push_back(ir::make_expr_ptr(std::move(cast_expr)));
+        return eval_aggregate_call_scalar(sum_call, input, scalars);
     }
     if (node.args.empty()) {
         return std::unexpected(node.callee + "(): expected column argument");

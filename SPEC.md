@@ -342,6 +342,10 @@ convert to the nearest integer before casting.
 **Int → Float casts** always succeed (subject to precision loss for very large
 `Int64` values converted to `Float32` or `Float64`).
 
+**Bool → Int casts** map `false` to `0` and `true` to `1`, which is what makes a
+predicate countable: `sum(Int64(price > vwap))` counts the rows above VWAP. (A
+null stays null, as with every scalar function.)
+
 **Column casts** apply element-wise: `Int64(price_col)` produces a
 `Series<Int64>` from a `Series<Float64>`, checking every element.
 
@@ -559,6 +563,7 @@ Aggregate functions skip null rows by default:
 ```
 sum(col)    // sums only non-null values; returns null for an all-null group
 count()     // counts all rows regardless of null
+count(col)  // counts only the non-null values of col; 0 (not null) if there are none
 mean(col)   // averages only non-null values
 median(col) // ignores null rows
 first(col)  // first non-null value; null for an all-null group
@@ -2088,7 +2093,8 @@ The following built-in functions are **aggregate functions**. They consume a
 | `mean(col)`           | `Series<Numeric>`  | `Float64`  | |
 | `min(col)`            | `Series<T>`        | `T`        | |
 | `max(col)`            | `Series<T>`        | `T`        | |
-| `count()`             | (none)             | `Int64`    | |
+| `count()`             | (none)             | `Int64`    | Counts rows in the group, nulls included. |
+| `count(col)`          | `Series<T>`        | `Int64`    | Counts the **non-null** values of `col`; `0` (not null) for a group with none. The argument must be a column name. |
 | `first(col)`          | `Series<T>`        | `T`        | |
 | `last(col)`           | `Series<T>`        | `T`        | |
 | `median(col)`         | `Series<Numeric>`  | `Float64`  | Middle value; null rows are ignored. Even-length groups return the average of the two middle values. |

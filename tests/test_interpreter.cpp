@@ -9385,3 +9385,114 @@ TEST_CASE("like rejects wrong arity and non-String arguments", "[interpreter][li
     REQUIRE_FALSE(wrong_pattern.has_value());
     CHECK(wrong_pattern.error().find("like") != std::string::npos);
 }
+
+// ── count(col): non-null count ───────────────────────────────────────────────
+// count() counts rows; count(col) counts the non-null values of col. Lowered to
+// sum() over a derived 0/1 column, so every grouping path shares one semantics.
+
+TEST_CASE("count(col) counts non-null values, count() counts rows",
+          "[interpreter][aggregate][count][null]") {
+    // The shape that motivates the form: a left join leaves unmatched rows with
+    // a null on the right, and SQL's count(o_orderkey) must report 0 for them
+    // where count() reports 1.
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 3});
+    t.add_column("v", Column<std::int64_t>{10, 0, 30, 0},
+                 std::vector<bool>{true, false, true, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    SECTION("grouped select") {
+        auto ir = require_ir("t[select { rows = count(), vals = count(v) }, by g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* rows = std::get_if<Column<std::int64_t>>(result->find("rows"));
+        const auto* vals = std::get_if<Column<std::int64_t>>(result->find("vals"));
+        REQUIRE(rows != nullptr);
+        REQUIRE(vals != nullptr);
+        REQUIRE(rows->size() == 3);
+        CHECK((*rows)[0] == 2);
+        CHECK((*vals)[0] == 1);  // group 1: two rows, one non-null
+        CHECK((*rows)[1] == 1);
+        CHECK((*vals)[1] == 1);
+        CHECK((*rows)[2] == 1);
+        CHECK((*vals)[2] == 0);  // group 3: all null -> 0, not null
+    }
+
+    SECTION("ungrouped select") {
+        auto ir = require_ir("t[select { rows = count(), vals = count(v) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        CHECK((*std::get_if<Column<std::int64_t>>(result->find("rows")))[0] == 4);
+        CHECK((*std::get_if<Column<std::int64_t>>(result->find("vals")))[0] == 2);
+    }
+
+    SECTION("grouped update broadcasts the per-group count") {
+        // `update + by` parses its aggregates at run time, not at lowering — a
+        // separate code path from the two above.
+        auto ir = require_ir("t[update { n = count(v) }, by g];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+        REQUIRE(n != nullptr);
+        REQUIRE(n->size() == 4);
+        CHECK((*n)[0] == 1);
+        CHECK((*n)[1] == 1);
+        CHECK((*n)[2] == 1);
+        CHECK((*n)[3] == 0);
+    }
+}
+
+TEST_CASE("count(col) works over a String column", "[interpreter][aggregate][count][null]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2});
+    Column<std::string> names{"alpha", "", "gamma"};
+    t.add_column("name", std::move(names), std::vector<bool>{true, false, true});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[select { n = count(name) }, by g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(n != nullptr);
+    CHECK((*n)[0] == 1);
+    CHECK((*n)[1] == 1);
+}
+
+TEST_CASE("count rejects more than one argument", "[interpreter][aggregate][count]") {
+    // Rejected at lowering, before any table is touched.
+    auto program = require_program("t[select { n = count(a, b) }];");
+    auto lowered = parser::lower(program);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK(lowered.error().message.find("count()") != std::string::npos);
+}
+
+TEST_CASE("count(expr) requires a column name", "[interpreter][aggregate][count]") {
+    // count(a + b) has no spelling: the 0/1 flag column it would need cannot
+    // reference another column materialized in the same update pass.
+    auto program = require_program("t[select { n = count(a + b) }];");
+    auto lowered = parser::lower(program);
+    REQUIRE_FALSE(lowered.has_value());
+    CHECK(lowered.error().message.find("column name") != std::string::npos);
+}
+
+TEST_CASE("Int64 casts Bool to 0/1", "[interpreter][cast]") {
+    // The cast count(col) leans on: it also makes `sum(Int64(pred))` spellable.
+    runtime::Table t;
+    t.add_column("x", Column<std::int64_t>{5, 15, 25});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { big = Int64(x > 10) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* big = std::get_if<Column<std::int64_t>>(result->find("big"));
+    REQUIRE(big != nullptr);
+    CHECK((*big)[0] == 0);
+    CHECK((*big)[1] == 1);
+    CHECK((*big)[2] == 1);
+}

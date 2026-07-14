@@ -116,7 +116,8 @@
             <tr><td><code>mean(col)</code></td><td>Arithmetic mean of non-null values.</td></tr>
             <tr><td><code>min(col)</code></td><td>Minimum non-null value.</td></tr>
             <tr><td><code>max(col)</code></td><td>Maximum non-null value.</td></tr>
-            <tr><td><code>count()</code></td><td>Row count for the current group/window.</td></tr>
+            <tr><td><code>count()</code></td><td>Row count for the current group/window, nulls included.</td></tr>
+            <tr><td><code>count(col)</code></td><td>Count of the <strong>non-null</strong> values of <code>col</code> — <code>0</code>, not null, for a group with none. The difference from <code>count()</code> matters after a left join, where an unmatched row is still a row.</td></tr>
             <tr><td><code>first(col)</code></td><td>First non-null value in order.</td></tr>
             <tr><td><code>last(col)</code></td><td>Last non-null value in order.</td></tr>
             <tr><td><code>median(col)</code></td><td>Median of non-null values.</td></tr>
@@ -222,7 +223,7 @@
         <p>These are regular call syntax in Ibex, used in expressions and updates.</p>
         <table class="repl-table">
           <tbody>
-            <tr><td><code>Int64(x)</code></td><td>Explicit cast to 64-bit integer.</td></tr>
+            <tr><td><code>Int64(x)</code></td><td>Explicit cast to 64-bit integer. A <code>Bool</code> casts to 0/1, so <code>sum(Int64(price &gt; vwap))</code> counts a predicate.</td></tr>
             <tr><td><code>Int32(x)</code></td><td>Explicit cast to 32-bit integer.</td></tr>
             <tr><td><code>Int(x)</code></td><td>Alias for <code>Int64(x)</code>.</td></tr>
             <tr><td><code>Float64(x)</code></td><td>Explicit cast to 64-bit float.</td></tr>

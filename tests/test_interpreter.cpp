@@ -8749,3 +8749,195 @@ TEST_CASE("Streaming first/last match the materializing path (parity)") {
         REQUIRE((*lw_s)[i] == (*lw_m)[i]);
     }
 }
+
+// ── Multi-key group-by (the generic grouping path) ────────────────────────────
+//
+// A group-by whose keys are neither all-categorical nor a single string column
+// lands in ChunkedAggregateOperator::process_rows_generic, which hashes each
+// row's key columns in place and compares a candidate group's stored key
+// against the row. Nothing exercised it before: making key comparison always
+// answer "equal" — which merges unrelated groups — left the whole suite green.
+
+namespace {
+
+// Chunk with an Int64 key, a String key and an Int64 value: mixed key types are
+// what force the generic path (a single string key or all-categorical keys have
+// their own fast paths).
+auto make_mixed_key_chunk(std::vector<std::int64_t> ids, std::vector<std::string> names,
+                          std::vector<std::int64_t> values) -> runtime::Chunk {
+    runtime::Chunk chunk;
+
+    runtime::ColumnEntry id_entry;
+    id_entry.name = "id";
+    id_entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{std::move(ids)});
+    chunk.columns.push_back(std::move(id_entry));
+
+    runtime::ColumnEntry name_entry;
+    name_entry.name = "name";
+    name_entry.column = std::make_shared<runtime::ColumnValue>(Column<std::string>{});
+    auto& name_col = std::get<Column<std::string>>(*name_entry.column);
+    name_col.reserve(names.size());
+    for (const auto& value : names) {
+        name_col.push_back(value);
+    }
+    chunk.columns.push_back(std::move(name_entry));
+
+    runtime::ColumnEntry value_entry;
+    value_entry.name = "v";
+    value_entry.column =
+        std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{std::move(values)});
+    chunk.columns.push_back(std::move(value_entry));
+
+    return chunk;
+}
+
+}  // namespace
+
+TEST_CASE("Interpret multi-key grouped aggregation distinguishes keys that share a column") {
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    // (1,"a") and (1,"b") share an id; (2,"a") shares the name with (1,"a").
+    // A grouping that compares only part of the key would merge them.
+    table.add_column("id", Column<std::int64_t>{1, 1, 2, 1, 2});
+    table.add_column("name", Column<std::string>{});
+    auto& names = std::get<Column<std::string>>(*table.columns[1].column);
+    for (const auto* value : {"a", "b", "a", "a", "a"}) {
+        names.push_back(value);
+    }
+    table.add_column("v", Column<std::int64_t>{10, 20, 30, 5, 7});
+    registry.emplace("t", std::move(table));
+
+    auto ir = require_ir("t[select { total = sum(v) }, by { id, name }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
+    REQUIRE(result.has_value());
+
+    const auto* id = std::get_if<Column<std::int64_t>>(result->find("id"));
+    const auto* name = std::get_if<Column<std::string>>(result->find("name"));
+    const auto* total = std::get_if<Column<std::int64_t>>(result->find("total"));
+    REQUIRE(id != nullptr);
+    REQUIRE(name != nullptr);
+    REQUIRE(total != nullptr);
+    REQUIRE(id->size() == 3);
+
+    CHECK((*id)[0] == 1);
+    CHECK((*name)[0] == "a");
+    CHECK((*total)[0] == 15);  // 10 + 5
+    CHECK((*id)[1] == 1);
+    CHECK((*name)[1] == "b");
+    CHECK((*total)[1] == 20);
+    CHECK((*id)[2] == 2);
+    CHECK((*name)[2] == "a");
+    CHECK((*total)[2] == 37);  // 30 + 7
+}
+
+TEST_CASE("Interpret multi-key grouped aggregation keeps a null key distinct from zero") {
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    // A null cell still holds the type's zero value, so a grouping that ignores
+    // validity would fold the null row into the genuine id=0 group.
+    table.add_column("id", Column<std::int64_t>{0, 0, 0},
+                     runtime::ValidityBitmap{true, false, true});
+    table.add_column("name", Column<std::string>{});
+    auto& names = std::get<Column<std::string>>(*table.columns[1].column);
+    for (const auto* value : {"a", "a", "a"}) {
+        names.push_back(value);
+    }
+    table.add_column("v", Column<std::int64_t>{1, 2, 4});
+    registry.emplace("t", std::move(table));
+
+    auto ir = require_ir("t[select { total = sum(v) }, by { id, name }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
+    REQUIRE(result.has_value());
+
+    const auto* total = std::get_if<Column<std::int64_t>>(result->find("total"));
+    REQUIRE(total != nullptr);
+    REQUIRE(total->size() == 2);
+    CHECK((*total)[0] == 5);  // rows 0 and 2: id = 0
+    CHECK((*total)[1] == 2);  // row 1: id is null
+
+    const auto* id_entry = result->find_entry("id");
+    REQUIRE(id_entry != nullptr);
+    REQUIRE(id_entry->validity.has_value());
+    CHECK((*id_entry->validity)[0] == true);
+    CHECK((*id_entry->validity)[1] == false);
+}
+
+TEST_CASE("Interpret multi-key grouped aggregation tracks groups across chunks") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    // Group state (the key table, each group's stored key and its hash) has to
+    // survive between chunks: (1,"a") appears in both, and must accumulate into
+    // one group rather than open a second.
+    externs.register_chunked_table("stream_mixed", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_mixed_key_chunk({1, 2}, {"a", "b"}, {10, 20}));
+        chunks.push_back(make_mixed_key_chunk({1, 3}, {"a", "c"}, {5, 30}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn stream_mixed() -> DataFrame from \"x.hpp\"; "
+        "stream_mixed()[select { total = sum(v) }, by { id, name }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* id = std::get_if<Column<std::int64_t>>(result->find("id"));
+    const auto* total = std::get_if<Column<std::int64_t>>(result->find("total"));
+    REQUIRE(id != nullptr);
+    REQUIRE(total != nullptr);
+    REQUIRE(id->size() == 3);
+
+    CHECK((*id)[0] == 1);
+    CHECK((*total)[0] == 15);  // 10 from chunk 1 + 5 from chunk 2
+    CHECK((*id)[1] == 2);
+    CHECK((*total)[1] == 20);
+    CHECK((*id)[2] == 3);
+    CHECK((*total)[2] == 30);
+}
+
+TEST_CASE("Interpret multi-key grouped aggregation survives growing past its key table") {
+    // More groups than the key table's initial capacity, so it has to grow and
+    // rehash every group it already holds without losing or merging any.
+    constexpr std::int64_t kGroups = 5000;
+    std::vector<std::int64_t> ids;
+    std::vector<std::string> names;
+    std::vector<std::int64_t> values;
+    ids.reserve(kGroups * 2);
+    names.reserve(kGroups * 2);
+    values.reserve(kGroups * 2);
+    for (std::int64_t pass = 0; pass < 2; ++pass) {
+        for (std::int64_t i = 0; i < kGroups; ++i) {
+            ids.push_back(i);
+            names.push_back("name-" + std::to_string(i));
+            values.push_back(i);
+        }
+    }
+
+    runtime::TableRegistry registry;
+    runtime::Table table;
+    table.add_column("id", Column<std::int64_t>{std::move(ids)});
+    table.add_column("name", Column<std::string>{});
+    auto& name_col = std::get<Column<std::string>>(*table.columns[1].column);
+    name_col.reserve(names.size());
+    for (const auto& value : names) {
+        name_col.push_back(value);
+    }
+    table.add_column("v", Column<std::int64_t>{std::move(values)});
+    registry.emplace("t", std::move(table));
+
+    auto ir = require_ir("t[select { total = sum(v) }, by { id, name }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
+    REQUIRE(result.has_value());
+
+    const auto* id = std::get_if<Column<std::int64_t>>(result->find("id"));
+    const auto* total = std::get_if<Column<std::int64_t>>(result->find("total"));
+    REQUIRE(id != nullptr);
+    REQUIRE(total != nullptr);
+    REQUIRE(id->size() == static_cast<std::size_t>(kGroups));
+    for (std::size_t g = 0; g < static_cast<std::size_t>(kGroups); ++g) {
+        REQUIRE((*id)[g] == static_cast<std::int64_t>(g));
+        REQUIRE((*total)[g] == static_cast<std::int64_t>(g) * 2);  // each id appears twice
+    }
+}

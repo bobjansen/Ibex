@@ -3258,6 +3258,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     // an ordinary Table — it never learns that a read was deferred.
     const runtime::TableRegistry* eval_tables = &tables;
     runtime::TableRegistry projected;
+    std::set<std::string> applied_scan_filters;
     if (!lazy_tables.empty()) {
         auto demand = ir::required_columns(*lowered.value());
         auto predicates = ir::scan_predicates(*lowered.value());
@@ -3276,6 +3277,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                     }
                 }
                 table = lazy->project_where(names, pushed->second, &scalars);
+                applied_scan_filters.insert(name);
             } else {
                 table =
                     needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
@@ -3286,6 +3288,11 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             projected.insert_or_assign(name, std::move(table.value()));
         }
         eval_tables = &projected;
+    }
+
+    if (!applied_scan_filters.empty()) {
+        lowered.value() =
+            ir::remove_applied_scan_filters(std::move(lowered.value()), applied_scan_filters);
     }
 
     runtime::ModelResult captured_model;

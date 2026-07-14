@@ -9611,3 +9611,43 @@ let supply = Table { p_partkey = [1, 1, 2, 2], ps_cost = [5.0, 3.0, 9.0, 8.0] };
     REQUIRE((*cost)[0] == Catch::Approx(3.0));
     REQUIRE((*cost)[1] == Catch::Approx(8.0));
 }
+
+TEST_CASE("Interpret aggregate in an expression does not leak its temp column") {
+    // `sum(x) / 7.0` computes sum into an internal `_aggN` temp and combines it
+    // in a trailing update. The temp is not the user's column: the result is
+    // exactly what the select named, plus the group keys.
+    runtime::Table table;
+    table.add_column("x", Column<double>{1.0, 2.0, 3.0});
+    table.add_column("g", Column<std::string>{"a", "a", "b"});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    SECTION("ungrouped") {
+        auto ir = require_ir("t[select { y = sum(x) / 7.0 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        std::vector<std::string> names;
+        for (const auto& entry : result->columns) {
+            names.push_back(entry.name);
+        }
+        REQUIRE(names == std::vector<std::string>{"y"});
+        const auto* y = std::get_if<Column<double>>(result->find("y"));
+        REQUIRE(y != nullptr);
+        REQUIRE((*y)[0] == Catch::Approx(6.0 / 7.0));
+    }
+
+    SECTION("grouped — the key survives even though the select never named it") {
+        auto ir = require_ir("t[select { y = sum(x) / 7.0 }, by { g }][order { g }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        std::vector<std::string> names;
+        for (const auto& entry : result->columns) {
+            names.push_back(entry.name);
+        }
+        REQUIRE(names == std::vector<std::string>{"g", "y"});
+        const auto* y = std::get_if<Column<double>>(result->find("y"));
+        REQUIRE(y != nullptr);
+        REQUIRE((*y)[0] == Catch::Approx(3.0 / 7.0));
+        REQUIRE((*y)[1] == Catch::Approx(3.0 / 7.0));
+    }
+}

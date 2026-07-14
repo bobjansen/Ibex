@@ -4,6 +4,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <functional>
 #include <optional>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -19,6 +21,7 @@
 #include <variant>
 #include <vector>
 
+#include "interpreter_internal.hpp"
 #include "join_internal.hpp"
 #include "runtime_internal.hpp"
 
@@ -26,31 +29,185 @@ namespace ibex::runtime {
 
 namespace {
 
-struct Key {
-    std::vector<ScalarValue> values;
-};
-
-struct KeyHash {
-    auto operator()(const Key& key) const -> std::size_t {
-        std::size_t seed = 0;
-        auto hash_combine = [&](std::size_t value) {
-            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-        };
-        for (const auto& value : key.values) {
-            const std::size_t h = std::visit(
-                [](const auto& v) { return std::hash<std::decay_t<decltype(v)>>{}(v); }, value);
-            hash_combine(h);
-        }
-        return seed;
-    }
-};
-
-struct KeyEq {
-    auto operator()(const Key& a, const Key& b) const -> bool { return a.values == b.values; }
-};
-
 // Sentinel: SIZE_MAX means "emit a default/null value for this position".
 constexpr std::size_t kNull = SIZE_MAX;
+
+// Sentinel group id: "this row's key is not in the index".
+constexpr std::uint32_t kNoGroup = UINT32_MAX;
+
+/// CSR view over the build side: matches(gid) is the ascending list of build
+/// rows whose key belongs to group gid. Replaces one heap-allocated
+/// vector<size_t> per distinct key — on a PK build side (every TPC-H join)
+/// that was one single-element heap vector per build row — with two flat
+/// arrays.
+struct GroupedRows {
+    std::vector<std::size_t> offsets;  ///< n_groups + 1
+    std::vector<std::size_t> rows;     ///< grouped build rows, ascending per group
+
+    [[nodiscard]] auto matches(std::uint32_t gid) const -> std::span<const std::size_t> {
+        return {rows.data() + offsets[gid], offsets[gid + 1] - offsets[gid]};
+    }
+    /// Every group holds exactly one build row (unique build keys).
+    [[nodiscard]] auto unique() const noexcept -> bool { return rows.size() + 1 == offsets.size(); }
+};
+
+/// Scatter build rows into CSR order by group id. `kNoGroup` rows (null keys,
+/// which match nothing) are left out of the index entirely.
+auto group_rows_csr(const std::vector<std::uint32_t>& row_gid, std::uint32_t n_groups)
+    -> GroupedRows {
+    GroupedRows out;
+    out.offsets.assign(static_cast<std::size_t>(n_groups) + 1, 0);
+    std::size_t indexed = 0;
+    for (const std::uint32_t gid : row_gid) {
+        if (gid != kNoGroup) {
+            ++out.offsets[gid + 1];
+            ++indexed;
+        }
+    }
+    for (std::uint32_t g = 0; g < n_groups; ++g) {
+        out.offsets[g + 1] += out.offsets[g];
+    }
+    out.rows.resize(indexed);
+    std::vector<std::size_t> cursor(out.offsets.begin(), out.offsets.end() - 1);
+    for (std::size_t row = 0; row < row_gid.size(); ++row) {
+        const std::uint32_t gid = row_gid[row];
+        if (gid != kNoGroup) {
+            out.rows[cursor[gid]++] = row;
+        }
+    }
+    return out;
+}
+
+/// Do two rows carry equal key values? `a` and `b` are the resolved key
+/// columns of the two sides; they may differ in representation (a String
+/// column joins against a Categorical one — both compare as text) but never
+/// in ExprType, which key validation already enforced. Null-keyed rows never
+/// reach this (they match nothing and are skipped before probing), so
+/// validity is not consulted.
+auto key_rows_equal(const std::vector<KeyCol>& a, std::size_t ra, const std::vector<KeyCol>& b,
+                    std::size_t rb) -> bool {
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const KeyCol& ca = a[i];
+        const KeyCol& cb = b[i];
+        switch (ca.kind) {
+            case KeyCol::Kind::Int64:
+                if (ca.i64[ra] != cb.i64[rb]) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Double:
+                if (!(ca.f64[ra] == cb.f64[rb])) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Bool:
+                if ((*ca.boolean)[ra] != (*cb.boolean)[rb]) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Date:
+                if (ca.date[ra].days != cb.date[rb].days) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Ts:
+                if (ca.ts[ra].nanos != cb.ts[rb].nanos) {
+                    return false;
+                }
+                break;
+            case KeyCol::Kind::Str:
+            case KeyCol::Kind::Cat:
+                if (ca.text(ra) != cb.text(rb)) {
+                    return false;
+                }
+                break;
+        }
+    }
+    return true;
+}
+
+/// Open-addressed key→gid index for the generic multi-key join, hashing and
+/// comparing the key columns in place. Each group is represented by its first
+/// build row (rep_rows) — no boxed Key is ever built, which is the fix the
+/// grouped aggregate already got (KeyRowIndex). Unlike KeyRowIndex it keeps
+/// no keys at all: a join's build side stays resident, so the representative
+/// row IS the key.
+struct RowKeyIndex {
+    std::vector<std::uint32_t> slots;   ///< 0 = empty, else gid + 1
+    std::vector<std::uint64_t> hashes;  ///< per gid
+    std::vector<std::size_t> rep_rows;  ///< per gid: first build row with this key
+
+    [[nodiscard]] auto size() const noexcept -> std::uint32_t {
+        return static_cast<std::uint32_t>(rep_rows.size());
+    }
+
+    void reserve(std::size_t n_rows) {
+        hashes.reserve(n_rows);
+        rep_rows.reserve(n_rows);
+        rehash(std::bit_ceil(std::max<std::size_t>(n_rows * 10 / 7, 1024)));
+    }
+
+    void rehash(std::size_t capacity) {
+        slots.assign(capacity, 0U);
+        const std::size_t mask = capacity - 1;
+        for (std::size_t gid = 0; gid < hashes.size(); ++gid) {
+            std::size_t probe = static_cast<std::size_t>(hashes[gid]) & mask;
+            while (slots[probe] != 0) {
+                probe = (probe + 1) & mask;
+            }
+            slots[probe] = static_cast<std::uint32_t>(gid) + 1;
+        }
+    }
+
+    auto find_or_insert(const std::vector<KeyCol>& cols, std::size_t row) -> std::uint32_t {
+        if (slots.empty()) {
+            rehash(1024);
+        }
+        const std::uint64_t hash = hash_key_row(cols, row);
+        const std::size_t mask = slots.size() - 1;
+        std::size_t probe = static_cast<std::size_t>(hash) & mask;
+        while (true) {
+            const std::uint32_t slot = slots[probe];
+            if (slot == 0) {
+                const auto gid = static_cast<std::uint32_t>(rep_rows.size());
+                rep_rows.push_back(row);
+                hashes.push_back(hash);
+                slots[probe] = gid + 1;
+                if ((hashes.size() * 10) > (slots.size() * 7)) {
+                    rehash(slots.size() * 2);
+                }
+                return gid;
+            }
+            const std::uint32_t gid = slot - 1;
+            if (hashes[gid] == hash && key_rows_equal(cols, row, cols, rep_rows[gid])) {
+                return gid;
+            }
+            probe = (probe + 1) & mask;
+        }
+    }
+
+    /// Probe with a row of the other side's key columns.
+    [[nodiscard]] auto find(const std::vector<KeyCol>& probe_cols, std::size_t row,
+                            const std::vector<KeyCol>& build_cols) const -> std::uint32_t {
+        if (slots.empty()) {
+            return kNoGroup;
+        }
+        const std::uint64_t hash = hash_key_row(probe_cols, row);
+        const std::size_t mask = slots.size() - 1;
+        std::size_t probe = static_cast<std::size_t>(hash) & mask;
+        while (true) {
+            const std::uint32_t slot = slots[probe];
+            if (slot == 0) {
+                return kNoGroup;
+            }
+            const std::uint32_t gid = slot - 1;
+            if (hashes[gid] == hash && key_rows_equal(probe_cols, row, build_cols, rep_rows[gid])) {
+                return gid;
+            }
+            probe = (probe + 1) & mask;
+        }
+    }
+};
 
 /// Pick a column on `side` that's a plausible time index — first preference
 /// `Timestamp`, then `Date`, then `Int`. Used to make the asof "not a
@@ -262,13 +419,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         return false;
     };
-    const auto left_key_is_null = [&](std::size_t l) {
-        return has_null_keys && row_key_is_null(left_key_validity, l);
-    };
-    const auto right_key_is_null = [&](std::size_t r) {
-        return has_null_keys && row_key_is_null(right_key_validity, r);
-    };
-
     robin_hood::unordered_set<std::string> key_set(keys.begin(), keys.end());
 
     const std::size_t n_left = left.rows();
@@ -548,12 +698,22 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         return output;
     }
 
-    // ── Helper: build index arrays from right-scan match iterator ────────
-    // Used by the small-left/large-right paths.
-    auto build_indices_from_right_scan = [&](auto&& for_each_left_match_for_right_row)
+    // ── Helper: build index arrays from a right-row → left-matches lookup ─
+    // Used by the small-left/large-right paths. Probes the index ONCE per
+    // right row, recording each hit's match span, then replays the hits to
+    // scatter — the previous shape re-ran the lookup for the fill pass,
+    // paying a second full round of hash probes over the large side (the
+    // same double-probe the chunked swapped join shed for q03).
+    auto build_indices_from_right_scan = [&](auto&& left_matches_for_right_row)
         -> std::tuple<std::vector<std::size_t>, std::vector<std::size_t>,
                       std::vector<std::size_t>> {
-        // Phase 1: count matches per left row.
+        struct Hit {
+            std::size_t right_row;
+            std::span<const std::size_t> matches;
+        };
+        std::vector<Hit> hits;
+
+        // Phase 1: probe once per right row; count matches per left row.
         std::vector<std::size_t> match_counts(n_left, 0);
         std::size_t total_matches = 0;
         std::vector<std::uint8_t> right_matched_flags;
@@ -562,28 +722,36 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         for (std::size_t r = 0; r < n_right; ++r) {
-            bool any = false;
-            for_each_left_match_for_right_row(r, [&](std::size_t l) {
+            const std::span<const std::size_t> matches = left_matches_for_right_row(r);
+            if (matches.empty()) {
+                continue;
+            }
+            hits.push_back(Hit{.right_row = r, .matches = matches});
+            for (const std::size_t l : matches) {
                 ++match_counts[l];
-                ++total_matches;
-                any = true;
-            });
-            if (preserve_right_rows && any) {
+            }
+            total_matches += matches.size();
+            if (preserve_right_rows) {
                 right_matched_flags[r] = 1U;
             }
         }
 
-        // Phase 2: build right-match array indexed by left offsets.
+        // Phase 2: replay the hits into a right-match array indexed by left
+        // offsets. Hits come in ascending right-row order, so each left row's
+        // matches stay ascending — the order the probe-twice version produced.
         std::vector<std::size_t> match_offsets(n_left + 1, 0);
         for (std::size_t l = 0; l < n_left; ++l) {
             match_offsets[l + 1] = match_offsets[l] + match_counts[l];
         }
         std::vector<std::size_t> right_matches(total_matches);
         std::vector<std::size_t> next_off = match_offsets;
-        for (std::size_t r = 0; r < n_right; ++r) {
-            for_each_left_match_for_right_row(
-                r, [&](std::size_t l) { right_matches[next_off[l]++] = r; });
+        for (const Hit& hit : hits) {
+            for (const std::size_t l : hit.matches) {
+                right_matches[next_off[l]++] = hit.right_row;
+            }
         }
+        hits.clear();
+        hits.shrink_to_fit();
 
         // Phase 3: build left_idx / right_idx.
         std::size_t unmatched_right = 0;
@@ -649,9 +817,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         return std::make_tuple(std::move(li), std::move(ri), std::move(kri));
     };
 
-    // ── Helper: build index arrays from left-scan match ──────────────────
-    // Used by the large-left/small-right paths.
-    auto build_indices_from_left_scan = [&](auto&& lookup_right_matches)
+    // ── Helper: build index arrays from a left-row → right-matches lookup ─
+    // Used by the large-left/small-right paths. An empty span means "no
+    // match".
+    auto build_indices_from_left_scan = [&](auto&& right_matches_for_left_row)
         -> std::tuple<std::vector<std::size_t>, std::vector<std::size_t>,
                       std::vector<std::size_t>> {
         std::vector<std::size_t> li;
@@ -666,8 +835,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         for (std::size_t l = 0; l < n_left; ++l) {
-            const auto* matches = lookup_right_matches(l);
-            const bool has_match = (matches != nullptr && !matches->empty());
+            const std::span<const std::size_t> matches = right_matches_for_left_row(l);
+            const bool has_match = !matches.empty();
             if (semi_join) {
                 if (has_match) {
                     li.push_back(l);
@@ -689,7 +858,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
                 continue;
             }
-            for (auto r : *matches) {
+            for (const std::size_t r : matches) {
                 li.push_back(l);
                 ri.push_back(r);
                 if (preserve_right_rows) {
@@ -716,112 +885,91 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     if (kind != ir::JoinKind::Asof && !has_null_keys && keys.size() == 1 &&
         (std::holds_alternative<Column<std::string>>(*left_keys[0]) ||
          std::holds_alternative<Column<Categorical>>(*left_keys[0]))) {
-        if (n_left < n_right) {
-            robin_hood::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
-                                      std::equal_to<>>
-                left_sv_index;
-            left_sv_index.reserve(n_left);
-            if (const auto* ls = std::get_if<Column<std::string>>(left_keys[0])) {
-                for (std::size_t l = 0; l < n_left; ++l) {
-                    left_sv_index[(*ls)[l]].push_back(l);
-                }
-            } else if (const auto* lc = std::get_if<Column<Categorical>>(left_keys[0])) {
-                for (std::size_t l = 0; l < n_left; ++l) {
-                    left_sv_index[(*lc)[l]].push_back(l);
-                }
+        // Index the smaller side: key → dense gid, rows per gid in a CSR.
+        const bool build_left = n_left < n_right;
+        const ColumnValue& build_col = build_left ? *left_keys[0] : *right_keys[0];
+        const std::size_t n_build = build_left ? n_left : n_right;
+
+        robin_hood::unordered_map<std::string_view, std::uint32_t, StringViewHash, std::equal_to<>>
+            key_gid;
+        key_gid.reserve(n_build);
+        std::vector<std::uint32_t> row_gid(n_build);
+        std::uint32_t n_groups = 0;
+        auto assign_gids = [&](const auto& col) {
+            for (std::size_t i = 0; i < n_build; ++i) {
+                auto [it, inserted] = key_gid.try_emplace(col[i], n_groups);
+                n_groups += inserted ? 1U : 0U;
+                row_gid[i] = it->second;
             }
+        };
+        if (const auto* bs = std::get_if<Column<std::string>>(&build_col)) {
+            assign_gids(*bs);
+        } else {
+            assign_gids(std::get<Column<Categorical>>(build_col));
+        }
+        const GroupedRows grouped = group_rows_csr(row_gid, n_groups);
 
-            auto for_each = [&](std::size_t r, auto&& emit_left_row) {
-                std::string_view sv;
-                if (const auto* rs = std::get_if<Column<std::string>>(right_keys[0])) {
-                    sv = (*rs)[r];
-                } else {
-                    sv = std::get<Column<Categorical>>(*right_keys[0])[r];
-                }
-                auto it = left_sv_index.find(sv);
-                if (it == left_sv_index.end()) {
-                    return;
-                }
-                for (auto l : it->second) {
-                    emit_left_row(l);
-                }
+        if (build_left) {
+            // Sides may mix String and Categorical (both are ExprType::String).
+            const auto* rs = std::get_if<Column<std::string>>(right_keys[0]);
+            const auto* rc = std::get_if<Column<Categorical>>(right_keys[0]);
+            auto lookup = [&](std::size_t r) -> std::span<const std::size_t> {
+                const std::string_view sv = rs != nullptr ? (*rs)[r] : (*rc)[r];
+                auto it = key_gid.find(sv);
+                return it == key_gid.end() ? std::span<const std::size_t>{}
+                                           : grouped.matches(it->second);
             };
-
-            auto [li, ri, kri] = build_indices_from_right_scan(for_each);
+            auto [li, ri, kri] = build_indices_from_right_scan(lookup);
             materialize(li, ri, kri);
             return output;
         }
 
-        robin_hood::unordered_map<std::string_view, std::vector<std::size_t>, StringViewHash,
-                                  std::equal_to<>>
-            right_sv_index;
-        right_sv_index.reserve(n_right);
-        if (const auto* rs = std::get_if<Column<std::string>>(right_keys[0])) {
-            for (std::size_t r = 0; r < n_right; ++r) {
-                right_sv_index[(*rs)[r]].push_back(r);
-            }
-        } else if (const auto* rc = std::get_if<Column<Categorical>>(right_keys[0])) {
-            for (std::size_t r = 0; r < n_right; ++r) {
-                right_sv_index[(*rc)[r]].push_back(r);
-            }
-        }
-
         if (const auto* lc = std::get_if<Column<Categorical>>(left_keys[0])) {
+            // Resolve each left dictionary code to a build-side gid once, then
+            // probe by code — no per-row hashing at all.
             const auto& dict = *lc->dictionary_ptr();
-            std::vector<const std::vector<std::size_t>*> code_to_right(dict.size(), nullptr);
-            bool unique_right = preserve_left_only;
+            std::vector<std::uint32_t> code_gid(dict.size(), kNoGroup);
             for (std::size_t code = 0; code < dict.size(); ++code) {
-                auto it = right_sv_index.find(std::string_view{dict[code]});
-                if (it != right_sv_index.end()) {
-                    code_to_right[code] = &it->second;
-                    if (unique_right && it->second.size() != 1) {
-                        unique_right = false;
-                    }
+                auto it = key_gid.find(std::string_view{dict[code]});
+                if (it != key_gid.end()) {
+                    code_gid[code] = it->second;
                 }
             }
             const auto* codes = lc->codes_data();
-            if (unique_right) {
+            if (preserve_left_only && grouped.unique()) {
                 std::vector<std::size_t> ri(n_left, kNull);
                 for (std::size_t l = 0; l < n_left; ++l) {
-                    const auto* matches = code_to_right[static_cast<std::size_t>(codes[l])];
-                    if (matches != nullptr) {
-                        ri[l] = (*matches)[0];
+                    const std::uint32_t gid = code_gid[static_cast<std::size_t>(codes[l])];
+                    if (gid != kNoGroup) {
+                        ri[l] = grouped.rows[grouped.offsets[gid]];
                     }
                 }
                 materialize_left_identity(ri);
                 return output;
             }
-            auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
-                return code_to_right[static_cast<std::size_t>(codes[l])];
+            auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
+                const std::uint32_t gid = code_gid[static_cast<std::size_t>(codes[l])];
+                return gid == kNoGroup ? std::span<const std::size_t>{} : grouped.matches(gid);
             };
             auto [li, ri, kri] = build_indices_from_left_scan(lookup);
             materialize(li, ri, kri);
         } else {
             const auto& ls = std::get<Column<std::string>>(*left_keys[0]);
-            if (preserve_left_only) {
-                bool unique_right = true;
-                for (const auto& [key, rows] : right_sv_index) {
-                    (void)key;
-                    if (rows.size() != 1) {
-                        unique_right = false;
-                        break;
+            if (preserve_left_only && grouped.unique()) {
+                std::vector<std::size_t> ri(n_left, kNull);
+                for (std::size_t l = 0; l < n_left; ++l) {
+                    auto it = key_gid.find(ls[l]);
+                    if (it != key_gid.end()) {
+                        ri[l] = grouped.rows[grouped.offsets[it->second]];
                     }
                 }
-                if (unique_right) {
-                    std::vector<std::size_t> ri(n_left, kNull);
-                    for (std::size_t l = 0; l < n_left; ++l) {
-                        auto it = right_sv_index.find(ls[l]);
-                        if (it != right_sv_index.end()) {
-                            ri[l] = it->second[0];
-                        }
-                    }
-                    materialize_left_identity(ri);
-                    return output;
-                }
+                materialize_left_identity(ri);
+                return output;
             }
-            auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
-                auto it = right_sv_index.find(ls[l]);
-                return it != right_sv_index.end() ? &it->second : nullptr;
+            auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
+                auto it = key_gid.find(ls[l]);
+                return it == key_gid.end() ? std::span<const std::size_t>{}
+                                           : grouped.matches(it->second);
             };
             auto [li, ri, kri] = build_indices_from_left_scan(lookup);
             materialize(li, ri, kri);
@@ -835,54 +983,51 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         const auto& left_ints = std::get<Column<std::int64_t>>(*left_keys[0]);
         const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
 
-        if (n_left < n_right) {
-            robin_hood::unordered_map<std::int64_t, std::vector<std::size_t>> left_int_index;
-            left_int_index.reserve(n_left);
-            for (std::size_t l = 0; l < n_left; ++l) {
-                left_int_index[left_ints[l]].push_back(l);
-            }
+        // Index the smaller side: key → dense gid, rows per gid in a CSR.
+        const bool build_left = n_left < n_right;
+        const auto* build_data = build_left ? left_ints.data() : right_ints.data();
+        const std::size_t n_build = build_left ? n_left : n_right;
 
-            auto for_each = [&](std::size_t r, auto&& emit_left_row) {
-                auto it = left_int_index.find(right_ints[r]);
-                if (it == left_int_index.end()) {
-                    return;
-                }
-                for (auto l : it->second) {
-                    emit_left_row(l);
-                }
+        robin_hood::unordered_map<std::int64_t, std::uint32_t> key_gid;
+        key_gid.reserve(n_build);
+        std::vector<std::uint32_t> row_gid(n_build);
+        std::uint32_t n_groups = 0;
+        for (std::size_t i = 0; i < n_build; ++i) {
+            auto [it, inserted] = key_gid.try_emplace(build_data[i], n_groups);
+            n_groups += inserted ? 1U : 0U;
+            row_gid[i] = it->second;
+        }
+        const GroupedRows grouped = group_rows_csr(row_gid, n_groups);
+
+        if (build_left) {
+            const auto* probe_data = right_ints.data();
+            auto lookup = [&](std::size_t r) -> std::span<const std::size_t> {
+                auto it = key_gid.find(probe_data[r]);
+                return it == key_gid.end() ? std::span<const std::size_t>{}
+                                           : grouped.matches(it->second);
             };
-
-            auto [li, ri, kri] = build_indices_from_right_scan(for_each);
+            auto [li, ri, kri] = build_indices_from_right_scan(lookup);
             materialize(li, ri, kri);
             return output;
         }
 
-        robin_hood::unordered_map<std::int64_t, std::vector<std::size_t>> right_int_index;
-        right_int_index.reserve(n_right);
-        bool unique_right = preserve_left_only;
-        for (std::size_t r = 0; r < n_right; ++r) {
-            auto& rows = right_int_index[right_ints[r]];
-            rows.push_back(r);
-            if (unique_right && rows.size() != 1) {
-                unique_right = false;
-            }
-        }
-
-        if (unique_right) {
+        const auto* probe_data = left_ints.data();
+        if (preserve_left_only && grouped.unique()) {
             std::vector<std::size_t> ri(n_left, kNull);
             for (std::size_t l = 0; l < n_left; ++l) {
-                auto it = right_int_index.find(left_ints[l]);
-                if (it != right_int_index.end()) {
-                    ri[l] = it->second[0];
+                auto it = key_gid.find(probe_data[l]);
+                if (it != key_gid.end()) {
+                    ri[l] = grouped.rows[grouped.offsets[it->second]];
                 }
             }
             materialize_left_identity(ri);
             return output;
         }
 
-        auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
-            auto it = right_int_index.find(left_ints[l]);
-            return it != right_int_index.end() ? &it->second : nullptr;
+        auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
+            auto it = key_gid.find(probe_data[l]);
+            return it == key_gid.end() ? std::span<const std::size_t>{}
+                                       : grouped.matches(it->second);
         };
         auto [li, ri, kri] = build_indices_from_left_scan(lookup);
         materialize(li, ri, kri);
@@ -1122,95 +1267,70 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     }
 
     // ── Generic multi-key fallback ───────────────────────────────────────
-    robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> right_index;
-    if (n_left < n_right) {
-        robin_hood::unordered_map<Key, std::vector<std::size_t>, KeyHash, KeyEq> left_index;
-        left_index.reserve(n_left);
-        for (std::size_t l = 0; l < n_left; ++l) {
-            if (left_key_is_null(l)) {
-                continue;  // never matchable, so never indexed
-            }
-            Key key;
-            key.values.reserve(keys.size());
-            for (const auto* col : left_keys) {
-                key.values.push_back(scalar_from_column(*col, l));
-            }
-            left_index[key].push_back(l);
+    // Hash and compare the key columns in place. The old shape boxed a Key —
+    // a heap-allocated vector<ScalarValue>, one std::visit hash per component,
+    // a string copy per string key — for EVERY row on both sides; that was
+    // the exact pattern already removed from group-by (see KeyRowIndex).
+    std::vector<KeyCol> left_cols;
+    std::vector<KeyCol> right_cols;
+    left_cols.reserve(keys.size());
+    right_cols.reserve(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        // Null-keyed rows are skipped before hashing (they match nothing), so
+        // the KeyCols carry no validity.
+        auto lc = make_key_col(*left_keys[i], nullptr);
+        auto rc = make_key_col(*right_keys[i], nullptr);
+        if (!lc.has_value() || !rc.has_value()) {
+            return std::unexpected("join: unsupported key column type for " + keys[i]);
         }
+        left_cols.push_back(*lc);
+        right_cols.push_back(*rc);
+    }
 
-        auto for_each = [&](std::size_t r, auto&& emit_left_row) {
-            if (right_key_is_null(r)) {
-                return;  // matches nothing, including another null
-            }
-            Key key;
-            key.values.reserve(keys.size());
-            for (const auto* col : right_keys) {
-                key.values.push_back(scalar_from_column(*col, r));
-            }
-            auto it = left_index.find(key);
-            if (it == left_index.end()) {
-                return;
-            }
-            for (auto l : it->second) {
-                emit_left_row(l);
-            }
-        };
+    const bool build_left = n_left < n_right;
+    const auto& build_cols = build_left ? left_cols : right_cols;
+    const auto& probe_cols = build_left ? right_cols : left_cols;
+    const auto& build_key_validity = build_left ? left_key_validity : right_key_validity;
+    const auto& probe_key_validity = build_left ? right_key_validity : left_key_validity;
+    const std::size_t n_build = build_left ? n_left : n_right;
 
-        auto [li, ri, kri] = build_indices_from_right_scan(for_each);
+    RowKeyIndex index;
+    index.reserve(n_build);
+    std::vector<std::uint32_t> row_gid(n_build, kNoGroup);
+    for (std::size_t i = 0; i < n_build; ++i) {
+        if (has_null_keys && row_key_is_null(build_key_validity, i)) {
+            continue;  // never matchable, so never indexed
+        }
+        row_gid[i] = index.find_or_insert(build_cols, i);
+    }
+    const GroupedRows grouped = group_rows_csr(row_gid, index.size());
+
+    auto lookup = [&](std::size_t row) -> std::span<const std::size_t> {
+        if (has_null_keys && row_key_is_null(probe_key_validity, row)) {
+            return {};  // matches nothing, including another null
+        }
+        const std::uint32_t gid = index.find(probe_cols, row, build_cols);
+        return gid == kNoGroup ? std::span<const std::size_t>{} : grouped.matches(gid);
+    };
+
+    if (build_left) {
+        auto [li, ri, kri] = build_indices_from_right_scan(lookup);
         materialize(li, ri, kri);
         return output;
     }
 
-    right_index.reserve(n_right);
-    bool unique_right = preserve_left_only;
-    for (std::size_t r = 0; r < n_right; ++r) {
-        if (right_key_is_null(r)) {
-            continue;  // never matchable, so never indexed
-        }
-        Key key;
-        key.values.reserve(keys.size());
-        for (const auto* col : right_keys) {
-            key.values.push_back(scalar_from_column(*col, r));
-        }
-        auto& rows = right_index[key];
-        rows.push_back(r);
-        if (unique_right && rows.size() != 1) {
-            unique_right = false;
-        }
-    }
-
-    if (unique_right) {
+    if (preserve_left_only && grouped.unique()) {
         std::vector<std::size_t> ri(n_left, kNull);
         for (std::size_t l = 0; l < n_left; ++l) {
-            if (left_key_is_null(l)) {
-                continue;  // stays kNull: unmatched
-            }
-            Key key;
-            key.values.reserve(keys.size());
-            for (const auto* col : left_keys) {
-                key.values.push_back(scalar_from_column(*col, l));
-            }
-            auto it = right_index.find(key);
-            if (it != right_index.end()) {
-                ri[l] = it->second[0];
+            const std::span<const std::size_t> matches = lookup(l);
+            if (!matches.empty()) {
+                ri[l] = matches.front();
             }
         }
         materialize_left_identity(ri);
         return output;
     }
 
-    auto lookup = [&](std::size_t l) -> const std::vector<std::size_t>* {
-        if (left_key_is_null(l)) {
-            return nullptr;  // matches nothing, including another null
-        }
-        Key key;
-        key.values.reserve(keys.size());
-        for (const auto* col : left_keys) {
-            key.values.push_back(scalar_from_column(*col, l));
-        }
-        auto it = right_index.find(key);
-        return it != right_index.end() ? &it->second : nullptr;
-    };
     auto [li, ri, kri] = build_indices_from_left_scan(lookup);
     materialize(li, ri, kri);
     return output;

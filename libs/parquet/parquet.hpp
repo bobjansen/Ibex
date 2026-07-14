@@ -453,18 +453,43 @@ inline auto build_categorical_column(const std::shared_ptr<arrow::ChunkedArray>&
     return ibex::Column<ibex::Categorical>{std::move(dict), std::move(codes)};
 }
 
+/// Decode straight into the column's flat char+offset buffers.
+///
+/// Going through a `std::vector<std::string>` first costs a heap allocation and
+/// a copy for every value that does not fit libstdc++'s 15-char SSO — which is
+/// every one of them for a column like c_comment (~73 chars) — and then
+/// `Column<std::string>`'s constructor copies all the bytes a second time and
+/// frees the strings again. Customer's four string columns are only 150k rows
+/// and were costing 24ms; that was ~100 cycles per value to move ~30 bytes.
+/// `GetView` hands back a view into Arrow's buffer, and push_back memcpy's it
+/// into the flat buffer once.
 inline void append_string_column(const std::shared_ptr<arrow::ChunkedArray>& chunked,
-                                 std::vector<std::string>& out) {
+                                 ibex::Column<std::string>& out) {
+    std::size_t rows = 0;
+    std::size_t bytes = 0;
+    for (const auto& chunk : chunked->chunks()) {
+        rows += static_cast<std::size_t>(chunk->length());
+        if (chunk->type_id() == arrow::Type::STRING) {
+            bytes += static_cast<std::size_t>(
+                std::static_pointer_cast<arrow::StringArray>(chunk)->total_values_length());
+        } else if (chunk->type_id() == arrow::Type::LARGE_STRING) {
+            bytes += static_cast<std::size_t>(
+                std::static_pointer_cast<arrow::LargeStringArray>(chunk)->total_values_length());
+        }
+    }
+    out.reserve(rows, bytes);
+
     for (const auto& chunk : chunked->chunks()) {
         if (chunk->type_id() == arrow::Type::STRING) {
             auto arr = std::static_pointer_cast<arrow::StringArray>(chunk);
             for (int64_t i = 0; i < arr->length(); ++i) {
-                out.push_back(arr->IsNull(i) ? std::string{} : arr->GetString(i));
+                // A null row still gets an empty string, as before.
+                out.push_back(arr->IsNull(i) ? std::string_view{} : arr->GetView(i));
             }
         } else if (chunk->type_id() == arrow::Type::LARGE_STRING) {
             auto arr = std::static_pointer_cast<arrow::LargeStringArray>(chunk);
             for (int64_t i = 0; i < arr->length(); ++i) {
-                out.push_back(arr->IsNull(i) ? std::string{} : arr->GetString(i));
+                out.push_back(arr->IsNull(i) ? std::string_view{} : arr->GetView(i));
             }
         } else {
             throw std::runtime_error("read_parquet: unsupported string column type");
@@ -589,10 +614,9 @@ inline void populate_from_arrow_table(const std::shared_ptr<arrow::Table>& table
             case arrow::Type::STRING:
             case arrow::Type::LARGE_STRING: {
                 // The string path already writes an empty string at a null row.
-                std::vector<std::string> values;
-                values.reserve(static_cast<std::size_t>(col->length()));
+                ibex::Column<std::string> values;
                 append_string_column(col, values);
-                emit(ibex::Column<std::string>{std::move(values)});
+                emit(std::move(values));
                 break;
             }
             case arrow::Type::DICTIONARY: {
@@ -1301,20 +1325,25 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
         }
         case arrow::Type::STRING:
         case arrow::Type::LARGE_STRING: {
-            std::vector<std::string> out;
+            // Straight into the flat buffers — see append_string_column. The
+            // ByteArray still points into the page's decompression buffer, so
+            // push_back's copy must happen here, before the next page read.
+            ibex::Column<std::string> out;
             out.reserve(output_rows);
             auto emitted = decode_physical_column<parquet::ByteArrayType>(
                 reader, leaf_index, selection, groups, [&](const parquet::ByteArray* value) {
                     validity.append(value != nullptr);
                     if (value == nullptr) {
-                        out.emplace_back();
+                        out.push_back(std::string_view{});
                     } else {
-                        out.emplace_back(reinterpret_cast<const char*>(value->ptr), value->len);
+                        out.push_back(
+                            std::string_view{reinterpret_cast<const char*>(
+                                                 value->ptr),  // NOLINT(*-reinterpret-cast)
+                                             value->len});
                     }
                 });
             verify(emitted);
-            entry.column = std::make_shared<ibex::runtime::ColumnValue>(
-                ibex::Column<std::string>{std::move(out)});
+            entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
             break;
         }
         case arrow::Type::DICTIONARY: {

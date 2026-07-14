@@ -25,6 +25,7 @@ set(IBEX_TEST_SOURCES
     test_interpreter.cpp
     test_interrupt.cpp
     test_codegen.cpp
+    test_filter_selection.cpp
     test_join.cpp
     test_lazy_table.cpp
     test_operator.cpp

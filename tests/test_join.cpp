@@ -1046,3 +1046,83 @@ TEST_CASE("non-equijoin: not-equal predicate", "[join][non-equijoin]") {
     auto out = interpret_expr("lhs join rhs on x != y;", tables);
     CHECK(out.rows() == 4);
 }
+
+// A right side above the chunked join's stream threshold (65,536 rows) makes
+// the operator materialize the left side, build its hash index there, and
+// probe with the right — the "swapped" path, which every other join test in
+// this file is too small to reach. It still owes the caller left-row order,
+// so the assertions below pin the exact emission order (left row ascending,
+// then right row ascending) against an independent reference, not just the
+// row count.
+TEST_CASE("join: swapped-mode inner join emits in left-row order", "[join]") {
+    constexpr std::size_t kLeftRows = 200;
+    constexpr std::size_t kRightRows = 70000;  // > kStreamRightThreshold
+    constexpr std::int64_t kLeftNullRow = 7;
+    constexpr std::int64_t kRightNullRow = 50;
+
+    // Left keys repeat (two rows per key), so each probe walks a chain rather
+    // than a single entry. Right keys span twice the left key range, so half of
+    // the probes miss.
+    std::vector<std::int64_t> left_keys;
+    std::vector<std::int64_t> left_vals;
+    left_keys.reserve(kLeftRows);
+    left_vals.reserve(kLeftRows);
+    runtime::ValidityBitmap left_validity(kLeftRows, true);
+    for (std::size_t i = 0; i < kLeftRows; ++i) {
+        left_keys.push_back(static_cast<std::int64_t>(i % 100));
+        left_vals.push_back(static_cast<std::int64_t>(1000 + i));
+    }
+    left_validity.set(static_cast<std::size_t>(kLeftNullRow), false);
+
+    std::vector<std::int64_t> right_keys;
+    std::vector<std::int64_t> right_vals;
+    right_keys.reserve(kRightRows);
+    right_vals.reserve(kRightRows);
+    runtime::ValidityBitmap right_validity(kRightRows, true);
+    for (std::size_t i = 0; i < kRightRows; ++i) {
+        right_keys.push_back(static_cast<std::int64_t>(i % 200));
+        right_vals.push_back(static_cast<std::int64_t>(i));
+    }
+    right_validity.set(static_cast<std::size_t>(kRightNullRow), false);
+
+    // Reference: for each left row in order, every matching right row in
+    // ascending order. A null key matches nothing on either side.
+    std::vector<std::vector<std::size_t>> rights_by_key(200);
+    for (std::size_t r = 0; r < kRightRows; ++r) {
+        if (r == static_cast<std::size_t>(kRightNullRow)) {
+            continue;
+        }
+        rights_by_key[static_cast<std::size_t>(right_keys[r])].push_back(r);
+    }
+    std::vector<std::int64_t> want_lval;
+    std::vector<std::int64_t> want_rval;
+    for (std::size_t l = 0; l < kLeftRows; ++l) {
+        if (l == static_cast<std::size_t>(kLeftNullRow)) {
+            continue;
+        }
+        for (std::size_t r : rights_by_key[static_cast<std::size_t>(left_keys[l])]) {
+            want_lval.push_back(left_vals[l]);
+            want_rval.push_back(right_vals[r]);
+        }
+    }
+    // Each matched left row pulls ~350 right rows: the chains are real.
+    REQUIRE(want_lval.size() > kLeftRows * 300);
+
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{std::move(left_keys)}, std::move(left_validity));
+    lhs.add_column("lval", Column<std::int64_t>{std::move(left_vals)});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{std::move(right_keys)}, std::move(right_validity));
+    rhs.add_column("rval", Column<std::int64_t>{std::move(right_vals)});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on id;", tables);
+
+    CHECK(out.rows() == want_lval.size());
+    CHECK(col_i64(out, "lval") == want_lval);
+    CHECK(col_i64(out, "rval") == want_rval);
+}

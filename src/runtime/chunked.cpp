@@ -2754,9 +2754,16 @@ class ChunkedInnerJoinOperator final : public Operator {
         return assemble_output(std::move(left_chunk), li.data(), ri.data(), total, li_identity);
     }
 
-    // Swapped mode: the hash index is on the left table. For each right
-    // row walk the left chain twice — first to count matches per left
-    // row, then to fill (li, ri) in left-scan order.
+    // Swapped mode: the hash index is on the left table, so the right table
+    // is the probe side, and output must still come out in left-row order.
+    //
+    // Phase 1 probes each right row once and remembers the head of every left
+    // chain it hit; phase 2 replays just those hits to fill (li, ri). The hash
+    // table is therefore probed once per right row for the whole join, not
+    // once per phase: a selective join over a large right side (q03 probes
+    // 3.2M lineitems to emit ~30K rows) no longer pays for 3.2M redundant
+    // cache-missing lookups. `hits` costs one entry per *matching* right row,
+    // so it is bounded by the output row count.
     auto emit_swapped() -> std::expected<Table, std::string> {
         const ColumnValue* rkey = right_.find(keys_->front());
         if (rkey == nullptr) {
@@ -2780,100 +2787,90 @@ class ChunkedInnerJoinOperator final : public Operator {
                               ? &*right_entry->validity
                               : nullptr;
 
-        // Phase 1: count.
-        auto walk_and_apply = [&](auto&& key_at, const auto& heads, auto&& apply) {
+        struct Hit {
+            std::size_t rrow;
+            std::size_t head;  // first left row in the chain for this key
+        };
+        std::vector<Hit> hits;
+
+        auto do_phase1 = [&](auto&& key_at, const auto& heads) {
             for (std::size_t r = 0; r < n_right; ++r) {
                 if (probe_is_null(r)) {
                     continue;
                 }
                 auto it = heads.find(key_at(r));
-                if (it == heads.end())
+                if (it == heads.end()) {
                     continue;
+                }
+                hits.push_back(Hit{r, it->second});
                 for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
-                    apply(cur, r);
+                    ++match_counts[cur];
+                    ++total;
                 }
             }
         };
-
-        auto do_phase1 = [&](auto&& key_at, const auto& heads) {
-            walk_and_apply(key_at, heads, [&](std::size_t lrow, std::size_t) {
-                ++match_counts[lrow];
-                ++total;
-            });
-        };
-
-        auto do_phase2 = [&](auto&& key_at, const auto& heads, std::vector<std::size_t>& li,
-                             std::vector<std::size_t>& ri) {
-            std::vector<std::size_t> offsets(n_left + 1, 0);
-            for (std::size_t l = 0; l < n_left; ++l) {
-                offsets[l + 1] = offsets[l] + match_counts[l];
-            }
-            li.assign(total, 0);
-            ri.assign(total, 0);
-            std::vector<std::size_t> next_off = offsets;
-            walk_and_apply(key_at, heads, [&](std::size_t lrow, std::size_t rrow) {
-                const std::size_t pos = next_off[lrow]++;
-                li[pos] = lrow;
-                ri[pos] = rrow;
-            });
-        };
-
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
 
         if (key_kind_ == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) { return data[r]; };
-            do_phase1(key_at, i64_heads_);
-            do_phase2(key_at, i64_heads_, li, ri);
+            do_phase1([&](std::size_t r) { return data[r]; }, i64_heads_);
         } else if (key_kind_ == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) { return data[r]; };
-            do_phase1(key_at, f64_heads_);
-            do_phase2(key_at, f64_heads_, li, ri);
+            do_phase1([&](std::size_t r) { return data[r]; }, f64_heads_);
         } else if (key_kind_ == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            auto key_at = [&](std::size_t r) { return (*col)[r]; };
-            do_phase1(key_at, bool_heads_);
-            do_phase2(key_at, bool_heads_, li, ri);
+            do_phase1([&](std::size_t r) { return (*col)[r]; }, bool_heads_);
         } else if (key_kind_ == ExprType::Date) {
             const auto* col = std::get_if<Column<Date>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) { return data[r]; };
-            do_phase1(key_at, date_heads_);
-            do_phase2(key_at, date_heads_, li, ri);
+            do_phase1([&](std::size_t r) { return data[r]; }, date_heads_);
         } else if (key_kind_ == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            auto key_at = [&](std::size_t r) { return data[r]; };
-            do_phase1(key_at, ts_heads_);
-            do_phase2(key_at, ts_heads_, li, ri);
+            do_phase1([&](std::size_t r) { return data[r]; }, ts_heads_);
         } else if (key_kind_ == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(rkey)) {
                 const auto& dict = c_cat->dictionary();
-                auto key_at = [&](std::size_t r) {
-                    return std::string_view{dict[static_cast<std::size_t>(c_cat->code_at(r))]};
-                };
-                do_phase1(key_at, string_heads_);
-                do_phase2(key_at, string_heads_, li, ri);
+                do_phase1(
+                    [&](std::size_t r) {
+                        return std::string_view{dict[static_cast<std::size_t>(c_cat->code_at(r))]};
+                    },
+                    string_heads_);
             } else if (const auto* c_str = std::get_if<Column<std::string>>(rkey)) {
-                auto key_at = [&](std::size_t r) { return (*c_str)[r]; };
-                do_phase1(key_at, string_heads_);
-                do_phase2(key_at, string_heads_, li, ri);
+                do_phase1([&](std::size_t r) { return (*c_str)[r]; }, string_heads_);
             } else {
                 return std::unexpected("inner join: right key type mismatch");
+            }
+        }
+
+        // Phase 2: replay the recorded hits. Right rows were visited in
+        // ascending order, so writing each match at the running offset of its
+        // left row yields (li, ri) sorted by left row, then by right row —
+        // the same order the two-probe version produced.
+        std::vector<std::size_t> li(total, 0);
+        std::vector<std::size_t> ri(total, 0);
+        std::vector<std::size_t> next_off(n_left, 0);
+        std::size_t acc = 0;
+        for (std::size_t l = 0; l < n_left; ++l) {
+            next_off[l] = acc;
+            acc += match_counts[l];
+        }
+        for (const Hit& hit : hits) {
+            for (std::size_t cur = hit.head; cur != kNil; cur = chain_next_[cur]) {
+                const std::size_t pos = next_off[cur]++;
+                li[pos] = cur;
+                ri[pos] = hit.rrow;
             }
         }
 

@@ -134,6 +134,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--out", default=str(SCRIPT_DIR / "results" / "ibex.tsv"))
+    parser.add_argument('queries', nargs='*')
     args = parser.parse_args()
 
     if not IBEX_BIN.exists():
@@ -144,7 +145,7 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    for qname in QUERY_NAMES:
+    for qname in args.queries or QUERY_NAMES:
         print(f"=== ibex {qname} ===", file=sys.stderr)
         durations = run_query(qname, args.warmup, args.iters)
         avg_ms = statistics.mean(durations)

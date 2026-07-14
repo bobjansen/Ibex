@@ -548,7 +548,10 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .min_args = 1,
             .max_args = 1,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
-                if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
+                // Bool casts to 0/1 — the standard SQL spelling for counting a
+                // predicate (`sum(Int64(is_not_null(x)))`, which is what
+                // `count(x)` lowers to).
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double || a[0] == ExprType::Bool) {
                     return ExprType::Int;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
@@ -557,6 +560,9 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                           const std::vector<ExprValue>& a) -> IV {
                 if (const auto* i = std::get_if<std::int64_t>(a.data())) {
                     return ExprValue{*i};
+                }
+                if (const auto* b = std::get_if<bool>(a.data())) {
+                    return ExprValue{static_cast<std::int64_t>(*b ? 1 : 0)};
                 }
                 if (const auto* d = std::get_if<double>(a.data())) {
                     if (*d != std::trunc(*d)) {

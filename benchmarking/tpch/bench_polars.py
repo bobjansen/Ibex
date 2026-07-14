@@ -165,8 +165,50 @@ def q19() -> pl.LazyFrame:
         )
     ).select(revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
 
+def q09() -> pl.LazyFrame:
+    part = scan("part").filter(pl.col("p_name").str.contains("green", literal=True)).select(["p_partkey"])
+    lineitem = scan("lineitem").select(
+        ["l_partkey", "l_suppkey", "l_orderkey", "l_quantity", "l_extendedprice", "l_discount"]
+    )
+    supplier = scan("supplier").select(["s_suppkey", "s_nationkey"])
+    partsupp = scan("partsupp").select(["ps_partkey", "ps_suppkey", "ps_supplycost"])
+    orders = scan("orders").select(["o_orderkey", "o_orderdate"])
+    nation = scan("nation").select(["n_nationkey", "n_name"])
+    return (
+        part.join(lineitem, left_on="p_partkey", right_on="l_partkey")
+        .join(supplier, left_on="l_suppkey", right_on="s_suppkey")
+        .join(partsupp, left_on=["p_partkey", "l_suppkey"], right_on=["ps_partkey", "ps_suppkey"])
+        .join(orders, left_on="l_orderkey", right_on="o_orderkey")
+        .join(nation, left_on="s_nationkey", right_on="n_nationkey")
+        .select(
+            nation=pl.col("n_name"),
+            o_year=pl.col("o_orderdate").dt.year(),
+            amount=pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
+            - pl.col("ps_supplycost") * pl.col("l_quantity"),
+        )
+        .group_by(["nation", "o_year"])
+        .agg(sum_profit=pl.col("amount").sum())
+        .sort(["nation", "o_year"], descending=[False, True])
+    )
 
-QUERIES = {"q01": q01, "q03": q03, "q05": q05, "q06": q06, "q10": q10, "q19": q19}
+def q13() -> pl.LazyFrame:
+    customer = scan("customer").select(["c_custkey"])
+    orders = (
+        scan("orders")
+        .filter(~pl.col("o_comment").str.contains("special.*requests"))
+        .select(["o_custkey", "o_orderkey"])
+    )
+    return (
+        customer.join(orders, left_on="c_custkey", right_on="o_custkey", how="left")
+        .group_by("c_custkey")
+        .agg(c_count=pl.col("o_orderkey").count())
+        .group_by("c_count")
+        .agg(custdist=pl.len())
+        .sort(["custdist", "c_count"], descending=[True, True])
+    )
+
+
+QUERIES = {"q01": q01, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q19": q19}
 
 
 def percentile(data: list[float], p: float) -> float:

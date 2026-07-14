@@ -27,7 +27,7 @@ IBEX_BIN = IBEX_ROOT / "build-release/tools/ibex"
 PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
 QUERIES_DIR = SCRIPT_DIR / "queries"
 
-QUERY_NAMES = ["q01", "q03", "q05", "q06", "q10", "q19"]
+QUERY_NAMES = ["q01", "q03", "q05", "q06", "q09", "q10", "q13", "q19"]
 
 TIME_RE = re.compile(r"^time:\s*([\d.]+)\s*(us|ms|s)\s*$")
 

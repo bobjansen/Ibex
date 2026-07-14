@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time the 6 implemented PDS-H queries against Polars, reading the same
+"""Time the 9 implemented PDS-H queries against Polars, reading the same
 Parquet tables benchmarking/tpch/queries/*.ibex use. Mirrors Ibex's own
 query semantics (same filters, join structure, and standard TPC-H
 qualification parameters) so the comparison is apples-to-apples.
@@ -208,7 +208,33 @@ def q13() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q19": q19}
+def q16() -> pl.LazyFrame:
+    excluded_suppliers = (
+        scan("supplier")
+        .filter(pl.col("s_comment").str.contains("Customer.*Complaints"))
+        .select("s_suppkey")
+    )
+    part = (
+        scan("part")
+        .filter(
+            (pl.col("p_brand") != "Brand#45")
+            & ~pl.col("p_type").str.starts_with("MEDIUM POLISHED")
+            & pl.col("p_size").is_in([49, 14, 23, 45, 19, 3, 36, 9])
+        )
+        .select(["p_partkey", "p_brand", "p_type", "p_size"])
+    )
+    partsupp = scan("partsupp").select(["ps_partkey", "ps_suppkey"])
+    return (
+        part.join(partsupp, left_on="p_partkey", right_on="ps_partkey")
+        .join(excluded_suppliers, left_on="ps_suppkey", right_on="s_suppkey", how="anti")
+        .unique(subset=["p_brand", "p_type", "p_size", "ps_suppkey"])
+        .group_by(["p_brand", "p_type", "p_size"])
+        .agg(supplier_cnt=pl.len())
+        .sort(["supplier_cnt", "p_brand", "p_type", "p_size"], descending=[True, False, False, False])
+    )
+
+
+QUERIES = {"q01": q01, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q19": q19}
 
 
 def percentile(data: list[float], p: float) -> float:

@@ -1,0 +1,25 @@
+// Proposed TPC-H Q20 — nested IN plus correlated scalar SUM.
+// Qualification parameters: forest, 1994-01-01, CANADA.
+import "parquet";
+
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+
+let result = (supplier join nation on s_nationkey == n_nationkey)[
+    filter n_name == "CANADA" && s_suppkey in (partsupp[
+        filter ps_partkey in (part[
+            filter like(p_name, "forest%"), select { p_partkey }
+        ]) && ps_availqty > scalar(lineitem[
+            filter l_partkey == outer(ps_partkey) && l_suppkey == outer(ps_suppkey)
+                && l_shipdate >= date"1994-01-01" && l_shipdate < date"1995-01-01",
+            select { required_quantity = 0.5 * sum(l_quantity) }
+        ]),
+        select { ps_suppkey }
+    ]),
+    select { s_name, s_address },
+    order { s_name }
+];
+result;

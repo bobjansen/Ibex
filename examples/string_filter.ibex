@@ -1,0 +1,54 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  String pattern matching with like(value, pattern)
+//
+//  like() is SQL-LIKE matching over the WHOLE string:
+//    %  matches zero or more characters
+//    _  matches exactly one character (one UTF-8 code point)
+//    \  escapes the next character, so % and _ can be matched literally
+//
+//  Matching is case-sensitive. There is no infix LIKE keyword — NOT LIKE is
+//  spelled with the ordinary ! operator.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let parts = Table {
+    p_name      = ["forest green plate", "midnight blue box", "green", "GREEN", "sea_green"],
+    p_type      = ["SMALL BRASS", "MEDIUM COPPER", "LARGE BRASS", "PROMO PLATED TIN", "TIN"],
+    p_container = ["SM CASE", "MED BAG", "LG BOX", "SM BOX", "JUMBO PKG"],
+    p_size      = [1, 2, 3, 4, 5]
+};
+
+print("substring — anything containing 'green' (case-sensitive: GREEN does not match):");
+parts[filter like(p_name, "%green%")];
+
+print("suffix — types ending in BRASS:");
+parts[filter like(p_type, "%BRASS")];
+
+print("prefix — containers starting with 'SM ':");
+parts[filter like(p_container, "SM %")];
+
+print("negation — everything that is NOT a promotional type:");
+parts[filter !like(p_type, "PROMO%")];
+
+print("ordered fragments — 'SM' somewhere, then 'BOX' later:");
+parts[filter like(p_container, "%SM%BOX%")];
+
+print("_ matches exactly one character:");
+parts[filter like(p_name, "sea_gree_")];
+
+print("an escaped _ matches only a literal underscore:");
+parts[filter like(p_name, "sea\\_green")];
+
+print("like() returns Bool, so it is also a field expression:");
+parts[update {
+    is_green = like(p_name, "%green%"),
+    is_promo = like(p_type, "PROMO%")
+}][select { p_name, p_type, is_green, is_promo }];
+
+print("and it composes with the other predicates:");
+parts[filter like(p_name, "%green%") && p_size < 3];
+
+// The pattern can be any String expression, not just a literal — a scalar
+// binding, or even a per-row pattern column.
+let needle = "%BRASS";
+print("pattern from a scalar binding:");
+parts[filter like(p_type, needle), select { p_name, p_type }];

@@ -28,6 +28,7 @@ PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
 # tolerance since the official answers are rounded to 2 decimal places)
 IMPLEMENTED = {
     "q1": "q01",
+    "q2": "q02",
     "q3": "q03",
     "q5": "q05",
     "q6": "q06",

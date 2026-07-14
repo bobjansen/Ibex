@@ -1,0 +1,58 @@
+// Correlated scalar subqueries: `scalar(...)` + `outer(column)` (SPEC 5.7).
+//
+// A subquery in a `filter` compares each outer row against an aggregate of the
+// inner rows that relate to *it*. This is TPC-H Q2's shape, in miniature: keep
+// every part's cheapest supplier.
+
+let parts = Table {
+    p_partkey = [1, 2, 3, 4],
+    p_name    = ["nut", "bolt", "screw", "washer"]
+};
+
+let supply = Table {
+    ps_partkey    = [1, 1, 2, 2, 3, 3, 4],
+    ps_suppkey    = [10, 11, 10, 12, 11, 12, 10],
+    ps_supplycost = [5.0, 3.0, 9.0, 9.0, 1.0, 7.0, 2.0],
+    ps_region     = ["EU", "EU", "EU", "EU", "EU", "EU", "US"]
+};
+
+// `ps_partkey` inside the subquery is the subquery's own column;
+// `outer(p_partkey)` reaches out to the row being tested. Names never leak
+// across the boundary implicitly, so the two can be told apart at a glance.
+let cheapest = (
+    parts join supply[select { p_partkey = ps_partkey, ps_suppkey, ps_supplycost }] on p_partkey
+)[
+    filter ps_supplycost == scalar(
+        supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_supplycost) }]
+    ),
+    order { p_partkey, ps_suppkey }
+];
+
+// Part 2's minimum (9.0) is offered by two suppliers, so both rows survive.
+// Nothing is added to the schema: a filter returns the rows it kept, not a
+// wider table.
+print("cheapest supplier per part:");
+print(cheapest);
+
+// The subquery may carry its own local predicates alongside the capture. Here
+// the minimum ranges over EUROPEAN supply only — and part 4, whose sole
+// supplier is US, has no European minimum at all. Its scalar is null, the
+// comparison against null is never true, and the row drops. That is SQL's
+// scalar-subquery behaviour, and it falls out of the left join the subquery
+// decorrelates into.
+let cheapest_european = (
+    parts join supply[
+        select { p_partkey = ps_partkey, ps_suppkey, ps_supplycost, ps_region }
+    ] on p_partkey
+)[
+    filter ps_supplycost == scalar(
+        supply[
+            filter ps_partkey == outer(p_partkey) && ps_region == "EU",
+            select { m = min(ps_supplycost) }
+        ]
+    ),
+    order { p_partkey, ps_suppkey }
+];
+
+print("cheapest EUROPEAN supplier per part — part 4 drops entirely:");
+print(cheapest_european);

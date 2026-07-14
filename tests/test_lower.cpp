@@ -1,10 +1,14 @@
+#include <ibex/ir/schema.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -759,5 +763,232 @@ Stream {
         const auto* str = std::get_if<std::string>(&lit->value);
         REQUIRE(str != nullptr);
         REQUIRE(*str == expected[i]);
+    }
+}
+
+namespace {
+
+// Sources with a statically known schema: a correlated subquery has to name the
+// columns it keeps, so it needs one (SPEC 5.7).
+constexpr const char* kCorrelatedSources = R"(
+let parts = Table { p_partkey = [1, 2], p_name = ["nut", "bolt"] };
+let supply = Table { ps_partkey = [1, 1], ps_cost = [5.0, 3.0] };
+)";
+
+auto lower_source(const std::string& source) -> parser::LowerResult {
+    auto program = require_parse(source.c_str());
+    return parser::lower(program);
+}
+
+/// Every node of `root`, so a test can assert on what the plan does and does
+/// not contain without depending on how canonicalize fused it.
+void collect_kinds(const ir::Node& node, std::vector<ir::NodeKind>& out) {
+    out.push_back(node.kind());
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_kinds(*child, out);
+        }
+    }
+}
+
+auto find_join(const ir::Node& node) -> const ir::JoinNode* {
+    if (const auto* join = dynamic_cast<const ir::JoinNode*>(&node)) {
+        return join;
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            if (const auto* found = find_join(*child)) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+TEST_CASE("Lower decorrelates a scalar subquery into an aggregate plus a left join") {
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               R"(
+parts[filter p_partkey == scalar(
+    supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+)];
+)");
+    REQUIRE(result.has_value());
+
+    // The correlation is gone: what is left is ordinary relational algebra.
+    std::vector<ir::NodeKind> kinds;
+    collect_kinds(*result.value(), kinds);
+    const auto has = [&](ir::NodeKind kind) {
+        return std::ranges::find(kinds, kind) != kinds.end();
+    };
+    REQUIRE(has(ir::NodeKind::Join));
+    REQUIRE(has(ir::NodeKind::Aggregate));
+
+    // The subquery runs ONCE, as a grouped aggregate — never per outer row.
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Left);
+    REQUIRE(join->keys() == std::vector<std::string>{"p_partkey"});
+    REQUIRE(join->predicate() == std::nullopt);  // a theta join would be a nested loop
+
+    // Right side: Rename(ps_partkey -> p_partkey) over the aggregate.
+    const auto* rename = as_node<ir::RenameNode>(join->children()[1].get());
+    REQUIRE(rename != nullptr);
+    REQUIRE(rename->renames().size() == 1);
+    REQUIRE(rename->renames()[0].old_name == "ps_partkey");
+    REQUIRE(rename->renames()[0].new_name == "p_partkey");
+
+    const auto* aggregate = as_node<ir::AggregateNode>(rename->children()[0].get());
+    REQUIRE(aggregate != nullptr);
+    REQUIRE(aggregate->group_by().size() == 1);
+    REQUIRE(aggregate->group_by()[0].name == "ps_partkey");
+    REQUIRE(aggregate->aggregations().size() == 1);
+    REQUIRE(aggregate->aggregations()[0].func == ir::AggFunc::Min);
+    REQUIRE(aggregate->aggregations()[0].column.name == "ps_cost");
+    REQUIRE(aggregate->aggregations()[0].alias == "__ibex_scalar_0");
+}
+
+TEST_CASE("Lower projects the subquery's generated column back off") {
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               R"(
+parts[filter p_partkey == scalar(
+    supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+)];
+)");
+    REQUIRE(result.has_value());
+
+    // A filter returns the rows it kept, not a wider table: the plan ends in a
+    // projection back to the outer query's columns, with no trace of the
+    // generated one. (Canonicalize fuses the Project onto the Filter below it.)
+    const auto* fused = as_node<ir::FilterProjectNode>(result->get());
+    REQUIRE(fused != nullptr);
+    std::vector<std::string> kept;
+    for (const auto& column : fused->columns()) {
+        kept.push_back(column.name);
+    }
+    REQUIRE(kept == std::vector<std::string>{"p_partkey", "p_name"});
+}
+
+TEST_CASE("Lower gives each scalar subquery in a filter its own generated column") {
+    auto result = lower_source(std::string(kCorrelatedSources) +
+                               R"(
+parts[filter
+    p_partkey == scalar(supply[filter ps_partkey == outer(p_partkey), select { a = min(ps_cost) }])
+    && p_partkey != scalar(supply[filter ps_partkey == outer(p_partkey), select { b = max(ps_cost) }])
+];
+)");
+    REQUIRE(result.has_value());
+
+    std::vector<std::string> aliases;
+    const auto walk = [&](auto&& self, const ir::Node& node) -> void {
+        if (const auto* aggregate = dynamic_cast<const ir::AggregateNode*>(&node)) {
+            for (const auto& spec : aggregate->aggregations()) {
+                aliases.push_back(spec.alias);
+            }
+        }
+        for (const auto& child : node.children()) {
+            if (child != nullptr) {
+                self(self, *child);
+            }
+        }
+    };
+    walk(walk, *result.value());
+    std::ranges::sort(aliases);
+    REQUIRE(aliases == std::vector<std::string>{"__ibex_scalar_0", "__ibex_scalar_1"});
+}
+
+TEST_CASE("Lower avoids a generated name the enclosing query already uses") {
+    auto result = lower_source(R"(
+let parts = Table { p_partkey = [1, 2], __ibex_scalar_0 = [7, 8] };
+let supply = Table { ps_partkey = [1, 1], ps_cost = [5.0, 3.0] };
+parts[filter p_partkey == scalar(
+    supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+)];
+)");
+    REQUIRE(result.has_value());
+
+    // The user's own __ibex_scalar_0 is kept, so the subquery had to land in
+    // __ibex_scalar_1 instead of silently colliding with it.
+    const auto* fused = as_node<ir::FilterProjectNode>(result->get());
+    REQUIRE(fused != nullptr);
+    std::vector<std::string> kept;
+    for (const auto& column : fused->columns()) {
+        kept.push_back(column.name);
+    }
+    REQUIRE(kept == std::vector<std::string>{"p_partkey", "__ibex_scalar_0"});
+
+    const auto* join = find_join(*result.value());
+    REQUIRE(join != nullptr);
+    const auto* rename = as_node<ir::RenameNode>(join->children()[1].get());
+    REQUIRE(rename != nullptr);
+    const auto* aggregate = as_node<ir::AggregateNode>(rename->children()[0].get());
+    REQUIRE(aggregate != nullptr);
+    REQUIRE(aggregate->aggregations()[0].alias == "__ibex_scalar_1");
+}
+
+TEST_CASE("Lower rejects unsupported correlated-subquery shapes") {
+    const auto lower_filter = [](const std::string& predicate) {
+        return lower_source(std::string(kCorrelatedSources) + "parts[filter " + predicate + "];");
+    };
+    const auto subquery = [](const char* capture, const char* projection) {
+        return std::string("scalar(supply[filter ") + capture + ", select { " + projection + " }])";
+    };
+
+    SECTION("outer() outside a subquery") {
+        auto result = lower_filter("p_partkey == outer(p_partkey)");
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("only valid inside a scalar") != std::string::npos);
+    }
+    SECTION("a capture must be an equality") {
+        auto result = lower_filter("p_partkey == " +
+                                   subquery("ps_partkey > outer(p_partkey)", "m = min(ps_cost)"));
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("must be an equality") != std::string::npos);
+    }
+    SECTION("the subquery must capture something") {
+        auto result = lower_filter("p_partkey == " + subquery("ps_cost > 0.0", "m = min(ps_cost)"));
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("uncorrelated") != std::string::npos);
+    }
+    SECTION("the subquery must select exactly one column") {
+        auto result =
+            lower_filter("p_partkey == " + subquery("ps_partkey == outer(p_partkey)",
+                                                    "m = min(ps_cost), n = max(ps_cost)"));
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("exactly one column") != std::string::npos);
+    }
+    SECTION("the selected column must be an aggregate") {
+        auto result = lower_filter("p_partkey == " +
+                                   subquery("ps_partkey == outer(p_partkey)", "m = ps_cost"));
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("must be an aggregate") != std::string::npos);
+    }
+    SECTION("the captured column must exist in the enclosing query") {
+        auto result = lower_filter("p_partkey == " +
+                                   subquery("ps_partkey == outer(nope)", "m = min(ps_cost)"));
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("outer(nope)") != std::string::npos);
+    }
+    SECTION("the subquery must be one whole side of the comparison") {
+        auto result = lower_filter("p_partkey == 1 + " +
+                                   subquery("ps_partkey == outer(p_partkey)", "m = min(ps_cost)"));
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("one whole side") != std::string::npos);
+    }
+    SECTION("a subquery is not allowed outside a filter") {
+        auto result =
+            lower_source(std::string(kCorrelatedSources) + "parts[update { x = " +
+                         subquery("ps_partkey == outer(p_partkey)", "m = min(ps_cost)") + " }];");
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("comparison in a filter") != std::string::npos);
+    }
+    SECTION("the enclosing query's schema must be known") {
+        // `unknown` is a bare scan: no schema, so the columns to keep cannot be named.
+        auto result =
+            lower_source(std::string(kCorrelatedSources) + "unknown[filter p_partkey == " +
+                         subquery("ps_partkey == outer(p_partkey)", "m = min(ps_cost)") + "];");
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("not statically known") != std::string::npos);
     }
 }

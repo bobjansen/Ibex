@@ -46,6 +46,43 @@ def q01() -> pl.LazyFrame:
     )
 
 
+def q02() -> pl.LazyFrame:
+    # The correlated subquery, decorrelated the same way Ibex lowers it: the
+    # minimum European supply cost per part, computed once and joined back.
+    european_supply = (
+        scan("partsupp")
+        .join(scan("supplier"), left_on="ps_suppkey", right_on="s_suppkey")
+        .join(scan("nation"), left_on="s_nationkey", right_on="n_nationkey")
+        .join(scan("region"), left_on="n_regionkey", right_on="r_regionkey")
+        .filter(pl.col("r_name") == "EUROPE")
+    )
+    minimum_cost = european_supply.group_by("ps_partkey").agg(
+        min_supplycost=pl.min("ps_supplycost")
+    )
+    return (
+        scan("part")
+        .filter((pl.col("p_size") == 15) & pl.col("p_type").str.ends_with("BRASS"))
+        .join(european_supply, left_on="p_partkey", right_on="ps_partkey")
+        .join(minimum_cost, left_on="p_partkey", right_on="ps_partkey")
+        .filter(pl.col("ps_supplycost") == pl.col("min_supplycost"))
+        .select(
+            "s_acctbal",
+            "s_name",
+            "n_name",
+            "p_partkey",
+            "p_mfgr",
+            "s_address",
+            "s_phone",
+            "s_comment",
+        )
+        .sort(
+            ["s_acctbal", "n_name", "s_name", "p_partkey"],
+            descending=[True, False, False, False],
+        )
+        .head(100)
+    )
+
+
 def q03() -> pl.LazyFrame:
     customer = scan("customer").filter(pl.col("c_mktsegment") == "BUILDING").select("c_custkey")
     orders = (
@@ -234,7 +271,7 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q19": q19}
+QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q19": q19}
 
 
 def percentile(data: list[float], p: float) -> float:

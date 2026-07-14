@@ -1,0 +1,24 @@
+// A correlated scalar subquery decorrelates into aggregate + rename + left
+// join, so the interpreter and the emitted C++ must agree on it. Part 2's
+// minimum is tied (both suppliers survive) and part 4's only supplier is US,
+// so its EU subquery finds no group at all and the null comparison drops it.
+let parts = Table {
+    p_partkey = [1, 2, 3, 4],
+    p_name    = ["nut", "bolt", "screw", "washer"]
+};
+let supply = Table {
+    ps_partkey = [1, 1, 2, 2, 3, 3, 4],
+    ps_suppkey = [10, 11, 10, 12, 11, 12, 10],
+    ps_cost    = [5.0, 3.0, 9.0, 9.0, 1.0, 7.0, 2.0],
+    ps_region  = ["EU", "EU", "EU", "EU", "EU", "EU", "US"]
+};
+(parts join supply[
+    select { p_partkey = ps_partkey, ps_suppkey, ps_cost, ps_region }
+] on p_partkey)[
+    filter ps_cost == scalar(
+        supply[
+            filter ps_partkey == outer(p_partkey) && ps_region == "EU",
+            select { m = min(ps_cost) }
+        ]
+    )
+][order { p_partkey, ps_suppkey }];

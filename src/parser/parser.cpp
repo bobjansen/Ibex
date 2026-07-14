@@ -849,6 +849,29 @@ class Parser {
         return keys;
     }
     auto parse_primary() -> ExprPtr {
+        // `outer(column)` — a correlated-subquery capture. `outer` is a reserved
+        // word (the `outer join` operator), so it never reaches the Identifier
+        // branch below; only the call form is an expression, and because the
+        // word is reserved no user function can produce a CallExpr with this
+        // callee. See SPEC.md Section 5.10.
+        if (check(TokenKind::KeywordOuter) && peek_next().kind == TokenKind::LParen) {
+            advance();  // 'outer'
+            advance();  // '('
+            auto column = consume_column_identifier("expected a column name in outer(...)");
+            if (!column.has_value()) {
+                return nullptr;
+            }
+            if (!consume(TokenKind::RParen, "expected ')' after outer(column)")) {
+                return nullptr;
+            }
+            auto arg = std::make_unique<Expr>();
+            arg->node = IdentifierExpr{.name = std::move(*column)};
+            auto expr = std::make_unique<Expr>();
+            std::vector<ExprPtr> args;
+            args.push_back(std::move(arg));
+            expr->node = CallExpr{.callee = "outer", .args = std::move(args), .named_args = {}};
+            return expr;
+        }
         if (match(TokenKind::Identifier)) {
             std::string name(previous().lexeme);
             if ((name == "date" || name == "timestamp" || name == "ts") &&

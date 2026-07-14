@@ -1468,3 +1468,49 @@ TEST_CASE("Parse update = expr with argument") {
     REQUIRE(call != nullptr);
     REQUIRE(call->callee == "gen_prices");
 }
+
+TEST_CASE("Parse correlated subquery: scalar(...) holding an outer(...) capture") {
+    const char* source =
+        "supply[filter cost == scalar(t[filter k == outer(j), select { m = min(v) }])];";
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    const auto& expr_stmt = std::get<ExprStmt>(result->statements.front());
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& filter = std::get<FilterClause>(block.clauses[0]);
+
+    // cost == scalar(...)
+    const auto& comparison = require_binary(require_expr(filter.predicate), BinaryOp::Eq);
+    const auto* subquery = std::get_if<CallExpr>(&comparison.right->node);
+    REQUIRE(subquery != nullptr);
+    REQUIRE(subquery->callee == "scalar");
+    REQUIRE(subquery->args.size() == 1);
+
+    // The argument is the inner table expression, not a scalar expression.
+    const auto& inner = require_block(require_expr(subquery->args[0]));
+    const auto& capture = std::get<FilterClause>(inner.clauses[0]);
+
+    // k == outer(j)
+    const auto& equality = require_binary(require_expr(capture.predicate), BinaryOp::Eq);
+    const auto* outer_call = std::get_if<CallExpr>(&equality.right->node);
+    REQUIRE(outer_call != nullptr);
+    REQUIRE(outer_call->callee == "outer");
+    REQUIRE(outer_call->args.size() == 1);
+    const auto* captured = std::get_if<IdentifierExpr>(&outer_call->args[0]->node);
+    REQUIRE(captured != nullptr);
+    REQUIRE(captured->name == "j");
+}
+
+TEST_CASE("Parse outer(...) capture does not shadow the outer join operator") {
+    // `outer` stays a join keyword; only `outer(` in operand position is a capture.
+    auto joined = parse("a outer join b on k;");
+    REQUIRE(joined.has_value());
+    const auto& expr_stmt = std::get<ExprStmt>(joined->statements.front());
+    const auto* join = std::get_if<JoinExpr>(&require_expr(expr_stmt.expr).node);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind == JoinKind::Outer);
+}
+
+TEST_CASE("Parse outer(...) capture requires a bare column name") {
+    REQUIRE_FALSE(parse("t[filter k == outer(1 + 2)];").has_value());
+    REQUIRE_FALSE(parse("t[filter k == outer()];").has_value());
+}

@@ -3670,6 +3670,19 @@ class Lowerer {
             final_columns.push_back(field.name);
         }
 
+        // An aggregate whose select field wraps its aggregates in an expression
+        // (`sum(x) / 7.0`) computes them into `_aggN` temps and combines those in
+        // a trailing update. Those temps are internal, so the result has to be
+        // projected back to what the select actually named. Decide that here:
+        // both `updates` and `group_by` are moved from below, and reading
+        // `updates` after its move is what used to leak `_aggN` to the caller.
+        const bool needs_project = !updates.empty();
+        std::vector<std::string> group_by_names;
+        group_by_names.reserve(group_by.size());
+        for (const auto& key : group_by) {
+            group_by_names.push_back(key.name);
+        }
+
         ir::NodePtr node = std::move(child);
         if (!preagg_updates.empty()) {
             auto preagg = builder_.update(std::move(preagg_updates));
@@ -3680,16 +3693,23 @@ class Lowerer {
         auto aggregate = builder_.aggregate(std::move(group_by), std::move(aggs));
         aggregate->add_child(std::move(node));
         node = std::move(aggregate);
-        if (!updates.empty()) {
+        if (needs_project) {
             auto update = builder_.update(std::move(updates));
             update->add_child(std::move(node));
             node = std::move(update);
         }
 
-        const bool needs_project = !updates.empty();
         if (needs_project) {
+            // The group keys survive the projection whether or not the select
+            // named them, and they come first — the same shape an aggregate with
+            // no trailing update produces.
             std::vector<ir::ColumnRef> columns;
-            columns.reserve(final_columns.size());
+            columns.reserve(group_by_names.size() + final_columns.size());
+            for (const auto& key : group_by_names) {
+                if (std::ranges::find(final_columns, key) == final_columns.end()) {
+                    columns.push_back(ir::ColumnRef{.name = key});
+                }
+            }
             for (const auto& name : final_columns) {
                 columns.push_back(ir::ColumnRef{.name = name});
             }

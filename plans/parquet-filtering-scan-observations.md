@@ -340,6 +340,12 @@ above 30 ms. End-to-end:
 
 Decoding rejected values traded away the only useful part of `Skip`. Rejected.
 
+> **Re-run and re-rejected on 2026-07-14** — see the follow-up at the end of this
+> document. If you are about to write a decoder that `ReadBatch`es a block into a
+> scratch buffer and gathers the selection out of it, it has now been measured
+> twice, and the second time it was **slower the denser the selection got**. Read
+> that section first.
+
 ### 2. Direct numeric dictionary expansion
 
 Hypothesis: for fully dictionary-encoded required numeric columns, call
@@ -795,3 +801,87 @@ doing single-threaded.
 Polars-st does all of q13 in 164ms. **Decode is no longer the dominant term** —
 the join and the group-by together are 147ms. Single-threaded work should go
 there next, not into the scan.
+
+## Follow-up 2026-07-14 (4): rejected experiment 1, re-run and re-rejected
+
+A working tree turned up carrying `decode_selected_numeric_column` — a selected
+numeric decoder that `ReadBatch`es 64K values into a scratch buffer and gathers
+the selection's offsets out of each batch, taking that path whenever the chunk
+statistics prove the row group null-free and the selection is not extremely
+sparse. That is **rejected experiment 1 above**, rebuilt: "a required-column loop
+that decoded 64K values and iterated only selection offsets falling in each
+batch." It was measured again, from scratch, and rejected again for the same
+reason. Recording it here because the entry above evidently was not enough to
+stop it being written a second time.
+
+It was correct — 1097/1097 tests, all 9 official SF-1 answers — so what follows
+is a performance verdict only.
+
+### The dense path was taken by every PDS-H scan, not just dense ones
+
+The guard was `group_rows / group_selected > kDirectDecodeBatchRows` (65536).
+`lineitem.parquet` has 6 row groups of 1,048,576 rows, so that declines the
+dense path only below **~16 selected rows per row group**. Every filtered scan
+in the suite — down to a 0.009%-selective needle — took it. The guard reads like
+a sparsity check and is not one.
+
+### Whole-query A/B says nothing, and that is the first finding
+
+Plugin-only A/B (base = the parent commit's `parquet.hpp`, identical REPL binary
+and runtime; interleaved, `taskset`-pinned, min-of-5 x 3 repeats):
+
+geomean **+0.8%** — and *every* query's delta was smaller than that query's own
+repeat-to-repeat spread on the base side (q10: delta +1.6%, base spread 7.3%).
+A whole-query harness on this box cannot see a decoder change at all; the join
+and group-by noise buries it. Isolate the scan statement or do not measure.
+
+### Isolated scan: the dense path never wins, and loses where it should win most
+
+`lineitem[filter <pred>, select { r = sum(l_extendedprice) }]` — payload decoded
+under a selection. Interleaved, pinned, min-of-10 per repeat, 3 repeats:
+
+| predicate selectivity | Skip path | dense + gather | delta |
+|---|---:|---:|---:|
+| 72.3% (`l_shipdate >= 1994-01-01`) | 58.0 ms | 59.9 ms | **+3.2%** |
+| 24.6% (`l_returnflag == "R"`) | 34.1 ms | 32.7 ms | -4.2% |
+| 1.9% (q06's predicate) | 39.9 ms | 39.5 ms | -1.2% |
+| 0.009% (558 rows) | 37.2 ms | 36.9 ms | -0.8% |
+
+The middle three are inside the drift (a separate set put the same three at
+-1.7%, +5.4%, +4.6%). The one delta that reproduced across both sets is the
+**densest** selection, and it is a **loss** (+8.8% in the first set, +3.2% here).
+
+The mechanism is the same one that sank the original experiment, and the shape of
+the table explains why there is no threshold to tune:
+
+- At every selectivity tested, the surviving rows still touch **every page**, so
+  both paths decode essentially every value. Skip's whole-page skip — its only
+  real saving — almost never fires on a scattered predicate.
+- The dense path therefore adds a 64K-value scratch write plus a gather read on
+  top of the same decode. That cost scales with the number of values decoded,
+  which is why the loss is **largest at 72%** and vanishes into noise at 1.9%.
+
+So the payoff curve runs the wrong way: the path is a wash exactly where it is
+cheap and a loss exactly where it is exercised. A threshold that never loses is a
+threshold that never fires. Reverted.
+
+### The row-group batch decoder in the same tree, also a dead end
+
+The tree also carried a `BatchColumnDecodeFn` on `LazyTable` (decode one row
+group, apply the predicate to it, then decode that batch's payload with a
+batch-local selection) with a `project_where` path to drive it. It was wired but
+**disabled** — `read_parquet_lazy` passed `batches = 0` — with the author's note
+that enabling it "reopens Arrow column readers and loses their page/decoder
+state, which is materially slower on mixed pages." That is rejected experiment 3's
+finding again ("the custom path lost Apache's decoder reuse"). Reverted with the
+rest; batch-local predicate evaluation stays listed under productive directions,
+but it only pays *inside* the decoder, not by re-entering it per row group.
+
+### What this does not touch
+
+"Selection-aware decoding inside the encoding decoder" (productive direction 1)
+is still the open lever and is still unattempted. Every rejection so far,
+including this one, has been an attempt to get selection-awareness by
+rearranging Apache's **public** API — `Skip`/`ReadBatch`/page readers — from
+above. Four attempts, four rejections, one mechanism: from above the decoder you
+can only choose to decode values you do not want, or to pay per value you do.

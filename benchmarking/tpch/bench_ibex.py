@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time the 10 implemented PDS-H queries in a single warm Ibex process.
+"""Time the 11 implemented PDS-H queries in a single warm Ibex process.
 
 `ibex_eval` starts a fresh process per invocation, which pays Arrow/AWS-SDK
 dynamic-library load cost (~1-2s of `sys` time) on every single run -- not
@@ -27,7 +27,7 @@ IBEX_BIN = IBEX_ROOT / "build-release/tools/ibex"
 PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
 QUERIES_DIR = SCRIPT_DIR / "queries"
 
-QUERY_NAMES = ["q01", "q02", "q03", "q05", "q06", "q09", "q10", "q13", "q16", "q19"]
+QUERY_NAMES = ["q01", "q02", "q03", "q05", "q06", "q09", "q10", "q13", "q16", "q17", "q19"]
 
 TIME_RE = re.compile(r"^time:\s*([\d.]+)\s*(us|ms|s)\s*$")
 

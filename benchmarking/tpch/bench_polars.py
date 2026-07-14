@@ -173,6 +173,26 @@ def q10() -> pl.LazyFrame:
     )
 
 
+def q17() -> pl.LazyFrame:
+    # The correlated subquery, decorrelated the same way Ibex lowers it: 20% of
+    # each part's average order quantity, computed once and joined back. The
+    # average is over ALL of a part's lineitem rows, not just the Brand#23
+    # MED BOX ones, so it is computed before the part filter is applied.
+    lineitem = scan("lineitem")
+    quantity_limit = lineitem.group_by("l_partkey").agg(
+        quantity_limit=0.2 * pl.mean("l_quantity")
+    )
+    part = scan("part").filter(
+        (pl.col("p_brand") == "Brand#23") & (pl.col("p_container") == "MED BOX")
+    )
+    return (
+        lineitem.join(part, left_on="l_partkey", right_on="p_partkey")
+        .join(quantity_limit, on="l_partkey")
+        .filter(pl.col("l_quantity") < pl.col("quantity_limit"))
+        .select(avg_yearly=pl.sum("l_extendedprice") / 7.0)
+    )
+
+
 def q19() -> pl.LazyFrame:
     lineitem = scan("lineitem")
     part = scan("part")
@@ -271,7 +291,7 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q19": q19}
+QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q17": q17, "q19": q19}
 
 
 def percentile(data: list[float], p: float) -> float:

@@ -123,6 +123,43 @@ auto chunked_agg_tracks_validity(ir::AggFunc func) -> bool {
 /// the child stream ends.
 // Streaming operator classes (internal linkage, see note below).
 namespace {
+
+/// Keeps one zero-row chunk back so an operator that rejects every row still
+/// emits its schema.
+///
+/// A stream carries its schema in its chunks, so an operator that emits no chunk
+/// emits no schema either: the result materializes as a table with no columns at
+/// all, and anything downstream that names a column — a join looking for its key,
+/// a filter for the value it compares — fails with "unknown column" on what is
+/// really just an empty input.
+///
+/// Row filters are where that bites, since they are what can reject everything.
+/// Each skips its empty chunks (forwarding them would be pure overhead), so this
+/// holds the first one back and releases it at end of stream if nothing else was
+/// ever emitted.
+class SchemaCarrier {
+   public:
+    /// Offer a zero-row result as the schema of last resort.
+    void hold(Table&& empty) {
+        if (!held_.has_value() && !empty.columns.empty()) {
+            held_ = std::move(empty);
+        }
+    }
+    void emitted() { emitted_ = true; }
+    /// The held chunk — once, and only if nothing else was ever emitted.
+    [[nodiscard]] auto release() -> std::optional<Chunk> {
+        if (emitted_ || !held_.has_value()) {
+            return std::nullopt;
+        }
+        emitted_ = true;
+        return table_to_chunk(std::move(*held_));
+    }
+
+   private:
+    std::optional<Table> held_;
+    bool emitted_ = false;
+};
+
 class ChunkedFilterOperator final : public Operator {
    public:
     ChunkedFilterOperator(OperatorPtr child, const ir::Expr* predicate,
@@ -136,7 +173,7 @@ class ChunkedFilterOperator final : public Operator {
                 return std::unexpected(std::move(chunk_res.error()));
             }
             if (!chunk_res.value().has_value()) {
-                return std::optional<Chunk>{};
+                return schema_.release();
             }
             const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto filtered = filter_table(t, *predicate_, scalars_);
@@ -144,8 +181,10 @@ class ChunkedFilterOperator final : public Operator {
                 return std::unexpected(std::move(filtered.error()));
             }
             if (!filtered->columns.empty() && filtered->rows() == 0) {
+                schema_.hold(std::move(filtered.value()));
                 continue;
             }
+            schema_.emitted();
             return std::optional<Chunk>{table_to_chunk(std::move(filtered.value()))};
         }
     }
@@ -154,6 +193,7 @@ class ChunkedFilterOperator final : public Operator {
     OperatorPtr child_;
     const ir::Expr* predicate_;
     const ScalarRegistry* scalars_;
+    SchemaCarrier schema_;
 };
 
 /// Per-chunk project: pulls a chunk, reuses `project_table` to select
@@ -203,7 +243,7 @@ class ChunkedFilterProjectOperator final : public Operator {
                 return std::unexpected(std::move(chunk_res.error()));
             }
             if (!chunk_res.value().has_value()) {
-                return std::optional<Chunk>{};
+                return schema_.release();
             }
             const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto out = filter_project_table(t, *predicate_, *columns_, scalars_);
@@ -211,8 +251,10 @@ class ChunkedFilterProjectOperator final : public Operator {
                 return std::unexpected(std::move(out.error()));
             }
             if (!out->columns.empty() && out->rows() == 0) {
+                schema_.hold(std::move(out.value()));
                 continue;
             }
+            schema_.emitted();
             return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
         }
     }
@@ -222,6 +264,7 @@ class ChunkedFilterProjectOperator final : public Operator {
     const ir::Expr* predicate_;
     const std::vector<ir::ColumnRef>* columns_;
     const ScalarRegistry* scalars_;
+    SchemaCarrier schema_;
 };
 
 /// Fused filter→head(n): pushes the row limit into the per-chunk filter so
@@ -253,7 +296,7 @@ class ChunkedFilterHeadOperator final : public Operator {
             }
             if (!chunk_res.value().has_value()) {
                 done_ = true;
-                return std::optional<Chunk>{};
+                return schema_.release();
             }
             const Table t = chunk_to_table(std::move(*chunk_res.value()));
             auto out = filter_table_limit(t, *predicate_, remaining_, scalars_);
@@ -262,6 +305,7 @@ class ChunkedFilterHeadOperator final : public Operator {
             }
             const std::size_t produced = out->rows();
             if (!out->columns.empty() && produced == 0) {
+                schema_.hold(std::move(out.value()));
                 continue;
             }
             remaining_ -= produced;
@@ -269,6 +313,7 @@ class ChunkedFilterHeadOperator final : public Operator {
                 done_ = true;
             }
             (void)count_;
+            schema_.emitted();
             return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
         }
     }
@@ -280,6 +325,7 @@ class ChunkedFilterHeadOperator final : public Operator {
     std::size_t remaining_;
     const ScalarRegistry* scalars_;
     bool done_ = false;
+    SchemaCarrier schema_;
 };
 
 /// Fused `Tail(Filter(x))`: filters each incoming chunk, then keeps only the
@@ -316,6 +362,7 @@ class ChunkedFilterTailOperator final : public Operator {
                 continue;
             }
             if (filtered->rows() == 0) {
+                schema_.hold(std::move(filtered.value()));
                 continue;
             }
             buffered_rows_ += filtered->rows();
@@ -324,8 +371,9 @@ class ChunkedFilterTailOperator final : public Operator {
         }
         done_ = true;
         if (buffered_.empty()) {
-            return std::optional<Chunk>{};
+            return schema_.release();
         }
+        schema_.emitted();
         if (buffered_.size() == 1) {
             return std::optional<Chunk>{table_to_chunk(std::move(buffered_.front()))};
         }
@@ -407,6 +455,7 @@ class ChunkedFilterTailOperator final : public Operator {
     std::deque<Table> buffered_;
     std::size_t buffered_rows_ = 0;
     bool done_ = false;
+    SchemaCarrier schema_;
 };
 
 /// Fused filter→update→project: evaluates the predicate per chunk, gathers
@@ -444,9 +493,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
             }
-            if (!filtered->columns.empty() && filtered->rows() == 0) {
-                continue;
-            }
+            const bool empty = !filtered->columns.empty() && filtered->rows() == 0;
             auto updated = update_table(std::move(filtered.value()), *fields_, scalars_, externs_);
             if (!updated.has_value()) {
                 return std::unexpected(std::move(updated.error()));
@@ -455,11 +502,19 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
             if (!projected.has_value()) {
                 return std::unexpected(std::move(projected.error()));
             }
+            // An empty chunk still runs the update and the projection, cheaply,
+            // because the schema it has to carry is the one they produce.
+            if (empty) {
+                schema_.hold(std::move(projected.value()));
+                continue;
+            }
+            schema_.emitted();
             return std::optional<Chunk>{table_to_chunk(std::move(projected.value()))};
         }
     }
 
    private:
+    SchemaCarrier schema_;
     OperatorPtr child_;
     const ir::Expr* predicate_;
     const std::vector<ir::FieldSpec>* fields_;
@@ -4034,6 +4089,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         decided_ = true;
         Chunk first;
         bool have = false;
+        std::optional<Chunk> schema_only;
         while (true) {
             auto chunk_res = child_->next();
             if (!chunk_res.has_value()) {
@@ -4043,14 +4099,33 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 break;  // EOF before any rows
             }
             if (chunk_res.value()->rows() == 0) {
-                continue;  // skip empty chunks
+                // Empty, but it still carries the input's columns and their
+                // types. Keep the first one in case no chunk ever has rows.
+                if (!schema_only.has_value() && !chunk_res.value()->columns.empty()) {
+                    schema_only = std::move(*chunk_res.value());
+                }
+                continue;
             }
             first = std::move(*chunk_res.value());
             have = true;
             break;
         }
         if (!have) {
-            done_ = true;  // empty input → no output, matching the hash operator
+            // Every row was filtered away upstream. Emitting nothing would emit
+            // no schema either, and the result would materialize with no columns
+            // at all — so a downstream join looking for its key, or a filter for
+            // the value it compares, would fail with "unknown column" on what is
+            // really just an empty input. The hash operator derives its output
+            // columns from the input's types, so hand it the empty chunk and let
+            // it produce a properly-shaped empty result.
+            if (schema_only.has_value()) {
+                fallback_ = std::make_unique<ChunkedAggregateOperator>(
+                    std::make_unique<PrependChunkOperator>(std::move(*schema_only),
+                                                           std::move(child_)),
+                    group_by_, aggregations_);
+                return {};
+            }
+            done_ = true;
             input_eof_ = true;
             return {};
         }

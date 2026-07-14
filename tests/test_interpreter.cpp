@@ -9697,3 +9697,75 @@ t[filter v > scalar(t[select { m = min(v) }])];
 )");
     REQUIRE(result.rows() == 2);  // not 6
 }
+
+TEST_CASE("Interpret empty results keep their schema") {
+    // A stream carries its schema in its chunks, so an operator that emits no
+    // chunk emits no schema either, and the result materializes with no columns
+    // at all. Anything downstream that names a column -- a join looking for its
+    // key, a filter for the value it compares -- then fails with "unknown
+    // column" on what is really just an empty input.
+    runtime::Table table;
+    table.add_column("g", Column<std::string>{"a", "b"});
+    table.add_column("v", Column<double>{1.0, 5.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    const auto column_names = [](const runtime::Table& result) {
+        std::vector<std::string> names;
+        for (const auto& entry : result.columns) {
+            names.push_back(entry.name);
+        }
+        return names;
+    };
+
+    SECTION("a filter that rejects every row") {
+        auto ir = require_ir("t[filter v > 100.0];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 0);
+        REQUIRE(column_names(*result) == std::vector<std::string>{"g", "v"});
+    }
+
+    SECTION("an ungrouped aggregate over an empty input") {
+        auto ir = require_ir("t[filter v > 100.0][select { m = mean(v) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 0);
+        REQUIRE(column_names(*result) == std::vector<std::string>{"m"});
+    }
+
+    SECTION("a grouped aggregate over an empty input") {
+        auto ir = require_ir("t[filter v > 100.0][select { m = mean(v) }, by { g }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 0);
+        REQUIRE(column_names(*result) == std::vector<std::string>{"g", "m"});
+    }
+}
+
+TEST_CASE("Interpret subquery over an empty inner plan keeps no rows") {
+    // The subquery's aggregate has no group to match, so the value is null and
+    // no comparison against it can pass. Before empty results kept their schema
+    // this was not merely wrong, it was a hard error: the left join went looking
+    // for its key in a right side that had no columns at all.
+    SECTION("correlated") {
+        auto result = interpret_source(std::string(kSupplySources) + R"(
+(parts join supply[select { p_partkey = ps_partkey, ps_cost }] on p_partkey)[
+    filter ps_cost == scalar(
+        supply[filter ps_partkey == outer(p_partkey) && ps_region == "MARS",
+               select { m = min(ps_cost) }]
+    )
+];
+)");
+        REQUIRE(result.rows() == 0);
+    }
+
+    SECTION("uncorrelated") {
+        auto result = interpret_source(std::string(kSupplySources) + R"(
+parts[filter p_partkey > scalar(
+    supply[filter ps_region == "MARS", select { m = min(ps_cost) }]
+)];
+)");
+        REQUIRE(result.rows() == 0);
+    }
+}

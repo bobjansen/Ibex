@@ -1,0 +1,55 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q4 — Order Priority Checking
+//
+//  How many orders in a quarter had at least one line item delivered later than
+//  promised. Standard TPC-H qualification parameter: DATE='1993-07-01'; the "+
+//  interval '3' month" bound is the fixed constant 1993-10-01, inlined as a
+//  literal Date.
+//
+//  The SQL is a correlated `exists`:
+//
+//      and exists (select * from lineitem
+//                  where l_orderkey = o_orderkey and l_commitdate < l_receiptdate)
+//
+//  That is a SEMI JOIN, and Ibex has one — no subquery syntax is needed here.
+//  `exists` over an equality correlation means exactly "keep the left row when
+//  the right side has at least one match", which is the semi join's definition:
+//  an order with three late line items comes back once, not three times, and an
+//  order with none is dropped.
+//
+//  The subquery's other term (`l_commitdate < l_receiptdate`) mentions only
+//  lineitem, so it filters the right side before the join rather than becoming
+//  part of a join condition.
+//
+//  `count()` counts rows, which is what `count(*)` means here — every surviving
+//  order is one row after the semi join, so there is nothing to count non-nulls
+//  over (contrast q13, which needs `count(col)` precisely because its left join
+//  leaves unmatched rows behind).
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q04.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+
+let result = (
+    orders_raw[
+        filter o_orderdate >= date"1993-07-01" && o_orderdate < date"1993-10-01",
+        select { o_orderkey, o_orderpriority }
+    ]
+    semi join
+    lineitem_raw[filter l_commitdate < l_receiptdate][select { o_orderkey = l_orderkey }]
+    on o_orderkey
+)[
+    select { order_count = count() },
+    by { o_orderpriority }
+][
+    order { o_orderpriority }
+];
+write_csv(result, "benchmarking/data/tpch/out/q04.csv");
+result;

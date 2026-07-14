@@ -583,8 +583,8 @@ using ColumnEvalFn = std::expected<ComputedColumn, std::string> (*)(const ir::Ca
 // Row-local scalar. `eval` is the general form and the semantic reference. A
 // few entries also have an optional whole-column kernel fast path, taken only
 // for the kernel-shaped call (every positional argument a bare column or
-// literal, see use_column_kernel); since only three builtins have one, the
-// kernel is not a pointer here but a one-byte ScalarKernel id in BuiltinFn's
+// literal, see use_column_kernel); since only a handful of builtins have one,
+// the kernel is not a pointer here but a one-byte ScalarKernel id in BuiltinFn's
 // flat metadata — like NullPolicy, it packs into padding instead of widening
 // the variant for every entry (see the sizeof note on BuiltinFn).
 struct ScalarExec {
@@ -618,6 +618,7 @@ enum class ScalarKernel : std::uint8_t {
     FillNull,    // fill_null
     FloatClean,  // null_if_nan / null_if_not_finite (kernel branches on callee)
     Coalesce,    // coalesce
+    Like,        // like (compiles the pattern once, then scans the column)
 };
 [[nodiscard]] auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn;
 

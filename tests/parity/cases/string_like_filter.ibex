@@ -1,0 +1,10 @@
+let pattern = "%green%";
+let parts = Table {
+    p_name = ["forest green plate", "midnight blue", "green", "GREEN", "sea_green"],
+    p_type = ["SMALL BRASS", "MEDIUM COPPER", "LARGE BRASS", "SMALL PLATED BRASS", "TIN"],
+    p_size = [1, 2, 3, 4, 5]
+};
+parts[filter like(p_name, pattern) || like(p_type, "%BRASS")]
+     [update { promo = like(p_type, "SMALL%"), plain = !like(p_name, "%green%") }]
+     [select { p_name, p_size, promo, plain }]
+     [order { p_size asc }];

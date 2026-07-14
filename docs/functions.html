@@ -213,6 +213,7 @@
             <tr><td><code>minute(t)</code></td><td>Minute component from Timestamp.</td></tr>
             <tr><td><code>second(t)</code></td><td>Second component from Timestamp.</td></tr>
             <tr><td><code>round(x, mode)</code></td><td>Round Float to Int with mode: <code>nearest</code>, <code>bankers</code>, <code>floor</code>, <code>ceil</code>, or <code>trunc</code>.</td></tr>
+            <tr><td><code>like(s, pattern)</code></td><td><code>Bool</code>: SQL-LIKE match over the whole string. See below.</td></tr>
           </tbody>
         </table>
       </article>
@@ -230,6 +231,32 @@
         </table>
       </article>
     </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">Strings</p>
+    <h2>Pattern matching with <code>like</code></h2>
+    <article class="card">
+      <p><code>like(value, pattern)</code> is SQL-LIKE matching: <code>(String, String) -&gt; Bool</code>. The pattern must match the <strong>whole</strong> value, so <code>like(s, "green")</code> is equality rather than a substring test. There is no infix <code>LIKE</code> keyword — <code>NOT LIKE</code> is written with the ordinary <code>!</code> operator.</p>
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>%</code></td><td>Matches zero or more characters.</td></tr>
+          <tr><td><code>_</code></td><td>Matches exactly one character (one UTF-8 code point, so a multi-byte character counts as one).</td></tr>
+          <tr><td><code>\</code></td><td>Escapes the next character, so <code>%</code> and <code>_</code> can be matched literally. Ibex string literals process escapes too, so a literal percent sign is written <code>like(s, "100\\%")</code>.</td></tr>
+        </tbody>
+      </table>
+      <p>Matching is case-sensitive and locale-independent. Null propagates like it does through any scalar function: a null value or a null pattern gives null, and a null predicate does not keep the row in <code>filter</code> (so <code>!like(...)</code> does not resurrect it either).</p>
+      <table class="repl-table">
+        <tbody>
+          <tr><td><code>parts[filter like(p_name, "%green%")]</code></td><td>Substring: <code>green</code> anywhere in the name.</td></tr>
+          <tr><td><code>parts[filter like(p_type, "%BRASS")]</code></td><td>Suffix.</td></tr>
+          <tr><td><code>parts[filter like(p_container, "SM %")]</code></td><td>Prefix.</td></tr>
+          <tr><td><code>orders[filter !like(o_comment, "%special%requests%")]</code></td><td>Negated match with two ordered fragments.</td></tr>
+          <tr><td><code>parts[update { is_green = like(p_name, "%green%") }]</code></td><td><code>like</code> returns <code>Bool</code>, so it is also a field expression.</td></tr>
+        </tbody>
+      </table>
+      <p>Case-insensitive matching, regular expressions, and collation are out of scope.</p>
+    </article>
   </section>
 
   <section class="section">

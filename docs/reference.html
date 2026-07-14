@@ -946,6 +946,45 @@ trades[<span class="kw">filter</span> <span class="fn-name">year</span>(date) <s
         </div>
       </div>
 
+      <!-- 6c-2. String pattern matching -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">String Matching</span>
+          <h3><code>like</code> matches a string against a pattern</h3>
+          <p>
+            <code>like(value, pattern)</code> is SQL-LIKE matching &mdash;
+            <code>(String,&nbsp;String)&nbsp;-&gt;&nbsp;Bool</code>. The pattern
+            must cover the <strong>whole</strong> value: <code>%</code> matches
+            zero or more characters, <code>_</code> matches exactly one code
+            point, and <code>\</code> escapes either of them. Matching is
+            case-sensitive.
+          </p>
+          <p>
+            There is no infix <code>LIKE</code> keyword; <code>NOT LIKE</code> is
+            the ordinary <code>!</code> operator. Because <code>like</code>
+            returns <code>Bool</code>, it works as a field expression as well as
+            a predicate. Null propagates: a null value or pattern yields null,
+            and a null predicate keeps no row.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Substring, suffix, prefix</span>
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(p_name, <span class="str">"%green%"</span>)];
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(p_type, <span class="str">"%BRASS"</span>)];
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(p_container, <span class="str">"SM %"</span>)];
+
+<span class="cm">// NOT LIKE, with two ordered fragments</span>
+orders[<span class="kw">filter</span> <span class="op">!</span><span class="fn-name">like</span>(o_comment, <span class="str">"%special%requests%"</span>)];
+
+<span class="cm">// Bool-valued, so it is also a field</span>
+parts[<span class="kw">update</span> { is_green = <span class="fn-name">like</span>(p_name, <span class="str">"%green%"</span>) }];
+
+<span class="cm">// _ is one character; \ escapes a literal % or _</span>
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(code, <span class="str">"A_C"</span>)];
+sales[<span class="kw">filter</span> <span class="fn-name">like</span>(label, <span class="str">"100\\%"</span>)];</code></pre>
+        </div>
+      </div>
+
       <!-- 6d. Type system: casts and round() -->
       <div class="tour-item">
         <div class="tour-text">

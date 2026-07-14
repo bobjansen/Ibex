@@ -9050,3 +9050,84 @@ TEST_CASE("Interpret resampled aggregation survives a Cartesian cell overflow") 
         REQUIRE((*total)[g] == static_cast<double>(g) + 1.0);
     }
 }
+
+// ── IN-lists over in-memory data ─────────────────────────────────────────────
+//
+// `col == a || col == b` on a categorical column is a membership test, and
+// compute_mask evaluates it in one pass against a byte per dictionary code
+// rather than building a full-width mask per OR arm. In-memory tables (CSV,
+// constructed frames, a filter sitting above a join) all take that path.
+
+TEST_CASE("Interpret an IN-list over a categorical column") {
+    Column<Categorical> mode(std::vector<std::string>{"AIR", "AIR REG", "SHIP", "RAIL"});
+    for (auto code : {0, 1, 2, 3, 0, 2}) {
+        mode.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+
+    runtime::Table table;
+    table.add_column("mode", std::move(mode));
+    table.add_column("qty", Column<std::int64_t>{10, 20, 30, 40, 50, 60});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    auto ir = require_ir(R"(t[filter mode == "AIR" || mode == "AIR REG"];)");
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
+    REQUIRE(result.has_value());
+
+    const auto* qty = std::get_if<Column<std::int64_t>>(result->find("qty"));
+    REQUIRE(qty != nullptr);
+    REQUIRE(qty->size() == 3);
+    CHECK((*qty)[0] == 10);
+    CHECK((*qty)[1] == 20);
+    CHECK((*qty)[2] == 50);
+
+    // A value the column never takes matches nothing rather than everything.
+    auto none_ir = require_ir(R"(t[filter mode == "TRUCK" || mode == "BARGE"];)");
+    auto none = runtime::interpret(*none_ir, registry, nullptr, nullptr);
+    REQUIRE(none.has_value());
+    CHECK(none->rows() == 0);
+
+    // Still a disjunction when the arms name different columns.
+    auto mixed_ir = require_ir(R"(t[filter mode == "SHIP" || qty == 10];)");
+    auto mixed = runtime::interpret(*mixed_ir, registry, nullptr, nullptr);
+    REQUIRE(mixed.has_value());
+    CHECK(mixed->rows() == 3);  // rows 0, 2, 5
+
+    // An IN-list ANDed with a range: the q19 shape, in memory.
+    auto both_ir = require_ir(R"(t[filter (mode == "AIR" || mode == "SHIP") && qty >= 30];)");
+    auto both = runtime::interpret(*both_ir, registry, nullptr, nullptr);
+    REQUIRE(both.has_value());
+    const auto* both_qty = std::get_if<Column<std::int64_t>>(both->find("qty"));
+    REQUIRE(both_qty != nullptr);
+    REQUIRE(both_qty->size() == 3);
+    CHECK((*both_qty)[0] == 30);
+    CHECK((*both_qty)[1] == 50);
+    CHECK((*both_qty)[2] == 60);
+}
+
+TEST_CASE("Interpret an IN-list over a categorical column with nulls") {
+    Column<Categorical> mode(std::vector<std::string>{"AIR", "SHIP"});
+    for (auto code : {0, 0, 1}) {
+        mode.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+    runtime::ValidityBitmap validity(3, true);
+    validity.set(1, false);  // holds AIR's code, but is null
+
+    runtime::Table table;
+    table.add_column("mode", std::move(mode), std::move(validity));
+    table.add_column("qty", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    auto ir = require_ir(R"(t[filter mode == "AIR" || mode == "SHIP"];)");
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr);
+    REQUIRE(result.has_value());
+
+    const auto* qty = std::get_if<Column<std::int64_t>>(result->find("qty"));
+    REQUIRE(qty != nullptr);
+    REQUIRE(qty->size() == 2);  // the null matches no literal
+    CHECK((*qty)[0] == 1);
+    CHECK((*qty)[1] == 3);
+}

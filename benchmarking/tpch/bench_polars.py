@@ -191,6 +191,28 @@ def q10() -> pl.LazyFrame:
     )
 
 
+def q11() -> pl.LazyFrame:
+    # The uncorrelated scalar subquery: one value, the same for every row. Ibex
+    # broadcasts it with a cross join against the subquery's single row; Polars
+    # folds it into the predicate the same way.
+    german_supply = (
+        scan("partsupp")
+        .join(scan("supplier"), left_on="ps_suppkey", right_on="s_suppkey")
+        .join(scan("nation"), left_on="s_nationkey", right_on="n_nationkey")
+        .filter(pl.col("n_name") == "GERMANY")
+    )
+    value = pl.col("ps_supplycost") * pl.col("ps_availqty")
+    threshold = german_supply.select(threshold=value.sum() * 0.0001)
+    return (
+        german_supply.group_by("ps_partkey")
+        .agg(value=value.sum())
+        .join(threshold, how="cross")
+        .filter(pl.col("value") > pl.col("threshold"))
+        .select("ps_partkey", "value")
+        .sort("value", descending=True)
+    )
+
+
 def q17() -> pl.LazyFrame:
     # The correlated subquery, decorrelated the same way Ibex lowers it: 20% of
     # each part's average order quantity, computed once and joined back. The
@@ -309,7 +331,7 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q17": q17, "q19": q19}
+QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q19": q19}
 
 
 def percentile(data: list[float], p: float) -> float:

@@ -56,3 +56,19 @@ let cheapest_european = (
 
 print("cheapest EUROPEAN supplier per part — part 4 drops entirely:");
 print(cheapest_european);
+
+// ── Uncorrelated: one value, the same for every row ──────────────────────────
+//
+// A subquery that captures nothing with `outer(...)` is not per-row at all — it
+// is a single value, evaluated once and broadcast. Because it must be an
+// aggregate with no `by`, it collapses to exactly one row, so it can never
+// multiply the rows it filters.
+print("parts costing more than the overall mean supply cost:");
+print(supply[filter ps_supplycost > scalar(supply[select { m = mean(ps_supplycost) }])]);
+
+// It may carry its own filter too — here the mean is over EUROPEAN supply only,
+// but it is still one value compared against every row.
+print("...and above the mean EUROPEAN cost:");
+print(supply[
+    filter ps_supplycost > scalar(supply[filter ps_region == "EU", select { m = mean(ps_supplycost) }])
+]);

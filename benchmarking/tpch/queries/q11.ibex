@@ -1,0 +1,59 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q11 — Important Stock Identification
+//
+//  Which parts account for a significant share of German supply value: those
+//  whose stock value exceeds 0.01% of the total across all German suppliers.
+//  Standard TPC-H qualification parameters: NATION='GERMANY', FRACTION=0.0001.
+//
+//  The SQL puts an UNCORRELATED scalar subquery in a HAVING clause:
+//
+//      having sum(ps_supplycost * ps_availqty) > (
+//          select sum(ps_supplycost * ps_availqty) * 0.0001 from ... )
+//
+//  Uncorrelated means the subquery captures nothing with `outer(...)` — it is a
+//  single value, the same for every row (SPEC 5.7). It is evaluated once and
+//  broadcast, which is a CROSS JOIN against its one row, not a re-execution per
+//  row. Two things make that safe:
+//
+//    - The subquery must be an aggregate with no `by`, so it collapses to
+//      exactly one row and can never silently multiply the outer rows.
+//    - If its input were empty it would yield no row at all, and the cross join
+//      would drop every outer row — which is what comparing against SQL's null
+//      scalar does anyway.
+//
+//  The HAVING is a filter over the *aggregated* result, so it is a separate
+//  block from the group-by: `[select ..., by ...][filter value > scalar(...)]`.
+//
+//  `german_supply` is bound once and named twice — by the outer group-by and by
+//  the subquery — so the join runs once and both scans read the same table.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q11.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+
+let german_supply = (
+    partsupp_raw[select { ps_partkey, ps_suppkey, ps_supplycost, ps_availqty }]
+    join supplier_raw[select { ps_suppkey = s_suppkey, s_nationkey }] on ps_suppkey
+    join nation_raw[filter n_name == "GERMANY"][select { s_nationkey = n_nationkey }] on s_nationkey
+);
+
+let result = german_supply[
+    select { value = sum(ps_supplycost * ps_availqty) },
+    by { ps_partkey }
+][
+    filter value > scalar(
+        german_supply[select { threshold = sum(ps_supplycost * ps_availqty) * 0.0001 }]
+    )
+][
+    order { value desc }
+];
+write_csv(result, "benchmarking/data/tpch/out/q11.csv");
+result;

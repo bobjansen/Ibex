@@ -109,6 +109,24 @@ def q03() -> pl.LazyFrame:
     )
 
 
+def q04() -> pl.LazyFrame:
+    # SQL's correlated `exists` is a semi join, which is how Ibex writes it too.
+    orders = scan("orders").filter(
+        (pl.col("o_orderdate") >= date(1993, 7, 1)) & (pl.col("o_orderdate") < date(1993, 10, 1))
+    )
+    late = (
+        scan("lineitem")
+        .filter(pl.col("l_commitdate") < pl.col("l_receiptdate"))
+        .select("l_orderkey")
+    )
+    return (
+        orders.join(late, left_on="o_orderkey", right_on="l_orderkey", how="semi")
+        .group_by("o_orderpriority")
+        .agg(order_count=pl.len())
+        .sort("o_orderpriority")
+    )
+
+
 def q05() -> pl.LazyFrame:
     customer = scan("customer").select(["c_custkey", "c_nationkey"])
     orders = (
@@ -291,7 +309,7 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q17": q17, "q19": q19}
+QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q13": q13, "q16": q16, "q17": q17, "q19": q19}
 
 
 def percentile(data: list[float], p: float) -> float:

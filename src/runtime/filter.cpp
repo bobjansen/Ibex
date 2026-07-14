@@ -2527,6 +2527,47 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
         return filter_selection_impl(input, plan.leftover, scalars, std::move(selected));
     }
 
+    // Nothing fused — a string equality (`l_returnflag == "R"`) or an OR block.
+    // The first conjunct still yields the selection directly from its mask:
+    // numbering every row only to delete three quarters of them again costs
+    // more than the comparison does (a 48MB index vector over lineitem, then a
+    // remove_if pass across it).
+    //
+    // Count first, then left-pack. `push_back` loses to the remove_if it
+    // replaces at moderate selectivity: it re-checks capacity every row and
+    // branches on a predicate that, at q10's ~25% hit rate, the predictor
+    // cannot learn. Sizing the result up front makes the fill branchless.
+    if (!conjuncts.empty()) {
+        auto mask = compute_mask(conjuncts.front(), input, scalars, input.rows());
+        if (!mask) {
+            return std::unexpected(mask.error());
+        }
+        const std::size_t rows = input.rows();
+        const auto* valid = mask->valid ? mask->valid->data() : nullptr;
+        const auto* values = mask->value.data();
+        auto keeps = [&](std::size_t row) {
+            return values[row] != 0 && (valid == nullptr || valid[row] != 0);
+        };
+
+        std::size_t kept = 0;
+        for (std::size_t row = 0; row < rows; ++row) {
+            kept += static_cast<std::size_t>(keeps(row));
+        }
+        // One slot of slack so the unconditional store below always lands
+        // in-bounds, including on the final rejected row.
+        std::vector<std::size_t> selected(kept + 1);
+        std::size_t out = 0;
+        for (std::size_t row = 0; row < rows; ++row) {
+            selected[out] = row;
+            out += static_cast<std::size_t>(keeps(row));
+        }
+        selected.resize(kept);
+
+        using ConjunctDiff = std::vector<ir::Expr>::difference_type;
+        const std::vector<ir::Expr> rest(conjuncts.begin() + ConjunctDiff{1}, conjuncts.end());
+        return filter_selection_impl(input, rest, scalars, std::move(selected));
+    }
+
     std::vector<std::size_t> selected(input.rows());
     std::iota(selected.begin(), selected.end(), std::size_t{0});
     return filter_selection_impl(input, conjuncts, scalars, std::move(selected));

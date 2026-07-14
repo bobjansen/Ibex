@@ -12,6 +12,7 @@
 #include <ibex/runtime/safe_arith.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -21,10 +22,12 @@
 #include <ctime>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -2086,6 +2089,336 @@ auto filter_table(const Table& input, const ir::Expr& predicate, const ScalarReg
 
 namespace {
 
+// ─── Fused bounds ─────────────────────────────────────────────────────────────
+//
+// A filter pushed into a scan arrives as a list of conjuncts, and the generic
+// path below evaluates them one at a time: a full-width mask per conjunct, then
+// a remove_if over the surviving row ids. A multi-column range filter pays that
+// per bound — q06 tests two bounds on l_shipdate, two on l_discount and one on
+// l_quantity, so five mask passes over six million rows and five passes over a
+// 48MB index vector, to keep ~1.8% of them.
+//
+// Fusing rewrites that into one pass. The conjuncts on each column collapse
+// into a single lo/hi range (`l_discount >= 0.05 && l_discount <= 0.07` is one
+// range test, not two comparisons), and every column's range is evaluated
+// blockwise against the same L1-resident mask, appending survivors straight to
+// the selection. Each predicate column is read exactly once and no full-width
+// mask or full-width index vector is ever built.
+//
+// This is a pure optimization: AND is commutative and every conjunct here is
+// row-local and side-effect free, so fusing and reordering cannot change which
+// rows survive. Conjuncts that aren't `column <cmp> literal` over a numeric or
+// time column stay in `leftover` and run on the (now much smaller) selection.
+
+enum class BoundsKind : std::uint8_t { Int64, Double, Date, Timestamp };
+
+struct BoundsSpec {
+    BoundsKind kind{};
+    const void* data = nullptr;
+    const ValidityBitmap* validity = nullptr;  // null → no nulls to exclude
+    std::int64_t lo_i = std::numeric_limits<std::int64_t>::min();
+    std::int64_t hi_i = std::numeric_limits<std::int64_t>::max();
+    double lo_d = -std::numeric_limits<double>::infinity();
+    double hi_d = std::numeric_limits<double>::infinity();
+    bool lo_incl = true;
+    bool hi_incl = true;
+    bool unsatisfiable = false;
+};
+
+template <typename T>
+void tighten_lo(T& cur, bool& cur_incl, T v, bool incl) {
+    if (v > cur) {
+        cur = v;
+        cur_incl = incl;
+    } else if (v == cur && !incl) {
+        cur_incl = false;
+    }
+}
+
+template <typename T>
+void tighten_hi(T& cur, bool& cur_incl, T v, bool incl) {
+    if (v < cur) {
+        cur = v;
+        cur_incl = incl;
+    } else if (v == cur && !incl) {
+        cur_incl = false;
+    }
+}
+
+// Fold one `column <op> literal` conjunct into the column's running range.
+// Returns false when the literal's type doesn't match the column's, leaving the
+// conjunct for the generic path rather than guessing at a conversion.
+auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit) -> bool {
+    if (op == ir::CompareOp::Ne) {
+        return false;
+    }
+
+    const bool integral = spec.kind != BoundsKind::Double;
+    std::int64_t vi = 0;
+    double vd = 0.0;
+    if (spec.kind == BoundsKind::Int64) {
+        const auto* i = std::get_if<std::int64_t>(&lit.value);
+        if (i == nullptr) {
+            return false;  // e.g. `int_col < 24.5` — let the generic path round it
+        }
+        vi = *i;
+    } else if (spec.kind == BoundsKind::Date) {
+        const auto* d = std::get_if<Date>(&lit.value);
+        if (d == nullptr) {
+            return false;
+        }
+        vi = d->days;
+    } else if (spec.kind == BoundsKind::Timestamp) {
+        const auto* t = std::get_if<Timestamp>(&lit.value);
+        if (t == nullptr) {
+            return false;
+        }
+        vi = t->nanos;
+    } else {
+        if (const auto* d = std::get_if<double>(&lit.value)) {
+            vd = *d;
+        } else if (const auto* i = std::get_if<std::int64_t>(&lit.value)) {
+            vd = static_cast<double>(*i);
+        } else {
+            return false;
+        }
+        if (std::isnan(vd)) {
+            return false;  // every comparison against NaN is false; not a range
+        }
+    }
+
+    const bool lower = op == ir::CompareOp::Gt || op == ir::CompareOp::Ge;
+    const bool upper = op == ir::CompareOp::Lt || op == ir::CompareOp::Le;
+    const bool incl = op != ir::CompareOp::Gt && op != ir::CompareOp::Lt;
+    if (lower || op == ir::CompareOp::Eq) {
+        if (integral) {
+            tighten_lo(spec.lo_i, spec.lo_incl, vi, incl);
+        } else {
+            tighten_lo(spec.lo_d, spec.lo_incl, vd, incl);
+        }
+    }
+    if (upper || op == ir::CompareOp::Eq) {
+        if (integral) {
+            tighten_hi(spec.hi_i, spec.hi_incl, vi, incl);
+        } else {
+            tighten_hi(spec.hi_d, spec.hi_incl, vd, incl);
+        }
+    }
+
+    // Contradictory bounds (`x > 5 && x < 3`, or `x >= 5 && x < 5`) select
+    // nothing; recording that lets the whole scan short-circuit.
+    if (integral) {
+        spec.unsatisfiable =
+            spec.lo_i > spec.hi_i || (spec.lo_i == spec.hi_i && !(spec.lo_incl && spec.hi_incl));
+    } else {
+        spec.unsatisfiable =
+            spec.lo_d > spec.hi_d || (spec.lo_d == spec.hi_d && !(spec.lo_incl && spec.hi_incl));
+    }
+    return true;
+}
+
+struct BoundsPlan {
+    std::vector<BoundsSpec> specs;
+    std::vector<ir::Expr> leftover;
+};
+
+// Split a conjunct into (column, op, literal), normalizing `literal op column`
+// into `column flip(op) literal`.
+auto split_col_cmp_lit(const ir::Expr& expr)
+    -> std::optional<std::tuple<const ir::ColumnRef*, ir::CompareOp, const ir::Literal*>> {
+    const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
+    if (cmp == nullptr) {
+        return std::nullopt;
+    }
+    if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node)) {
+        if (const auto* lit = std::get_if<ir::Literal>(&cmp->right->node)) {
+            return std::tuple{col, cmp->op, lit};
+        }
+    }
+    if (const auto* lit = std::get_if<ir::Literal>(&cmp->left->node)) {
+        if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->right->node)) {
+            return std::tuple{col, flip_cmp(cmp->op), lit};
+        }
+    }
+    return std::nullopt;
+}
+
+auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjuncts) -> BoundsPlan {
+    BoundsPlan plan;
+    robin_hood::unordered_map<std::string, std::size_t> spec_of_column;
+    plan.leftover.reserve(conjuncts.size());
+
+    for (const auto& conjunct : conjuncts) {
+        auto split = split_col_cmp_lit(conjunct);
+        if (!split.has_value()) {
+            plan.leftover.push_back(conjunct);
+            continue;
+        }
+        const auto& [col, op, lit] = *split;
+
+        auto index = input.index.find(col->name);
+        if (index == input.index.end()) {
+            plan.leftover.push_back(conjunct);
+            continue;
+        }
+        const auto& entry = input.columns[index->second];
+
+        auto existing = spec_of_column.find(col->name);
+        BoundsSpec candidate;
+        if (existing != spec_of_column.end()) {
+            candidate = plan.specs[existing->second];
+        } else {
+            const auto& column = *entry.column;
+            if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
+                candidate.kind = BoundsKind::Int64;
+                candidate.data = c_int->data();
+            } else if (const auto* c_dbl = std::get_if<Column<double>>(&column)) {
+                candidate.kind = BoundsKind::Double;
+                candidate.data = c_dbl->data();
+            } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {
+                // Date is a single int32 field and Timestamp a single int64, so
+                // their storage is the scalar array the kernels want.
+                candidate.kind = BoundsKind::Date;
+                candidate.data = c_date->data();
+            } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(&column)) {
+                candidate.kind = BoundsKind::Timestamp;
+                candidate.data = c_ts->data();
+            } else {
+                plan.leftover.push_back(conjunct);  // string/bool/categorical
+                continue;
+            }
+            candidate.validity = entry.validity.has_value() ? &*entry.validity : nullptr;
+        }
+
+        if (!merge_bound(candidate, op, *lit)) {
+            plan.leftover.push_back(conjunct);
+            continue;
+        }
+        if (existing != spec_of_column.end()) {
+            plan.specs[existing->second] = candidate;
+        } else {
+            spec_of_column.emplace(col->name, plan.specs.size());
+            plan.specs.push_back(candidate);
+        }
+    }
+    return plan;
+}
+
+template <typename T, bool LoIncl, bool HiIncl>
+void bounds_kernel(const T* __restrict values, T lo, T hi, std::uint8_t* __restrict mask,
+                   std::size_t len, bool first) {
+    if (first) {
+        for (std::size_t i = 0; i < len; ++i) {
+            const T v = values[i];
+            const bool ok = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+            mask[i] = static_cast<std::uint8_t>(ok);
+        }
+        return;
+    }
+    for (std::size_t i = 0; i < len; ++i) {
+        const T v = values[i];
+        const bool ok = (LoIncl ? v >= lo : v > lo) && (HiIncl ? v <= hi : v < hi);
+        mask[i] = static_cast<std::uint8_t>(mask[i] & static_cast<std::uint8_t>(ok));
+    }
+}
+
+template <typename T>
+void bounds_range(const T* values, T lo, T hi, bool lo_incl, bool hi_incl, std::uint8_t* mask,
+                  std::size_t len, bool first) {
+    if (lo_incl && hi_incl) {
+        bounds_kernel<T, true, true>(values, lo, hi, mask, len, first);
+    } else if (lo_incl) {
+        bounds_kernel<T, true, false>(values, lo, hi, mask, len, first);
+    } else if (hi_incl) {
+        bounds_kernel<T, false, true>(values, lo, hi, mask, len, first);
+    } else {
+        bounds_kernel<T, false, false>(values, lo, hi, mask, len, first);
+    }
+}
+
+template <typename T>
+auto clamp_bound(std::int64_t v) -> T {
+    if (v < static_cast<std::int64_t>(std::numeric_limits<T>::min())) {
+        return std::numeric_limits<T>::min();
+    }
+    if (v > static_cast<std::int64_t>(std::numeric_limits<T>::max())) {
+        return std::numeric_limits<T>::max();
+    }
+    return static_cast<T>(v);
+}
+
+void apply_bounds_spec(const BoundsSpec& spec, std::size_t base, std::size_t len,
+                       std::uint8_t* mask, bool first) {
+    switch (spec.kind) {
+        case BoundsKind::Int64: {
+            const auto* values = static_cast<const std::int64_t*>(spec.data) + base;
+            bounds_range<std::int64_t>(values, spec.lo_i, spec.hi_i, spec.lo_incl, spec.hi_incl,
+                                       mask, len, first);
+            break;
+        }
+        case BoundsKind::Timestamp: {
+            const auto* values =
+                reinterpret_cast<const std::int64_t*>(  // NOLINT(*-reinterpret-cast)
+                    static_cast<const Timestamp*>(spec.data)) +
+                base;
+            bounds_range<std::int64_t>(values, spec.lo_i, spec.hi_i, spec.lo_incl, spec.hi_incl,
+                                       mask, len, first);
+            break;
+        }
+        case BoundsKind::Date: {
+            const auto* values =
+                reinterpret_cast<const std::int32_t*>(  // NOLINT(*-reinterpret-cast)
+                    static_cast<const Date*>(spec.data)) +
+                base;
+            bounds_range<std::int32_t>(values, clamp_bound<std::int32_t>(spec.lo_i),
+                                       clamp_bound<std::int32_t>(spec.hi_i), spec.lo_incl,
+                                       spec.hi_incl, mask, len, first);
+            break;
+        }
+        case BoundsKind::Double: {
+            const auto* values = static_cast<const double*>(spec.data) + base;
+            bounds_range<double>(values, spec.lo_d, spec.hi_d, spec.lo_incl, spec.hi_incl, mask,
+                                 len, first);
+            break;
+        }
+    }
+    // A null compares false against any bound, so it never survives a conjunct.
+    if (spec.validity != nullptr) {
+        for (std::size_t i = 0; i < len; ++i) {
+            mask[i] = static_cast<std::uint8_t>(
+                mask[i] & static_cast<std::uint8_t>((*spec.validity)[base + i]));
+        }
+    }
+}
+
+auto select_bounds(const std::vector<BoundsSpec>& specs, std::size_t rows)
+    -> std::vector<std::size_t> {
+    constexpr std::size_t kBlock = 4096;
+    std::vector<std::size_t> selected;
+    for (const auto& spec : specs) {
+        if (spec.unsatisfiable) {
+            return selected;
+        }
+    }
+    selected.reserve(std::min<std::size_t>(rows, kBlock));
+
+    std::array<std::uint8_t, kBlock> mask{};
+    for (std::size_t base = 0; base < rows; base += kBlock) {
+        const std::size_t len = std::min(kBlock, rows - base);
+        bool first = true;
+        for (const auto& spec : specs) {
+            apply_bounds_spec(spec, base, len, mask.data(), first);
+            first = false;
+        }
+        for (std::size_t i = 0; i < len; ++i) {
+            if (mask[i] != 0) {
+                selected.push_back(base + i);
+            }
+        }
+    }
+    return selected;
+}
+
 auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conjuncts,
                            const ScalarRegistry* scalars, std::vector<std::size_t> selected)
     -> std::expected<std::vector<std::size_t>, std::string> {
@@ -2185,6 +2518,15 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
 auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
                       const ScalarRegistry* scalars)
     -> std::expected<std::vector<std::size_t>, std::string> {
+    // Range conjuncts fuse into one blocked pass that yields the selection
+    // directly; whatever doesn't fuse runs against that selection instead of
+    // against every row.
+    auto plan = build_bounds_plan(input, conjuncts);
+    if (!plan.specs.empty()) {
+        auto selected = select_bounds(plan.specs, input.rows());
+        return filter_selection_impl(input, plan.leftover, scalars, std::move(selected));
+    }
+
     std::vector<std::size_t> selected(input.rows());
     std::iota(selected.begin(), selected.end(), std::size_t{0});
     return filter_selection_impl(input, conjuncts, scalars, std::move(selected));

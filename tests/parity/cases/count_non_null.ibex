@@ -1,0 +1,5 @@
+let customer = Table { c_custkey = [1, 2, 3], c_name = ["ann", "bob", "cyd"] };
+let orders = Table { c_custkey = [1, 1, 3], o_id = [10, 11, 30] };
+let joined = customer left join orders on c_custkey;
+joined[select { rows = count(), orders = count(o_id) }, by { c_custkey, c_name }]
+      [order { c_custkey asc }];

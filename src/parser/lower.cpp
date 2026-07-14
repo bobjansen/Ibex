@@ -44,6 +44,30 @@ struct CompileTimeValue {
 
 auto clone_expr(const Expr& expr) -> ExprPtr;
 
+// `count()` counts rows; `count(col)` counts the NON-NULL values of col (SQL
+// semantics — the distinction is the whole point of the form, e.g. counting the
+// matched rows of a left join). AggFunc::Count is column-less by construction —
+// every grouping implementation special-cases it as "no column to resolve" — so
+// rather than teaching all of them to carry one, count(col) is lowered to what
+// it means: sum() over a pre-aggregate 0/1 column. This rides the existing
+// pre-aggregate machinery (the same one behind `sum(price * qty)`), so the
+// chunked, grouped, windowed, and generated paths all get it for free.
+//
+// Produces the field `alias = Int64(col is not null)`.
+auto make_count_flag_field(std::string column, std::string alias) -> ir::FieldSpec {
+    ir::Expr operand;
+    operand.node = ir::ColumnRef{.name = std::move(column)};
+    ir::Expr not_null;
+    not_null.node =
+        ir::IsNullExpr{.operand = ir::make_expr_ptr(std::move(operand)), .negated = true};
+    ir::CallExpr cast;
+    cast.callee = "Int64";
+    cast.args.push_back(ir::make_expr_ptr(std::move(not_null)));
+    ir::Expr cast_expr;
+    cast_expr.node = std::move(cast);
+    return ir::FieldSpec{.alias = std::move(alias), .expr = std::move(cast_expr)};
+}
+
 auto column_type_name(ir::ColumnType type) -> std::string_view {
     switch (type) {
         case ir::ColumnType::Int32:
@@ -2822,12 +2846,32 @@ class Lowerer {
                 }
                 const std::string alias = make_temp();
                 if (call->callee == "count") {
-                    if (!call->args.empty()) {
-                        return std::unexpected(LowerError{.message = "count() takes no arguments"});
+                    if (call->args.size() > 1) {
+                        return std::unexpected(LowerError{
+                            .message = "count() takes at most one argument: count() counts rows, "
+                                       "count(col) counts non-null values"});
                     }
+                    if (call->args.empty()) {
+                        aggs.push_back(ir::AggSpec{
+                            .func = func.value(),
+                            .column = ir::ColumnRef{.name = ""},
+                            .alias = alias,
+                        });
+                        temp_columns[alias] = true;
+                        return ir::Expr{.node = ir::ColumnRef{.name = alias}};
+                    }
+                    const auto* ident = extract_column_ident(*call->args[0]);
+                    if (ident == nullptr) {
+                        return std::unexpected(LowerError{
+                            .message = "count(): argument must be a column name (count(col) counts "
+                                       "its non-null values)"});
+                    }
+                    const std::string flag = make_temp();
+                    preagg_updates.push_back(make_count_flag_field(ident->name, flag));
+                    temp_columns[flag] = true;
                     aggs.push_back(ir::AggSpec{
-                        .func = func.value(),
-                        .column = ir::ColumnRef{.name = ""},
+                        .func = ir::AggFunc::Sum,
+                        .column = ir::ColumnRef{.name = flag},
                         .alias = alias,
                     });
                     temp_columns[alias] = true;
@@ -2959,13 +3003,34 @@ class Lowerer {
                 auto func = parse_agg_func(call->callee);
                 if (func.has_value()) {
                     if (call->callee == "count") {
-                        if (!call->args.empty()) {
-                            return std::unexpected(
-                                LowerError{.message = "count() takes no arguments"});
+                        if (call->args.size() > 1) {
+                            return std::unexpected(LowerError{
+                                .message =
+                                    "count() takes at most one argument: count() counts rows, "
+                                    "count(col) counts non-null values"});
                         }
+                        if (call->args.empty()) {
+                            aggs.push_back(ir::AggSpec{
+                                .func = func.value(),
+                                .column = ir::ColumnRef{.name = ""},
+                                .alias = field.name,
+                            });
+                            final_columns.push_back(field.name);
+                            continue;
+                        }
+                        const auto* ident = extract_column_ident(*call->args[0]);
+                        if (ident == nullptr) {
+                            return std::unexpected(LowerError{
+                                .message =
+                                    "count(): argument must be a column name (count(col) counts "
+                                    "its non-null values)"});
+                        }
+                        const std::string flag = make_temp();
+                        preagg_updates.push_back(make_count_flag_field(ident->name, flag));
+                        temp_columns[flag] = true;
                         aggs.push_back(ir::AggSpec{
-                            .func = func.value(),
-                            .column = ir::ColumnRef{.name = ""},
+                            .func = ir::AggFunc::Sum,
+                            .column = ir::ColumnRef{.name = flag},
                             .alias = field.name,
                         });
                         final_columns.push_back(field.name);
@@ -3237,10 +3302,26 @@ class Lowerer {
                     .message = "resample select: unknown aggregate function: " + call->callee});
             }
             if (call->callee == "count") {
-                if (!call->args.empty())
-                    return std::unexpected(LowerError{.message = "count() takes no arguments"});
-                lowered.aggs.push_back(
-                    ir::AggSpec{.func = func.value(), .column = {.name = ""}, .alias = field.name});
+                if (call->args.size() > 1) {
+                    return std::unexpected(LowerError{
+                        .message = "count() takes at most one argument: count() counts rows, "
+                                   "count(col) counts non-null values"});
+                }
+                if (call->args.empty()) {
+                    lowered.aggs.push_back(ir::AggSpec{
+                        .func = func.value(), .column = {.name = ""}, .alias = field.name});
+                    continue;
+                }
+                const auto* ident = extract_column_ident(*call->args[0]);
+                if (ident == nullptr) {
+                    return std::unexpected(LowerError{
+                        .message = "count(): argument must be a column name (count(col) counts "
+                                   "its non-null values)"});
+                }
+                const std::string flag = make_temp();
+                lowered.preagg_updates.push_back(make_count_flag_field(ident->name, flag));
+                lowered.aggs.push_back(ir::AggSpec{
+                    .func = ir::AggFunc::Sum, .column = {.name = flag}, .alias = field.name});
                 continue;
             }
             if (call->callee == "ewma") {

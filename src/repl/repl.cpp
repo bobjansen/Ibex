@@ -1659,9 +1659,10 @@ constexpr BuiltinDoc kBuiltinDocs[] = {
      .summary = "Aggregate sum over each group.",
      .example = "trades[select { total = sum(price) }, by symbol]"},
     {.name = "count",
-     .signature = "count() -> Int64",
-     .summary = "Count rows in the current group.",
-     .example = "trades[select { n = count() }, by symbol]"},
+     .signature = "count() -> Int64  |  count(col) -> Int64",
+     .summary = "count() counts rows in the group; count(col) counts its non-null values "
+                "(0, not null, when there are none).",
+     .example = "orders[select { n = count(), filled = count(fill_px) }, by symbol]"},
     {.name = "min",
      .signature = "min(col) -> same type",
      .summary = "Aggregate minimum.",

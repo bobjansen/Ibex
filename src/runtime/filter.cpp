@@ -1744,6 +1744,123 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
 }
 }  // namespace
 
+namespace {
+
+// Split a conjunct into (column, op, literal), normalizing `literal op column`
+// into `column flip(op) literal`.
+auto split_col_cmp_lit(const ir::Expr& expr)
+    -> std::optional<std::tuple<const ir::ColumnRef*, ir::CompareOp, const ir::Literal*>> {
+    const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
+    if (cmp == nullptr) {
+        return std::nullopt;
+    }
+    if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node)) {
+        if (const auto* lit = std::get_if<ir::Literal>(&cmp->right->node)) {
+            return std::tuple{col, cmp->op, lit};
+        }
+    }
+    if (const auto* lit = std::get_if<ir::Literal>(&cmp->left->node)) {
+        if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->right->node)) {
+            return std::tuple{col, flip_cmp(cmp->op), lit};
+        }
+    }
+    return std::nullopt;
+}
+
+// Flatten an OR tree into its leaves. `a || b || c` parses left-deep, and an
+// IN-list is exactly the case where every leaf is `<same column> == <literal>`.
+void flatten_or(const ir::Expr& expr, std::vector<const ir::Expr*>& out) {
+    if (const auto* logical = std::get_if<ir::LogicalExpr>(&expr.node)) {
+        if (logical->op == ir::LogicalOp::Or) {
+            flatten_or(*logical->left, out);
+            flatten_or(*logical->right, out);
+            return;
+        }
+    }
+    out.push_back(&expr);
+}
+
+/// `col == "a" || col == "b" || …` → (col, {"a","b",…}). One column, equality
+/// only, string literals only; anything else is not an IN-list.
+auto try_extract_in_list(const ir::Expr& expr)
+    -> std::optional<std::pair<const ir::ColumnRef*, std::vector<std::string_view>>> {
+    const auto* logical = std::get_if<ir::LogicalExpr>(&expr.node);
+    if (logical == nullptr || logical->op != ir::LogicalOp::Or) {
+        return std::nullopt;
+    }
+    std::vector<const ir::Expr*> leaves;
+    flatten_or(expr, leaves);
+
+    const ir::ColumnRef* column = nullptr;
+    std::vector<std::string_view> values;
+    values.reserve(leaves.size());
+    for (const auto* leaf : leaves) {
+        auto split = split_col_cmp_lit(*leaf);
+        if (!split.has_value()) {
+            return std::nullopt;
+        }
+        const auto& [col, op, lit] = *split;
+        if (op != ir::CompareOp::Eq) {
+            return std::nullopt;
+        }
+        const auto* text = std::get_if<std::string>(&lit->value);
+        if (text == nullptr) {
+            return std::nullopt;
+        }
+        if (column == nullptr) {
+            column = col;
+        } else if (column->name != col->name) {
+            return std::nullopt;  // an OR across two columns is not a membership test
+        }
+        values.emplace_back(*text);
+    }
+    if (column == nullptr) {
+        return std::nullopt;
+    }
+    return std::pair{column, std::move(values)};
+}
+
+/// Evaluate an IN-list in one pass: `col == "a" || col == "b" || …` over a
+/// Categorical column is a lookup in a byte-per-dictionary-code table, so the
+/// per-row cost is one indexed load regardless of how long the list is. The
+/// generic OR path instead builds a full-width mask per arm and combines them,
+/// which is what a SQL `IN` degrades into once it is spelled as an OR-chain.
+auto try_in_list_mask(const ir::Expr& expr, const Table& table, std::size_t n)
+    -> std::optional<Mask> {
+    auto in_list = try_extract_in_list(expr);
+    if (!in_list.has_value()) {
+        return std::nullopt;
+    }
+    const auto& [column, values] = *in_list;
+    auto index = table.index.find(column->name);
+    if (index == table.index.end()) {
+        return std::nullopt;
+    }
+    const auto& entry = table.columns[index->second];
+    const auto* cat = std::get_if<Column<Categorical>>(entry.column.get());
+    if (cat == nullptr) {
+        return std::nullopt;  // plain string columns keep the generic path
+    }
+
+    const auto& dict = cat->dictionary();
+    std::vector<std::uint8_t> code_ok(dict.size(), 0U);
+    for (std::size_t code = 0; code < dict.size(); ++code) {
+        code_ok[code] = static_cast<std::uint8_t>(
+            std::find(values.begin(), values.end(), std::string_view{dict[code]}) != values.end());
+    }
+
+    Mask mask;
+    mask.value.resize(n);
+    const auto* codes = cat->codes_data();
+    for (std::size_t row = 0; row < n; ++row) {
+        mask.value[row] = code_ok[static_cast<std::size_t>(codes[row])];
+    }
+    mask.apply_validity(entry.validity.has_value() ? &*entry.validity : nullptr, n);
+    return mask;
+}
+
+}  // namespace
+
 // Compute a boolean Mask for all n rows, with 3-valued logic (3VL) for nulls.
 // valid==nullopt means all rows are valid (common non-null path, zero overhead).
 auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
@@ -1799,6 +1916,14 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                     return std::move(*mask);
                 }
                 const bool is_and = node.op == ir::LogicalOp::And;
+                // Fast path: an IN-list (`col == a || col == b || …` on one
+                // categorical column) is a membership test, not a chain of
+                // independent ORs — one pass, no mask per arm.
+                if (!is_and) {
+                    if (auto in_mask = try_in_list_mask(expr, table, n); in_mask.has_value()) {
+                        return std::move(*in_mask);
+                    }
+                }
                 // Fast path: two numeric (column cmp literal) terms without nulls.
                 // Evaluate both comparisons and combine in a single pass.
                 if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table);
@@ -2217,44 +2342,174 @@ auto merge_bound(BoundsSpec& spec, ir::CompareOp op, const ir::Literal& lit) -> 
     return true;
 }
 
+// A membership test on a text column: `col == "x"`, `col != "x"`, or an
+// OR-chain of equalities on one column — an IN-list, which is how SQL's
+// `col IN (...)` reaches Ibex since there is no `in` operator.
+//
+// These are the other half of a pushed-down filter, and until now only the
+// numeric half fused: q19 pushes `l_shipinstruct == 'DELIVER IN PERSON'` and
+// `l_shipmode IN ('AIR','AIR REG')`, which cost a full-width mask for the
+// first, a mask *per arm* plus a combine for the OR, and a remove_if over the
+// survivors. Folding them into the same blocked pass as the ranges reads each
+// column once and allocates no full-width mask at all.
+//
+// A Categorical column is tested against a byte per dictionary code, so the
+// per-row work is one indexed load however long the IN-list is. Note a literal
+// that is not in the dictionary simply matches no code — an impossible
+// predicate then selects nothing, for free.
+struct SetSpec {
+    const Column<Categorical>* cat = nullptr;
+    const Column<std::string>* str = nullptr;
+    const ValidityBitmap* validity = nullptr;
+
+    // Accumulated across conjuncts on this column before being compiled below.
+    // `allowed` is only meaningful once has_allowed is set (no Eq/IN seen yet
+    // means "any value"); `denied` collects the `!=` literals.
+    std::vector<std::string_view> allowed;
+    std::vector<std::string_view> denied;
+    bool has_allowed = false;
+    bool unsatisfiable = false;
+
+    // Compiled forms.
+    std::vector<std::uint8_t> code_ok;  // Categorical: indexed by dictionary code
+    robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> allow_set;
+    robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> deny_set;
+
+    [[nodiscard]] auto matches(std::string_view value) const -> bool {
+        if (has_allowed && !allow_set.contains(value)) {
+            return false;
+        }
+        return deny_set.empty() || !deny_set.contains(value);
+    }
+};
+
 struct BoundsPlan {
     std::vector<BoundsSpec> specs;
+    std::vector<SetSpec> sets;
     std::vector<ir::Expr> leftover;
 };
 
-// Split a conjunct into (column, op, literal), normalizing `literal op column`
-// into `column flip(op) literal`.
-auto split_col_cmp_lit(const ir::Expr& expr)
-    -> std::optional<std::tuple<const ir::ColumnRef*, ir::CompareOp, const ir::Literal*>> {
-    const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
-    if (cmp == nullptr) {
-        return std::nullopt;
+/// Bind a text column, or report that it is not one.
+auto bind_set_column(const ColumnEntry& entry, SetSpec& spec) -> bool {
+    if (const auto* c_cat = std::get_if<Column<Categorical>>(entry.column.get())) {
+        spec.cat = c_cat;
+    } else if (const auto* c_str = std::get_if<Column<std::string>>(entry.column.get())) {
+        spec.str = c_str;
+    } else {
+        return false;
     }
-    if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node)) {
-        if (const auto* lit = std::get_if<ir::Literal>(&cmp->right->node)) {
-            return std::tuple{col, cmp->op, lit};
+    spec.validity = entry.validity.has_value() ? &*entry.validity : nullptr;
+    return true;
+}
+
+/// Intersect this column's allowed values with `values` (an Eq or an IN-list).
+/// Conjuncts AND together, so a second Eq narrows rather than widens.
+void restrict_allowed(SetSpec& spec, const std::vector<std::string_view>& values) {
+    if (!spec.has_allowed) {
+        spec.allowed = values;
+        spec.has_allowed = true;
+        return;
+    }
+    std::vector<std::string_view> both;
+    for (const auto& value : spec.allowed) {
+        if (std::find(values.begin(), values.end(), value) != values.end()) {
+            both.push_back(value);
         }
     }
-    if (const auto* lit = std::get_if<ir::Literal>(&cmp->left->node)) {
-        if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->right->node)) {
-            return std::tuple{col, flip_cmp(cmp->op), lit};
-        }
+    spec.allowed = std::move(both);
+    if (spec.allowed.empty()) {
+        spec.unsatisfiable = true;
     }
-    return std::nullopt;
+}
+
+/// Turn the accumulated allow/deny literals into the form the kernel reads.
+void compile_set_spec(SetSpec& spec) {
+    for (const auto& value : spec.allowed) {
+        spec.allow_set.insert(value);
+    }
+    for (const auto& value : spec.denied) {
+        spec.deny_set.insert(value);
+    }
+    if (spec.cat == nullptr) {
+        return;
+    }
+    const auto& dict = spec.cat->dictionary();
+    spec.code_ok.assign(dict.size(), 0U);
+    bool any = false;
+    for (std::size_t code = 0; code < dict.size(); ++code) {
+        const bool ok = spec.matches(dict[code]);
+        spec.code_ok[code] = static_cast<std::uint8_t>(ok);
+        any = any || ok;
+    }
+    if (!any) {
+        spec.unsatisfiable = true;
+    }
 }
 
 auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjuncts) -> BoundsPlan {
     BoundsPlan plan;
     robin_hood::unordered_map<std::string, std::size_t> spec_of_column;
+    robin_hood::unordered_map<std::string, std::size_t> set_of_column;
     plan.leftover.reserve(conjuncts.size());
 
+    // A text column and the values it is allowed to take: an Eq, a `!=`, or an
+    // OR-chain of equalities on that one column.
+    const auto add_set_conjunct = [&](const ir::ColumnRef& col,
+                                      const std::vector<std::string_view>& values,
+                                      bool negated) -> bool {
+        auto index = input.index.find(col.name);
+        if (index == input.index.end()) {
+            return false;
+        }
+        auto existing = set_of_column.find(col.name);
+        std::size_t at = 0;
+        if (existing != set_of_column.end()) {
+            at = existing->second;
+        } else {
+            SetSpec spec;
+            if (!bind_set_column(input.columns[index->second], spec)) {
+                return false;  // not a text column
+            }
+            at = plan.sets.size();
+            plan.sets.push_back(std::move(spec));
+            set_of_column.emplace(col.name, at);
+        }
+        SetSpec& spec = plan.sets[at];
+        if (negated) {
+            spec.denied.insert(spec.denied.end(), values.begin(), values.end());
+        } else {
+            restrict_allowed(spec, values);
+        }
+        return true;
+    };
+
     for (const auto& conjunct : conjuncts) {
+        if (auto in_list = try_extract_in_list(conjunct); in_list.has_value()) {
+            if (add_set_conjunct(*in_list->first, in_list->second, /*negated=*/false)) {
+                continue;
+            }
+            plan.leftover.push_back(conjunct);
+            continue;
+        }
+
         auto split = split_col_cmp_lit(conjunct);
         if (!split.has_value()) {
             plan.leftover.push_back(conjunct);
             continue;
         }
         const auto& [col, op, lit] = *split;
+
+        // A text equality (or inequality) is a membership test, not a range.
+        if (const auto* text = std::get_if<std::string>(&lit->value)) {
+            if (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne) {
+                const std::vector<std::string_view> values{std::string_view{*text}};
+                if (add_set_conjunct(*col, values, op == ir::CompareOp::Ne)) {
+                    continue;
+                }
+            }
+            plan.leftover.push_back(conjunct);
+            continue;
+        }
 
         auto index = input.index.find(col->name);
         if (index == input.index.end()) {
@@ -2300,6 +2555,10 @@ auto build_bounds_plan(const Table& input, const std::vector<ir::Expr>& conjunct
             spec_of_column.emplace(col->name, plan.specs.size());
             plan.specs.push_back(candidate);
         }
+    }
+
+    for (auto& spec : plan.sets) {
+        compile_set_spec(spec);
     }
     return plan;
 }
@@ -2391,13 +2650,53 @@ void apply_bounds_spec(const BoundsSpec& spec, std::size_t base, std::size_t len
     }
 }
 
-auto select_bounds(const std::vector<BoundsSpec>& specs, std::size_t rows)
-    -> std::vector<std::size_t> {
+void apply_set_spec(const SetSpec& spec, std::size_t base, std::size_t len, std::uint8_t* mask,
+                    bool first) {
+    if (spec.cat != nullptr) {
+        // One indexed load per row, whatever the IN-list's length.
+        const auto* codes = spec.cat->codes_data() + base;
+        const std::uint8_t* code_ok = spec.code_ok.data();
+        if (first) {
+            for (std::size_t i = 0; i < len; ++i) {
+                mask[i] = code_ok[static_cast<std::size_t>(codes[i])];
+            }
+        } else {
+            for (std::size_t i = 0; i < len; ++i) {
+                mask[i] = static_cast<std::uint8_t>(mask[i] &
+                                                    code_ok[static_cast<std::size_t>(codes[i])]);
+            }
+        }
+    } else {
+        const auto& column = *spec.str;
+        for (std::size_t i = 0; i < len; ++i) {
+            if (!first && mask[i] == 0) {
+                continue;  // already rejected — skip the lookup
+            }
+            const bool ok = spec.matches(std::string_view{column[base + i]});
+            mask[i] = static_cast<std::uint8_t>(ok);
+        }
+    }
+    // A null matches no literal, so it survives no membership test either.
+    if (spec.validity != nullptr) {
+        for (std::size_t i = 0; i < len; ++i) {
+            mask[i] = static_cast<std::uint8_t>(
+                mask[i] & static_cast<std::uint8_t>((*spec.validity)[base + i]));
+        }
+    }
+}
+
+auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSpec>& sets,
+                   std::size_t rows) -> std::vector<std::size_t> {
     constexpr std::size_t kBlock = 4096;
     std::vector<std::size_t> selected;
     for (const auto& spec : specs) {
         if (spec.unsatisfiable) {
             return selected;
+        }
+    }
+    for (const auto& spec : sets) {
+        if (spec.unsatisfiable) {
+            return selected;  // e.g. `x == 'nope'` where 'nope' is not a value x takes
         }
     }
     selected.reserve(std::min<std::size_t>(rows, kBlock));
@@ -2408,6 +2707,10 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, std::size_t rows)
         bool first = true;
         for (const auto& spec : specs) {
             apply_bounds_spec(spec, base, len, mask.data(), first);
+            first = false;
+        }
+        for (const auto& spec : sets) {
+            apply_set_spec(spec, base, len, mask.data(), first);
             first = false;
         }
         for (std::size_t i = 0; i < len; ++i) {
@@ -2522,8 +2825,8 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
     // directly; whatever doesn't fuse runs against that selection instead of
     // against every row.
     auto plan = build_bounds_plan(input, conjuncts);
-    if (!plan.specs.empty()) {
-        auto selected = select_bounds(plan.specs, input.rows());
+    if (!plan.specs.empty() || !plan.sets.empty()) {
+        auto selected = select_bounds(plan.specs, plan.sets, input.rows());
         return filter_selection_impl(input, plan.leftover, scalars, std::move(selected));
     }
 

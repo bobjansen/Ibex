@@ -217,3 +217,128 @@ TEST_CASE("filter_selection: fused ranges hold across block boundaries", "[filte
         REQUIRE(selected[i] == 4000 + i);
     }
 }
+
+// ── IN-lists ─────────────────────────────────────────────────────────────────
+//
+// SQL's `col IN (a, b)` reaches Ibex as `col == a || col == b`, and a pushed
+// filter's text predicates fuse into the same blocked pass as the ranges: a
+// Categorical column is tested against one byte per dictionary code, so the
+// per-row cost is one indexed load however long the list is.
+
+namespace {
+
+auto cat_column(const std::vector<std::string>& dict, const std::vector<std::size_t>& codes)
+    -> Column<Categorical> {
+    Column<Categorical> col(dict);
+    for (auto code : codes) {
+        col.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+    return col;
+}
+
+// mode: AIR, AIR REG, SHIP, RAIL, AIR — plus a parallel int for range mixing.
+auto ship_table() -> runtime::Table {
+    runtime::Table table;
+    table.add_column("mode", cat_column({"AIR", "AIR REG", "SHIP", "RAIL"}, {0, 1, 2, 3, 0}));
+    table.add_column("plain", Column<std::string>{});
+    auto& plain = std::get<Column<std::string>>(*table.columns[1].column);
+    for (const auto* value : {"AIR", "AIR REG", "SHIP", "RAIL", "AIR"}) {
+        plain.push_back(value);
+    }
+    table.add_column("qty", Column<std::int64_t>{1, 2, 3, 4, 5});
+    return table;
+}
+
+auto in_list(const std::string& column, const std::vector<std::string>& values) -> ir::Expr {
+    ir::Expr acc = cmp(column, ir::CompareOp::Eq, ir::Literal{.value = values.front()});
+    for (std::size_t i = 1; i < values.size(); ++i) {
+        ir::Expr next = cmp(column, ir::CompareOp::Eq, ir::Literal{.value = values[i]});
+        acc = ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::Or,
+                                               .left = ir::make_expr_ptr(std::move(acc)),
+                                               .right = ir::make_expr_ptr(std::move(next))}};
+    }
+    return acc;
+}
+
+auto lit_s(const std::string& v) -> ir::Literal {
+    return ir::Literal{.value = v};
+}
+
+}  // namespace
+
+TEST_CASE("filter_selection: an IN-list over a categorical column fuses", "[filter][selection]") {
+    const auto table = ship_table();
+
+    CHECK(select(table, {in_list("mode", {"AIR", "AIR REG"})}) ==
+          std::vector<std::size_t>{0, 1, 4});
+    // A single equality is the one-element case.
+    CHECK(select(table, {cmp("mode", ir::CompareOp::Eq, lit_s("SHIP"))}) ==
+          std::vector<std::size_t>{2});
+    // Order within the list is irrelevant, and a value absent from the data is
+    // simply not matched.
+    CHECK(select(table, {in_list("mode", {"RAIL", "NOPE", "SHIP"})}) ==
+          std::vector<std::size_t>{2, 3});
+}
+
+TEST_CASE("filter_selection: IN-lists work on plain string columns too", "[filter][selection]") {
+    const auto table = ship_table();
+    CHECK(select(table, {in_list("plain", {"AIR", "RAIL"})}) == std::vector<std::size_t>{0, 3, 4});
+    CHECK(select(table, {cmp("plain", ir::CompareOp::Ne, lit_s("AIR"))}) ==
+          std::vector<std::size_t>{1, 2, 3});
+}
+
+TEST_CASE("filter_selection: a literal outside the dictionary selects nothing",
+          "[filter][selection]") {
+    const auto table = ship_table();
+    // "TRUCK" is not a value `mode` can take, so no code matches it.
+    CHECK(select(table, {cmp("mode", ir::CompareOp::Eq, lit_s("TRUCK"))}).empty());
+    // Two different equalities on one column cannot both hold.
+    CHECK(select(table, {cmp("mode", ir::CompareOp::Eq, lit_s("AIR")),
+                         cmp("mode", ir::CompareOp::Eq, lit_s("SHIP"))})
+              .empty());
+}
+
+TEST_CASE("filter_selection: conjuncts narrow an IN-list rather than widen it",
+          "[filter][selection]") {
+    const auto table = ship_table();
+    // `mode IN (AIR, AIR REG, SHIP) && mode != AIR` -> {AIR REG, SHIP}
+    CHECK(select(table, {in_list("mode", {"AIR", "AIR REG", "SHIP"}),
+                         cmp("mode", ir::CompareOp::Ne, lit_s("AIR"))}) ==
+          std::vector<std::size_t>{1, 2});
+    // Two IN-lists on one column intersect.
+    CHECK(select(table, {in_list("mode", {"AIR", "AIR REG", "SHIP"}),
+                         in_list("mode", {"SHIP", "RAIL"})}) == std::vector<std::size_t>{2});
+}
+
+TEST_CASE("filter_selection: an IN-list fuses alongside a numeric range", "[filter][selection]") {
+    const auto table = ship_table();
+    // The q19 shape: a text membership test and a range in one pass.
+    CHECK(select(table,
+                 {in_list("mode", {"AIR", "AIR REG"}), cmp("qty", ir::CompareOp::Ge, lit_i(2))}) ==
+          std::vector<std::size_t>{1, 4});
+}
+
+TEST_CASE("filter_selection: a null survives no membership test", "[filter][selection]") {
+    runtime::Table table;
+    runtime::ValidityBitmap validity(3, true);
+    validity.set(1, false);
+    table.add_column("mode", cat_column({"AIR", "SHIP"}, {0, 0, 1}), std::move(validity));
+
+    // Row 1's code says AIR, but it is null, so the membership test drops it.
+    CHECK(select(table, {in_list("mode", {"AIR", "SHIP"})}) == std::vector<std::size_t>{0, 2});
+}
+
+TEST_CASE("filter_selection: an OR across two columns is not a membership test",
+          "[filter][selection]") {
+    const auto table = ship_table();
+    // `mode == AIR || plain == RAIL` is a genuine disjunction and must not be
+    // mistaken for an IN-list on either column.
+    ir::Expr disjunction{
+        .node = ir::LogicalExpr{
+            .op = ir::LogicalOp::Or,
+            .left = ir::make_expr_ptr(cmp("mode", ir::CompareOp::Eq, lit_s("AIR"))),
+            .right = ir::make_expr_ptr(cmp("plain", ir::CompareOp::Eq, lit_s("RAIL")))}};
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(std::move(disjunction));
+    CHECK(select(table, conjuncts) == std::vector<std::size_t>{0, 3, 4});
+}

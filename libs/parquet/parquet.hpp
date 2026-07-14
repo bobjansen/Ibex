@@ -27,6 +27,7 @@
 #include <arrow/util/formatting.h>
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -916,6 +917,96 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
     return emitted;
 }
 
+/// Dense String decode — the counterpart of decode_numeric_column's bulk path,
+/// which strings never had: every full read of a non-dictionary string column
+/// went through the level-aware per-value loop.
+///
+/// Two costs disappear when the chunk statistics prove the group is null-free:
+/// definition levels are not decoded at all (6M int16 of scratch traffic on
+/// lineitem), and validity is bumped in bulk rather than a bit per row.
+///
+/// The third cost is the one that actually dominated: `Column<std::string>`'s
+/// flat character buffer was never reserved (only its offsets were), so it grew
+/// by doubling — re-copying l_comment's ~160MB of text about as many times as it
+/// takes to reach that size. The column chunk's uncompressed byte size is a
+/// close upper bound on the decoded characters (it also carries a 4-byte length
+/// per value), so one reserve up front removes the whole reallocation chain.
+inline auto decode_string_column(parquet::arrow::FileReader& reader, int leaf_index,
+                                 const ibex::runtime::Selection* selection,
+                                 const DirectDecodeGroups& groups, ibex::Column<std::string>& out,
+                                 DirectValidity& validity) -> std::size_t {
+    const auto& metadata = *reader.parquet_reader()->metadata();
+    const bool optional = metadata.schema()->Column(leaf_index)->max_definition_level() != 0;
+
+    if (selection != nullptr || (optional && !groups_have_no_nulls(metadata, groups, leaf_index))) {
+        return decode_physical_column<parquet::ByteArrayType>(
+            reader, leaf_index, selection, groups, [&](const parquet::ByteArray* value) {
+                validity.append(value != nullptr);
+                out.push_back(
+                    value == nullptr
+                        ? std::string_view{}
+                        : std::string_view{
+                              reinterpret_cast<const char*>(  // NOLINT(*-reinterpret-cast)
+                                  value->ptr),
+                              value->len});
+            });
+    }
+
+    // The chunk's uncompressed byte size bounds the characters it can decode to
+    // (it also carries a 4-byte length per value, so it overshoots slightly).
+    // That bound is what lets the values be written straight through cursors
+    // instead of one push_back — see Column<std::string>::begin_bulk_append.
+    std::size_t chars_bound = 0;
+    for (int group = groups.begin; group < groups.end; ++group) {
+        chars_bound += static_cast<std::size_t>(
+            metadata.RowGroup(group)->ColumnChunk(leaf_index)->total_uncompressed_size());
+    }
+    auto writer = out.begin_bulk_append(groups.rows, chars_bound);
+
+    std::unique_ptr<parquet::ByteArray[]> values(
+        new parquet::ByteArray[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::size_t emitted = 0;
+
+    for (int group = groups.begin; group < groups.end; ++group) {
+        auto row_group = reader.parquet_reader()->RowGroup(group);
+        auto column = row_group->Column(leaf_index);
+        if (column->type() != parquet::ByteArrayType::type_num) {
+            throw std::runtime_error("read_parquet: physical column type does not match schema");
+        }
+        auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
+        const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        std::size_t row = 0;
+        while (row < group_rows && typed->HasNext()) {
+            const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
+                static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+            std::int64_t values_read = 0;
+            const std::int64_t levels_read =
+                typed->ReadBatch(request, nullptr, nullptr, values.get(), &values_read);
+            if (levels_read <= 0 || levels_read != values_read) {
+                throw std::runtime_error(
+                    "read_parquet: dense string decoder made no progress or found a null value "
+                    "that contradicts the column statistics");
+            }
+            const auto count = static_cast<std::size_t>(values_read);
+            // The ByteArray points into the page's decompression buffer, so the
+            // copy has to happen before the next ReadBatch reuses it.
+            for (std::size_t i = 0; i < count; ++i) {
+                writer.append(std::string_view{
+                    reinterpret_cast<const char*>(values[i].ptr),  // NOLINT(*-reinterpret-cast)
+                    values[i].len});
+            }
+            validity.append_valid(count);
+            emitted += count;
+            row += static_cast<std::size_t>(levels_read);
+        }
+        if (row != group_rows) {
+            throw std::runtime_error("read_parquet: column ended before its row group");
+        }
+    }
+    out.finish_bulk_append(writer);
+    return emitted;
+}
+
 inline auto decode_dictionary_column(parquet::arrow::FileReader& reader, int leaf_index,
                                      const ibex::runtime::Selection* selection,
                                      const DirectDecodeGroups& groups,
@@ -1327,21 +1418,11 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
         case arrow::Type::LARGE_STRING: {
             // Straight into the flat buffers — see append_string_column. The
             // ByteArray still points into the page's decompression buffer, so
-            // push_back's copy must happen here, before the next page read.
+            // the copy must happen before the next page read.
             ibex::Column<std::string> out;
             out.reserve(output_rows);
-            auto emitted = decode_physical_column<parquet::ByteArrayType>(
-                reader, leaf_index, selection, groups, [&](const parquet::ByteArray* value) {
-                    validity.append(value != nullptr);
-                    if (value == nullptr) {
-                        out.push_back(std::string_view{});
-                    } else {
-                        out.push_back(
-                            std::string_view{reinterpret_cast<const char*>(
-                                                 value->ptr),  // NOLINT(*-reinterpret-cast)
-                                             value->len});
-                    }
-                });
+            auto emitted =
+                decode_string_column(reader, leaf_index, selection, groups, out, validity);
             verify(emitted);
             entry.column = std::make_shared<ibex::runtime::ColumnValue>(std::move(out));
             break;

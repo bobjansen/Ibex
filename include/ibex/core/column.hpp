@@ -4,6 +4,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <iterator>
@@ -402,8 +403,14 @@ class Column<Categorical> {
 ///   - Zero SSO overhead for large-cardinality string columns
 template <>
 class Column<std::string> {
-    std::vector<std::uint32_t> offsets_;  // size = rows+1; offsets_[0]=0 always
-    std::vector<char> chars_;             // all string bytes concatenated
+    // NoInitAllocator (as Column<T> uses) so that resizing to make room for a
+    // bulk write does not first zero-fill the buffer. On a 6M-row string column
+    // the character buffer is ~160MB, and value-initializing it costs more than
+    // the bulk append saves — see begin_bulk_append and resize_for_gather, both
+    // of which overwrite every byte they expose.
+    std::vector<std::uint32_t, detail::NoInitAllocator<std::uint32_t>>
+        offsets_;                                             // size = rows+1; offsets_[0]=0 always
+    std::vector<char, detail::NoInitAllocator<char>> chars_;  // all string bytes concatenated
 
    public:
     using value_type = std::string_view;
@@ -459,6 +466,57 @@ class Column<std::string> {
         offsets_.reserve(n + 1);
         if (chars_hint)
             chars_.reserve(chars_hint);
+    }
+
+    /// Bulk append through raw cursors, for producers that know an upper bound
+    /// on the bytes they are about to write (the Parquet decoder gets one from
+    /// the column chunk metadata).
+    ///
+    /// `push_back` costs a `vector::insert` plus an `offsets_` push per value —
+    /// a capacity check, a memmove call, and a size update each time. On a
+    /// 6M-row string column that is as expensive as the Parquet decode feeding
+    /// it: 112ms against 55ms for the same bytes written through cursors. The
+    /// storage is sized once, then written straight through.
+    ///
+    /// Usage: `auto w = begin_bulk_append(rows, chars_upper_bound);` then
+    /// `w.append(sv)` exactly `rows` times, then `finish_bulk_append(w)`, which
+    /// trims the character buffer to what was actually written. Writing more
+    /// than `rows` values or more than `chars_upper_bound` bytes is undefined.
+    class BulkAppender {
+        friend class Column<std::string>;
+        char* chars_ = nullptr;             // write cursor
+        std::uint32_t* offsets_ = nullptr;  // write cursor
+        const char* chars_begin_ = nullptr;
+
+       public:
+        void append(std::string_view value) noexcept {
+            if (!value.empty()) {
+                std::memcpy(chars_, value.data(), value.size());
+                chars_ += value.size();
+            }
+            *offsets_++ = static_cast<std::uint32_t>(chars_ - chars_begin_);
+        }
+    };
+
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    [[nodiscard]] auto begin_bulk_append(size_type rows, size_type chars_upper_bound)
+        -> BulkAppender {
+        const size_type old_rows = size();
+        const size_type old_chars = chars_.size();
+        offsets_.resize(old_rows + rows + 1);
+        chars_.resize(old_chars + chars_upper_bound);
+
+        BulkAppender writer;
+        writer.chars_begin_ = chars_.data();
+        writer.chars_ = chars_.data() + old_chars;
+        writer.offsets_ = offsets_.data() + old_rows + 1;
+        return writer;
+    }
+
+    void finish_bulk_append(const BulkAppender& writer) {
+        const auto written = static_cast<size_type>(writer.chars_ - writer.chars_begin_);
+        chars_.resize(written);
+        offsets_.resize(static_cast<size_type>(writer.offsets_ - offsets_.data()));
     }
 
     void clear() noexcept {

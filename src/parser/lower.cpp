@@ -347,6 +347,165 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
         expr.node);
 }
 
+/// Look through redundant parentheses.
+auto unwrap_group(const Expr& expr) -> const Expr& {
+    const Expr* current = &expr;
+    while (const auto* group = std::get_if<GroupExpr>(&current->node)) {
+        current = group->expr.get();
+    }
+    return *current;
+}
+
+/// The call `expr` is, if it calls `callee`; null otherwise.
+auto as_call(const Expr& expr, std::string_view callee) -> const CallExpr* {
+    const auto* call = std::get_if<CallExpr>(&unwrap_group(expr).node);
+    return call != nullptr && call->callee == callee ? call : nullptr;
+}
+
+/// A `scalar(table_expr)` correlated-subquery call, if `expr` is one.
+///
+/// The one-argument form is the subquery; the REPL's older `scalar(table,
+/// column)` value extractor keeps the two-argument form, so arity is what
+/// tells them apart.
+auto as_scalar_subquery(const Expr& expr) -> const CallExpr* {
+    const auto* call = as_call(expr, "scalar");
+    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty()) {
+        return nullptr;
+    }
+    return call;
+}
+
+auto clause_contains_call(const Clause& clause, std::string_view callee) -> bool;
+
+/// True when any node anywhere in `expr` calls `callee`.
+auto contains_call(const Expr& expr, std::string_view callee) -> bool {
+    return std::visit(
+        [&](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            const auto in = [&](const ExprPtr& child) {
+                return child != nullptr && contains_call(*child, callee);
+            };
+            if constexpr (std::is_same_v<T, CallExpr>) {
+                if (node.callee == callee) {
+                    return true;
+                }
+                return std::ranges::any_of(node.args, in) ||
+                       std::ranges::any_of(node.named_args,
+                                           [&](const NamedArg& a) { return in(a.value); });
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                return std::ranges::any_of(node.named_args,
+                                           [&](const NamedArg& a) { return in(a.value); });
+            } else if constexpr (std::is_same_v<T, UnaryExpr> || std::is_same_v<T, GroupExpr>) {
+                return in(node.expr);
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                return in(node.left) || in(node.right);
+            } else if constexpr (std::is_same_v<T, AscribeExpr>) {
+                return in(node.base);
+            } else if constexpr (std::is_same_v<T, ArrayLiteralExpr>) {
+                return std::ranges::any_of(node.elements, in);
+            } else if constexpr (std::is_same_v<T, TableExpr>) {
+                return in(node.row_count) ||
+                       std::ranges::any_of(node.columns,
+                                           [&](const TableColumnDef& c) { return in(c.expr); });
+            } else if constexpr (std::is_same_v<T, BlockExpr>) {
+                return in(node.base) || std::ranges::any_of(node.clauses, [&](const Clause& c) {
+                           return clause_contains_call(c, callee);
+                       });
+            } else if constexpr (std::is_same_v<T, JoinExpr>) {
+                return in(node.left) || in(node.right) ||
+                       (node.predicate.has_value() && in(*node.predicate));
+            } else if constexpr (std::is_same_v<T, StreamExpr>) {
+                return in(node.source) || std::ranges::any_of(node.sink_args, in) ||
+                       std::ranges::any_of(node.transform, [&](const Clause& c) {
+                           return clause_contains_call(c, callee);
+                       });
+            } else {
+                return false;  // IdentifierExpr, LiteralExpr
+            }
+        },
+        expr.node);
+}
+
+auto clause_contains_call(const Clause& clause, std::string_view callee) -> bool {
+    return std::visit(
+        [&](const auto& c) -> bool {
+            using T = std::decay_t<decltype(c)>;
+            const auto in = [&](const ExprPtr& expr) {
+                return expr != nullptr && contains_call(*expr, callee);
+            };
+            const auto in_fields = [&](const std::vector<Field>& fields) {
+                return std::ranges::any_of(fields, [&](const Field& f) { return in(f.expr); });
+            };
+            const auto in_tuple_fields = [&](const std::vector<TupleField>& fields) {
+                return std::ranges::any_of(fields, [&](const TupleField& f) { return in(f.expr); });
+            };
+            const auto in_map_fields = [&](const std::vector<MapField>& fields) {
+                return std::ranges::any_of(
+                    fields, [&](const MapField& f) { return in(f.expr) || in(f.where_expr); });
+            };
+            if constexpr (std::is_same_v<T, FilterClause>) {
+                return in(c.predicate);
+            } else if constexpr (std::is_same_v<T, SelectClause> ||
+                                 std::is_same_v<T, UpdateClause>) {
+                return in_fields(c.fields) || in_tuple_fields(c.tuple_fields) ||
+                       in_map_fields(c.map_fields);
+            } else if constexpr (std::is_same_v<T, DistinctClause> ||
+                                 std::is_same_v<T, RenameClause>) {
+                return in_fields(c.fields);
+            } else if constexpr (std::is_same_v<T, ByClause>) {
+                return in_fields(c.keys);
+            } else if constexpr (std::is_same_v<T, MeltClause>) {
+                return in_fields(c.id_fields);
+            } else if constexpr (std::is_same_v<T, HeadClause> || std::is_same_v<T, TailClause>) {
+                return in(c.count);
+            } else if constexpr (std::is_same_v<T, ModelClause>) {
+                return std::ranges::any_of(c.params,
+                                           [&](const ModelParam& p) { return in(p.value); });
+            } else {
+                return false;  // clauses with no expressions
+            }
+        },
+        clause);
+}
+
+/// Flatten a top-level `&&` chain into its conjuncts. Parentheses are looked
+/// through, so the returned pointers are never GroupExprs.
+void split_conjuncts(const Expr& expr, std::vector<const Expr*>& out) {
+    const Expr& term = unwrap_group(expr);
+    if (const auto* binary = std::get_if<BinaryExpr>(&term.node);
+        binary != nullptr && binary->op == BinaryOp::And) {
+        split_conjuncts(*binary->left, out);
+        split_conjuncts(*binary->right, out);
+        return;
+    }
+    out.push_back(&term);
+}
+
+/// Rebuild `terms` as one `&&` chain of clones.
+auto clone_conjunction(const std::vector<const Expr*>& terms) -> ExprPtr {
+    ExprPtr out = clone_expr(*terms.front());
+    for (std::size_t i = 1; i < terms.size(); ++i) {
+        auto conjunction = std::make_unique<Expr>();
+        conjunction->node =
+            BinaryExpr{.op = BinaryOp::And, .left = std::move(out), .right = clone_expr(*terms[i])};
+        out = std::move(conjunction);
+    }
+    return out;
+}
+
+/// Fold lowered predicates into one `&&` chain.
+auto fold_conjunction(std::vector<ir::Expr> terms) -> ir::Expr {
+    ir::Expr out = std::move(terms.front());
+    for (std::size_t i = 1; i < terms.size(); ++i) {
+        out = ir::Expr{.node = ir::LogicalExpr{
+                           .op = ir::LogicalOp::And,
+                           .left = ir::make_expr_ptr(std::move(out)),
+                           .right = ir::make_expr_ptr(std::move(terms[i])),
+                       }};
+    }
+    return out;
+}
+
 /// Clone `expr` while substituting any IdentifierExpr whose name appears in
 /// `subs` with a clone of the bound replacement. Used to inline an aggregate
 /// UDF body's parameter references with the call's argument expressions.
@@ -1625,13 +1784,11 @@ class Lowerer {
         auto node = std::move(base.value());
 
         if (state.filter) {
-            auto predicate = lower_expr_to_ir(*state.filter->predicate);
-            if (!predicate.has_value()) {
-                return std::unexpected(predicate.error());
+            auto filtered = lower_filter(*state.filter->predicate, std::move(node));
+            if (!filtered.has_value()) {
+                return std::unexpected(filtered.error());
             }
-            auto filter_node = builder_.filter(std::move(predicate.value()));
-            filter_node->add_child(std::move(node));
-            node = std::move(filter_node);
+            node = std::move(filtered.value());
         }
 
         if (state.rename) {
@@ -2345,6 +2502,373 @@ class Lowerer {
         return result;
     }
 
+    /// One `inner_column == outer(outer_column)` capture.
+    struct CapturedKey {
+        std::string inner;
+        std::string outer;
+    };
+
+    /// A lowered correlated subquery: an aggregate keyed by the captured
+    /// columns, renamed so its keys carry the *outer* names, plus those names
+    /// (which are the left-join keys).
+    struct ScalarSubqueryPlan {
+        ir::NodePtr plan;
+        std::vector<std::string> keys;
+    };
+
+    /// Lower a `filter` predicate over `input`.
+    ///
+    /// A predicate with no `scalar(...)` subquery becomes a plain FilterNode.
+    /// One with subqueries is decorrelated: each subquery is evaluated once, as
+    /// an aggregate over its captured key, and left-joined to the outer rows.
+    /// The subquery must never be run per outer row.
+    ///
+    ///     filter local && ps_supplycost == scalar(inner[filter ps_partkey == outer(p_partkey),
+    ///     ...])
+    ///
+    ///     Filter(ps_supplycost == __ibex_scalar_0)
+    ///       Join(Left, on p_partkey)
+    ///         Filter(local)(outer)
+    ///         Rename(ps_partkey -> p_partkey)
+    ///           Aggregate(by ps_partkey: min(ps_supplycost) as __ibex_scalar_0)(inner)
+    ///
+    /// The left join is what gives the subquery SQL's scalar semantics: an
+    /// outer row whose key matches no inner group gets a null, and the
+    /// comparison above then drops it.
+    auto lower_filter(const Expr& predicate, ir::NodePtr input) -> LowerResult {
+        std::vector<const Expr*> conjuncts;
+        split_conjuncts(predicate, conjuncts);
+
+        std::vector<const Expr*> local;
+        std::vector<const Expr*> correlated;
+        local.reserve(conjuncts.size());
+        for (const auto* conjunct : conjuncts) {
+            if (contains_call(*conjunct, "scalar")) {
+                correlated.push_back(conjunct);
+            } else {
+                local.push_back(conjunct);
+            }
+        }
+
+        if (correlated.empty()) {
+            auto lowered = lower_expr_to_ir(predicate);
+            if (!lowered.has_value()) {
+                return std::unexpected(lowered.error());
+            }
+            auto filter = builder_.filter(std::move(lowered.value()));
+            filter->add_child(std::move(input));
+            return filter;
+        }
+
+        // A filter yields the rows it kept, not a wider table, so the generated
+        // scalar columns the joins below add have to be projected back off —
+        // which means naming every column that stays. Without a closed schema
+        // there is no such list, and rather than let a filter silently widen its
+        // input in exactly the cases where the schema is unclear, refuse.
+        const ir::SchemaInfo outer_schema = ir::infer_schema(*input, source_schemas());
+        if (!outer_schema.is_known() || outer_schema.is_open()) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): the enclosing query's columns are not statically known, so a "
+                           "correlated subquery cannot be used here; ascribe a schema to the "
+                           "source (`src as DataFrame<{...}>`)"});
+        }
+
+        // The uncorrelated conjuncts go below the join, directly on the outer
+        // input: they shrink it before it is probed, and sitting on the outer
+        // subtree is what lets `push_filters_into_joins` push them further down
+        // into the outer query's own joins and scans.
+        if (!local.empty()) {
+            auto lowered = lower_conjunction(local);
+            if (!lowered.has_value()) {
+                return std::unexpected(lowered.error());
+            }
+            auto filter = builder_.filter(std::move(lowered.value()));
+            filter->add_child(std::move(input));
+            input = std::move(filter);
+        }
+
+        std::vector<ir::Expr> residual;
+        residual.reserve(correlated.size());
+        for (const auto* conjunct : correlated) {
+            auto rewritten = decorrelate(*conjunct, input);
+            if (!rewritten.has_value()) {
+                return std::unexpected(rewritten.error());
+            }
+            residual.push_back(std::move(rewritten.value()));
+        }
+
+        auto filter = builder_.filter(fold_conjunction(std::move(residual)));
+        filter->add_child(std::move(input));
+        input = std::move(filter);
+
+        std::vector<ir::ColumnRef> columns;
+        columns.reserve(outer_schema.fields().size());
+        for (const auto& field : outer_schema.fields()) {
+            columns.push_back(ir::ColumnRef{.name = field.name});
+        }
+        auto project = builder_.project(std::move(columns));
+        project->add_child(std::move(input));
+        return project;
+    }
+
+    /// Join the subquery in `conjunct` onto `input` and return the comparison
+    /// rewritten against the generated scalar column.
+    auto decorrelate(const Expr& conjunct, ir::NodePtr& input)
+        -> std::expected<ir::Expr, LowerError> {
+        const auto* comparison = std::get_if<BinaryExpr>(&conjunct.node);
+        if (comparison == nullptr || !is_compare_op(comparison->op)) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): a correlated subquery is only supported as one side of a "
+                           "comparison in a filter"});
+        }
+        const Expr& left = unwrap_group(*comparison->left);
+        const Expr& right = unwrap_group(*comparison->right);
+        const CallExpr* subquery = as_scalar_subquery(left);
+        const bool on_left = subquery != nullptr;
+        if (subquery == nullptr) {
+            subquery = as_scalar_subquery(right);
+        }
+        if (subquery == nullptr) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): a correlated subquery must be one whole side of the "
+                           "comparison, not part of a larger expression"});
+        }
+        const Expr& value = on_left ? right : left;
+        if (contains_call(value, "scalar")) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): only one correlated subquery per comparison is supported"});
+        }
+        if (contains_call(value, "outer")) {
+            return std::unexpected(LowerError{
+                .message = "outer(): a capture is only valid inside a scalar(...) subquery"});
+        }
+
+        const std::string alias = next_scalar_alias(*input);
+        auto subplan = lower_scalar_subquery(*subquery, *input, alias);
+        if (!subplan.has_value()) {
+            return std::unexpected(subplan.error());
+        }
+
+        auto join = builder_.join(ir::JoinKind::Left, subplan->keys);
+        join->add_child(std::move(input));
+        join->add_child(std::move(subplan->plan));
+        input = std::move(join);
+
+        auto lowered_value = lower_expr_to_ir(value);
+        if (!lowered_value.has_value()) {
+            return std::unexpected(lowered_value.error());
+        }
+        auto scalar_ref = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = alias}});
+        auto value_ref = ir::make_expr_ptr(std::move(lowered_value.value()));
+        return ir::Expr{.node = ir::CompareExpr{
+                            .op = to_compare_op(comparison->op),
+                            .left = on_left ? std::move(scalar_ref) : std::move(value_ref),
+                            .right = on_left ? std::move(value_ref) : std::move(scalar_ref),
+                        }};
+    }
+
+    /// Lower `scalar(inner[filter ..., select { a = agg(col) }])` into an
+    /// aggregate over the captured keys, exposing the aggregate as `alias`.
+    auto lower_scalar_subquery(const CallExpr& call, const ir::Node& outer_input,
+                               const std::string& alias)
+        -> std::expected<ScalarSubqueryPlan, LowerError> {
+        const Expr& argument = unwrap_group(*call.args.front());
+        if (contains_call(argument, "scalar")) {
+            return std::unexpected(
+                LowerError{.message = "scalar(): nested correlated subqueries are not supported"});
+        }
+        const auto* block = std::get_if<BlockExpr>(&argument.node);
+        if (block == nullptr) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): expected a table expression with a filter and a select "
+                           "clause, e.g. scalar(t[filter k == outer(j), select { m = min(v) }])"});
+        }
+
+        const FilterClause* filter = nullptr;
+        const SelectClause* select = nullptr;
+        for (const auto& clause : block->clauses) {
+            if (const auto* f = std::get_if<FilterClause>(&clause)) {
+                if (filter != nullptr) {
+                    return std::unexpected(
+                        LowerError{.message = "scalar(): duplicate filter clause"});
+                }
+                filter = f;
+            } else if (const auto* s = std::get_if<SelectClause>(&clause)) {
+                if (select != nullptr) {
+                    return std::unexpected(
+                        LowerError{.message = "scalar(): duplicate select clause"});
+                }
+                select = s;
+            } else {
+                return std::unexpected(
+                    LowerError{.message = "scalar(): a correlated subquery supports only filter "
+                                          "and select clauses"});
+            }
+        }
+        if (filter == nullptr) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): the subquery needs a filter clause holding the outer(...) "
+                           "capture"});
+        }
+        if (select == nullptr || select->fields.size() != 1 || !select->tuple_fields.empty() ||
+            !select->map_fields.empty()) {
+            return std::unexpected(
+                LowerError{.message = "scalar(): the subquery must select exactly one column"});
+        }
+        const Field& aggregate = select->fields.front();
+        if (aggregate.expr == nullptr || !expr_contains_builtin_aggregate(*aggregate.expr)) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): the selected column must be an aggregate, e.g. min(col)"});
+        }
+        if (contains_call(*block->base, "outer") || contains_call(*aggregate.expr, "outer")) {
+            return std::unexpected(LowerError{
+                .message = "outer(): a capture may appear only in the subquery's filter clause"});
+        }
+
+        std::vector<const Expr*> conjuncts;
+        split_conjuncts(*filter->predicate, conjuncts);
+        std::vector<CapturedKey> captures;
+        std::vector<const Expr*> local;
+        local.reserve(conjuncts.size());
+        for (const auto* conjunct : conjuncts) {
+            if (!contains_call(*conjunct, "outer")) {
+                local.push_back(conjunct);
+                continue;
+            }
+            auto capture = parse_capture(*conjunct);
+            if (!capture.has_value()) {
+                return std::unexpected(capture.error());
+            }
+            const bool duplicate = std::ranges::any_of(captures, [&](const CapturedKey& seen) {
+                return seen.inner == capture->inner || seen.outer == capture->outer;
+            });
+            if (duplicate) {
+                return std::unexpected(LowerError{.message = "scalar(): duplicate outer(" +
+                                                             capture->outer + ") capture"});
+            }
+            captures.push_back(std::move(capture.value()));
+        }
+        if (captures.empty()) {
+            return std::unexpected(LowerError{
+                .message = "scalar(): the subquery captures nothing from the enclosing query; "
+                           "uncorrelated scalar subqueries are not supported yet"});
+        }
+
+        // A captured name that the enclosing query does not produce is a
+        // lower-time error, not a runtime "unknown column" from the join.
+        const ir::SchemaInfo outer_schema = ir::infer_schema(outer_input, source_schemas());
+        if (outer_schema.is_known() && !outer_schema.is_open()) {
+            for (const auto& capture : captures) {
+                if (outer_schema.find(capture.outer) == nullptr) {
+                    return std::unexpected(
+                        LowerError{.message = "outer(" + capture.outer +
+                                              "): no such column in the enclosing query"});
+                }
+            }
+        }
+
+        // Rebuild the subquery with the captures stripped: what is left is an
+        // ordinary grouped aggregate, keyed by the columns the captures compared.
+        BlockExpr grouped;
+        grouped.base = clone_expr(*block->base);
+        if (!local.empty()) {
+            grouped.clauses.emplace_back(FilterClause{.predicate = clone_conjunction(local)});
+        }
+        ByClause by;
+        by.is_braced = true;
+        by.keys.reserve(captures.size());
+        for (const auto& capture : captures) {
+            by.keys.push_back(Field{.name = capture.inner, .expr = nullptr});
+        }
+        grouped.clauses.emplace_back(std::move(by));
+        SelectClause projection;
+        projection.fields.push_back(Field{.name = alias, .expr = clone_expr(*aggregate.expr)});
+        grouped.clauses.emplace_back(std::move(projection));
+
+        Expr grouped_expr;
+        grouped_expr.node = std::move(grouped);
+        auto lowered = lower_expr(grouped_expr);
+        if (!lowered.has_value()) {
+            return std::unexpected(lowered.error());
+        }
+        auto plan = std::move(lowered.value());
+
+        // The aggregate keys carry the inner names; the join needs the outer ones.
+        std::vector<ir::RenameSpec> renames;
+        std::vector<std::string> keys;
+        keys.reserve(captures.size());
+        for (const auto& capture : captures) {
+            if (capture.inner != capture.outer) {
+                renames.push_back(
+                    ir::RenameSpec{.new_name = capture.outer, .old_name = capture.inner});
+            }
+            keys.push_back(capture.outer);
+        }
+        if (!renames.empty()) {
+            auto rename = builder_.rename(std::move(renames));
+            rename->add_child(std::move(plan));
+            plan = std::move(rename);
+        }
+        return ScalarSubqueryPlan{.plan = std::move(plan), .keys = std::move(keys)};
+    }
+
+    /// Read `inner_column == outer(outer_column)` (either way round).
+    static auto parse_capture(const Expr& conjunct) -> std::expected<CapturedKey, LowerError> {
+        const auto* equality = std::get_if<BinaryExpr>(&conjunct.node);
+        if (equality == nullptr || equality->op != BinaryOp::Eq) {
+            return std::unexpected(LowerError{
+                .message = "outer(): a capture must be an equality between a local column and "
+                           "outer(column), e.g. `ps_partkey == outer(p_partkey)`"});
+        }
+        const Expr& left = unwrap_group(*equality->left);
+        const Expr& right = unwrap_group(*equality->right);
+        const CallExpr* capture = as_call(left, "outer");
+        const bool on_left = capture != nullptr;
+        if (capture == nullptr) {
+            capture = as_call(right, "outer");
+        }
+        if (capture == nullptr) {
+            return std::unexpected(
+                LowerError{.message = "outer(): a capture must be one whole side of the equality"});
+        }
+        const Expr& inner = on_left ? right : left;
+        const auto* inner_column = std::get_if<IdentifierExpr>(&inner.node);
+        if (inner_column == nullptr) {
+            return std::unexpected(
+                LowerError{.message = "outer(): the local side of a capture must be a bare column "
+                                      "name"});
+        }
+        // The parser only ever builds `outer` from `outer(<column>)`.
+        const auto& outer_column = std::get<IdentifierExpr>(capture->args.front()->node);
+        return CapturedKey{.inner = inner_column->name, .outer = outer_column.name};
+    }
+
+    /// A generated column name for a subquery result that no input column can
+    /// collide with.
+    auto next_scalar_alias(const ir::Node& input) -> std::string {
+        const ir::SchemaInfo schema = ir::infer_schema(input, source_schemas());
+        while (true) {
+            std::string alias = "__ibex_scalar_" + std::to_string(scalar_subquery_count_++);
+            if (!schema.is_known() || schema.find(alias) == nullptr) {
+                return alias;
+            }
+        }
+    }
+
+    auto lower_conjunction(const std::vector<const Expr*>& terms)
+        -> std::expected<ir::Expr, LowerError> {
+        std::vector<ir::Expr> lowered;
+        lowered.reserve(terms.size());
+        for (const auto* term : terms) {
+            auto one = lower_expr_to_ir(*term);
+            if (!one.has_value()) {
+                return std::unexpected(one.error());
+            }
+            lowered.push_back(std::move(one.value()));
+        }
+        return fold_conjunction(std::move(lowered));
+    }
+
     auto lower_expr_to_ir(const Expr& expr) -> std::expected<ir::Expr, LowerError> {
         if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
             // Inside an inlined scalar UDF body, a parameter name resolves to the
@@ -2379,6 +2903,19 @@ class Lowerer {
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
         }
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+            // Both correlation forms are consumed by `lower_filter` before any
+            // expression is lowered, so reaching here means one was written
+            // somewhere the decorrelation cannot see.
+            if (call->callee == "outer") {
+                return std::unexpected(LowerError{
+                    .message = "outer(): a capture is only valid inside a scalar(...) correlated "
+                               "subquery"});
+            }
+            if (as_scalar_subquery(expr) != nullptr) {
+                return std::unexpected(LowerError{
+                    .message = "scalar(): a correlated subquery is only supported as one side of a "
+                               "comparison in a filter clause"});
+            }
             // A call to a scalar user function is inlined: its body replaces the
             // call, with parameters substituted by the argument expressions.
             if (auto it = functions_.find(call->callee); it != functions_.end()) {
@@ -3943,6 +4480,8 @@ class Lowerer {
     // reject recursive inlining.
     std::vector<robin_hood::unordered_map<std::string, ir::Expr>> inline_scopes_;
     robin_hood::unordered_set<std::string> inlining_active_;
+    // Serial number for the generated column a `scalar(...)` subquery lands in.
+    std::size_t scalar_subquery_count_ = 0;
 };
 
 }  // namespace

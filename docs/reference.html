@@ -838,6 +838,45 @@ tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code><
         </div>
       </div>
 
+      <!-- 6a. Correlated scalar subqueries -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Subqueries</span>
+          <h3>Compare a row against an aggregate of the rows that relate to it</h3>
+          <p>
+            Inside a <code>filter</code>, <code>scalar(...)</code> holds a table
+            expression whose single aggregate column is compared against the
+            outer row. <code>outer(column)</code> captures a column from the
+            enclosing query &mdash; it is the correlation boundary. A bare name
+            inside the subquery always means the subquery&rsquo;s own column, so
+            the two sides can share names without ambiguity.
+          </p>
+          <p>
+            The subquery is <strong>decorrelated</strong>, never run once per
+            outer row: it becomes one aggregate grouped by the captured column,
+            left-joined back onto the outer rows. When nothing matches an outer
+            row&rsquo;s key the value is null, and comparing against null keeps
+            no rows &mdash; SQL&rsquo;s scalar-subquery semantics.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Each part's cheapest supplier — TPC-H Q2's shape.</span>
+<span class="cm">// The minimum is taken over the supply rows whose ps_partkey</span>
+<span class="cm">// matches THIS row's p_partkey.</span>
+(parts <span class="kw">join</span> supply <span class="kw">on</span> p_partkey)[
+    <span class="kw">filter</span> ps_supplycost == <span class="fn-name">scalar</span>(
+        supply[
+            <span class="kw">filter</span> ps_partkey == <span class="kw">outer</span>(p_partkey),
+            <span class="kw">select</span> { m = <span class="fn-name">min</span>(ps_supplycost) }
+        ]
+    )
+];
+
+<span class="cm">// The subquery is a filter, not a projection: its value</span>
+<span class="cm">// never becomes a column of the result.</span></code></pre>
+        </div>
+      </div>
+
       <!-- 6b. Null handling -->
       <div class="tour-item">
         <div class="tour-text">

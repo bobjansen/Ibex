@@ -1,0 +1,83 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q2 — Minimum Cost Supplier
+//
+//  The correlated-scalar-subquery query: of the European suppliers of a size-15
+//  BRASS part, keep only those offering it at the *minimum* supply cost for that
+//  part. Standard TPC-H qualification parameters: SIZE=15, TYPE='%BRASS',
+//  REGION='EUROPE'.
+//
+//  `scalar(...)` holding an `outer(...)` capture is a correlated scalar subquery
+//  (SPEC 5.7). It is NOT run once per outer row: the lowerer decorrelates it
+//  into a single grouped aggregate over the inner plan, left-joined back onto
+//  the outer rows on the captured key. The left join is what gives it SQL's
+//  scalar semantics — a part with no European supplier at all gets a null
+//  minimum, and the `==` against a null then drops the row.
+//
+//  The subquery's minimum ranges over every European supplier of the part, not
+//  only the size-15 BRASS ones, which is why the outer filter cannot simply be
+//  repeated inside it.
+//
+//  Each source is bound ONCE, unprojected, so it stays a lazy binding. The outer
+//  chain and the subquery then both scan partsupp/supplier/nation/region by that
+//  one name: projection pushdown unions what the two scans demand and decodes
+//  each file once. Binding a second `read_parquet` of partsupp for the subquery
+//  would read the same 800k rows twice.
+//
+//  Every join is a plain equijoin: as in q05/q19 the key columns are renamed to
+//  a shared name in the `select`, so each join is a hash join rather than a
+//  theta join (`on <predicate>`, which is O(N*M) nested-loop).
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q02.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let region_raw = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
+
+let result = (
+    (
+        (
+            part_raw[select { p_partkey, p_mfgr, p_size, p_type }]
+            join
+            partsupp_raw[select { p_partkey = ps_partkey, ps_suppkey, ps_supplycost }]
+            on p_partkey
+        )
+        join
+        supplier_raw[
+            select { ps_suppkey = s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment,
+                     s_nationkey }
+        ]
+        on ps_suppkey
+    )
+    join nation_raw[select { s_nationkey = n_nationkey, n_name, n_regionkey }] on s_nationkey
+    join region_raw[filter r_name == "EUROPE"][select { n_regionkey = r_regionkey }] on n_regionkey
+)[
+    filter p_size == 15 && like(p_type, "%BRASS")
+        && ps_supplycost == scalar(
+            (
+                (
+                    partsupp_raw[select { ps_partkey, ps_suppkey, ps_supplycost }]
+                    join supplier_raw[select { ps_suppkey = s_suppkey, s_nationkey }] on ps_suppkey
+                )
+                join nation_raw[select { s_nationkey = n_nationkey, n_regionkey }] on s_nationkey
+                join region_raw[filter r_name == "EUROPE"][select { n_regionkey = r_regionkey }]
+                    on n_regionkey
+            )[
+                filter ps_partkey == outer(p_partkey),
+                select { minimum_supplycost = min(ps_supplycost) }
+            ]
+        ),
+    select { s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment }
+][
+    order { s_acctbal desc, n_name, s_name, p_partkey },
+    head 100
+];
+write_csv(result, "benchmarking/data/tpch/out/q02.csv");
+result;

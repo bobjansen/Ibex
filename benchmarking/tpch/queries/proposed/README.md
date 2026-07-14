@@ -4,14 +4,24 @@ These files are deliberately **not executable Ibex yet**.  They are a design
 exercise for the TPC-H queries that need a subquery, using the official SF-1
 qualification parameters from `benchmarking/data/tpch/dbgen/queries/`.
 
-The proposed additions are intentionally small:
+**Shipped:** the *correlated* scalar aggregate — `scalar(...)` with an
+`outer(...)` capture — is implemented and specified (SPEC 5.7).  Q2 moved out of
+this directory to `../q02.ibex`.  Note that the drafts here take liberties the
+real language does not: `on p_partkey == ps_partkey` is a theta join (a nested
+loop), so the shipped queries rename keys to a shared name and join on that,
+and a `[...]` block binds to the operand immediately left of it, so a join chain
+needs parentheses before its clauses.  Read the drafts below for intent, not
+for syntax.
+
+The remaining proposed additions are intentionally small:
 
 ```ibex
 // A table-producing expression in a boolean predicate.
 exists (lineitem[filter l_orderkey == outer(o_orderkey)])
 not exists (orders[filter o_custkey == outer(c_custkey)])
 
-// Convert an exactly-one-row, exactly-one-column table into a scalar.
+// An UNcorrelated scalar: exactly one row, exactly one column, evaluated once.
+// (The correlated form — with an outer(...) capture — already works.)
 scalar(lineitem[select { average = mean(l_quantity) }])
 
 // Membership against a one-column table expression.  `not in` follows SQL

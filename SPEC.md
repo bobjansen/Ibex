@@ -808,10 +808,20 @@ expr            = primary
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
                 | "^" IDENT                      (* scope escape *)
+                | outer_capture
                 | literal
                 | array_lit
                 | schema_lit
                 | "(" expr ")" ;
+
+(* Correlated scalar subquery — Section 5.7. The subquery is the one-argument
+   form of `scalar`; the two-argument `scalar(table, column)` is the one-row
+   value extractor of Section 12. `outer` is a hard keyword, so the capture
+   form is the only way a call named `outer` can exist. *)
+
+scalar_subquery = "scalar" "(" expr ")" ;
+
+outer_capture   = "outer" "(" IDENT ")" ;
 
 table_col_def   = IDENT "=" expr ;
 
@@ -1954,6 +1964,69 @@ Join expressions are **syntactic sugar** for the built-in join functions:
 - `A asof join B on { time, k1, k2 }` → `asof_join(A, B, time, k1, k2, tolerance = 0s)`
 
 For non-zero as-of tolerances, use the function forms directly (Section 11.3).
+
+---
+
+### 5.7 Correlated Scalar Subqueries
+
+A `filter` predicate may compare a value against `scalar(<table expression>)`:
+a subquery evaluated per *group of* outer rows, not per outer row.
+
+```ibex
+partsupp[
+    filter ps_supplycost == scalar(
+        supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_supplycost) }]
+    )
+]
+```
+
+Read it as: keep an outer row only when its `ps_supplycost` equals the minimum
+supply cost among the inner rows whose `ps_partkey` matches *that row's*
+`p_partkey`.
+
+**`outer(column)`** captures a column from the immediately enclosing query. It
+is a correlation boundary, not a table alias and not a re-read of the outer
+table. A bare column name inside a subquery resolves only in the subquery's own
+scope — names never fall through to the enclosing query implicitly, so an inner
+and an outer column may share a name without ambiguity.
+
+**Shape.** The subquery must be a block with exactly a `filter` clause and a
+`select` clause. The `select` must produce exactly one column, and that column
+must be an aggregate. The `filter` must contain at least one *capture equality*
+— `inner_column == outer(outer_column)`, in either order — and may contain any
+number of ordinary local predicates alongside it.
+
+**Nulls.** When no inner row matches an outer row's captured key, the subquery's
+value is null, and a comparison against null is never true: the row is dropped.
+This is SQL's scalar-subquery behaviour.
+
+**Result schema.** The subquery's value is not a column of the result. A filter
+yields the rows it kept, never a wider table. Naming the columns that stay is
+how that is enforced, so the enclosing query's schema must be statically known:
+over a source with no schema, ascribe one (`src as DataFrame<{...}>`).
+
+**Evaluation.** The subquery is *decorrelated*, never run once per outer row: it
+becomes one aggregate grouped by the captured column, left-joined back onto the
+outer rows. That is also why a source used by both the outer query and the
+subquery should be bound once (`let partsupp = read_parquet(...)`) and named
+twice — one binding is one read.
+
+Not yet supported, each rejected with a diagnostic:
+
+```ibex
+outer(p_partkey);                             // no enclosing subquery
+scalar(part[select { a, b }]);                // more than one result column
+scalar(t[filter x > outer(y), select {...}]); // capture must be an equality
+scalar(t[select { m = min(v) }]);             // no capture (uncorrelated)
+update { x = scalar(...) };                   // only filter comparisons, for now
+t[filter b == 1 + scalar(...)];               // must be one whole side of the comparison
+```
+
+Only one level of correlation is supported: an `outer(...)` inside a subquery
+refers to the query enclosing it, and subqueries do not nest.
+
+`scalar` keeps its two-argument form — `scalar(table, column)` extracts a value
+from a one-row table (Section 12). Arity tells the two apart.
 
 ---
 

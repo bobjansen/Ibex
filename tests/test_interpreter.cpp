@@ -9496,3 +9496,118 @@ TEST_CASE("Int64 casts Bool to 0/1", "[interpreter][cast]") {
     CHECK((*big)[1] == 1);
     CHECK((*big)[2] == 1);
 }
+
+// ── Correlated scalar subqueries (SPEC 5.7) ─────────────────────────────────
+//
+// Table literals give the sources a statically known schema, which a
+// correlated subquery needs in order to name the columns it keeps.
+
+namespace {
+
+// parts 1-4; supply covers 1-3 in EU, and part 4 only from US. Part 2's
+// minimum cost is tied between two suppliers.
+constexpr const char* kSupplySources = R"(
+let parts = Table {
+    p_partkey = [1, 2, 3, 4],
+    p_name    = ["nut", "bolt", "screw", "washer"]
+};
+let supply = Table {
+    ps_partkey = [1, 1, 2, 2, 3, 3, 4],
+    ps_suppkey = [10, 11, 10, 12, 11, 12, 10],
+    ps_cost    = [5.0, 3.0, 9.0, 9.0, 1.0, 7.0, 2.0],
+    ps_region  = ["EU", "EU", "EU", "EU", "EU", "EU", "US"]
+};
+)";
+
+auto interpret_source(const std::string& source) -> runtime::Table {
+    auto ir = require_ir(source.c_str());
+    runtime::TableRegistry registry;
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    return std::move(result.value());
+}
+
+auto int_column(const runtime::Table& table, const std::string& name) -> std::vector<std::int64_t> {
+    const auto* found = table.find(name);
+    REQUIRE(found != nullptr);
+    const auto* column = std::get_if<Column<std::int64_t>>(found);
+    REQUIRE(column != nullptr);
+    return {column->begin(), column->end()};
+}
+
+}  // namespace
+
+TEST_CASE("Interpret correlated subquery keeps every row matching the group's aggregate") {
+    auto result = interpret_source(std::string(kSupplySources) + R"(
+(parts join supply[select { p_partkey = ps_partkey, ps_suppkey, ps_cost }] on p_partkey)[
+    filter ps_cost == scalar(
+        supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+    ),
+    order { p_partkey, ps_suppkey }
+];
+)");
+
+    // Part 2's minimum (9.0) is offered by two suppliers: the subquery selects a
+    // value, not a row, so BOTH qualify.
+    REQUIRE(result.rows() == 5);
+    REQUIRE(int_column(result, "p_partkey") == std::vector<std::int64_t>{1, 2, 2, 3, 4});
+    REQUIRE(int_column(result, "ps_suppkey") == std::vector<std::int64_t>{11, 10, 12, 11, 10});
+}
+
+TEST_CASE("Interpret correlated subquery drops rows whose captured key matches no group") {
+    auto result = interpret_source(std::string(kSupplySources) + R"(
+(parts join supply[select { p_partkey = ps_partkey, ps_suppkey, ps_cost, ps_region }]
+    on p_partkey)[
+    filter ps_cost == scalar(
+        supply[
+            filter ps_partkey == outer(p_partkey) && ps_region == "EU",
+            select { m = min(ps_cost) }
+        ]
+    ),
+    order { p_partkey, ps_suppkey }
+];
+)");
+
+    // Part 4's only supplier is US, so the EU-restricted subquery has no group
+    // for it at all: its value is null, and `== null` is never true.
+    REQUIRE(result.rows() == 4);
+    REQUIRE(int_column(result, "p_partkey") == std::vector<std::int64_t>{1, 2, 2, 3});
+}
+
+TEST_CASE("Interpret correlated subquery does not widen the filter's schema") {
+    auto result = interpret_source(std::string(kSupplySources) + R"(
+(parts join supply[select { p_partkey = ps_partkey, ps_suppkey, ps_cost }] on p_partkey)[
+    filter ps_cost == scalar(
+        supply[filter ps_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+    )
+];
+)");
+
+    std::vector<std::string> names;
+    for (const auto& entry : result.columns) {
+        names.push_back(entry.name);
+    }
+    REQUIRE(names == std::vector<std::string>{"p_partkey", "p_name", "ps_suppkey", "ps_cost"});
+}
+
+TEST_CASE("Interpret correlated subquery resolves bare inner names in the inner scope") {
+    // Both sides call the key `p_partkey`. The bare name inside the subquery is
+    // the subquery's own column; only outer(...) reaches the enclosing query.
+    auto result = interpret_source(R"(
+let parts = Table { p_partkey = [1, 2, 3], p_name = ["nut", "bolt", "screw"] };
+let supply = Table { p_partkey = [1, 1, 2, 2], ps_cost = [5.0, 3.0, 9.0, 8.0] };
+(parts join supply on p_partkey)[
+    filter ps_cost == scalar(
+        supply[filter p_partkey == outer(p_partkey), select { m = min(ps_cost) }]
+    ),
+    order { p_partkey }
+];
+)");
+
+    REQUIRE(result.rows() == 2);
+    REQUIRE(int_column(result, "p_partkey") == std::vector<std::int64_t>{1, 2});
+    const auto* cost = std::get_if<Column<double>>(result.find("ps_cost"));
+    REQUIRE(cost != nullptr);
+    REQUIRE((*cost)[0] == Catch::Approx(3.0));
+    REQUIRE((*cost)[1] == Catch::Approx(8.0));
+}

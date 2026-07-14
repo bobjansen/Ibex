@@ -1,0 +1,31 @@
+// Proposed TPC-H Q22 — uncorrelated scalar AVG plus correlated NOT EXISTS.
+// Qualification country codes: 13, 31, 23, 29, 30, 18, 17.
+// `prefix` is a separate string-function addition, not subquery syntax.
+import "parquet";
+
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let average_customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+
+let average_balance = scalar(average_customer[
+    filter c_acctbal > 0.0
+        && (prefix(c_phone, 2) == "13" || prefix(c_phone, 2) == "31"
+            || prefix(c_phone, 2) == "23" || prefix(c_phone, 2) == "29"
+            || prefix(c_phone, 2) == "30" || prefix(c_phone, 2) == "18"
+            || prefix(c_phone, 2) == "17"),
+    select { average_balance = mean(c_acctbal) }
+]);
+
+let result = customer[
+    filter c_acctbal > average_balance
+        && (prefix(c_phone, 2) == "13" || prefix(c_phone, 2) == "31"
+            || prefix(c_phone, 2) == "23" || prefix(c_phone, 2) == "29"
+            || prefix(c_phone, 2) == "30" || prefix(c_phone, 2) == "18"
+            || prefix(c_phone, 2) == "17")
+        && not exists (orders[filter o_custkey == outer(c_custkey)]),
+    update { cntrycode = prefix(c_phone, 2) }
+][
+    select { numcust = count(), totacctbal = sum(c_acctbal) },
+    by { cntrycode }, order { cntrycode }
+];
+result;

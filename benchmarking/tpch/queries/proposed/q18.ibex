@@ -1,0 +1,18 @@
+// Proposed TPC-H Q18 — uncorrelated IN with grouped input.
+// Qualification parameter: 300.
+import "parquet";
+
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let order_totals = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+
+let result = ((customer join orders on c_custkey == o_custkey)
+    join lineitem on o_orderkey == l_orderkey)[
+        filter o_orderkey in (order_totals[
+            select { quantity = sum(l_quantity) }, by { l_orderkey }
+        ][filter quantity > 300][select { l_orderkey }]),
+        select { sum_quantity = sum(l_quantity) },
+        by { c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice }
+    ][order { o_totalprice desc, o_orderdate }, head 100];
+result;

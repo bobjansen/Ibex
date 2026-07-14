@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_bench.sh — time the 6 implemented PDS-H queries: ibex vs. polars
+# run_bench.sh — time the 9 implemented PDS-H queries: ibex vs. polars
 # (multi-threaded, matching Polars' default/published numbers) vs.
 # polars-st (single-threaded, the fair apples-to-apples comparison since
 # Ibex has no multithreading yet).

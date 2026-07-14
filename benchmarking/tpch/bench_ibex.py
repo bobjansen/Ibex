@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time the 6 implemented PDS-H queries in a single warm Ibex process.
+"""Time the 9 implemented PDS-H queries in a single warm Ibex process.
 
 `ibex_eval` starts a fresh process per invocation, which pays Arrow/AWS-SDK
 dynamic-library load cost (~1-2s of `sys` time) on every single run -- not
@@ -27,7 +27,7 @@ IBEX_BIN = IBEX_ROOT / "build-release/tools/ibex"
 PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
 QUERIES_DIR = SCRIPT_DIR / "queries"
 
-QUERY_NAMES = ["q01", "q03", "q05", "q06", "q09", "q10", "q13", "q19"]
+QUERY_NAMES = ["q01", "q03", "q05", "q06", "q09", "q10", "q13", "q16", "q19"]
 
 TIME_RE = re.compile(r"^time:\s*([\d.]+)\s*(us|ms|s)\s*$")
 
@@ -68,9 +68,9 @@ def split_top_level_statements(text: str) -> list[str]:
 
 
 def extract_setup_and_body(qname: str) -> tuple[str, str, int]:
-    """Split a query file into (extern-fn setup, repeatable body, body statement count).
+    """Split a query file into (declaration setup, repeatable body, body statement count).
 
-    Setup = `extern fn` declarations (declared once, outside the timed
+    Setup = `extern fn` and `import` declarations (declared once, outside the timed
     section). Body = everything else minus the trailing `write_csv(...)`
     and bare `result;` statements, which exist only for check_answers.py
     and would otherwise add CSV-write + result-print noise to the timing.
@@ -79,10 +79,11 @@ def extract_setup_and_body(qname: str) -> tuple[str, str, int]:
     lines = [line for line in text.splitlines() if line.strip() and not line.strip().startswith("//")]
     statements = split_top_level_statements("\n".join(lines))
 
-    setup = [s for s in statements if s.startswith("extern fn")]
+    setup = [s for s in statements if s.startswith("extern fn") or s.startswith("import ")]
     body_statements = [
         s for s in statements
-        if not s.startswith("extern fn") and not s.startswith("write_csv(") and s != "result;"
+        if not s.startswith("extern fn") and not s.startswith("import ")
+        and not s.startswith("write_csv(") and s != "result;"
     ]
 
     return "\n".join(setup), "\n".join(body_statements) + "\n", len(body_statements)

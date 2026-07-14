@@ -1,5 +1,9 @@
 # Filtering Parquet scan: direct decode + late materialization
 
+Implemented in `588d8e5` and `400315c`. Detailed profiles, Polars comparison,
+rejected decoder prototypes, and follow-up directions are recorded in
+[`parquet-filtering-scan-observations.md`](parquet-filtering-scan-observations.md).
+
 ## Why
 
 With join predicate pushdown done, every PDS-H query is **scan-dominated**.

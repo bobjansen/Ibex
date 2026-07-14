@@ -1967,7 +1967,7 @@ For non-zero as-of tolerances, use the function forms directly (Section 11.3).
 
 ---
 
-### 5.7 Correlated Scalar Subqueries
+### 5.7 Scalar Subqueries
 
 A `filter` predicate may compare a value against `scalar(<table expression>)`:
 a subquery evaluated per *group of* outer rows, not per outer row.
@@ -1990,26 +1990,40 @@ table. A bare column name inside a subquery resolves only in the subquery's own
 scope — names never fall through to the enclosing query implicitly, so an inner
 and an outer column may share a name without ambiguity.
 
-**Shape.** The subquery must be a block with exactly a `filter` clause and a
-`select` clause. The `select` must produce exactly one column, and that column
-must be an aggregate. The `filter` must contain at least one *capture equality*
-— `inner_column == outer(outer_column)`, in either order — and may contain any
-number of ordinary local predicates alongside it.
+**Shape.** The subquery is a block with a `select` clause and an optional
+`filter` clause. The `select` must produce exactly one column, and that column
+must be an aggregate. A `filter` may hold *capture equalities* —
+`inner_column == outer(outer_column)`, in either order — alongside any number of
+ordinary local predicates.
+
+**Correlated or not.** A subquery that captures with `outer(...)` is evaluated
+per captured key. One that captures nothing is *uncorrelated*: a single value,
+the same for every row, evaluated once and broadcast.
+
+```ibex
+// Uncorrelated: rows above the overall mean.
+t[filter v > scalar(t[select { m = mean(v) }])]
+```
+
+Because the subquery must be an aggregate with no `by`, it collapses to exactly
+one row, so an uncorrelated subquery can never multiply the rows it filters.
+
+**Evaluation.** The subquery is *decorrelated*, never run once per outer row. A
+correlated one becomes an aggregate grouped by the captured column, left-joined
+back onto the outer rows; an uncorrelated one becomes a cross join against its
+single row. That is also why a source used by both the outer query and the
+subquery should be bound once (`let partsupp = read_parquet(...)`) and named
+twice — one binding is one read.
 
 **Nulls.** When no inner row matches an outer row's captured key, the subquery's
 value is null, and a comparison against null is never true: the row is dropped.
-This is SQL's scalar-subquery behaviour.
+An uncorrelated subquery whose input is empty likewise keeps no rows. This is
+SQL's scalar-subquery behaviour.
 
 **Result schema.** The subquery's value is not a column of the result. A filter
 yields the rows it kept, never a wider table. Naming the columns that stay is
 how that is enforced, so the enclosing query's schema must be statically known:
 over a source with no schema, ascribe one (`src as DataFrame<{...}>`).
-
-**Evaluation.** The subquery is *decorrelated*, never run once per outer row: it
-becomes one aggregate grouped by the captured column, left-joined back onto the
-outer rows. That is also why a source used by both the outer query and the
-subquery should be bound once (`let partsupp = read_parquet(...)`) and named
-twice — one binding is one read.
 
 Not yet supported, each rejected with a diagnostic:
 
@@ -2017,7 +2031,6 @@ Not yet supported, each rejected with a diagnostic:
 outer(p_partkey);                             // no enclosing subquery
 scalar(part[select { a, b }]);                // more than one result column
 scalar(t[filter x > outer(y), select {...}]); // capture must be an equality
-scalar(t[select { m = min(v) }]);             // no capture (uncorrelated)
 update { x = scalar(...) };                   // only filter comparisons, for now
 t[filter b == 1 + scalar(...)];               // must be one whole side of the comparison
 ```

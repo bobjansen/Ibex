@@ -2649,7 +2649,15 @@ class Lowerer {
             return std::unexpected(subplan.error());
         }
 
-        auto join = builder_.join(ir::JoinKind::Left, subplan->keys);
+        // A correlated subquery joins on its captured keys, so an outer row with
+        // no matching group gets a null. An uncorrelated one is a single value
+        // broadcast to every row, which is a cross join against its one row —
+        // and if the subquery's input was empty it produces no row at all, so
+        // the cross join drops every outer row, exactly as comparing against
+        // SQL's null scalar would.
+        const bool correlated = !subplan->keys.empty();
+        auto join =
+            builder_.join(correlated ? ir::JoinKind::Left : ir::JoinKind::Cross, subplan->keys);
         join->add_child(std::move(input));
         join->add_child(std::move(subplan->plan));
         input = std::move(join);
@@ -2668,20 +2676,25 @@ class Lowerer {
     }
 
     /// Lower `scalar(inner[filter ..., select { a = agg(col) }])` into an
-    /// aggregate over the captured keys, exposing the aggregate as `alias`.
+    /// aggregate exposed as `alias`.
+    ///
+    /// With an `outer(...)` capture the aggregate is grouped by the captured
+    /// columns and the returned keys name them, for the caller's left join.
+    /// Without one the subquery is a single value: the aggregate is ungrouped
+    /// and the returned keys are empty, for the caller's cross join.
     auto lower_scalar_subquery(const CallExpr& call, const ir::Node& outer_input,
                                const std::string& alias)
         -> std::expected<ScalarSubqueryPlan, LowerError> {
         const Expr& argument = unwrap_group(*call.args.front());
         if (contains_call(argument, "scalar")) {
             return std::unexpected(
-                LowerError{.message = "scalar(): nested correlated subqueries are not supported"});
+                LowerError{.message = "scalar(): nested subqueries are not supported"});
         }
         const auto* block = std::get_if<BlockExpr>(&argument.node);
         if (block == nullptr) {
             return std::unexpected(LowerError{
-                .message = "scalar(): expected a table expression with a filter and a select "
-                           "clause, e.g. scalar(t[filter k == outer(j), select { m = min(v) }])"});
+                .message = "scalar(): expected a table expression with a select clause, e.g. "
+                           "scalar(t[select { m = min(v) }])"});
         }
 
         const FilterClause* filter = nullptr;
@@ -2700,15 +2713,9 @@ class Lowerer {
                 }
                 select = s;
             } else {
-                return std::unexpected(
-                    LowerError{.message = "scalar(): a correlated subquery supports only filter "
-                                          "and select clauses"});
+                return std::unexpected(LowerError{
+                    .message = "scalar(): a subquery supports only filter and select clauses"});
             }
-        }
-        if (filter == nullptr) {
-            return std::unexpected(LowerError{
-                .message = "scalar(): the subquery needs a filter clause holding the outer(...) "
-                           "capture"});
         }
         if (select == nullptr || select->fields.size() != 1 || !select->tuple_fields.empty() ||
             !select->map_fields.empty()) {
@@ -2725,8 +2732,12 @@ class Lowerer {
                 .message = "outer(): a capture may appear only in the subquery's filter clause"});
         }
 
+        // The filter is optional: an uncorrelated subquery has nothing to capture,
+        // and may have nothing to filter either.
         std::vector<const Expr*> conjuncts;
-        split_conjuncts(*filter->predicate, conjuncts);
+        if (filter != nullptr) {
+            split_conjuncts(*filter->predicate, conjuncts);
+        }
         std::vector<CapturedKey> captures;
         std::vector<const Expr*> local;
         local.reserve(conjuncts.size());
@@ -2748,12 +2759,6 @@ class Lowerer {
             }
             captures.push_back(std::move(capture.value()));
         }
-        if (captures.empty()) {
-            return std::unexpected(LowerError{
-                .message = "scalar(): the subquery captures nothing from the enclosing query; "
-                           "uncorrelated scalar subqueries are not supported yet"});
-        }
-
         // A captured name that the enclosing query does not produce is a
         // lower-time error, not a runtime "unknown column" from the join.
         const ir::SchemaInfo outer_schema = ir::infer_schema(outer_input, source_schemas());
@@ -2767,20 +2772,26 @@ class Lowerer {
             }
         }
 
-        // Rebuild the subquery with the captures stripped: what is left is an
-        // ordinary grouped aggregate, keyed by the columns the captures compared.
+        // Rebuild the subquery with the captures stripped. What is left is an
+        // ordinary aggregate: grouped by the columns the captures compared, or
+        // ungrouped when there were none — and an ungrouped aggregate is what
+        // makes the uncorrelated form safe to cross-join, because it collapses
+        // to exactly one row (none, if its input was empty) and so can never
+        // silently multiply the outer rows.
         BlockExpr grouped;
         grouped.base = clone_expr(*block->base);
         if (!local.empty()) {
             grouped.clauses.emplace_back(FilterClause{.predicate = clone_conjunction(local)});
         }
-        ByClause by;
-        by.is_braced = true;
-        by.keys.reserve(captures.size());
-        for (const auto& capture : captures) {
-            by.keys.push_back(Field{.name = capture.inner, .expr = nullptr});
+        if (!captures.empty()) {
+            ByClause by;
+            by.is_braced = true;
+            by.keys.reserve(captures.size());
+            for (const auto& capture : captures) {
+                by.keys.push_back(Field{.name = capture.inner, .expr = nullptr});
+            }
+            grouped.clauses.emplace_back(std::move(by));
         }
-        grouped.clauses.emplace_back(std::move(by));
         SelectClause projection;
         projection.fields.push_back(Field{.name = alias, .expr = clone_expr(*aggregate.expr)});
         grouped.clauses.emplace_back(std::move(projection));

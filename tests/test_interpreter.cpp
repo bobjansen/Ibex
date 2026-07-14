@@ -9651,3 +9651,49 @@ TEST_CASE("Interpret aggregate in an expression does not leak its temp column") 
         REQUIRE((*y)[1] == Catch::Approx(3.0 / 7.0));
     }
 }
+
+TEST_CASE("Interpret uncorrelated subquery broadcasts one value to every row") {
+    // No outer(...) capture: the subquery is a single value, the same for every
+    // row. It is evaluated once and cross-joined, never re-run per row.
+    auto result = interpret_source(R"(
+let t = Table { g = ["a", "b", "c", "d"], v = [1.0, 5.0, 9.0, 20.0] };
+t[filter v > scalar(t[select { m = mean(v) }]), order { g }];
+)");
+    // mean is 8.75, so only 9.0 and 20.0 clear it.
+    REQUIRE(result.rows() == 2);
+    const auto* g = std::get_if<Column<std::string>>(result.find("g"));
+    REQUIRE(g != nullptr);
+    REQUIRE((*g)[0] == "c");
+    REQUIRE((*g)[1] == "d");
+
+    // The subquery's value is not a column of the result.
+    std::vector<std::string> names;
+    for (const auto& entry : result.columns) {
+        names.push_back(entry.name);
+    }
+    REQUIRE(names == std::vector<std::string>{"g", "v"});
+}
+
+TEST_CASE("Interpret uncorrelated subquery may carry its own filter") {
+    auto result = interpret_source(R"(
+let t = Table { g = ["a", "b", "c", "d"], v = [1.0, 5.0, 9.0, 20.0] };
+t[filter v > scalar(t[filter v < 10.0, select { m = mean(v) }]), order { g }];
+)");
+    // The subquery's mean is over v < 10 only: (1 + 5 + 9) / 3 = 5.
+    REQUIRE(result.rows() == 2);
+    const auto* g = std::get_if<Column<std::string>>(result.find("g"));
+    REQUIRE(g != nullptr);
+    REQUIRE((*g)[0] == "c");
+    REQUIRE((*g)[1] == "d");
+}
+
+TEST_CASE("Interpret uncorrelated subquery cannot multiply the outer rows") {
+    // The subquery must be an ungrouped aggregate, so it collapses to exactly
+    // one row. A cross join against more than one row would silently duplicate
+    // every outer row -- the row count here is the guard against that.
+    auto result = interpret_source(R"(
+let t = Table { g = ["a", "b", "c"], v = [10.0, 20.0, 30.0] };
+t[filter v > scalar(t[select { m = min(v) }])];
+)");
+    REQUIRE(result.rows() == 2);  // not 6
+}

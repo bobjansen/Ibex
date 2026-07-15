@@ -484,6 +484,53 @@ auto validate_builtin(std::string_view name, const BuiltinFn& fn) -> void {
     }
 }
 
+/// Byte offset where each UTF-8 codepoint starts, with a trailing sentinel
+/// equal to the string length; so the codepoint count is `size() - 1` and
+/// codepoint `i` spans `[out[i], out[i + 1])`. A malformed lead or truncated
+/// sequence is treated as a single-byte codepoint, which keeps the walk in
+/// bounds rather than reading past the end.
+auto utf8_codepoint_offsets(const std::string& s) -> std::vector<std::size_t> {
+    std::vector<std::size_t> offsets;
+    offsets.reserve(s.size() + 1);
+    std::size_t i = 0;
+    while (i < s.size()) {
+        offsets.push_back(i);
+        const auto lead = static_cast<unsigned char>(s[i]);
+        std::size_t advance = 1;
+        if (lead >= 0xF0) {
+            advance = 4;
+        } else if (lead >= 0xE0) {
+            advance = 3;
+        } else if (lead >= 0xC0) {
+            advance = 2;
+        }
+        i += std::min(advance, s.size() - i);
+    }
+    offsets.push_back(s.size());
+    return offsets;
+}
+
+/// `substring(s, start[, length])` on Unicode codepoints, Polars `str.slice`
+/// semantics: `start` is 0-based and may be negative (counted from the end);
+/// `length` is optional (to the end when omitted). Indices clamp into range
+/// rather than erroring, so an out-of-range slice is empty, not a failure.
+auto utf8_substring(const std::string& s, std::int64_t start, std::optional<std::int64_t> length)
+    -> std::string {
+    const std::vector<std::size_t> offsets = utf8_codepoint_offsets(s);
+    const auto count = static_cast<std::int64_t>(offsets.size() - 1);
+
+    std::int64_t begin = start < 0 ? start + count : start;
+    begin = std::clamp<std::int64_t>(begin, 0, count);
+
+    std::int64_t end = count;
+    if (length.has_value()) {
+        end = *length <= 0 ? begin : std::min(begin + *length, count);
+    }
+    return s.substr(
+        offsets[static_cast<std::size_t>(begin)],
+        offsets[static_cast<std::size_t>(end)] - offsets[static_cast<std::size_t>(begin)]);
+}
+
 }  // namespace
 
 const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
@@ -767,6 +814,44 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                   return ExprValue{like_match(*compiled, *value)};
                               }},
                           });
+
+        // substring(s, start[, length]): a Unicode-codepoint slice with Polars
+        // `str.slice` semantics — start is 0-based and may be negative (from the
+        // end), length is optional (to the end when omitted). String -> String.
+        // No column kernel yet; the per-row eval is both semantics and impl.
+        m.emplace("substring",
+                  BuiltinFn{
+                      .min_args = 2,
+                      .max_args = 3,
+                      .infer = [](std::string_view, const std::vector<ExprType>& a) -> IT {
+                          if (a[0] != ExprType::String) {
+                              return std::unexpected("substring: first argument must be String");
+                          }
+                          for (std::size_t i = 1; i < a.size(); ++i) {
+                              if (a[i] != ExprType::Int) {
+                                  return std::unexpected("substring: start and length must be Int");
+                              }
+                          }
+                          return ExprType::String;
+                      },
+                      .exec = ScalarExec{.eval = [](std::string_view,
+                                                    const std::vector<ExprValue>& a) -> IV {
+                          const auto* value = std::get_if<std::string>(a.data());
+                          const auto* start = std::get_if<std::int64_t>(&a[1]);
+                          if (value == nullptr || start == nullptr) {
+                              return std::unexpected("substring: expects (String, Int[, Int])");
+                          }
+                          std::optional<std::int64_t> length;
+                          if (a.size() == 3) {
+                              const auto* len = std::get_if<std::int64_t>(&a[2]);
+                              if (len == nullptr) {
+                                  return std::unexpected("substring: length must be Int");
+                              }
+                              length = *len;
+                          }
+                          return ExprValue{utf8_substring(*value, *start, length)};
+                      }},
+                  });
 
         // pmin / pmax: 2+ comparable args of one type (Int/Float widen to Float).
         const BuiltinFn pminmax{

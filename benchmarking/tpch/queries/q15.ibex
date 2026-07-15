@@ -1,0 +1,38 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q15 — Top Supplier
+//
+//  The supplier (or suppliers, on a tie) with the highest revenue from lines
+//  shipped in one quarter. Standard TPC-H qualification parameter:
+//  DATE='1996-01-01' (a three-month window).
+//
+//  The SQL builds a `revenue` view — per-supplier revenue — and selects the
+//  suppliers whose revenue equals `(select max(total_revenue) from revenue)`.
+//  That max is an UNCORRELATED scalar subquery (SPEC 5.7): one value, broadcast
+//  to every row. `revenue` is bound once and named twice (the join and the max),
+//  so the per-supplier aggregate runs once.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q15.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let revenue = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+    filter l_shipdate >= date"1996-01-01" && l_shipdate < date"1996-04-01"
+][
+    select { total_revenue = sum(l_extendedprice * (1.0 - l_discount)) },
+    by { s_suppkey = l_suppkey }
+];
+
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
+    select { s_suppkey, s_name, s_address, s_phone }
+];
+
+let result = (supplier join revenue on s_suppkey)[
+    filter total_revenue == scalar(revenue[select { m = max(total_revenue) }]),
+    select { s_suppkey, s_name, s_address, s_phone, total_revenue }
+][order { s_suppkey }];
+write_csv(result, "benchmarking/data/tpch/out/q15.csv");
+result;

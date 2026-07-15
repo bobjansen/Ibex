@@ -1,0 +1,36 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q14 — Promotion Effect
+//
+//  What fraction of one month's revenue came from promotional parts. Standard
+//  TPC-H qualification parameter: DATE='1995-09-01' (a one-month window).
+//
+//  The SQL's `case when p_type like 'PROMO%' then rev else 0` is written as
+//  `rev * Int64(like(...))` — Int64(Bool) is 1/0, so the product is the revenue
+//  on promo lines and 0 elsewhere. The ratio of two aggregates rides the same
+//  post-aggregate path as q17's `sum(...)/7`.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q14.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+    filter l_shipdate >= date"1995-09-01" && l_shipdate < date"1995-10-01"
+][select { l_partkey, l_extendedprice, l_discount }];
+
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet")[
+    select { l_partkey = p_partkey, p_type }
+];
+
+let result = (lineitem join part on l_partkey)[
+    select {
+        promo_revenue = 100.0
+            * sum(l_extendedprice * (1.0 - l_discount) * Int64(like(p_type, "PROMO%")))
+            / sum(l_extendedprice * (1.0 - l_discount))
+    }
+];
+write_csv(result, "benchmarking/data/tpch/out/q14.csv");
+result;

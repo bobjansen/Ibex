@@ -436,7 +436,109 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q18": q18, "q19": q19, "q20": q20, "q21": q21, "q22": q22}
+def q07() -> pl.LazyFrame:
+    lineitem = scan("lineitem").filter(
+        (pl.col("l_shipdate") >= date(1995, 1, 1)) & (pl.col("l_shipdate") <= date(1996, 12, 31))
+    )
+    n1 = scan("nation").select(supp_nation="n_name", s_nationkey="n_nationkey")
+    n2 = scan("nation").select(cust_nation="n_name", c_nationkey="n_nationkey")
+    return (
+        scan("supplier")
+        .join(lineitem, left_on="s_suppkey", right_on="l_suppkey")
+        .join(scan("orders"), left_on="l_orderkey", right_on="o_orderkey")
+        .join(scan("customer"), left_on="o_custkey", right_on="c_custkey")
+        .join(n1, on="s_nationkey")
+        .join(n2, on="c_nationkey")
+        .filter(
+            ((pl.col("supp_nation") == "FRANCE") & (pl.col("cust_nation") == "GERMANY"))
+            | ((pl.col("supp_nation") == "GERMANY") & (pl.col("cust_nation") == "FRANCE"))
+        )
+        .with_columns(l_year=pl.col("l_shipdate").dt.year())
+        .group_by(["supp_nation", "cust_nation", "l_year"])
+        .agg(revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
+        .sort(["supp_nation", "cust_nation", "l_year"])
+    )
+
+
+def q08() -> pl.LazyFrame:
+    part = scan("part").filter(pl.col("p_type") == "ECONOMY ANODIZED STEEL").select("p_partkey")
+    orders = scan("orders").filter(
+        (pl.col("o_orderdate") >= date(1995, 1, 1)) & (pl.col("o_orderdate") <= date(1996, 12, 31))
+    )
+    n_supp = scan("nation").select(supp_nation="n_name", s_nationkey="n_nationkey")
+    n_cust = scan("nation").select(c_nationkey="n_nationkey", n_regionkey="n_regionkey")
+    region = scan("region").filter(pl.col("r_name") == "AMERICA").select("r_regionkey")
+    volume = pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
+    return (
+        part.join(scan("lineitem"), left_on="p_partkey", right_on="l_partkey")
+        .join(scan("supplier"), left_on="l_suppkey", right_on="s_suppkey")
+        .join(n_supp, on="s_nationkey")
+        .join(orders, left_on="l_orderkey", right_on="o_orderkey")
+        .join(scan("customer"), left_on="o_custkey", right_on="c_custkey")
+        .join(n_cust, on="c_nationkey")
+        .join(region, left_on="n_regionkey", right_on="r_regionkey")
+        .with_columns(o_year=pl.col("o_orderdate").dt.year())
+        .group_by("o_year")
+        .agg(
+            mkt_share=(volume * (pl.col("supp_nation") == "BRAZIL")).sum() / volume.sum()
+        )
+        .sort("o_year")
+    )
+
+
+def q12() -> pl.LazyFrame:
+    orders = scan("orders").select(["o_orderkey", "o_orderpriority"])
+    lineitem = scan("lineitem").filter(
+        pl.col("l_shipmode").is_in(["MAIL", "SHIP"])
+        & (pl.col("l_commitdate") < pl.col("l_receiptdate"))
+        & (pl.col("l_shipdate") < pl.col("l_commitdate"))
+        & (pl.col("l_receiptdate") >= date(1994, 1, 1))
+        & (pl.col("l_receiptdate") < date(1995, 1, 1))
+    )
+    high = pl.col("o_orderpriority").is_in(["1-URGENT", "2-HIGH"])
+    return (
+        lineitem.join(orders, left_on="l_orderkey", right_on="o_orderkey")
+        .group_by("l_shipmode")
+        .agg(high_line_count=high.sum(), low_line_count=(~high).sum())
+        .sort("l_shipmode")
+    )
+
+
+def q14() -> pl.LazyFrame:
+    lineitem = scan("lineitem").filter(
+        (pl.col("l_shipdate") >= date(1995, 9, 1)) & (pl.col("l_shipdate") < date(1995, 10, 1))
+    )
+    revenue = pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
+    return (
+        lineitem.join(scan("part"), left_on="l_partkey", right_on="p_partkey")
+        .select(
+            promo_revenue=100.0
+            * (revenue * pl.col("p_type").str.starts_with("PROMO")).sum()
+            / revenue.sum()
+        )
+    )
+
+
+def q15() -> pl.LazyFrame:
+    revenue = (
+        scan("lineitem")
+        .filter(
+            (pl.col("l_shipdate") >= date(1996, 1, 1)) & (pl.col("l_shipdate") < date(1996, 4, 1))
+        )
+        .group_by("l_suppkey")
+        .agg(total_revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
+    )
+    peak = revenue.select(pl.max("total_revenue")).collect().item()
+    return (
+        scan("supplier")
+        .join(revenue, left_on="s_suppkey", right_on="l_suppkey")
+        .filter(pl.col("total_revenue") == peak)
+        .select(["s_suppkey", "s_name", "s_address", "s_phone", "total_revenue"])
+        .sort("s_suppkey")
+    )
+
+
+QUERIES = {q: globals()[q] for q in sorted(k for k in globals() if len(k) == 3 and k[0] == "q" and k[1:].isdigit())}
 
 
 def percentile(data: list[float], p: float) -> float:

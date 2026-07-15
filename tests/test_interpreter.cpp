@@ -417,6 +417,46 @@ TEST_CASE("Interpret distinct") {
     REQUIRE((*prices)[1] == 20);
 }
 
+TEST_CASE("Interpret multi-column distinct keeps a null key distinct from a real one") {
+    // The in-place multi-key path (KeyRowIndex + KeyCol) must treat a null cell
+    // as its own value: a null groups only with another null, never with the
+    // type's zero. Rows: (A,10) (A,null) (A,10) (A,null) (null,10) -> three
+    // distinct keys, in first-occurrence order.
+    runtime::Table table;
+    table.add_column("symbol", Column<std::string>{"A", "A", "A", "A", "z"});
+    table.add_column("price", runtime::ColumnValue{Column<std::int64_t>{10, 0, 10, 0, 10}},
+                     runtime::ValidityBitmap{true, false, true, false, true});
+    // Also mark the last symbol ("z") null, to exercise a null in the first key column.
+    table.columns.front().validity = runtime::ValidityBitmap{true, true, true, true, false};
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", std::move(table));
+
+    auto ir = require_ir("trades[distinct { symbol, price }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 3);
+
+    const auto* sym_entry = result->find_entry("symbol");
+    const auto* price_entry = result->find_entry("price");
+    REQUIRE(sym_entry != nullptr);
+    REQUIRE(price_entry != nullptr);
+    const auto& syms = std::get<Column<std::string>>(*sym_entry->column);
+    const auto& prices = std::get<Column<std::int64_t>>(*price_entry->column);
+
+    // Row 0: (A, 10) — both valid.
+    REQUIRE(syms[0] == "A");
+    REQUIRE((*price_entry->validity)[0] == true);
+    REQUIRE(prices[0] == 10);
+    // Row 1: (A, null) — a distinct key, not merged with (A, 10).
+    REQUIRE(syms[1] == "A");
+    REQUIRE((*price_entry->validity)[1] == false);
+    // Row 2: (null, 10) — the null symbol keeps it distinct from (A, 10).
+    REQUIRE((*sym_entry->validity)[2] == false);
+    REQUIRE((*price_entry->validity)[2] == true);
+    REQUIRE(prices[2] == 10);
+}
+
 TEST_CASE("Interpret order") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{20, 10, 20});

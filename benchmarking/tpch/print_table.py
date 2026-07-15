@@ -12,7 +12,7 @@ from collections import defaultdict
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 FRAMEWORK_ORDER = ["ibex", "polars", "polars-st"]
-QUERY_ORDER = ["q01", "q02", "q03", "q04", "q05", "q06", "q09", "q10", "q11", "q13", "q16", "q17", "q19"]
+QUERY_ORDER = ["q01", "q02", "q03", "q04", "q05", "q06", "q09", "q10", "q11", "q13", "q16", "q17", "q18", "q19"]
 
 
 def load(paths):

@@ -1,0 +1,63 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q7 — Volume Shipping
+//
+//  Revenue on goods shipped between two nations, by year and direction.
+//  Standard TPC-H qualification parameters: NATION1='FRANCE', NATION2='GERMANY',
+//  shipped in 1995-1996.
+//
+//  Six tables: supplier and customer each carry a nation (the two `nation`
+//  aliases n1/n2 in the SQL), joined separately so both stay plain equijoins.
+//  The two-nation `OR` keeps only France->Germany and Germany->France pairs.
+//  `l_year` is `year(l_shipdate)`, materialized with `update` before the `by`
+//  because a group key must be a bare column.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q07.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
+    select { l_suppkey = s_suppkey, s_nationkey }
+];
+
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+    filter l_shipdate >= date"1995-01-01" && l_shipdate <= date"1996-12-31"
+][select { l_suppkey, o_orderkey = l_orderkey, l_extendedprice, l_discount, l_shipdate }];
+
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
+    select { o_orderkey, c_custkey = o_custkey }
+];
+
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
+    select { c_custkey, c_nationkey }
+];
+
+// Two views of nation: the supplier's (supp_nation) and the customer's (cust_nation).
+let supp_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+    select { s_nationkey = n_nationkey, supp_nation = n_name }
+];
+let cust_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+    select { c_nationkey = n_nationkey, cust_nation = n_name }
+];
+
+let joined = (((
+    (supplier join lineitem on l_suppkey)
+        join orders on o_orderkey)
+        join customer on c_custkey)
+        join supp_nation on s_nationkey)
+        join cust_nation on c_nationkey;
+
+let result = joined[
+    filter (supp_nation == "FRANCE" && cust_nation == "GERMANY")
+        || (supp_nation == "GERMANY" && cust_nation == "FRANCE")
+][
+    update { l_year = year(l_shipdate) }
+][
+    select { revenue = sum(l_extendedprice * (1.0 - l_discount)) },
+    by { supp_nation, cust_nation, l_year }
+][order { supp_nation, cust_nation, l_year }];
+write_csv(result, "benchmarking/data/tpch/out/q07.csv");
+result;

@@ -1,0 +1,43 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q12 — Shipping Modes and Order Priority
+//
+//  For two ship modes, how many late-received lines belonged to high-priority
+//  versus low-priority orders. Standard TPC-H qualification parameters:
+//  SHIPMODE1='MAIL', SHIPMODE2='SHIP', DATE='1994-01-01'.
+//
+//  The two `case when ... then 1 else 0` sums count lines by priority class,
+//  written as `sum(Int64(<predicate>))` — Int64(Bool) is 1/0, so the sum is the
+//  number of matching lines. `l_shipmode in ('MAIL','SHIP')` is the OR-chain it
+//  lowers to (as q19 does its IN-lists). The receipt/commit/ship-date ordering
+//  filters mirror the SQL exactly.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q12.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
+    select { l_orderkey = o_orderkey, o_orderpriority }
+];
+
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+    filter (l_shipmode == "MAIL" || l_shipmode == "SHIP")
+        && l_commitdate < l_receiptdate
+        && l_shipdate < l_commitdate
+        && l_receiptdate >= date"1994-01-01" && l_receiptdate < date"1995-01-01"
+][select { l_orderkey, l_shipmode }];
+
+let result = (lineitem join orders on l_orderkey)[
+    select {
+        high_line_count =
+            sum(Int64(o_orderpriority == "1-URGENT" || o_orderpriority == "2-HIGH")),
+        low_line_count =
+            sum(Int64(o_orderpriority != "1-URGENT" && o_orderpriority != "2-HIGH"))
+    },
+    by { l_shipmode }
+][order { l_shipmode }];
+write_csv(result, "benchmarking/data/tpch/out/q12.csv");
+result;

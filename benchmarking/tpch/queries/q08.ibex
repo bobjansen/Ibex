@@ -1,0 +1,77 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q8 — National Market Share
+//
+//  One nation's share of its region's market for a part type, by year. Standard
+//  TPC-H qualification parameters: NATION='BRAZIL', REGION='AMERICA',
+//  TYPE='ECONOMY ANODIZED STEEL', orders in 1995-1996.
+//
+//  Eight tables. Nation appears twice, in different roles: the CUSTOMER's nation
+//  reaches region (the market is "orders from customers in AMERICA"), while the
+//  SUPPLIER's nation names who filled the order (the numerator is "supplied from
+//  BRAZIL"). They are joined separately, so both stay plain equijoins.
+//
+//  mkt_share = supplied-from-BRAZIL revenue / total revenue, per year. The
+//  numerator's `case when nation = 'BRAZIL' then volume else 0` is
+//  `volume * Int64(supp_nation == "BRAZIL")`, and the ratio of the two sums
+//  rides the post-aggregate path (as q17/q14 do).
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q08.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet")[
+    filter p_type == "ECONOMY ANODIZED STEEL"
+][select { l_partkey = p_partkey }];
+
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+    select { l_partkey, l_suppkey, o_orderkey = l_orderkey, l_extendedprice, l_discount }
+];
+
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
+    select { l_suppkey = s_suppkey, s_nationkey }
+];
+// The supplier's nation — names who filled the order (the numerator).
+let supp_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+    select { s_nationkey = n_nationkey, supp_nation = n_name }
+];
+
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
+    filter o_orderdate >= date"1995-01-01" && o_orderdate <= date"1996-12-31"
+][select { o_orderkey, c_custkey = o_custkey, o_orderdate }];
+
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
+    select { c_custkey, c_nationkey }
+];
+// The customer's nation — reaches region, which scopes the market.
+let cust_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+    select { c_nationkey = n_nationkey, n_regionkey }
+];
+let region = read_parquet("benchmarking/data/tpch/parquet/region.parquet")[
+    filter r_name == "AMERICA"
+][select { n_regionkey = r_regionkey }];
+
+let joined = (((((
+    (part join lineitem on l_partkey)
+        join supplier on l_suppkey)
+        join supp_nation on s_nationkey)
+        join orders on o_orderkey)
+        join customer on c_custkey)
+        join cust_nation on c_nationkey)
+        join region on n_regionkey;
+
+let result = joined[
+    update { o_year = year(o_orderdate) }
+][
+    select {
+        mkt_share =
+            sum(l_extendedprice * (1.0 - l_discount) * Int64(supp_nation == "BRAZIL"))
+            / sum(l_extendedprice * (1.0 - l_discount))
+    },
+    by { o_year }
+][order { o_year }];
+write_csv(result, "benchmarking/data/tpch/out/q08.csv");
+result;

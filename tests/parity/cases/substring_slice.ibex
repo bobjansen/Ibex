@@ -1,0 +1,4 @@
+let t = Table { phone = ["13-1", "31-2", "99-3"], bal = [1.0, 2.0, 3.0] };
+t[filter substring(phone, 0, 2) == "13" || substring(phone, 0, 2) == "31"][
+    update { cc = substring(phone, 0, 2) }
+][select { cc, bal }][order { bal }];

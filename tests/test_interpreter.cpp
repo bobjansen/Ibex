@@ -9769,3 +9769,87 @@ parts[filter p_partkey > scalar(
         REQUIRE(result.rows() == 0);
     }
 }
+
+// ── substring(s, start[, length]) ────────────────────────────────────────────
+// A Unicode-codepoint slice with Polars str.slice semantics: 0-based start that
+// may be negative (from the end), optional length (to the end when omitted).
+
+namespace {
+
+auto substring_over(const std::vector<std::string>& values, const std::string& call)
+    -> std::vector<std::string> {
+    Column<std::string> col;
+    for (const auto& v : values) {
+        col.push_back(v);
+    }
+    runtime::Table t;
+    t.add_column("v", std::move(col));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    const std::string source = "t[update { m = " + call + " }][select { m }];";
+    auto ir = require_ir(source.c_str());
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<std::string>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    std::vector<std::string> out;
+    out.reserve(m->size());
+    for (std::size_t i = 0; i < m->size(); ++i) {
+        out.emplace_back((*m)[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("substring is 0-based with an optional length", "[interpreter][substring]") {
+    const std::vector<std::string> v{"13-abc", "ab"};
+    CHECK(substring_over(v, "substring(v, 0, 2)") == std::vector<std::string>{"13", "ab"});
+    CHECK(substring_over(v, "substring(v, 3)") == std::vector<std::string>{"abc", ""});
+    // Length past the end clamps; start past the end is empty.
+    CHECK(substring_over(v, "substring(v, 3, 99)") == std::vector<std::string>{"abc", ""});
+    CHECK(substring_over(v, "substring(v, 9, 2)") == std::vector<std::string>{"", ""});
+    // Zero and negative length are empty.
+    CHECK(substring_over(v, "substring(v, 0, 0)") == std::vector<std::string>{"", ""});
+}
+
+TEST_CASE("substring negative start counts from the end", "[interpreter][substring]") {
+    const std::vector<std::string> v{"13-abc", "ab"};
+    CHECK(substring_over(v, "substring(v, -3)") == std::vector<std::string>{"abc", "ab"});
+    CHECK(substring_over(v, "substring(v, -3, 2)") == std::vector<std::string>{"ab", "ab"});
+    // A start before the beginning clamps to 0, not an error.
+    CHECK(substring_over(v, "substring(v, -99, 2)") == std::vector<std::string>{"13", "ab"});
+}
+
+TEST_CASE("substring slices codepoints, never splitting a UTF-8 byte sequence",
+          "[interpreter][substring]") {
+    // "café-99" is c a f é - 9 9 (é is two bytes, 0xC3 0xA9); "日本語文" is four
+    // three-byte codepoints.
+    const std::vector<std::string> v{"café-99", "日本語文"};
+    // Codepoint 3 is é / 文, taken whole — never a half-decoded byte.
+    CHECK(substring_over(v, "substring(v, 3, 1)") == std::vector<std::string>{"é", "文"});
+    CHECK(substring_over(v, "substring(v, 0, 3)") == std::vector<std::string>{"caf", "日本語"});
+    CHECK(substring_over(v, "substring(v, -1)") == std::vector<std::string>{"9", "文"});
+    CHECK(substring_over(v, "substring(v, 0, 1)") == std::vector<std::string>{"c", "日"});
+}
+
+TEST_CASE("substring propagates null", "[interpreter][substring]") {
+    Column<std::string> col;
+    col.push_back("keep");
+    col.push_back("drop");
+    runtime::Table t;
+    t.add_column("v", runtime::ColumnValue{std::move(col)}, runtime::ValidityBitmap{true, false});
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { m = substring(v, 0, 2) }][select { m }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* out = result->find_entry("m");
+    REQUIRE(out != nullptr);
+    REQUIRE(out->validity.has_value());
+    CHECK((*out->validity)[0] == true);
+    CHECK((*out->validity)[1] == false);  // null in -> null out
+}

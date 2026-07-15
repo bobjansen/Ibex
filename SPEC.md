@@ -3062,6 +3062,7 @@ extern implementations. The recommended path for custom scalar logic is
 | `pmax(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `is_nan(x)`     | `Float64 -> Bool`                  |
 | `like(s, pattern)` | `(String, String) -> Bool` (SQL-LIKE matching, see below) |
+| `substring(s, start[, len])` | `(String, Int[, Int]) -> String` (0-based codepoint slice, see below) |
 | `is_null(x)` / `is_not_null(x)` | `Any -> Bool` (tests the value's null bit; never null itself) |
 | `coalesce(a, b, ...)` | `T{1+} -> T` (first non-null argument per row; args share one type) |
 | `year(t)`       | `Date|Timestamp -> Int32`          |
@@ -3167,6 +3168,29 @@ Semantics:
 
 Case-insensitive matching, regular expressions, and collation are deliberately
 out of scope.
+
+#### String Slicing — `substring`
+
+`substring(s, start[, length])` extracts a run of Unicode **codepoints**:
+`(String, Int[, Int]) -> String`. It follows Polars `str.slice`, not SQL — the
+target audience is dataframe users:
+
+```
+customer[update { cntrycode = substring(c_phone, 0, 2) }];  // first two characters
+customer[filter substring(c_phone, 0, 2) == "13"];
+```
+
+Semantics:
+
+- `start` is **0-based**. A negative `start` counts from the end, so
+  `substring(s, -3)` is the last three codepoints.
+- `length` is optional; omitted, the slice runs to the end of the string.
+- Indices **clamp** rather than error: a `start` past the end yields `""`, a
+  `length` past the end stops at the end, and a zero or negative `length` yields
+  `""`.
+- Slicing is by codepoint, never by byte — a multi-byte UTF-8 character is never
+  split, so the result is always valid UTF-8.
+- Null propagates, as for every ordinary scalar function.
 
 ### 12.6.1 Ranking
 

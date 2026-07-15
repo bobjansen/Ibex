@@ -255,6 +255,28 @@ def q18() -> pl.LazyFrame:
     )
 
 
+def q22() -> pl.LazyFrame:
+    codes = ["13", "31", "23", "29", "30", "18", "17"]
+    in_scope = (
+        scan("customer")
+        .with_columns(cntrycode=pl.col("c_phone").str.slice(0, 2))
+        .filter(pl.col("cntrycode").is_in(codes))
+        .select(["c_custkey", "cntrycode", "c_acctbal"])
+    )
+    # The uncorrelated threshold: average positive balance among those customers,
+    # broadcast with a cross join (one row) exactly as Ibex does.
+    threshold = in_scope.filter(pl.col("c_acctbal") > 0).select(threshold=pl.mean("c_acctbal"))
+    with_orders = scan("orders").select(c_custkey="o_custkey").unique()
+    return (
+        in_scope.join(threshold, how="cross")
+        .filter(pl.col("c_acctbal") > pl.col("threshold"))
+        .join(with_orders, on="c_custkey", how="anti")
+        .group_by("cntrycode")
+        .agg(numcust=pl.len(), totacctbal=pl.sum("c_acctbal"))
+        .sort("cntrycode")
+    )
+
+
 def q19() -> pl.LazyFrame:
     lineitem = scan("lineitem")
     part = scan("part")
@@ -353,7 +375,7 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q18": q18, "q19": q19}
+QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q18": q18, "q19": q19, "q22": q22}
 
 
 def percentile(data: list[float], p: float) -> float:

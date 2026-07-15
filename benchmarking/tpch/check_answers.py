@@ -41,6 +41,7 @@ IMPLEMENTED = {
     "q10": "q10",
     "q18": "q18",
     "q19": "q19",
+    "q22": "q22",
 }
 
 FLOAT_ABS_TOL = 0.02  # official answers are rounded to 2 decimal places

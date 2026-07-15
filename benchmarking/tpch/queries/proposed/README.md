@@ -38,8 +38,14 @@ ps_suppkey in (supplier[select { s_suppkey }])
 ```
 
 The uncorrelated `scalar` needed for Q11 now works, and Q11 has moved out of
-this directory.  The uncorrelated scalar in Q22 works too; Q22's remaining
-blockers are `not exists` (an anti join) and `prefix`/`substring`.
+this directory.
+
+**Q22 has also moved out.**  `substring` was its last missing primitive (added
+0-based and codepoint-aware, following Polars `str.slice`); everything else was
+already here — the country-code `in` as an OR-chain, the balance threshold as an
+uncorrelated `scalar`, and the `not exists` as an anti join (a plain one is exact
+because o_custkey is non-null).  The `prefix` the draft invented was never needed:
+`prefix(s, n)` is just `substring(s, 0, n)`.
 
 **Q18 has also moved out**, shipped exactly the way it is described above — its
 uncorrelated positive `in` written as the plain semi join it reduces to, no `in`

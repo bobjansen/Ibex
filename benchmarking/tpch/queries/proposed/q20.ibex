@@ -1,5 +1,21 @@
-// Proposed TPC-H Q20 — nested IN plus correlated scalar SUM.
+// Proposed TPC-H Q20 — Potential Part Promotion. Nested IN + correlated scalar.
 // Qualification parameters: forest, 1994-01-01, CANADA.
+//
+// Three subqueries nest here (see plans/in-subquery-plan.md):
+//
+//   - the OUTER `s_suppkey in (partsupp[...])`      — uncorrelated IN  = semi join
+//   - the INNER `ps_partkey in (part[...])`         — uncorrelated IN  = semi join
+//   - the DEEPEST `ps_availqty > scalar(lineitem[...])` — CORRELATED scalar,
+//     already implemented and shipped (SPEC 5.7); it captures ps_partkey and
+//     ps_suppkey from the partsupp row.
+//
+// Both `in`s are UNCORRELATED and positive, so each is a plain semi join — no
+// null-aware anti join needed. The correlated scalar already works. So q20's
+// real blocker is not a missing primitive but assembling three nested subqueries
+// by hand; the `in` feature buys the readability that keeps it one expression.
+//
+// V1 restriction: each `in` LHS is a bare column, and each subquery produces one
+// column, renamed to the LHS so the semi join is a plain equijoin.
 import "parquet";
 
 let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
@@ -8,17 +24,21 @@ let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
 let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
 let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
 
-let result = (supplier join nation on s_nationkey == n_nationkey)[
-    filter n_name == "CANADA" && s_suppkey in (partsupp[
-        filter ps_partkey in (part[
-            filter like(p_name, "forest%"), select { p_partkey }
-        ]) && ps_availqty > scalar(lineitem[
-            filter l_partkey == outer(ps_partkey) && l_suppkey == outer(ps_suppkey)
-                && l_shipdate >= date"1994-01-01" && l_shipdate < date"1995-01-01",
-            select { required_quantity = 0.5 * sum(l_quantity) }
-        ]),
-        select { ps_suppkey }
-    ]),
+let result = (supplier join nation on { s_nationkey = n_nationkey })[
+    filter n_name == "CANADA" && s_suppkey in (
+        partsupp[
+            filter ps_partkey in (
+                part[filter like(p_name, "forest%"), select { ps_partkey = p_partkey }]
+            ) && ps_availqty > scalar(
+                lineitem[
+                    filter l_partkey == outer(ps_partkey) && l_suppkey == outer(ps_suppkey)
+                        && l_shipdate >= date"1994-01-01" && l_shipdate < date"1995-01-01",
+                    select { required_quantity = 0.5 * sum(l_quantity) }
+                ]
+            ),
+            select { s_suppkey = ps_suppkey }
+        ]
+    ),
     select { s_name, s_address },
     order { s_name }
 ];

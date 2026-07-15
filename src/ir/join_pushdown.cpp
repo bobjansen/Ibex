@@ -234,6 +234,102 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
     }
     return node;
 }
+
+/// Push a `Semi`/`Anti` join below the `Inner` join it sits on, when the join's
+/// keys all live in one side of that inner join:
+///
+///   (X ⋈ Y) ⋉ Z on k   with k ⊆ X   →   (X ⋉ Z on k) ⋈ Y
+///
+/// A semi/anti join only tests whether the key exists in Z and adds no columns,
+/// and it depends only on X's key values, which an inner join leaves untouched —
+/// so filtering X first yields the identical pair set. The win is that the inner
+/// join then materialises far fewer rows: PDS-H q18 joins all 6M line items and
+/// keeps 57 orders, versus filtering to 57 orders and joining a few hundred.
+auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodePtr {
+    auto& outer = static_cast<JoinNode&>(*node);
+    if ((outer.kind() != JoinKind::Semi && outer.kind() != JoinKind::Anti) ||
+        outer.predicate().has_value() || outer.keys().empty()) {
+        return node;
+    }
+    if (outer.children().size() != 2 || outer.children()[0] == nullptr ||
+        outer.children()[1] == nullptr || outer.children()[0]->kind() != NodeKind::Join) {
+        return node;
+    }
+    auto& inner = static_cast<JoinNode&>(*outer.mutable_children()[0]);
+    // Only an equi Inner join is safe to push through: Left/Right/Outer decide
+    // which left rows survive, which the semi/anti filter would then race.
+    if (inner.kind() != JoinKind::Inner || inner.predicate().has_value() ||
+        inner.children().size() != 2 || inner.children()[0] == nullptr ||
+        inner.children()[1] == nullptr) {
+        return node;
+    }
+
+    const SchemaInfo left = infer_schema(*inner.children()[0], sources);
+    const SchemaInfo right = infer_schema(*inner.children()[1], sources);
+    const auto& keys = outer.keys();
+    const auto in_schema = [](const SchemaInfo& s, const std::string& name) {
+        return s.is_known() && s.find(name) != nullptr;
+    };
+    const auto is_inner_key = [&](const std::string& name) {
+        return std::ranges::find(inner.keys(), name) != inner.keys().end();
+    };
+    // A left push is licensed when every key is in the (Known) left schema — a
+    // shared name resolves to the left above the join. A right push additionally
+    // needs a closed Known left proving each key is absent from the left or is an
+    // inner-join key (equal on both sides). Mirrors `classify` for filters.
+    const bool push_left = left.is_known() && std::ranges::all_of(keys, [&](const std::string& n) {
+                               return in_schema(left, n);
+                           });
+    const bool push_right =
+        !push_left && right.is_known() && left.is_known() && !left.is_open() &&
+        std::ranges::all_of(keys, [&](const std::string& n) {
+            return in_schema(right, n) && (left.find(n) == nullptr || is_inner_key(n));
+        });
+    if (!push_left && !push_right) {
+        return node;
+    }
+
+    NodePtr inner_owned = std::move(outer.mutable_children()[0]);
+    NodePtr z = std::move(outer.mutable_children()[1]);
+    outer.mutable_children().clear();
+    auto& inner_ref = static_cast<JoinNode&>(*inner_owned);
+    NodePtr x = std::move(inner_ref.mutable_children()[0]);
+    NodePtr y = std::move(inner_ref.mutable_children()[1]);
+    inner_ref.mutable_children().clear();
+
+    // `node` (the semi/anti join) is reattached over the chosen side and Z, then
+    // pushed again in case that side is itself a join it can descend into.
+    NodePtr& target = push_left ? x : y;
+    node->add_child(std::move(target));
+    node->add_child(std::move(z));
+    NodePtr pushed = rewrite_semi_over_join(std::move(node), sources);
+
+    inner_owned->add_child(push_left ? std::move(pushed) : std::move(x));
+    inner_owned->add_child(push_left ? std::move(y) : std::move(pushed));
+    return inner_owned;
+}
+
+auto semi_walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
+    if (!node) {
+        return node;
+    }
+    for (auto& child : node->mutable_children()) {
+        child = semi_walk(std::move(child), sources);
+    }
+    if (node->kind() == NodeKind::Program) {
+        auto& prog = static_cast<ProgramNode&>(*node);
+        if (prog.mutable_main_node()) {
+            prog.mutable_main_node() = semi_walk(std::move(prog.mutable_main_node()), sources);
+        }
+        for (auto& pre : prog.mutable_preamble()) {
+            pre = semi_walk(std::move(pre), sources);
+        }
+    }
+    if (node->kind() == NodeKind::Join) {
+        return rewrite_semi_over_join(std::move(node), sources);
+    }
+    return node;
+}
 // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
@@ -245,6 +341,10 @@ auto push_filters_into_joins(NodePtr root, const SourceSchemas& sources) -> Node
         next_id_counter() = max_id + 1;
     }
     return walk(std::move(root), sources);
+}
+
+auto push_semi_joins_down(NodePtr root, const SourceSchemas& sources) -> NodePtr {
+    return semi_walk(std::move(root), sources);
 }
 
 }  // namespace ibex::ir

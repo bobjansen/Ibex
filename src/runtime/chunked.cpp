@@ -2011,18 +2011,57 @@ class ChunkedDistinctOperator final : public Operator {
             }
 
             const std::size_t rows = t.rows();
+
+            // Resolve each key column once for the whole chunk, so the row loop
+            // hashes and compares values where they sit instead of boxing a Key
+            // (a heap-allocated vector of variants) per row. make_key_col covers
+            // every column type; the boxed fallback below is for anything it
+            // cannot, and never runs for the built-in types.
+            std::vector<KeyCol> cols;
+            cols.reserve(t.columns.size());
+            bool all_key_cols = true;
+            for (const auto& entry : t.columns) {
+                auto col = make_key_col(entry);
+                if (!col.has_value()) {
+                    all_key_cols = false;
+                    break;
+                }
+                cols.push_back(*col);
+            }
+
             std::vector<std::size_t> idx;
             idx.reserve(rows);
-            for (std::size_t row = 0; row < rows; ++row) {
-                Key key;
-                key.values.reserve(t.columns.size());
-                for (const auto& entry : t.columns) {
-                    push_key_value(key, entry, row);
+            if (all_key_cols) {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    // find_or_insert calls the maker only for a genuinely new
+                    // value; a duplicate hashes and compares in place, no alloc.
+                    bool is_new = false;
+                    key_index_.find_or_insert(group_order_, cols, row, [&] {
+                        is_new = true;
+                        Key key;
+                        key.values.reserve(t.columns.size());
+                        for (const auto& entry : t.columns) {
+                            push_key_value(key, entry, row);
+                        }
+                        group_order_.push_back(std::move(key));
+                        return static_cast<std::uint32_t>(group_order_.size() - 1);
+                    });
+                    if (is_new) {
+                        idx.push_back(row);
+                    }
                 }
-                if (!seen_.insert(std::move(key)).second) {
-                    continue;
+            } else {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    Key key;
+                    key.values.reserve(t.columns.size());
+                    for (const auto& entry : t.columns) {
+                        push_key_value(key, entry, row);
+                    }
+                    if (!seen_.insert(std::move(key)).second) {
+                        continue;
+                    }
+                    idx.push_back(row);
                 }
-                idx.push_back(row);
             }
 
             if (idx.empty()) {
@@ -2163,6 +2202,12 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
     OperatorPtr child_;
+    // Multi-column dedup: `key_index_` hashes and compares each row in place and
+    // holds one owned Key per distinct value in `group_order_` (the group-by hot
+    // loop's mechanism). `seen_` is the fallback for a column type make_key_col
+    // can't resolve — it boxes a Key per row, which is what this replaced.
+    KeyRowIndex key_index_;
+    std::vector<Key> group_order_;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     robin_hood::unordered_flat_set<std::int64_t> seen_i64_;
     robin_hood::unordered_flat_set<double> seen_f64_;

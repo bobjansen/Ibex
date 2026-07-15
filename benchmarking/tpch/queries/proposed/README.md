@@ -30,18 +30,23 @@ The remaining proposed additions are intentionally small:
 exists (lineitem[filter l_orderkey == outer(o_orderkey)])
 !exists (orders[filter o_custkey == outer(c_custkey)])
 
-// An UNcorrelated scalar: exactly one row, exactly one column, evaluated once.
-// (The correlated form — with an outer(...) capture — already works.)
-scalar(lineitem[select { average = mean(l_quantity) }])
-
-// Membership against a one-column table expression.  `not in` follows SQL
-// three-valued/null semantics; it must not be silently implemented as a plain
-// anti join.
+// Membership against a one-column table expression — a SEMI JOIN, not a scalar
+// (`plans/in-subquery-plan.md`).  `not in` is an ANTI join, but a null-aware
+// one: a plain anti join is only exact when the subquery column is non-nullable,
+// which is why Q16 could ship its `not in` as one (s_suppkey is a primary key).
 ps_suppkey in (supplier[select { s_suppkey }])
 ```
 
-Ranked by queries unblocked per unit of work: uncorrelated `scalar` (Q11, Q22)
-and `in` / `not in` (Q18, Q20) come before `exists`.
+The uncorrelated `scalar` needed for Q11 now works, and Q11 has moved out of
+this directory.  The uncorrelated scalar in Q22 works too; Q22's remaining
+blockers are `not exists` (an anti join) and `prefix`/`substring`.
+
+Ranked by queries unblocked per unit of work: `in` / `not in` (Q18, Q20) come
+before `exists` (0 new queries — an equality `exists` is already a semi join).
+Both Q18 and Q20 use only uncorrelated positive `in`s, which reduce to plain semi
+joins, so — like Q04's `exists` — they are expressible today; the feature buys
+readability, and the null-aware anti join (needed by neither) buys correctness
+for a general `not in`.
 
 `outer(...)` is explicit by design: it makes the correlation boundary visible,
 allows an inner column to shadow an outer column, and avoids guessing which

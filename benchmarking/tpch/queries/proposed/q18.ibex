@@ -1,18 +1,42 @@
-// Proposed TPC-H Q18 — uncorrelated IN with grouped input.
+// Proposed TPC-H Q18 — Large Volume Customer. Uncorrelated IN.
 // Qualification parameter: 300.
+//
+// The SQL keeps orders whose total quantity exceeds 300:
+//
+//     where o_orderkey in (
+//         select l_orderkey from lineitem group by l_orderkey
+//         having sum(l_quantity) > 300 )
+//
+// `in (subquery)` is a SEMI JOIN, not a scalar (see plans/in-subquery-plan.md).
+// This one is UNCORRELATED — the subquery is a fixed set of "big" orders that
+// does not reference the outer row — so, exactly like q04's `exists`, it reduces
+// to a plain semi join and could ship today without the feature: compute the set
+// into a `let`, rename its column to the join key, and `semi join`. `in` syntax
+// only buys readability here; the positive form needs no null handling.
+//
+// V1 restriction: the LHS of `in` is a bare column (o_orderkey), and the
+// subquery produces exactly one column. The lowering renames that column to the
+// LHS so the semi join is a plain equijoin.
 import "parquet";
 
 let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
 let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
 let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let order_totals = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
 
-let result = ((customer join orders on c_custkey == o_custkey)
-    join lineitem on o_orderkey == l_orderkey)[
-        filter o_orderkey in (order_totals[
-            select { quantity = sum(l_quantity) }, by { l_orderkey }
-        ][filter quantity > 300][select { l_orderkey }]),
-        select { sum_quantity = sum(l_quantity) },
-        by { c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice }
-    ][order { o_totalprice desc, o_orderdate }, head 100];
+let result = (
+    (customer join orders on { c_custkey = o_custkey })
+        join lineitem on { o_orderkey = l_orderkey }
+)[
+    filter o_orderkey in (
+        lineitem[
+            select { quantity = sum(l_quantity) },
+            by { o_orderkey = l_orderkey }
+        ][filter quantity > 300][select { o_orderkey }]
+    ),
+    select { sum_quantity = sum(l_quantity) },
+    by { c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice }
+][
+    order { o_totalprice desc, o_orderdate },
+    head 100
+];
 result;

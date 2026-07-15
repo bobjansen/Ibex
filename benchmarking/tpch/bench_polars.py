@@ -255,6 +255,67 @@ def q18() -> pl.LazyFrame:
     )
 
 
+def q20() -> pl.LazyFrame:
+    forest_parts = (
+        scan("part").filter(pl.col("p_name").str.starts_with("forest")).select("p_partkey")
+    )
+    required = (
+        scan("lineitem")
+        .filter(
+            (pl.col("l_shipdate") >= date(1994, 1, 1)) & (pl.col("l_shipdate") < date(1995, 1, 1))
+        )
+        .group_by(["l_partkey", "l_suppkey"])
+        .agg(required=0.5 * pl.sum("l_quantity"))
+    )
+    target = (
+        scan("partsupp")
+        .join(forest_parts, left_on="ps_partkey", right_on="p_partkey", how="semi")
+        .join(required, left_on=["ps_partkey", "ps_suppkey"], right_on=["l_partkey", "l_suppkey"])
+        .filter(pl.col("ps_availqty") > pl.col("required"))
+        .select("ps_suppkey")
+        .unique()
+    )
+    return (
+        scan("supplier")
+        .join(scan("nation").filter(pl.col("n_name") == "CANADA"),
+              left_on="s_nationkey", right_on="n_nationkey")
+        .join(target, left_on="s_suppkey", right_on="ps_suppkey", how="semi")
+        .select(["s_name", "s_address"])
+        .sort("s_name")
+    )
+
+
+def q21() -> pl.LazyFrame:
+    orders_f = scan("orders").filter(pl.col("o_orderstatus") == "F").select("o_orderkey")
+    li_f = scan("lineitem").join(
+        orders_f, left_on="l_orderkey", right_on="o_orderkey", how="semi"
+    )
+    n_sup = (
+        li_f.unique(["l_orderkey", "l_suppkey"])
+        .group_by("l_orderkey")
+        .agg(n_sup=pl.len())
+    )
+    late = li_f.filter(pl.col("l_receiptdate") > pl.col("l_commitdate"))
+    n_late = late.unique(["l_orderkey", "l_suppkey"]).group_by("l_orderkey").agg(n_late=pl.len())
+    qualifying = (
+        late.select(["l_orderkey", "l_suppkey"])
+        .join(n_sup, on="l_orderkey")
+        .filter(pl.col("n_sup") > 1)
+        .join(n_late, on="l_orderkey")
+        .filter(pl.col("n_late") == 1)
+        .select("l_suppkey")
+    )
+    return (
+        qualifying.join(scan("supplier"), left_on="l_suppkey", right_on="s_suppkey")
+        .join(scan("nation").filter(pl.col("n_name") == "SAUDI ARABIA"),
+              left_on="s_nationkey", right_on="n_nationkey")
+        .group_by("s_name")
+        .agg(numwait=pl.len())
+        .sort(["numwait", "s_name"], descending=[True, False])
+        .head(100)
+    )
+
+
 def q22() -> pl.LazyFrame:
     codes = ["13", "31", "23", "29", "30", "18", "17"]
     in_scope = (
@@ -375,7 +436,7 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q18": q18, "q19": q19, "q22": q22}
+QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q18": q18, "q19": q19, "q20": q20, "q21": q21, "q22": q22}
 
 
 def percentile(data: list[float], p: float) -> float:

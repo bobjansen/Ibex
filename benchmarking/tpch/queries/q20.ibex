@@ -1,0 +1,65 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q20 — Potential Part Promotion
+//
+//  Suppliers in a nation who hold more of a "forest…" part than half of what
+//  they shipped of it in 1994 — i.e. surplus stock worth promoting. Standard
+//  TPC-H qualification parameters: COLOR='forest', DATE='1994-01-01',
+//  NATION='CANADA'.
+//
+//  The SQL nests three subqueries; every one is a primitive Ibex already has, so
+//  q20 assembles today with no `in` syntax (plans/in-subquery-plan.md):
+//
+//    - `ps_partkey in (part where p_name like 'forest%')` — an uncorrelated `in`,
+//      i.e. a SEMI JOIN of partsupp against the forest parts.
+//    - `ps_availqty > (select 0.5*sum(l_quantity) from lineitem where
+//      l_partkey = ps_partkey and l_suppkey = ps_suppkey and <1994>)` — a
+//      CORRELATED scalar subquery with a COMPOSITE capture (two outer columns),
+//      decorrelated into a group-by on (l_partkey, l_suppkey) left-joined back
+//      (SPEC 5.7).
+//    - `s_suppkey in (…)` — the outer uncorrelated `in`, another semi join.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q20.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
+let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+
+// Inner `in`: parts whose name starts with "forest".
+let forest_parts = part_raw[filter like(p_name, "forest%")][select { ps_partkey = p_partkey }];
+
+// partsupp rows for those parts whose available quantity exceeds half of what
+// that (part, supplier) shipped in 1994 — the correlated scalar with a composite
+// (ps_partkey, ps_suppkey) capture.
+let target = (
+    partsupp_raw[select { ps_partkey, ps_suppkey, ps_availqty }]
+    semi join forest_parts on ps_partkey
+)[
+    filter Float64(ps_availqty) > scalar(
+        lineitem_raw[
+            filter l_partkey == outer(ps_partkey) && l_suppkey == outer(ps_suppkey)
+                && l_shipdate >= date"1994-01-01" && l_shipdate < date"1995-01-01",
+            select { required = 0.5 * sum(l_quantity) }
+        ]
+    )
+][select { s_suppkey = ps_suppkey }];
+
+let result = (
+    (supplier_raw[select { s_suppkey, s_name, s_address, s_nationkey }]
+        join nation_raw[filter n_name == "CANADA"][select { s_nationkey = n_nationkey }]
+            on s_nationkey)
+    semi join target on s_suppkey
+)[
+    select { s_name, s_address }
+][
+    order { s_name }
+];
+write_csv(result, "benchmarking/data/tpch/out/q20.csv");
+result;

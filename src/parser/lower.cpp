@@ -4539,6 +4539,7 @@ auto lower(const Program& program) -> LowerResult {
     // pure structural rewrite that cannot tell which side of a join produces a
     // column, and its rules expect the un-fused Filter(Join(...)) shape.
     *lowered = ir::push_filters_into_joins(std::move(*lowered), source_schemas);
+    *lowered = ir::push_semi_joins_down(std::move(*lowered), source_schemas);
 
     const auto optimization_context = build_optimization_context(*effects);
     ir::OptimizationStats optimization_stats;
@@ -4564,7 +4565,9 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
         // Join pushdown must precede the caller's `required_columns` pass so
         // projection pushdown demands the pushed filters' columns from the
         // right scans (the REPL runs that pass on the tree returned here).
-        *lowered = ir::push_filters_into_joins(std::move(*lowered), lowerer.source_schemas());
+        const ir::SourceSchemas schemas = lowerer.source_schemas();
+        *lowered = ir::push_filters_into_joins(std::move(*lowered), schemas);
+        *lowered = ir::push_semi_joins_down(std::move(*lowered), schemas);
     }
     return lowered;
 }

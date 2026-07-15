@@ -41,12 +41,17 @@ The uncorrelated `scalar` needed for Q11 now works, and Q11 has moved out of
 this directory.  The uncorrelated scalar in Q22 works too; Q22's remaining
 blockers are `not exists` (an anti join) and `prefix`/`substring`.
 
-Ranked by queries unblocked per unit of work: `in` / `not in` (Q18, Q20) come
-before `exists` (0 new queries — an equality `exists` is already a semi join).
-Both Q18 and Q20 use only uncorrelated positive `in`s, which reduce to plain semi
-joins, so — like Q04's `exists` — they are expressible today; the feature buys
-readability, and the null-aware anti join (needed by neither) buys correctness
-for a general `not in`.
+**Q18 has also moved out**, shipped exactly the way it is described above — its
+uncorrelated positive `in` written as the plain semi join it reduces to, no `in`
+syntax required, just as Q04's `exists` shipped as a semi join.  The `in` feature
+would only make it read closer to the SQL.
+
+Ranked by queries unblocked per unit of work: `in` / `not in` (Q20, and the
+readability of Q18) come before `exists` (0 new queries — an equality `exists` is
+already a semi join).  Q20 uses only uncorrelated positive `in`s, so like Q18 it
+is expressible today; its blocker is the intricacy of assembling three nested
+subqueries by hand, not a missing primitive.  The null-aware anti join buys
+correctness for a general `not in`, which no remaining query needs.
 
 `outer(...)` is explicit by design: it makes the correlation boundary visible,
 allows an inner column to shadow an outer column, and avoids guessing which

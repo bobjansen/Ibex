@@ -39,6 +39,7 @@ IMPLEMENTED = {
     "q17": "q17",
     "q11": "q11",
     "q10": "q10",
+    "q18": "q18",
     "q19": "q19",
 }
 
@@ -57,6 +58,16 @@ FLOAT_ABS_TOL = 0.02  # official answers are rounded to 2 decimal places
 # 1e-9 and both differ from the decimal reference.
 TOLERANCES = {"q17": 0.05}
 
+# Per-query fixups for the answer file's column headers, applied to the expected
+# rows so the query can name its columns naturally. dbgen pads each header to the
+# column's display width and truncates it to fit, and names an unaliased
+# expression `colN`. q18's date column is only as wide as "1994-04-07", so
+# "o_orderdate" arrives as "o_orderdat", and its unaliased sum(l_quantity) as
+# "col6".
+COLUMN_ALIASES = {
+    "q18": {"o_orderdat": "o_orderdate", "col6": "sum_quantity"},
+}
+
 EPOCH = datetime.date(1970, 1, 1)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -67,9 +78,13 @@ def read_answer(qnum: str) -> list[dict[str, str]]:
     # comment text that starts mid-sentence), not padding, so stripping it
     # would corrupt the expected value.
     path = ANSWERS_DIR / f"{qnum}.out"
+    aliases = COLUMN_ALIASES.get(qnum, {})
     with open(path, newline="") as f:
         reader = csv.DictReader(f, delimiter="|")
-        return [{k.strip(): v.rstrip() for k, v in row.items() if k} for row in reader]
+        return [
+            {aliases.get(k.strip(), k.strip()): v.rstrip() for k, v in row.items() if k}
+            for row in reader
+        ]
 
 
 def read_ibex_output(stem: str) -> list[dict[str, str]]:

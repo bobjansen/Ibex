@@ -233,6 +233,28 @@ def q17() -> pl.LazyFrame:
     )
 
 
+def q18() -> pl.LazyFrame:
+    # SQL's uncorrelated `in` is a semi join, which is how Ibex writes it too.
+    lineitem = scan("lineitem")
+    big_orders = (
+        lineitem.group_by("l_orderkey")
+        .agg(order_quantity=pl.sum("l_quantity"))
+        .filter(pl.col("order_quantity") > 300)
+        .select("l_orderkey")
+    )
+    return (
+        scan("customer")
+        .select(["c_custkey", "c_name"])
+        .join(scan("orders"), left_on="c_custkey", right_on="o_custkey")
+        .join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
+        .join(big_orders, left_on="o_orderkey", right_on="l_orderkey", how="semi")
+        .group_by(["c_name", "c_custkey", "o_orderkey", "o_orderdate", "o_totalprice"])
+        .agg(sum_quantity=pl.sum("l_quantity"))
+        .sort(["o_totalprice", "o_orderdate"], descending=[True, False])
+        .head(100)
+    )
+
+
 def q19() -> pl.LazyFrame:
     lineitem = scan("lineitem")
     part = scan("part")
@@ -331,7 +353,7 @@ def q16() -> pl.LazyFrame:
     )
 
 
-QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q19": q19}
+QUERIES = {"q01": q01, "q02": q02, "q03": q03, "q04": q04, "q05": q05, "q06": q06, "q09": q09, "q10": q10, "q11": q11, "q13": q13, "q16": q16, "q17": q17, "q18": q18, "q19": q19}
 
 
 def percentile(data: list[float], p: float) -> float:

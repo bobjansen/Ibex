@@ -1,0 +1,63 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q18 — Large Volume Customer
+//
+//  The customers behind the biggest orders: for every order whose line items
+//  total more than 300 units, report the order and its customer. Standard TPC-H
+//  qualification parameter: QUANTITY=300.
+//
+//  The SQL is an uncorrelated `in`:
+//
+//      where o_orderkey in (
+//          select l_orderkey from lineitem group by l_orderkey
+//          having sum(l_quantity) > 300 )
+//
+//  `in (subquery)` is a SEMI JOIN (plans/in-subquery-plan.md), and this one is
+//  uncorrelated -- the set of big orders does not depend on the outer row -- so,
+//  exactly like q04's `exists`, it is a plain semi join and needs no `in` syntax:
+//  compute the big-order keys into a binding, rename that key to o_orderkey, and
+//  `semi join` on it. A positive `in` needs no null handling; the semi join is
+//  exact.
+//
+//  lineitem is bound once and scanned twice -- by the main chain and by the
+//  big-order aggregate -- both demanding {l_orderkey, l_quantity}, so projection
+//  pushdown unions them and the 6M rows decode once.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q18.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
+    select { c_custkey, c_name }
+];
+
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
+    select { o_orderkey, c_custkey = o_custkey, o_orderdate, o_totalprice }
+];
+
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let lineitem = lineitem_raw[select { o_orderkey = l_orderkey, l_quantity }];
+
+// The `in` set: orders whose line items total more than 300 units. One column,
+// named to the key the semi join probes on.
+let big_orders = lineitem_raw[
+    select { order_quantity = sum(l_quantity) },
+    by { o_orderkey = l_orderkey }
+][filter order_quantity > 300.0][select { o_orderkey }];
+
+let cust_orders = customer join orders on c_custkey;
+let with_lineitem = cust_orders join lineitem on o_orderkey;
+let qualifying = with_lineitem semi join big_orders on o_orderkey;
+
+let result = qualifying[
+    select { sum_quantity = sum(l_quantity) },
+    by { c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice }
+][
+    order { o_totalprice desc, o_orderdate },
+    head 100
+];
+write_csv(result, "benchmarking/data/tpch/out/q18.csv");
+result;

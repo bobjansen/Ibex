@@ -63,7 +63,22 @@ auto test_sources() -> ir::SourceSchemas {
         "b", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64},
                                     {.name = "bx", .type = ir::ColumnType::Int64},
                                     {.name = "shared", .type = ir::ColumnType::Int64}}));
+    // `c` is the semi/anti-join filter source: it carries whichever key is tested.
+    sources.insert_or_assign(
+        "c", ir::SchemaInfo::known({{.name = "ax", .type = ir::ColumnType::Int64},
+                                    {.name = "bx", .type = ir::ColumnType::Int64}}));
     return sources;
+}
+
+/// Join(semi_kind, [semi_key], Join(inner_kind, [k], a, b), c).
+auto semi_over_join_tree(ir::JoinKind semi_kind, std::string semi_key,
+                         ir::JoinKind inner_kind = ir::JoinKind::Inner) -> ir::NodePtr {
+    auto inner = make_join({2}, inner_kind, {"k"}, make_scan({3}, "a"), make_scan({4}, "b"));
+    auto semi = std::make_unique<ir::JoinNode>(ir::NodeId{1}, semi_kind,
+                                               std::vector<std::string>{std::move(semi_key)});
+    semi->add_child(std::move(inner));
+    semi->add_child(make_scan({5}, "c"));
+    return semi;
 }
 
 auto filter_join_tree(ir::JoinKind kind, ir::Expr pred) -> ir::NodePtr {
@@ -253,4 +268,69 @@ TEST_CASE("join pushdown: schema flows through a Project side", "[ir][join_pushd
     REQUIRE(out->kind() == ir::NodeKind::Join);
     REQUIRE(out->children()[0]->kind() == ir::NodeKind::Project);
     REQUIRE(out->children()[1]->kind() == ir::NodeKind::Filter);
+}
+
+TEST_CASE("semi pushdown: key in the left side descends there", "[ir][join_pushdown][semi]") {
+    // (a JOIN b on k) SEMI c on ax  ->  (a SEMI c on ax) JOIN b on k.
+    auto out =
+        ir::push_semi_joins_down(semi_over_join_tree(ir::JoinKind::Semi, "ax"), test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(*out).kind() == ir::JoinKind::Inner);
+    const auto& left = *out->children()[0];
+    REQUIRE(left.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(left).kind() == ir::JoinKind::Semi);
+    REQUIRE(scan_name(*left.children()[0]) == "a");
+    REQUIRE(scan_name(*left.children()[1]) == "c");
+    REQUIRE(scan_name(*out->children()[1]) == "b");  // b untouched on the right
+}
+
+TEST_CASE("semi pushdown: key in the right side descends there", "[ir][join_pushdown][semi]") {
+    // (a JOIN b on k) SEMI c on bx  ->  a JOIN (b SEMI c on bx) on k.
+    auto out =
+        ir::push_semi_joins_down(semi_over_join_tree(ir::JoinKind::Semi, "bx"), test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Join);
+    REQUIRE(scan_name(*out->children()[0]) == "a");  // a untouched on the left
+    const auto& right = *out->children()[1];
+    REQUIRE(right.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(right).kind() == ir::JoinKind::Semi);
+    REQUIRE(scan_name(*right.children()[0]) == "b");
+    REQUIRE(scan_name(*right.children()[1]) == "c");
+}
+
+TEST_CASE("anti pushdown works the same as semi", "[ir][join_pushdown][semi]") {
+    auto out =
+        ir::push_semi_joins_down(semi_over_join_tree(ir::JoinKind::Anti, "ax"), test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Join);
+    const auto& left = *out->children()[0];
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(left).kind() == ir::JoinKind::Anti);
+    REQUIRE(scan_name(*left.children()[0]) == "a");
+}
+
+TEST_CASE("semi pushdown: key on both sides pushes left", "[ir][join_pushdown][semi]") {
+    // The inner-join key k is in both a and b; a left push is the choice.
+    auto out =
+        ir::push_semi_joins_down(semi_over_join_tree(ir::JoinKind::Semi, "k"), test_sources());
+    REQUIRE(out->kind() == ir::NodeKind::Join);
+    const auto& left = *out->children()[0];
+    REQUIRE(left.kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(left).kind() == ir::JoinKind::Semi);
+    REQUIRE(scan_name(*left.children()[0]) == "a");
+}
+
+TEST_CASE("semi pushdown: does not descend a left join", "[ir][join_pushdown][semi]") {
+    // A Left inner join changes which left rows survive; the semi filter must
+    // stay above it.
+    auto out = ir::push_semi_joins_down(
+        semi_over_join_tree(ir::JoinKind::Semi, "ax", ir::JoinKind::Left), test_sources());
+    // Unchanged: still Semi at the root.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(*out).kind() == ir::JoinKind::Semi);
+    REQUIRE(out->children()[0]->kind() == ir::NodeKind::Join);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    REQUIRE(static_cast<const ir::JoinNode&>(*out->children()[0]).kind() == ir::JoinKind::Left);
 }

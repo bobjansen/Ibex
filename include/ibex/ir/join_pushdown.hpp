@@ -50,4 +50,28 @@ namespace ibex::ir {
 /// returns the rewritten tree.
 [[nodiscard]] auto push_filters_into_joins(NodePtr root, const SourceSchemas& sources) -> NodePtr;
 
+/// Semi/anti-join pushdown through an inner join.
+///
+/// Rewrites `(X ⋈ Y) ⋉ Z on k` into `(X ⋉ Z on k) ⋈ Y` when the semi/anti join's
+/// keys `k` are all confined to one side of the inner join:
+///
+///   Join(Semi, k, Join(Inner, k', X, Y), Z)
+///     → Join(Inner, k', Join(Semi, k, X, Z), Y)      (k ⊆ X)
+///
+/// A semi/anti join adds no columns and depends only on its left key values,
+/// which an inner join leaves untouched, so the pair set is identical. The
+/// point is to filter before the join instead of after: PDS-H q18 as written
+/// joins all 6M line items and keeps 57 orders (~430ms), versus semi-filtering
+/// to 57 orders and joining a few hundred line items (~17ms).
+///
+/// Which side receives the push follows the same schema rules as
+/// `push_filters_into_joins`: a left push needs the keys in the Known left
+/// schema; a right push additionally needs a closed Known left proving each key
+/// is absent from the left or is an inner-join key. Only an equi Inner join is
+/// descended through (Left/Right/Outer decide left-row survival, which the
+/// semi/anti filter would race). Runs after `push_filters_into_joins` and before
+/// `required_columns`. Pure on IR: takes ownership and returns the rewritten
+/// tree.
+[[nodiscard]] auto push_semi_joins_down(NodePtr root, const SourceSchemas& sources) -> NodePtr;
+
 }  // namespace ibex::ir

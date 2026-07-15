@@ -39,7 +39,6 @@ let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
 ];
 
 let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let lineitem = lineitem_raw[select { o_orderkey = l_orderkey, l_quantity }];
 
 // The `in` set: orders whose line items total more than 300 units. One column,
 // named to the key the semi join probes on.
@@ -48,11 +47,19 @@ let big_orders = lineitem_raw[
     by { o_orderkey = l_orderkey }
 ][filter order_quantity > 300.0][select { o_orderkey }];
 
-let cust_orders = customer join orders on c_custkey;
-let with_lineitem = cust_orders join lineitem on o_orderkey;
-let qualifying = with_lineitem semi join big_orders on o_orderkey;
-
-let result = qualifying[
+// The join chain and the semi join are ONE expression on purpose: semi-join
+// pushdown (src/ir/join_pushdown.cpp) only sees a Join(Semi(Join(Inner …)))
+// when they share an IR tree, and a `let` between them would materialize the
+// full 6M-row join first. Written this way, the pass pushes the semi join down
+// to `orders` — filtering to the ~57 qualifying orders before the line-item
+// join, so it touches a few hundred line items instead of all 6M.
+let result = (
+    (
+        (customer join orders on c_custkey)
+        join lineitem_raw[select { o_orderkey = l_orderkey, l_quantity }] on o_orderkey
+    )
+    semi join big_orders on o_orderkey
+)[
     select { sum_quantity = sum(l_quantity) },
     by { c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice }
 ][

@@ -501,6 +501,65 @@ TEST_CASE("Interpret packed multi-column distinct dedups fixed-width integral ke
     }
 }
 
+TEST_CASE("Interpret single-fixed-width-key group-by covers int64, Date, and Timestamp keys") {
+    // The int-key group-by fast path reads Date/Timestamp as their raw integer;
+    // the output must reconstruct the original key type, and the aggregate must
+    // be correct per group.
+    SECTION("int64 key") {
+        runtime::Table t;
+        t.add_column("k", Column<std::int64_t>{5, 5, 7, 5});
+        t.add_column("v", Column<std::int64_t>{1, 2, 3, 4});
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+        auto ir = require_ir("t[select { s = sum(v) }, by { k }][order { k }];");
+        auto r = runtime::interpret(*ir, registry);
+        REQUIRE(r.has_value());
+        REQUIRE(r->rows() == 2);
+        const auto& k = std::get<Column<std::int64_t>>(*r->find_entry("k")->column);
+        const auto& s = std::get<Column<std::int64_t>>(*r->find_entry("s")->column);
+        REQUIRE(k[0] == 5);
+        REQUIRE(s[0] == 7);  // 1 + 2 + 4
+        REQUIRE(k[1] == 7);
+        REQUIRE(s[1] == 3);
+    }
+
+    SECTION("Date key reconstructs a Date column") {
+        runtime::Table t;
+        t.add_column("d", Column<Date>{Date{100}, Date{200}, Date{100}});
+        t.add_column("v", Column<std::int64_t>{10, 20, 30});
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+        auto ir = require_ir("t[select { s = sum(v) }, by { d }][order { d }];");
+        auto r = runtime::interpret(*ir, registry);
+        REQUIRE(r.has_value());
+        REQUIRE(r->rows() == 2);
+        const auto& d = std::get<Column<Date>>(*r->find_entry("d")->column);
+        const auto& s = std::get<Column<std::int64_t>>(*r->find_entry("s")->column);
+        REQUIRE(d[0].days == 100);
+        REQUIRE(s[0] == 40);  // 10 + 30
+        REQUIRE(d[1].days == 200);
+        REQUIRE(s[1] == 20);
+    }
+
+    SECTION("Timestamp key reconstructs a Timestamp column") {
+        runtime::Table t;
+        t.add_column("ts", Column<Timestamp>{Timestamp{1000}, Timestamp{1000}, Timestamp{2000}});
+        t.add_column("v", Column<double>{1.5, 2.5, 4.0});
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+        auto ir = require_ir("t[select { m = min(v) }, by { ts }][order { ts }];");
+        auto r = runtime::interpret(*ir, registry);
+        REQUIRE(r.has_value());
+        REQUIRE(r->rows() == 2);
+        const auto& ts = std::get<Column<Timestamp>>(*r->find_entry("ts")->column);
+        const auto& m = std::get<Column<double>>(*r->find_entry("m")->column);
+        REQUIRE(ts[0].nanos == 1000);
+        REQUIRE(m[0] == Catch::Approx(1.5));
+        REQUIRE(ts[1].nanos == 2000);
+        REQUIRE(m[1] == Catch::Approx(4.0));
+    }
+}
+
 TEST_CASE("Interpret order") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{20, 10, 20});

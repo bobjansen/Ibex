@@ -1,0 +1,55 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q22 — Global Sales Opportunity
+//
+//  Customers in seven country codes whose account balance beats the average
+//  positive balance of their peer group, but who have never placed an order.
+//  Standard TPC-H qualification country codes: 13, 31, 23, 29, 30, 18, 17.
+//
+//  Every piece here is something Ibex already had, once `substring` landed:
+//
+//    - cntrycode = substring(c_phone, 0, 2)  -- the last primitive q22 needed,
+//      a 0-based codepoint slice (SPEC 12.6).
+//    - cntrycode in ('13', ...)  -- a literal-list `in`, written as the OR-chain
+//      of equality it lowers to (as q19 does its IN-lists).
+//    - c_acctbal > (select avg(c_acctbal) ...)  -- an UNCORRELATED scalar
+//      subquery (SPEC 5.7): one value, broadcast to every row. Its input is the
+//      in-scope customers with a positive balance, computed before the
+//      balance filter, so `in_scope` is bound once and named twice.
+//    - not exists (orders where o_custkey = c_custkey)  -- a pure equality
+//      correlation, i.e. an ANTI JOIN on c_custkey, exactly as q16 writes its
+//      `not in`. The subquery column is non-null so a plain anti join is exact.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q22.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let customer_raw = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+
+// Customers in the seven target country codes, carrying the derived code.
+let in_scope = customer_raw[update { cntrycode = substring(c_phone, 0, 2) }][
+    filter cntrycode == "13" || cntrycode == "31" || cntrycode == "23"
+        || cntrycode == "29" || cntrycode == "30" || cntrycode == "18" || cntrycode == "17"
+][select { c_custkey, cntrycode, c_acctbal }];
+
+let with_orders = orders_raw[select { c_custkey = o_custkey }];
+
+let result = (
+    in_scope[
+        filter c_acctbal > scalar(
+            in_scope[filter c_acctbal > 0.0, select { avg_balance = mean(c_acctbal) }]
+        )
+    ]
+    anti join with_orders on c_custkey
+)[
+    select { numcust = count(), totacctbal = sum(c_acctbal) },
+    by { cntrycode }
+][
+    order { cntrycode }
+];
+write_csv(result, "benchmarking/data/tpch/out/q22.csv");
+result;

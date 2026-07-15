@@ -2010,6 +2010,24 @@ class ChunkedDistinctOperator final : public Operator {
                 return std::optional<Chunk>{table_to_chunk(std::move(*out))};
             }
 
+            // Fixed-width integral keys with no nulls pack into a single integer,
+            // so a multi-column distinct dedups through a flat typed set with no
+            // per-row Key allocation — the dominant cost on high-cardinality
+            // input, where nearly every row is a new value and the KeyRowIndex
+            // path still heap-builds one owned Key each. Doubles are excluded
+            // (byte equality would split -0.0 from 0.0 and merge NaNs) and so are
+            // categoricals (a code names different values across chunks).
+            if (auto plan = build_packed_key(t); plan.has_value()) {
+                std::optional<Table> out =
+                    plan->width <= sizeof(std::uint64_t)
+                        ? process_packed<std::uint64_t>(std::move(t), plan->cols, seen_packed64_)
+                        : process_packed<UInt128>(std::move(t), plan->cols, seen_packed128_);
+                if (!out.has_value()) {
+                    continue;
+                }
+                return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+            }
+
             const std::size_t rows = t.rows();
 
             // Resolve each key column once for the whole chunk, so the row loop
@@ -2175,6 +2193,115 @@ class ChunkedDistinctOperator final : public Operator {
         return gather_rows(t, idx);
     }
 
+    using UInt128 = __uint128_t;
+    struct U128Hash {
+        auto operator()(UInt128 value) const noexcept -> std::size_t {
+            auto lo = static_cast<std::uint64_t>(value);
+            const auto hi = static_cast<std::uint64_t>(value >> 64);
+            lo ^= hi + 0x9e3779b97f4a7c15ULL + (lo << 6) + (lo >> 2);
+            return static_cast<std::size_t>(lo);
+        }
+    };
+
+    /// One fixed-width integral key column, resolved to its raw storage and the
+    /// bit offset it occupies in the packed key.
+    struct PackCol {
+        enum class Kind : std::uint8_t { Int64, Date, Ts, Bool } kind{Kind::Int64};
+        const std::int64_t* i64 = nullptr;
+        const Date* date = nullptr;
+        const Timestamp* ts = nullptr;
+        const Column<bool>* boolean = nullptr;
+        unsigned shift = 0;  ///< bit offset of this column's cell in the packed key
+    };
+    struct PackedPlan {
+        std::vector<PackCol> cols;
+        unsigned width = 0;  ///< total packed width in bytes
+    };
+
+    /// A key is packable iff every column is a fixed-width INTEGRAL type (byte
+    /// equality equals value equality — so no double, whose -0.0/NaN break that,
+    /// and no categorical, whose code names a different value in a later chunk)
+    /// with no nulls, and the columns together fit in 16 bytes.
+    static auto build_packed_key(const Table& t) -> std::optional<PackedPlan> {
+        PackedPlan plan;
+        plan.cols.reserve(t.columns.size());
+        unsigned bytes = 0;
+        for (const auto& entry : t.columns) {
+            if (entry.validity.has_value()) {
+                return std::nullopt;
+            }
+            PackCol col;
+            col.shift = bytes * 8;
+            const ColumnValue& column = *entry.column;
+            if (const auto* c_int = std::get_if<Column<std::int64_t>>(&column)) {
+                col.kind = PackCol::Kind::Int64;
+                col.i64 = c_int->data();
+                bytes += 8;
+            } else if (const auto* c_date = std::get_if<Column<Date>>(&column)) {
+                col.kind = PackCol::Kind::Date;
+                col.date = c_date->data();
+                bytes += 4;
+            } else if (const auto* c_ts = std::get_if<Column<Timestamp>>(&column)) {
+                col.kind = PackCol::Kind::Ts;
+                col.ts = c_ts->data();
+                bytes += 8;
+            } else if (const auto* c_bool = std::get_if<Column<bool>>(&column)) {
+                col.kind = PackCol::Kind::Bool;
+                col.boolean = c_bool;
+                bytes += 1;
+            } else {
+                return std::nullopt;
+            }
+            if (bytes > sizeof(UInt128)) {
+                return std::nullopt;
+            }
+            plan.cols.push_back(col);
+        }
+        plan.width = bytes;
+        return plan;
+    }
+
+    template <typename Packed, typename Set>
+    auto process_packed(Table t, const std::vector<PackCol>& cols, Set& seen)
+        -> std::optional<Table> {
+        const std::size_t rows = t.rows();
+        std::vector<std::size_t> idx;
+        idx.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            Packed key = 0;
+            for (const auto& col : cols) {
+                std::uint64_t cell = 0;
+                switch (col.kind) {
+                    case PackCol::Kind::Int64:
+                        cell = static_cast<std::uint64_t>(col.i64[row]);
+                        break;
+                    case PackCol::Kind::Date:
+                        cell = static_cast<std::uint32_t>(col.date[row].days);
+                        break;
+                    case PackCol::Kind::Ts:
+                        cell = static_cast<std::uint64_t>(col.ts[row].nanos);
+                        break;
+                    case PackCol::Kind::Bool:
+                        cell = (*col.boolean)[row] ? 1U : 0U;
+                        break;
+                }
+                key |= static_cast<Packed>(cell) << col.shift;
+            }
+            if (seen.insert(key).second) {
+                idx.push_back(row);
+            }
+        }
+        if (idx.empty()) {
+            return std::nullopt;
+        }
+        t.ordering.reset();
+        t.time_index.reset();
+        if (idx.size() == rows) {
+            return t;
+        }
+        return gather_rows(t, idx);
+    }
+
     auto process_single_column(Table t) -> std::optional<Table> {
         const ColumnValue& column = *t.columns.front().column;
         if (const auto* col = std::get_if<Column<std::int64_t>>(&column)) {
@@ -2208,6 +2335,8 @@ class ChunkedDistinctOperator final : public Operator {
     // can't resolve — it boxes a Key per row, which is what this replaced.
     KeyRowIndex key_index_;
     std::vector<Key> group_order_;
+    robin_hood::unordered_flat_set<std::uint64_t> seen_packed64_;
+    robin_hood::unordered_flat_set<UInt128, U128Hash> seen_packed128_;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     robin_hood::unordered_flat_set<std::int64_t> seen_i64_;
     robin_hood::unordered_flat_set<double> seen_f64_;

@@ -457,6 +457,50 @@ TEST_CASE("Interpret multi-column distinct keeps a null key distinct from a real
     REQUIRE(prices[2] == 10);
 }
 
+TEST_CASE("Interpret packed multi-column distinct dedups fixed-width integral keys") {
+    // Two int64 keys pack into 16 bytes (the uint128 path). Negative and large
+    // values must stay distinct, and a repeated pair must collapse.
+    SECTION("two int64 columns, including negatives and a duplicate") {
+        runtime::Table table;
+        table.add_column("a", Column<std::int64_t>{1, 1, -1, 1, 9223372036854775807LL, -1});
+        table.add_column("b", Column<std::int64_t>{2, 3, 2, 2, 0, 2});
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(table));
+
+        auto ir = require_ir("t[distinct { a, b }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        // (1,2) (1,3) (-1,2) (1,2)dup (max,0) (-1,2)dup -> 4 distinct.
+        REQUIRE(result->rows() == 4);
+        const auto& a = std::get<Column<std::int64_t>>(*result->find_entry("a")->column);
+        const auto& b = std::get<Column<std::int64_t>>(*result->find_entry("b")->column);
+        REQUIRE(a[0] == 1);
+        REQUIRE(b[0] == 2);
+        REQUIRE(a[1] == 1);
+        REQUIRE(b[1] == 3);
+        REQUIRE(a[2] == -1);
+        REQUIRE(b[2] == 2);
+        REQUIRE(a[3] == 9223372036854775807LL);
+        REQUIRE(b[3] == 0);
+    }
+
+    // Date + bool = 5 bytes (the uint64 path), a different width tier and mixed
+    // integral types.
+    SECTION("date and bool columns") {
+        runtime::Table table;
+        table.add_column("d", Column<Date>{Date{100}, Date{100}, Date{200}, Date{100}});
+        table.add_column("flag", Column<bool>{true, false, true, true});
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(table));
+
+        auto ir = require_ir("t[distinct { d, flag }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        // (100,T) (100,F) (200,T) (100,T)dup -> 3 distinct.
+        REQUIRE(result->rows() == 3);
+    }
+}
+
 TEST_CASE("Interpret order") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{20, 10, 20});

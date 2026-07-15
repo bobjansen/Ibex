@@ -1,0 +1,66 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  PDS-H / TPC-H Q21 — Suppliers Who Kept Orders Waiting
+//
+//  Suppliers in a nation who were the sole reason a multi-supplier order shipped
+//  late: their own line arrived after its commit date, and no other supplier on
+//  that order was also late. Standard TPC-H qualification: NATION='SAUDI ARABIA'.
+//
+//  The SQL correlates two subqueries on an INEQUALITY (l_suppkey <> l1.l_suppkey),
+//  which a semi join cannot express directly. But q21 has the standard set-based
+//  rewrite that turns both into per-order distinct-supplier counts — the same
+//  distinct+count pattern q16 uses — so it needs no `exists` syntax and no
+//  row-identity primitive:
+//
+//    - `exists (l2 … l_suppkey <> l1.l_suppkey)` — "another supplier is on this
+//      order" — holds iff the order has MORE THAN ONE distinct supplier.
+//    - `not exists (l3 … different supplier AND late)` — "no other supplier was
+//      also late" — holds iff the order has EXACTLY ONE distinct late supplier,
+//      which must be l1's own (l1 is late by the outer filter).
+//
+//  l1 stays at line granularity (one row per late line), so count(*) counts
+//  waiting lines, matching the SQL. `li_F` is bound once and reused three times.
+//
+//  Run:
+//    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
+//        benchmarking/tpch/queries/q21.ibex
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
+
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+
+// Lines belonging to status-F orders.
+let orders_F = orders_raw[filter o_orderstatus == "F"][select { l_orderkey = o_orderkey }];
+let li_F = lineitem_raw[select { l_orderkey, l_suppkey, l_receiptdate, l_commitdate }]
+    semi join orders_F on l_orderkey;
+
+// exists (another supplier on the order)  ==  order has >1 distinct supplier.
+let n_sup = li_F[distinct { l_orderkey, l_suppkey }][select { n_sup = count() }, by { l_orderkey }];
+
+// not exists (another LATE supplier)  ==  order has exactly 1 distinct late supplier.
+let n_late = li_F[filter l_receiptdate > l_commitdate][distinct { l_orderkey, l_suppkey }][
+    select { n_late = count() }, by { l_orderkey }];
+
+// l1 = the late lines themselves (one row per line, not deduplicated).
+let l1 = li_F[filter l_receiptdate > l_commitdate][select { l_orderkey, l_suppkey }];
+
+let qualifying = ((l1 join n_sup on l_orderkey)[filter n_sup > 1]
+    join n_late on l_orderkey)[filter n_late == 1][select { l_suppkey }];
+
+let result = (
+    (qualifying join supplier_raw[select { l_suppkey = s_suppkey, s_name, s_nationkey }] on l_suppkey)
+    join nation_raw[filter n_name == "SAUDI ARABIA"][select { s_nationkey = n_nationkey }]
+        on s_nationkey
+)[
+    select { numwait = count() },
+    by { s_name }
+][
+    order { numwait desc, s_name },
+    head 100
+];
+write_csv(result, "benchmarking/data/tpch/out/q21.csv");
+result;

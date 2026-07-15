@@ -1,82 +1,49 @@
-# Proposed subquery syntax — TPC-H syntax experiment
+# Subquery queries — experiment complete
 
-These files are deliberately **not executable Ibex yet**.  They are a design
-exercise for the TPC-H queries that need a subquery, using the official SF-1
-qualification parameters from `benchmarking/data/tpch/dbgen/queries/`.
+This directory held drafts of the TPC-H queries that use a subquery, written
+against the official SF-1 qualification parameters. **Every one has shipped to
+`../` and passes the official answer check.** The drafts are gone; this note is
+the retrospective.
 
-**Shipped:** the *correlated* scalar aggregate — `scalar(...)` with an
-`outer(...)` capture — is implemented and specified (SPEC 5.7).  Q2 and Q17 moved
-out of this directory.
+## The conclusion: almost no new *syntax* was needed
 
-**Q4 also moved out, and it needed no new syntax at all.**  An equality-correlated
-`exists` *is* a semi join, and `not exists` *is* an anti join — both of which Ibex
-has always had.  `exists` is therefore an ergonomic feature, not a capability one:
-it buys readability, plus exactly one shape a semi join cannot express (Q21's
-correlated *inequality*, `l2.l_suppkey <> l1.l_suppkey`, where a semi join on the
-order key alone is vacuously true because every row matches itself).  See
-`plans/exists-subquery-plan.md`.
+Nine queries were thought to be blocked on subquery syntax. Building them turned
+up something better — most were blocked on nothing, and the rest on two small,
+general primitives, not on subquery syntax at all:
 
-Note that the drafts here take liberties the real language does not:
-`on p_partkey == ps_partkey` is a theta join (a nested loop), so the shipped
-queries rename keys to a shared name and join on that, and a `[...]` block binds
-to the operand immediately left of it, so a join chain needs parentheses before
-its clauses.  Read the drafts for intent, not for syntax.
+| Query | What it actually needed |
+|---|---|
+| Q2, Q17 | **Correlated scalar subquery** (`scalar(...)` + `outer(...)`) — built (SPEC 5.7). |
+| Q11 | **Uncorrelated scalar subquery** — the same feature with no capture (a cross join). |
+| Q20 | The correlated scalar (composite capture) + two `in`s, each a plain **semi join**. |
+| Q22 | **`substring`** (built, SPEC 12.6) + an uncorrelated scalar + a `not exists` as an **anti join**. |
+| Q4 | Nothing — an equality `exists` **is** a semi join. |
+| Q16, Q18 | Nothing — an `in` / `not in` against a fixed set **is** a semi / anti join. |
+| Q21 | Nothing — its inequality-correlated `exists` / `not exists` rewrites to per-order **distinct-supplier counts** (the same distinct+count as Q16). |
 
-The remaining proposed additions are intentionally small:
+So the whole "subquery syntax" project reduced to two engine features — the
+correlated scalar subquery and `substring` — plus the realisation that `exists`,
+`not exists`, and `in` over a computed set are semi/anti joins that Ibex already
+had. The queries read a little further from their SQL than they would with the
+sugar, but they run, and correctly.
 
-```ibex
-// A boolean subquery term.  Sugar for a semi/anti join in the common case;
-// genuinely new only for a correlated inequality (Q21).
-exists (lineitem[filter l_orderkey == outer(o_orderkey)])
-!exists (orders[filter o_custkey == outer(c_custkey)])
+## What is still only a proposal (and needs no query)
 
-// Membership against a one-column table expression — a SEMI JOIN, not a scalar
-// (`plans/in-subquery-plan.md`).  `not in` is an ANTI join, but a null-aware
-// one: a plain anti join is only exact when the subquery column is non-nullable,
-// which is why Q16 could ship its `not in` as one (s_suppkey is a primary key).
-ps_suppkey in (supplier[select { s_suppkey }])
-```
+Two design docs survive, both for *ergonomics*, since no remaining query needs
+them:
 
-The uncorrelated `scalar` needed for Q11 now works, and Q11 has moved out of
-this directory.
+- `plans/exists-subquery-plan.md` — `exists` / `not exists` as first-class terms.
+  Zero new queries: the equality cases are semi/anti joins, and Q21's inequality
+  case has the distinct-count rewrite above. A *generic* inequality-correlated
+  `exists` (Tier 3) would still want a `row_number()` Ibex lacks, but no TPC-H
+  query forces it.
+- `plans/in-subquery-plan.md` — `in` / `not in` as first-class terms. The one
+  genuinely new operator it proposes is a **null-aware anti join** (a plain anti
+  join is only exact when the subquery column is non-null — which is why Q16 and
+  Q22 could use one). No current query needs it.
 
-**Q22 has also moved out.**  `substring` was its last missing primitive (added
-0-based and codepoint-aware, following Polars `str.slice`); everything else was
-already here — the country-code `in` as an OR-chain, the balance threshold as an
-uncorrelated `scalar`, and the `not exists` as an anti join (a plain one is exact
-because o_custkey is non-null).  The `prefix` the draft invented was never needed:
-`prefix(s, n)` is just `substring(s, 0, n)`.
+## Not yet written (and not subquery-related)
 
-**Q18 has also moved out**, shipped exactly the way it is described above — its
-uncorrelated positive `in` written as the plain semi join it reduces to, no `in`
-syntax required, just as Q04's `exists` shipped as a semi join.  The `in` feature
-would only make it read closer to the SQL.
-
-Ranked by queries unblocked per unit of work: `in` / `not in` (Q20, and the
-readability of Q18) come before `exists` (0 new queries — an equality `exists` is
-already a semi join).  Q20 uses only uncorrelated positive `in`s, so like Q18 it
-is expressible today; its blocker is the intricacy of assembling three nested
-subqueries by hand, not a missing primitive.  The null-aware anti join buys
-correctness for a general `not in`, which no remaining query needs.
-
-`outer(...)` is explicit by design: it makes the correlation boundary visible,
-allows an inner column to shadow an outer column, and avoids guessing which
-scope an unqualified column belongs to.  Ordinary `let` bindings remain the
-names of tables; aliases are deliberately not required for this first design.
-Even Q21's repeated `lineitem` scan is unambiguous because every nested
-subquery has its own lexical scope.
-
-Each draft keeps the normal Ibex bracket clauses and uses `scalar(...)` only
-where SQL requires a scalar subquery.  The following unrelated gap is left
-spelled as a proposed call so the corpus shows the full remaining scope:
-
-- `prefix(text, n)` in Q22.
-
-Neither is part of the correlated-subquery feature.
-
-The intended lowering is: `exists`/`not exists` to semi/anti joins;
-correlated aggregate scalars to an aggregate by captured key followed by a
-join; and an uncorrelated `scalar` to a one-time value.  A nested-loop Apply
-operator is not the target execution plan.  Reusing a `let`-bound table inside
-a subquery (as Q17 does) denotes the same source/materialization; decorrelation
-must not turn that reuse into another I/O read.
+Q7, Q8, Q12, Q14, Q15 are absent from the corpus, but none of them uses a
+subquery — they are ordinary join/aggregate queries that simply have not been
+transcribed yet.

@@ -252,6 +252,13 @@ class ExternRegistry;
                              const ExternRegistry* externs = nullptr,
                              ModelResult* model_out = nullptr) -> std::expected<Table, std::string>;
 
+/// Invoke an extern whose first argument is a table. The scalar result, if
+/// any, is intentionally discarded: this API is the execution seam for
+/// top-level script effects such as write_csv and write_parquet.
+[[nodiscard]] auto invoke_table_consumer(const ExternRegistry& externs, const std::string& callee,
+                                         const Table& input, const std::vector<ScalarValue>& args)
+    -> std::expected<void, std::string>;
+
 /// Evaluate row-local filter conjuncts and return the surviving row indices in
 /// ascending order. Null predicate values do not survive (the same three-valued
 /// logic used by a Filter node). This is the seam used by deferred file readers

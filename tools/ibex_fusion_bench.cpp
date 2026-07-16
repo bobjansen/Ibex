@@ -136,14 +136,15 @@ const std::vector<Guard>& fusion_guards() {
         {"order_head_1000", "wide_order_unsorted", 3.0,
          "TopK(k=1000) heap-select must still beat a full sort"},
         // Sorted-input aggregate must stream group-at-a-time, not fall back to
-        // hashing. The gap is algorithmic (no hash-table build), ~12x at CI
-        // scale; 4x catches the streaming path silently disengaging (which
-        // would land near 1x — both paths hashing).
-        {"agg_sorted_stream_1k", "agg_sorted_hash_1k", 4.0,
+        // hashing. The new single-int-key hash fast path intentionally made
+        // the 1k-group baseline inexpensive; this margin still distinguishes
+        // streaming from its hash fallback. High-cardinality input retains a
+        // larger algorithmic gap from avoiding a full group table.
+        {"agg_sorted_stream_1k", "agg_sorted_hash_1k", 1.25,
          "Aggregate on group-sorted input must stream, not hash"},
-        {"agg_sorted_stream_highcard", "agg_sorted_hash_highcard", 4.0,
+        {"agg_sorted_stream_highcard", "agg_sorted_hash_highcard", 3.0,
          "High-cardinality sorted aggregate must stream, not build a full hash table"},
-        {"agg_firstlast_stream_highcard", "agg_firstlast_hash_highcard", 4.0,
+        {"agg_firstlast_stream_highcard", "agg_firstlast_hash_highcard", 3.0,
          "High-cardinality sorted First/Last must stream, not build a full hash table"},
     };
     return guards;

@@ -11,8 +11,18 @@ matching Polars' own PDS-H "cached" methodology -- each iteration still
 scans the Parquet file, just from a warm page cache rather than warm/reused
 in-memory tables).
 
+Two timing modes:
+  default        -- each query body is split into statements piped one at a
+                    time; a query's time is the sum of its per-statement
+                    `time:` lines. Good for stage breakdowns, but the REPL's
+                    whole-script batch planner never engages.
+  --whole-script -- each query is ONE `:run <file>` of the query file (minus
+                    its write_csv sink) in the warm REPL, so the batch planner
+                    (source hoisting, whole-plan pushdown, join rewrites)
+                    executes it the way `ibex file.ibex` would.
+
 Usage:
-  uv run benchmarking/tpch/bench_ibex.py [--warmup N] [--iters N] [--out path]
+  uv run benchmarking/tpch/bench_ibex.py [--whole-script] [--warmup N] [--iters N] [--out path]
 """
 import argparse
 import pathlib
@@ -20,6 +30,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 IBEX_ROOT = SCRIPT_DIR.parent.parent
@@ -89,12 +100,8 @@ def extract_setup_and_body(qname: str) -> tuple[str, str, int]:
     return "\n".join(setup), "\n".join(body_statements) + "\n", len(body_statements)
 
 
-def run_query(qname: str, warmup: int, iters: int) -> list[float]:
-    setup, body, n_statements = extract_setup_and_body(qname)
-    script_parts = [setup, ":timing on"]
-    script_parts.extend([body] * (warmup + iters))
-    script = "\n".join(script_parts) + "\n:quit\n"
-
+def run_repl_script(qname: str, script: str) -> list[float]:
+    """Drive the warm REPL with `script` and return every `time:` line in ms."""
     proc = subprocess.run(
         [str(IBEX_BIN), "--plugin-path", str(PLUGIN_DIR)],
         input=script,
@@ -105,13 +112,21 @@ def run_query(qname: str, warmup: int, iters: int) -> list[float]:
     )
     if proc.returncode != 0:
         raise RuntimeError(f"{qname}: ibex REPL failed (exit {proc.returncode}):\n{proc.stderr}")
+    return [to_ms(float(m.group(1)), m.group(2)) for m in map(TIME_RE.match, proc.stdout.splitlines()) if m]
 
-    times_ms = [to_ms(float(m.group(1)), m.group(2)) for m in map(TIME_RE.match, proc.stdout.splitlines()) if m]
+
+def run_query(qname: str, warmup: int, iters: int) -> list[float]:
+    setup, body, n_statements = extract_setup_and_body(qname)
+    script_parts = [setup, ":timing on"]
+    script_parts.extend([body] * (warmup + iters))
+    script = "\n".join(script_parts) + "\n:quit\n"
+
+    times_ms = run_repl_script(qname, script)
     expected = n_statements * (warmup + iters)
     if len(times_ms) != expected:
         raise RuntimeError(
             f"{qname}: expected {expected} timing lines ({n_statements} stmts x "
-            f"{warmup + iters} runs), got {len(times_ms)}. REPL stdout:\n{proc.stdout}"
+            f"{warmup + iters} runs), got {len(times_ms)}"
         )
 
     # Sum each iteration's per-statement timings into one total, drop warmup.
@@ -120,6 +135,27 @@ def run_query(qname: str, warmup: int, iters: int) -> list[float]:
         for i in range(warmup + iters)
     ]
     return per_iter[warmup:]
+
+
+def run_query_whole_script(qname: str, warmup: int, iters: int, tmpdir: pathlib.Path) -> list[float]:
+    """Time the query as ONE :run of the whole file (minus its write_csv sink),
+    so the REPL's batch planner sees the complete script: source hoisting,
+    whole-plan projection/selection pushdown, and join rewrites all engage,
+    exactly as they would for `ibex file.ibex`. One `time:` line per run.
+    """
+    text = (QUERIES_DIR / f"{qname}.ibex").read_text()
+    lines = [line for line in text.splitlines() if not line.strip().startswith("write_csv(")]
+    script_path = tmpdir / f"{qname}_whole.ibex"
+    script_path.write_text("\n".join(lines) + "\n")
+
+    runs = warmup + iters
+    script = "\n".join([":timing on"] + [f":run {script_path}"] * runs) + "\n:quit\n"
+    times_ms = run_repl_script(qname, script)
+    if len(times_ms) != runs:
+        raise RuntimeError(
+            f"{qname}: expected {runs} timing lines (1 per :run), got {len(times_ms)}"
+        )
+    return times_ms[warmup:]
 
 
 def percentile(data: list[float], p: float) -> float:
@@ -133,7 +169,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=5)
-    parser.add_argument("--out", default=str(SCRIPT_DIR / "results" / "ibex.tsv"))
+    parser.add_argument("--out", default=None)
+    parser.add_argument(
+        "--whole-script", action="store_true",
+        help="time each query as one :run of the whole file through the batch "
+             "planner, instead of summing per-statement timings")
     parser.add_argument('queries', nargs='*')
     args = parser.parse_args()
 
@@ -141,13 +181,22 @@ def main() -> int:
         print(f"error: {IBEX_BIN} not found — run cmake --build build-release first", file=sys.stderr)
         return 1
 
-    out_path = pathlib.Path(args.out)
+    default_name = "ibex_whole_script.tsv" if args.whole_script else "ibex.tsv"
+    out_path = pathlib.Path(args.out) if args.out else SCRIPT_DIR / "results" / default_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmpdir = None
+    if args.whole_script:
+        tmpdir_handle = tempfile.TemporaryDirectory(prefix="ibex_ws_")
+        tmpdir = pathlib.Path(tmpdir_handle.name)
 
     rows = []
     for qname in args.queries or QUERY_NAMES:
         print(f"=== ibex {qname} ===", file=sys.stderr)
-        durations = run_query(qname, args.warmup, args.iters)
+        if args.whole_script:
+            durations = run_query_whole_script(qname, args.warmup, args.iters, tmpdir)
+        else:
+            durations = run_query(qname, args.warmup, args.iters)
         avg_ms = statistics.mean(durations)
         print(f"  avg={avg_ms:.2f}ms min={min(durations):.2f}ms max={max(durations):.2f}ms", file=sys.stderr)
         rows.append({

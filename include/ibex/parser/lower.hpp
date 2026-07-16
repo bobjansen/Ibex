@@ -31,8 +31,21 @@ struct ScriptSink {
     std::optional<std::string> input_binding;
 };
 
+/// A `let` binding whose plan the executor materializes exactly once, in
+/// declaration order, before any sink or result plan runs. Chosen by the
+/// lowerer when a binding is referenced from several table positions and its
+/// subtree contains real computation (a join, aggregate, sort, …): cloning
+/// such a subtree per reference would re-run that computation per consumer.
+/// References to the binding lower to a Scan of its name; the executor must
+/// place the materialized table in the registry under that name.
+struct SharedBinding {
+    std::string name;
+    ir::NodePtr plan;
+};
+
 struct ScriptPlan {
     std::vector<ir::NodePtr> preamble;
+    std::vector<SharedBinding> shared_bindings;
     std::vector<ScriptSink> sinks;
     ir::NodePtr result;
     /// Set when the final expression is a simple identifier.

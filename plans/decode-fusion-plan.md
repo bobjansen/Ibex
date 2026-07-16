@@ -1,0 +1,225 @@
+# Fusing whole-script optimization with decoding
+
+Status: Stages 1–3 IMPLEMENTED 2026-07-16 (uncommitted); Stage 4 not started.
+See "Implementation notes" at the bottom for what landed and what the
+whole-script benchmark mode now measures.
+Goal: no field is decoded (or materialized) unless it participates in the
+result — driven by the whole-script plan, not by how the query author split
+statements.
+
+## Where things actually stand (verified 2026-07-16)
+
+The mechanism the goal needs already exists. `try_execute_whole_script`
+(`src/repl/repl.cpp:4228`) lowers an eligible script into relational plans,
+runs `ir::required_columns` + `ir::scan_predicates` over the *complete* DAG,
+and materializes each lazy source through `LazyTable::project` /
+`project_where` with only the demanded columns. 21 of the 22 PDS-H queries
+are eligible (q16 uses `import`, which the gate declines).
+
+Correctness is now validated end to end:
+
+- All 22 queries produce **byte-identical CSVs** on the statement path vs the
+  batch path, pinned to `parquet_sf1` (an earlier apparent q07/q08/q21
+  divergence was the `benchmarking/data/tpch/parquet` symlink being flipped
+  to a different scale factor mid-comparison — see gotcha below).
+- `check_answers.py` (which drives `ibex_eval` → batch path): 22/22 OK on SF-1.
+
+What the batch path buys today, measured: a *naturally written* q03-style
+query (filter in its own `let`, no hand-written `select` after the scan) runs
+**0.25s / 258MB** through the batch planner vs **1.1s / 908MB**
+statement-at-a-time (SF-2 lineitem). The statement path decodes all 16
+lineitem columns because each statement's root demand is "all"; the batch
+path decodes 3.
+
+But three gaps keep this from being the benchmark story:
+
+### Gap 1 — the benchmark never exercises the batch planner
+
+`bench_ibex.py` splits each query into statements and pipes them one at a
+time into the REPL (`:timing on`), summing per-statement times. The batch
+planner only engages on whole-file execution (`ibex file.ibex`, `ibex_eval`).
+The queries compensate by hand-fusing scan+filter+select into single
+statements — the author is doing the optimizer's job, and every future query
+must be hand-tuned the same way or silently decode the world.
+
+### Gap 2 — predicate-only columns are still gathered and materialized
+
+Both drivers compute `required_columns` **before**
+`remove_applied_scan_filters` (statement path `src/repl/repl.cpp:3283`, batch
+path `:4302`). So a column referenced only by a pushed-down filter is in
+`names`, and `project_where` (`src/runtime/lazy_table.cpp:132`) gathers it
+row-by-row into the scan output — which the very next Project drops.
+
+The full-column decode of predicate columns is unavoidable (the selection
+needs them); the *gather + materialization* is pure waste:
+
+- q03: `l_shipdate` gathered for 3.2M survivors (SF-1)
+- q13: `o_comment` — a ~49-byte string column gathered for ~1.45M survivors
+- q10: `l_returnflag`; q06: `l_quantity` + `l_shipdate`; q19: several
+
+### Gap 3 — multi-scan sources lose pushdown in batch mode
+
+`scan_predicates` erases any source scanned more than once in the plan
+(`src/ir/scan_predicates.cpp:201`, `scan_counts != 1`). Statement-at-a-time
+rarely hits this (each statement scans once); a whole-script plan hits it
+whenever a file is read twice — q07 (nation ×2), q15/q20/q21 (lineitem ×2,
+`lower()` clones bound IR per reference). Measured pinned to SF-1
+(min-of-3, whole process incl. ~0.1s startup):
+
+| query | stmt path | batch path |
+|---|---:|---:|
+| q15 | 0.06s | 0.12s |
+| q21 | 0.81s | 0.90s |
+| q07 | 0.31s | 0.33s |
+| q03 (control, single-scan) | 0.14s | 0.15s |
+
+So today the batch path is parity-or-mildly-worse on the hand-tuned suite.
+Its wins only appear on queries nobody hand-tuned.
+
+## Plan
+
+### Stage 1 — stop materializing predicate-only columns (small, both paths)
+
+Reorder both drivers: extract `scan_predicates`, decide which lazy sources
+get pushed conjuncts, `remove_applied_scan_filters` from the plan, **then**
+compute `required_columns` on the reduced plan and pass those names to
+`project_where`. `project_where` already handles names that exclude predicate
+columns — the predicate table is decoded for the selection either way; the
+output loop simply stops gathering non-demanded ones.
+
+Also fix while there: batch path `project_where` call (`repl.cpp:4318`)
+doesn't pass `&scalars`; the statement path (`:3299`) does.
+
+Measure: q03/q06/q10/q13/q19 scan statements, isolated (whole-query PDS-H
+numbers cannot see decoder-scale changes — repeat spread swamps them).
+
+### Stage 2 — per-scan predicate identity (unblocks de-hand-tuning)
+
+Key `scan_predicates` (and the driver's materialization) by scan *instance*
+(node id), not source name, so two scans of one file each get their own
+conjuncts and demanded columns. Driver materializes one table per scan
+instance (unique registry binding + rewritten scan name), sharing the
+`LazyTable` so unfiltered column decodes still hit the cache once.
+
+Adjacent cheap win: `project_where` currently never caches the full-column
+predicate decode it does (`lazy_table.cpp:81`); when selection is computed
+from a whole-file decode, insert those columns into `cache_` — a second scan
+of the same file reuses them.
+
+This removes the q15/q21 batch regressions and is the prerequisite for
+writing queries naturally (no hand-fused scan-filter-select statements).
+
+### Stage 3 — make the benchmark measure whole-script execution
+
+Add a REPL command (e.g. `:run <file>`) that executes a file through
+`try_execute_whole_script` in the warm process and reports one `:timing`
+line for the whole script; give `bench_ibex.py` a `--whole-script` mode that
+uses it. Keep the per-statement mode for stage breakdowns. Then queries can
+be written naturally and the planner's decode decisions show up in the
+numbers Polars is compared against.
+
+(Whole-file `ibex_eval` per iteration is not an alternative: ~0.2s
+Arrow/AWS-SDK dlopen noise per run.)
+
+### Stage 4 — push conjuncts into the decoder (the big one)
+
+Today the seam is `ColumnDecodeFn(names, selection)`
+(`include/ibex/runtime/lazy_table.hpp:23`): `project_where` fully decodes
+predicate columns, computes a selection in the runtime, then decodes the
+rest per-value through Arrow `ReadBatch`/`Skip` glue — measured at ~44% of
+q03's scan statement (see `plans/filtered-scan-and-groupby-plan.md`,
+finding 1; per-row-group experiments in
+`plans/parquet-filtering-scan-observations.md`).
+
+Extend the seam to a request struct — demanded columns **plus the pushed
+conjuncts** — so the parquet plugin can, per row group:
+
+1. prune the whole group on min/max statistics before any decode,
+2. dense-decode predicate columns, evaluate the selection in-block,
+3. dense-decode remaining columns and gather survivors inside the decoder
+   (never materializing predicate-only columns at all — subsumes Stage 1
+   for the parquet source).
+
+This folds the already-diagnosed "direct per-row-group decode +
+selection-aware late materialization are ONE work item" conclusion into the
+plan-driven seam. Known traps, all previously hit: `ColumnDecodeFn` is
+plugin ABI (rebuild the .so in lockstep); Arrow `Skip()` decodes partial-page
+gaps (dense decode + gather, never Skip, for scattered selections); the
+LazyTable cache must not be poisoned by filtered decodes; conjunct
+evaluation needs the same semantics as `filter_selection` (fused same-column
+range passes — `src/runtime/filter.cpp`).
+
+### Stage 5 (horizon) — late materialization across joins
+
+The planner knows join selectivities (cardinality estimates landed with the
+whole-script arc). Decode join keys + predicate columns first, probe, then
+decode payload columns only for join survivors. Requires scan operators that
+hold the `LazyTable` and accept a selection at execution time rather than
+materializing up front. Don't start until Stage 4's per-row-group machinery
+exists — it's the same gather path.
+
+## Implementation notes (2026-07-16)
+
+Stages 1–3 landed together; 1,147 Release tests pass, `check_answers.py`
+22/22 OK, and all 22 queries stay byte-identical on both paths pinned to
+`parquet_sf1`.
+
+- **Stage 1**: both drivers now run `scan_predicates` →
+  `remove_applied_scan_filters` → `required_columns`, in that order, so
+  predicate-only columns are decoded for the selection but never gathered
+  into the scan output. The batch path's missing `&scalars` turned out to be
+  correct-by-construction (batch-eligible scripts cannot bind scalars —
+  documented in a comment instead of "fixed").
+- **Stage 2**: `ir::split_scan_instances` (in `scan_predicates.{hpp,cpp}`)
+  renames each scan of a multi-scanned lazy source to `name#k`; both drivers
+  materialize per instance and resolve instances back to the shared
+  `LazyTable`. `project_where` now caches its whole-file predicate decodes
+  (they are legitimate whole-column cache entries) and reuses cached whole
+  columns for predicates. Inline self-joins of a lazy source work through
+  the statement path too. q15 batch improved 0.12s → 0.08s.
+- **Stage 3**: REPL `:run <file>` executes a file exactly like
+  `ibex file.ibex` (batch planner, fresh scope, one `:timing` line);
+  `bench_ibex.py --whole-script` drives it (query file minus its `write_csv`
+  sink) and writes `results/ibex_whole_script.tsv`.
+
+**What the new mode measures (SF-1, warmup 1 / iters 5, serial — treat
+small deltas as drift per the interleaved-methodology note):** whole-script
+vs statement mode is at parity on single-reference queries, and slower
+exactly where `lower()` clones a shared `let` binding per reference:
+q21 785 vs 617ms (li_F consumed 3×), q15 72 vs 46ms, q11 38 vs 22ms,
+q22 68 vs 49ms, q14 65 vs 52ms, q02 73 vs 64ms.
+
+**Shared subplan materialization — DONE 2026-07-16.** The lowerer counts
+table-position references per binding in an AST pre-pass
+(`count_table_refs`, lower.cpp); a binding bound once, referenced ≥2×, whose
+lowered plan `contains_expensive_node` (join/aggregate/distinct/order/
+update/window/reshape — NOT plain scan/filter/project, which stay inlined so
+each consumer keeps its own pushdown) is moved to
+`ScriptPlan::shared_bindings` instead of `bindings_`; later references then
+miss `bindings_` and lower to `Scan(name)` via the existing fallback. The
+batch executor materializes each shared plan once, in declaration order,
+into a base registry every sink/result `evaluate()` copies from; shared
+tables contribute exact schemas and row counts to the join-rewrite passes.
+Sink-arg and bare-final references are deliberately not counted — the
+executor's `cached_bindings` already dedups those.
+
+Measured SF-2, whole-script vs statement mode (back-to-back pairs on a
+drifty box): q11 +70%→+0.6%, q15 +55%→+2%, q22 +40%→**faster** (92 vs
+98ms — the shared `substring` update runs once), q21 +27%→**faster** (1336
+vs 1450ms), q14/q02 → parity. Whole-script mode is now parity-or-better
+than hand-tuned statement mode on every query measured. Cross-boundary
+column pruning (main plan demanding fewer of a shared binding's output
+columns) is still v2 — shared plans materialize their full output schema.
+
+## Gotchas for whoever picks this up
+
+- `benchmarking/data/tpch/parquet` is a **symlink** flipped by
+  `run_bench.sh --sf N`. Any A/B comparison must pin explicit
+  `parquet_sf<N>/` paths — a mid-run flip produced convincing-looking fake
+  divergences during this analysis. `check_answers.py` is only meaningful
+  with the symlink at `parquet_sf1`.
+- The REPL's multiline reader chokes on some query files piped raw; reflow
+  through `bench_ibex.split_top_level_statements` (one statement per line)
+  when emulating the harness.
+- Post-commit perf hook: check `pgrep -af 'perf|ibex|ninja'` before trusting
+  any measurement.

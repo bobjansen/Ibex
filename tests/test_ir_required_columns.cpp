@@ -264,6 +264,53 @@ TEST_CASE("scan_predicates: removes a fully applied fused filter while retaining
     REQUIRE(rewritten->children().front()->kind() == ir::NodeKind::Scan);
 }
 
+TEST_CASE("split_scan_instances: repeated scans get per-instance identity",
+          "[ir][scan_predicates]") {
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
+                                               std::vector<std::string>{"id"});
+    join->add_child(
+        with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")), make_scan("t")));
+    join->add_child(with_child(std::make_unique<ir::FilterNode>(ir::NodeId{4}, gt_zero("b")),
+                               std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t")));
+
+    auto split = ir::split_scan_instances(std::move(join), {"t"});
+    REQUIRE(split.instances == std::map<std::string, std::string>{{"t#1", "t"}, {"t#2", "t"}});
+
+    // With per-instance identity, each scan's filter becomes pushable, and
+    // demand is tracked per scan.
+    auto predicates = ir::scan_predicates(*split.plan);
+    REQUIRE(predicates.contains("t#1"));
+    REQUIRE(predicates.contains("t#2"));
+    CHECK(predicates.at("t#1").size() == 1);
+    CHECK(predicates.at("t#2").size() == 1);
+
+    auto demand = ir::required_columns(*split.plan);
+    REQUIRE(demand.contains("t#1"));
+    REQUIRE(demand.contains("t#2"));
+}
+
+TEST_CASE("split_scan_instances: a source scanned once keeps its name", "[ir][scan_predicates]") {
+    auto plan =
+        with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")), make_scan("t"));
+
+    auto split = ir::split_scan_instances(std::move(plan), {"t"});
+    CHECK(split.instances.empty());
+    REQUIRE(ir::scan_predicates(*split.plan).contains("t"));
+}
+
+TEST_CASE("split_scan_instances: only named sources are split", "[ir][scan_predicates]") {
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
+                                               std::vector<std::string>{"id"});
+    join->add_child(make_scan("t"));
+    join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t"));
+
+    // `t` is not offered for splitting (it is not a lazy source), so the plan
+    // is untouched.
+    auto split = ir::split_scan_instances(std::move(join), {"other"});
+    CHECK(split.instances.empty());
+    CHECK_FALSE(ir::scan_predicates(*split.plan).contains("t"));
+}
+
 TEST_CASE("scan_predicates: does not remove a non-local filter", "[ir][scan_predicates]") {
     ir::CallExpr lag;
     lag.callee = "lag";

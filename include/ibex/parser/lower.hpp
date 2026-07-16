@@ -7,6 +7,7 @@
 #include <expected>
 #include <robin_hood.h>
 #include <string>
+#include <vector>
 
 namespace ibex::parser {
 
@@ -15,6 +16,24 @@ struct LowerError {
 };
 
 using LowerResult = std::expected<ir::NodePtr, LowerError>;
+
+/// A table-consuming top-level effect separated from the relational DAG it
+/// consumes.  Keeping this out of ProgramNode is essential for whole-script
+/// planning: the input can be optimized with the rest of the script before
+/// the executor schedules the sink in source order.
+struct ScriptSink {
+    std::string callee;
+    ir::NodePtr input;
+    std::vector<ir::Expr> args;
+};
+
+struct ScriptPlan {
+    std::vector<ir::NodePtr> preamble;
+    std::vector<ScriptSink> sinks;
+    ir::NodePtr result;
+};
+
+using ScriptPlanResult = std::expected<ScriptPlan, LowerError>;
 
 struct LowerContext {
     robin_hood::unordered_map<std::string, ir::NodePtr> bindings;
@@ -50,6 +69,12 @@ struct LowerContext {
 /// Lower a parsed Program into an IR node tree.
 /// Returns the IR for the last expression statement.
 [[nodiscard]] auto lower(const Program& program) -> LowerResult;
+
+/// Lower a complete script while preserving table-consuming extern calls as
+/// explicit effects instead of forcing them into the relational result tree.
+/// The caller schedules `preamble`, `sinks`, and `result`; the latter can be
+/// passed through whole-script optimization before any source is materialized.
+[[nodiscard]] auto lower_script(const Program& program) -> ScriptPlanResult;
 
 /// Lower a single expression with an external context.
 [[nodiscard]] auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult;

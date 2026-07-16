@@ -87,6 +87,30 @@ df;
     REQUIRE(scan->source_name() == "df");
 }
 
+TEST_CASE("lower_script separates table sinks from the relational result", "[parser][lower]") {
+    auto program = require_parse(R"(
+extern fn read(path: String) -> DataFrame from "reader.hpp";
+extern fn write(df: DataFrame, path: String) -> Int from "writer.hpp";
+let source = read("input");
+let result = source[select { id }];
+write(result, "output");
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->preamble.empty());
+    REQUIRE(lowered->sinks.size() == 1);
+    CHECK(lowered->sinks[0].callee == "write");
+    REQUIRE(lowered->sinks[0].args.size() == 1);
+    REQUIRE(std::get_if<ir::Literal>(&lowered->sinks[0].args[0].node) != nullptr);
+
+    const auto* result = as_node<ir::ProjectNode>(lowered->result.get());
+    REQUIRE(result != nullptr);
+    REQUIRE(result->children().size() == 1);
+    CHECK(result->children()[0]->kind() == ir::NodeKind::ExternCall);
+}
+
 TEST_CASE("Lower grouped aggregation to IR") {
     auto program = require_parse("df[select { symbol, total = sum(price) }, by symbol];");
     auto result = parser::lower(program);

@@ -68,27 +68,40 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         ir::collect_expr_column_refs(conjunct, referenced);
     }
 
-    std::vector<std::string> predicate_names;
-    predicate_names.reserve(referenced.size());
+    // Predicate columns are decoded whole-file (the selection needs every
+    // row), so they are legitimate cache entries: reuse any already cached,
+    // and cache the ones decoded here for later projections.
+    std::vector<std::string> predicate_missing;
+    predicate_missing.reserve(referenced.size());
     for (const auto& field : schema_.columns) {
-        if (referenced.contains(field.name)) {
-            predicate_names.push_back(field.name);
+        if (referenced.contains(field.name) && !cache_.contains(field.name)) {
+            predicate_missing.push_back(field.name);
         }
     }
-
-    Table predicates;
-    if (!predicate_names.empty()) {
-        auto decoded = decode_(predicate_names, nullptr);
+    if (!predicate_missing.empty()) {
+        auto decoded = decode_(predicate_missing, nullptr);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
-        predicates = std::move(*decoded);
-        for (const auto& name : predicate_names) {
-            if (predicates.find_entry(name) == nullptr) {
+        for (auto& entry : decoded->columns) {
+            auto name = entry.name;
+            cache_.insert_or_assign(std::move(name), std::move(entry));
+        }
+        for (const auto& name : predicate_missing) {
+            if (!cache_.contains(name)) {
                 return std::unexpected("lazy source did not produce predicate column '" + name +
                                        "'");
             }
         }
+    }
+
+    Table predicates;
+    for (const auto& field : schema_.columns) {
+        if (!referenced.contains(field.name)) {
+            continue;
+        }
+        const auto& entry = cache_.at(field.name);
+        predicates.add_column_shared(entry.name, entry.column, entry.validity);
     }
     predicates.logical_rows = rows_;
     if (!predicates.columns.empty() && predicates.rows() != rows_) {

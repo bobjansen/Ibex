@@ -347,6 +347,166 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
         expr.node);
 }
 
+using TableRefCounts = robin_hood::unordered_map<std::string, std::size_t>;
+
+void count_table_refs(const Expr& expr, bool table_position, TableRefCounts& counts);
+
+void count_table_refs(const ExprPtr& expr, bool table_position, TableRefCounts& counts) {
+    if (expr != nullptr) {
+        count_table_refs(*expr, table_position, counts);
+    }
+}
+
+void count_table_refs_fields(const std::vector<Field>& fields, TableRefCounts& counts) {
+    for (const auto& field : fields) {
+        count_table_refs(field.expr, false, counts);
+    }
+}
+
+/// Walk one block clause. Clause expressions are expression positions — a bare
+/// identifier there is a column or scalar, never a table — but they can hold
+/// table subqueries (`scalar(t[...])`), so they are still walked.
+void count_table_refs_clause(const Clause& clause, TableRefCounts& counts) {
+    std::visit(
+        [&](const auto& c) {
+            using T = std::decay_t<decltype(c)>;
+            if constexpr (std::is_same_v<T, FilterClause>) {
+                count_table_refs(c.predicate, false, counts);
+            } else if constexpr (std::is_same_v<T, SelectClause> ||
+                                 std::is_same_v<T, UpdateClause>) {
+                count_table_refs_fields(c.fields, counts);
+                for (const auto& tuple : c.tuple_fields) {
+                    count_table_refs(tuple.expr, false, counts);
+                }
+                for (const auto& map_field : c.map_fields) {
+                    count_table_refs(map_field.where_expr, false, counts);
+                    count_table_refs(map_field.expr, false, counts);
+                }
+                if constexpr (std::is_same_v<T, UpdateClause>) {
+                    count_table_refs(c.merge_expr, false, counts);
+                    count_table_refs(c.guard, false, counts);
+                }
+            } else if constexpr (std::is_same_v<T, DistinctClause> ||
+                                 std::is_same_v<T, RenameClause>) {
+                count_table_refs_fields(c.fields, counts);
+            } else if constexpr (std::is_same_v<T, MeltClause>) {
+                count_table_refs_fields(c.id_fields, counts);
+            } else if constexpr (std::is_same_v<T, ByClause>) {
+                count_table_refs_fields(c.keys, counts);
+            } else if constexpr (std::is_same_v<T, HeadClause> || std::is_same_v<T, TailClause>) {
+                count_table_refs(c.count, false, counts);
+            } else if constexpr (std::is_same_v<T, ModelClause>) {
+                for (const auto& param : c.params) {
+                    count_table_refs(param.value, false, counts);
+                }
+            }
+        },
+        clause);
+}
+
+/// Count how many times each name occurs in TABLE position: the base of a
+/// block, either side of a join, or a group/ascription wrapping one. Used by
+/// whole-script lowering to find bindings worth materializing once instead of
+/// cloning per reference. Undercounting is safe — the binding is inlined
+/// exactly as before — so ambiguous positions (call arguments, clause
+/// expressions) do not count bare identifiers.
+void count_table_refs(const Expr& expr, bool table_position, TableRefCounts& counts) {
+    std::visit(
+        [&](const auto& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, IdentifierExpr>) {
+                if (table_position) {
+                    ++counts[node.name];
+                }
+            } else if constexpr (std::is_same_v<T, LiteralExpr>) {
+                // Reads nothing.
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                for (const auto& arg : node.args) {
+                    count_table_refs(arg, false, counts);
+                }
+                for (const auto& named : node.named_args) {
+                    count_table_refs(named.value, false, counts);
+                }
+            } else if constexpr (std::is_same_v<T, RankExpr>) {
+                for (const auto& named : node.named_args) {
+                    count_table_refs(named.value, false, counts);
+                }
+            } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                count_table_refs(node.expr, false, counts);
+            } else if constexpr (std::is_same_v<T, BinaryExpr>) {
+                count_table_refs(node.left, false, counts);
+                count_table_refs(node.right, false, counts);
+            } else if constexpr (std::is_same_v<T, GroupExpr>) {
+                count_table_refs(node.expr, table_position, counts);
+            } else if constexpr (std::is_same_v<T, BlockExpr>) {
+                count_table_refs(node.base, true, counts);
+                for (const auto& clause : node.clauses) {
+                    count_table_refs_clause(clause, counts);
+                }
+            } else if constexpr (std::is_same_v<T, JoinExpr>) {
+                count_table_refs(node.left, true, counts);
+                count_table_refs(node.right, true, counts);
+                if (node.predicate.has_value()) {
+                    count_table_refs(*node.predicate, false, counts);
+                }
+            } else if constexpr (std::is_same_v<T, StreamExpr>) {
+                count_table_refs(node.source, false, counts);
+                for (const auto& clause : node.transform) {
+                    count_table_refs_clause(clause, counts);
+                }
+                for (const auto& arg : node.sink_args) {
+                    count_table_refs(arg, false, counts);
+                }
+            } else if constexpr (std::is_same_v<T, ArrayLiteralExpr>) {
+                for (const auto& element : node.elements) {
+                    count_table_refs(element, false, counts);
+                }
+            } else if constexpr (std::is_same_v<T, TableExpr>) {
+                for (const auto& column : node.columns) {
+                    count_table_refs(column.expr, false, counts);
+                }
+                count_table_refs(node.row_count, false, counts);
+            } else if constexpr (std::is_same_v<T, AscribeExpr>) {
+                count_table_refs(node.base, table_position, counts);
+            }
+        },
+        expr.node);
+}
+
+/// True when re-running `plan` per consumer would repeat real computation:
+/// a join, aggregation, de-duplication, sort, reshape, or computed columns
+/// (an update re-runs its per-row kernels). A scan/filter/project chain stays
+/// inlined — each consumer then keeps its own selection and column pushdown,
+/// which is worth more than sharing the cheap pass.
+auto contains_expensive_node(const ir::Node& node) -> bool {
+    switch (node.kind()) {
+        case ir::NodeKind::Join:
+        case ir::NodeKind::Aggregate:
+        case ir::NodeKind::Distinct:
+        case ir::NodeKind::Order:
+        case ir::NodeKind::TopK:
+        case ir::NodeKind::Update:
+        case ir::NodeKind::Window:
+        case ir::NodeKind::Resample:
+        case ir::NodeKind::Melt:
+        case ir::NodeKind::Dcast:
+        case ir::NodeKind::Cov:
+        case ir::NodeKind::Corr:
+        case ir::NodeKind::Transpose:
+        case ir::NodeKind::Matmul:
+        case ir::NodeKind::Model:
+            return true;
+        default:
+            break;
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr && contains_expensive_node(*child)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Look through redundant parentheses.
 auto unwrap_group(const Expr& expr) -> const Expr& {
     const Expr* current = &expr;
@@ -1104,6 +1264,22 @@ class Lowerer {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
         std::vector<ScriptSink> sinks;
+        share_repeated_bindings_ = true;
+        for (const auto& stmt : program.statements) {
+            if (const auto* let_stmt = std::get_if<LetStmt>(&stmt)) {
+                ++let_counts_[let_stmt->name];
+                count_table_refs(*let_stmt->value, /*table_position=*/true, table_ref_counts_);
+            } else if (const auto* expr_stmt = std::get_if<ExprStmt>(&stmt)) {
+                // A bare trailing identifier and a sink's direct binding
+                // argument are deduplicated by the executor's binding cache
+                // already, so neither adds to the sharing count here.
+                if (!std::holds_alternative<IdentifierExpr>(expr_stmt->expr->node)) {
+                    count_table_refs(*expr_stmt->expr, /*table_position=*/true, table_ref_counts_);
+                }
+            } else if (const auto* tuple_let = std::get_if<TupleLetStmt>(&stmt)) {
+                count_table_refs(*tuple_let->value, /*table_position=*/true, table_ref_counts_);
+            }
+        }
         const auto infer_compile_time_list =
             [this](const Expr& expr) -> std::optional<std::vector<std::string>> {
             if (auto string_list = extract_string_list(expr); string_list.has_value()) {
@@ -1168,7 +1344,17 @@ class Lowerer {
                     continue;
                 }
                 if (bindings_ != nullptr) {
-                    (*bindings_)[let_stmt.name] = std::move(value.value());
+                    if (share_repeated_bindings_ && !let_stmt.is_mut &&
+                        let_counts_[let_stmt.name] == 1 && table_ref_counts_[let_stmt.name] >= 2 &&
+                        contains_expensive_node(*value.value())) {
+                        // Referenced from several places and expensive to
+                        // re-run: materialized once by the executor. Later
+                        // references miss bindings_ and lower to Scan(name).
+                        shared_bindings_.push_back(
+                            SharedBinding{.name = let_stmt.name, .plan = std::move(value.value())});
+                    } else {
+                        (*bindings_)[let_stmt.name] = std::move(value.value());
+                    }
                 }
                 continue;
             }
@@ -1244,6 +1430,7 @@ class Lowerer {
         }
         return ScriptPlan{
             .preamble = std::move(preamble_calls),
+            .shared_bindings = std::move(shared_bindings_),
             .sinks = std::move(sinks),
             .result = std::move(last_expr),
             .result_binding = [&]() -> std::optional<std::string> {
@@ -4559,6 +4746,15 @@ class Lowerer {
 
     ir::Builder builder_;
     robin_hood::unordered_map<std::string, ir::NodePtr>* bindings_ = nullptr;
+    // Whole-script binding sharing (lower_script only). A binding referenced
+    // from several table positions whose plan contains real computation is
+    // moved here instead of into bindings_: later references then lower to a
+    // Scan of its name (the bindings_ miss falls through to a scan), and the
+    // batch executor materializes each plan exactly once, in order.
+    TableRefCounts table_ref_counts_;
+    TableRefCounts let_counts_;
+    std::vector<SharedBinding> shared_bindings_;
+    bool share_repeated_bindings_ = false;
     robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     robin_hood::unordered_set<std::string> table_externs_;
     robin_hood::unordered_set<std::string> sink_externs_;
@@ -4619,7 +4815,20 @@ auto lower_script(const Program& program) -> ScriptPlanResult {
     if (!lowered.has_value()) {
         return lowered;
     }
-    const auto source_schemas = build_source_schemas(lowerer.table_extern_decls());
+    auto source_schemas = build_source_schemas(lowerer.table_extern_decls());
+    // Shared bindings run first at execution time, so their plans get the same
+    // checks and rewrites as the result, and each contributes its inferred
+    // schema for the plans that scan it (an Unknown schema is sound — checks
+    // just fall back to runtime there).
+    for (auto& shared : lowered->shared_bindings) {
+        if (auto err = ir::check_column_refs(*shared.plan, source_schemas)) {
+            return std::unexpected(LowerError{.message = *err});
+        }
+        shared.plan = ir::push_filters_into_joins(std::move(shared.plan), source_schemas);
+        shared.plan = ir::push_semi_joins_down(std::move(shared.plan), source_schemas);
+        source_schemas.insert_or_assign(shared.name,
+                                        ir::infer_schema(*shared.plan, source_schemas));
+    }
     if (auto err = ir::check_column_refs(*lowered->result, source_schemas)) {
         return std::unexpected(LowerError{.message = *err});
     }

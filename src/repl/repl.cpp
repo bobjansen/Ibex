@@ -111,9 +111,9 @@ enum class ReadLineStatus : std::uint8_t { Line, Eof, Interrupted };
 
 #ifdef IBEX_HAS_READLINE
 constexpr std::string_view kColonCommands[] = {
-    ":q",         ":quit",    ":exit",   ":help",     ":tables", ":scalars",
-    ":functions", ":imports", ":schema", ":head",     ":peek",   ":describe",
-    ":load",      ":timing",  ":time",   ":comments", ":doc",    ":source",
+    ":q",       ":quit",     ":exit", ":help",   ":tables",   ":scalars", ":functions",
+    ":imports", ":schema",   ":head", ":peek",   ":describe", ":load",    ":timing",
+    ":time",    ":comments", ":doc",  ":source", ":run",
 };
 
 constexpr std::string_view kCompletionBuiltins[] = {
@@ -488,7 +488,7 @@ auto repl_completion(const char* text, int start, int end) -> char** {
         return matches_from(std::move(commands), text);
     }
 
-    if (command_matches(line, ":load")) {
+    if (command_matches(line, ":load") || command_matches(line, ":run")) {
         rl_attempted_completion_over = 1;
         return rl_completion_matches(text, rl_filename_completion_function);
     }
@@ -1767,6 +1767,8 @@ void print_help() {
     fmt::print("  ?name                 Shorthand for :doc name\n");
     fmt::print("  :source <fn>          Show source for a user-defined function\n");
     fmt::print("  :load <file>          Load and execute an .ibex script\n");
+    fmt::print(
+        "  :run <file>           Execute a script whole (batch-planned), in a fresh scope\n");
     fmt::print("  :time <command>       Time exactly one command\n");
     fmt::print("  :timing [on|off]      Toggle command timing\n");
     fmt::print("  :comments [on|off]    Toggle script comment echo during :load\n");
@@ -3276,31 +3278,63 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     // each source, and materialize only those from any lazy binding it scans.
     // `interpret` then runs against a registry in which every scanned source is
     // an ordinary Table — it never learns that a read was deferred.
+    //
+    // Selection pushdown happens first: a filter fully absorbed by a scan is
+    // removed from the plan BEFORE column demand is computed, so a column
+    // referenced only by that filter is decoded to compute the selection but
+    // never gathered into the scan's output.
     const runtime::TableRegistry* eval_tables = &tables;
     runtime::TableRegistry projected;
-    std::set<std::string> applied_scan_filters;
     if (!lazy_tables.empty()) {
-        auto demand = ir::required_columns(*lowered.value());
-        auto predicates = ir::scan_predicates(*lowered.value());
-        projected = tables;
+        // A lazy source scanned twice (a self-join, or two differently
+        // filtered subqueries) gets one instance name per scan, so each scan
+        // keeps its own pushed selection and column demand.
+        std::set<std::string> lazy_names;
         for (const auto& [name, lazy] : lazy_tables) {
-            auto needed = demand.find(name);
-            if (needed == demand.end()) {
-                continue;  // this plan never scans it
+            lazy_names.insert(name);
+        }
+        auto split = ir::split_scan_instances(std::move(lowered.value()), lazy_names);
+        lowered.value() = std::move(split.plan);
+        const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
+            auto it = lazy_tables.find(name);
+            if (it == lazy_tables.end()) {
+                if (const auto instance = split.instances.find(name);
+                    instance != split.instances.end()) {
+                    it = lazy_tables.find(instance->second);
+                }
+            }
+            return it == lazy_tables.end() ? nullptr : it->second.get();
+        };
+
+        auto predicates = ir::scan_predicates(*lowered.value());
+        std::set<std::string> applied_scan_filters;
+        for (const auto& [name, conjuncts] : predicates) {
+            if (resolve_lazy(name) != nullptr) {
+                applied_scan_filters.insert(name);
+            }
+        }
+        if (!applied_scan_filters.empty()) {
+            lowered.value() =
+                ir::remove_applied_scan_filters(std::move(lowered.value()), applied_scan_filters);
+        }
+        auto demand = ir::required_columns(*lowered.value());
+        projected = tables;
+        for (const auto& [name, needed] : demand) {
+            auto* lazy = resolve_lazy(name);
+            if (lazy == nullptr) {
+                continue;  // an ordinary table, not a deferred one
             }
             std::expected<runtime::Table, std::string> table;
-            if (auto pushed = predicates.find(name); pushed != predicates.end()) {
-                std::set<std::string> names = needed->second.names;
-                if (needed->second.all) {
+            if (applied_scan_filters.contains(name)) {
+                std::set<std::string> names = needed.names;
+                if (needed.all) {
                     for (const auto& field : lazy->schema().columns) {
                         names.insert(field.name);
                     }
                 }
-                table = lazy->project_where(names, pushed->second, &scalars);
-                applied_scan_filters.insert(name);
+                table = lazy->project_where(names, predicates.at(name), &scalars);
             } else {
-                table =
-                    needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
+                table = needed.all ? lazy->materialize() : lazy->project(needed.names);
             }
             if (!table) {
                 return std::unexpected(table.error());
@@ -3308,11 +3342,6 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             projected.insert_or_assign(name, std::move(table.value()));
         }
         eval_tables = &projected;
-    }
-
-    if (!applied_scan_filters.empty()) {
-        lowered.value() =
-            ir::remove_applied_scan_filters(std::move(lowered.value()), applied_scan_filters);
     }
 
     runtime::ModelResult captured_model;
@@ -4271,12 +4300,19 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         return std::nullopt;
     }
 
-    const auto evaluate = [&](ir::NodePtr plan) -> std::expected<runtime::Table, std::string> {
+    const auto evaluate = [&](ir::NodePtr plan, const runtime::TableRegistry& base_tables)
+        -> std::expected<runtime::Table, std::string> {
         auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
-        runtime::TableRegistry tables = build_builtin_tables();
+        runtime::TableRegistry tables = base_tables;
         LazyTableRegistry lazy_sources;
         ir::SourceSchemas schemas;
         ir::SourceRowCounts row_counts;
+        // Materialized shared bindings participate in schema-aware rewrites
+        // (and cardinality estimates) with their exact schemas and sizes.
+        for (const auto& [name, table] : base_tables) {
+            schemas.insert_or_assign(name, table_schema_info(table));
+            row_counts.insert_or_assign(name, table.rows());
+        }
         for (const auto& source : sources) {
             const auto* function = externs.find(source.callee);
             auto args = literal_args(source.args);
@@ -4299,38 +4335,79 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
         rewritten =
             ir::reorder_inner_joins_for_aggregates(std::move(rewritten), schemas, row_counts);
-        const auto demand = ir::required_columns(*rewritten);
+        // A source scanned twice in the plan (nation on both join sides, a
+        // self-joined fact table) gets one instance name per scan, so each
+        // scan keeps its own pushed selection and column demand.
+        std::set<std::string> lazy_names;
+        for (const auto& [name, lazy] : lazy_sources) {
+            lazy_names.insert(name);
+        }
+        auto split = ir::split_scan_instances(std::move(rewritten), lazy_names);
+        rewritten = std::move(split.plan);
+        const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
+            auto it = lazy_sources.find(name);
+            if (it == lazy_sources.end()) {
+                if (const auto instance = split.instances.find(name);
+                    instance != split.instances.end()) {
+                    it = lazy_sources.find(instance->second);
+                }
+            }
+            return it == lazy_sources.end() ? nullptr : it->second.get();
+        };
+        // Absorb scan filters before computing demand, so a column referenced
+        // only by a pushed filter is decoded for the selection but never
+        // gathered into the scan's output. No ScalarRegistry is passed to
+        // project_where: batch-eligible scripts cannot bind scalars, so a
+        // pushed conjunct can never reference one.
         const auto predicates = ir::scan_predicates(*rewritten);
         std::set<std::string> applied_filters;
-        for (const auto& [name, lazy] : lazy_sources) {
-            const auto needed = demand.find(name);
-            if (needed == demand.end()) {
+        for (const auto& [name, conjuncts] : predicates) {
+            if (resolve_lazy(name) != nullptr) {
+                applied_filters.insert(name);
+            }
+        }
+        if (!applied_filters.empty()) {
+            rewritten = ir::remove_applied_scan_filters(std::move(rewritten), applied_filters);
+        }
+        const auto demand = ir::required_columns(*rewritten);
+        for (const auto& [name, needed] : demand) {
+            auto* lazy = resolve_lazy(name);
+            if (lazy == nullptr) {
                 continue;
             }
             std::expected<runtime::Table, std::string> table;
-            if (const auto pushed = predicates.find(name); pushed != predicates.end()) {
-                std::set<std::string> names = needed->second.names;
-                if (needed->second.all) {
+            if (applied_filters.contains(name)) {
+                std::set<std::string> names = needed.names;
+                if (needed.all) {
                     for (const auto& field : lazy->schema().columns) {
                         names.insert(field.name);
                     }
                 }
-                table = lazy->project_where(names, pushed->second);
-                applied_filters.insert(name);
+                table = lazy->project_where(names, predicates.at(name));
             } else {
-                table =
-                    needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
+                table = needed.all ? lazy->materialize() : lazy->project(needed.names);
             }
             if (!table.has_value()) {
                 return std::unexpected(table.error());
             }
             tables.insert_or_assign(name, std::move(table.value()));
         }
-        if (!applied_filters.empty()) {
-            rewritten = ir::remove_applied_scan_filters(std::move(rewritten), applied_filters);
-        }
         return runtime::interpret(*rewritten, tables, nullptr, &externs);
     };
+
+    // Bindings the lowerer marked as shared are evaluated exactly once, in
+    // declaration order (a later one may scan an earlier one), before any sink
+    // or result plan. Their plans are pure relational expressions, so running
+    // them ahead of the sinks does not reorder any observable effect.
+    runtime::TableRegistry base_tables = build_builtin_tables();
+    for (auto& shared : script->shared_bindings) {
+        auto table = evaluate(std::move(shared.plan), base_tables);
+        if (!table.has_value()) {
+            fmt::print("error: {}\n", table.error());
+            return false;
+        }
+        base_tables.insert_or_assign(shared.name, std::move(table.value()));
+    }
 
     runtime::TableRegistry cached_bindings;
     for (auto& sink : script->sinks) {
@@ -4342,7 +4419,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
         }
         if (!input.has_value()) {
-            input = evaluate(std::move(sink.input));
+            input = evaluate(std::move(sink.input), base_tables);
             if (input.has_value() && sink.input_binding.has_value()) {
                 cached_bindings.insert_or_assign(*sink.input_binding, input.value());
             }
@@ -4370,7 +4447,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
     }
     if (!result.has_value()) {
-        result = evaluate(std::move(script->result));
+        result = evaluate(std::move(script->result), base_tables);
     }
     if (!result.has_value()) {
         fmt::print("error: {}\n", result.error());
@@ -4824,6 +4901,24 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             }
             const std::size_t count = parse_optional_size(count_text, 10);
             describe_table(table.value(), count);
+            continue;
+        }
+        if (starts_with_command(line_view, ":run")) {
+            // Executes the file the way `ibex file.ibex` would: through the
+            // whole-script batch planner when the script is eligible, in a
+            // scope of its own (no bindings leak into or out of the session).
+            // With :timing on this prints ONE time line for the whole script,
+            // which is what the benchmark harness's whole-script mode reads.
+            auto arg_view = trim(line_view.substr(std::string_view(":run").size()));
+            std::string path = parse_load_path(arg_view);
+            if (path.empty()) {
+                fmt::print("usage: :run <file>\n");
+                report_timing();
+                continue;
+            }
+            // Failures already print their own error line.
+            static_cast<void>(run_file(path, config, registry));
+            report_timing();
             continue;
         }
         if (line_view.starts_with(":load")) {

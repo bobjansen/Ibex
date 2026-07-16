@@ -734,6 +734,214 @@ result;
     REQUIRE(source_instances == 2);
 }
 
+namespace {
+
+/// Lazy two-column source recording every decode request, for asserting what a
+/// plan actually reads. Column `a` is {1,2,3}, column `b` is {10,20,30}.
+auto register_recording_lazy_source(
+    ibex::runtime::ExternRegistry& registry, std::vector<std::vector<std::string>>& decode_calls,
+    std::vector<std::optional<ibex::runtime::Selection>>* decode_selections = nullptr) -> void {
+    registry.register_lazy_table(
+        "read_fake",
+        [&decode_calls, decode_selections](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ibex::runtime::Table schema;
+            schema.add_column("a", ibex::Column<std::int64_t>{});
+            schema.add_column("b", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 3,
+                [&decode_calls, decode_selections](const std::vector<std::string>& names,
+                                                   const ibex::runtime::Selection* selection)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    decode_calls.push_back(names);
+                    if (decode_selections != nullptr) {
+                        decode_selections->push_back(
+                            selection == nullptr ? std::nullopt : std::optional{*selection});
+                    }
+                    const ibex::runtime::Selection all{0, 1, 2};
+                    const auto& rows = selection == nullptr ? all : *selection;
+                    ibex::runtime::Table table;
+                    for (const auto& name : names) {
+                        std::vector<std::int64_t> values;
+                        values.reserve(rows.size());
+                        for (const auto row : rows) {
+                            values.push_back(
+                                static_cast<std::int64_t>(name == "a" ? row + 1 : (row + 1) * 10));
+                        }
+                        table.add_column(name, ibex::Column<std::int64_t>{std::move(values)});
+                    }
+                    table.logical_rows = rows.size();
+                    return table;
+                });
+        });
+}
+
+auto register_int_capture(ibex::runtime::ExternRegistry& registry, const std::string& column,
+                          std::vector<std::int64_t>& captured) -> void {
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&captured, column](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            const auto* values = std::get_if<ibex::Column<std::int64_t>>(table.find(column));
+            if (values == nullptr) {
+                return std::unexpected("capture expected Int64 column " + column);
+            }
+            captured.assign(values->begin(), values->end());
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+}
+
+}  // namespace
+
+TEST_CASE("REPL lazy scan: a filtered count() decodes only the predicate column", "[repl][lazy]") {
+    // The filter is absorbed by the scan, so demand is computed on the reduced
+    // plan: count() reads no column, and `a` matters only for the selection.
+    // The scan materializes zero columns and the count comes from logical_rows.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    std::vector<std::int64_t> captured;
+    register_recording_lazy_source(registry, decode_calls);
+    register_int_capture(registry, "n", captured);
+
+    SECTION("batch planner path") {
+        const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+let input = read_fake();
+let result = input[filter a > 1, select { n = count() }];
+capture(result);
+result;
+)";
+        REQUIRE(ibex::repl::execute_script(src, registry));
+        REQUIRE(captured == std::vector<std::int64_t>{2});
+        REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
+    }
+
+    SECTION("statement-at-a-time path") {
+        // A scalar let is outside the batch planner's shape, so the same
+        // script runs through the statement executor.
+        const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+let force_statement_path = 1;
+let input = read_fake();
+let result = input[filter a > 1, select { n = count() }];
+capture(result);
+result;
+)";
+        REQUIRE(ibex::repl::execute_script(src, registry));
+        REQUIRE(captured == std::vector<std::int64_t>{2});
+        REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
+    }
+}
+
+TEST_CASE("REPL batch planner materializes a shared aggregate binding once", "[repl][batch]") {
+    // `agg` is consumed by two different sinks. Cloned per reference, each
+    // sink's plan would re-read the source and re-run the aggregate (one lazy
+    // instance per sink plan); shared, the binding is evaluated once and both
+    // sinks scan the materialized table.
+    ibex::runtime::ExternRegistry registry;
+    int source_instances = 0;
+    registry.register_lazy_table(
+        "read_fake",
+        [&source_instances](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ++source_instances;
+            ibex::runtime::Table schema;
+            schema.add_column("a", ibex::Column<std::int64_t>{});
+            schema.add_column("b", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 4,
+                [](const std::vector<std::string>& names, const ibex::runtime::Selection* selection)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    const std::vector<std::int64_t> a_values{1, 2, 3, 4};
+                    const std::vector<std::int64_t> b_values{1, 1, 2, 2};
+                    const ibex::runtime::Selection all{0, 1, 2, 3};
+                    const auto& rows = selection == nullptr ? all : *selection;
+                    ibex::runtime::Table table;
+                    for (const auto& name : names) {
+                        const auto& source = name == "a" ? a_values : b_values;
+                        std::vector<std::int64_t> values;
+                        values.reserve(rows.size());
+                        for (const auto row : rows) {
+                            values.push_back(source[row]);
+                        }
+                        table.add_column(name, ibex::Column<std::int64_t>{std::move(values)});
+                    }
+                    table.logical_rows = rows.size();
+                    return table;
+                });
+        });
+
+    std::vector<std::pair<std::string, std::vector<std::int64_t>>> captures;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&captures](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            const auto* tag = std::get_if<std::string>(&args.at(0));
+            const auto* values = std::get_if<ibex::Column<std::int64_t>>(table.find("s"));
+            if (tag == nullptr || values == nullptr) {
+                return std::unexpected("capture expected a tag and Int64 column s");
+            }
+            captures.emplace_back(*tag, std::vector<std::int64_t>(values->begin(), values->end()));
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+
+    const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame, tag: String) -> Int from "fake.hpp";
+
+let input = read_fake();
+let agg = input[select { b, s = sum(a) }, by { b }];
+let lo = agg[filter b == 1, select { s }];
+let hi = agg[filter b == 2, select { s }];
+capture(lo, "lo");
+capture(hi, "hi");
+hi;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE(captures == std::vector<std::pair<std::string, std::vector<std::int64_t>>>{
+                            {"lo", {3}},
+                            {"hi", {7}},
+                        });
+    REQUIRE(source_instances == 1);
+}
+
+TEST_CASE("REPL lazy scan: a source scanned twice pushes each scan's own filter", "[repl][lazy]") {
+    // The two subqueries filter the same lazy source differently. Per-scan
+    // instance identity keeps both filters pushable, and the shared decode
+    // cache means the predicate column is decoded once for both selections.
+    ibex::runtime::ExternRegistry registry;
+    std::vector<std::vector<std::string>> decode_calls;
+    std::vector<std::optional<ibex::runtime::Selection>> decode_selections;
+    std::vector<std::int64_t> captured;
+    register_recording_lazy_source(registry, decode_calls, &decode_selections);
+    register_int_capture(registry, "b", captured);
+
+    const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+
+let input = read_fake();
+let one = input[filter a > 1, select { b }];
+let two = input[filter a > 2, select { b }];
+let result = one join two on b;
+capture(result);
+result;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE(captured == std::vector<std::int64_t>{30});
+    REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}, {"b"}, {"b"}});
+    REQUIRE(decode_selections.size() == 3);
+    CHECK_FALSE(decode_selections[0].has_value());
+    REQUIRE(decode_selections[1].has_value());
+    CHECK(*decode_selections[1] == ibex::runtime::Selection{1, 2});
+    REQUIRE(decode_selections[2].has_value());
+    CHECK(*decode_selections[2] == ibex::runtime::Selection{2});
+}
+
 TEST_CASE("REPL supports named arguments and defaults for extern functions") {
     ibex::runtime::ExternRegistry registry;
     registry.register_table(

@@ -1100,9 +1100,10 @@ class Lowerer {
         return sources;
     }
 
-    auto lower_program(const Program& program) -> LowerResult {
+    auto lower_script(const Program& program) -> ScriptPlanResult {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
+        std::vector<ScriptSink> sinks;
         const auto infer_compile_time_list =
             [this](const Expr& expr) -> std::optional<std::vector<std::string>> {
             if (auto string_list = extract_string_list(expr); string_list.has_value()) {
@@ -1178,6 +1179,32 @@ class Lowerer {
             }
             if (std::holds_alternative<ExprStmt>(stmt)) {
                 const auto& expr_stmt = std::get<ExprStmt>(stmt);
+                if (const auto* call = std::get_if<CallExpr>(&expr_stmt.expr->node);
+                    call != nullptr && sink_externs_.contains(call->callee)) {
+                    if (call->args.empty() || !call->named_args.empty()) {
+                        return std::unexpected(LowerError{
+                            .message = call->callee +
+                                       ": table sink requires a positional table argument and "
+                                       "does not yet support named arguments"});
+                    }
+                    auto input = lower_expr(*call->args.front());
+                    if (!input.has_value()) {
+                        return std::unexpected(input.error());
+                    }
+                    std::vector<ir::Expr> args;
+                    args.reserve(call->args.size() - 1);
+                    for (std::size_t i = 1; i < call->args.size(); ++i) {
+                        auto arg = lower_expr_to_ir(*call->args[i]);
+                        if (!arg.has_value()) {
+                            return std::unexpected(arg.error());
+                        }
+                        args.push_back(std::move(arg.value()));
+                    }
+                    sinks.push_back(ScriptSink{.callee = call->callee,
+                                               .input = std::move(input.value()),
+                                               .args = std::move(args)});
+                    continue;
+                }
                 auto value = lower_expr(*expr_stmt.expr);
                 if (!value.has_value()) {
                     // Not a table expression — check whether it's a scalar call
@@ -1208,10 +1235,24 @@ class Lowerer {
         if (!last_expr) {
             return std::unexpected(LowerError{.message = "no expression to lower"});
         }
-        if (!preamble_calls.empty()) {
-            return builder_.program(std::move(preamble_calls), std::move(last_expr));
+        return ScriptPlan{.preamble = std::move(preamble_calls),
+                          .sinks = std::move(sinks),
+                          .result = std::move(last_expr)};
+    }
+
+    auto lower_program(const Program& program) -> LowerResult {
+        auto plan = lower_script(program);
+        if (!plan.has_value()) {
+            return std::unexpected(plan.error());
         }
-        return last_expr;
+        if (!plan->sinks.empty()) {
+            return std::unexpected(
+                LowerError{.message = "table-consuming extern calls require lower_script()"});
+        }
+        if (!plan->preamble.empty()) {
+            return builder_.program(std::move(plan->preamble), std::move(plan->result));
+        }
+        return std::move(plan->result);
     }
 
     auto lower_expression(const Expr& expr) -> LowerResult { return lower_expr(expr); }
@@ -4546,6 +4587,32 @@ auto lower(const Program& program) -> LowerResult {
     auto optimized =
         ir::optimize_plan(std::move(*lowered), optimization_context, &optimization_stats);
     return optimized;
+}
+
+auto lower_script(const Program& program) -> ScriptPlanResult {
+    auto effects = analyze_effects(program);
+    if (!effects.has_value()) {
+        return std::unexpected(LowerError{.message = effects.error().format()});
+    }
+
+    robin_hood::unordered_map<std::string, ir::NodePtr> bindings;
+    Lowerer lowerer(&bindings);
+    auto lowered = lowerer.lower_script(program);
+    if (!lowered.has_value()) {
+        return lowered;
+    }
+    const auto source_schemas = build_source_schemas(lowerer.table_extern_decls());
+    if (auto err = ir::check_column_refs(*lowered->result, source_schemas)) {
+        return std::unexpected(LowerError{.message = *err});
+    }
+    lowered->result = ir::push_filters_into_joins(std::move(lowered->result), source_schemas);
+    lowered->result = ir::push_semi_joins_down(std::move(lowered->result), source_schemas);
+
+    const auto optimization_context = build_optimization_context(*effects);
+    ir::OptimizationStats optimization_stats;
+    lowered->result =
+        ir::optimize_plan(std::move(lowered->result), optimization_context, &optimization_stats);
+    return lowered;
 }
 
 auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {

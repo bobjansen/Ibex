@@ -2021,7 +2021,7 @@ class ChunkedDistinctOperator final : public Operator {
                 std::optional<Table> out =
                     plan->width <= sizeof(std::uint64_t)
                         ? process_packed<std::uint64_t>(std::move(t), plan->cols, seen_packed64_)
-                        : process_packed<UInt128>(std::move(t), plan->cols, seen_packed128_);
+                        : process_packed<Packed128>(std::move(t), plan->cols, seen_packed128_);
                 if (!out.has_value()) {
                     continue;
                 }
@@ -2193,11 +2193,19 @@ class ChunkedDistinctOperator final : public Operator {
         return gather_rows(t, idx);
     }
 
-    using UInt128 = __uint128_t;
-    struct U128Hash {
-        auto operator()(UInt128 value) const noexcept -> std::size_t {
-            auto lo = static_cast<std::uint64_t>(value);
-            const auto hi = static_cast<std::uint64_t>(value >> 64);
+    // MSVC has no __uint128_t. This is only a packed identity key, so a pair
+    // of words is both portable and avoids pulling a compiler-specific integer
+    // type into the distinct fast path.
+    struct Packed128 {
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+
+        [[nodiscard]] friend auto operator==(const Packed128&, const Packed128&) -> bool = default;
+    };
+    struct Packed128Hash {
+        auto operator()(const Packed128& value) const noexcept -> std::size_t {
+            auto lo = value.lo;
+            const auto hi = value.hi;
             lo ^= hi + 0x9e3779b97f4a7c15ULL + (lo << 6) + (lo >> 2);
             return static_cast<std::size_t>(lo);
         }
@@ -2252,7 +2260,7 @@ class ChunkedDistinctOperator final : public Operator {
             } else {
                 return std::nullopt;
             }
-            if (bytes > sizeof(UInt128)) {
+            if (bytes > sizeof(Packed128)) {
                 return std::nullopt;
             }
             plan.cols.push_back(col);
@@ -2268,7 +2276,7 @@ class ChunkedDistinctOperator final : public Operator {
         std::vector<std::size_t> idx;
         idx.reserve(rows);
         for (std::size_t row = 0; row < rows; ++row) {
-            Packed key = 0;
+            Packed key{};
             for (const auto& col : cols) {
                 std::uint64_t cell = 0;
                 switch (col.kind) {
@@ -2285,7 +2293,18 @@ class ChunkedDistinctOperator final : public Operator {
                         cell = (*col.boolean)[row] ? 1U : 0U;
                         break;
                 }
-                key |= static_cast<Packed>(cell) << col.shift;
+                if constexpr (std::is_same_v<Packed, Packed128>) {
+                    if (col.shift < 64) {
+                        key.lo |= cell << col.shift;
+                        if (col.shift != 0) {
+                            key.hi |= cell >> (64 - col.shift);
+                        }
+                    } else {
+                        key.hi |= cell << (col.shift - 64);
+                    }
+                } else {
+                    key |= static_cast<Packed>(cell) << col.shift;
+                }
             }
             if (seen.insert(key).second) {
                 idx.push_back(row);
@@ -2336,7 +2355,7 @@ class ChunkedDistinctOperator final : public Operator {
     KeyRowIndex key_index_;
     std::vector<Key> group_order_;
     robin_hood::unordered_flat_set<std::uint64_t> seen_packed64_;
-    robin_hood::unordered_flat_set<UInt128, U128Hash> seen_packed128_;
+    robin_hood::unordered_flat_set<Packed128, Packed128Hash> seen_packed128_;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     robin_hood::unordered_flat_set<std::int64_t> seen_i64_;
     robin_hood::unordered_flat_set<double> seen_f64_;

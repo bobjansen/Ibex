@@ -1516,7 +1516,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         /// none. Pass 1b treats it as an ordinary code — it counts toward
         /// n_distinct and takes part in the Cartesian encoding — so nulls group
         /// together, and stay distinct from every real value, for free.
-        std::uint32_t null_code{kNoNullCode};
+        // Do not refer to the enclosing function's local constexpr here:
+        // MSVC then treats the implicitly generated default constructor as
+        // unavailable when vector value-initializes ColCodes.
+        std::uint32_t null_code{std::numeric_limits<std::uint32_t>::max()};
 
         [[nodiscard]] auto is_null_code(std::uint32_t code) const noexcept -> bool {
             return code == null_code;

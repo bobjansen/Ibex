@@ -458,8 +458,8 @@ TEST_CASE("Interpret multi-column distinct keeps a null key distinct from a real
 }
 
 TEST_CASE("Interpret packed multi-column distinct dedups fixed-width integral keys") {
-    // Two int64 keys pack into 16 bytes (the uint128 path). Negative and large
-    // values must stay distinct, and a repeated pair must collapse.
+    // Two int64 keys pack into the 16-byte path. Negative and large values
+    // must stay distinct, and a repeated pair must collapse.
     SECTION("two int64 columns, including negatives and a duplicate") {
         runtime::Table table;
         table.add_column("a", Column<std::int64_t>{1, 1, -1, 1, 9223372036854775807LL, -1});

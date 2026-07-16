@@ -520,12 +520,16 @@ auto repl_completion(const char* text, int start, int end) -> char** {
                         text);
 }
 
-/// Polled by readline roughly 10x/second while it waits for input (and right
-/// after a signal EINTRs the wait). On Ctrl+C, discard the pending line and
-/// set rl_done, which makes rl_read_key() hand back a synthetic newline so
+#if defined(RL_READLINE_VERSION) && RL_READLINE_VERSION >= 0x0500
+/// Polled by GNU readline roughly 10x/second while it waits for input (and
+/// right after a signal EINTRs the wait). On Ctrl+C, discard the pending line
+/// and set rl_done, which makes rl_read_key() hand back a synthetic newline so
 /// readline() returns the (emptied) line to the caller. rl_done is only
 /// honored on the rl_event_hook path — rl_signal_event_hook does not unblock
 /// rl_getc's internal read loop.
+///
+/// macOS's libedit compatibility headers report Readline 4.2 but do not expose
+/// this hook API; there Ctrl+C surfaces as a null return from readline().
 auto interrupt_event_hook() -> int {
     if (runtime::interrupt_requested()) {
         rl_replace_line("", 0);
@@ -533,6 +537,7 @@ auto interrupt_event_hook() -> int {
     }
     return 0;
 }
+#endif
 
 void configure_line_editing() {
     rl_attempted_completion_function = repl_completion;
@@ -551,9 +556,14 @@ void configure_line_editing() {
     // interrupt an interactive *prompt*, and a redirected stdin has no prompt to
     // interrupt. Ctrl+C during evaluation is handled elsewhere, by the
     // interpreter's cooperative interrupt checks.
+    // libedit's macOS compatibility API lacks rl_event_hook (and the related
+    // rl_replace_line / rl_done helpers used by the hook). It reports 4.2, so
+    // use its null-on-EINTR behavior instead; read_repl_line handles that.
+#if defined(RL_READLINE_VERSION) && RL_READLINE_VERSION >= 0x0500
     if (::isatty(STDIN_FILENO) != 0) {
         rl_event_hook = interrupt_event_hook;
     }
+#endif
 
 #if defined(RL_READLINE_VERSION) && RL_READLINE_VERSION >= 0x0500
     // The REPL owns SIGINT (see install_interrupt_handler): GNU readline must

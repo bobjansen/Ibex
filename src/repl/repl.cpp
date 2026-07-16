@@ -38,7 +38,6 @@
 #include <string.h>
 #include <string_view>
 #include <type_traits>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -47,6 +46,7 @@
 #else
 #include <dlfcn.h>
 #include <signal.h>
+#include <unistd.h>
 #endif
 #include <filesystem>
 #include <fstream>

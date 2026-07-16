@@ -102,6 +102,8 @@ result;
     REQUIRE(lowered->preamble.empty());
     REQUIRE(lowered->sinks.size() == 1);
     CHECK(lowered->sinks[0].callee == "write");
+    CHECK(lowered->sinks[0].input_binding == std::optional<std::string>{"result"});
+    CHECK(lowered->result_binding == std::optional<std::string>{"result"});
     REQUIRE(lowered->sinks[0].args.size() == 1);
     REQUIRE(std::get_if<ir::Literal>(&lowered->sinks[0].args[0].node) != nullptr);
 

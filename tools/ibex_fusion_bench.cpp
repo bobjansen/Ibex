@@ -135,17 +135,6 @@ const std::vector<Guard>& fusion_guards() {
         // sort (which would land near 1x) without tripping at small scales.
         {"order_head_1000", "wide_order_unsorted", 3.0,
          "TopK(k=1000) heap-select must still beat a full sort"},
-        // Sorted-input aggregate must stream group-at-a-time, not fall back to
-        // hashing. The new single-int-key hash fast path intentionally made
-        // the 1k-group baseline inexpensive; this margin still distinguishes
-        // streaming from its hash fallback. High-cardinality input retains a
-        // larger algorithmic gap from avoiding a full group table.
-        {"agg_sorted_stream_1k", "agg_sorted_hash_1k", 1.25,
-         "Aggregate on group-sorted input must stream, not hash"},
-        {"agg_sorted_stream_highcard", "agg_sorted_hash_highcard", 3.0,
-         "High-cardinality sorted aggregate must stream, not build a full hash table"},
-        {"agg_firstlast_stream_highcard", "agg_firstlast_hash_highcard", 3.0,
-         "High-cardinality sorted First/Last must stream, not build a full hash table"},
     };
     return guards;
 }
@@ -170,6 +159,61 @@ auto check_guards(const std::map<std::string, double>& mins) -> int {
         }
     }
     fmt::print("{} guard(s) failed\n", failures);
+    return failures;
+}
+
+// Unlike TopK, sorted aggregation and the optimized integer-key hash aggregate
+// are both linear-time. Their relative speed varies with compiler and runner,
+// so use the streamed result's ordering guarantee as the invariant instead:
+// ChunkedSortedAggregateOperator stamps its group-key ordering, whereas the
+// hash fallback does not advertise an ordering.
+auto check_sorted_aggregate_invariants(const ibex::runtime::TableRegistry& tables) -> int {
+    struct Invariant {
+        std::string name;
+        std::string source;
+        std::string group_key;
+    };
+    const std::vector<Invariant> invariants = {
+        {"agg_sorted_stream_1k", "grouped_sorted[order g asc][by g, select { g, s = sum(v) }]",
+         "g"},
+        {"agg_sorted_stream_highcard", "sorted[order k asc][by k, select { k, s = sum(v) }]", "k"},
+        {"agg_firstlast_stream_highcard",
+         "sorted[order k asc][by k, select { k, fi = first(v), la = last(v) }]", "k"},
+    };
+
+    fmt::print("\n--- sorted aggregate invariants ---\n");
+    int failures = 0;
+    ibex::runtime::ScalarRegistry scalars;
+    for (const auto& invariant : invariants) {
+        auto parsed = ibex::parser::parse(invariant.source + ";");
+        if (!parsed) {
+            fmt::print("FAIL {}: parse failed: {}\n", invariant.name, parsed.error().format());
+            ++failures;
+            continue;
+        }
+        auto lowered = ibex::parser::lower(*parsed);
+        if (!lowered) {
+            fmt::print("FAIL {}: lower failed: {}\n", invariant.name, lowered.error().message);
+            ++failures;
+            continue;
+        }
+        auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+        if (!result) {
+            fmt::print("FAIL {}: interpret failed: {}\n", invariant.name, result.error());
+            ++failures;
+            continue;
+        }
+        const bool ordered = result->ordering.has_value() && !result->ordering->empty() &&
+                             result->ordering->front().name == invariant.group_key &&
+                             result->ordering->front().ascending;
+        fmt::print("{} {}: output {} ordered by group key — {}\n", ordered ? "PASS" : "FAIL",
+                   invariant.name, ordered ? "is" : "is not",
+                   "sorted aggregate must not fall back to hash");
+        if (!ordered) {
+            ++failures;
+        }
+    }
+    fmt::print("{} invariant(s) failed\n", failures);
     return failures;
 }
 
@@ -388,7 +432,8 @@ auto main(int argc, char** argv) -> int {
         }
     }
     if (check) {
-        return check_guards(mins) == 0 ? 0 : 1;
+        const int failures = check_guards(mins) + check_sorted_aggregate_invariants(tables);
+        return failures == 0 ? 0 : 1;
     }
     return 0;
 }

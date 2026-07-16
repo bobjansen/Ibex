@@ -1266,11 +1266,13 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
             const auto* entry = output.find_entry(col_ref->name);
             if (entry != nullptr) {
-                if (entry->validity.has_value()) {
-                    output.add_column(field.alias, *entry->column, *entry->validity);
-                } else {
-                    output.add_column(field.alias, *entry->column);
-                }
+                // `alias = other_column` renames rather than computes, so the
+                // two names can share one buffer under the copy-on-write
+                // invariant. Deep-copying here moved 26MB per renamed key
+                // column on a q03-shaped scan — the join-key alignment idiom
+                // (`select { o_orderkey = l_orderkey }`) hits this on nearly
+                // every query.
+                output.add_column_shared(field.alias, entry->column, entry->validity);
                 continue;
             }
             if (scalars != nullptr) {
@@ -1568,11 +1570,13 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
             const auto* entry = output.find_entry(col_ref->name);
             if (entry != nullptr) {
-                if (entry->validity.has_value()) {
-                    output.add_column(field.alias, *entry->column, *entry->validity);
-                } else {
-                    output.add_column(field.alias, *entry->column);
-                }
+                // `alias = other_column` renames rather than computes, so the
+                // two names can share one buffer under the copy-on-write
+                // invariant. Deep-copying here moved 26MB per renamed key
+                // column on a q03-shaped scan — the join-key alignment idiom
+                // (`select { o_orderkey = l_orderkey }`) hits this on nearly
+                // every query.
+                output.add_column_shared(field.alias, entry->column, entry->validity);
                 continue;
             }
             if (scalars != nullptr) {

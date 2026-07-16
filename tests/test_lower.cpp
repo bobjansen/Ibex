@@ -113,6 +113,99 @@ result;
     CHECK(result->children()[0]->kind() == ir::NodeKind::ExternCall);
 }
 
+namespace {
+
+void count_scans_of(const ir::Node& node, const std::string& name, std::size_t& count) {
+    if (const auto* scan = as_node<ir::ScanNode>(&node); scan != nullptr) {
+        if (scan->source_name() == name) {
+            ++count;
+        }
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            count_scans_of(*child, name, count);
+        }
+    }
+}
+
+}  // namespace
+
+TEST_CASE("lower_script shares an expensive binding referenced twice", "[parser][lower]") {
+    auto program = require_parse(R"(
+let agg = t[select { b, s = sum(a) }, by { b }];
+let lo = agg[filter b == 1];
+let hi = agg[filter b == 2];
+let result = lo join hi on b;
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    REQUIRE(lowered->shared_bindings.size() == 1);
+    CHECK(lowered->shared_bindings[0].name == "agg");
+    // The shared plan is the aggregate itself...
+    std::size_t agg_nodes = 0;
+    CHECK(as_node<ir::AggregateNode>(lowered->shared_bindings[0].plan.get()) != nullptr);
+    count_scans_of(*lowered->shared_bindings[0].plan, "t", agg_nodes);
+    CHECK(agg_nodes == 1);
+    // ...and both references in the result plan are scans of its name, not
+    // clones of the aggregate subtree.
+    std::size_t scans = 0;
+    count_scans_of(*lowered->result, "agg", scans);
+    CHECK(scans == 2);
+}
+
+TEST_CASE("lower_script keeps a cheap repeated binding inlined", "[parser][lower]") {
+    // A scan/filter chain is cheap to re-run and inlining preserves each
+    // consumer's own selection pushdown, so it is not shared.
+    auto program = require_parse(R"(
+let flt = t[filter a > 0];
+let lo = flt[filter b == 1];
+let hi = flt[filter b == 2];
+let result = lo join hi on b;
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    CHECK(lowered->shared_bindings.empty());
+    std::size_t scans = 0;
+    count_scans_of(*lowered->result, "t", scans);
+    CHECK(scans == 2);
+}
+
+TEST_CASE("lower_script does not share a binding referenced once", "[parser][lower]") {
+    auto program = require_parse(R"(
+let agg = t[select { b, s = sum(a) }, by { b }];
+let result = agg[filter b == 1];
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    CHECK(lowered->shared_bindings.empty());
+}
+
+TEST_CASE("lower_script does not share a rebound name", "[parser][lower]") {
+    // `agg` is bound twice; name-keyed sharing cannot represent both versions,
+    // so both stay inlined.
+    auto program = require_parse(R"(
+let agg = t[select { b, s = sum(a) }, by { b }];
+let lo = agg[filter b == 1];
+let agg = t[select { b, s = max(a) }, by { b }];
+let hi = agg[filter b == 2];
+let result = lo join hi on b;
+result;
+)");
+
+    auto lowered = parser::lower_script(program);
+    REQUIRE(lowered.has_value());
+    CHECK(lowered->shared_bindings.empty());
+    std::size_t scans = 0;
+    count_scans_of(*lowered->result, "t", scans);
+    CHECK(scans == 2);
+}
+
 TEST_CASE("Lower grouped aggregation to IR") {
     auto program = require_parse("df[select { symbol, total = sum(price) }, by symbol];");
     auto result = parser::lower(program);

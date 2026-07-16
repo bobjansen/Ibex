@@ -298,12 +298,46 @@ TEST_CASE("LazyTable: project_where never poisons the whole-column cache",
     auto lazy = make_lazy(source);
 
     REQUIRE(lazy.project_where({"a", "b"}, {greater_than("a", 1)}));
-    auto whole = lazy.project({"a"});
-    REQUIRE(whole);
-    CHECK(whole->rows() == 3);
+    REQUIRE(source.decode_calls.size() == 2);
+
+    // The predicate column was decoded whole-file for the selection, so it is
+    // a legitimate cache entry: projecting it later costs no decode and comes
+    // back full-length.
+    auto whole_a = lazy.project({"a"});
+    REQUIRE(whole_a);
+    CHECK(whole_a->rows() == 3);
+    CHECK(source.decode_calls.size() == 2);
+    const auto* a = std::get_if<Column<std::int64_t>>(whole_a->find("a"));
+    REQUIRE(a != nullptr);
+    CHECK((*a)[0] == 1);
+    CHECK((*a)[2] == 3);
+
+    // The payload column was decoded under a selection, so it must NOT be
+    // cached: projecting it whole decodes it again, densely.
+    auto whole_b = lazy.project({"b"});
+    REQUIRE(whole_b);
+    CHECK(whole_b->rows() == 3);
     REQUIRE(source.decode_calls.size() == 3);
-    CHECK(source.decode_calls.back() == std::vector<std::string>{"a"});
+    CHECK(source.decode_calls.back() == std::vector<std::string>{"b"});
     CHECK_FALSE(source.selections.back().has_value());
+}
+
+TEST_CASE("LazyTable: project_where reuses cached whole columns for predicates",
+          "[runtime][lazy_table]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    REQUIRE(lazy.project({"a"}));
+    REQUIRE(source.decode_calls.size() == 1);
+
+    // `a` is already cached whole-file, so only the payload column is decoded.
+    auto table = lazy.project_where({"b"}, {greater_than("a", 1)});
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+    REQUIRE(source.decode_calls.size() == 2);
+    CHECK(source.decode_calls.back() == std::vector<std::string>{"b"});
+    REQUIRE(source.selections.back().has_value());
+    CHECK(*source.selections.back() == runtime::Selection{1, 2});
 }
 
 TEST_CASE("LazyTable: a decode failure surfaces as an error", "[runtime][lazy_table]") {

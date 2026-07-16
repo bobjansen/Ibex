@@ -17,8 +17,26 @@ using ScanPredicateMap = std::map<std::string, std::vector<Expr>>;
 /// when it occurs exactly once in the plan: the materialized table registry is
 /// keyed by source name, so applying
 /// one occurrence's selection to a repeated/self-join scan would be unsound.
+/// Run `split_scan_instances` first to give repeated scans their own identity.
 ///
 [[nodiscard]] auto scan_predicates(const Node& root) -> ScanPredicateMap;
+
+struct ScanInstanceSplit {
+    NodePtr plan;
+    /// Instance scan name -> the source it reads. Only sources scanned more
+    /// than once are split; a source scanned once keeps its original name and
+    /// has no entry here.
+    std::map<std::string, std::string> instances;
+};
+
+/// Give each scan of `sources` that occurs more than once in the plan its own
+/// instance name (`name#k`), so selection pushdown and column demand stay
+/// per-scan for repeated/self-join scans instead of being abandoned. `#`
+/// cannot appear in an identifier, so an instance name cannot collide with a
+/// user binding. The caller must materialize each instance name into the
+/// registry it interprets against.
+[[nodiscard]] auto split_scan_instances(NodePtr root, const std::set<std::string>& sources)
+    -> ScanInstanceSplit;
 
 /// Remove row-local filters which have already been applied by a lazy source.
 /// `applied_sources` must contain only sources for which the caller actually

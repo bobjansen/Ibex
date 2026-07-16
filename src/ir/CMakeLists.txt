@@ -5,6 +5,7 @@ add_library(ibex_ir STATIC
     expr_predicates.cpp
     extern_sources.cpp
     join_pushdown.cpp
+    join_order.cpp
     node.cpp
     optimizer.cpp
     required_columns.cpp

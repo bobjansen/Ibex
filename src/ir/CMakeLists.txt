@@ -6,6 +6,7 @@ add_library(ibex_ir STATIC
     extern_sources.cpp
     join_pushdown.cpp
     join_order.cpp
+    join_reorder.cpp
     node.cpp
     optimizer.cpp
     required_columns.cpp

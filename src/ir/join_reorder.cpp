@@ -1,0 +1,181 @@
+#include <ibex/ir/join_order.hpp>
+#include <ibex/ir/join_reorder.hpp>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <robin_hood.h>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace ibex::ir {
+namespace {
+
+struct Edge {
+    std::size_t right = 0;
+    std::vector<std::string> keys;
+};
+
+auto next_id() -> std::uint64_t& {
+    thread_local std::uint64_t value = 0;
+    return value;
+}
+
+void max_id(const Node& node, std::uint64_t& value) {
+    value = std::max(value, node.id().value);
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            max_id(*child, value);
+        }
+    }
+    if (node.kind() == NodeKind::Program) {
+        const auto& program = static_cast<const ProgramNode&>(node);
+        for (const auto& preamble : program.preamble()) {
+            if (preamble != nullptr) {
+                max_id(*preamble, value);
+            }
+        }
+        max_id(program.main_node(), value);
+    }
+}
+
+auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge>& edges) -> bool {
+    if (node->kind() != NodeKind::Join) {
+        leaves.push_back(std::move(node));
+        return true;
+    }
+    auto* join = static_cast<JoinNode*>(node.get());
+    if (join->kind() != JoinKind::Inner || join->predicate().has_value() || join->keys().empty() ||
+        join->mutable_children().size() != 2 || join->mutable_children()[0] == nullptr ||
+        join->mutable_children()[1] == nullptr ||
+        join->mutable_children()[1]->kind() == NodeKind::Join) {
+        return false;
+    }
+    NodePtr left = std::move(join->mutable_children()[0]);
+    NodePtr right = std::move(join->mutable_children()[1]);
+    join->mutable_children().clear();
+    if (!take_left_deep(std::move(left), leaves, edges)) {
+        return false;
+    }
+    leaves.push_back(std::move(right));
+    edges.push_back(Edge{.right = leaves.size() - 1, .keys = join->keys()});
+    return true;
+}
+
+auto aggregate_order_insensitive(const AggregateNode& aggregate) -> bool {
+    return std::ranges::none_of(aggregate.aggregations(), [](const AggSpec& spec) {
+        return spec.func == AggFunc::First || spec.func == AggFunc::Last;
+    });
+}
+
+auto schemas_are_unambiguous(const std::vector<NodePtr>& leaves, const std::vector<Edge>& edges,
+                             const SourceSchemas& schemas) -> bool {
+    robin_hood::unordered_set<std::string> join_keys;
+    for (const auto& edge : edges) {
+        join_keys.insert(edge.keys.begin(), edge.keys.end());
+    }
+    robin_hood::unordered_set<std::string> seen;
+    for (const auto& leaf : leaves) {
+        const auto schema = infer_schema(*leaf, schemas);
+        if (!schema.is_known() || schema.is_open()) {
+            return false;
+        }
+        for (const auto& field : schema.fields()) {
+            if (!seen.insert(field.name).second && !join_keys.contains(field.name)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+auto connecting_keys(std::size_t candidate, const std::vector<std::size_t>& selected,
+                     const std::vector<Edge>& edges) -> const std::vector<std::string>* {
+    for (const auto& edge : edges) {
+        const bool candidate_in_edge = candidate <= edge.right;
+        const bool selected_in_edge = std::ranges::any_of(
+            selected, [&](std::size_t relation) { return relation <= edge.right; });
+        if (candidate_in_edge && selected_in_edge &&
+            std::ranges::any_of(selected,
+                                [&](std::size_t relation) { return relation != candidate; })) {
+            return &edge.keys;
+        }
+    }
+    return nullptr;
+}
+
+auto reorder_aggregate_child(NodePtr child, const SourceSchemas& schemas,
+                             const SourceRowCounts& row_counts) -> NodePtr {
+    const auto order = choose_inner_join_order(*child, schemas, row_counts);
+    if (!order.has_value()) {
+        return child;
+    }
+    bool already_ordered = true;
+    for (std::size_t i = 0; i < order->size(); ++i) {
+        already_ordered = already_ordered && (*order)[i] == i;
+    }
+    if (already_ordered) {
+        return child;
+    }
+
+    std::vector<NodePtr> leaves;
+    std::vector<Edge> edges;
+    if (!take_left_deep(std::move(child), leaves, edges) ||
+        !schemas_are_unambiguous(leaves, edges, schemas)) {
+        return nullptr;
+    }
+    NodePtr result = std::move(leaves[order->front()]);
+    std::vector<std::size_t> selected{order->front()};
+    for (std::size_t pos = 1; pos < order->size(); ++pos) {
+        const std::size_t candidate = (*order)[pos];
+        const auto* keys = connecting_keys(candidate, selected, edges);
+        if (keys == nullptr || leaves[candidate] == nullptr) {
+            return nullptr;
+        }
+        auto join = std::make_unique<JoinNode>(NodeId{next_id()++}, JoinKind::Inner, *keys);
+        join->add_child(std::move(result));
+        join->add_child(std::move(leaves[candidate]));
+        result = std::move(join);
+        selected.push_back(candidate);
+    }
+    return result;
+}
+
+auto walk(NodePtr node, const SourceSchemas& schemas, const SourceRowCounts& row_counts)
+    -> NodePtr {
+    if (node == nullptr) {
+        return node;
+    }
+    for (auto& child : node->mutable_children()) {
+        child = walk(std::move(child), schemas, row_counts);
+    }
+    if (node->kind() == NodeKind::Aggregate && node->mutable_children().size() == 1 &&
+        node->mutable_children()[0] != nullptr) {
+        const auto& aggregate = static_cast<const AggregateNode&>(*node);
+        if (aggregate_order_insensitive(aggregate) &&
+            node->mutable_children()[0]->kind() == NodeKind::Join) {
+            NodePtr reordered = reorder_aggregate_child(std::move(node->mutable_children()[0]),
+                                                        schemas, row_counts);
+            if (reordered != nullptr) {
+                node->mutable_children()[0] = std::move(reordered);
+            }
+        }
+    }
+    return node;
+}
+
+}  // namespace
+
+auto reorder_inner_joins_for_aggregates(NodePtr root, const SourceSchemas& schemas,
+                                        const SourceRowCounts& row_counts) -> NodePtr {
+    if (root != nullptr) {
+        std::uint64_t highest = 0;
+        max_id(*root, highest);
+        next_id() = highest + 1;
+    }
+    return walk(std::move(root), schemas, row_counts);
+}
+
+}  // namespace ibex::ir

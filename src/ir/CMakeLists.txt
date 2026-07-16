@@ -1,5 +1,6 @@
 add_library(ibex_ir STATIC
     builder.cpp
+    cardinality.cpp
     canonicalize.cpp
     expr_predicates.cpp
     extern_sources.cpp

@@ -9946,6 +9946,38 @@ auto substring_over(const std::vector<std::string>& values, const std::string& c
 
 }  // namespace
 
+TEST_CASE("table consumer dispatches a planned script sink", "[interpreter][extern]") {
+    runtime::ExternRegistry externs;
+    std::size_t seen_rows = 0;
+    std::string seen_path;
+    externs.register_scalar_table_consumer(
+        "write_test", runtime::ScalarKind::Int,
+        [&](const runtime::Table& input,
+            const runtime::ExternArgs& args) -> std::expected<runtime::ExternValue, std::string> {
+            seen_rows = input.rows();
+            if (args.size() != 1) {
+                return std::unexpected("expected path");
+            }
+            const auto* path = std::get_if<std::string>(&args[0]);
+            if (path == nullptr) {
+                return std::unexpected("path must be a string");
+            }
+            seen_path = *path;
+            return runtime::ExternValue{runtime::ScalarValue{std::int64_t{1}}};
+        });
+
+    runtime::Table input;
+    input.add_column("id", Column<std::int64_t>{1, 2});
+    auto result = runtime::invoke_table_consumer(externs, "write_test", input,
+                                                 {runtime::ScalarValue{std::string{"out"}}});
+    REQUIRE(result.has_value());
+    CHECK(seen_rows == 2);
+    CHECK(seen_path == "out");
+
+    auto unknown = runtime::invoke_table_consumer(externs, "missing", input, {});
+    CHECK_FALSE(unknown.has_value());
+}
+
 TEST_CASE("substring is 0-based with an optional length", "[interpreter][substring]") {
     const std::vector<std::string> v{"13-abc", "ab"};
     CHECK(substring_over(v, "substring(v, 0, 2)") == std::vector<std::string>{"13", "ab"});

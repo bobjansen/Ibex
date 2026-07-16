@@ -1298,6 +1298,23 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
     return sink.run();
 }
 
+auto invoke_table_consumer(const ExternRegistry& externs, const std::string& callee,
+                           const Table& input, const std::vector<ScalarValue>& args)
+    -> std::expected<void, std::string> {
+    const auto* function = externs.find(callee);
+    if (function == nullptr) {
+        return std::unexpected("unknown table consumer: " + callee);
+    }
+    if (!function->first_arg_is_table || !function->table_consumer_func) {
+        return std::unexpected("extern function is not a table consumer: " + callee);
+    }
+    auto result = function->table_consumer_func(input, args);
+    if (!result.has_value()) {
+        return std::unexpected(result.error());
+    }
+    return {};
+}
+
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
                  const std::vector<std::string>& keys, const ir::Expr* predicate,
                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {

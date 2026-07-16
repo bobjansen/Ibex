@@ -121,7 +121,56 @@ numbers Polars is compared against.
 (Whole-file `ibex_eval` per iteration is not an alternative: ~0.2s
 Arrow/AWS-SDK dlopen noise per run.)
 
-### Stage 4 — push conjuncts into the decoder (the big one)
+### Stage 4 — READ THIS BEFORE WRITING ANY DECODER CODE
+
+**Stage 4 as originally drafted below is largely already-rejected work.** The
+2026-07-16 re-profile plus `plans/parquet-filtering-scan-observations.md`
+change the picture:
+
+- Points (2) and (3) of the draft — dense-decode the block, evaluate the
+  selection in-block, gather survivors — are **rejected experiment #1**, which
+  has now been measured and rejected **four times** (see that document's
+  "Paths not worth repeating" and its 2026-07-14 (4) follow-up). The mechanism
+  is structural, not a tuning problem: at every selectivity tested the
+  survivors still touch every page, so both paths decode every value, and the
+  dense path merely adds a scratch write plus a gather on top. It loses most
+  where it is exercised most (densest selection, +3–9%). There is no threshold
+  that fires without losing.
+- Point (1), row-group statistics pruning, is sound but does nothing for these
+  files: every lineitem row group's `l_shipdate` range spans the predicate, so
+  stats read 6/6 groups. Worth doing for clustered/sorted data — not against
+  PDS-H as the acceptance benchmark.
+- The genuinely open lever is **selection-awareness inside the encoding
+  decoder** (skipping within RLE/bit-packed runs, indexing PLAIN values without
+  forcing rejected values through scratch). That capability is *below* Apache's
+  public `TypedColumnReader` API — it needs an Arrow patch/fork, and the same
+  document measured a hand-written native page decoder at only 1.15× on
+  numerics and **0.93× (slower) on strings** once Arrow's SIMD was enabled. The
+  maintenance cost is real and the ceiling is a few ms per scan.
+
+Current q03 lineitem scan profile (39.5ms, after 3e8a46d + fb50e37):
+
+| component | self |
+|---|---:|
+| `decode_physical_column<DOUBLE>` per-value lambda | 32.5% |
+| `decode_physical_column<INT64>` per-value lambda | 18.5% |
+| memmove | 10.5% |
+| `direct_decode_table` glue | 9.4% |
+| `filter_selection` self | 7.6% |
+| Arrow's actual decode (GetSpaced + unpack32_avx2) | ~9.6% |
+
+Checked and found already correct (do not "fix" these): the selected path
+reserves its output column exactly (`direct_column`'s `out.reserve(output_rows)`
+on every arm), and `DirectValidity` starts all-true and only writes on a null,
+discarding the bitmap entirely when the column proves null-free.
+
+**Recommended next single-thread work is NOT here.** The observations doc's own
+conclusion after decomposing q13 stands: decode is no longer the dominant term;
+the join and group-by are. See `plans/filtered-scan-and-groupby-plan.md`
+finding 2.2 (per-group Key boxing / malloc churn, ~12% of q10's aggregate) —
+and note its finding 2.1 (faster string hash) is now **refuted and reverted**.
+
+### Stage 4 (original draft — superseded by the section above)
 
 Today the seam is `ColumnDecodeFn(names, selection)`
 (`include/ibex/runtime/lazy_table.hpp:23`): `project_where` fully decodes

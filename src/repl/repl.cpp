@@ -4222,11 +4222,9 @@ auto literal_args(const std::vector<ir::Expr>& exprs)
     return args;
 }
 
-/// Executes the deliberately narrow first whole-script shape: a sequence of
-/// relational lets, zero or more table sinks of the final binding, and that
-/// binding as the final expression. Everything else keeps the mature
-/// statement-at-a-time executor below until its effects are represented in
-/// ScriptPlan too.
+/// Executes relational batch scripts whose top-level effects are represented
+/// by ScriptPlan. Scalar, tuple, import, and function semantics remain on the
+/// mature statement-at-a-time path until they have equivalent plan nodes.
 auto try_execute_whole_script(const parser::Program& program, runtime::ExternRegistry& externs,
                               const ReplConfig& config) -> std::optional<bool> {
     for (const auto& stmt : program.statements) {
@@ -4244,27 +4242,25 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     }
 
     auto script = parser::lower_script(program);
-    if (!script.has_value() || !script->preamble.empty() || !script->result_binding.has_value()) {
+    if (!script.has_value() || !script->preamble.empty()) {
         return std::nullopt;
-    }
-    for (const auto& sink : script->sinks) {
-        if (sink.input_binding != script->result_binding) {
-            return std::nullopt;
-        }
     }
 
     robin_hood::unordered_set<std::string> loaded_plugins;
     std::set<std::string> lazy_callees;
     for (const auto& stmt : program.statements) {
         const auto* decl = std::get_if<parser::ExternDecl>(&stmt);
-        if (decl == nullptr || decl->source_path.empty()) {
+        if (decl == nullptr) {
             continue;
         }
-        const auto loaded = try_load_plugin(plugin_stem(decl->source_path),
-                                            config.plugin_search_paths, loaded_plugins, externs);
-        if (loaded.status == PluginLoadStatus::LoadError) {
-            fmt::print("error: {}\n", loaded.message);
-            return false;
+        if (!decl->source_path.empty()) {
+            const auto loaded =
+                try_load_plugin(plugin_stem(decl->source_path), config.plugin_search_paths,
+                                loaded_plugins, externs);
+            if (loaded.status == PluginLoadStatus::LoadError) {
+                fmt::print("error: {}\n", loaded.message);
+                return false;
+            }
         }
         if (const auto* function = externs.find(decl->name);
             function != nullptr && function->lazy_table_func) {
@@ -4275,77 +4271,110 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         return std::nullopt;
     }
 
-    auto [plan, sources] = ir::hoist_extern_sources(std::move(script->result), lazy_callees);
-    runtime::TableRegistry tables = build_builtin_tables();
-    LazyTableRegistry lazy_sources;
-    ir::SourceSchemas schemas;
-    ir::SourceRowCounts row_counts;
-    for (const auto& source : sources) {
-        const auto* function = externs.find(source.callee);
-        auto args = literal_args(source.args);
-        if (function == nullptr || !function->lazy_table_func || !args.has_value()) {
-            fmt::print("error: {}\n", args.has_value() ? "lazy source unavailable" : args.error());
-            return false;
-        }
-        auto lazy = function->lazy_table_func(*args);
-        if (!lazy.has_value()) {
-            fmt::print("error: {}\n", lazy.error());
-            return false;
-        }
-        schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
-        row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
-        lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
-    }
-
-    plan = ir::push_filters_into_joins(std::move(plan), schemas);
-    plan = ir::push_semi_joins_down(std::move(plan), schemas);
-    plan = ir::reorder_inner_joins_for_aggregates(std::move(plan), schemas, row_counts);
-    const auto demand = ir::required_columns(*plan);
-    const auto predicates = ir::scan_predicates(*plan);
-    std::set<std::string> applied_filters;
-    for (const auto& [name, lazy] : lazy_sources) {
-        const auto needed = demand.find(name);
-        if (needed == demand.end()) {
-            continue;
-        }
-        std::expected<runtime::Table, std::string> table;
-        if (const auto pushed = predicates.find(name); pushed != predicates.end()) {
-            std::set<std::string> names = needed->second.names;
-            if (needed->second.all) {
-                for (const auto& field : lazy->schema().columns) {
-                    names.insert(field.name);
-                }
+    const auto evaluate = [&](ir::NodePtr plan) -> std::expected<runtime::Table, std::string> {
+        auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
+        runtime::TableRegistry tables = build_builtin_tables();
+        LazyTableRegistry lazy_sources;
+        ir::SourceSchemas schemas;
+        ir::SourceRowCounts row_counts;
+        for (const auto& source : sources) {
+            const auto* function = externs.find(source.callee);
+            auto args = literal_args(source.args);
+            if (function == nullptr || !function->lazy_table_func) {
+                return std::unexpected("lazy source unavailable: " + source.callee);
             }
-            table = lazy->project_where(names, pushed->second);
-            applied_filters.insert(name);
-        } else {
-            table = needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
+            if (!args.has_value()) {
+                return std::unexpected(args.error());
+            }
+            auto lazy = function->lazy_table_func(*args);
+            if (!lazy.has_value()) {
+                return std::unexpected(lazy.error());
+            }
+            schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
+            row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
+            lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
         }
-        if (!table.has_value()) {
-            fmt::print("error: {}\n", table.error());
+
+        rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
+        rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
+        rewritten =
+            ir::reorder_inner_joins_for_aggregates(std::move(rewritten), schemas, row_counts);
+        const auto demand = ir::required_columns(*rewritten);
+        const auto predicates = ir::scan_predicates(*rewritten);
+        std::set<std::string> applied_filters;
+        for (const auto& [name, lazy] : lazy_sources) {
+            const auto needed = demand.find(name);
+            if (needed == demand.end()) {
+                continue;
+            }
+            std::expected<runtime::Table, std::string> table;
+            if (const auto pushed = predicates.find(name); pushed != predicates.end()) {
+                std::set<std::string> names = needed->second.names;
+                if (needed->second.all) {
+                    for (const auto& field : lazy->schema().columns) {
+                        names.insert(field.name);
+                    }
+                }
+                table = lazy->project_where(names, pushed->second);
+                applied_filters.insert(name);
+            } else {
+                table =
+                    needed->second.all ? lazy->materialize() : lazy->project(needed->second.names);
+            }
+            if (!table.has_value()) {
+                return std::unexpected(table.error());
+            }
+            tables.insert_or_assign(name, std::move(table.value()));
+        }
+        if (!applied_filters.empty()) {
+            rewritten = ir::remove_applied_scan_filters(std::move(rewritten), applied_filters);
+        }
+        return runtime::interpret(*rewritten, tables, nullptr, &externs);
+    };
+
+    runtime::TableRegistry cached_bindings;
+    for (auto& sink : script->sinks) {
+        std::expected<runtime::Table, std::string> input = std::unexpected("");
+        if (sink.input_binding.has_value()) {
+            if (const auto cached = cached_bindings.find(*sink.input_binding);
+                cached != cached_bindings.end()) {
+                input = cached->second;
+            }
+        }
+        if (!input.has_value()) {
+            input = evaluate(std::move(sink.input));
+            if (input.has_value() && sink.input_binding.has_value()) {
+                cached_bindings.insert_or_assign(*sink.input_binding, input.value());
+            }
+        }
+        if (!input.has_value()) {
+            fmt::print("error: {}\n", input.error());
             return false;
         }
-        tables.insert_or_assign(name, std::move(table.value()));
-    }
-    if (!applied_filters.empty()) {
-        plan = ir::remove_applied_scan_filters(std::move(plan), applied_filters);
-    }
-    auto result = runtime::interpret(*plan, tables, nullptr, &externs);
-    if (!result.has_value()) {
-        fmt::print("error: {}\n", result.error());
-        return false;
-    }
-    for (const auto& sink : script->sinks) {
         auto args = literal_args(sink.args);
         if (!args.has_value()) {
             fmt::print("error: {}\n", args.error());
             return false;
         }
-        auto invoked = runtime::invoke_table_consumer(externs, sink.callee, *result, *args);
+        auto invoked = runtime::invoke_table_consumer(externs, sink.callee, *input, *args);
         if (!invoked.has_value()) {
             fmt::print("error: {}\n", invoked.error());
             return false;
         }
+    }
+    std::expected<runtime::Table, std::string> result = std::unexpected("");
+    if (script->result_binding.has_value()) {
+        if (const auto cached = cached_bindings.find(*script->result_binding);
+            cached != cached_bindings.end()) {
+            result = cached->second;
+        }
+    }
+    if (!result.has_value()) {
+        result = evaluate(std::move(script->result));
+    }
+    if (!result.has_value()) {
+        fmt::print("error: {}\n", result.error());
+        return false;
     }
     render_eval_value(EvalValue{std::move(result.value())});
     return true;

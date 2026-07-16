@@ -1,5 +1,6 @@
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -11,6 +12,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 using ibex::repl::normalize_input;
 
@@ -661,6 +663,75 @@ fn second_highest_salary(employee: DataFrame<{ salary: Int }>) -> DataFrame {
                                 "capture(second_highest_salary(employee));\n";
         REQUIRE_FALSE(ibex::repl::execute_script(src, registry));
     }
+}
+
+TEST_CASE("REPL batch planner executes non-final table sinks", "[repl][batch]") {
+    ibex::runtime::ExternRegistry registry;
+    int source_instances = 0;
+    registry.register_lazy_table(
+        "read_fake",
+        [&source_instances](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ++source_instances;
+            ibex::runtime::Table schema;
+            schema.add_column("a", ibex::Column<std::int64_t>{});
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 3,
+                [](const std::vector<std::string>& names, const ibex::runtime::Selection* selection)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    const std::vector<std::int64_t> values{1, 2, 3};
+                    const ibex::runtime::Selection all{0, 1, 2};
+                    const auto& rows = selection == nullptr ? all : *selection;
+                    ibex::runtime::Table table;
+                    for (const auto& name : names) {
+                        if (name != "a") {
+                            continue;
+                        }
+                        std::vector<std::int64_t> selected;
+                        selected.reserve(rows.size());
+                        for (const auto row : rows) {
+                            selected.push_back(values[row]);
+                        }
+                        table.add_column("a", ibex::Column<std::int64_t>{std::move(selected)});
+                    }
+                    table.logical_rows = rows.size();
+                    return table;
+                });
+        });
+
+    std::vector<std::pair<std::string, std::vector<std::int64_t>>> captures;
+    registry.register_scalar_table_consumer(
+        "capture", ibex::runtime::ScalarKind::Int,
+        [&captures](const ibex::runtime::Table& table, const ibex::runtime::ExternArgs& args)
+            -> std::expected<ibex::runtime::ExternValue, std::string> {
+            const auto* tag = std::get_if<std::string>(&args.at(0));
+            const auto* values = std::get_if<ibex::Column<std::int64_t>>(table.find("a"));
+            if (tag == nullptr || values == nullptr) {
+                return std::unexpected("capture expected a tag and Int64 column a");
+            }
+            captures.emplace_back(*tag, std::vector<std::int64_t>(values->begin(), values->end()));
+            return ibex::runtime::ExternValue{std::int64_t{0}};
+        });
+
+    const char* src = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+extern fn capture(df: DataFrame, tag: String) -> Int from "fake.hpp";
+
+let input = read_fake();
+let early = input[filter a > 1, select { a }];
+capture(early, "early");
+let result = input[filter a > 2, select { a }];
+capture(result, "result");
+result;
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry));
+    REQUIRE(captures == std::vector<std::pair<std::string, std::vector<std::int64_t>>>{
+                            {"early", {2, 3}},
+                            {"result", {3}},
+                        });
+    // The result sink's table is reused for the final expression, while the
+    // earlier sink is independently planned and executed.
+    REQUIRE(source_instances == 2);
 }
 
 TEST_CASE("REPL supports named arguments and defaults for extern functions") {

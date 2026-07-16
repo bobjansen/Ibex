@@ -5,6 +5,7 @@
 #include <ibex/parser/ast.hpp>
 
 #include <expected>
+#include <optional>
 #include <robin_hood.h>
 #include <string>
 #include <vector>
@@ -25,12 +26,17 @@ struct ScriptSink {
     std::string callee;
     ir::NodePtr input;
     std::vector<ir::Expr> args;
+    /// Set when the source syntax passed a simple `let` binding to the sink.
+    /// The batch executor uses this to avoid evaluating the final result twice.
+    std::optional<std::string> input_binding;
 };
 
 struct ScriptPlan {
     std::vector<ir::NodePtr> preamble;
     std::vector<ScriptSink> sinks;
     ir::NodePtr result;
+    /// Set when the final expression is a simple identifier.
+    std::optional<std::string> result_binding;
 };
 
 using ScriptPlanResult = std::expected<ScriptPlan, LowerError>;

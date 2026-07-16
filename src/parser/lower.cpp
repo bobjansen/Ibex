@@ -1200,9 +1200,16 @@ class Lowerer {
                         }
                         args.push_back(std::move(arg.value()));
                     }
-                    sinks.push_back(ScriptSink{.callee = call->callee,
-                                               .input = std::move(input.value()),
-                                               .args = std::move(args)});
+                    sinks.push_back(ScriptSink{
+                        .callee = call->callee,
+                        .input = std::move(input.value()),
+                        .args = std::move(args),
+                        .input_binding =
+                            std::get_if<IdentifierExpr>(&call->args.front()->node)
+                                ? std::optional<std::string>{std::get<IdentifierExpr>(
+                                                                 call->args.front()->node)
+                                                                 .name}
+                                : std::nullopt});
                     continue;
                 }
                 auto value = lower_expr(*expr_stmt.expr);
@@ -1235,9 +1242,20 @@ class Lowerer {
         if (!last_expr) {
             return std::unexpected(LowerError{.message = "no expression to lower"});
         }
-        return ScriptPlan{.preamble = std::move(preamble_calls),
-                          .sinks = std::move(sinks),
-                          .result = std::move(last_expr)};
+        return ScriptPlan{
+            .preamble = std::move(preamble_calls),
+            .sinks = std::move(sinks),
+            .result = std::move(last_expr),
+            .result_binding = [&]() -> std::optional<std::string> {
+                const auto* last = std::get_if<ExprStmt>(&program.statements.back());
+                if (last == nullptr) {
+                    return std::nullopt;
+                }
+                if (const auto* ident = std::get_if<IdentifierExpr>(&last->expr->node)) {
+                    return ident->name;
+                }
+                return std::nullopt;
+            }()};
     }
 
     auto lower_program(const Program& program) -> LowerResult {

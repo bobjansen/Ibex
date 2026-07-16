@@ -89,13 +89,24 @@ auto choose_inner_join_order(const Node& root, const SourceSchemas& schemas,
     while (order.size() < relations.size()) {
         std::optional<std::size_t> next;
         for (const auto& edge : edges) {
-            const std::size_t candidate = edge.right_relation;
-            if (selected[candidate] || !has_all_keys(relations[candidate].schema, edge.keys) ||
-                !group_has_all_keys(relations, order, edge.keys)) {
-                continue;
+            std::vector<std::size_t> endpoints;
+            endpoints.reserve(edge.right_relation + 1);
+            for (std::size_t i = 0; i < edge.right_relation; ++i) {
+                endpoints.push_back(i);
             }
-            if (!next.has_value() || rows(candidate) < rows(*next)) {
-                next = candidate;
+            endpoints.push_back(edge.right_relation);
+            for (const std::size_t candidate : endpoints) {
+                if (selected[candidate] || !has_all_keys(relations[candidate].schema, edge.keys)) {
+                    continue;
+                }
+                const bool connected = std::ranges::any_of(
+                    endpoints, [&](std::size_t endpoint) { return selected[endpoint]; });
+                if (!connected || !group_has_all_keys(relations, order, edge.keys)) {
+                    continue;
+                }
+                if (!next.has_value() || rows(candidate) < rows(*next)) {
+                    next = candidate;
+                }
             }
         }
         if (!next.has_value()) {

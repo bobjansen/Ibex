@@ -14,6 +14,7 @@ set(IBEX_TEST_SOURCES
     test_ir_extern_sources.cpp
     test_ir_join_pushdown.cpp
     test_ir_join_order.cpp
+    test_ir_join_reorder.cpp
     test_ir_node.cpp
     test_ir_optimizer.cpp
     test_ir_required_columns.cpp

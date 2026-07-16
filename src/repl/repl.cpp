@@ -3,6 +3,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/extern_sources.hpp>
 #include <ibex/ir/join_pushdown.hpp>
+#include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/scan_predicates.hpp>
@@ -4278,6 +4279,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     runtime::TableRegistry tables = build_builtin_tables();
     LazyTableRegistry lazy_sources;
     ir::SourceSchemas schemas;
+    ir::SourceRowCounts row_counts;
     for (const auto& source : sources) {
         const auto* function = externs.find(source.callee);
         auto args = literal_args(source.args);
@@ -4291,11 +4293,13 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             return false;
         }
         schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
+        row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
         lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
     }
 
     plan = ir::push_filters_into_joins(std::move(plan), schemas);
     plan = ir::push_semi_joins_down(std::move(plan), schemas);
+    plan = ir::reorder_inner_joins_for_aggregates(std::move(plan), schemas, row_counts);
     const auto demand = ir::required_columns(*plan);
     const auto predicates = ir::scan_predicates(*plan);
     std::set<std::string> applied_filters;

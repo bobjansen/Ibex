@@ -2,6 +2,7 @@ add_library(ibex_ir STATIC
     builder.cpp
     canonicalize.cpp
     expr_predicates.cpp
+    extern_sources.cpp
     join_pushdown.cpp
     node.cpp
     optimizer.cpp

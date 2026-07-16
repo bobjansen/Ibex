@@ -2730,6 +2730,17 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
         }
         selected.insert(selected.end(), hits.begin(),
                         hits.begin() + static_cast<std::ptrdiff_t>(kept));
+        if (base == 0 && rows > kBlock) {
+            // One up-front capacity estimate from the first block's hit rate.
+            // Growing by doubling instead re-copies the vector ~10 times on a
+            // q03-shaped scan (3.2M survivors, up to 26MB per re-copy). The
+            // 12.5% headroom plus one block of slack absorbs drift; a
+            // clustered predicate that defeats the estimate just falls back
+            // to doubling from a larger base.
+            const std::size_t blocks = (rows + kBlock - 1) / kBlock;
+            const std::size_t estimated = selected.size() * blocks;
+            selected.reserve(std::min(rows, estimated + (estimated / 8) + kBlock));
+        }
     }
     return selected;
 }

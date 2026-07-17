@@ -808,3 +808,46 @@ sequence should be: plumb real distinct counts -> estimate Inner honestly ->
 show the pass changes q21's plan AND that the new plan is faster -> only then
 relax the shape gate -> benchmark per query. That is a considerably larger piece
 of work than "relax a gate", and it should be costed as such.
+
+### The join-reordering prize, measured (2026-07-17)
+
+Before plumbing distinct-key stats to feed a cost model, measure what a cost
+model could win. Hand-permuted the join order on two queries, holding filters,
+projections and everything else identical, and verified both orders return the
+correct answer. SF-1, pinned, min-of-7, three rounds:
+
+| query | best order written by hand | worst order written by hand | spread |
+|---|---:|---:|---:|
+| q03 (3-table chain) | 93.6 / 93.7 / 98.7 ms | 112.6 / 113.7 / 119.1 ms | **+20%** |
+| q05 (4-table chain) | 129.4 / 130.7 / 139.8 ms | 186.5 / 188.0 / 193.9 ms | **+43%** |
+
+"Worst" joins the two biggest relations first (q03: orders x lineitem before
+customer; q05: the unfiltered 6M-row lineitem x supplier before orders and
+customer) — a plausible thing to write if you are not thinking about it.
+
+**So join order is worth 20-43% on a 3-4 table chain, and that is the size of
+the prize.** Expect more on wider joins; q09's six-table chain was not measured
+and should be.
+
+**Read this as a user number, not a benchmark number.** PDS-H's queries are
+already in the good order — TPC-H's SQL starts from the filtered dimension table
+and our transcription mirrors it — so the suite will measure ~0 for a working
+reorder pass and that says nothing about its value. This is the same trap as the
+rest of this document: the hand-fused suite measured ~0 for the reader-schema fix
+too, which is worth 6x to anyone writing a join the natural way. The benchmark's
+queries were written by someone who already knew the answer. Real ones are not.
+
+**The prize is symmetric, which is the real design constraint.** The same 20-43%
+is the *downside*: a cost model that mis-estimates turns a good hand-written
+order into a bad one. A reorder pass must not punish the careful to rescue the
+careless. That is the argument against a foreign-key guess
+(`rows ~ max(|L|, |R|)`) and for real distinct-key counts — Parquet footers carry
+them per row group, nothing plumbs them through `LazyTable` to the planner yet,
+and that plumbing is the actual next piece of work.
+
+Sequence: (1) plumb per-row-group distinct counts through LazyTable into
+SourceRowCounts' sibling, (2) estimate Inner honestly from them, (3) confirm the
+pass changes q21's plan and does not regress it, (4) relax the shape gate,
+(5) benchmark per query AND against a deliberately badly-ordered variant of each
+query, since the well-ordered suite cannot show the win and can only show the
+regression.

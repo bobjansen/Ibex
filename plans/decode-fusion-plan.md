@@ -695,3 +695,38 @@ Both assertions now say so.
 the queries naturally is now a phrasing decision, not a 6x cliff — though it is
 still worth doing only if the queries should measure the optimizer rather than
 the author.
+
+### `reorder_inner_joins_for_aggregates` is a no-op on the whole suite
+
+Follow-up to the "dead on 12 of 13" note: it is worse. **Two independent gates
+block it, and PDS-H trips both**, so the pass has never changed a plan here.
+
+1. **Shape gate** (`join_reorder.cpp:169`): the aggregate's child must be a
+   `Join`. It is a `Project` on 21 of 22 queries — the aggregate block's
+   `select` lowers to one. Only q21 gets past this.
+2. **Cost model** (`join_order.cpp`, `collect_left_deep`): every leaf needs a row
+   estimate and a Known schema. On q21 — the one query that reaches it —
+   `choose_inner_join_order` **DECLINES**: a leaf of kind `Project` has
+   `rows=false`, no estimate, so the collect bails before any ordering happens.
+
+Measured accordingly: q21 with the pass on vs compiled out is 678/653 vs 662/688
+(pinned, min-of-5, two rounds, disagreeing on sign) — no difference, which is
+exactly what a no-op predicts.
+
+`estimate_cardinality` does propagate through `Project` (it is in the
+"retain row count exactly" arm with Update/Rename/Order/Ascribe), so the missing
+estimate comes from **below** the Project — its own child has none. That is the
+next thing to find: which node under q21's join leaves has no row estimate, and
+why. Do not assume; instrument, as the leaf print here did.
+
+**So "relax the shape gate" is necessary but not sufficient.** Relaxing it would
+route 21 more queries into a cost model that then has to succeed where it
+currently declines — and the pass has *zero* evidence behind it, since it has
+never once fired to effect. Sequence: (1) find why the leaf estimate is missing
+and fix that, (2) confirm the pass then changes q21's plan AND that the new plan
+is faster, (3) only then relax the shape gate, (4) benchmark per query, since a
+costed reorder that improves the geomean can wreck an individual query.
+
+Both gates being independent also means the earlier note's framing was too kind:
+this is not "a good pass behind a too-strict gate", it is an unvalidated pass
+behind two gates, whose cost model has never been exercised on a real plan.

@@ -1410,6 +1410,41 @@ TEST_CASE("Interpret update fuses nested numeric arithmetic") {
     REQUIRE((*col)[2] == Catch::Approx(10.0));
 }
 
+TEST_CASE("Interpret vectorizes a numeric expression containing Int64(like(...))") {
+    // The q14 shape: a numeric aggregate/update expression whose factor is a
+    // string predicate cast to int. This used to drop the whole expression to
+    // the per-row evaluator (recompiling the LIKE pattern every row); the
+    // vectorized path now splices the compiled `like` column in as a leaf. The
+    // arithmetic must still be exact.
+    runtime::Table table;
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0});
+    table.add_column("kind", Column<std::string>{"PROMO SILVER", "STANDARD", "PROMO GOLD", "BULK"});
+
+    runtime::TableRegistry registry;
+    registry.emplace("parts", table);
+
+    auto ir = require_ir(R"(parts[update { rev = price * Int64(like(kind, "PROMO%")) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* col = std::get_if<Column<double>>(result->find("rev"));
+    REQUIRE(col != nullptr);
+    REQUIRE(col->size() == 4);
+    REQUIRE((*col)[0] == Catch::Approx(10.0));  // PROMO -> ×1
+    REQUIRE((*col)[1] == Catch::Approx(0.0));   // no match -> ×0
+    REQUIRE((*col)[2] == Catch::Approx(30.0));  // PROMO -> ×1
+    REQUIRE((*col)[3] == Catch::Approx(0.0));
+
+    // And the same through an aggregate, which is where q14 uses it.
+    auto agg = require_ir(R"(parts[select { promo = sum(price * Int64(like(kind, "PROMO%"))) }];)");
+    auto agg_res = runtime::interpret(*agg, registry);
+    REQUIRE(agg_res.has_value());
+    const auto* total = std::get_if<Column<double>>(agg_res->find("promo"));
+    REQUIRE(total != nullptr);
+    REQUIRE(total->size() == 1);
+    REQUIRE((*total)[0] == Catch::Approx(40.0));  // 10 + 30
+}
+
 TEST_CASE("Interpret blocked nested numeric update across block boundaries") {
     constexpr std::size_t rows = 513;
     Column<double> price;

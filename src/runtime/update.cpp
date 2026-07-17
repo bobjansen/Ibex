@@ -418,16 +418,129 @@ auto lookup_round_int_fn(std::string_view mode) -> std::int64_t (*)(double) {
     return nullptr;
 }
 
+// Materialize `src` as a Column<int64_t> (want == Int) or Column<double>
+// (want == Double), converting a bool/int/double source elementwise. Bool maps
+// to 0/1, which is exactly what `Int64(like(...))` means. Returns nullopt for a
+// source that is not a numeric-or-bool column.
+auto to_numeric_column(const ColumnValue& src, ExprType want) -> std::optional<ColumnValue> {
+    const auto build = [&](auto&& read, std::size_t n) -> ColumnValue {
+        if (want == ExprType::Int) {
+            Column<std::int64_t> out;
+            out.reserve(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                out.push_back(static_cast<std::int64_t>(read(i)));
+            }
+            return ColumnValue{std::move(out)};
+        }
+        Column<double> out;
+        out.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            out.push_back(static_cast<double>(read(i)));
+        }
+        return ColumnValue{std::move(out)};
+    };
+    if (const auto* c = std::get_if<Column<bool>>(&src)) {
+        return build([&](std::size_t i) { return (*c)[i] ? 1 : 0; }, c->size());
+    }
+    if (const auto* c = std::get_if<Column<std::int64_t>>(&src)) {
+        return build([&](std::size_t i) { return (*c)[i]; }, c->size());
+    }
+    if (const auto* c = std::get_if<Column<double>>(&src)) {
+        return build([&](std::size_t i) { return (*c)[i]; }, c->size());
+    }
+    return std::nullopt;
+}
+
+// A sub-expression that is not natively numeric but produces a numeric column
+// via a column KERNEL -- most usefully `Int64(like(col, "pat"))`, whose pattern
+// compiles once instead of per row. Evaluate it once here and splice it in as an
+// Int/DoubleColumn leaf so the surrounding arithmetic still vectorizes, instead
+// of dropping the whole enclosing expression to the per-row evaluator.
+//
+// Recursion-safe by construction: the only kernels reached
+// (`use_column_kernel`) take column/literal args, so this never re-enters the
+// numeric compiler on the same node. The materialized column is owned by
+// `temps`, whose heap buffers outlive the block evaluation (moving a Column on a
+// `temps` reallocation preserves its data pointer).
+auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
+                            std::vector<NumericUpdateNode>& nodes, std::vector<ColumnValue>& temps)
+    -> std::optional<std::uint32_t> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+
+    // Either `Cast(kernel_call(...))` or a bare `kernel_call(...)` whose result
+    // is already numeric. The cast fixes the leaf type; otherwise the kernel's
+    // own result type does.
+    const ir::CallExpr* kernel_call = call;
+    std::optional<ExprType> want;
+    if ((call->callee == "Int" || call->callee == "Int64") && call->args.size() == 1) {
+        want = ExprType::Int;
+        kernel_call = std::get_if<ir::CallExpr>(&call->args[0]->node);
+    } else if (call->callee == "Float64" && call->args.size() == 1) {
+        want = ExprType::Double;
+        kernel_call = std::get_if<ir::CallExpr>(&call->args[0]->node);
+    }
+    if (kernel_call == nullptr) {
+        return std::nullopt;
+    }
+
+    const BuiltinFn* fn = find_builtin(kernel_call->callee);
+    if (fn == nullptr || !use_column_kernel(*fn, *kernel_call)) {
+        return std::nullopt;
+    }
+    const ColumnEvalFn kernel = column_eval_of(*fn);
+    if (kernel == nullptr) {
+        return std::nullopt;
+    }
+    ColumnEvalCtx ctx{.scalars = scalars, .externs = nullptr, .window = std::nullopt};
+    auto col = kernel(*kernel_call, input, input.rows(), ctx);
+    if (!col.has_value()) {
+        return std::nullopt;
+    }
+    // No cast wrapper: keep the kernel's own numeric type; a bool result with no
+    // cast is not a numeric leaf, so decline (the per-row path handles it).
+    if (!want.has_value()) {
+        if (std::holds_alternative<Column<std::int64_t>>(col->column)) {
+            want = ExprType::Int;
+        } else if (std::holds_alternative<Column<double>>(col->column)) {
+            want = ExprType::Double;
+        } else {
+            return std::nullopt;
+        }
+    }
+
+    auto numeric = to_numeric_column(col->column, *want);
+    if (!numeric.has_value()) {
+        return std::nullopt;
+    }
+    temps.push_back(std::move(*numeric));
+
+    NumericUpdateNode node;
+    node.type = *want;
+    if (*want == ExprType::Int) {
+        node.kind = NumericUpdateNode::Kind::IntColumn;
+        node.i64 = std::get<Column<std::int64_t>>(temps.back()).data();
+    } else {
+        node.kind = NumericUpdateNode::Kind::DoubleColumn;
+        node.dbl = std::get<Column<double>>(temps.back()).data();
+    }
+    nodes.push_back(node);
+    return static_cast<std::uint32_t>(nodes.size() - 1);
+}
+
 auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                                      const ScalarRegistry* scalars,
-                                     std::vector<NumericUpdateNode>& nodes)
+                                     std::vector<NumericUpdateNode>& nodes,
+                                     std::vector<ColumnValue>& temps)
     -> std::optional<std::uint32_t> {
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
-        auto left = try_compile_numeric_update_expr(*bin->left, input, scalars, nodes);
+        auto left = try_compile_numeric_update_expr(*bin->left, input, scalars, nodes, temps);
         if (!left.has_value()) {
             return std::nullopt;
         }
-        auto right = try_compile_numeric_update_expr(*bin->right, input, scalars, nodes);
+        auto right = try_compile_numeric_update_expr(*bin->right, input, scalars, nodes, temps);
         if (!right.has_value()) {
             return std::nullopt;
         }
@@ -456,7 +569,8 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
             if (kern == nullptr) {
                 return std::nullopt;
             }
-            auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes);
+            auto child =
+                try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes, temps);
             if (!child.has_value()) {
                 return std::nullopt;
             }
@@ -479,7 +593,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         if ((is_min || is_max) && call->args.size() >= 2 && call->named_args.empty()) {
             std::optional<std::uint32_t> acc;
             for (const auto& arg : call->args) {
-                auto a = try_compile_numeric_update_expr(*arg, input, scalars, nodes);
+                auto a = try_compile_numeric_update_expr(*arg, input, scalars, nodes, temps);
                 if (!a.has_value()) {
                     return std::nullopt;  // non-numeric arg (string/date/…): slow path
                 }
@@ -504,7 +618,8 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         // a Double argument): compile the child, wrap in a UnaryDouble node.
         if (call->args.size() == 1 && call->named_args.empty()) {
             if (auto fn = lookup_unary_double_fn(call->callee)) {
-                auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes);
+                auto child =
+                    try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes, temps);
                 if (!child.has_value()) {
                     return std::nullopt;
                 }
@@ -523,7 +638,10 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                 return static_cast<std::uint32_t>(nodes.size() - 1);
             }
         }
-        return std::nullopt;  // other calls aren't fast-compilable here
+        // A column-kernel call (e.g. `Int64(like(col, "pat"))`): evaluate it once
+        // into a numeric column leaf rather than dropping the whole enclosing
+        // expression to the per-row evaluator.
+        return try_splice_column_leaf(expr, input, scalars, nodes, temps);
     }
 
     auto operand = resolve_fast_operand(expr, input, scalars);
@@ -1222,7 +1340,12 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std:
 
     std::vector<NumericUpdateNode> nodes;
     nodes.reserve(8);
-    auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes);
+    // Owns any columns materialized by `try_splice_column_leaf` (e.g. a compiled
+    // `like`). Must outlive `eval_numeric_update_blocks`, which reads leaf data
+    // pointers into these; reserved so pushes never reallocate mid-compile.
+    std::vector<ColumnValue> temps;
+    temps.reserve(8);
+    auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes, temps);
     if (!root.has_value() || nodes[*root].type != output_kind) {
         return std::nullopt;
     }

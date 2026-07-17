@@ -733,8 +733,12 @@ result;
                             {"result", {3}},
                         });
     // The result sink's table is reused for the final expression, while the
-    // earlier sink is independently planned and executed.
-    REQUIRE(source_instances == 2);
+    // earlier sink is independently planned and executed -- two instances. The
+    // third is the schema probe: lowering resolves each distinct reader once up
+    // front to learn what it returns, which is what lets join filter pushdown
+    // see a reader's schema at all (it runs inside lower_script, before
+    // canonicalize fuses the Filter it needs to move).
+    REQUIRE(source_instances == 3);
 }
 
 namespace {
@@ -909,7 +913,10 @@ hi;
                             {"lo", {3}},
                             {"hi", {7}},
                         });
-    REQUIRE(source_instances == 1);
+    // One instance materializes the shared binding -- the point of this test.
+    // The second is the schema probe, which resolves each distinct reader once
+    // before lowering so join filter pushdown can see what a reader returns.
+    REQUIRE(source_instances == 2);
 }
 
 TEST_CASE("REPL lazy scan: a source scanned twice pushes each scan's own filter", "[repl][lazy]") {

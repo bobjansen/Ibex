@@ -67,6 +67,20 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 /// always sound.
 [[nodiscard]] auto infer_schema(const Node& node, const SourceSchemas& sources = {}) -> SchemaInfo;
 
+/// Key identifying one reader *call site* in a `SourceSchemas`, e.g.
+/// `read_parquet("data/lineitem.parquet")`.
+///
+/// A declared reader return schema is keyed by the bare callee, which assumes
+/// one schema per function. That is false for a generic reader: `read_parquet`
+/// yields a different schema for every path. So a caller that knows what a
+/// specific call site returns -- the driver, which can read the footer -- keys
+/// it by this instead, and `infer_schema` prefers it over the bare callee.
+///
+/// Returns nullopt when any argument is not a literal, since then the call site
+/// is not identifiable without evaluating it.
+[[nodiscard]] auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& args)
+    -> std::optional<std::string>;
+
 /// Prove every ascription in `root` that sits over a statically known input
 /// schema, marking it checked (see `AscribeNode::checked`). Returns the first
 /// ascription that provably fails -- a fatal user error, and one worth raising

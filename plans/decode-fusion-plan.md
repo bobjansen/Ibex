@@ -851,3 +851,56 @@ pass changes q21's plan and does not regress it, (4) relax the shape gate,
 (5) benchmark per query AND against a deliberately badly-ordered variant of each
 query, since the well-ordered suite cannot show the win and can only show the
 regression.
+
+### CORRECTION: Parquet footers do NOT carry distinct counts (2026-07-17)
+
+This document asserted three times that "Parquet footers carry per-row-group
+distinct counts, nothing plumbs them through". **The second half is true; the
+first half is false for our files, and probably for most.** Checked:
+
+    lineitem.parquet, 6 row groups: every column has_distinct_count = False
+
+`distinct_count` is optional in the Parquet spec and Arrow's writer does not
+populate it. So "plumb the distinct counts through LazyTable" — the next work
+item as written — has nothing to plumb. Do not start it.
+
+**What the footer does carry: min/max per column per row group, and null_count.**
+That is enough to derive a distinct-count *estimate*, because for an integer key
+`distinct <= span` where `span = max - min + 1`, and trivially `distinct <= rows`.
+So `distinct_est = min(rows, span)` is a real upper bound, computable from the
+footer with no decode.
+
+Validated against every TPC-H join key (whole-file min/max across row groups):
+
+| key | rows | span | `min(rows, span)` | actual distinct |
+|---|---:|---:|---:|---:|
+| customer.c_custkey | 150,000 | 150,000 | 150,000 | 150,000 (exact) |
+| supplier.s_suppkey | 10,000 | 10,000 | 10,000 | 10,000 (exact) |
+| nation.n_nationkey | 25 | 25 | 25 | 25 (exact) |
+| orders.o_orderkey | 1,500,000 | 6,000,000 | 1,500,000 | 1,500,000 (exact) |
+| lineitem.l_suppkey | 6,001,215 | 10,000 | 10,000 | 10,000 (exact) |
+| orders.o_custkey | 1,500,000 | 149,999 | 149,999 | ~99,996 (1.5x high) |
+| lineitem.l_orderkey | 6,001,215 | 6,000,000 | 6,000,000 | 1,500,000 (4x high) |
+
+Exact on five of seven, and the two misses are both *over*-estimates of distinct.
+Note what that does to `|L| * |R| / max(dL, dR)`: overestimating distinct
+**under**estimates the join's output, so an over-estimated key makes a relation
+look cheaper to join than it is. `l_orderkey` is exactly the case that matters
+(the 4x one is the fact table), so this cannot be adopted naively.
+
+**A sharper reading of the same data:** `span == rows` detects a *dense unique
+key* — it holds for c_custkey, s_suppkey and n_nationkey (all true PKs) and for
+none of the foreign keys. It misses o_orderkey (a real PK, but TPC-H leaves it
+sparse: span is 4x rows), which is a safe direction to miss in. It is a
+heuristic, not a proof — values `1,1,3` give span 3 over 3 rows — but combined
+with a PK-FK join's defining property (`|PK side ⋈ FK side| = |FK side|`) it
+gives an estimate that is exact whenever it fires, rather than a guess.
+
+**Revised next step.** Not "plumb distinct counts" — they do not exist. Instead:
+plumb **min/max/null_count** per column through `LazyTable` to the planner
+(the decoder already reads chunk statistics for the null-free fast paths, so the
+access pattern exists), derive `distinct_est` and dense-unique detection from
+them, and estimate Inner joins only where a PK is *detected* — declining
+otherwise rather than guessing. That respects the symmetric-prize constraint:
+it wins on PK-FK joins, which is most of them, and stays silent where it would
+be guessing.

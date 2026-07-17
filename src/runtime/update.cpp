@@ -490,6 +490,32 @@ auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const Scal
     if (fn == nullptr || !use_column_kernel(*fn, *kernel_call)) {
         return std::nullopt;
     }
+    // Splice a kernel only if its result validity is exactly its inputs'
+    // validity. The numeric fast path recomputes the field's validity with
+    // `collect_expr_validity`, which ANDs the input columns' masks; a kernel that
+    // *changes* nulls would then be re-nulled on the rows it just resolved. The
+    // null-handling kernels (fill_null/coalesce/float_clean) are exactly those.
+    // A `switch` with no `default` makes a newly added kernel a compile error
+    // here -- it must state its validity behaviour rather than default into the
+    // fast (and possibly wrong) path.
+    const auto preserves_input_validity = [](ScalarKernel kernel) {
+        switch (kernel) {
+            case ScalarKernel::Like:
+            case ScalarKernel::NumericCast:
+                return true;
+            case ScalarKernel::FillNull:
+            case ScalarKernel::Coalesce:
+            case ScalarKernel::FloatClean:
+            case ScalarKernel::None:
+                return false;
+        }
+        // Unreachable: the switch is exhaustive (a new ScalarKernel is a
+        // -Wswitch compile error above). Loud rather than a silent `false`.
+        invariant_violation("preserves_input_validity: unhandled ScalarKernel");
+    };
+    if (!preserves_input_validity(fn->scalar_kernel)) {
+        return std::nullopt;
+    }
     const ColumnEvalFn kernel = column_eval_of(*fn);
     if (kernel == nullptr) {
         return std::nullopt;

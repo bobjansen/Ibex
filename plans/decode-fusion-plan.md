@@ -776,3 +776,35 @@ q21's plan and whether the new plan is *faster*. That is the first evidence this
 pass would ever have. Only then consider Inner estimates and relaxing the shape
 gate — and note Inner is where the real risk lives, since every query the
 relaxation would newly reach is an inner chain.
+
+### Semi/Anti/Cross estimates added — and they do NOT unblock q21
+
+Added the sound half of a `Join` arm to `estimate_cardinality`: Semi and Anti
+(each selects from its left input, never duplicates it, so `left.rows` is a hard
+upper bound and the Filter arm's selectivity guess applies), and Cross (exact).
+Inner and the outer kinds still return nothing.
+
+**It does not unblock q21, which was the point of doing it.** Instrumenting the
+join kind the estimator gives up on: `JoinKind=0`, **Inner**. q21's join-chain
+leaf is a `Project` over a nested *inner* join — not, as predicted, over the
+semi join its `exists` clause lowers to. `collect_left_deep` only walks plain
+inner joins down the chain, so a nested inner join that fails its qualification
+(a predicate, no keys, or a right-deep shape) sits under a leaf and has to be
+*estimated* rather than decomposed. So the blocker is precisely the hard half.
+
+Kept anyway, with tests: the arm is sound, and every route to a working cost
+model needs it. But be clear about its status — **it changes no plan today**
+(verified: 1162 tests, 22/22 answers, and the reorder still declines on q21, the
+only query that reaches the cost model). It is a correct piece of a foundation,
+not a win, and it must not be cited as evidence the pass works.
+
+**The honest read on join reordering.** Every path forward now runs through an
+Inner join estimate, which needs distinct-key counts. That is a real project:
+Parquet footers carry per-row-group distinct counts, but nothing plumbs them
+through `LazyTable` to the planner, and a foreign-key assumption
+(`rows ~ max(|L|, |R|)`) is a guess that would drive reordering on 21 queries
+that currently have none. Given the pass has never once fired to effect, the
+sequence should be: plumb real distinct counts -> estimate Inner honestly ->
+show the pass changes q21's plan AND that the new plan is faster -> only then
+relax the shape gate -> benchmark per query. That is a considerably larger piece
+of work than "relax a gate", and it should be costed as such.

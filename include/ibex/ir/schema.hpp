@@ -2,6 +2,7 @@
 
 #include <ibex/ir/node.hpp>
 
+#include <expected>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
@@ -65,6 +66,16 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 /// `node`'s result. Operators not yet modelled return `Unknown`, which is
 /// always sound.
 [[nodiscard]] auto infer_schema(const Node& node, const SourceSchemas& sources = {}) -> SchemaInfo;
+
+/// Prove every ascription in `root` that sits over a statically known input
+/// schema, marking it checked (see `AscribeNode::checked`). Returns the first
+/// ascription that provably fails -- a fatal user error, and one worth raising
+/// before a single page is decoded.
+///
+/// Ascriptions over an input whose schema is unknown or open are left alone for
+/// the interpreter to check against real data.
+[[nodiscard]] auto check_ascriptions(Node& root, const SourceSchemas& sources)
+    -> std::expected<void, std::string>;
 
 /// Validate the column references in `node` (and its subtree) against the
 /// statically inferred input schemas, where the input schema is `Known`.

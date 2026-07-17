@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
@@ -188,6 +189,93 @@ auto child_schema(const Node& node, const SourceSchemas& sources, std::size_t in
 }
 
 }  // namespace
+
+namespace {
+
+auto type_name(ColumnType type) -> std::string_view {
+    switch (type) {
+        case ColumnType::Int32:
+            return "Int32";
+        case ColumnType::Int64:
+            return "Int64";
+        case ColumnType::Float32:
+            return "Float32";
+        case ColumnType::Float64:
+            return "Float64";
+        case ColumnType::Bool:
+            return "Bool";
+        case ColumnType::String:
+            return "String";
+        case ColumnType::Date:
+            return "Date";
+        case ColumnType::Timestamp:
+            return "Timestamp";
+    }
+    return "?";
+}
+
+auto check_one(const AscribeNode& asc, const SchemaInfo& input)
+    -> std::expected<void, std::string> {
+    for (const auto& field : asc.schema()) {
+        const auto* have = input.find(field.name);
+        if (have == nullptr) {
+            return std::unexpected("schema ascription: missing column '" + field.name + "'");
+        }
+        // Plain equality is right here even though the interpreter's check is
+        // lenient about Categorical: `column_ir_type` maps both Column<string>
+        // and Column<Categorical> to ColumnType::String, so the distinction the
+        // interpreter has to tolerate does not exist at the schema level.
+        if (field.type.has_value() && have->type.has_value() && *have->type != *field.type) {
+            return std::unexpected("schema ascription: column '" + field.name + "' is " +
+                                   std::string(type_name(*have->type)) +
+                                   " but the ascription requires " +
+                                   std::string(type_name(*field.type)));
+        }
+    }
+    if (asc.open()) {
+        return {};
+    }
+    // An exact ascription also asserts the input has no column it does not
+    // list. That is a question about the schema, so the schema answers it --
+    // no need to materialize the extras just to notice them.
+    for (const auto& have : input.fields()) {
+        const bool listed = std::any_of(asc.schema().begin(), asc.schema().end(),
+                                        [&](const SchemaField& f) { return f.name == have.name; });
+        if (!listed) {
+            return std::unexpected("schema ascription: input has extra column '" + have.name +
+                                   "' not in the ascribed schema (add `*` to allow extras)");
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+auto check_ascriptions(Node& root, const SourceSchemas& sources)
+    -> std::expected<void, std::string> {
+    for (const auto& child : root.children()) {
+        if (child != nullptr) {
+            if (auto below = check_ascriptions(*child, sources); !below.has_value()) {
+                return below;
+            }
+        }
+    }
+    if (root.kind() != NodeKind::Ascribe || root.children().empty() ||
+        root.children().front() == nullptr) {
+        return {};
+    }
+    const SchemaInfo input = infer_schema(*root.children().front(), sources);
+    if (!input.is_known() || input.is_open()) {
+        // Nothing to prove it against; the interpreter checks it against data.
+        return {};
+    }
+    auto& asc = static_cast<AscribeNode&>(root);
+    if (auto ok = check_one(asc, input); !ok.has_value()) {
+        return ok;
+    }
+    asc.set_checked();
+    return {};
+}
 
 auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo {
     switch (node.kind()) {

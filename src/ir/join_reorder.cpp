@@ -1,3 +1,4 @@
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_order.hpp>
 #include <ibex/ir/join_reorder.hpp>
 
@@ -95,6 +96,69 @@ auto aggregate_order_insensitive(const AggregateNode& aggregate) -> bool {
     });
 }
 
+/// True if `node` computes each output row from the corresponding input row
+/// alone, so the order and grouping of the rows beneath it cannot change what it
+/// produces. Reordering an inner chain changes neither the column set nor the
+/// multiset of rows, only their order -- which is exactly what such a node is
+/// blind to.
+///
+/// The order-sensitivity is per-EXPRESSION, not per-node kind: `update
+/// { m = rolling_mean(p, 20) }` reads its neighbours, so its values depend on
+/// the order the join happens to emit. `is_row_local_update_expr` is the
+/// existing front door for that question. A grouped `update ... by {...}` is
+/// excluded for the same reason.
+auto is_row_wise(const Node& node) -> bool {
+    switch (node.kind()) {
+        case NodeKind::Project:
+        case NodeKind::Rename:
+            return true;  // pure column plumbing
+        case NodeKind::Filter:
+            return is_row_local_update_expr(static_cast<const FilterNode&>(node).predicate());
+        case NodeKind::Update: {
+            const auto& update = static_cast<const UpdateNode&>(node);
+            if (!update.group_by().empty() || !update.tuple_fields().empty()) {
+                return false;
+            }
+            return std::ranges::all_of(update.fields(), [](const FieldSpec& field) {
+                return is_row_local_update_expr(field.expr);
+            });
+        }
+        case NodeKind::FilterProject:
+            return is_row_local_update_expr(
+                static_cast<const FilterProjectNode&>(node).predicate());
+        case NodeKind::FilterUpdateProject: {
+            const auto& fused = static_cast<const FilterUpdateProjectNode&>(node);
+            if (!is_row_local_update_expr(fused.predicate())) {
+                return false;
+            }
+            return std::ranges::all_of(fused.fields(), [](const FieldSpec& field) {
+                return is_row_local_update_expr(field.expr);
+            });
+        }
+        default:
+            return false;
+    }
+}
+
+/// The slot holding the aggregate's inner-join chain, which is only rarely the
+/// aggregate's immediate child: the aggregate block's own `select` lowers to a
+/// Project, and an equijoin's renames to an Update, so on the PDS-H suite the
+/// chain sits under a Project or Update on 21 of 22 queries. Returns nullptr
+/// when no chain is reachable through row-wise nodes.
+auto find_join_chain(NodePtr& slot) -> NodePtr* {
+    NodePtr* current = &slot;
+    while (*current != nullptr) {
+        if ((*current)->kind() == NodeKind::Join) {
+            return current;
+        }
+        if (!is_row_wise(**current) || (*current)->mutable_children().size() != 1) {
+            return nullptr;
+        }
+        current = &(*current)->mutable_children()[0];
+    }
+    return nullptr;
+}
+
 auto schemas_are_unambiguous(const std::vector<const Node*>& leaves, const std::vector<Edge>& edges,
                              const SourceSchemas& schemas) -> bool {
     robin_hood::unordered_set<std::string> join_keys;
@@ -131,9 +195,8 @@ auto connecting_keys(std::size_t candidate, const std::vector<std::size_t>& sele
     return nullptr;
 }
 
-auto reorder_aggregate_child(NodePtr child, const SourceSchemas& schemas,
-                             const SourceRowCounts& row_counts) -> NodePtr {
-    const auto order = choose_inner_join_order(*child, schemas, row_counts);
+auto reorder_aggregate_child(NodePtr child, const SourceStats& stats) -> NodePtr {
+    const auto order = choose_inner_join_order(*child, stats);
     if (!order.has_value()) {
         return child;
     }
@@ -149,7 +212,7 @@ auto reorder_aggregate_child(NodePtr child, const SourceSchemas& schemas,
     std::vector<const Node*> preview;
     std::vector<Edge> preview_edges;
     if (!scan_left_deep(*child, preview, preview_edges) ||
-        !schemas_are_unambiguous(preview, preview_edges, schemas)) {
+        !schemas_are_unambiguous(preview, preview_edges, stats.schemas)) {
         return child;
     }
 
@@ -175,23 +238,22 @@ auto reorder_aggregate_child(NodePtr child, const SourceSchemas& schemas,
     return result;
 }
 
-auto walk(NodePtr node, const SourceSchemas& schemas, const SourceRowCounts& row_counts)
-    -> NodePtr {
+auto walk(NodePtr node, const SourceStats& stats) -> NodePtr {
     if (node == nullptr) {
         return node;
     }
     for (auto& child : node->mutable_children()) {
-        child = walk(std::move(child), schemas, row_counts);
+        child = walk(std::move(child), stats);
     }
     if (node->kind() == NodeKind::Aggregate && node->mutable_children().size() == 1 &&
         node->mutable_children()[0] != nullptr) {
         const auto& aggregate = static_cast<const AggregateNode&>(*node);
-        if (aggregate_order_insensitive(aggregate) &&
-            node->mutable_children()[0]->kind() == NodeKind::Join) {
-            NodePtr reordered = reorder_aggregate_child(std::move(node->mutable_children()[0]),
-                                                        schemas, row_counts);
-            if (reordered != nullptr) {
-                node->mutable_children()[0] = std::move(reordered);
+        if (aggregate_order_insensitive(aggregate)) {
+            if (NodePtr* chain = find_join_chain(node->mutable_children()[0])) {
+                NodePtr reordered = reorder_aggregate_child(std::move(*chain), stats);
+                if (reordered != nullptr) {
+                    *chain = std::move(reordered);
+                }
             }
         }
     }
@@ -200,14 +262,13 @@ auto walk(NodePtr node, const SourceSchemas& schemas, const SourceRowCounts& row
 
 }  // namespace
 
-auto reorder_inner_joins_for_aggregates(NodePtr root, const SourceSchemas& schemas,
-                                        const SourceRowCounts& row_counts) -> NodePtr {
+auto reorder_inner_joins_for_aggregates(NodePtr root, const SourceStats& stats) -> NodePtr {
     if (root != nullptr) {
         std::uint64_t highest = 0;
         max_id(*root, highest);
         next_id() = highest + 1;
     }
-    return walk(std::move(root), schemas, row_counts);
+    return walk(std::move(root), stats);
 }
 
 }  // namespace ibex::ir

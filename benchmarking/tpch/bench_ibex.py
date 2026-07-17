@@ -224,7 +224,8 @@ def main() -> int:
         if args.statements:
             durations, (mode, reason) = run_query(qname, args.warmup, args.iters)
         else:
-            durations, (mode, reason) = run_query_whole_script(qname, args.warmup, args.iters, tmpdir)
+            # tmpdir is never None here
+            durations, (mode, reason) = run_query_whole_script(qname, args.warmup, args.iters, tmpdir) # pyright: ignore[reportArgumentType]
         avg_ms = statistics.mean(durations)
         note = f" [{mode}: {reason}]" if reason else f" [{mode}]"
         print(f"  avg={avg_ms:.2f}ms min={min(durations):.2f}ms max={max(durations):.2f}ms{note}",

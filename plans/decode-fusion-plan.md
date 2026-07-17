@@ -547,3 +547,61 @@ counts per side — for the 123ms and 585ms plans. The row counts will separate
 "the joins see unfiltered inputs" from "the joins carry too many columns", which
 is the question effect (2) turns on. Do not reason about it from node kinds
 again; two diagnoses in this thread died that way.
+
+### SOLVED: filter pushdown is schema-blind over readers (2026-07-17)
+
+`push_filters_into_joins` is called from **`lower.cpp`** (4810, 4841, 4849,
+4877), not from the driver — and at lower time `source_schemas` is **empty**,
+because a reader like `read_parquet` has no declared return schema. Instrumenting
+`classify` shows it plainly (`sources has 0 entries`, and the join's child is an
+`ExternCall`, not a `Scan` — this runs before `hoist_extern_sources`).
+
+The ordering is deliberate and documented at `lower.cpp:4805`: pushdown must run
+*before* canonicalize, because canonicalize fuses `Filter(Join(...))` into
+`FilterUpdateProject` and cannot tell which side produces a column. So pushdown
+gets exactly one attempt, at the moment when reader schemas do not yet exist.
+
+Whether a conjunct pushes then depends on whether the join side happens to
+describe itself:
+
+| side shape | schema at lower time | result |
+|---|---|---|
+| `Project(reader)` | **Known** — a Project's schema is its own field list, whatever it reads | pushes |
+| `Update(reader)`, bare `reader` | **Unknown** — Update propagates its input's schema, and the reader has none | blocked |
+
+Measured, per conjunct (`IBEX_DEBUG_PUSH` instrumentation of `classify`):
+
+- all sides `select`: 5 classify calls, every conjunct pushed -> 102ms
+- lineitem `update`: `right known=false`, so `l_shipdate` -> `Above` -> 123ms
+- fully natural: **zero classify calls** — nothing matched `Filter` over `Join`
+  at all, because with both sides unknown nothing pushed at the inner join
+  either, and canonicalize then fused the filter away -> 585ms
+
+The driver's own `push_filters_into_joins` call (`repl.cpp:4368`), which *does*
+have real schemas, is effectively dead here: by the time it runs the filter is
+inside a fused node and the pass only matches a plain `Filter` over a `Join`.
+
+**This is why the hand-fused suite is fast.** The `select` after each scan is not
+just doing projection pushdown by hand — it is *supplying the schema* that makes
+filter pushdown possible at all. That is a far bigger thing to have been doing by
+hand than anyone realized.
+
+**Confirmed by construction:** ascribing the three readers with their exact
+schemas (nothing else changed, still `update` renames, still filters above both
+joins) takes natural q03 from **574ms to 108ms**, against 96ms hand-fused, with
+the correct answer. An ascription gives the lowerer the schema, which is exactly
+and only what the pass was missing.
+
+**The fix is not to ascribe in user code.** It is to give the lowerer the reader
+schemas it already could have: a Parquet footer read is cheap and happens anyway.
+`try_execute_whole_script` currently lowers first and resolves lazy sources
+second; resolving them first (the extern args are literals in the AST) and
+feeding their schemas into `lower_script` would make every naturally-written
+join push its filters without the author writing anything. Ascription remains
+the escape hatch for readers whose schema genuinely cannot be known up front.
+
+Note this also explains the earlier bisect's non-linearity, which no
+node-kind-level story could: it is not a threshold, it is per-conjunct. Each
+conjunct pushes only if the side owning it self-describes, so projecting one
+table pushes only that table's conjunct — and one unpushed conjunct above a
+6M-row join dominates whatever the other two saved.

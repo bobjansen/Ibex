@@ -403,24 +403,46 @@ right and misleading. Corrected after testing:
   `open` is now a required parameter so a dropped argument is a compile error
   rather than a silent meaning change. Test: "wildcard ascription survives the
   IR clone".
-- **Ascription forced a full decode — FIXED for the wildcard form.**
-  `required_columns` handled Ascribe under its `default:` arm, which widens
-  demand to every column, so ascribing a reader silently disabled projection
-  pushdown: `{ l_shipdate: Date, * }` (ONE named column) cost 228ms vs 60ms
-  unascribed. A wildcard asserts only that the listed columns exist with the
-  listed types and explicitly allows extras, so whether the extras are
-  materialized is unobservable — demand is now the parent's plus the ascribed
-  names. Measured 63ms vs 60ms plain: the 4x is gone.
+- **Ascription forced a full decode (~4x) — FIXED, for exact and wildcard
+  alike.** `required_columns` handled Ascribe under its `default:` arm, which
+  widens demand to every column, so ascribing a reader silently disabled
+  projection pushdown: `{ l_shipdate: Date, * }` — one named column — cost
+  228ms against 60ms unascribed, and the exact 16-column form 235ms.
 
-  An **exact** ascription still widens, and must: it also asserts the input has
-  no column it does not list, and that can only be checked against the whole
-  input (235ms, unchanged). Narrowing it first would hide the very extras it
-  exists to reject.
+  The fix is to check the ascription against the source's **schema**, not its
+  data. `LazyTable::schema()` is the Parquet footer, and both drivers already
+  hold every source's names and types in `schemas` before any pass runs. A new
+  `ir::check_ascriptions` proves each ascription over a statically known input
+  and marks the node checked; a checked ascription is a pure identity, so the
+  interpreter skips its runtime check and `required_columns` passes the parent's
+  demand straight through. Both forms are now at parity with an unascribed scan
+  (60-63ms vs 60ms), and a bad ascription is now caught *before* a page is
+  decoded rather than after.
+
+  **This supersedes the note that briefly stood here** claiming an exact
+  ascription "must" widen because "no unlisted column" can only be checked
+  against the whole input. That was wrong: it is a question about the schema,
+  and the schema answers it. The wildcard-only fix (55ff818) was a half measure
+  built on the same mistake — it fixed the case where the assertion happened not
+  to need the extras, rather than noticing the assertion never needed *data* at
+  all.
+
+  Two things this touched that are worth knowing:
+  - `ir::ColumnType` has **no Categorical** — `column_ir_type` maps both
+    `Column<string>` and `Column<Categorical>` to `String`. So the leniency the
+    interpreter needs (its check sees runtime variants, where Categorical is
+    distinct) does not exist at the schema level, and plain equality is correct
+    in the new pass. `s_name: String` over a dictionary-encoded column still
+    passes, which is the case that would have broken had this gone the other way.
+  - The lowerer's static check (`lower.cpp`) and the interpreter's runtime check
+    disagree on exactly that point — the static one uses strict equality. It has
+    never bitten because it only fires on a known input schema and readers never
+    had one. Left alone, but it is a live inconsistency if reader schemas ever
+    reach the lowerer.
 
   Bad ascriptions stay fatal even when nothing else reads the column — verified
-  on a lazy source for both a missing column and a wrong type, `ibex file.ibex`
-  and `ibex_eval` exit 1. (Interactive `:run` reports and keeps the session,
-  which is the right split.)
+  on a lazy source for both a missing column and a wrong type; `ibex file.ibex`
+  and `ibex_eval` exit 1. (Interactive `:run` reports and keeps the session.)
 
 Note this is now academic for q15/q22 — the shared-binding schema fix (2241720)
 means they need no ascription at all. It matters for anyone who ascribes a

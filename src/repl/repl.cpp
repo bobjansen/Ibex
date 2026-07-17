@@ -3306,6 +3306,13 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return it == lazy_tables.end() ? nullptr : it->second.get();
         };
 
+        // Same as the whole-script driver: prove the ascriptions against the
+        // source schemas before demand is computed, so they stop demanding the
+        // columns they only assert.
+        if (auto ok = ir::check_ascriptions(*lowered.value(), context.source_schemas);
+            !ok.has_value()) {
+            return std::unexpected(ok.error());
+        }
         auto predicates = ir::scan_predicates(*lowered.value());
         std::set<std::string> applied_scan_filters;
         for (const auto& [name, conjuncts] : predicates) {
@@ -4351,6 +4358,13 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
         }
 
+        // Prove what the ascriptions assert before anything is decoded: the
+        // assertion is about shape, and `schemas` already holds every source's
+        // names and types straight from its footer. Proving them here is also
+        // what stops them demanding the data they only assert.
+        if (auto ok = ir::check_ascriptions(*rewritten, schemas); !ok.has_value()) {
+            return std::unexpected(ok.error());
+        }
         rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
         rewritten =

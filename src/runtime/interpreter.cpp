@@ -560,6 +560,12 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 }
                 return false;
             };
+            if (asc.checked()) {
+                // Proven against the input schema before execution, so the
+                // columns it names need not be materialized -- and must not
+                // be looked for here, since demand was narrowed on that basis.
+                return child;
+            }
             for (const auto& field : asc.schema()) {
                 const auto* col = t.find(field.name);
                 if (col == nullptr) {

@@ -200,6 +200,39 @@ TEST_CASE("schema: update infers arithmetic result types", "[ir][schema]") {
     REQUIRE(type_of(s, "d") == ColumnType::Float64);  // division -> Float64
 }
 
+// --- Fused nodes --------------------------------------------------------
+//
+// canonicalize fuses `Project(Filter(x))` and `Project(Update(Filter(x)))` --
+// the shape of an ordinary scan leaf -- so these arms are not a corner case:
+// while they were Unknown, no real plan's leaf had a schema, and every pass
+// gated on a Known input silently declined on every query.
+
+TEST_CASE("schema: a fused filter+select reports the projection's columns", "[ir][schema]") {
+    // R5 fuses this into FilterProject; the schema must not change with it.
+    auto s = schema_of("t[filter a > 0, select { c, a }];", base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(names(s) == std::vector<std::string>{"c", "a"});
+    REQUIRE(type_of(s, "c") == ColumnType::String);
+    REQUIRE(type_of(s, "a") == ColumnType::Int64);
+}
+
+TEST_CASE("schema: a fused filter+update+select types its computed fields", "[ir][schema]") {
+    // R6 fuses this into FilterUpdateProject. The update's fields are visible
+    // only through the projection, so the update has to be typed first.
+    // Chained blocks, since `select` and `update` are mutually exclusive within
+    // one (SPEC C5) -- the fusion is what brings them back together.
+    auto s = schema_of("t[filter a > 0][update { d = a * b }][select { a, d }];", base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(names(s) == std::vector<std::string>{"a", "d"});
+    REQUIRE(type_of(s, "d") == ColumnType::Float64);  // Int * Float -> Float64
+}
+
+TEST_CASE("schema: a fused node carries a unique key through", "[ir][schema]") {
+    auto s = schema_of("t[select { a, total = sum(b) }, by a][filter total > 0, select { a }];",
+                       base_sources());
+    REQUIRE(s.is_unique_within({"a"}));
+}
+
 TEST_CASE("schema: an unknown source produces an unknown schema", "[ir][schema]") {
     auto s = schema_of("t[filter a > 0];");  // no source schema injected
     REQUIRE_FALSE(s.is_known());

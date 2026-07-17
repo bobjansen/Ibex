@@ -11,8 +11,11 @@
 
 namespace ibex::runtime {
 
-LazyTable::LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode)
-    : schema_(std::move(schema)), rows_(rows), decode_(std::move(decode)) {}
+LazyTable::LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats)
+    : schema_(std::move(schema)),
+      rows_(rows),
+      decode_(std::move(decode)),
+      stats_(std::move(stats)) {}
 
 auto LazyTable::project(const std::set<std::string>& names) -> std::expected<Table, std::string> {
     std::vector<std::string> missing;

@@ -1822,3 +1822,22 @@ totals[filter total == scalar(totals[select { m = max(total) }])];
 )";
     CHECK(capture_planner_line(source, registry) == "planner: whole-script");
 }
+
+TEST_CASE("REPL wildcard ascription survives the IR clone", "[repl][lazy][planner][ascribe]") {
+    // `as DataFrame<{ a: Int, * }>` allows extra columns. Whole-script lowering
+    // clones bound IR per reference, and the clone rebuilt the AscribeNode
+    // without its `open` flag -- silently turning the wildcard into an exact
+    // schema, so any unlisted column became an error. Statement mode never
+    // cloned, so only whole-script execution saw it.
+    std::vector<std::vector<std::string>> decode_calls;
+    ibex::runtime::ExternRegistry registry;
+    register_recording_lazy_source(registry, decode_calls);  // yields columns a, b
+
+    const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let rows = read_fake() as DataFrame<{ a: Int, * }>;
+rows[select { n = count() }];
+)";
+    CHECK(capture_planner_line(source, registry) == "planner: whole-script");
+    REQUIRE(ibex::repl::execute_script(source, registry));
+}

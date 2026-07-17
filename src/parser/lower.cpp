@@ -4817,19 +4817,27 @@ auto lower(const Program& program) -> LowerResult {
     return optimized;
 }
 
-auto lower_script(const Program& program) -> ScriptPlanResult {
+auto lower_script(const Program& program, const ir::SourceSchemas& reader_schemas)
+    -> ScriptPlanResult {
     auto effects = analyze_effects(program);
     if (!effects.has_value()) {
         return std::unexpected(LowerError{.message = effects.error().format()});
     }
 
     robin_hood::unordered_map<std::string, ir::NodePtr> bindings;
-    Lowerer lowerer(&bindings);
+    // reader_schemas lands in binding_schemas_, which source_schemas() overlays,
+    // so a reader call site resolves for check_column_refs and -- the point --
+    // for the join filter pushdown a few lines below.
+    Lowerer lowerer(&bindings, {}, {}, {}, {}, reader_schemas);
     auto lowered = lowerer.lower_script(program);
     if (!lowered.has_value()) {
         return lowered;
     }
-    auto source_schemas = build_source_schemas(lowerer.table_extern_decls());
+    // source_schemas(), not build_source_schemas(): the accessor overlays the
+    // lowerer's binding schemas, which is where the caller's reader call-site
+    // schemas live. Rebuilding from the extern declarations alone drops them,
+    // and the pushdown below is exactly what needs them.
+    auto source_schemas = lowerer.source_schemas();
     // Shared bindings run first at execution time, so their plans get the same
     // checks and rewrites as the result, and each contributes its inferred
     // schema for the plans that scan it (an Unknown schema is sound — checks

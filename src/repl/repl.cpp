@@ -4294,14 +4294,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
     }
 
-    auto script = parser::lower_script(program);
-    if (!script.has_value()) {
-        return decline(fmt::format("script did not lower: {}", script.error().message));
-    }
-    if (!script->preamble.empty()) {
-        return decline("script has statements that must run before the plan");
-    }
-
     robin_hood::unordered_set<std::string> loaded_plugins;
     std::set<std::string> lazy_callees;
     for (const auto& stmt : program.statements) {
@@ -4325,6 +4317,65 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     }
     if (lazy_callees.empty()) {
         return decline("script has no lazy table sources to plan against");
+    }
+
+    // Resolve the readers BEFORE lowering, so lowering knows what they return.
+    //
+    // Join filter pushdown runs inside lower_script -- it has to, because it
+    // must precede canonicalize, which fuses Filter(Join(...)) and cannot tell
+    // which side of a join owns a column. Without reader schemas that pass is
+    // blind: it pushes a conjunct only when the owning join side happens to be a
+    // Project, which describes itself regardless of what it reads. So a query
+    // that renames a join key with `update` (the natural way to write it, since
+    // TPC-H-style keys do not match by name) loses filter pushdown entirely and
+    // joins unfiltered inputs.
+    //
+    // A reader's schema costs a footer read, which the executor pays anyway.
+    // Lower once to discover which readers are called with which arguments, ask
+    // each for its schema, then lower for real with the answers.
+    ir::SourceSchemas reader_schemas;
+    if (auto probe = parser::lower_script(program); probe.has_value()) {
+        std::vector<ir::NodePtr> probe_plans;
+        probe_plans.push_back(std::move(probe->result));
+        for (auto& shared : probe->shared_bindings) {
+            probe_plans.push_back(std::move(shared.plan));
+        }
+        for (auto& sink : probe->sinks) {
+            probe_plans.push_back(std::move(sink.input));
+        }
+        for (auto& plan : probe_plans) {
+            if (plan == nullptr) {
+                continue;
+            }
+            auto [_, hoisted] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
+            for (const auto& source : hoisted) {
+                const auto key = ir::extern_call_site_key(source.callee, source.args);
+                if (!key.has_value() || reader_schemas.contains(*key)) {
+                    continue;
+                }
+                const auto* function = externs.find(source.callee);
+                auto args = literal_args(source.args);
+                if (function == nullptr || !function->lazy_table_func || !args.has_value()) {
+                    continue;
+                }
+                auto lazy = function->lazy_table_func(*args);
+                if (!lazy.has_value()) {
+                    // A reader that cannot even be opened is the executor's
+                    // error to report, with its own message. Leave the schema
+                    // unknown and let lowering proceed as it did before.
+                    continue;
+                }
+                reader_schemas.insert_or_assign(*key, table_schema_info(lazy.value()->schema()));
+            }
+        }
+    }
+
+    auto script = parser::lower_script(program, reader_schemas);
+    if (!script.has_value()) {
+        return decline(fmt::format("script did not lower: {}", script.error().message));
+    }
+    if (!script->preamble.empty()) {
+        return decline("script has statements that must run before the plan");
     }
 
     const auto evaluate = [&](ir::NodePtr plan, const runtime::TableRegistry& base_tables)

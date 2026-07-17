@@ -93,7 +93,17 @@ struct LowerContext {
 /// explicit effects instead of forcing them into the relational result tree.
 /// The caller schedules `preamble`, `sinks`, and `result`; the latter can be
 /// passed through whole-script optimization before any source is materialized.
-[[nodiscard]] auto lower_script(const Program& program) -> ScriptPlanResult;
+/// Lower a whole script into a batch-executable plan.
+///
+/// `reader_schemas` supplies the schemas of reader call sites, keyed by
+/// `ir::extern_call_site_key`. It matters more than it looks: join filter
+/// pushdown runs inside this function, because it must precede canonicalize
+/// (which fuses `Filter(Join(...))` and cannot tell which side owns a column) --
+/// and without reader schemas that pass is blind, pushing a conjunct only when
+/// its join side happens to be a `Project` that describes itself. Passing them
+/// is what lets a naturally-written join push its filters at all.
+[[nodiscard]] auto lower_script(const Program& program,
+                                const ir::SourceSchemas& reader_schemas = {}) -> ScriptPlanResult;
 
 /// Lower a single expression with an external context.
 [[nodiscard]] auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult;

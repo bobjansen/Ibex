@@ -11,6 +11,12 @@ namespace ibex::repl {
 /// Configuration for the REPL session.
 struct ReplConfig {
     bool verbose = false;
+    /// Print `planner: whole-script` / `planner: statements (<reason>)` to
+    /// stderr per script. Deliberately NOT folded into `verbose`, which also
+    /// raises the spdlog level to debug: the benchmark harness reads this line
+    /// to record which engine path it measured, and must not pay for logging
+    /// someone later adds to a hot path.
+    bool report_planner = false;
     std::string prompt = "ibex> ";
     bool persistent_history = true;
     /// History file used when readline is available. Empty means

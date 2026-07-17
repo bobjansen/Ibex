@@ -13,8 +13,9 @@ The mechanism the goal needs already exists. `try_execute_whole_script`
 (`src/repl/repl.cpp:4228`) lowers an eligible script into relational plans,
 runs `ir::required_columns` + `ir::scan_predicates` over the *complete* DAG,
 and materializes each lazy source through `LazyTable::project` /
-`project_where` with only the demanded columns. 21 of the 22 PDS-H queries
-are eligible (q16 uses `import`, which the gate declines).
+`project_where` with only the demanded columns. **19** of the 22 PDS-H queries
+are eligible; q15, q16 and q22 decline (see "The gate declines three queries,
+not one" below).
 
 Correctness is now validated end to end:
 
@@ -254,11 +255,48 @@ executor's `cached_bindings` already dedups those.
 
 Measured SF-2, whole-script vs statement mode (back-to-back pairs on a
 drifty box): q11 +70%→+0.6%, q15 +55%→+2%, q22 +40%→**faster** (92 vs
-98ms — the shared `substring` update runs once), q21 +27%→**faster** (1336
-vs 1450ms), q14/q02 → parity. Whole-script mode is now parity-or-better
-than hand-tuned statement mode on every query measured. Cross-boundary
+98ms), q21 +27%→**faster** (1336 vs 1450ms), q14/q02 → parity. Cross-boundary
 column pruning (main plan demanding fewer of a shared binding's output
 columns) is still v2 — shared plans materialize their full output schema.
+
+**Correction (2026-07-17): the q15/q22 numbers above are not what they look
+like.** Those two queries never reached the planner at all — they decline the
+gate and silently fall back, so "q22 92 vs 98ms, the shared `substring` update
+runs once" was measuring statement mode against itself, and the earlier claim
+of "parity-or-better on every query measured" rested partly on a fallback.
+This went unnoticed because declining was silent. It is now reported (below).
+
+Re-measured SF-1, min-of-2-rounds interleaved, quiet box, whole-script vs
+statements: **geomean 0.983× over the 19 planned queries**, suite total
+3247 vs 3299ms (−1.6%). Best q02 −11.2%, q05 −8.8%, q22 −7.8%, q14/q06 −6.2%;
+worst q06 +6.2%, q04 +5.0%. Nothing regresses beyond noise, so whole-script is
+now the harness default — and it is the path `ibex file.ibex` already takes.
+
+## The gate declines three queries, not one
+
+`try_execute_whole_script` returns `nullopt` to mean "fall back", which is
+invisible from outside. It now fills a `decline_reason`, and `execute_script`
+prints `planner: whole-script` / `planner: statements (<reason>)` under
+`--verbose`; `bench_ibex.py` records it per query into the TSV's `mode` column
+and warns when anything fell back. A benchmark that cannot see which engine
+path it measured cannot tell a regression from a gate change.
+
+- **q16** — `script uses \`import\``. Known, structural.
+- **q15, q22** — `script did not lower: scalar(): the enclosing query's
+  columns are not statically known, so a correlated subquery cannot be used
+  here`. This one is architectural, not a bug: whole-script lowering happens
+  *before* any source is read, so `read_parquet(...)`'s schema is still open,
+  and the lowerer cannot classify an identifier inside `scalar(...)` as inner
+  or outer without the enclosing schema — so it refuses. Statement mode never
+  hits this because each statement lowers *after* its predecessors
+  materialized, giving `scalar()` a closed outer schema to resolve against.
+  Both queries take `scalar(...)` over a previously-bound `let` (q15's
+  `revenue`, q22's `in_scope`), which is exactly the shape that needs it.
+  Fixing it means giving the lowerer schemas for lazy sources up front — the
+  Parquet footer already has them, and `ir::SourceSchemas` already exists for
+  the join rewrites; the gap is that lowering runs before that is populated.
+  Worth doing: it would also let the shared-binding pass reach q15/q22, whose
+  `scalar()` subqueries re-scan a binding the main plan already computes.
 
 ## Gotchas for whoever picks this up
 

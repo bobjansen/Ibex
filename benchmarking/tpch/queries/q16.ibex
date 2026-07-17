@@ -8,8 +8,12 @@
 // {49, 14, 23, 45, 19, 3, 36, 9}.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import "parquet";
-import "csv";
+// Declared inline rather than via `import "parquet"` — these are the same two
+// declarations the import stubs carry, but `import` makes the whole-script
+// planner decline, so the imported form silently ran on the statement path
+// while the other 21 queries were batch-planned.
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
 let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet")[
     filter p_brand != "Brand#45" && !like(p_type, "MEDIUM POLISHED%")

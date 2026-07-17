@@ -12,17 +12,26 @@ scans the Parquet file, just from a warm page cache rather than warm/reused
 in-memory tables).
 
 Two timing modes:
-  default        -- each query body is split into statements piped one at a
-                    time; a query's time is the sum of its per-statement
-                    `time:` lines. Good for stage breakdowns, but the REPL's
-                    whole-script batch planner never engages.
-  --whole-script -- each query is ONE `:run <file>` of the query file (minus
-                    its write_csv sink) in the warm REPL, so the batch planner
-                    (source hoisting, whole-plan pushdown, join rewrites)
-                    executes it the way `ibex file.ibex` would.
+  default      -- each query is ONE `:run <file>` of the query file (minus its
+                  write_csv sink) in the warm REPL, so the batch planner
+                  (source hoisting, whole-plan pushdown, join rewrites) executes
+                  it the way `ibex file.ibex` does. This is the default because
+                  it is the path real scripts take: `execute_script` always
+                  tries the whole-script planner first. Polars is timed through
+                  its lazy API, which likewise optimizes the whole plan, so this
+                  is also the apples-to-apples comparison.
+  --statements -- each query body is split into statements piped one at a time;
+                  a query's time is the sum of its per-statement `time:` lines.
+                  The batch planner never engages. Keep this for stage
+                  breakdowns and A/B profiling of a single operator.
+
+The planner can decline a script (see try_execute_whole_script) and silently
+fall back to statements, which would look like an unexplained regression here.
+So the REPL is run with --report-planner and the line it prints is recorded
+per query, reported below, and written to the `mode` column of the TSV.
 
 Usage:
-  uv run benchmarking/tpch/bench_ibex.py [--whole-script] [--warmup N] [--iters N] [--out path]
+  uv run benchmarking/tpch/bench_ibex.py [--statements] [--warmup N] [--iters N] [--out path]
 """
 import argparse
 import pathlib
@@ -41,6 +50,7 @@ QUERIES_DIR = SCRIPT_DIR / "queries"
 QUERY_NAMES = ["q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22"]
 
 TIME_RE = re.compile(r"^time:\s*([\d.]+)\s*(us|ms|s)\s*$")
+PLANNER_RE = re.compile(r"^planner:\s*(\S+?)(?:\s*\((.*)\))?\s*$")
 
 
 def to_ms(value: float, unit: str) -> float:
@@ -100,10 +110,10 @@ def extract_setup_and_body(qname: str) -> tuple[str, str, int]:
     return "\n".join(setup), "\n".join(body_statements) + "\n", len(body_statements)
 
 
-def run_repl_script(qname: str, script: str) -> list[float]:
-    """Drive the warm REPL with `script` and return every `time:` line in ms."""
+def run_repl_script(qname: str, script: str) -> tuple[list[float], str]:
+    """Drive the warm REPL with `script`; return (every `time:` line in ms, stderr)."""
     proc = subprocess.run(
-        [str(IBEX_BIN), "--plugin-path", str(PLUGIN_DIR)],
+        [str(IBEX_BIN), "--plugin-path", str(PLUGIN_DIR), "--report-planner"],
         input=script,
         cwd=IBEX_ROOT,
         capture_output=True,
@@ -112,16 +122,31 @@ def run_repl_script(qname: str, script: str) -> list[float]:
     )
     if proc.returncode != 0:
         raise RuntimeError(f"{qname}: ibex REPL failed (exit {proc.returncode}):\n{proc.stderr}")
-    return [to_ms(float(m.group(1)), m.group(2)) for m in map(TIME_RE.match, proc.stdout.splitlines()) if m]
+    times = [to_ms(float(m.group(1)), m.group(2))
+             for m in map(TIME_RE.match, proc.stdout.splitlines()) if m]
+    return times, proc.stderr
 
 
-def run_query(qname: str, warmup: int, iters: int) -> list[float]:
+def planner_mode(stderr: str) -> tuple[str, str]:
+    """Read the `planner:` line the REPL prints under --report-planner. Every :run
+    of the same file reports the same mode, so the set should hold a single value.
+    """
+    seen = {(m.group(1), m.group(2) or "") for m in map(PLANNER_RE.match, stderr.splitlines()) if m}
+    if not seen:
+        return "unknown", "no planner line — is the REPL built from this tree?"
+    if len(seen) > 1:
+        modes = ", ".join(sorted(m for m, _ in seen))
+        return "mixed", f"runs disagreed: {modes}"
+    return seen.pop()
+
+
+def run_query(qname: str, warmup: int, iters: int) -> tuple[list[float], tuple[str, str]]:
     setup, body, n_statements = extract_setup_and_body(qname)
     script_parts = [setup, ":timing on"]
     script_parts.extend([body] * (warmup + iters))
     script = "\n".join(script_parts) + "\n:quit\n"
 
-    times_ms = run_repl_script(qname, script)
+    times_ms, _ = run_repl_script(qname, script)
     expected = n_statements * (warmup + iters)
     if len(times_ms) != expected:
         raise RuntimeError(
@@ -134,10 +159,12 @@ def run_query(qname: str, warmup: int, iters: int) -> list[float]:
         sum(times_ms[i * n_statements : (i + 1) * n_statements])
         for i in range(warmup + iters)
     ]
-    return per_iter[warmup:]
+    return per_iter[warmup:], ("statements", "forced by --statements")
 
 
-def run_query_whole_script(qname: str, warmup: int, iters: int, tmpdir: pathlib.Path) -> list[float]:
+def run_query_whole_script(
+    qname: str, warmup: int, iters: int, tmpdir: pathlib.Path
+) -> tuple[list[float], tuple[str, str]]:
     """Time the query as ONE :run of the whole file (minus its write_csv sink),
     so the REPL's batch planner sees the complete script: source hoisting,
     whole-plan projection/selection pushdown, and join rewrites all engage,
@@ -150,12 +177,12 @@ def run_query_whole_script(qname: str, warmup: int, iters: int, tmpdir: pathlib.
 
     runs = warmup + iters
     script = "\n".join([":timing on"] + [f":run {script_path}"] * runs) + "\n:quit\n"
-    times_ms = run_repl_script(qname, script)
+    times_ms, stderr = run_repl_script(qname, script)
     if len(times_ms) != runs:
         raise RuntimeError(
             f"{qname}: expected {runs} timing lines (1 per :run), got {len(times_ms)}"
         )
-    return times_ms[warmup:]
+    return times_ms[warmup:], planner_mode(stderr)
 
 
 def percentile(data: list[float], p: float) -> float:
@@ -171,9 +198,10 @@ def main() -> int:
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--out", default=None)
     parser.add_argument(
-        "--whole-script", action="store_true",
-        help="time each query as one :run of the whole file through the batch "
-             "planner, instead of summing per-statement timings")
+        "--statements", action="store_true",
+        help="time each query by summing its per-statement timings, bypassing the "
+             "whole-script batch planner. For stage breakdowns; not the path "
+             "`ibex file.ibex` takes.")
     parser.add_argument('queries', nargs='*')
     args = parser.parse_args()
 
@@ -181,24 +209,26 @@ def main() -> int:
         print(f"error: {IBEX_BIN} not found — run cmake --build build-release first", file=sys.stderr)
         return 1
 
-    default_name = "ibex_whole_script.tsv" if args.whole_script else "ibex.tsv"
+    default_name = "ibex_statements.tsv" if args.statements else "ibex.tsv"
     out_path = pathlib.Path(args.out) if args.out else SCRIPT_DIR / "results" / default_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     tmpdir = None
-    if args.whole_script:
+    if not args.statements:
         tmpdir_handle = tempfile.TemporaryDirectory(prefix="ibex_ws_")
         tmpdir = pathlib.Path(tmpdir_handle.name)
 
     rows = []
     for qname in args.queries or QUERY_NAMES:
         print(f"=== ibex {qname} ===", file=sys.stderr)
-        if args.whole_script:
-            durations = run_query_whole_script(qname, args.warmup, args.iters, tmpdir)
+        if args.statements:
+            durations, (mode, reason) = run_query(qname, args.warmup, args.iters)
         else:
-            durations = run_query(qname, args.warmup, args.iters)
+            durations, (mode, reason) = run_query_whole_script(qname, args.warmup, args.iters, tmpdir)
         avg_ms = statistics.mean(durations)
-        print(f"  avg={avg_ms:.2f}ms min={min(durations):.2f}ms max={max(durations):.2f}ms", file=sys.stderr)
+        note = f" [{mode}: {reason}]" if reason else f" [{mode}]"
+        print(f"  avg={avg_ms:.2f}ms min={min(durations):.2f}ms max={max(durations):.2f}ms{note}",
+              file=sys.stderr)
         rows.append({
             "framework": "ibex",
             "query": qname,
@@ -208,16 +238,26 @@ def main() -> int:
             "stddev_ms": statistics.pstdev(durations) if len(durations) > 1 else 0.0,
             "p95_ms": percentile(durations, 0.95),
             "p99_ms": percentile(durations, 0.99),
+            "mode": mode,
         })
 
     with open(out_path, "w") as f:
-        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\n")
+        f.write("framework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\tmode\n")
         for r in rows:
             f.write(
                 f"{r['framework']}\t{r['query']}\t{r['avg_ms']:.3f}\t{r['min_ms']:.3f}\t"
-                f"{r['max_ms']:.3f}\t{r['stddev_ms']:.3f}\t{r['p95_ms']:.3f}\t{r['p99_ms']:.3f}\n"
+                f"{r['max_ms']:.3f}\t{r['stddev_ms']:.3f}\t{r['p95_ms']:.3f}\t{r['p99_ms']:.3f}\t"
+                f"{r['mode']}\n"
             )
     print(f"results written to {out_path}", file=sys.stderr)
+
+    # A query that quietly fell back is timing a different engine path than the
+    # rest of the table; say so rather than letting it read as a slow query.
+    if not args.statements:
+        fell_back = [r["query"] for r in rows if r["mode"] != "whole-script"]
+        if fell_back:
+            print(f"\nNOTE: {len(fell_back)} quer{'y' if len(fell_back) == 1 else 'ies'} did not "
+                  f"use the whole-script planner: {', '.join(fell_back)}", file=sys.stderr)
     return 0
 
 

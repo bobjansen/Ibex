@@ -1841,3 +1841,64 @@ rows[select { n = count() }];
     CHECK(capture_planner_line(source, registry) == "planner: whole-script");
     REQUIRE(ibex::repl::execute_script(source, registry));
 }
+
+TEST_CASE("REPL wildcard ascription does not materialize what it only asserts",
+          "[repl][lazy][planner][ascribe]") {
+    // Naming a column in an ascription asserts its shape; it does not ask for
+    // its data. A wildcard allows extras, so whether they are materialized is
+    // unobservable -- demand must stay narrow or ascribing a reader silently
+    // costs a full decode (~4x on a lineitem scan).
+    std::vector<std::vector<std::string>> decode_calls;
+    ibex::runtime::ExternRegistry registry;
+    register_recording_lazy_source(registry, decode_calls);  // columns a, b
+
+    SECTION("only the asserted column is decoded, not the whole source") {
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let rows = read_fake() as DataFrame<{ a: Int, * }>;
+rows[select { n = count() }];
+)";
+        REQUIRE(ibex::repl::execute_script(source, registry));
+        REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
+    }
+
+    SECTION("an exact ascription still reads everything, to reject extras") {
+        // It asserts the input has NO unlisted column, which can only be
+        // checked against the whole input.
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let rows = read_fake() as DataFrame<{ a: Int, b: Int }>;
+rows[select { n = count() }];
+)";
+        REQUIRE(ibex::repl::execute_script(source, registry));
+        REQUIRE(decode_calls.size() == 1);
+        CHECK(decode_calls.front() == std::vector<std::string>{"a", "b"});
+    }
+}
+
+TEST_CASE("REPL ascribing a column the source lacks is a fatal error",
+          "[repl][lazy][planner][ascribe]") {
+    // Fatal user error, even when nothing else in the script reads the column:
+    // narrowing demand must not let a bad ascription through unchecked.
+    std::vector<std::vector<std::string>> decode_calls;
+    ibex::runtime::ExternRegistry registry;
+    register_recording_lazy_source(registry, decode_calls);
+
+    SECTION("missing column") {
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let rows = read_fake() as DataFrame<{ nope: Int, * }>;
+rows[select { n = count() }];
+)";
+        CHECK_FALSE(ibex::repl::execute_script(source, registry));
+    }
+
+    SECTION("wrong type") {
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let rows = read_fake() as DataFrame<{ a: String, * }>;
+rows[select { n = count() }];
+)";
+        CHECK_FALSE(ibex::repl::execute_script(source, registry));
+    }
+}

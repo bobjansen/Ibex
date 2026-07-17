@@ -403,15 +403,24 @@ right and misleading. Corrected after testing:
   `open` is now a required parameter so a dropped argument is a compile error
   rather than a silent meaning change. Test: "wildcard ascription survives the
   IR clone".
-- **Ascription still forces a full decode, and that is a genuine open gap.**
-  Even `{ l_shipdate: Date, * }` — one named column — makes the lineitem scan
-  cost 228ms vs 60ms unascribed (~4x); the closed 16-column form costs 235ms.
-  Naming a column in an ascription should not imply materializing it: the check
-  needs each column's *name and type*, which the Parquet footer already carries,
-  not its *data*. So `required_columns` should not turn an Ascribe's field list
-  into data demand, and the runtime check over a lazy scan should validate
-  against the source schema rather than the materialized projection. Until then,
-  ascribing a reader silently disables projection pushdown.
+- **Ascription forced a full decode — FIXED for the wildcard form.**
+  `required_columns` handled Ascribe under its `default:` arm, which widens
+  demand to every column, so ascribing a reader silently disabled projection
+  pushdown: `{ l_shipdate: Date, * }` (ONE named column) cost 228ms vs 60ms
+  unascribed. A wildcard asserts only that the listed columns exist with the
+  listed types and explicitly allows extras, so whether the extras are
+  materialized is unobservable — demand is now the parent's plus the ascribed
+  names. Measured 63ms vs 60ms plain: the 4x is gone.
+
+  An **exact** ascription still widens, and must: it also asserts the input has
+  no column it does not list, and that can only be checked against the whole
+  input (235ms, unchanged). Narrowing it first would hide the very extras it
+  exists to reject.
+
+  Bad ascriptions stay fatal even when nothing else reads the column — verified
+  on a lazy source for both a missing column and a wrong type, `ibex file.ibex`
+  and `ibex_eval` exit 1. (Interactive `:run` reports and keeps the session,
+  which is the right split.)
 
 Note this is now academic for q15/q22 — the shared-binding schema fix (2241720)
 means they need no ascription at all. It matters for anyone who ascribes a

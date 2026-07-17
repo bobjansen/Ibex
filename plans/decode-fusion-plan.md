@@ -904,3 +904,54 @@ them, and estimate Inner joins only where a PK is *detected* — declining
 otherwise rather than guessing. That respects the symmetric-prize constraint:
 it wins on PK-FK joins, which is most of them, and stays silent where it would
 be guessing.
+
+### Better idea: carry unique constraints by construction
+
+Uniqueness gives a join estimate **without any distinct counts**. For an inner
+join on a key that is unique on one side, each row of the other side matches at
+most one row, so `|PK side ⋈ FK side| <= |FK side|` — exactly. There is no
+`|L| * |R| / max(dL, dR)` to compute and no cardinality of the key to know. You
+only need to know *that* a side is unique, never *how many* values it has.
+
+And most of the uniqueness in a plan is **provable by construction**, not
+inferred:
+
+| node | unique key of its output | evidence |
+|---|---|---|
+| `select {...}, by {a, b}` | `{a, b}` | proof — one row per distinct group |
+| ungrouped aggregate | `{}` (at most one row) | proof — the strongest form |
+| `distinct {a, b, c}` | `{a, b, c}` | proof |
+| `filter` / `order` / `head` / `tail` | inherits | proof — these only drop rows |
+| `select` / `update` | inherits each key whose columns survive (follow renames) | proof |
+| `Scan` of a reader | `span == rows` on an integer key | **heuristic** (see the footer note above) |
+
+Note the last row is a different *kind* of claim from the rest. Same
+abstraction, different evidence quality: the constructed ones cannot be wrong;
+the footer one can (`1,1,3` has span 3 over 3 rows). Worth keeping that
+distinction in the data structure rather than flattening it — it is exactly the
+sort of inference an optimizer hint should be able to switch off, and it decides
+whether a wrong guess is possible at all.
+
+**Where it pays here.** The decorrelated-subquery shape is agg-then-join-back,
+and it is in five queries: q11/q15/q22 group-by then join, q02/q17 ungrouped
+aggregate then cross join. q15 is the clean example — `revenue` is
+`lineitem[..., by {s_suppkey = l_suppkey}]`, so it is unique on `s_suppkey` by
+construction, and `supplier join revenue on s_suppkey` therefore yields at most
+`|supplier|` rows. That is an exact estimate for a join we currently cannot
+estimate at all, derived from the plan alone with no statistics, no footer, and
+no guess.
+
+**It also fills a hole found while checking this:** `estimate_cardinality` does
+not model `Aggregate` either (0 cases — it is not in the 15 kinds). So an
+aggregate's output has no row estimate today, which is its own reason the cost
+model declines. Uniqueness does not fix that directly (the row count still needs
+the distinct cardinality of the group keys), but the two want the same
+plumbing and should be designed together.
+
+**Sketch.** `SchemaInfo` gains a set of unique column-sets alongside `fields_`,
+populated in `infer_schema`'s existing arms — every one of the proof rows above
+is a few lines in a case that already exists. Then the Join arm of
+`estimate_cardinality` estimates Inner where a unique key of one side is a
+subset of the join keys, and declines otherwise. That ordering matters: it makes
+the *provable* half work end to end before any heuristic is introduced, so the
+footer PK detection becomes an optional refinement rather than a prerequisite.

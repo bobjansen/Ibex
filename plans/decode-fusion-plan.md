@@ -605,3 +605,51 @@ node-kind-level story could: it is not a threshold, it is per-conjunct. Each
 conjunct pushes only if the side owning it self-describes, so projecting one
 table pushes only that table's conjunct — and one unpushed conjunct above a
 6M-row join dominates whatever the other two saved.
+
+### `reorder_inner_joins_for_aggregates` is dead on 12 of 13 queries (2026-07-17)
+
+The pass matches an `Aggregate` whose child is **directly** a `Join`
+(`join_reorder.cpp:169`). Instrumenting that check across the PDS-H suite, the
+aggregate's child is:
+
+| query | child |
+|---|---|
+| q02 q03 q05 q07 q08 q09 q10 q11 q13 q18 | `Project` |
+| q01 | `Update` |
+| q20 | `FilterProject` |
+| q13 (2nd) | `Aggregate` |
+| **q21** | **`Join`** — the only query where the pass fires |
+
+So costed join reordering runs on 1 of 13 queries checked. Everywhere else a
+`Project` sits between the aggregate and the join chain, because the aggregate
+block's `select` lowers to one.
+
+**Why the tests did not catch it:** `tests/test_ir_join_reorder.cpp` hand-builds
+`Aggregate(Join(Join(Scan, Scan), Scan))` with the Builder — the exact shape the
+pass wants, and a shape the lowerer does not emit for any of these queries. The
+pass is correct on its own terms and unreachable in practice. Any test for an
+optimizer pass that constructs its own IR is testing the pass against the
+author's mental model of the plan, not against the plan.
+
+**Relaxation looks sound.** Inner joins are associative and commutative, the
+aggregate is already checked order-insensitive (`aggregate_order_insensitive`),
+and `Project`/`Filter`/`Update`/the fused variants are row-wise — none depends on
+the order or grouping of rows below it, and reordering a join chain changes
+neither the column set nor the multiset of rows. So the gate can walk down
+through row-wise unary nodes to find the chain, and reorder it in place rather
+than replacing the aggregate's immediate child.
+
+Unlike filter pushdown, this pass has real schemas: it runs from the driver
+(`repl.cpp:4371`) after the lazy sources are resolved, so `schemas_are_unambiguous`
+and the cardinality estimates are working with the truth. The only thing wrong is
+the shape gate.
+
+**Before doing it:** this changes join order on ~11 queries that have never had
+it, so it must be benchmarked per query, not just in aggregate — a costed
+reorder that helps the geomean can still regress an individual query badly, and
+the estimates have never been exercised on these shapes. Also worth checking
+whether q21 (the one query it does fire on) is actually faster for it; if that
+was never measured either, the pass has no evidence behind it at all.
+
+**Test it from the lowerer, not the Builder.** Parse a query, lower it, and
+assert the pass fires — otherwise the next shape change silently kills it again.

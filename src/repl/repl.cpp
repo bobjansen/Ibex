@@ -38,7 +38,6 @@
 #include <expected>
 #include <iterator>
 #include <memory>
-#include <string.h>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -47,8 +46,8 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <csignal>
 #include <dlfcn.h>
-#include <signal.h>
 #include <unistd.h>
 #endif
 #include <filesystem>

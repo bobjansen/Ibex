@@ -234,6 +234,87 @@ void inherit_unique_keys(const SchemaInfo& input, SchemaInfo& out) {
     }
 }
 
+/// Schema of projecting `columns` out of `input`. Shared by `Project` and the
+/// fused nodes that end in a projection, so the two cannot drift apart.
+///
+/// Known even from an Unknown input: the projection itself fixes the output
+/// column set, whatever it reads.
+auto project_schema(const std::vector<ColumnRef>& columns, const SchemaInfo& input) -> SchemaInfo {
+    std::vector<SchemaField> out;
+    out.reserve(columns.size());
+    for (const auto& ref : columns) {
+        std::optional<ColumnType> type;
+        if (const auto* field = input.find(ref.name)) {
+            type = field->type;
+        }
+        out.push_back(SchemaField{.name = ref.name, .type = type});
+    }
+    // Keep the time index only if the projection retains that column.
+    std::optional<std::string> time_index;
+    if (input.time_index().has_value()) {
+        const bool kept = std::ranges::any_of(
+            columns, [&](const ColumnRef& ref) { return ref.name == *input.time_index(); });
+        if (kept) {
+            time_index = input.time_index();
+        }
+    }
+    SchemaInfo result = SchemaInfo::known(std::move(out), /*open=*/false, std::move(time_index));
+    // Row-preserving, so a key survives iff the projection keeps all its columns.
+    inherit_unique_keys(input, result);
+    return result;
+}
+
+/// Schema of adding/replacing `fields` (and `tuple_fields`) on `input`. Shared
+/// by `Update` and the fused node that contains one.
+///
+/// Existing columns are retained, so they must be known: an Unknown input gives
+/// an Unknown result.
+auto update_schema(const std::vector<FieldSpec>& fields,
+                   const std::vector<TupleFieldSpec>& tuple_fields, const SchemaInfo& input)
+    -> SchemaInfo {
+    if (!input.is_known()) {
+        return SchemaInfo::unknown();
+    }
+    std::vector<SchemaField> out = input.fields();
+    auto upsert = [&out](const std::string& name, std::optional<ColumnType> type) {
+        for (auto& field : out) {
+            if (field.name == name) {
+                field.type = type;
+                return;
+            }
+        }
+        out.push_back(SchemaField{.name = name, .type = type});
+    };
+    for (const auto& field : fields) {
+        upsert(field.alias, expr_type(field.expr, input));
+    }
+    for (const auto& tuple : tuple_fields) {
+        for (const auto& alias : tuple.aliases) {
+            upsert(alias, std::nullopt);
+        }
+    }
+    // Update retains every existing column, so the time index survives.
+    SchemaInfo result = SchemaInfo::known(std::move(out), input.is_open(), input.time_index());
+    // A key survives only if the update rewrote none of its columns: assigning a
+    // column keeps its name but replaces its values, and nothing says the new
+    // ones are still distinct.
+    robin_hood::unordered_set<std::string> assigned;
+    for (const auto& field : fields) {
+        assigned.insert(field.alias);
+    }
+    for (const auto& tuple : tuple_fields) {
+        assigned.insert(tuple.aliases.begin(), tuple.aliases.end());
+    }
+    for (const auto& key : input.unique_keys()) {
+        const bool untouched = std::ranges::none_of(
+            key, [&](const std::string& name) { return assigned.contains(name); });
+        if (untouched) {
+            result.add_unique_key(key);
+        }
+    }
+    return result;
+}
+
 /// Unique constraints a join's output inherits from its inputs. Each follows
 /// from the join's definition alone -- no data, no statistics.
 ///
@@ -509,38 +590,9 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             return result;
         }
 
-        case NodeKind::Project: {
-            // Output is exactly the listed columns; carry types over from the
-            // child when it is known. Known even from an Unknown child, since
-            // the projection itself fixes the output column set.
-            const auto& project = static_cast<const ProjectNode&>(node);
-            const SchemaInfo input = child_schema(node, sources);
-            std::vector<SchemaField> out;
-            out.reserve(project.columns().size());
-            for (const auto& ref : project.columns()) {
-                std::optional<ColumnType> type;
-                if (const auto* field = input.find(ref.name)) {
-                    type = field->type;
-                }
-                out.push_back(SchemaField{.name = ref.name, .type = type});
-            }
-            // Keep the time index only if the projection retains that column.
-            std::optional<std::string> time_index;
-            if (input.time_index().has_value()) {
-                const bool kept = std::any_of(
-                    project.columns().begin(), project.columns().end(),
-                    [&](const ColumnRef& ref) { return ref.name == *input.time_index(); });
-                if (kept) {
-                    time_index = input.time_index();
-                }
-            }
-            SchemaInfo result =
-                SchemaInfo::known(std::move(out), /*open=*/false, std::move(time_index));
-            // Row-preserving, so a key survives iff the projection keeps all of
-            // its columns.
-            inherit_unique_keys(input, result);
-            return result;
-        }
+        case NodeKind::Project:
+            return project_schema(static_cast<const ProjectNode&>(node).columns(),
+                                  child_schema(node, sources));
 
         case NodeKind::Rename: {
             const auto& rename = static_cast<const RenameNode&>(node);
@@ -580,52 +632,9 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
 
         case NodeKind::Update: {
-            // Existing columns are retained, so we must know them: Unknown child
-            // -> Unknown. Adds or replaces the listed fields.
             const auto& update = static_cast<const UpdateNode&>(node);
-            const SchemaInfo input = child_schema(node, sources);
-            if (!input.is_known()) {
-                return SchemaInfo::unknown();
-            }
-            std::vector<SchemaField> out = input.fields();
-            auto upsert = [&out](const std::string& name, std::optional<ColumnType> type) {
-                for (auto& field : out) {
-                    if (field.name == name) {
-                        field.type = type;
-                        return;
-                    }
-                }
-                out.push_back(SchemaField{.name = name, .type = type});
-            };
-            for (const auto& field : update.fields()) {
-                upsert(field.alias, expr_type(field.expr, input));
-            }
-            for (const auto& tuple : update.tuple_fields()) {
-                for (const auto& alias : tuple.aliases) {
-                    upsert(alias, std::nullopt);
-                }
-            }
-            // Update retains every existing column, so the time index survives.
-            SchemaInfo result =
-                SchemaInfo::known(std::move(out), input.is_open(), input.time_index());
-            // A key survives only if the update rewrote none of its columns:
-            // assigning a column keeps its name but replaces its values, and
-            // nothing says the new ones are still distinct.
-            robin_hood::unordered_set<std::string> assigned;
-            for (const auto& field : update.fields()) {
-                assigned.insert(field.alias);
-            }
-            for (const auto& tuple : update.tuple_fields()) {
-                assigned.insert(tuple.aliases.begin(), tuple.aliases.end());
-            }
-            for (const auto& key : input.unique_keys()) {
-                const bool untouched = std::ranges::none_of(
-                    key, [&](const std::string& name) { return assigned.contains(name); });
-                if (untouched) {
-                    result.add_unique_key(key);
-                }
-            }
-            return result;
+            return update_schema(update.fields(), update.tuple_fields(),
+                                 child_schema(node, sources));
         }
 
         case NodeKind::Aggregate: {
@@ -829,17 +838,41 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             return result;
         }
 
+        // The fused nodes canonicalize produces are exactly the operators above
+        // run back to back, so their schemas are those operators' schemas. They
+        // are not a detail: canonicalize fuses `Project(Filter(scan))` -- the
+        // shape of every hand-written scan leaf -- so leaving these Unknown
+        // meant no real plan's leaf had a schema, and anything gated on a Known
+        // input (the join-order cost model, ambiguity checks) silently declined
+        // on every query. R5/R6/R7/R8/R16 in canonicalize.cpp define the
+        // equivalences these mirror.
+        case NodeKind::FilterProject: {
+            // Project(Filter(x)): the projection fixes the output columns.
+            const auto& fused = static_cast<const FilterProjectNode&>(node);
+            return project_schema(fused.columns(), child_schema(node, sources));
+        }
+        case NodeKind::FilterUpdateProject: {
+            // Project(Update(Filter(x))). The update's computed fields are only
+            // observable through the projection, and a projected name resolves
+            // against the update's output -- so type the update first, then
+            // project it.
+            const auto& fused = static_cast<const FilterUpdateProjectNode&>(node);
+            SchemaInfo updated = update_schema(fused.fields(), {}, child_schema(node, sources));
+            return project_schema(fused.project_columns(), updated);
+        }
+        // Head(Filter(x)) / Tail(Filter(x)) / Head(Order(x)): row-subsetting
+        // only, so schema, time index and unique constraints pass through.
+        case NodeKind::FilterHead:
+        case NodeKind::FilterTail:
+        case NodeKind::TopK:
+            return child_schema(node, sources);
+
         // Data-dependent output columns or not yet modelled: Unknown is sound.
         case NodeKind::Dcast:
         case NodeKind::Transpose:
         case NodeKind::Matmul:
         case NodeKind::Model:
         case NodeKind::Stream:
-        case NodeKind::FilterProject:
-        case NodeKind::FilterUpdateProject:
-        case NodeKind::FilterHead:
-        case NodeKind::FilterTail:
-        case NodeKind::TopK:
             return SchemaInfo::unknown();
     }
     return SchemaInfo::unknown();

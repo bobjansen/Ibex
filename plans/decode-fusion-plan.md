@@ -369,15 +369,31 @@ producing the correct answer):
 **Filter pushdown through joins works** — moving all three conjuncts above two
 joins costs 7%. `push_filters_into_joins` earns its keep here.
 
-**Projection pushdown does not reach a scan through a join.** The whole 6x is
-lineitem decoding all 16 columns instead of 3. This is the known gotcha from
-the projection-pushdown work ("pushdown only reaches a source through the
-statement that scans it; `let j = a join b` demands ALL of both sides"), and
-`update { o_orderkey = l_orderkey }` — the rename the language *requires* before
-an equijoin, since TPC-H keys don't match by name — sits between the scan and
-the join. Whether the blocker is Update or Join is the first thing to check;
-that determines whether the fix is in `required_columns`' Update arm or its
-Join arm.
+**The 6x is a projection/materialization problem, but the mechanism is NOT yet
+diagnosed** — and the obvious guess is already wrong. "Demand does not reach a
+scan through a join" does not survive reading the code: `required_columns`'
+Join arm widens only for Asof; for an equijoin it passes `need` plus the join
+keys to both sides, commenting that a name absent from one side's schema is
+simply not read there. The Update arm likewise narrows unless `need.all` is
+already set. So on paper the demand reaching the lineitem scan in the natural
+phrasing should be narrow, and it evidently is not — or the cost is not in the
+scan at all.
+
+Note the arithmetic: natural 585ms minus filters-above-joins 102ms is 483ms,
+while a *full* 16-column lineitem decode measures ~235ms (see the ascription
+work below). So the delta is roughly twice a full decode, which a wide scan
+alone cannot explain. The join carrying 16 columns through its gather for
+millions of rows is the other candidate, and may be the larger one.
+
+**Diagnose before fixing.** Instrument what the natural plan actually demands
+(the recording lazy source in tests/test_repl.cpp is the cheap way — assert
+`decode_calls`, do not infer from wall clock), and decompose natural q03 by
+stage to see whether the cost is decode or join gather. Only the `update`-vs-
+`select` difference separates the 102ms phrasing from the 585ms one, so start
+there. This paragraph replaces a confident guess that failed its first check;
+three diagnoses in this arc looked obvious and were wrong (q15/q22
+"architectural", exact ascriptions "must widen"), all three because a plausible
+story was never tested against the code.
 
 **So: rewrite the queries only after fixing this.** Doing it now would post a 6x
 regression on q03 and similar elsewhere. The order is (1) make demand analysis

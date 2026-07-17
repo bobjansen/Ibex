@@ -1802,3 +1802,23 @@ read_fake()[select { c = count() }];
               "planner: statements (`let n` has a non-DataFrame type annotation)");
     }
 }
+
+TEST_CASE("REPL shared bindings keep their schema for scalar() decorrelation",
+          "[repl][lazy][planner]") {
+    // A binding is shared exactly when it is expensive and referenced twice --
+    // and the second reference is often the one inside `scalar(...)`. Sharing
+    // rewrites those references to Scan(name), whose schema resolves through
+    // source_schemas(); if the binding's schema is not recorded there, the
+    // decorrelation check sees an unknown outer schema and the whole script
+    // silently falls back to statements. That regressed PDS-H q15 and q22.
+    std::vector<std::vector<std::string>> decode_calls;
+    ibex::runtime::ExternRegistry registry;
+    register_recording_lazy_source(registry, decode_calls);
+
+    const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let totals = read_fake()[select { total = sum(b) }, by { a }];
+totals[filter total == scalar(totals[select { m = max(total) }])];
+)";
+    CHECK(capture_planner_line(source, registry) == "planner: whole-script");
+}

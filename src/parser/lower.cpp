@@ -1350,6 +1350,20 @@ class Lowerer {
                         // Referenced from several places and expensive to
                         // re-run: materialized once by the executor. Later
                         // references miss bindings_ and lower to Scan(name).
+                        //
+                        // Record the schema first. A Scan resolves its schema
+                        // through source_schemas(), which knows nothing about a
+                        // binding the executor has not materialized yet -- but
+                        // it is inferable right here, and inlining the plan
+                        // would have exposed it. Dropping it breaks the checks
+                        // that need a closed schema (scalar() decorrelation) on
+                        // exactly the queries sharing exists to help: the second
+                        // reference that makes a binding worth sharing is often
+                        // the one inside `scalar(...)`.
+                        if (auto schema = ir::infer_schema(*value.value(), source_schemas());
+                            schema.is_known()) {
+                            binding_schemas_.insert_or_assign(let_stmt.name, schema);
+                        }
                         shared_bindings_.push_back(
                             SharedBinding{.name = let_stmt.name, .plan = std::move(value.value())});
                     } else {

@@ -41,6 +41,31 @@ void max_id(const Node& node, std::uint64_t& value) {
     }
 }
 
+/// Walk the same left-deep inner-join chain as `take_left_deep` WITHOUT taking
+/// it apart, so every check that can reject the rewrite runs while the plan is
+/// still intact. `take_left_deep` moves children out as it descends and frees
+/// what it holds when it bails, which is unrecoverable: a rejection after that
+/// point leaves the aggregate with no input at all.
+auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vector<Edge>& edges)
+    -> bool {
+    if (node.kind() != NodeKind::Join) {
+        leaves.push_back(&node);
+        return true;
+    }
+    const auto& join = static_cast<const JoinNode&>(node);
+    if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
+        join.children().size() != 2 || join.children()[0] == nullptr ||
+        join.children()[1] == nullptr || join.children()[1]->kind() == NodeKind::Join) {
+        return false;
+    }
+    if (!scan_left_deep(*join.children()[0], leaves, edges)) {
+        return false;
+    }
+    leaves.push_back(join.children()[1].get());
+    edges.push_back(Edge{.right = leaves.size() - 1, .keys = join.keys()});
+    return true;
+}
+
 auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge>& edges) -> bool {
     if (node->kind() != NodeKind::Join) {
         leaves.push_back(std::move(node));
@@ -70,14 +95,14 @@ auto aggregate_order_insensitive(const AggregateNode& aggregate) -> bool {
     });
 }
 
-auto schemas_are_unambiguous(const std::vector<NodePtr>& leaves, const std::vector<Edge>& edges,
+auto schemas_are_unambiguous(const std::vector<const Node*>& leaves, const std::vector<Edge>& edges,
                              const SourceSchemas& schemas) -> bool {
     robin_hood::unordered_set<std::string> join_keys;
     for (const auto& edge : edges) {
         join_keys.insert(edge.keys.begin(), edge.keys.end());
     }
     robin_hood::unordered_set<std::string> seen;
-    for (const auto& leaf : leaves) {
+    for (const auto* leaf : leaves) {
         const auto schema = infer_schema(*leaf, schemas);
         if (!schema.is_known() || schema.is_open()) {
             return false;
@@ -119,12 +144,19 @@ auto reorder_aggregate_child(NodePtr child, const SourceSchemas& schemas,
     if (already_ordered) {
         return child;
     }
+    // Reject on the intact plan: past `take_left_deep` there is nothing to hand
+    // back.
+    std::vector<const Node*> preview;
+    std::vector<Edge> preview_edges;
+    if (!scan_left_deep(*child, preview, preview_edges) ||
+        !schemas_are_unambiguous(preview, preview_edges, schemas)) {
+        return child;
+    }
 
     std::vector<NodePtr> leaves;
     std::vector<Edge> edges;
-    if (!take_left_deep(std::move(child), leaves, edges) ||
-        !schemas_are_unambiguous(leaves, edges, schemas)) {
-        return nullptr;
+    if (!take_left_deep(std::move(child), leaves, edges)) {
+        return nullptr;  // unreachable: scan_left_deep applies the same shape checks
     }
     NodePtr result = std::move(leaves[order->front()]);
     std::vector<std::size_t> selected{order->front()};

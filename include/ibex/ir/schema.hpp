@@ -14,6 +14,20 @@ namespace ibex::ir {
 // `ColumnType` and `SchemaField` are defined in node.hpp so that IR nodes
 // (e.g. AscribeNode) can carry a schema without depending on this header.
 
+/// A set of columns whose value tuples are distinct across a result's rows: at
+/// most one row per tuple. The empty set is the strongest form — the result has
+/// at most one row.
+///
+/// Every constraint carried in a `SchemaInfo` is **proved by construction**: it
+/// follows from what an operator does (`by {a, b}` emits one row per distinct
+/// group), never from inspecting data or from a statistic that could be wrong.
+/// That is what lets `estimate_cardinality` bound an inner join from one
+/// (`|PK ⋈ FK| <= |FK|`) rather than guess. A heuristic source — say, detecting
+/// a dense integer key from Parquet footer min/max, where `1,1,3` spans 3 over
+/// 3 rows — must carry its evidence alongside rather than join this set
+/// silently: the point of the set is that a wrong answer is impossible.
+using UniqueKey = std::vector<std::string>;
+
 /// Result of schema propagation for a node: either a `Known` ordered list of
 /// columns, or `Unknown` (⊥) — the sound default that defeats static checking
 /// downstream and falls back to runtime validation.
@@ -50,11 +64,29 @@ class SchemaInfo {
     /// Returns the field named `name`, or nullptr if absent (or schema Unknown).
     [[nodiscard]] auto find(std::string_view name) const -> const SchemaField*;
 
+    /// Column-sets proved unique across this result's rows. May be non-empty
+    /// even on an Unknown schema — an `Aggregate` fixes its group keys whatever
+    /// it reads — and on an open one, since extra columns cannot make a unique
+    /// tuple repeat.
+    [[nodiscard]] auto unique_keys() const noexcept -> const std::vector<UniqueKey>& {
+        return unique_keys_;
+    }
+    /// Records `key` as unique, ignoring a duplicate or a superset of one
+    /// already held (a superset of a unique key is trivially unique and only
+    /// makes later subset tests slower).
+    void add_unique_key(UniqueKey key);
+
+    /// True when some unique key is a *subset* of `columns` — i.e. `columns`
+    /// determines at most one row. The subset direction is the useful one: an
+    /// inner join on keys {a, b} is bounded by uniqueness on {a} alone.
+    [[nodiscard]] auto is_unique_within(const std::vector<std::string>& columns) const -> bool;
+
    private:
     bool known_ = false;
     bool open_ = false;
     std::vector<SchemaField> fields_;
     std::optional<std::string> time_index_;
+    std::vector<UniqueKey> unique_keys_;
 };
 
 /// Maps a source/extern table name to its declared schema. An entry that is

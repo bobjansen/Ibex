@@ -102,6 +102,96 @@ TEST_CASE("schema: aggregate resolves sum and mean result types", "[ir][schema]"
     REQUIRE(type_of(s, "avg") == ColumnType::Float64);  // mean is always Float64
 }
 
+// --- Unique constraints -------------------------------------------------
+//
+// Each of these asserts a proof carried by construction, so what matters is
+// that it survives the plan the LOWERER emits -- `schema_of` parses and lowers,
+// which is the point. A constraint proved against a hand-built IR shape the
+// lowerer never produces would be worth nothing (the same mistake that left
+// `reorder_inner_joins_for_aggregates` dead behind a test that passed).
+
+TEST_CASE("schema: a group-by proves its keys unique", "[ir][schema]") {
+    auto s = schema_of("t[select { a, total = sum(b) }, by a];", base_sources());
+    REQUIRE(s.is_unique_within({"a"}));
+    // A wider set containing the key is unique too -- it can only split groups.
+    REQUIRE(s.is_unique_within({"a", "total"}));
+    // The aggregate value is not a key: two groups can sum to the same number.
+    REQUIRE_FALSE(s.is_unique_within({"total"}));
+}
+
+TEST_CASE("schema: an ungrouped aggregate proves at most one row", "[ir][schema]") {
+    auto s = schema_of("t[select { total = sum(b) }];", base_sources());
+    // The empty key: no column is needed to tell its rows apart.
+    REQUIRE(s.unique_keys().size() == 1);
+    REQUIRE(s.unique_keys().front().empty());
+    REQUIRE(s.is_unique_within({}));
+    REQUIRE(s.is_unique_within({"anything"}));
+}
+
+TEST_CASE("schema: a group-by key stays unique through filter and select", "[ir][schema]") {
+    // The row-wise operators a real plan puts between an aggregate and a join.
+    // If the proof does not survive them it never reaches the estimator.
+    auto s = schema_of("t[filter b > 0, select { a, total = sum(b) }, by a][filter total > 1];",
+                       base_sources());
+    REQUIRE(s.is_unique_within({"a"}));
+}
+
+TEST_CASE("schema: projecting the group key away drops the proof", "[ir][schema]") {
+    auto s = schema_of("t[select { a, total = sum(b) }, by a][select { total }];", base_sources());
+    REQUIRE(s.unique_keys().empty());
+}
+
+TEST_CASE("schema: overwriting a unique column drops the proof", "[ir][schema]") {
+    // `update` keeps the column's name but replaces its values, and nothing
+    // says the new ones are still distinct.
+    auto s = schema_of("t[select { a, total = sum(b) }, by a][update { a = 1 }];", base_sources());
+    REQUIRE_FALSE(s.is_unique_within({"a"}));
+    auto kept =
+        schema_of("t[select { a, total = sum(b) }, by a][update { z = 1 }];", base_sources());
+    REQUIRE(kept.is_unique_within({"a"}));  // an unrelated column is no threat
+}
+
+TEST_CASE("schema: renaming a unique column renames the proof", "[ir][schema]") {
+    auto s = schema_of("t[select { a, total = sum(b) }, by a][rename { k = a }];", base_sources());
+    REQUIRE(s.is_unique_within({"k"}));
+    REQUIRE_FALSE(s.is_unique_within({"a"}));
+}
+
+TEST_CASE("schema: distinct proves every column together unique", "[ir][schema]") {
+    // `distinct a, b` lowers to Distinct(Project(a, b)), so the proof covers
+    // exactly the projected columns.
+    auto s = schema_of("t[distinct { a, b }];", base_sources());
+    REQUIRE(s.is_unique_within({"a", "b"}));
+    REQUIRE_FALSE(s.is_unique_within({"a"}));
+}
+
+TEST_CASE("schema: an inner join keeps a proof both sides can support", "[ir][schema]") {
+    // Both sides unique on `a`, so the join matches at most one row against at
+    // most one row: neither side's rows can duplicate, and `a` stays unique.
+    auto s =
+        schema_of("t[select { a, x = sum(b) }, by a] join t[select { a, y = sum(b) }, by a] on a;",
+                  base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(s.is_unique_within({"a"}));
+}
+
+TEST_CASE("schema: a join with a non-unique left loses the right's proof", "[ir][schema]") {
+    // This is the soundness edge. `revenue` is unique on `a`, but `t` is not:
+    // several `t` rows can match one revenue row, duplicating it. So `a` is NOT
+    // unique in the output, even though it is unique on the side it came from.
+    // (The join's *size* is still bounded here -- that is what the estimator
+    // uses -- but a bound on rows is not a proof about keys.)
+    auto s = schema_of("t join t[select { a, total = sum(b) }, by a] on a;", base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(s.unique_keys().empty());
+}
+
+TEST_CASE("schema: a join between two non-unique sides proves nothing", "[ir][schema]") {
+    auto s = schema_of("t join t on a;", base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE(s.unique_keys().empty());
+}
+
 TEST_CASE("schema: update infers arithmetic result types", "[ir][schema]") {
     auto s = schema_of("t[update { i = a * 2, f = a * b, d = a / a }];", base_sources());
     REQUIRE(s.is_known());

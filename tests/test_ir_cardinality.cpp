@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -136,7 +137,7 @@ TEST_CASE("cardinality takes the tighter bound when both join sides are unique",
     // arrive in if one is ever derived (see the footer note in
     // plans/decode-fusion-plan.md).
     auto unique_source = [](std::string column) {
-        auto info = ir::SchemaInfo::known({ir::SchemaField{.name = column}});
+        auto info = ir::SchemaInfo::known({ir::SchemaField{.name = column, .type = std::nullopt}});
         info.add_unique_key({std::move(column)});
         return info;
     };

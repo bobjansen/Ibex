@@ -1561,6 +1561,96 @@ inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow:
 ///
 /// This is what gives `let t = read_parquet(p)` projection pushdown. Binding
 /// touches metadata only; a query that references 4 of 16 columns decodes 4.
+/// Merge one column's footer statistics across every row group into a whole-file
+/// range. Integers only: `span = max - min + 1` is what the planner derives a
+/// distinct-count estimate from, and that arithmetic means nothing for a double
+/// or a string.
+///
+/// Any chunk that cannot answer abandons the column entirely. A range merged
+/// from a subset of the row groups is not a conservative answer, it is a wrong
+/// one -- the planner would read it as "no value lies outside this".
+inline auto merge_column_stats(const parquet::FileMetaData& metadata, int leaf_index)
+    -> ibex::runtime::ColumnStats {
+    ibex::runtime::ColumnStats out;
+    std::size_t nulls = 0;
+    bool nulls_known = true;
+    bool range_known = true;
+    std::int64_t low = 0;
+    std::int64_t high = 0;
+
+    for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
+        if (!chunk->is_stats_set()) {
+            return {};
+        }
+        const auto stats = chunk->statistics();
+        if (stats == nullptr) {
+            return {};
+        }
+        if (stats->HasNullCount()) {
+            nulls += static_cast<std::size_t>(stats->null_count());
+        } else {
+            nulls_known = false;
+        }
+        if (!range_known || !stats->HasMinMax()) {
+            range_known = false;
+            continue;
+        }
+        std::int64_t chunk_low = 0;
+        std::int64_t chunk_high = 0;
+        if (stats->physical_type() == parquet::Type::INT64) {
+            const auto& typed = static_cast<const parquet::Int64Statistics&>(*stats);
+            chunk_low = typed.min();
+            chunk_high = typed.max();
+        } else if (stats->physical_type() == parquet::Type::INT32) {
+            const auto& typed = static_cast<const parquet::Int32Statistics&>(*stats);
+            chunk_low = typed.min();
+            chunk_high = typed.max();
+        } else {
+            range_known = false;  // not an integer column
+            continue;
+        }
+        if (group == 0 || chunk_low < low) {
+            low = chunk_low;
+        }
+        if (group == 0 || chunk_high > high) {
+            high = chunk_high;
+        }
+    }
+
+    if (range_known && metadata.num_row_groups() > 0) {
+        out.min = low;
+        out.max = high;
+    }
+    if (nulls_known) {
+        out.null_count = nulls;
+    }
+    return out;
+}
+
+/// Whole-file per-column statistics, read from the footer that is already in
+/// memory. No page is decoded, so this costs a binding nothing.
+inline auto read_column_stats(const parquet::FileMetaData& metadata,
+                              const arrow::Schema& arrow_schema)
+    -> ibex::runtime::SourceColumnStats {
+    ibex::runtime::SourceColumnStats out;
+    const auto* descr = metadata.schema();
+    for (int leaf = 0; leaf < descr->num_columns(); ++leaf) {
+        // A leaf's path is the Arrow field name only for flat schemas; nested
+        // columns (a struct's fields) share a top-level name and must not be
+        // conflated, so take only leaves whose path is a top-level field.
+        const std::string name = descr->Column(leaf)->path()->ToDotString();
+        if (arrow_schema.GetFieldIndex(name) < 0) {
+            continue;
+        }
+        auto stats = merge_column_stats(metadata, leaf);
+        if (stats.min.has_value() || stats.null_count.has_value()) {
+            out.emplace(name, stats);
+        }
+    }
+    return out;
+}
+
 inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
     std::string path_string{path};
     auto input = open_parquet_input(path);
@@ -1608,8 +1698,9 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
         }
     };
 
-    return std::make_shared<ibex::runtime::LazyTable>(schema_table_from_arrow(*arrow_schema), rows,
-                                                      std::move(decode));
+    return std::make_shared<ibex::runtime::LazyTable>(
+        schema_table_from_arrow(*arrow_schema), rows, std::move(decode),
+        read_column_stats(*reader->parquet_reader()->metadata(), *arrow_schema));
 }
 
 inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {

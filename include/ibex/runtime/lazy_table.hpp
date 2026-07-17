@@ -3,9 +3,11 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <robin_hood.h>
 #include <set>
 #include <string>
@@ -23,6 +25,27 @@ using Selection = std::vector<std::size_t>;
 using ColumnDecodeFn = std::function<std::expected<Table, std::string>(
     const std::vector<std::string>&, const Selection*)>;
 
+/// What a source's metadata says about one column before anything is decoded.
+///
+/// Parquet footers carry min/max and a null count per column chunk. They do
+/// **not** carry distinct counts — that field is optional in the spec and
+/// Arrow's writer leaves it unset on every file we produce — so anything about
+/// distinctness has to be *derived* from what is here, by the planner, which
+/// owns that policy. This type is deliberately raw metadata and nothing else.
+struct ColumnStats {
+    /// Whole-source value range for an INTEGER column, merged across row groups.
+    /// Absent for other types, and wherever any chunk lacks statistics — a
+    /// partial range would be a lie, not a conservative answer.
+    std::optional<std::int64_t> min;
+    std::optional<std::int64_t> max;
+    /// Nulls across the whole source. Absent when any chunk fails to report one.
+    std::optional<std::size_t> null_count;
+};
+
+/// Column name -> what the source's metadata says about it. A column may be
+/// absent, which means "nothing known" and never "nothing there".
+using SourceColumnStats = robin_hood::unordered_map<std::string, ColumnStats>;
+
 /// A table source whose schema is known up front but whose column data is
 /// decoded only when a query asks for it, and cached once decoded.
 ///
@@ -37,12 +60,17 @@ using ColumnDecodeFn = std::function<std::expected<Table, std::string>(
 class LazyTable {
    public:
     /// `schema` is a zero-row Table carrying the source's column names and
-    /// types; `rows` is its true row count.
-    LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode);
+    /// types; `rows` is its true row count. `stats` is optional metadata a
+    /// source may know for free (Parquet's footer); an empty map costs only the
+    /// planning that would have used it.
+    LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats = {});
 
     /// Column names and types, with no rows. Cheap: known from metadata alone.
     [[nodiscard]] auto schema() const noexcept -> const Table& { return schema_; }
     [[nodiscard]] auto rows() const noexcept -> std::size_t { return rows_; }
+    /// Per-column source metadata, for the planner. Read from the file's footer
+    /// at bind time, so consulting it decodes nothing.
+    [[nodiscard]] auto column_stats() const noexcept -> const SourceColumnStats& { return stats_; }
 
     /// Materialize `names`, in schema order. Names not in the schema are
     /// ignored, so a caller may pass the union of the columns demanded across
@@ -68,6 +96,7 @@ class LazyTable {
     Table schema_;
     std::size_t rows_ = 0;
     ColumnDecodeFn decode_;
+    SourceColumnStats stats_;
     robin_hood::unordered_map<std::string, ColumnEntry> cache_;
 };
 

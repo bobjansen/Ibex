@@ -369,31 +369,50 @@ producing the correct answer):
 **Filter pushdown through joins works** — moving all three conjuncts above two
 joins costs 7%. `push_filters_into_joins` earns its keep here.
 
-**The 6x is a projection/materialization problem, but the mechanism is NOT yet
-diagnosed** — and the obvious guess is already wrong. "Demand does not reach a
-scan through a join" does not survive reading the code: `required_columns`'
-Join arm widens only for Asof; for an equijoin it passes `need` plus the join
-keys to both sides, commenting that a name absent from one side's schema is
-simply not read there. The Update arm likewise narrows unless `need.all` is
-already set. So on paper the demand reaching the lineitem scan in the natural
-phrasing should be narrow, and it evidently is not — or the cost is not in the
-scan at all.
+**The 6x is NOT a decode problem. Measured, not reasoned.** Dumping the demand
+map (`required_columns`) for each phrasing settles it:
 
-Note the arithmetic: natural 585ms minus filters-above-joins 102ms is 483ms,
-while a *full* 16-column lineitem decode measures ~235ms (see the ascription
-work below). So the delta is roughly twice a full decode, which a wide scan
-alone cannot explain. The join carrying 16 columns through its gather for
-millions of rows is the other candidate, and may be the larger one.
+    natural       lineitem scan demands: l_discount l_extendedprice l_orderkey l_shipdate
+    hand-fused    lineitem scan demands: l_discount l_extendedprice l_orderkey
 
-**Diagnose before fixing.** Instrument what the natural plan actually demands
-(the recording lazy source in tests/test_repl.cpp is the cheap way — assert
-`decode_calls`, do not infer from wall clock), and decompose natural q03 by
-stage to see whether the cost is decode or join gather. Only the `update`-vs-
-`select` difference separates the 102ms phrasing from the 585ms one, so start
-there. This paragraph replaces a confident guess that failed its first check;
-three diagnoses in this arc looked obvious and were wrong (q15/q22
-"architectural", exact ascriptions "must widen"), all three because a plausible
-story was never tested against the code.
+The scans are the same four columns (hand-fused drops l_shipdate only because
+its filter was absorbed into the scan). Demand is narrow in every phrasing --
+`required_columns`' Join arm widens only for Asof, and passes `need` + join keys
+to both sides otherwise. So "projection pushdown does not reach through a join"
+is simply false, and the 6x buys nothing in the scan.
+
+Bisecting the phrasings (SF-1, pinned, min-of-5) localizes it but does not yet
+explain it:
+
+| phrasing | ms |
+|---|---:|
+| hand-fused | ~95 |
+| all three sides projected, lineitem renamed by `update` not `select` | ~123 |
+| natural + orders projected (customer bare) | ~610 |
+| natural + customer projected (orders renamed by `update`) | ~575 |
+| fully natural | ~585 |
+
+`update` on the lineitem side costs 14ms, not 6x. Projecting *either* customer
+or orders alone changes nothing. Projecting *all three* drops it to 123ms. That
+non-linearity is the whole clue: this is a threshold, not an additive cost --
+something is bailing out entirely, and only flips back on when the last leaf is
+right.
+
+**Leading hypothesis: inner-join reordering is bailing.**
+`ir::reorder_inner_joins_for_aggregates` -> `schemas_are_unambiguous`
+(`src/ir/join_reorder.cpp:73`) requires *every* leaf's schema to be known and
+closed, and gives up on the whole reorder otherwise. One all-or-nothing gate
+across all leaves matches the observed shape exactly. Note `infer_schema` of a
+bare `Scan(customer)` returns the source's *full* schema (all 8 columns), not
+the demand-narrowed one, so a bare leaf and a projected leaf are not the same
+input to that check even when the scan decodes identically.
+
+**Next step:** print the chosen join order for each phrasing (or assert on it),
+confirm whether `schemas_are_unambiguous` returns false for the natural plan,
+and if so find which leaf and why. If confirmed, the fix is in the gate, not in
+demand analysis -- and it would mean naturally-written joins silently lose join
+reordering, which is worth far more than the benchmark phrasing question that
+surfaced it.
 
 **So: rewrite the queries only after fixing this.** Doing it now would post a 6x
 regression on q03 and similar elsewhere. The order is (1) make demand analysis

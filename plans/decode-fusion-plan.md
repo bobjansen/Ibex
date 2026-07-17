@@ -351,3 +351,38 @@ decline plus a plausible story reads exactly like a win. This is why
 - Ascription is exact/closed by default, so ascribing a raw reader means
   naming every column in the file. For a benchmark that exists to measure
   projection pushdown that is actively counterproductive.
+
+## Probe: what a naturally-written query costs today (2026-07-17)
+
+The suite's queries hand-fuse scan+filter+select, i.e. the author does the
+optimizer's job. Asked whether to rewrite them naturally so the planner has to
+do the work, this probe measured three phrasings of q03 (SF-1, pinned to cores
+2-3, min-of-8 in one warm REPL, all three whole-script planned, all three
+producing the correct answer):
+
+| phrasing | ms |
+|---|---:|
+| hand-fused (what the suite ships) | ~95 |
+| filters moved above both joins, hand-written projections kept | ~102 |
+| fully natural (no hand-written `select` after any scan) | **~585** |
+
+**Filter pushdown through joins works** — moving all three conjuncts above two
+joins costs 7%. `push_filters_into_joins` earns its keep here.
+
+**Projection pushdown does not reach a scan through a join.** The whole 6x is
+lineitem decoding all 16 columns instead of 3. This is the known gotcha from
+the projection-pushdown work ("pushdown only reaches a source through the
+statement that scans it; `let j = a join b` demands ALL of both sides"), and
+`update { o_orderkey = l_orderkey }` — the rename the language *requires* before
+an equijoin, since TPC-H keys don't match by name — sits between the scan and
+the join. Whether the blocker is Update or Join is the first thing to check;
+that determines whether the fix is in `required_columns`' Update arm or its
+Join arm.
+
+**So: rewrite the queries only after fixing this.** Doing it now would post a 6x
+regression on q03 and similar elsewhere. The order is (1) make demand analysis
+reach scans through joins/updates, (2) then de-hand-fuse the suite, which at
+that point measures the optimizer instead of the author. The upside is real —
+the hand-fusion is currently hiding a 6x gap that every naturally-written user
+query walks into, and Polars' lazy API does this pushdown for free, which is
+why its published queries can afford to be written the same way ours are.

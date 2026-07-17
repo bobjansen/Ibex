@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <cstddef>
 #include <map>
@@ -29,7 +30,12 @@ struct CardinalityOptions {
 /// Estimate output rows for a logical plan. Unknown inputs remain unknown;
 /// this is deliberately more useful than inventing a global table-size default
 /// when a planner cannot establish a source's scale.
+///
+/// `schemas` is consulted only for the unique constraints an inner join's
+/// estimate needs (see the Join arm); pass the same map given to
+/// `infer_schema`. Without it, inner joins simply go unestimated.
 [[nodiscard]] auto estimate_cardinality(const Node& root, const SourceRowCounts& sources,
+                                        const SourceSchemas& schemas = {},
                                         CardinalityOptions options = {}) -> CardinalityEstimate;
 
 }  // namespace ibex::ir

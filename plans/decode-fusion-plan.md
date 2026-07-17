@@ -955,3 +955,65 @@ is a few lines in a case that already exists. Then the Join arm of
 subset of the join keys, and declines otherwise. That ordering matters: it makes
 the *provable* half work end to end before any heuristic is introduced, so the
 footer PK detection becomes an optional refinement rather than a prerequisite.
+
+### DONE: uniqueness by construction, and it fires the pass for the first time
+
+Implemented as sketched. `SchemaInfo` carries `unique_keys_`; `infer_schema`
+populates it in the arms that can *prove* it (Aggregate group keys, ungrouped
+aggregate = the empty key, Distinct's projected columns, Resample's bucket+keys)
+and carries it through the row-wise operators (Filter/Order/Head/Tail inherit;
+Project keeps a key it does not drop; Update keeps a key it does not overwrite;
+Rename follows renames; Window/Rbind strip it). `estimate_cardinality` gained
+the `SourceSchemas` it needs, an Inner arm that bounds the join by the opposite
+side's rows when one side is provably unique on a subset of the join keys, and
+an Aggregate arm (ungrouped = 1 row; grouped declines — uniqueness answers "are
+the keys distinct", never "how many are there").
+
+**The headline: `reorder_inner_joins_for_aggregates` now fires on q21. It never
+had, in the entire history of this document.** Instrumented, not assumed:
+
+    [order] inner join: left_unique=0 right_unique=1 left_rows=725436 right_rows=- -> 725436
+    [order] leaf kind=Project rows=725436 / rows=10000 / rows=6
+    [order] chosen order: 2 1 0
+
+That is the whole thesis working end to end: the nested inner join under q21's
+leaf has a **right side that is provably unique** on the join keys and a right
+row count that is *unknowable* (`right_rows=-`, a grouped aggregate). The bound
+needs only the former. With the leaf finally estimable, the cost model produces
+an order and the chain is rebuilt smallest-first (the 6-row filtered nation
+instead of the 725k-row lineitem).
+
+**And it makes no measurable difference.** Interleaved A/B, same binary with the
+pass env-gated off, SF-1, pinned to cores 2-3, min-of-8 in one warm REPL, three
+rounds:
+
+| round | reorder ON | OFF | delta |
+|---|---:|---:|---:|
+| 1 | 700.6 ms | 684.7 ms | +2.3% |
+| 2 | 696.0 ms | 683.9 ms | +1.8% |
+| 3 | 664.9 ms | 683.4 ms | **−2.7%** |
+
+Rounds disagree on sign: noise. So the answer to this document's own question —
+"check whether q21 is actually faster for it; if that was never measured either,
+the pass has no evidence behind it at all" — is **no, and that is fine**. q21's
+chain order does not matter; the suite's queries are well written. The prize
+(20-43%) lives on badly-ordered queries, which is what the pass must be judged
+against. Equality on a well-written suite is the pass condition, not a failure.
+1176 tests, 22/22 answers, with the reorder live.
+
+**A dead path stopped being dead.** `reorder_aggregate_child` called
+`take_left_deep` — which moves children out as it descends and frees what it
+holds when it bails — and only *then* ran `schemas_are_unambiguous`. A rejection
+there returned nullptr, and `walk` left the aggregate's child slot **null**: a
+gutted plan. It was unreachable only because the cost model always declined
+before reaching it. Making inner joins estimable made it live. Now every check
+that can reject runs on the intact plan (`scan_left_deep`, a const traversal
+applying the same shape checks), and rejection hands the plan back untouched.
+Tested. This is the shape of hazard this whole document keeps finding: code that
+is correct only because it never ran.
+
+**What this does NOT do:** it changes no other query's plan. q03/q05/q09's
+aggregate child is an `Update` (kind 8) — not a `Project`, as the table above
+records; the reader-schema fix moved it — so the shape gate still rejects them.
+Relaxing that gate is the next step, and the thing to validate it against is a
+*deliberately badly-ordered* query, not the suite.

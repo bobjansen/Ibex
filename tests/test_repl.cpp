@@ -5,12 +5,15 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <cstdio>
 #include <csv.hpp>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <ranges>
 #include <set>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -1708,4 +1711,94 @@ print(cheapest[select { n = count() }]);
 
     REQUIRE(ibex::repl::execute_script(source, registry));
     CHECK(reads == 1);
+}
+
+namespace {
+
+/// Runs `source` with planner reporting on; returns what the REPL wrote to stderr.
+/// The `planner:` line there is what bench_ibex.py reads to record which engine
+/// path each query measured, so its shape is a contract, not just a log line.
+auto capture_planner_line(std::string_view source, ibex::runtime::ExternRegistry& registry)
+    -> std::string {
+    // Per-pid: catch_discover_tests gives each TEST_CASE its own process, and
+    // ctest -j runs them concurrently -- a fixed name would let two captures
+    // clobber each other's file.
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("ibex_planner_capture_" + std::to_string(getpid()) + ".txt");
+    ibex::repl::ReplConfig config;
+    config.report_planner = true;
+    config.persistent_history = false;
+
+    std::fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    REQUIRE(std::freopen(path.string().c_str(), "w", stderr) != nullptr);
+    static_cast<void>(ibex::repl::execute_script(source, registry, config));
+    std::fflush(stderr);
+    REQUIRE(dup2(saved, fileno(stderr)) != -1);
+    static_cast<void>(close(saved));
+
+    std::ifstream in{path};
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::filesystem::remove(path);
+    for (const auto& line : std::views::split(text, '\n')) {
+        std::string_view view{line.begin(), line.end()};
+        if (view.starts_with("planner:")) {
+            return std::string{view};
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
+TEST_CASE("REPL reports which planner path a script took", "[repl][lazy][planner]") {
+    std::vector<std::vector<std::string>> decode_calls;
+    ibex::runtime::ExternRegistry registry;
+    register_recording_lazy_source(registry, decode_calls);
+
+    const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let rows = read_fake();
+rows[filter a > 1, select { n = count() }];
+)";
+    CHECK(capture_planner_line(source, registry) == "planner: whole-script");
+}
+
+TEST_CASE("REPL reports why the whole-script planner declined", "[repl][lazy][planner]") {
+    // Declining is otherwise invisible, and the fallback path has different
+    // performance -- a benchmark that cannot see the mode reads a gate change
+    // as a regression. Each decline must name its cause.
+    std::vector<std::vector<std::string>> decode_calls;
+
+    SECTION("no lazy source to plan against") {
+        ibex::runtime::ExternRegistry registry;
+        const auto line = capture_planner_line("let t = Table { a = [1, 2] };\nt;\n", registry);
+        CHECK(line == "planner: statements (script has no lazy table sources to plan against)");
+    }
+
+    SECTION("a function declaration") {
+        ibex::runtime::ExternRegistry registry;
+        register_recording_lazy_source(registry, decode_calls);
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+fn double_it(x: Int) -> Int {
+  x * 2;
+}
+read_fake()[select { n = count() }];
+)";
+        CHECK(capture_planner_line(source, registry) ==
+              "planner: statements (script declares a function)");
+    }
+
+    SECTION("a non-DataFrame type annotation") {
+        ibex::runtime::ExternRegistry registry;
+        register_recording_lazy_source(registry, decode_calls);
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let n: Int = 3;
+read_fake()[select { c = count() }];
+)";
+        CHECK(capture_planner_line(source, registry) ==
+              "planner: statements (`let n` has a non-DataFrame type annotation)");
+    }
 }

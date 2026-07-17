@@ -23,6 +23,9 @@ auto main(int argc, char** argv) -> int {
                    "span multiple lines.")
         ->type_name("FILE");
     app.add_flag("-v,--verbose", verbose, "Enable verbose output");
+    bool report_planner = false;
+    app.add_flag("--report-planner", report_planner,
+                 "Print which planner path each script took (whole-script vs statements).");
     app.add_flag("--no-history", no_history, "Disable persistent readline history");
     app.add_option("--plugin-path", plugin_path,
                    "Directory to search for plugin shared libraries (*.so). "
@@ -55,6 +58,7 @@ auto main(int argc, char** argv) -> int {
 
     ibex::repl::ReplConfig config;
     config.verbose = verbose;
+    config.report_planner = report_planner;
     config.persistent_history = !no_history;
     config.history_path = history_file;
     if (!plugin_path.empty()) {

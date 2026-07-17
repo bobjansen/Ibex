@@ -4254,25 +4254,45 @@ auto literal_args(const std::vector<ir::Expr>& exprs)
 /// Executes relational batch scripts whose top-level effects are represented
 /// by ScriptPlan. Scalar, tuple, import, and function semantics remain on the
 /// mature statement-at-a-time path until they have equivalent plan nodes.
+/// Returns nullopt when the script is not eligible for whole-script planning
+/// and the caller must fall back to statement-at-a-time execution. Declining is
+/// silent and the two paths differ in speed, so `decline_reason` (when non-null)
+/// receives a short explanation: a benchmark that cannot see which path it
+/// measured cannot tell a regression from a gate change.
 auto try_execute_whole_script(const parser::Program& program, runtime::ExternRegistry& externs,
-                              const ReplConfig& config) -> std::optional<bool> {
+                              const ReplConfig& config, std::string* decline_reason = nullptr)
+    -> std::optional<bool> {
+    const auto decline = [&](std::string_view reason) -> std::optional<bool> {
+        if (decline_reason != nullptr) {
+            *decline_reason = reason;
+        }
+        return std::nullopt;
+    };
+
     for (const auto& stmt : program.statements) {
-        if (std::holds_alternative<parser::ImportDecl>(stmt) ||
-            std::holds_alternative<parser::FunctionDecl>(stmt) ||
-            std::holds_alternative<parser::TupleLetStmt>(stmt)) {
-            return std::nullopt;
+        if (std::holds_alternative<parser::ImportDecl>(stmt)) {
+            return decline("script uses `import`");
+        }
+        if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
+            return decline("script declares a function");
+        }
+        if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
+            return decline("script uses a tuple `let`");
         }
         if (const auto* let = std::get_if<parser::LetStmt>(&stmt);
             let != nullptr && let->type.has_value() &&
             let->type->kind != parser::Type::Kind::DataFrame &&
             let->type->kind != parser::Type::Kind::TimeFrame) {
-            return std::nullopt;
+            return decline(fmt::format("`let {}` has a non-DataFrame type annotation", let->name));
         }
     }
 
     auto script = parser::lower_script(program);
-    if (!script.has_value() || !script->preamble.empty()) {
-        return std::nullopt;
+    if (!script.has_value()) {
+        return decline(fmt::format("script did not lower: {}", script.error().message));
+    }
+    if (!script->preamble.empty()) {
+        return decline("script has statements that must run before the plan");
     }
 
     robin_hood::unordered_set<std::string> loaded_plugins;
@@ -4297,7 +4317,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
     }
     if (lazy_callees.empty()) {
-        return std::nullopt;
+        return decline("script has no lazy table sources to plan against");
     }
 
     const auto evaluate = [&](ir::NodePtr plan, const runtime::TableRegistry& base_tables)
@@ -4475,8 +4495,16 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
         fmt::print("error: {}\n", parsed.error().format());
         return false;
     }
-    if (auto planned = try_execute_whole_script(*parsed, registry, config); planned.has_value()) {
+    std::string decline_reason;
+    if (auto planned = try_execute_whole_script(*parsed, registry, config, &decline_reason);
+        planned.has_value()) {
+        if (config.report_planner) {
+            fmt::print(stderr, "planner: whole-script\n");
+        }
         return *planned;
+    }
+    if (config.report_planner) {
+        fmt::print(stderr, "planner: statements ({})\n", decline_reason);
     }
     auto tables = build_builtin_tables();
     LazyTableRegistry lazy_tables;

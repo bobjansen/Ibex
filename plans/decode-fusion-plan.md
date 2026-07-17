@@ -13,9 +13,9 @@ The mechanism the goal needs already exists. `try_execute_whole_script`
 (`src/repl/repl.cpp:4228`) lowers an eligible script into relational plans,
 runs `ir::required_columns` + `ir::scan_predicates` over the *complete* DAG,
 and materializes each lazy source through `LazyTable::project` /
-`project_where` with only the demanded columns. **19** of the 22 PDS-H queries
-are eligible; q15, q16 and q22 decline (see "The gate declines three queries,
-not one" below).
+`project_where` with only the demanded columns. **All 22** PDS-H queries are now eligible. Three
+declined until 2026-07-17 — and did so *silently*; see "The gate declines three
+queries, not one" below.
 
 Correctness is now validated end to end:
 
@@ -282,21 +282,9 @@ and warns when anything fell back. A benchmark that cannot see which engine
 path it measured cannot tell a regression from a gate change.
 
 - **q16** — `script uses \`import\``. Known, structural.
-- **q15, q22** — `script did not lower: scalar(): the enclosing query's
-  columns are not statically known, so a correlated subquery cannot be used
-  here`. This one is architectural, not a bug: whole-script lowering happens
-  *before* any source is read, so `read_parquet(...)`'s schema is still open,
-  and the lowerer cannot classify an identifier inside `scalar(...)` as inner
-  or outer without the enclosing schema — so it refuses. Statement mode never
-  hits this because each statement lowers *after* its predecessors
-  materialized, giving `scalar()` a closed outer schema to resolve against.
-  Both queries take `scalar(...)` over a previously-bound `let` (q15's
-  `revenue`, q22's `in_scope`), which is exactly the shape that needs it.
-  Fixing it means giving the lowerer schemas for lazy sources up front — the
-  Parquet footer already has them, and `ir::SourceSchemas` already exists for
-  the join rewrites; the gap is that lowering runs before that is populated.
-  Worth doing: it would also let the shared-binding pass reach q15/q22, whose
-  `scalar()` subqueries re-scan a binding the main plan already computes.
+- **q15, q22** — FIXED. Diagnosed 2026-07-17 and it was **not** architectural,
+  it was a regression this plan's own shared-binding work introduced. Written
+  up below because the first diagnosis was wrong in an instructive way.
 
 ## Gotchas for whoever picks this up
 
@@ -310,3 +298,56 @@ path it measured cannot tell a regression from a gate change.
   when emulating the harness.
 - Post-commit perf hook: check `pgrep -af 'perf|ibex|ninja'` before trusting
   any measurement.
+
+## q15/q22: a self-inflicted decline, and a wrong diagnosis worth remembering
+
+The symptom: both queries declined with `scalar(): the enclosing query's
+columns are not statically known`. The obvious reading — whole-script lowering
+runs before any source is read, so `read_parquet`'s schema is open and
+`scalar()` cannot classify an identifier as inner-vs-outer — is wrong, and two
+experiments killed it:
+
+1. Ascribing the *reads* with their full concrete schemas (all 16 lineitem
+   columns) changed nothing. So an open source schema was not the cause.
+2. Flipping `share_repeated_bindings_` to false made both queries plan
+   immediately. So the cause was sharing.
+
+The real mechanism: an aggregate's or projection's output schema is **known
+regardless of its input**, because the field list names it outright —
+`[select { total_revenue = ... }, by { s_suppkey = l_suppkey }]` is exactly
+`{s_suppkey, total_revenue}` whatever it reads. So with the binding *inlined*,
+`infer_schema` walks the plan and resolves the join's schema fine, open sources
+and all. But the shared-binding pass rewrites the reference to `Scan("revenue")`,
+and `Scan` resolves its schema through `source_schemas()`, which knows nothing
+about a binding the executor has not materialized yet. The schema was knowable
+and sharing threw it away.
+
+Fix (`lower_script`, the shared-binding bind site): infer the schema off the
+plan before moving it into `shared_bindings_` and record it in
+`binding_schemas_`, which `source_schemas()` already overlays. Four lines. The
+trigger condition is worth internalizing: **a binding is shared exactly when it
+is expensive and referenced twice — and the second reference is very often the
+one inside `scalar(...)`.** So sharing systematically breaks decorrelation on
+the queries it exists to help.
+
+Measured SF-1, pinned to cores 2-3, interleaved, min-of-8 in one warm REPL,
+3 rounds — `:run` planned vs `:run` falling back (same path, same framing):
+q15 46.7 → 45.7ms (−2.2%), q22 51.1 → 49.9ms (−2.3%). Consistent sign every
+round. 1155 tests, 22/22 answers.
+
+**The note this corrects.** The plan previously recorded "q22 needed Update in
+the expensive set (per-row substring re-ran twice)" as a *fix*, with "q22 92 vs
+98ms → faster" as evidence. Adding `Update` to the expensive set is what made
+`in_scope` shared, which is what made q22 stop planning. The 92-vs-98ms was
+statement mode timed against itself, and the "fix" was the fallback. A silent
+decline plus a plausible story reads exactly like a win. This is why
+`--report-planner` exists.
+
+**Two things learned about ascription** (from experiment 1, both real):
+- `ScalarType` has no `Categorical`, so a dictionary-encoded Parquet string
+  column cannot be ascribed by its decoded type at all. `String` does validate
+  against a Categorical column, so ascription works — but the user has to know
+  to write the type the column *isn't*.
+- Ascription is exact/closed by default, so ascribing a raw reader means
+  naming every column in the file. For a benchmark that exists to measure
+  projection pushdown that is actively counterproductive.

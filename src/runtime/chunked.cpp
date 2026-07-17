@@ -3431,17 +3431,31 @@ class ChunkedAggregateOperator final : public Operator {
                 std::holds_alternative<Column<std::string>>(*group_entries[0]->column) &&
                 !group_entries[0]->validity.has_value();
             // Single fixed-width-integer key: a direct value map, no owned Key.
+            const auto int_kind_of = [](const ColumnValue& col) -> std::optional<IntKeyKind> {
+                if (std::holds_alternative<Column<std::int64_t>>(col)) {
+                    return IntKeyKind::Int64;
+                }
+                if (std::holds_alternative<Column<Date>>(col)) {
+                    return IntKeyKind::Date;
+                }
+                if (std::holds_alternative<Column<Timestamp>>(col)) {
+                    return IntKeyKind::Ts;
+                }
+                return std::nullopt;
+            };
             if (group_entries.size() == 1 && !group_entries[0]->validity.has_value()) {
-                const ColumnValue& key_col = *group_entries[0]->column;
-                if (std::holds_alternative<Column<std::int64_t>>(key_col)) {
+                if (auto kind = int_kind_of(*group_entries[0]->column)) {
                     int_fast_path_ = true;
-                    int_key_kind_ = IntKeyKind::Int64;
-                } else if (std::holds_alternative<Column<Date>>(key_col)) {
-                    int_fast_path_ = true;
-                    int_key_kind_ = IntKeyKind::Date;
-                } else if (std::holds_alternative<Column<Timestamp>>(key_col)) {
-                    int_fast_path_ = true;
-                    int_key_kind_ = IntKeyKind::Ts;
+                    int_key_kind_ = *kind;
+                }
+            } else if (group_entries.size() == 2 && !group_entries[0]->validity.has_value() &&
+                       !group_entries[1]->validity.has_value()) {
+                auto ka = int_kind_of(*group_entries[0]->column);
+                auto kb = int_kind_of(*group_entries[1]->column);
+                if (ka.has_value() && kb.has_value()) {
+                    pair_int_fast_path_ = true;
+                    int_key_kind_ = *ka;
+                    int_key_kind_b_ = *kb;
                 }
             }
             initialized_ = true;
@@ -3472,6 +3486,9 @@ class ChunkedAggregateOperator final : public Operator {
         }
         if (int_fast_path_) {
             return process_rows_int(group_entries, agg_entries, rows);
+        }
+        if (pair_int_fast_path_) {
+            return process_rows_int_pair(group_entries, agg_entries, rows);
         }
         return process_rows_generic(group_entries, agg_entries, rows);
     }
@@ -3574,6 +3591,67 @@ class ChunkedAggregateOperator final : public Operator {
                     gid = static_cast<std::uint32_t>(n_groups_);
                     int_index_.emplace(key, gid);
                     int_order_.push_back(key);
+                    ++n_groups_;
+                    flat_slots_.resize(n_groups_ * n_aggs_);
+                } else {
+                    gid = it->second;
+                }
+                prev_key = key;
+                prev_gid = gid;
+                have_prev = true;
+            }
+            gids[row] = gid;
+        }
+
+        accumulate_columns(gids, agg_entries, rows);
+        return std::nullopt;
+    }
+
+    // Two fixed-width-integer keys, grouped as one 128-bit composite. Mirrors
+    // process_rows_int exactly, packing (key_a, key_b) into a u128 so a single
+    // hash probe replaces the generic path's per-key Key comparison.
+    auto process_rows_int_pair(const std::vector<const ColumnEntry*>& group_entries,
+                               const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
+        -> std::optional<std::string> {
+        const auto raw_reader = [](const ColumnValue& col, IntKeyKind kind) {
+            return [&col, kind](std::size_t row) -> std::int64_t {
+                switch (kind) {
+                    case IntKeyKind::Int64:
+                        return std::get<Column<std::int64_t>>(col).data()[row];
+                    case IntKeyKind::Date:
+                        return std::get<Column<Date>>(col).data()[row].days;
+                    case IntKeyKind::Ts:
+                        return std::get<Column<Timestamp>>(col).data()[row].nanos;
+                }
+                return 0;
+            };
+        };
+        const auto key_a_at = raw_reader(*group_entries[0]->column, int_key_kind_);
+        const auto key_b_at = raw_reader(*group_entries[1]->column, int_key_kind_b_);
+        const auto pack = [](std::int64_t a, std::int64_t b) -> __uint128_t {
+            return (static_cast<__uint128_t>(static_cast<std::uint64_t>(a)) << 64) |
+                   static_cast<std::uint64_t>(b);
+        };
+
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
+
+        __uint128_t prev_key = 0;
+        std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
+        bool have_prev = false;
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::int64_t a = key_a_at(row);
+            const std::int64_t b = key_b_at(row);
+            const __uint128_t key = pack(a, b);
+            std::uint32_t gid{};
+            if (have_prev && key == prev_key) {
+                gid = prev_gid;
+            } else {
+                auto it = pair_index_.find(key);
+                if (it == pair_index_.end()) {
+                    gid = static_cast<std::uint32_t>(n_groups_);
+                    pair_index_.emplace(key, gid);
+                    pair_order_.emplace_back(a, b);
                     ++n_groups_;
                     flat_slots_.resize(n_groups_ * n_aggs_);
                 } else {
@@ -4153,7 +4231,7 @@ class ChunkedAggregateOperator final : public Operator {
         // fast paths above are only taken for key columns with no nulls.
         std::vector<ValidityBitmap> key_validity(group_by_->size());
         std::uint64_t any_null_keys = 0;
-        if (!cat_fast_path_ && !str_fast_path_ && !int_fast_path_) {
+        if (!cat_fast_path_ && !str_fast_path_ && !int_fast_path_ && !pair_int_fast_path_) {
             for (const auto& key : group_order_) {
                 any_null_keys |= key.null_mask;
             }
@@ -4163,6 +4241,20 @@ class ChunkedAggregateOperator final : public Operator {
                 }
             }
         }
+
+        const auto push_int_key = [](ColumnValue& col, IntKeyKind kind, std::int64_t raw) {
+            switch (kind) {
+                case IntKeyKind::Int64:
+                    std::get<Column<std::int64_t>>(col).push_back(raw);
+                    return;
+                case IntKeyKind::Date:
+                    std::get<Column<Date>>(col).push_back(Date{static_cast<std::int32_t>(raw)});
+                    return;
+                case IntKeyKind::Ts:
+                    std::get<Column<Timestamp>>(col).push_back(Timestamp{raw});
+                    return;
+            }
+        };
 
         const AggSlot* fs = flat_slots_.data();
         for (std::size_t g = 0; g < n_groups_; ++g) {
@@ -4182,20 +4274,10 @@ class ChunkedAggregateOperator final : public Operator {
                 auto& str_col = std::get<Column<std::string>>(out.mutable_column(0));
                 str_col.push_back(str_order_[g]);
             } else if (int_fast_path_) {
-                switch (int_key_kind_) {
-                    case IntKeyKind::Int64:
-                        std::get<Column<std::int64_t>>(out.mutable_column(0))
-                            .push_back(int_order_[g]);
-                        break;
-                    case IntKeyKind::Date:
-                        std::get<Column<Date>>(out.mutable_column(0))
-                            .push_back(Date{static_cast<std::int32_t>(int_order_[g])});
-                        break;
-                    case IntKeyKind::Ts:
-                        std::get<Column<Timestamp>>(out.mutable_column(0))
-                            .push_back(Timestamp{int_order_[g]});
-                        break;
-                }
+                push_int_key(out.mutable_column(0), int_key_kind_, int_order_[g]);
+            } else if (pair_int_fast_path_) {
+                push_int_key(out.mutable_column(0), int_key_kind_, pair_order_[g].first);
+                push_int_key(out.mutable_column(1), int_key_kind_b_, pair_order_[g].second);
             } else {
                 const Key& key = group_order_[g];
                 for (std::size_t ci = 0; ci < key.values.size(); ++ci) {
@@ -4393,6 +4475,26 @@ class ChunkedAggregateOperator final : public Operator {
     IntKeyKind int_key_kind_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> int_index_;
     std::vector<std::int64_t> int_order_;  ///< group keys, as raw integers, in first-seen order
+
+    // Two fixed-width-integer keys are packed into a single 128-bit composite
+    // key and grouped exactly as one integer key: `(l_partkey, l_suppkey)` on
+    // TPC-H q20's ~800k groups otherwise falls to the generic `Key` path, which
+    // boxes a ScalarValue-vector Key per group and compares it field-by-field on
+    // every probe. Packing two 64-bit values into 128 bits is injective with no
+    // knowledge of their domains, so this is always exact.
+    bool pair_int_fast_path_ = false;
+    IntKeyKind int_key_kind_b_ = IntKeyKind::Int64;
+    struct U128Hash {
+        auto operator()(__uint128_t key) const noexcept -> std::size_t {
+            const auto lo = static_cast<std::uint64_t>(key);
+            const auto hi = static_cast<std::uint64_t>(key >> 64);
+            std::uint64_t h = lo * 0x9e3779b97f4a7c15ULL;
+            h ^= hi + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    robin_hood::unordered_flat_map<__uint128_t, std::uint32_t, U128Hash> pair_index_;
+    std::vector<std::pair<std::int64_t, std::int64_t>> pair_order_;
 };
 
 /// Replays one buffered chunk ahead of the rest of a child stream. Used by

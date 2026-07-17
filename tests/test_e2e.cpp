@@ -97,6 +97,29 @@ auto make_trades() -> runtime::TableRegistry {
 
 }  // namespace
 
+// --- Grouping ----------------------------------------------------------------
+
+TEST_CASE("E2E: group-by on two integer keys packs into one composite key", "[e2e][aggregate]") {
+    // Two int keys route to the packed-u128 fast path (process_rows_int_pair)
+    // instead of the generic boxed-Key path. The grouping and the two-column key
+    // reconstruction on output must match exactly. Keys (a, b) with (1,10),
+    // (2,20) and (1,20) present -- note (1,10) and (1,20) share `a` and (2,20)
+    // and (1,20) share `b`, so a per-key collision would merge groups wrongly.
+    runtime::Table t;
+    t.add_column("a", Column<std::int64_t>{1, 1, 2, 2, 1});
+    t.add_column("b", Column<std::int64_t>{10, 10, 20, 20, 20});
+    t.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    auto out = run("t[select { s = sum(v) }, by { a, b }];", tables);
+    REQUIRE(out.rows() == 3);
+    // First-seen group order: (1,10), (2,20), (1,20).
+    CHECK(col_i64(out, "a") == std::vector<std::int64_t>{1, 2, 1});
+    CHECK(col_i64(out, "b") == std::vector<std::int64_t>{10, 20, 20});
+    CHECK(col_dbl(out, "s") == std::vector<double>{3.0, 7.0, 5.0});
+}
+
 // --- Basic filter ------------------------------------------------------------
 
 TEST_CASE("E2E: filter with greater-than", "[e2e]") {

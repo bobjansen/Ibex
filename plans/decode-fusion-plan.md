@@ -398,21 +398,56 @@ non-linearity is the whole clue: this is a threshold, not an additive cost --
 something is bailing out entirely, and only flips back on when the last leaf is
 right.
 
-**Leading hypothesis: inner-join reordering is bailing.**
-`ir::reorder_inner_joins_for_aggregates` -> `schemas_are_unambiguous`
-(`src/ir/join_reorder.cpp:73`) requires *every* leaf's schema to be known and
-closed, and gives up on the whole reorder otherwise. One all-or-nothing gate
-across all leaves matches the observed shape exactly. Note `infer_schema` of a
-bare `Scan(customer)` returns the source's *full* schema (all 8 columns), not
-the demand-narrowed one, so a bare leaf and a projected leaf are not the same
-input to that check even when the scan decodes identically.
+**Diagnosed to one line, 2026-07-17.** Instrumenting the aggregate's child node
+kind across the four phrasings settles what the timings could not:
 
-**Next step:** print the chosen join order for each phrasing (or assert on it),
-confirm whether `schemas_are_unambiguous` returns false for the natural plan,
-and if so find which leaf and why. If confirmed, the fix is in the gate, not in
-demand analysis -- and it would mean naturally-written joins silently lose join
-reordering, which is worth far more than the benchmark phrasing question that
-surfaced it.
+| phrasing | ms | aggregate's child |
+|---|---:|---|
+| hand-fused (no filter above the joins at all) | 95 | `Project` |
+| filters above joins, every side `select` | 102 | `Project` — filter **was pushed** |
+| same, but lineitem renamed by `update` | 123 | `FilterUpdateProject` — **not pushed** |
+| fully natural | 585 | `FilterUpdateProject` — **not pushed** |
+
+A `Project` child means the top-level filter is *gone*: `push_filters_into_joins`
+moved every conjunct onto a join side. A `FilterUpdateProject` child means the
+filter is still sitting above both joins, so they run on unfiltered inputs --
+6M lineitem rows instead of 3.2M, and the customer/orders join unfiltered too.
+That is the 6x, and it is a *filter* pushdown failure, not a projection one.
+
+**The trigger is a join side being `Update(Scan)` rather than `Project(Scan)`.**
+Nothing else separates the 102ms and 123ms rows -- same filter, same scans, same
+demand (both decode the same four lineitem columns). Since TPC-H keys do not
+match by name, an equijoin *requires* a rename, and `update` is the natural way
+to write one -- so the natural phrasing trips this on every join.
+
+**Ruled out, with evidence, do not re-run:**
+- *Projection pushdown / wide scans.* Demand is narrow in every phrasing; the
+  lineitem scan decodes the same 4 columns natural or hand-fused.
+- *`required_columns`' Join arm.* Widens only for Asof; otherwise passes `need`
+  plus join keys to both sides.
+- *Inner-join reordering.* Never fires for q03 in ANY phrasing --
+  `reorder_inner_joins_for_aggregates` needs an Aggregate whose child is
+  *directly* a Join, and here it is always a Project or a fused node. (Its
+  `schemas_are_unambiguous` gate is never reached, so it is not the cause. That
+  the pass is dead on this query shape is a separate finding worth its own look.)
+- *`infer_schema`'s Update arm.* Correct: propagates `known` and `open` from its
+  input, so an `Update(Scan)` side is Known and closed like a `Project(Scan)`.
+
+**Where to look next.** `join_pushdown.cpp` contains zero references to
+`FilterProject` / `FilterUpdateProject`, and `walk` (:231) only matches a plain
+`NodeKind::Filter` directly over a `NodeKind::Join`. Two candidates remain, and
+they are cheap to separate:
+1. The fused node is built *before* pushdown runs in the `update` shape, so the
+   filter is invisible to `walk` -- but then the `select` shape should fuse too,
+   and it evidently does not. Check when FilterUpdateProject is formed in each.
+2. `push_conjunct`'s side attribution (:96-124) rejects a conjunct because an
+   `Update` side's schema is the source's FULL column list (16 lineitem columns
+   + the alias), where a `Project` side's is 4. A wider side schema can only
+   change the outcome via `left.find(name) != nullptr` -- so a conjunct that is
+   unambiguous over projected sides may look ambiguous over unprojected ones.
+
+Print the destination `push_conjunct` picks per conjunct for the 102ms and
+123ms plans; they differ by exactly one node, so the divergence will be obvious.
 
 **So: rewrite the queries only after fixing this.** Doing it now would post a 6x
 regression on q03 and similar elsewhere. The order is (1) make demand analysis

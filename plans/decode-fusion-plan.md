@@ -517,3 +517,33 @@ right and misleading. Corrected after testing:
 Note this is now academic for q15/q22 — the shared-binding schema fix (2241720)
 means they need no ascription at all. It matters for anyone who ascribes a
 reader for static checking and unknowingly pays 4x for it.
+
+### Correction: the pushdown finding is real but does NOT explain the 6x
+
+Re-reading the table above: `upd_line` (123ms) and `natural` (585ms) BOTH have a
+`FilterUpdateProject` child, i.e. both fail to push the filter. So an unpushed
+filter is worth ~21ms here (102 -> 123), not 6x. The claim that "the trigger is
+a join side being Update(Scan)" explains which plans lose pushdown; it does not
+explain the 460ms that separates the two plans that both lost it.
+
+So there are TWO independent effects, and only the small one is diagnosed:
+
+1. **A join side that is `Update(Scan)` loses filter pushdown.** Real, isolated
+   (the only difference between the 102ms and 123ms plans), worth ~21ms on q03.
+2. **Something about customer/orders being unprojected costs ~460ms**, on top of
+   (1) and independent of it. `upd_line` differs from `natural` only in that
+   customer and orders are `select`-projected rather than bare/`update`-renamed.
+   Undiagnosed. Note it is NOT the scan: demand is narrow in both and both
+   decode the same columns.
+
+The bisect earlier in this document already contained the refutation and it was
+missed: projecting *either* customer or orders alone leaves ~590ms, but
+projecting *both* (plus lineitem's `update`) gives 123ms. A single all-or-nothing
+gate somewhere still fits effect (2) — it just is not join reordering (dead on
+this shape) and not the filter pushdown above (which the 123ms plan also fails).
+
+Next: instrument what each JOIN actually receives — input row counts and column
+counts per side — for the 123ms and 585ms plans. The row counts will separate
+"the joins see unfiltered inputs" from "the joins carry too many columns", which
+is the question effect (2) turns on. Do not reason about it from node kinds
+again; two diagnoses in this thread died that way.

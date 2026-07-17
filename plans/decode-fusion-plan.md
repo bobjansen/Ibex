@@ -730,3 +730,49 @@ costed reorder that improves the geomean can wreck an individual query.
 Both gates being independent also means the earlier note's framing was too kind:
 this is not "a good pass behind a too-strict gate", it is an unvalidated pass
 behind two gates, whose cost model has never been exercised on a real plan.
+
+### The missing estimate: `estimate_cardinality` has no `Join` arm
+
+Found by instrumenting the estimator's `default:` arm — it reports
+`no estimate for node kind=16`, which is `Join`. Not a Scan lookup miss (the
+scans all resolve in `row_counts`); the estimator simply does not model a join.
+
+Why that blocks q21 specifically: `take_left_deep` / `collect_left_deep` only
+follow **plain inner joins** down the chain. q21's `exists` clauses lower to
+semi/anti joins, so a nested semi join is not part of the chain — it becomes a
+**leaf**. Estimating that leaf means estimating a Join, the estimator returns
+nothing, and `collect_left_deep` bails on the whole chain. One unestimable leaf
+kills the ordering for every relation in the query.
+
+So the chain is now fully explained, end to end:
+
+    aggregate's child is a Project (21/22 queries)      -> shape gate rejects
+    q21 gets past                                        -> leaf is Project(SemiJoin)
+    Join has no cardinality arm                          -> leaf has no row estimate
+    collect_left_deep bails                              -> cost model declines
+    nothing is ever reordered                            -> pass is a no-op
+
+**Adding the arm is a real design decision, not a fill-in-the-blank.**
+`CardinalityEstimate` already carries a `heuristic` flag, and `CardinalityOptions`
+already keeps a `filter_selectivity = 0.25` guess, so the shape of an answer
+exists. The content does not:
+
+- **Semi / Anti** are the easy half and the ones q21 needs: neither can widen its
+  left input, so `rows <= left.rows` is a sound upper bound, and a selectivity
+  guess (semi ~ `left * s`, anti ~ `left * (1 - s)`) fits the existing
+  `filter_selectivity` idiom. Mark heuristic.
+- **Inner** is the hard half. The textbook estimate is
+  `|L| * |R| / max(distinct(L.k), distinct(R.k))`, and we have no distinct
+  counts — Parquet footers carry them per row group, but nothing plumbs them
+  through. Without stats, the honest options are a foreign-key assumption
+  (`rows ~ max(|L|, |R|)`) or refusing to guess. **A join-order cost model whose
+  join estimate is a guess is a cost model that reorders on a guess**, which is
+  precisely how a costed optimizer regresses individual queries while improving
+  a geomean.
+
+**Sequence stands, with the first step now concrete:** add Semi/Anti estimates
+(sound, bounded, enough to unblock q21), then check whether the pass changes
+q21's plan and whether the new plan is *faster*. That is the first evidence this
+pass would ever have. Only then consider Inner estimates and relaxing the shape
+gate — and note Inner is where the real risk lives, since every query the
+relaxation would newly reach is an inner chain.

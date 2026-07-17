@@ -386,3 +386,33 @@ that point measures the optimizer instead of the author. The upside is real —
 the hand-fusion is currently hiding a 6x gap that every naturally-written user
 query walks into, and Polars' lazy API does this pushdown for free, which is
 why its published queries can afford to be written the same way ours are.
+
+## Correction: ascription, `*`, and what it actually costs (2026-07-17)
+
+The note above ("ascribing a raw reader means naming every column") was half
+right and misleading. Corrected after testing:
+
+- **`*` exists and is the answer to verbosity.** `read_parquet(...) as
+  DataFrame<{ l_shipdate: Date, * }>` names only what you care about. Exact is
+  the *default*, not the only option.
+- **`*` was BROKEN under the whole-script planner** — a real bug, found here.
+  `lower.cpp`'s IR clone rebuilt AscribeNode via `builder_.ascribe(asc.schema())`,
+  and the builder's `bool open = false` default silently turned every cloned
+  wildcard into an exact schema. Whole-script lowering clones bound IR per
+  reference; statement mode does not clone, so only one path saw it. Fixed, and
+  `open` is now a required parameter so a dropped argument is a compile error
+  rather than a silent meaning change. Test: "wildcard ascription survives the
+  IR clone".
+- **Ascription still forces a full decode, and that is a genuine open gap.**
+  Even `{ l_shipdate: Date, * }` — one named column — makes the lineitem scan
+  cost 228ms vs 60ms unascribed (~4x); the closed 16-column form costs 235ms.
+  Naming a column in an ascription should not imply materializing it: the check
+  needs each column's *name and type*, which the Parquet footer already carries,
+  not its *data*. So `required_columns` should not turn an Ascribe's field list
+  into data demand, and the runtime check over a lazy scan should validate
+  against the source schema rather than the materialized projection. Until then,
+  ascribing a reader silently disables projection pushdown.
+
+Note this is now academic for q15/q22 — the shared-binding schema fix (2241720)
+means they need no ascription at all. It matters for anyone who ascribes a
+reader for static checking and unknowingly pays 4x for it.

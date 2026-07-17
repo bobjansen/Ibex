@@ -4529,7 +4529,7 @@ class Lowerer {
             }
             case ir::NodeKind::Ascribe: {
                 const auto& asc = static_cast<const ir::AscribeNode&>(node);
-                clone = builder_.ascribe(asc.schema());
+                clone = builder_.ascribe(asc.schema(), asc.open());
                 break;
             }
             case ir::NodeKind::Columns: {

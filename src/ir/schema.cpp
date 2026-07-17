@@ -277,6 +277,38 @@ auto check_ascriptions(Node& root, const SourceSchemas& sources)
     return {};
 }
 
+auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& args)
+    -> std::optional<std::string> {
+    std::string key = callee;
+    key += '(';
+    for (const auto& arg : args) {
+        const auto* literal = std::get_if<Literal>(&arg.node);
+        if (literal == nullptr) {
+            return std::nullopt;
+        }
+        std::visit(
+            [&](const auto& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, std::string>) {
+                    key += '"';
+                    key += value;
+                    key += '"';
+                } else if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double> ||
+                                     std::is_same_v<T, bool>) {
+                    key += std::to_string(value);
+                } else if constexpr (std::is_same_v<T, Date>) {
+                    key += "d" + std::to_string(value.days);
+                } else {
+                    key += "t" + std::to_string(value.nanos);
+                }
+            },
+            literal->value);
+        key += ',';
+    }
+    key += ')';
+    return key;
+}
+
 auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo {
     switch (node.kind()) {
         case NodeKind::Program:
@@ -291,6 +323,14 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
         case NodeKind::ExternCall: {
             const auto& call = static_cast<const ExternCallNode&>(node);
+            // A call-site schema is what this specific reader call returns, and
+            // beats the callee's declared one, which is per-function and so
+            // cannot describe a generic reader like read_parquet.
+            if (const auto key = extern_call_site_key(call.callee(), call.args())) {
+                if (auto it = sources.find(*key); it != sources.end()) {
+                    return it->second;
+                }
+            }
             if (auto it = sources.find(call.callee()); it != sources.end()) {
                 return it->second;
             }

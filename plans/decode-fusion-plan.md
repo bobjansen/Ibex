@@ -653,3 +653,45 @@ was never measured either, the pass has no evidence behind it at all.
 
 **Test it from the lowerer, not the Builder.** Parse a query, lower it, and
 assert the pass fires — otherwise the next shape change silently kills it again.
+
+### FIXED: the lowerer now gets reader schemas (2026-07-17)
+
+Natural q03: **585 -> 96ms**, identical to hand-fused. Every phrasing now lands
+at 92-96ms — the shape of the query no longer decides whether its filters push.
+
+Three parts:
+
+1. **Per-call-site schema keys** (`ir::extern_call_site_key`). `infer_schema`
+   keyed an `ExternCall` by its callee, which assumes one schema per function —
+   false for a generic reader, since `read_parquet` returns a different schema
+   per path. A call site is now keyed `read_parquet("path")`, and infer_schema
+   prefers that over the bare callee (which still serves declared reader return
+   schemas).
+2. **`lower_script(program, reader_schemas)`.** They reach the Lowerer's
+   `binding_schemas_`, which `source_schemas()` overlays.
+3. **The driver resolves readers before lowering.** It lowers once to discover
+   which readers are called with which literal arguments, asks each for its
+   schema (a footer read — the executor pays it anyway), then lowers for real.
+
+**The bug within the bug:** `lower_script` built its schema map with
+`build_source_schemas(lowerer.table_extern_decls())` rather than calling
+`lowerer.source_schemas()` — the accessor that overlays `binding_schemas_`. So
+the schemas were threaded correctly all the way in and then dropped one line
+before the pass that needed them. The first end-to-end attempt showed 624ms and
+looked like a failed idea; it was a one-word bug.
+
+Cost: one extra lowering and one footer read per distinct reader, per script.
+Interleaved A/B (pinned, min-of-6, old vs new binary) on the hand-fused suite:
+q03 99.5/97.5 -> 95.7/98.8, q21 699/691 -> 706/678, q05 130/134 -> 131/135 —
+no regression. (A serial before/after run read +11% across every query
+*including one that got faster*; that was box drift. Interleave.)
+
+Two tests changed, and the change is the point: `source_instances` counted
+LazyTable constructions, and each script now builds one more — the schema probe.
+Both assertions now say so.
+
+**This removes the argument for de-hand-fusing being blocked.** The suite's
+`select` after each scan is no longer load-bearing for filter pushdown. Rewriting
+the queries naturally is now a phrasing decision, not a 6x cliff — though it is
+still worth doing only if the queries should measure the optimizer rather than
+the author.

@@ -588,9 +588,20 @@ class AscribeNode final : public Node {
     /// True if the ascription ends with a `*` wildcard (extra columns allowed).
     [[nodiscard]] auto open() const noexcept -> bool { return open_; }
 
+    /// True once `check_ascriptions` has proven this ascription holds against a
+    /// statically known input schema. The assertion is about *shape*, so proving
+    /// it needs names and types only — a Parquet footer, never a decoded value.
+    /// Once proven the node is a pure identity: the interpreter skips its check
+    /// and `required_columns` stops demanding the columns the check would have
+    /// read, which is what keeps an ascription from disabling projection
+    /// pushdown.
+    [[nodiscard]] auto checked() const noexcept -> bool { return checked_; }
+    void set_checked() noexcept { checked_ = true; }
+
    private:
     std::vector<SchemaField> schema_;
     bool open_;
+    bool checked_ = false;
 };
 
 /// Columns node: exposes the child table's column names as a one-column table.

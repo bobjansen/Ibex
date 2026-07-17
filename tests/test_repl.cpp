@@ -1859,20 +1859,35 @@ let rows = read_fake() as DataFrame<{ a: Int, * }>;
 rows[select { n = count() }];
 )";
         REQUIRE(ibex::repl::execute_script(source, registry));
-        REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}});
+        // Not even an empty decode: count() comes from logical_rows, so the
+        // scan never calls the decoder at all.
+        REQUIRE(decode_calls.empty());
     }
 
-    SECTION("an exact ascription still reads everything, to reject extras") {
-        // It asserts the input has NO unlisted column, which can only be
-        // checked against the whole input.
+    SECTION("an exact ascription reads nothing either") {
+        // It also asserts the input has no unlisted column -- but that is a
+        // question about the schema, and the source's schema answers it without
+        // decoding a page. So `check_ascriptions` proves it up front and the
+        // scan is left to materialize only what the query actually reads: here,
+        // count(), which reads nothing.
         const std::string source = R"(
 extern fn read_fake() -> DataFrame from "fake.hpp";
 let rows = read_fake() as DataFrame<{ a: Int, b: Int }>;
 rows[select { n = count() }];
 )";
         REQUIRE(ibex::repl::execute_script(source, registry));
-        REQUIRE(decode_calls.size() == 1);
-        CHECK(decode_calls.front() == std::vector<std::string>{"a", "b"});
+        // Not even an empty decode: count() comes from logical_rows, so the
+        // scan never calls the decoder at all.
+        REQUIRE(decode_calls.empty());
+    }
+
+    SECTION("an exact ascription still rejects an unlisted column") {
+        const std::string source = R"(
+extern fn read_fake() -> DataFrame from "fake.hpp";
+let rows = read_fake() as DataFrame<{ a: Int }>;
+rows[select { n = count() }];
+)";
+        CHECK_FALSE(ibex::repl::execute_script(source, registry));
     }
 }
 

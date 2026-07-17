@@ -314,6 +314,12 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
         // extras it exists to reject.
         case NodeKind::Ascribe: {
             const auto& asc = static_cast<const AscribeNode&>(node);
+            if (asc.checked()) {
+                // Already proven against the input's schema, so it reads nothing
+                // at all: pass the parent's demand straight through.
+                visit_children(node, need, out);
+                return;
+            }
             if (!asc.open()) {
                 visit_children_widened(node, out);
                 return;

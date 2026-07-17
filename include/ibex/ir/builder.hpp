@@ -102,7 +102,12 @@ class Builder {
         return std::make_unique<AsTimeframeNode>(next_id(), std::move(column));
     }
 
-    [[nodiscard]] auto ascribe(std::vector<SchemaField> schema, bool open = false) -> NodePtr {
+    /// `open` is required rather than defaulted: it is the difference between a
+    /// wildcard schema and an exact one, and a caller that forgets it silently
+    /// gets the stricter meaning instead of a compile error. The IR clone in
+    /// lower.cpp did exactly that, turning `as { a: Int, * }` into `as { a: Int }`
+    /// on every cloned reference.
+    [[nodiscard]] auto ascribe(std::vector<SchemaField> schema, bool open) -> NodePtr {
         return std::make_unique<AscribeNode>(next_id(), std::move(schema), open);
     }
 

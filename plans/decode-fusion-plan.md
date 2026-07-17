@@ -1017,3 +1017,105 @@ aggregate child is an `Update` (kind 8) — not a `Project`, as the table above
 records; the reader-schema fix moved it — so the shape gate still rejects them.
 Relaxing that gate is the next step, and the thing to validate it against is a
 *deliberately badly-ordered* query, not the suite.
+
+### Relaxing the shape gate: tried, measured, REVERTED — the gate was load-bearing
+
+The goal is to beat *badly written* Ibex; parity on the well-written suite is
+the pass condition, not a failure. So: relax the gate to find the join chain
+through row-wise unary nodes, and judge it on deliberately badly-ordered
+queries. Both parts were built and measured. **The relaxation works, wins big
+where it should, and was reverted anyway** — because it also regresses q09 by
+**+173%**.
+
+**Two real bugs found on the way in, both worth keeping** (the second is
+committed, the first is what this section's revert leaves behind):
+
+1. **`infer_schema` did not model the fused nodes.** `FilterProject` and
+   `FilterUpdateProject` sat in the "not yet modelled: Unknown is sound" arm.
+   But canonicalize R5/R6 fuse `Project(Filter(scan))` — *the shape of every
+   hand-written scan leaf*. So **no real plan's leaf had a schema**, and every
+   pass gated on a Known input declined on every query, invisibly. Instrumented:
+   q03's first leaf came back `kind=29 rows=375000 known=0`. The estimate was
+   there all along; the schema was the blocker. Fixed (arms delegate to the same
+   `project_schema` / `update_schema` helpers the unfused arms now use, so the
+   two cannot drift), with tests. **This is kept** — it is a completeness fix in
+   its own right and a prerequisite for any future cost model.
+2. The gutted-plan hazard, above.
+
+**With both fixed, the relaxation does exactly what it was built to do.**
+Deliberately badly-ordered q03 (joins the two biggest relations first; identical
+filters, projections, aggregate — verified byte-identical output). SF-1, pinned
+to cores 2-3, min-of-6 in one warm REPL, interleaved, three rounds:
+
+| phrasing | reorder ON | OFF | delta |
+|---|---:|---:|---:|
+| q03 **badly written** | 95.7 / 93.7 / 96.1 ms | 115.7 / 112.7 / 114.2 ms | **−17%, same sign every round** |
+| q03 well written | 99.7 / 94.5 / 93.5 ms | 96.1 / 96.5 / 96.2 ms | ±3%, rounds disagree — noise |
+
+The badly-written query lands at 93.7–96.1ms against the well-written
+93.5–99.7ms: **the bad order is rescued to parity with the good one.** That is
+the whole objective, demonstrated.
+
+**And then the suite.** Interleaved A/B, min-of-4, two rounds, reorder on vs off:
+
+| query | delta | |
+|---|---:|---|
+| q02 | **−22% / −31%** | a real win on a *well-written* query |
+| q03 q04 q05 q06 q07 | −1% to −8% | wins or noise |
+| q10 | **+17%** | regression |
+| q08 | **+17% / +12%** | regression |
+| **q09** | **+173%** (206 → 562 ms) | **disqualifying** |
+
+**Why q09 explodes, and it is not the estimates.** Instrumented, its six leaves
+come back correctly sized — nation 25, supplier 10k, part 50k, partsupp 800k,
+orders 1.5M, lineitem 6M — and the model picks `5 2 1 0 3 4`: nation, supplier,
+then **lineitem third**. Joining 10k suppliers into 6M lineitems builds a 6M-row
+intermediate that part, partsupp and orders then each probe against.
+
+**`choose_inner_join_order` is not a cost model — it is "smallest table next".**
+It ranks each candidate by *that relation's own row count*
+(`rows(candidate) < rows(*next)`, `join_order.cpp`) and never estimates the join
+it would produce. There is no intermediate cardinality anywhere in the loop. For
+a 3-table chain smallest-first usually coincides with the right answer (hence
+q03's −17%); for q09's six tables it is a catastrophe. The `CardinalityEstimate`
+plumbing exists and is now sound — the greedy loop simply never calls it on a
+join.
+
+So the shape gate was not "a too-strict gate on a good pass". **It was the only
+thing preventing an unvalidated cost model from reaching 21 queries**, and the
+first thing that happens when you open it is a 2.7× regression. The gate was
+load-bearing, and this document's earlier caution was right for a reason it had
+not identified.
+
+**Reverted:** the gate stays. Kept: the fused-node schema arms (+ tests), which
+are what made the defect visible and are needed by whatever replaces the greedy.
+
+**The next step is now precisely specified, and it is not a gate change.**
+Rank candidates by the estimated size of the *join*, not of the relation. That
+needs an Inner estimate for scan⋈scan, which needs a PK on a scan — i.e. exactly
+the footer `span == rows` detection this document already worked out and
+deferred. The order is: (1) detect dense unique keys from footer min/max and
+feed them in as (heuristic-evidence) unique constraints, (2) rank the greedy by
+estimated join output, (3) re-run *both* halves of this experiment — the
+badly-ordered variants must still win, and q09/q08/q10 must not move. Neither
+half is optional: this attempt passed the first and failed the second.
+
+**Reproducible test bed** (rebuild the bad variants from the suite's queries by
+permuting only the join order; verify byte-identical output first):
+`q03_bad` joins orders×lineitem before customer; `q05_bad` joins
+lineitem×supplier before orders/customer. A/B with an `IBEX_NO_REORDER`
+env kill-switch, interleaved, pinned, min-of-6, ≥3 rounds — and note the trap
+this session hit: **the switch must actually exist in the binary**. A first A/B
+read ±0% on everything because the kill-switch had been stripped before the
+build, so both columns were the same configuration — the same "measuring one
+thing against itself" failure this document records for q22.
+
+**q05 is out of reach even so, for an unrelated reason.** Its bad phrasing does
+not reorder at all: the chain's first leaf is a `Filter` with no estimate
+(`kind=1 rows=-`), because `c_nationkey == s_nationkey` references two tables,
+cannot be pushed to either side, and so sits *between* joins — splitting the
+chain. `collect_left_deep` stops there and treats the whole sub-chain below as
+one opaque leaf, so the reorder can only shuffle the top segment while q05's bad
+order is inside the leaf. Reordering across a mid-chain post-join filter is
+sound (an inner chain plus a filter is one relational expression; the filter can
+be applied last), but it is a separate piece of work from the cost model.

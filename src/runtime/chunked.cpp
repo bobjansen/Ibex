@@ -2383,6 +2383,23 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             initialized_ = true;
         }
 
+        // Swapped mode: the left side was materialized during `initialize` (the
+        // right was too large to set-ify cheaply), and the right-key set now
+        // holds only the intersection of the two key columns, so one pass of
+        // `filter_chunk` over the whole materialized left produces the result.
+        if (swapped_) {
+            if (swapped_emitted_) {
+                return std::optional<Chunk>{};
+            }
+            swapped_emitted_ = true;
+            auto filtered = filter_chunk(std::move(*left_swapped_));
+            left_swapped_.reset();
+            if (!filtered.has_value()) {
+                return std::optional<Chunk>{};
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
+        }
+
         while (true) {
             auto chunk_res = left_->next();
             if (!chunk_res.has_value()) {
@@ -2402,6 +2419,55 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     }
 
    private:
+    // Above this many right rows, building a hash set of every right key is the
+    // dominant cost of the whole operator (q04: 3.8M inserts into a robin_hood
+    // set, ~40% of the query). Past it, materialize the left and swap.
+    static constexpr std::size_t kSemiSwapThreshold = 65536;
+
+    // Build the right-key set as the INTERSECTION of the two key columns, by
+    // probing the large right against a map of the small left keys rather than
+    // inserting every right key. `filter_chunk` then works unchanged: a left row
+    // is in the intersection iff it has a right match (semi keeps those; anti
+    // keeps the rest). Restricted to integer keys, which every TPC-H join uses
+    // and where the win is; other key types keep the streaming build-on-right.
+    auto init_int_swapped(const Column<std::int64_t>& rcol) -> std::optional<std::string> {
+        auto left_res = MaterializeOperator(std::move(left_)).run();
+        if (!left_res.has_value()) {
+            return std::move(left_res.error());
+        }
+        left_swapped_ = std::move(*left_res);
+        swapped_ = true;
+
+        const ColumnValue* lkey = left_swapped_->find(keys_->front());
+        const auto* lcol = lkey != nullptr ? std::get_if<Column<std::int64_t>>(lkey) : nullptr;
+        if (lcol != nullptr && lcol->size() < rcol.size()) {
+            // 57k inserts + 3.8M finds, versus 3.8M inserts the other way.
+            robin_hood::unordered_flat_map<std::int64_t, char> seen;
+            seen.reserve(lcol->size());
+            for (const std::int64_t v : *lcol) {
+                seen.try_emplace(v, char{0});
+            }
+            for (const std::int64_t v : rcol) {
+                if (auto it = seen.find(v); it != seen.end()) {
+                    it->second = char{1};
+                }
+            }
+            for (const auto& [k, matched] : seen) {
+                if (matched != char{0}) {
+                    right_i64_.insert(k);
+                }
+            }
+        } else {
+            // Left is not the smaller side (or its key vanished); the plain
+            // right set is as good, and the materialized left still emits once.
+            right_i64_.reserve(rcol.size());
+            for (const std::int64_t v : rcol) {
+                right_i64_.insert(v);
+            }
+        }
+        return std::nullopt;
+    }
+
     auto initialize() -> std::optional<std::string> {
         if (keys_->size() != 1) {
             return "ChunkedSemiAntiJoinOperator only supports single-key joins";
@@ -2416,6 +2482,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 
         if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
             right_kind_ = ExprType::Int;
+            if (col->size() > kSemiSwapThreshold) {
+                return init_int_swapped(*col);
+            }
             for (const std::int64_t row : *col) {
                 right_i64_.insert(row);
             }
@@ -2585,6 +2654,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     ir::JoinKind kind_;
     const std::vector<std::string>* keys_;
     bool initialized_ = false;
+    bool swapped_ = false;
+    bool swapped_emitted_ = false;
+    std::optional<Table> left_swapped_;
     ExprType right_kind_ = ExprType::Int;
 
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;

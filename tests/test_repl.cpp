@@ -13,7 +13,9 @@
 #include <ranges>
 #include <set>
 #include <string>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <utility>
 #include <vector>
 
@@ -23,7 +25,7 @@ TEST_CASE("REPL normalizes implicit semicolons") {
     REQUIRE(normalize_input("1+1") == "1+1;");
     REQUIRE(normalize_input("let x = 1;") == "let x = 1;");
     REQUIRE(normalize_input("  1+1  ") == "  1+1  ;");
-    REQUIRE(normalize_input("") == "");
+    REQUIRE(normalize_input("").empty());
 }
 
 TEST_CASE("REPL loads script with inferred lets") {
@@ -961,7 +963,7 @@ TEST_CASE("REPL supports named arguments and defaults for extern functions") {
             if (args.size() != 4) {
                 return std::unexpected("read_fake() expects 4 arguments");
             }
-            const auto* path = std::get_if<std::string>(&args[0]);
+            const auto* path = std::get_if<std::string>(args.data());
             const auto* nulls = std::get_if<std::string>(&args[1]);
             const auto* delimiter = std::get_if<std::string>(&args[2]);
             const auto* has_header = std::get_if<bool>(&args[3]);
@@ -969,7 +971,7 @@ TEST_CASE("REPL supports named arguments and defaults for extern functions") {
                 has_header == nullptr) {
                 return std::unexpected("read_fake(): wrong argument types");
             }
-            if (*path != "data.csv" || *nulls != "" || *delimiter != "," || *has_header != false) {
+            if (*path != "data.csv" || !nulls->empty() || *delimiter != "," || *has_header) {
                 return std::unexpected("read_fake(): defaults/named binding mismatch");
             }
             ibex::runtime::Table t;

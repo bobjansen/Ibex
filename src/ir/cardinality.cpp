@@ -5,6 +5,9 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <string>
+#include <variant>
+#include <vector>
 
 namespace ibex::ir {
 namespace {
@@ -175,12 +178,114 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
     }
 }
 
+/// The column `alias` is computed from, when a field simply renames one --
+/// `select { o_orderkey = l_orderkey }`. Anything computed (`a * b`, a call) has
+/// no single source column and gives nullopt, which stops the walk.
+auto renamed_from(const std::vector<FieldSpec>& fields, const std::string& alias)
+    -> std::optional<std::string> {
+    for (const auto& field : fields) {
+        if (field.alias != alias) {
+            continue;
+        }
+        if (const auto* ref = std::get_if<ColumnRef>(&field.expr.node)) {
+            return ref->name;
+        }
+        return std::nullopt;  // computed: not a rename of anything
+    }
+    return alias;  // untouched by this update
+}
+
+auto distinct_below(const Node& node, const std::string& column, const SourceStats& stats)
+    -> std::optional<std::size_t>;
+
+/// Follow `column` into the single child of a row-wise node, under whatever name
+/// it has down there.
+auto distinct_through(const Node& node, const std::string& column, const SourceStats& stats)
+    -> std::optional<std::size_t> {
+    if (node.children().size() != 1 || node.children().front() == nullptr) {
+        return std::nullopt;
+    }
+    return distinct_below(*node.children().front(), column, stats);
+}
+
+auto distinct_below(const Node& node, const std::string& column, const SourceStats& stats)
+    -> std::optional<std::size_t> {
+    switch (node.kind()) {
+        case NodeKind::Scan: {
+            const auto& scan = static_cast<const ScanNode&>(node);
+            const auto source = stats.distinct.find(scan.source_name());
+            if (source == stats.distinct.end()) {
+                return std::nullopt;
+            }
+            const auto found = source->second.find(column);
+            return found == source->second.end() ? std::nullopt : std::optional{found->second};
+        }
+        // Row-wise and column-preserving: the name means the same thing below.
+        case NodeKind::Filter:
+        case NodeKind::Order:
+        case NodeKind::Head:
+        case NodeKind::Tail:
+        case NodeKind::Distinct:
+        case NodeKind::Project:
+        case NodeKind::FilterProject:
+        case NodeKind::FilterHead:
+        case NodeKind::FilterTail:
+        case NodeKind::TopK:
+        case NodeKind::Ascribe:
+        case NodeKind::AsTimeframe:
+            return distinct_through(node, column, stats);
+
+        case NodeKind::Update: {
+            const auto below = renamed_from(static_cast<const UpdateNode&>(node).fields(), column);
+            return below ? distinct_through(node, *below, stats) : std::nullopt;
+        }
+        case NodeKind::FilterUpdateProject: {
+            const auto below =
+                renamed_from(static_cast<const FilterUpdateProjectNode&>(node).fields(), column);
+            return below ? distinct_through(node, *below, stats) : std::nullopt;
+        }
+        case NodeKind::Rename: {
+            std::string below = column;
+            for (const auto& spec : static_cast<const RenameNode&>(node).renames()) {
+                if (spec.new_name == column) {
+                    below = spec.old_name;
+                    break;
+                }
+            }
+            return distinct_through(node, below, stats);
+        }
+        default:
+            // Joins, aggregates, anything else: a proof may still answer for
+            // these (see `distinct_estimate`); metadata cannot.
+            return std::nullopt;
+    }
+}
+
 }  // namespace
 
 auto estimate_cardinality(const Node& root, const SourceRowCounts& sources,
                           const SourceSchemas& schemas, CardinalityOptions options)
     -> CardinalityEstimate {
     return estimate(root, sources, schemas, options);
+}
+
+auto distinct_estimate(const Node& node, const std::string& column, const SourceStats& stats)
+    -> std::optional<std::size_t> {
+    const auto rows = estimate_cardinality(node, stats.rows, stats.schemas).rows;
+
+    // A proof beats any statistic: unique on {column} means every row holds a
+    // different value, so the row count *is* the distinct count.
+    if (rows.has_value() && infer_schema(node, stats.schemas).is_unique_within({column})) {
+        return rows;
+    }
+
+    const auto below = distinct_below(node, column, stats);
+    if (!below.has_value()) {
+        return std::nullopt;
+    }
+    // Nothing on the way up invents a value, and no result can hold more
+    // distinct values than it has rows.
+    return rows.has_value() ? std::min(*below, *rows) : below;
 }
 
 }  // namespace ibex::ir

@@ -10,7 +10,7 @@ namespace ibex::ir {
 /// The rewrite is deliberately narrow: it requires known schemas and source
 /// sizes, permits duplicate names only for equijoin keys, and leaves First/
 /// Last aggregates untouched because they observe input order.
-[[nodiscard]] auto reorder_inner_joins_for_aggregates(NodePtr root, const SourceSchemas& schemas,
-                                                      const SourceRowCounts& row_counts) -> NodePtr;
+[[nodiscard]] auto reorder_inner_joins_for_aggregates(NodePtr root, const SourceStats& stats)
+    -> NodePtr;
 
 }  // namespace ibex::ir

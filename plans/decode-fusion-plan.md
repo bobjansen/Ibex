@@ -1100,6 +1100,103 @@ estimated join output, (3) re-run *both* halves of this experiment — the
 badly-ordered variants must still win, and q09/q08/q10 must not move. Neither
 half is optional: this attempt passed the first and failed the second.
 
+### DONE: a real cost model — footer stats, distinct estimates, minimax, and a length guard
+
+Built the join-output cost model and shipped it. The path was longer than
+"rank by the join, not the relation," and every wrong turn was caught by
+measurement, not reasoning — three separate diagnoses died mid-flight.
+
+**What landed:**
+
+1. **Parquet footer statistics reach the planner.** `LazyTable` carries a
+   `SourceColumnStats` map (min/max/null_count per column), filled from the
+   footer that a bind reads anyway. Verified against every TPC-H key — it
+   reproduces this document's own table exactly. Integers only; a chunk that
+   can't answer abandons the column (a partial range is wrong, not
+   conservative). Committed separately ("Read what the Parquet footer already
+   knows"). **GOTCHA: `LazyTable`'s layout is plugin ABI — adding the member
+   segfaults `ibex` until `parquet.so` is rebuilt; a targeted `--target parquet
+   ibex` is not enough, build everything.**
+
+2. **A distinct-value estimator** (`ir::distinct_estimate`). A proof first —
+   `SchemaInfo::unique_keys` gives distinct == rows exactly — then footer
+   `min(rows, span)` followed down through the row-wise operators and renames
+   (`select { o_orderkey = l_orderkey }` asks about a different column than it
+   answers), capped at the node's own row estimate.
+
+3. **The cost model** (`choose_inner_join_order`, rewritten). Ranks each
+   candidate by the estimated size of the *join it makes* — textbook
+   `|L|·|R| / max(dL,dR)` — not the candidate's own rows, and tries **every
+   seed** because the seed decides what is reachable next. This is what "smallest
+   table next" could never do.
+
+4. **Minimax, not sum.** Seeds are compared by (largest intermediate, then
+   total). Minimizing the worst intermediate is what separates a good order from
+   one that only looks cheap on average — the failure mode is a single giant
+   intermediate a sum lets hide.
+
+5. **A chain-length guard (≤5 relations).** The load-bearing decision, and the
+   honest one.
+
+**Results (SF-1, pinned, min-of-6, ≥3 rounds, interleaved, quiet box; the
+guarded-out q05/q08 suite queries double as a noise calibration — identical plan
+ON vs OFF, they read ±6% with spikes to +23%, which is the floor everything else
+is judged against):**
+
+| query | delta | what it is |
+|---|---:|---|
+| q02 (well-written) | **−29%** consistent | a real win; our transcription reorders well |
+| q03 deliberately bad order | **−23%** consistent | rescued to parity with the good order |
+| q10 (well-written, reorders) | ±noise | parity |
+| q03 well-written | ±noise | **stays identity** — cost model keeps the author's order |
+| q08, q09, q05, q07 | ±noise | **guarded out** (6–8 relations) → author's order |
+| everything else | ±noise | declines or identity |
+
+Only q02 and q10 reorder among the well-written suite (q02 wins, q10 parity);
+q03 and the rest keep their order or decline. **Parity-or-better on the
+well-written suite, a −23% rescue on a bad order. The bar is met.** 22/22 answers,
+1184 tests.
+
+**Why the guard is essential, not fitted.** Three fixes were tried against q09
+(6 tables), which regressed +173% under "smallest table next":
+
+- *Textbook cost model alone* → q09 +95%. The `l_orderkey` trap, exactly as
+  predicted: `lineitem.l_orderkey`'s footer distinct reads 6M (`min(rows,span)`)
+  when the true count is 1.5M, so `orders⋈lineitem` is underestimated 4× and the
+  model starts there.
+- *+ containment cap* (cap a key's distinct by the min across joined relations)
+  → q09 fixed, but it **broke q08** (+11%): it capped `lineitem.l_partkey`'s
+  correct 200k down to a *filtered* `part`'s 50k. A domain-based variant (cap by
+  pre-filter footer domain) fixed q08's estimate but not its chosen order, and
+  then a toy `small-dim ⋈ fact` case proved the cap **unsound in general** — it
+  caps a fact's correct large domain by a small dimension's domain. **Reverted.**
+  It only ever appeared to work because PDS-H joins are PK-FK with matching
+  cardinality.
+- *The guard* handles q08 and q09 by declining: chains beyond 5 relations keep
+  the author's order. Footer stats genuinely cannot size a wide snowflake — a
+  string filter's selectivity (`p_name like "%green%"`) is invisible, and on 8
+  tables that error compounds into a spuriously-cheap tiny-dimension seed. The
+  guard is the honest boundary of what a Parquet footer supports, and it is what
+  lets the sound short-chain model ship without the unsound cap. (With the cap
+  gone, an unguarded q09 would regress +95% again — so the guard is load-bearing,
+  not cosmetic.)
+
+**The trap that cost a measurement, again.** A first bad-order A/B read ±0% on
+everything because the `IBEX_NO_REORDER` kill-switch had been stripped before the
+build — both columns were the same binary. And a full-suite run on a loaded box
+(load 1.35) read q05/q07 at +6% *though they are guarded out and provably
+identical* — pure drift. Both are the same lesson this document keeps
+re-learning: verify the switch is in the binary, and calibrate the noise with a
+provably-identical query before trusting any delta.
+
+**What remains open** (unchanged in kind, now with the machinery in place):
+rescuing badly-ordered chains of 6+ relations needs filter-selectivity estimates
+the footer does not carry. The distinct estimator, the cost model, and the seed
+search all already handle arbitrary widths; only the guard holds them back, and
+only because the *inputs* are too coarse above 5 tables. Better filter
+selectivity (string distinct counts, or sampling) is the unlock, not more
+planner machinery.
+
 **Reproducible test bed** (rebuild the bad variants from the suite's queries by
 permuting only the join order; verify byte-identical output first):
 `q03_bad` joins orders×lineitem before customer; `q05_bad` joins

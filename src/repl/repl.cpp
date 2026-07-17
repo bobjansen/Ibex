@@ -1348,6 +1348,33 @@ auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
     return ir::SchemaInfo::known(std::move(fields), /*open=*/false);
 }
 
+/// Turn a source's raw footer statistics into the per-column distinct-value
+/// ESTIMATES the join-order cost model ranks with. This is where the estimation
+/// policy lives -- the plugin reports only what the file says.
+///
+/// For an integer column, distinct values <= the value span (`max - min + 1`)
+/// and <= the row count, so `min(rows, span)` is a real upper bound. It is exact
+/// for a dense key (a TPC-H PK: span == rows) and reads high for a sparse one
+/// (`l_orderkey`: 6M span over 1.5M actual). That asymmetry is deliberate and
+/// safe for ranking: overestimating a fact table's key distinctness makes its
+/// joins look larger, never smaller, so the planner errs toward NOT trusting it
+/// to shrink a join -- the conservative direction.
+auto derive_column_distinct(const runtime::LazyTable& lazy) -> ir::ColumnDistinct {
+    ir::ColumnDistinct out;
+    const auto rows = lazy.rows();
+    for (const auto& [name, stats] : lazy.column_stats()) {
+        if (!stats.min.has_value() || !stats.max.has_value()) {
+            continue;  // no integer range -> no estimate for this column
+        }
+        // max >= min by construction, so the span is positive; guard the
+        // arithmetic against a pathological footer all the same.
+        const auto span =
+            *stats.max >= *stats.min ? static_cast<std::size_t>(*stats.max - *stats.min) + 1 : rows;
+        out.emplace(name, std::min(rows, span));
+    }
+    return out;
+}
+
 /// Validates that `column` satisfies the scalar element type declared in `type`.
 /// Returns nullopt on success, or an error message on failure.
 auto validate_column_type(const runtime::ColumnValue& column, const parser::Type& type)
@@ -4383,10 +4410,12 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
         runtime::TableRegistry tables = base_tables;
         LazyTableRegistry lazy_sources;
-        ir::SourceSchemas schemas;
-        ir::SourceRowCounts row_counts;
+        ir::SourceStats source_stats;
+        ir::SourceSchemas& schemas = source_stats.schemas;
+        ir::SourceRowCounts& row_counts = source_stats.rows;
         // Materialized shared bindings participate in schema-aware rewrites
-        // (and cardinality estimates) with their exact schemas and sizes.
+        // (and cardinality estimates) with their exact schemas and sizes. A
+        // materialized table carries no footer stats, so no distinct estimates.
         for (const auto& [name, table] : base_tables) {
             schemas.insert_or_assign(name, table_schema_info(table));
             row_counts.insert_or_assign(name, table.rows());
@@ -4406,6 +4435,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
             schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
             row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
+            source_stats.distinct.insert_or_assign(source.source_name,
+                                                   derive_column_distinct(*lazy.value()));
             lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
         }
 
@@ -4418,8 +4449,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
         rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
-        rewritten =
-            ir::reorder_inner_joins_for_aggregates(std::move(rewritten), schemas, row_counts);
+        rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
         // A source scanned twice in the plan (nation on both join sides, a
         // self-joined fact table) gets one instance name per scan, so each
         // scan keeps its own pushed selection and column demand.

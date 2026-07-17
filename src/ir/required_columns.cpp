@@ -302,10 +302,34 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
             return;
         }
 
+        // A wildcard ascription (`as { a: Int, * }`) asserts only that the named
+        // columns exist with the named types; extra columns are explicitly
+        // allowed, so whether they are materialized is unobservable. Demand what
+        // the parent wants plus the names the check itself reads, and no more --
+        // naming a column asserts its shape, it does not ask for its data.
+        //
+        // An exact ascription is different and must keep widening: it also
+        // asserts the input has *no* column it does not list, and that can only
+        // be checked against the whole input. Narrowing it first would hide the
+        // extras it exists to reject.
+        case NodeKind::Ascribe: {
+            const auto& asc = static_cast<const AscribeNode&>(node);
+            if (!asc.open()) {
+                visit_children_widened(node, out);
+                return;
+            }
+            ColumnDemand below = need;
+            for (const auto& field : asc.schema()) {
+                below.add(field.name);
+            }
+            visit_children(node, below, out);
+            return;
+        }
+
         // Distinct de-duplicates over every input column, so narrowing its
         // input would change which rows survive — not just which columns.
         case NodeKind::Distinct:
-        // Everything else — Window, Resample, AsTimeframe, Ascribe, Columns,
+        // Everything else — Window, Resample, AsTimeframe, Columns,
         // Melt, Dcast, Cov, Corr, Transpose, Matmul, Rbind, Model, Stream,
         // ExternCall, Construct — either reads columns this pass cannot name or
         // consumes its input whole.

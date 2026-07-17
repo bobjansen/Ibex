@@ -31,6 +31,30 @@ auto SchemaInfo::find(std::string_view name) const -> const SchemaField* {
 
 namespace {
 
+auto contains_all(const std::vector<std::string>& haystack, const UniqueKey& needles) -> bool {
+    return std::ranges::all_of(needles, [&](const std::string& needle) {
+        return std::ranges::find(haystack, needle) != haystack.end();
+    });
+}
+
+}  // namespace
+
+auto SchemaInfo::is_unique_within(const std::vector<std::string>& columns) const -> bool {
+    return std::ranges::any_of(unique_keys_,
+                               [&](const UniqueKey& key) { return contains_all(columns, key); });
+}
+
+void SchemaInfo::add_unique_key(UniqueKey key) {
+    if (is_unique_within(key)) {
+        return;  // already implied by a key we hold
+    }
+    std::ranges::sort(key);
+    key.erase(std::ranges::unique(key).begin(), key.end());
+    unique_keys_.push_back(std::move(key));
+}
+
+namespace {
+
 auto literal_type(const Literal& lit) -> ColumnType {
     return std::visit(
         [](const auto& value) -> ColumnType {
@@ -188,6 +212,102 @@ auto child_schema(const Node& node, const SourceSchemas& sources, std::size_t in
     return infer_schema(*node.children()[index], sources);
 }
 
+/// Drop the unique constraints from a schema that is otherwise passed through,
+/// for operators whose row multiplicity breaks them.
+auto without_unique_keys(SchemaInfo info) -> SchemaInfo {
+    if (!info.is_known()) {
+        return info;
+    }
+    return SchemaInfo::known(info.fields(), info.is_open(), info.time_index());
+}
+
+/// Carry `input`'s unique constraints into `out` for an operator that only
+/// drops or reorders rows, keeping each key whose columns all survive. Dropping
+/// rows cannot make a unique tuple repeat, so every surviving key still holds.
+void inherit_unique_keys(const SchemaInfo& input, SchemaInfo& out) {
+    for (const auto& key : input.unique_keys()) {
+        const bool survives = std::ranges::all_of(
+            key, [&](const std::string& name) { return out.find(name) != nullptr; });
+        if (survives) {
+            out.add_unique_key(key);
+        }
+    }
+}
+
+/// Unique constraints a join's output inherits from its inputs. Each follows
+/// from the join's definition alone -- no data, no statistics.
+///
+/// The pivot is the same fact the cardinality estimator turns on: when one side
+/// is unique on (a subset of) the join keys, every row of the *other* side
+/// matches at most one row across it, so the output rows are in bijection with
+/// a subset of that side's rows and every constraint that held there still
+/// holds.
+void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const SchemaInfo& right,
+                          SchemaInfo& out) {
+    // Left columns always reach the output under their own names.
+    const auto left_key_survives = [&](const UniqueKey& key) {
+        return std::ranges::all_of(
+            key, [&](const std::string& name) { return out.find(name) != nullptr; });
+    };
+    // A right column whose name collides with a left one is dropped -- the
+    // left's is kept -- so a right constraint naming it carries over only where
+    // the join equates the two, which is exactly on a join key.
+    const auto right_key_survives = [&](const UniqueKey& key) {
+        return std::ranges::all_of(key, [&](const std::string& name) {
+            return out.find(name) != nullptr &&
+                   (left.find(name) == nullptr ||
+                    std::ranges::find(join.keys(), name) != join.keys().end());
+        });
+    };
+    const auto keep = [&](const SchemaInfo& side, const auto& survives) {
+        for (const auto& key : side.unique_keys()) {
+            if (survives(key)) {
+                out.add_unique_key(key);
+            }
+        }
+    };
+
+    switch (join.kind()) {
+        case JoinKind::Semi:
+        case JoinKind::Anti:
+            // Selects left rows; the right contributes neither rows nor columns.
+            keep(left, left_key_survives);
+            return;
+        case JoinKind::Inner:
+            if (right.is_unique_within(join.keys())) {
+                keep(left, left_key_survives);
+            }
+            if (left.is_unique_within(join.keys())) {
+                keep(right, right_key_survives);
+            }
+            return;
+        case JoinKind::Cross:
+            // Every (l, r) pair appears exactly once, so a left key and a right
+            // key *together* identify a row -- neither does alone. The common
+            // shape is a decorrelated scalar subquery, whose right side is an
+            // ungrouped aggregate: its key is empty, so the pair is just the
+            // left's key.
+            for (const auto& left_key : left.unique_keys()) {
+                for (const auto& right_key : right.unique_keys()) {
+                    if (!left_key_survives(left_key) || !right_key_survives(right_key)) {
+                        continue;
+                    }
+                    UniqueKey combined = left_key;
+                    combined.insert(combined.end(), right_key.begin(), right_key.end());
+                    out.add_unique_key(std::move(combined));
+                }
+            }
+            return;
+        case JoinKind::Left:
+        case JoinKind::Right:
+        case JoinKind::Outer:
+        case JoinKind::Asof:
+            // Not modelled: the outer kinds pad with null rows and Asof matches
+            // on an inequality, so neither reduces to the argument above.
+            return;
+    }
+}
+
 }  // namespace
 
 namespace {
@@ -337,17 +457,38 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             return SchemaInfo::unknown();
         }
 
-        // Pure row-shaping operators: schema (and time index) pass through.
+        // Pure row-shaping operators: schema, time index and unique constraints
+        // all pass through. These only drop or reorder rows.
         case NodeKind::Filter:
         case NodeKind::Order:
         case NodeKind::Head:
         case NodeKind::Tail:
-        case NodeKind::Distinct:
-        case NodeKind::Window:
-        // Rbind requires every operand to share child[0]'s schema, so the
-        // output schema is simply that of the first child.
-        case NodeKind::Rbind:
             return child_schema(node, sources);
+
+        case NodeKind::Distinct: {
+            // Deduplicates whole rows, so all columns together are unique by
+            // construction -- but only once we know what "all columns" are. An
+            // open schema may hide the column that separates two rows agreeing
+            // on every listed one.
+            SchemaInfo out = child_schema(node, sources);
+            if (out.is_known() && !out.is_open()) {
+                UniqueKey all;
+                all.reserve(out.fields().size());
+                for (const auto& field : out.fields()) {
+                    all.push_back(field.name);
+                }
+                out.add_unique_key(std::move(all));
+            }
+            return out;
+        }
+
+        // Schema passes through; unique constraints do not. Rbind concatenates
+        // rows (its operands share child[0]'s schema), so a tuple unique within
+        // one operand can repeat across them. Window's row multiplicity is not
+        // modelled here.
+        case NodeKind::Window:
+        case NodeKind::Rbind:
+            return without_unique_keys(child_schema(node, sources));
 
         case NodeKind::AsTimeframe: {
             // Designates the time-index column. The index column is materialised
@@ -363,7 +504,9 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     field.type = ColumnType::Timestamp;
                 }
             }
-            return SchemaInfo::known(std::move(out), input.is_open(), atf.column());
+            SchemaInfo result = SchemaInfo::known(std::move(out), input.is_open(), atf.column());
+            inherit_unique_keys(input, result);  // row-preserving
+            return result;
         }
 
         case NodeKind::Project: {
@@ -391,7 +534,12 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     time_index = input.time_index();
                 }
             }
-            return SchemaInfo::known(std::move(out), /*open=*/false, std::move(time_index));
+            SchemaInfo result =
+                SchemaInfo::known(std::move(out), /*open=*/false, std::move(time_index));
+            // Row-preserving, so a key survives iff the projection keeps all of
+            // its columns.
+            inherit_unique_keys(input, result);
+            return result;
         }
 
         case NodeKind::Rename: {
@@ -402,6 +550,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             }
             std::vector<SchemaField> out = input.fields();
             std::optional<std::string> time_index = input.time_index();
+            std::vector<UniqueKey> keys = input.unique_keys();
             for (const auto& spec : rename.renames()) {
                 for (auto& field : out) {
                     if (field.name == spec.old_name) {
@@ -411,8 +560,23 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 if (time_index.has_value() && *time_index == spec.old_name) {
                     time_index = spec.new_name;  // the index column was renamed
                 }
+                // Renaming a column changes what to call a constraint, never
+                // whether it holds. Applied in the same sequence as the fields
+                // above so the two cannot disagree.
+                for (auto& key : keys) {
+                    for (auto& name : key) {
+                        if (name == spec.old_name) {
+                            name = spec.new_name;
+                        }
+                    }
+                }
             }
-            return SchemaInfo::known(std::move(out), input.is_open(), std::move(time_index));
+            SchemaInfo result =
+                SchemaInfo::known(std::move(out), input.is_open(), std::move(time_index));
+            for (auto& key : keys) {
+                result.add_unique_key(std::move(key));
+            }
+            return result;
         }
 
         case NodeKind::Update: {
@@ -442,7 +606,26 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 }
             }
             // Update retains every existing column, so the time index survives.
-            return SchemaInfo::known(std::move(out), input.is_open(), input.time_index());
+            SchemaInfo result =
+                SchemaInfo::known(std::move(out), input.is_open(), input.time_index());
+            // A key survives only if the update rewrote none of its columns:
+            // assigning a column keeps its name but replaces its values, and
+            // nothing says the new ones are still distinct.
+            robin_hood::unordered_set<std::string> assigned;
+            for (const auto& field : update.fields()) {
+                assigned.insert(field.alias);
+            }
+            for (const auto& tuple : update.tuple_fields()) {
+                assigned.insert(tuple.aliases.begin(), tuple.aliases.end());
+            }
+            for (const auto& key : input.unique_keys()) {
+                const bool untouched = std::ranges::none_of(
+                    key, [&](const std::string& name) { return assigned.contains(name); });
+                if (untouched) {
+                    result.add_unique_key(key);
+                }
+            }
+            return result;
         }
 
         case NodeKind::Aggregate: {
@@ -464,12 +647,25 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 out.push_back(
                     SchemaField{.name = spec.alias, .type = agg_result_type(spec, input)});
             }
-            return SchemaInfo::known(std::move(out));
+            SchemaInfo result = SchemaInfo::known(std::move(out));
+            // One row per distinct group, so the group keys are unique by
+            // construction -- and, like the column set above, true whatever the
+            // input turns out to be. An ungrouped aggregate collapses to a
+            // single row: that is the empty key, no column needed to tell its
+            // rows apart.
+            UniqueKey keys;
+            keys.reserve(agg.group_by().size());
+            for (const auto& key : agg.group_by()) {
+                keys.push_back(key.name);
+            }
+            result.add_unique_key(std::move(keys));
+            return result;
         }
 
         case NodeKind::Join: {
             // A ∪ B: left columns, then right columns whose names are not
             // already present (shared join keys appear once).
+            const auto& join = static_cast<const JoinNode&>(node);
             const SchemaInfo left = child_schema(node, sources, 0);
             const SchemaInfo right = child_schema(node, sources, 1);
             if (!left.is_known() || !right.is_known()) {
@@ -484,7 +680,10 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     out.push_back(field);
                 }
             }
-            return SchemaInfo::known(std::move(out), left.is_open() || right.is_open());
+            SchemaInfo result =
+                SchemaInfo::known(std::move(out), left.is_open() || right.is_open());
+            add_join_unique_keys(join, left, right, result);
+            return result;
         }
 
         case NodeKind::Construct: {
@@ -615,7 +814,19 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 out.push_back(
                     SchemaField{.name = spec.alias, .type = agg_result_type(spec, input)});
             }
-            return SchemaInfo::known(std::move(out), /*open=*/!bucket.has_value(), bucket);
+            SchemaInfo result =
+                SchemaInfo::known(std::move(out), /*open=*/!bucket.has_value(), bucket);
+            // One row per (bucket, group), by the same construction as
+            // Aggregate -- but only claimable once the bucket column has a name.
+            if (bucket.has_value()) {
+                UniqueKey keys{*bucket};
+                keys.reserve(rs.group_by().size() + 1);
+                for (const auto& key : rs.group_by()) {
+                    keys.push_back(key.name);
+                }
+                result.add_unique_key(std::move(keys));
+            }
+            return result;
         }
 
         // Data-dependent output columns or not yet modelled: Unknown is sound.

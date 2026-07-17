@@ -28,7 +28,7 @@ auto collect_left_deep(const Node& node, const SourceSchemas& schemas,
                        const SourceRowCounts& row_counts, std::vector<Relation>& relations,
                        std::vector<JoinEdge>& edges) -> bool {
     if (node.kind() != NodeKind::Join) {
-        const auto estimate = estimate_cardinality(node, row_counts);
+        const auto estimate = estimate_cardinality(node, row_counts, schemas);
         const auto schema = infer_schema(node, schemas);
         if (!estimate.rows.has_value() || !schema.is_known()) {
             return false;

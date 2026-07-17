@@ -352,3 +352,38 @@ TEST_CASE("LazyTable: a decode failure surfaces as an error", "[runtime][lazy_ta
     REQUIRE_FALSE(table);
     CHECK(table.error() == "boom");
 }
+
+TEST_CASE("lazy table carries source column stats without decoding", "[lazy_table]") {
+    // A source's metadata is what the planner gets to reason from before any
+    // page is read. Reaching for it must not pull data in behind it.
+    FakeSource source;
+    runtime::SourceColumnStats stats;
+    stats.emplace("a", runtime::ColumnStats{.min = 1, .max = 3, .null_count = 0});
+    runtime::LazyTable lazy(
+        source.schema(), 3,
+        [&](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        },
+        std::move(stats));
+
+    const auto& out = lazy.column_stats();
+    auto it = out.find("a");
+    REQUIRE(it != out.end());
+    CHECK(it->second.min == 1);
+    CHECK(it->second.max == 3);
+    CHECK(it->second.null_count == 0);
+    // A column the source said nothing about is absent -- "nothing known", never
+    // "nothing there".
+    CHECK(out.find("b") == out.end());
+    CHECK(source.decode_calls.empty());
+}
+
+TEST_CASE("lazy table defaults to knowing no column stats", "[lazy_table]") {
+    FakeSource source;
+    runtime::LazyTable lazy(
+        source.schema(), 3,
+        [&](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        });
+    CHECK(lazy.column_stats().empty());
+}

@@ -577,20 +577,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                                            "' has the wrong type");
                 }
             }
-            // An exact (non-wildcard) ascription forbids columns not listed.
-            if (!asc.open()) {
-                for (const auto& entry : t.index) {
-                    const bool listed = std::any_of(
-                        asc.schema().begin(), asc.schema().end(),
-                        [&](const ir::SchemaField& f) { return f.name == entry.first; });
-                    if (!listed) {
-                        return std::unexpected("schema ascription: input has extra column '" +
-                                               entry.first +
-                                               "' not in the ascribed schema (add `*` to allow "
-                                               "extras)");
-                    }
-                }
-            }
             return child;
         }
         case ir::NodeKind::Columns: {

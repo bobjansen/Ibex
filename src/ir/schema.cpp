@@ -433,20 +433,6 @@ auto check_one(const AscribeNode& asc, const SchemaInfo& input)
                                    std::string(type_name(*field.type)));
         }
     }
-    if (asc.open()) {
-        return {};
-    }
-    // An exact ascription also asserts the input has no column it does not
-    // list. That is a question about the schema, so the schema answers it --
-    // no need to materialize the extras just to notice them.
-    for (const auto& have : input.fields()) {
-        const bool listed = std::any_of(asc.schema().begin(), asc.schema().end(),
-                                        [&](const SchemaField& f) { return f.name == have.name; });
-        if (!listed) {
-            return std::unexpected("schema ascription: input has extra column '" + have.name +
-                                   "' not in the ascribed schema (add `*` to allow extras)");
-        }
-    }
     return {};
 }
 
@@ -715,10 +701,11 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
 
         case NodeKind::Ascribe: {
-            // The ascription fixes the result schema (validated at run time); a
-            // wildcard ascription is open (extra columns allowed).
+            // The ascription fixes the statically visible result schema. Extra
+            // physical columns pass through at run time, but are deliberately
+            // hidden until a later ascription names them.
             const auto& asc = static_cast<const AscribeNode&>(node);
-            return SchemaInfo::known(asc.schema(), asc.open());
+            return SchemaInfo::known(asc.schema(), /*open=*/false);
         }
 
         case NodeKind::Columns:
@@ -947,13 +934,13 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
         }
     }
 
-    // Missing-column checks are only sound on a closed Known input: an open
-    // (wildcard) schema may have extra columns, so an absent name is not
-    // provably missing.
+    // A Known schema contains every column that may be referenced statically.
+    // An open schema may carry extra physical columns, but those are anonymous
+    // until a later ascription names them.
     const SchemaInfo input = node.children().empty()
                                  ? SchemaInfo::unknown()
                                  : infer_schema(*node.children().front(), sources);
-    if (!input.is_known() || input.is_open()) {
+    if (!input.is_known()) {
         return std::nullopt;
     }
 

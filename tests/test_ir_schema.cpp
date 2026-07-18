@@ -289,6 +289,13 @@ TEST_CASE("schema: ascription recovers a known schema over an unknown child", "[
     REQUIRE(type_of(s, "y") == ColumnType::Float64);
 }
 
+TEST_CASE("schema: ascription hides physical extras even with a wildcard", "[ir][schema]") {
+    auto s = schema_of("t as DataFrame<{ a: Int64, * }>;", base_sources());
+    REQUIRE(s.is_known());
+    REQUIRE_FALSE(s.is_open());
+    REQUIRE(names(s) == std::vector<std::string>{"a"});
+}
+
 TEST_CASE("schema: melt yields id columns plus variable/value", "[ir][schema]") {
     ibex::ir::MeltNode melt(ibex::ir::NodeId{2}, {"a"}, {"b"});  // id=a, measure=b
     melt.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));

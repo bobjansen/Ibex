@@ -436,8 +436,9 @@ the same type. Field order is significant.
 A trailing `*` marks the schema **open**: it lists the columns that must be
 present but permits additional, unlisted columns. Without `*` a schema is
 **exact (closed)** — exactly the listed columns, no more. The distinction
-governs validation where a declared schema meets actual data (Sections 3.6 and
-6.6):
+governs validation where a declared schema meets actual data (Section 6.6).
+Schema ascription is deliberately a minimum-required contract regardless of
+this marker (Section 3.6):
 
 ```
 { a: Int64 }       // exact: the table has exactly column a
@@ -693,42 +694,39 @@ A table expression may be ascribed a schema with the postfix `as` operator:
 
 The ascribed type must be a `DataFrame` or `TimeFrame` type. As a shorthand, a
 bare schema after `as` — `expr as { ... }` — is sugar for
-`expr as DataFrame<{ ... }>` (the wildcard `*` is allowed in it too). Use the
+`expr as DataFrame<{ ... }>` (the wildcard `*` is accepted too). Use the
 explicit `TimeFrame<{ ... }>` form to ascribe a TimeFrame. The ascription is a
-**runtime-checked identity**: the table is validated against the named schema
-and then passed through unchanged. The schema is **exact (closed) by default** —
-every listed column must be present with a matching type, *and* the table must
-not contain columns the schema does not list. A trailing `*` wildcard
-(Section 3.3) relaxes this to allow extra columns. A missing column, a
-wrong-type column, or (without `*`) an unlisted extra column is an error.
+**runtime-checked identity** and a minimum-required-columns contract: every
+listed column must be present with a matching type, while additional columns
+are allowed and pass through unchanged. A missing or wrong-type column is an
+error. The trailing `*` has no additional effect for an ascription because
+extras are always permitted.
 
 ```
 let trades = read_csv("trades.csv") as DataFrame<{ date: Date, px: Float64 }>;
-let wide   = read_csv("trades.csv") as DataFrame<{ date: Date, * }>;  // extras ok
 ```
 
 The purpose is to recover a statically known schema at a boundary where it would
 otherwise be unknown. Sources such as `read_csv` produce a `DataFrame` with an
 implementation-inferred (statically unknown) schema; ascribing a schema lets the
 compiler treat the result as a known schema from that point onward, so
-downstream column references can be checked statically. It is also the way to
+downstream column references can be checked statically. Only the named columns
+are part of that static schema: physical extras cannot be referenced downstream
+until a later ascription names them. It is also the way to
 re-establish a known schema after a data-dependent operator (e.g. `dcast`).
 
-(This exact-by-default behavior is distinct from `DataFrame<Schema>` *function
-parameter* contracts in Section 10.3, which are minimum-required — "at least
-these columns" — so that helpers compose over wider tables. A reader/ascription
-asserts the shape of concrete data, where exact-with-opt-in-`*` is the safer
-default; a parameter declares what a reusable function needs.)
+This matches `DataFrame<Schema>` function parameter contracts in Section 10.3:
+both say "at least these columns" and hide unlisted columns from static use.
 
 When the input's schema is **statically known and closed** (for example a
-`Table { ... }` literal, or any pipeline built on one or on another exact
+`Table { ... }` literal, or any pipeline built on one or on another
 ascription), an ascription the input provably cannot satisfy — a missing
-required column, a column with a provably different type, or (without `*`) an
-unlisted extra column — is reported as a **compile-time (lowering) error**. When
+required column or a column with a provably different type — is reported as a
+**compile-time (lowering) error**. When
 the input schema is statically unknown (e.g. an I/O source) or open, the check is
 deferred to the runtime validation described above.
 
-Declared **reader return schemas** participate the same way: an
+Declared **reader return schemas** remain exact/open schema declarations: an
 `extern fn read_typed(path: String) -> DataFrame<{ ... }>` declaration is taken
 as the reader's exact output schema (add `*` if the reader may yield more
 columns), so a call like `read_typed(...)[select { typo }]` is checked

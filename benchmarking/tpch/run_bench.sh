@@ -83,5 +83,10 @@ uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --pdsh
     --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-duckdb \
     --out "$RESULTS/pdsh_duckdb${SUFFIX}.tsv"
 
+echo "=== upstream PDS-H DuckDB SQL (single-threaded) ==="
+uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --threads 1 \
+    --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
+    --framework pdsh-duckdb-st --out "$RESULTS/pdsh_duckdb_st${SUFFIX}.tsv"
+
 echo
 python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*"${SUFFIX}.tsv"

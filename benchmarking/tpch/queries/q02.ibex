@@ -6,22 +6,11 @@
 //  part. Standard TPC-H qualification parameters: SIZE=15, TYPE='%BRASS',
 //  REGION='EUROPE'.
 //
-//  `scalar(...)` holding an `outer(...)` capture is a correlated scalar subquery
-//  (SPEC 5.7). It is NOT run once per outer row: the lowerer decorrelates it
-//  into a single grouped aggregate over the inner plan, left-joined back onto
-//  the outer rows on the captured key. The left join is what gives it SQL's
-//  scalar semantics — a part with no European supplier at all gets a null
-//  minimum, and the `==` against a null then drops the row.
-//
-//  The subquery's minimum ranges over every European supplier of the part, not
-//  only the size-15 BRASS ones, which is why the outer filter cannot simply be
-//  repeated inside it.
-//
-//  Each source is bound ONCE, unprojected, so it stays a lazy binding. The outer
-//  chain and the subquery then both scan partsupp/supplier/nation/region by that
-//  one name: projection pushdown unions what the two scans demand and decodes
-//  each file once. Binding a second `read_parquet` of partsupp for the subquery
-//  would read the same 800k rows twice.
+//  The SQL uses a correlated scalar MIN. It is decorrelated explicitly here:
+//  first build the European offers for the selected parts, then group them by
+//  part and join each minimum back on (part key, supply cost). Restricting the
+//  part keys first is valid because size/type are invariant attributes of a
+//  part; every European offer for each surviving part remains in the minimum.
 //
 //  Every join is a plain equijoin: as in q05/q19 the key columns are renamed to
 //  a shared name in the `select`, so each join is a hash join rather than a
@@ -41,39 +30,30 @@ let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet
 let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
 let region_raw = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
 
-let result = (
+let selected_parts = part_raw[
+    filter p_size == 15 && like(p_type, "%BRASS"),
+    select { p_partkey, p_mfgr }
+];
+
+let european_offers = (
     (
-        (
-            part_raw[select { p_partkey, p_mfgr, p_size, p_type }]
-            join
-            partsupp_raw[select { p_partkey = ps_partkey, ps_suppkey, ps_supplycost }]
+        selected_parts
+        join partsupp_raw[select { p_partkey = ps_partkey, ps_suppkey, ps_supplycost }]
             on p_partkey
-        )
-        join
-        supplier_raw[
-            select { ps_suppkey = s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment,
-                     s_nationkey }
-        ]
-        on ps_suppkey
-    )
+    ) join supplier_raw[
+        select { ps_suppkey = s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment,
+                 s_nationkey }
+    ] on ps_suppkey
     join nation_raw[select { s_nationkey = n_nationkey, n_name, n_regionkey }] on s_nationkey
     join region_raw[filter r_name == "EUROPE"][select { n_regionkey = r_regionkey }] on n_regionkey
-)[
-    filter p_size == 15 && like(p_type, "%BRASS")
-        && ps_supplycost == scalar(
-            (
-                (
-                    partsupp_raw[select { ps_partkey, ps_suppkey, ps_supplycost }]
-                    join supplier_raw[select { ps_suppkey = s_suppkey, s_nationkey }] on ps_suppkey
-                )
-                join nation_raw[select { s_nationkey = n_nationkey, n_regionkey }] on s_nationkey
-                join region_raw[filter r_name == "EUROPE"][select { n_regionkey = r_regionkey }]
-                    on n_regionkey
-            )[
-                filter ps_partkey == outer(p_partkey),
-                select { minimum_supplycost = min(ps_supplycost) }
-            ]
-        ),
+);
+
+let minimum_offers = european_offers[
+    select { ps_supplycost = min(ps_supplycost) },
+    by { p_partkey }
+];
+
+let result = (european_offers join minimum_offers on { p_partkey, ps_supplycost })[
     select { s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment }
 ][
     order { s_acctbal desc, n_name, s_name, p_partkey },

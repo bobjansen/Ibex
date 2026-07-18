@@ -700,22 +700,53 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
     // ── Helper: build index arrays from a right-row → left-matches lookup ─
     // Used by the small-left/large-right paths. Probes the index ONCE per
-    // right row, recording each hit's match span, then replays the hits to
-    // scatter — the previous shape re-ran the lookup for the fill pass,
-    // paying a second full round of hash probes over the large side (the
-    // same double-probe the chunked swapped join shed for q03).
+    // right row, in scan order, and emits matches immediately in that same
+    // order — the probe side's natural row order (parquet/CSV scan order,
+    // or an upstream join's own probe order). An earlier shape reassembled
+    // hits grouped by LEFT row instead, which reads as "preserve left
+    // order" but SPEC.md is explicit that "any join drop[s] ordering unless
+    // the implementation can prove a specific order" — there is no
+    // language-level guarantee here to preserve. Grouping by left row
+    // silently permutes the output away from the probe side's scan order,
+    // which then hurts cache locality on any DOWNSTREAM join that probes
+    // this join's output (measured ~10-15% on a chained TPC-H-style join
+    // sequence). Preserving scan order costs nothing extra: this phase
+    // already visits right rows in order once.
     auto build_indices_from_right_scan = [&](auto&& left_matches_for_right_row)
         -> std::tuple<std::vector<std::size_t>, std::vector<std::size_t>,
                       std::vector<std::size_t>> {
-        struct Hit {
-            std::size_t right_row;
-            std::span<const std::size_t> matches;
-        };
-        std::vector<Hit> hits;
+        if (semi_join || anti_join) {
+            // Membership join: left-only output. No right columns are
+            // emitted, so there's no probe-side order to preserve here —
+            // keep the simple left-row-order scan.
+            std::vector<std::uint8_t> left_matched(n_left, 0U);
+            for (std::size_t r = 0; r < n_right; ++r) {
+                for (const std::size_t l : left_matches_for_right_row(r)) {
+                    left_matched[l] = 1U;
+                }
+            }
+            std::vector<std::size_t> li;
+            li.reserve(n_left);
+            for (std::size_t l = 0; l < n_left; ++l) {
+                const bool has_match = left_matched[l] != 0U;
+                if ((semi_join && has_match) || (anti_join && !has_match)) {
+                    li.push_back(l);
+                }
+            }
+            std::vector<std::size_t> ri(li.size(), kNull);
+            return std::make_tuple(std::move(li), std::move(ri), std::vector<std::size_t>{});
+        }
 
-        // Phase 1: probe once per right row; count matches per left row.
-        std::vector<std::size_t> match_counts(n_left, 0);
-        std::size_t total_matches = 0;
+        // Preserving join: probe once per right row, in scan order, and
+        // emit matches immediately in that same order.
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+        li.reserve(n_right);
+        ri.reserve(n_right);
+        std::vector<std::uint8_t> left_matched_flags;
+        if (preserve_left_rows) {
+            left_matched_flags.assign(n_left, 0U);
+        }
         std::vector<std::uint8_t> right_matched_flags;
         if (preserve_right_rows) {
             right_matched_flags.assign(n_right, 0U);
@@ -726,83 +757,28 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             if (matches.empty()) {
                 continue;
             }
-            hits.push_back(Hit{.right_row = r, .matches = matches});
             for (const std::size_t l : matches) {
-                ++match_counts[l];
+                li.push_back(l);
+                ri.push_back(r);
+                if (preserve_left_rows) {
+                    left_matched_flags[l] = 1U;
+                }
             }
-            total_matches += matches.size();
             if (preserve_right_rows) {
                 right_matched_flags[r] = 1U;
             }
         }
 
-        // Phase 2: replay the hits into a right-match array indexed by left
-        // offsets. Hits come in ascending right-row order, so each left row's
-        // matches stay ascending — the order the probe-twice version produced.
-        std::vector<std::size_t> match_offsets(n_left + 1, 0);
-        for (std::size_t l = 0; l < n_left; ++l) {
-            match_offsets[l + 1] = match_offsets[l] + match_counts[l];
-        }
-        std::vector<std::size_t> right_matches(total_matches);
-        std::vector<std::size_t> next_off = match_offsets;
-        for (const Hit& hit : hits) {
-            for (const std::size_t l : hit.matches) {
-                right_matches[next_off[l]++] = hit.right_row;
-            }
-        }
-        hits.clear();
-        hits.shrink_to_fit();
-
-        // Phase 3: build left_idx / right_idx.
-        std::size_t unmatched_right = 0;
-        if (preserve_right_rows) {
-            unmatched_right = static_cast<std::size_t>(std::count(
-                right_matched_flags.begin(), right_matched_flags.end(), std::uint8_t{0}));
-        }
-
-        if (semi_join || anti_join) {
-            // Membership join: left-only output.
-            std::vector<std::size_t> li;
-            li.reserve(n_left);
-            std::vector<std::size_t> ri;  // always kNull for semi/anti
+        if (preserve_left_rows) {
             for (std::size_t l = 0; l < n_left; ++l) {
-                const bool has_match = (match_counts[l] > 0);
-                if ((semi_join && has_match) || (anti_join && !has_match)) {
-                    li.push_back(l);
-                }
-            }
-            ri.assign(li.size(), kNull);
-            return std::make_tuple(std::move(li), std::move(ri), std::vector<std::size_t>{});
-        }
-
-        // Preserving join.
-        std::size_t out_rows = 0;
-        for (std::size_t l = 0; l < n_left; ++l) {
-            auto preserve = preserve_left_rows ? 1U : 0U;
-            out_rows += match_counts[l] == 0 ? preserve : match_counts[l];
-        }
-        out_rows += unmatched_right;
-
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
-        std::vector<std::size_t> kri;
-        li.reserve(out_rows);
-        ri.reserve(out_rows);
-
-        for (std::size_t l = 0; l < n_left; ++l) {
-            if (match_counts[l] == 0) {
-                if (preserve_left_rows) {
+                if (left_matched_flags[l] == 0U) {
                     li.push_back(l);
                     ri.push_back(kNull);
                 }
-                continue;
-            }
-            for (std::size_t idx = match_offsets[l]; idx < match_offsets[l + 1]; ++idx) {
-                li.push_back(l);
-                ri.push_back(right_matches[idx]);
             }
         }
 
+        std::vector<std::size_t> kri;
         if (preserve_right_rows) {
             for (std::size_t r = 0; r < n_right; ++r) {
                 if (right_matched_flags[r] == 0U) {

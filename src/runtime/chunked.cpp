@@ -2701,9 +2701,13 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 ///   hash index on the materialized right, then probe each left chunk
 ///   streamed from the child. Matches the classic star-join shape.
 /// - Swapped: right is large and n_left < n_right. Materialize left,
-///   build the hash index on left, iterate right rows in two phases to
-///   emit output in left-row order (baseline's `build_indices_from_right_scan`
-///   equivalent). Much better cache behavior when the smaller side fits.
+///   build the hash index on left, iterate right rows once and emit output
+///   in that same right-scan (probe) order (baseline's
+///   `build_indices_from_right_scan` equivalent) — SPEC.md does not
+///   guarantee join row order, and preserving the probe side's scan order
+///   instead of reassembling by left row keeps cache locality for any
+///   downstream join that probes this join's output. Much better cache
+///   behavior overall when the smaller side fits.
 ///
 /// Name conflicts are resolved with the same `_right` suffix rule as
 /// `join_table_impl`.
@@ -3116,10 +3120,8 @@ class ChunkedInnerJoinOperator final : public Operator {
                 "ChunkedInnerJoinOperator: swapped mode without a materialized left table");
         }
         const Table& left_table = *left_table_;
-        const std::size_t n_left = left_table.rows();
         const std::size_t n_right = right_.rows();
 
-        std::vector<std::size_t> match_counts(n_left, 0);
         std::size_t total = 0;
 
         // In swapped mode the index is on the left, so the right table is the
@@ -3146,7 +3148,6 @@ class ChunkedInnerJoinOperator final : public Operator {
                 }
                 hits.push_back(Hit{r, it->second});
                 for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
-                    ++match_counts[cur];
                     ++total;
                 }
             }
@@ -3196,23 +3197,22 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         }
 
-        // Phase 2: replay the recorded hits. Right rows were visited in
-        // ascending order, so writing each match at the running offset of its
-        // left row yields (li, ri) sorted by left row, then by right row —
-        // the same order the two-probe version produced.
+        // Phase 2: replay the recorded hits in the same order Phase 1 visited
+        // them — right-scan (probe) order. SPEC.md does not guarantee join
+        // row order ("any join drop[s] ordering unless the implementation
+        // can prove a specific order"), so there's no correctness reason to
+        // reassemble by left row instead; doing so was actively harmful,
+        // permuting the output away from the probe side's natural scan
+        // order and hurting cache locality on any downstream join that
+        // probes this join's output.
         std::vector<std::size_t> li(total, 0);
         std::vector<std::size_t> ri(total, 0);
-        std::vector<std::size_t> next_off(n_left, 0);
-        std::size_t acc = 0;
-        for (std::size_t l = 0; l < n_left; ++l) {
-            next_off[l] = acc;
-            acc += match_counts[l];
-        }
+        std::size_t pos = 0;
         for (const Hit& hit : hits) {
             for (std::size_t cur = hit.head; cur != kNil; cur = chain_next_[cur]) {
-                const std::size_t pos = next_off[cur]++;
                 li[pos] = cur;
                 ri[pos] = hit.rrow;
+                ++pos;
             }
         }
 

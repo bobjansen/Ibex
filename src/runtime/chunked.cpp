@@ -1816,9 +1816,35 @@ class ChunkedOrderedLimitOperator final : public Operator {
             heap, [&](const Entry& a, const Entry& b) { return entry_preferred(a, b); });
     }
 
+    // Resolves this row's group heap without boxing a Key (a heap-allocated
+    // vector of ScalarValue) on every row: group_key_cols reads column
+    // storage in place, and group_index_ probes a dense gid by hash, only
+    // building a boxed Key the first time a group is seen. With a few hundred
+    // distinct groups over millions of rows (e.g. `by symbol`), that turns the
+    // per-row cost from an allocation + string hash into a hash-and-compare
+    // over existing memory. Only called when group_by_ is non-empty — the
+    // ungrouped case stays a direct `&heap_` at the call site so it never pays
+    // for a function call it doesn't need.
+    auto resolve_group_heap(const Table& chunk, const std::vector<KeyCol>& group_key_cols,
+                            std::size_t row) -> std::vector<Entry>* {
+        const std::uint32_t gid =
+            group_index_.find_or_insert(group_keys_, group_key_cols, row, [&] {
+                Key key;
+                key.values.reserve(group_by_->size());
+                for (const auto& ref : *group_by_) {
+                    const auto* entry = chunk.find_entry(ref.name);
+                    push_key_value(key, *entry, row);
+                }
+                group_keys_.push_back(std::move(key));
+                group_states_.push_back(GroupState{});
+                return static_cast<std::uint32_t>(group_states_.size() - 1);
+            });
+        return &group_states_[gid].heap;
+    }
+
     template <typename T>
     auto process_single_key_chunk(const Table& chunk, const Column<T>& key_column, bool ascending,
-                                  const std::vector<const ColumnValue*>& group_columns)
+                                  const std::vector<KeyCol>& group_key_cols)
         -> std::optional<std::string> {
         for (std::size_t row = 0; row < chunk.rows(); ++row) {
             const std::size_t sequence = next_sequence_++;
@@ -1826,12 +1852,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
 
             std::vector<Entry>* heap = &heap_;
             if (!group_by_->empty()) {
-                Key group_key;
-                group_key.values.reserve(group_columns.size());
-                for (const auto* column : group_columns) {
-                    group_key.values.push_back(scalar_from_column(*column, row));
-                }
-                heap = &group_heaps_[std::move(group_key)].heap;
+                heap = resolve_group_heap(chunk, group_key_cols, row);
             }
 
             if (heap->size() == count_ &&
@@ -1854,15 +1875,19 @@ class ChunkedOrderedLimitOperator final : public Operator {
             return std::nullopt;
         }
 
-        std::vector<const ColumnValue*> group_columns;
-        group_columns.reserve(group_by_->size());
+        std::vector<KeyCol> group_key_cols;
+        group_key_cols.reserve(group_by_->size());
         for (const auto& ref : *group_by_) {
-            const auto* column = chunk.find(ref.name);
-            if (column == nullptr) {
-                return "head group-by column not found: " + ref.name +
+            const auto* entry = chunk.find_entry(ref.name);
+            if (entry == nullptr) {
+                return "topk group-by column not found: " + ref.name +
                        " (available: " + format_columns(chunk) + ")";
             }
-            group_columns.push_back(column);
+            auto col = make_key_col(*entry);
+            if (!col.has_value()) {
+                return "topk group-by column has unsupported type: " + ref.name;
+            }
+            group_key_cols.push_back(*col);
         }
 
         std::vector<const ColumnValue*> key_columns;
@@ -1880,31 +1905,26 @@ class ChunkedOrderedLimitOperator final : public Operator {
             const bool ascending = keys_->front().ascending;
             const ColumnValue& key_column = *key_columns.front();
             if (const auto* col = std::get_if<Column<std::int64_t>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_columns);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
             }
             if (const auto* col = std::get_if<Column<double>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_columns);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
             }
             if (const auto* col = std::get_if<Column<bool>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_columns);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
             }
             if (const auto* col = std::get_if<Column<Date>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_columns);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
             }
             if (const auto* col = std::get_if<Column<Timestamp>>(&key_column)) {
-                return process_single_key_chunk(chunk, *col, ascending, group_columns);
+                return process_single_key_chunk(chunk, *col, ascending, group_key_cols);
             }
         }
 
         for (std::size_t row = 0; row < chunk.rows(); ++row) {
             std::vector<Entry>* heap = &heap_;
             if (!group_by_->empty()) {
-                Key group_key;
-                group_key.values.reserve(group_columns.size());
-                for (const auto* column : group_columns) {
-                    group_key.values.push_back(scalar_from_column(*column, row));
-                }
-                heap = &group_heaps_[std::move(group_key)].heap;
+                heap = resolve_group_heap(chunk, group_key_cols, row);
             }
 
             Entry entry;
@@ -1927,7 +1947,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
         if (group_by_->empty()) {
             winners = heap_;
         } else {
-            for (auto& [_, state] : group_heaps_) {
+            for (auto& state : group_states_) {
                 for (auto& entry : state.heap) {
                     winners.push_back(std::move(entry));
                 }
@@ -1973,7 +1993,9 @@ class ChunkedOrderedLimitOperator final : public Operator {
     bool emitted_ = false;
     std::size_t next_sequence_ = 0;
     std::vector<Entry> heap_;
-    robin_hood::unordered_flat_map<Key, GroupState, KeyHash, KeyEq> group_heaps_;
+    std::vector<Key> group_keys_;
+    std::vector<GroupState> group_states_;
+    KeyRowIndex group_index_;
     std::optional<Table> empty_template_;
 };
 

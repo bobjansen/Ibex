@@ -13,7 +13,10 @@
 #include <ranges>
 #include <set>
 #include <string>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#else
 #include <unistd.h>
 #endif
 #include <utility>
@@ -1724,6 +1727,46 @@ print(cheapest[select { n = count() }]);
 
 namespace {
 
+auto current_process_id() -> int {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return getpid();
+#endif
+}
+
+auto duplicate_file_descriptor(int descriptor) -> int {
+#ifdef _WIN32
+    return _dup(descriptor);
+#else
+    return dup(descriptor);
+#endif
+}
+
+auto replace_file_descriptor(int source, int destination) -> int {
+#ifdef _WIN32
+    return _dup2(source, destination);
+#else
+    return dup2(source, destination);
+#endif
+}
+
+auto close_file_descriptor(int descriptor) -> int {
+#ifdef _WIN32
+    return _close(descriptor);
+#else
+    return close(descriptor);
+#endif
+}
+
+auto file_descriptor(std::FILE* stream) -> int {
+#ifdef _WIN32
+    return _fileno(stream);
+#else
+    return fileno(stream);
+#endif
+}
+
 /// Runs `source` with planner reporting on; returns what the REPL wrote to stderr.
 /// The `planner:` line there is what bench_ibex.py reads to record which engine
 /// path each query measured, so its shape is a contract, not just a log line.
@@ -1733,18 +1776,18 @@ auto capture_planner_line(std::string_view source, ibex::runtime::ExternRegistry
     // ctest -j runs them concurrently -- a fixed name would let two captures
     // clobber each other's file.
     const auto path = std::filesystem::temp_directory_path() /
-                      ("ibex_planner_capture_" + std::to_string(getpid()) + ".txt");
+                      ("ibex_planner_capture_" + std::to_string(current_process_id()) + ".txt");
     ibex::repl::ReplConfig config;
     config.report_planner = true;
     config.persistent_history = false;
 
     std::fflush(stderr);
-    const int saved = dup(fileno(stderr));
+    const int saved = duplicate_file_descriptor(file_descriptor(stderr));
     REQUIRE(std::freopen(path.string().c_str(), "w", stderr) != nullptr);
     static_cast<void>(ibex::repl::execute_script(source, registry, config));
     std::fflush(stderr);
-    REQUIRE(dup2(saved, fileno(stderr)) != -1);
-    static_cast<void>(close(saved));
+    REQUIRE(replace_file_descriptor(saved, file_descriptor(stderr)) != -1);
+    static_cast<void>(close_file_descriptor(saved));
 
     std::ifstream in{path};
     const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

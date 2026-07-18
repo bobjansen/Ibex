@@ -536,6 +536,40 @@ auto rbind_table(const std::vector<const Table*>& tables,
                         // dictionary into the result's; other types copy values.
                         dst.push_back(src[r]);
                     }
+                } else if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                    // Every operand's dictionary remap normally needs a
+                    // per-row hash lookup (find_or_insert). But when every
+                    // operand shares the exact same dictionary object --
+                    // the common case for `rbind(t, t)` or operands drawn
+                    // from a common upstream scan -- no lookup can ever add
+                    // a new entry, so the codes are already valid as-is and
+                    // can be bulk-copied like any other column.
+                    bool shared_dict = tables[0]->columns[col_pos[0][ci]].column != nullptr;
+                    const auto& first_src =
+                        std::get<Col>(*tables[0]->columns[col_pos[0][ci]].column);
+                    for (std::size_t ti = 1; shared_dict && ti < tables.size(); ++ti) {
+                        const auto& src =
+                            std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
+                        shared_dict = src.dictionary_ptr() == first_src.dictionary_ptr();
+                    }
+                    if (shared_dict) {
+                        dst = Col(first_src.dictionary_ptr(), first_src.index_ptr(), {});
+                        dst.reserve(total_rows);
+                        for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+                            const auto& src =
+                                std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
+                            const auto& src_codes = src.codes();
+                            dst.append_codes(src_codes.begin(), src_codes.end());
+                        }
+                    } else {
+                        for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+                            const auto& src =
+                                std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
+                            for (std::size_t r = 0, n = src.size(); r < n; ++r) {
+                                dst.push_back(src[r]);
+                            }
+                        }
+                    }
                 } else {
                     // Plain append: every operand's rows land contiguously in
                     // the output, so each operand can be copied in one shot
@@ -543,7 +577,6 @@ auto rbind_table(const std::vector<const Table*>& tables,
                     // span-backed types that turns an O(rows) scalar loop
                     // (with a variant unwrap on every row) into one `insert`
                     // per operand that the compiler can fold into a memcpy.
-                    // Categorical still needs the per-row dictionary remap.
                     for (std::size_t ti = 0; ti < tables.size(); ++ti) {
                         const auto& src =
                             std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);

@@ -18,7 +18,9 @@
 //      which must be l1's own (l1 is late by the outer filter).
 //
 //  l1 stays at line granularity (one row per late line), so count(*) counts
-//  waiting lines, matching the SQL. `li_F` is bound once and reused three times.
+//  waiting lines, matching the SQL. Candidate l1 rows are restricted to Saudi
+//  suppliers first; their order keys then restrict the two distinct-supplier
+//  aggregates without removing any line from a candidate order.
 //
 //  Run:
 //    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
@@ -38,24 +40,32 @@ let orders_F = orders_raw[filter o_orderstatus == "F"][select { l_orderkey = o_o
 let li_F = lineitem_raw[select { l_orderkey, l_suppkey, l_receiptdate, l_commitdate }]
     semi join orders_F on l_orderkey;
 
+let saudi_suppliers = (
+    supplier_raw[select { l_suppkey = s_suppkey, s_name, s_nationkey }]
+    join nation_raw[filter n_name == "SAUDI ARABIA"][select { s_nationkey = n_nationkey }]
+        on s_nationkey
+)[select { l_suppkey, s_name }];
+
+// Only Saudi late lines can contribute to the final result.
+let l1 = li_F[filter l_receiptdate > l_commitdate][select { l_orderkey, l_suppkey }]
+    semi join saudi_suppliers on l_suppkey;
+let candidate_orders = l1[distinct { l_orderkey }];
+let candidate_li = li_F semi join candidate_orders on l_orderkey;
+
 // exists (another supplier on the order)  ==  order has >1 distinct supplier.
-let n_sup = li_F[distinct { l_orderkey, l_suppkey }][select { n_sup = count() }, by { l_orderkey }];
+let n_sup = candidate_li[distinct { l_orderkey, l_suppkey }][
+    select { n_sup = count() }, by { l_orderkey }];
 
 // not exists (another LATE supplier)  ==  order has exactly 1 distinct late supplier.
-let n_late = li_F[filter l_receiptdate > l_commitdate][distinct { l_orderkey, l_suppkey }][
+let n_late = candidate_li[filter l_receiptdate > l_commitdate][
+    distinct { l_orderkey, l_suppkey }
+][
     select { n_late = count() }, by { l_orderkey }];
-
-// l1 = the late lines themselves (one row per line, not deduplicated).
-let l1 = li_F[filter l_receiptdate > l_commitdate][select { l_orderkey, l_suppkey }];
 
 let qualifying = ((l1 join n_sup on l_orderkey)[filter n_sup > 1]
     join n_late on l_orderkey)[filter n_late == 1][select { l_suppkey }];
 
-let result = (
-    (qualifying join supplier_raw[select { l_suppkey = s_suppkey, s_name, s_nationkey }] on l_suppkey)
-    join nation_raw[filter n_name == "SAUDI ARABIA"][select { s_nationkey = n_nationkey }]
-        on s_nationkey
-)[
+let result = (qualifying join saudi_suppliers on l_suppkey)[
     select { numwait = count() },
     by { s_name }
 ][

@@ -142,8 +142,25 @@ userdata_exit() {
     fi
 }
 trap userdata_exit EXIT
-apt-get update -qq
-apt-get install -y ca-certificates git
+# Retry apt-get on transient dpkg/apt lock contention -- e.g. unattended-upgrades
+# holding /var/lib/dpkg/lock-frontend in the first seconds after boot, which is
+# exactly what killed the 2026-07-18 R run here: apt-get exited 100 before the
+# repo was even cloned, set -Eeuo pipefail propagated it, and userdata_exit
+# self-terminated the instance.
+apt_get_retry() {
+    attempt=1; max_attempts=36; delay=5
+    while ! apt-get "\$@"; do
+        if (( attempt >= max_attempts )); then
+            echo "apt-get \$* failed after \${max_attempts} attempts" >&2
+            return 1
+        fi
+        echo "apt-get \$* failed (attempt \${attempt}/\${max_attempts}, likely a dpkg/apt lock) -- retrying in \${delay}s" >&2
+        sleep "\$delay"
+        attempt=\$((attempt + 1))
+    done
+}
+apt_get_retry update -qq
+apt_get_retry install -y ca-certificates git
 if [[ ! -d /ibex/.git ]]; then
     git clone "${repo_url}" /ibex
 fi

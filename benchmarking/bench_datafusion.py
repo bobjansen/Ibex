@@ -336,6 +336,20 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ).collect(),
     )
     run(
+        "where_update_expr",
+        lambda: ctx.sql(
+            "SELECT symbol, CASE WHEN price > 900.0 THEN price * 0.9 ELSE price END AS price "
+            "FROM prices"
+        ).collect(),
+    )
+    run(
+        "where_update_multi",
+        lambda: ctx.sql(
+            "SELECT symbol, CASE WHEN price > 900.0 THEN price * 0.9 ELSE price END AS price, "
+            "CASE WHEN price > 900.0 THEN price - 900.0 ELSE NULL END AS excess FROM prices"
+        ).collect(),
+    )
+    run(
         "rbind_two",
         lambda: ctx.sql(
             "SELECT * FROM prices UNION ALL SELECT * FROM prices"
@@ -819,6 +833,12 @@ def bench_datafusion_fill(n_rows, warmup, iters, ctx):
         "fill_null",
         lambda: ctx.sql(
             "SELECT COALESCE(val, 0.0) AS v2 FROM fill_data"
+        ).collect(),
+    )
+    run(
+        "where_update_nullable",
+        lambda: ctx.sql(
+            "SELECT CASE WHEN val IS NULL THEN 0.0 ELSE val END AS val FROM fill_data"
         ).collect(),
     )
     # fill_forward / fill_backward skipped: DataFusion *supports* LAST_VALUE(... )

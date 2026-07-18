@@ -1928,7 +1928,8 @@ int main(int argc, char** argv) {
                    "Benchmark suite(s) to run (comma-separated or repeated). "
                    "Supported: all, core, cumulative, sort, window, groupagg, pipeline, join, "
                    "rng, fill, null, filter, multi, "
-                   "events, reshape, timeframe, merge_validity, rng_micro, bool, filter_micro")
+                   "events, reshape, timeframe, transform, stats, scalar, merge_validity, "
+                   "rng_micro, bool, filter_micro")
         ->delimiter(',');
 
     CLI11_PARSE(app, argc, argv);
@@ -2263,16 +2264,22 @@ int main(int argc, char** argv) {
         }
 
         // Transform benchmarks: core single-pass language features that had no
-        // coverage. pmin_clip exercises the vectorised pmin path (winsorising a
-        // column against a scalar); where_update_clip is a guarded update (the
-        // ibex equivalent of SQL CASE WHEN — replaces matching rows, keeps
-        // cardinality); rbind_two vertically concatenates two tables (RbindNode).
+        // coverage. The guarded-update rows cover the literal fast path,
+        // row-local subset evaluation, multi-field projection/scatter, and the
+        // full-table window fallback. rbind_two vertically concatenates two
+        // tables (RbindNode).
         if (status == 0 && run_suite("transform")) {
             fmt::print("\n-- Transform benchmarks ({} prices rows) --\n",
                        tables.at("prices").rows());
             std::vector<BenchQuery> transform_queries = {
                 {"pmin_clip", "prices[update { clipped = pmin(price, 500.0) }]"},
                 {"where_update_clip", "prices[where price > 900.0 update { price = 900.0 }]"},
+                {"where_update_expr", "prices[where price > 900.0 update { price = price * 0.9 }]"},
+                {"where_update_multi",
+                 "prices[where price > 900.0 update { price = price * 0.9, excess = price - "
+                 "900.0 }]"},
+                {"where_update_window",
+                 "prices[where price > 900.0 update { prev = lag(price, 1) }]"},
                 {"rbind_two", "rbind(prices, prices)"},
             };
             for (const auto& query : transform_queries) {
@@ -2359,6 +2366,7 @@ int main(int argc, char** argv) {
             fmt::print("\n-- Fill benchmarks ({} rows, 50% nulls) --\n", fill_rows);
             std::vector<BenchQuery> fill_queries = {
                 {"fill_null", "fill_data[update { v2 = fill_null(val, 0.0) }]"},
+                {"where_update_nullable", "fill_data[where is_null(val) update { val = 0.0 }]"},
                 {"fill_forward", "fill_data[update { v2 = fill_forward(val) }]"},
                 {"fill_backward", "fill_data[update { v2 = fill_backward(val) }]"},
             };

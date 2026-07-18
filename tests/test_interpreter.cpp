@@ -7452,6 +7452,37 @@ TEST_CASE("rbind: remaps categorical dictionaries", "[rbind][categorical]") {
     CHECK(g[3] == "z");
 }
 
+TEST_CASE("rbind: appending a table to itself takes the shared-dictionary fast path",
+          "[rbind][categorical]") {
+    // Both operands are literally the same table, so their categorical
+    // columns share one dictionary object -- this exercises rbind_table's
+    // fast path (bulk-copy codes, no per-row dictionary lookup) rather than
+    // the generic remap used when dictionaries differ.
+    Column<Categorical> ca;
+    ca.push_back("x");
+    ca.push_back("y");
+    ca.push_back("x");
+
+    runtime::Table a;
+    a.add_column("g", std::move(ca));
+
+    runtime::TableRegistry registry;
+    registry.emplace("a", a);
+
+    auto ir = require_ir("rbind(a, a);");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 6);
+
+    const auto& g = std::get<Column<Categorical>>(*result->find("g"));
+    CHECK(g[0] == "x");
+    CHECK(g[1] == "y");
+    CHECK(g[2] == "x");
+    CHECK(g[3] == "x");
+    CHECK(g[4] == "y");
+    CHECK(g[5] == "x");
+}
+
 TEST_CASE("rbind: two TimeFrames interleave by time index and stay a TimeFrame",
           "[rbind][timeframe]") {
     runtime::Table a, b;

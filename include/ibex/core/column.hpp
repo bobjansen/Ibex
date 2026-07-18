@@ -324,6 +324,15 @@ class Column<Categorical> {
 
     void push_code(code_type code) { codes_.push_back(code); }
 
+    /// Bulk-append already-resolved codes (e.g. from another Column<Categorical>
+    /// proven to share this instance's dictionary). Codes are copied as-is
+    /// with no dictionary lookup -- callers must ensure they are valid for
+    /// this dictionary.
+    template <typename InputIt>
+    void append_codes(InputIt first, InputIt last) {
+        codes_.insert(codes_.end(), first, last);
+    }
+
     void push_back(value_type value) {
         auto code = find_or_insert(value);
         codes_.push_back(code);

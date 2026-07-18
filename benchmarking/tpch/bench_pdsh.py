@@ -30,6 +30,8 @@ def percentile(data: list[float], p: float) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", choices=("polars", "duckdb"), required=True)
+    parser.add_argument("--threads", type=int, default=None,
+                        help="connection thread count (DuckDB only)")
     parser.add_argument("--pdsh-root", type=pathlib.Path, required=True,
                         help="checkout of pola-rs/polars-benchmark")
     parser.add_argument("--sf", default="1")
@@ -38,6 +40,8 @@ def main() -> int:
     parser.add_argument("--framework", default=None)
     parser.add_argument("--out", type=pathlib.Path, required=True)
     args = parser.parse_args()
+    if args.threads is not None and (args.engine != "duckdb" or args.threads < 1):
+        parser.error("--threads requires --engine duckdb and a positive value")
 
     parquet = DATA_ROOT / f"parquet_sf{args.sf}"
     if not parquet.is_dir():
@@ -75,8 +79,18 @@ def main() -> int:
                 "RUN_ITERATIONS": str(args.warmup + args.iters),
             }
             print(f"=== {framework} q{query_number:02d} ===", file=sys.stderr)
+            command = [sys.executable, "-m", f"queries.{args.engine}.q{query_number}"]
+            if args.engine == "duckdb" and args.threads is not None:
+                # Apply the setting to the exact connection owned by upstream,
+                # then invoke its otherwise unchanged query implementation.
+                launcher = (
+                    "from queries.duckdb import utils; "
+                    f"utils.get_connection().execute('SET threads={args.threads}'); "
+                    f"from queries.duckdb.q{query_number} import q; q()"
+                )
+                command = [sys.executable, "-c", launcher]
             subprocess.run(
-                [sys.executable, "-m", f"queries.{args.engine}.q{query_number}"],
+                command,
                 cwd=args.pdsh_root,
                 env=env,
                 check=True,

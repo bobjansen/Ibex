@@ -543,11 +543,15 @@ TEST_CASE("Lower rejects an impossible ascription over a known input") {
         REQUIRE_FALSE(result.has_value());
         REQUIRE(result.error().message.find("Float64") != std::string::npos);
     }
-    SECTION("an exact ascription forbids unlisted extra columns") {
+    SECTION("an ascription allows but hides unlisted extra columns") {
         auto program = require_parse("Table { a = [1], b = [2.5] } as DataFrame<{ a: Int64 }>;");
         auto result = parser::lower(program);
-        REQUIRE_FALSE(result.has_value());
-        REQUIRE(result.error().message.find("extra column 'b'") != std::string::npos);
+        REQUIRE(result.has_value());
+        const auto schema = ir::infer_schema(**result);
+        REQUIRE(schema.is_known());
+        REQUIRE_FALSE(schema.is_open());
+        REQUIRE(schema.find("a") != nullptr);
+        REQUIRE(schema.find("b") == nullptr);
     }
     SECTION("a wildcard ascription allows extra columns") {
         auto program = require_parse("Table { a = [1], b = [2.5] } as DataFrame<{ a: Int64, * }>;");
@@ -597,11 +601,13 @@ TEST_CASE("Lower validates references against a declared reader return schema") 
             "read_typed(\"f\")[select { a }];");
         REQUIRE(parser::lower(program).has_value());
     }
-    SECTION("a wildcard reader allows unlisted columns") {
+    SECTION("a wildcard reader hides unlisted columns") {
         auto program = require_parse(
             "extern fn read_open(p: String) -> DataFrame<{ a: Int64, * }> from \"x.hpp\";\n"
             "read_open(\"f\")[select { b }];");
-        REQUIRE(parser::lower(program).has_value());
+        auto result = parser::lower(program);
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().message.find("b") != std::string::npos);
     }
 }
 
@@ -618,6 +624,8 @@ TEST_CASE("Lower rejects missing column references over a known schema") {
     rejects("Table { a = [1] }[order { b }];", "b");
     rejects("Table { a = [1] }[rename { x = b }];", "b");
     rejects("Table { a = [1] }[select { a }, order { b }];", "b");
+    rejects("(Table { a = [1], b = [2] } as { a: Int64 })[select { b }];", "b");
+    rejects("(Table { a = [1], b = [2] } as { a: Int64, * })[select { b }];", "b");
 
     SECTION("valid references lower cleanly") {
         auto program = require_parse("Table { a = [1], b = [2] }[select { a }, order { a }];");

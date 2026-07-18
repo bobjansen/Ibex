@@ -575,8 +575,10 @@ class AsTimeframeNode final : public Node {
 /// Ascribe node: a runtime-checked schema ascription (`expr as DataFrame<{...}>`).
 /// At interpret time the child table is validated against `schema` (each listed
 /// column must exist with a matching type); the table is then passed through
-/// unchanged. Statically, the result schema is exactly `schema`, which lets the
-/// schema-propagation pass recover a Known schema past an Unknown source.
+/// unchanged, including any extra columns. Statically, the result schema exposes
+/// exactly `schema`; extra physical columns cannot be used until named by a later
+/// ascription. This lets schema propagation recover a Known schema past an
+/// Unknown source.
 class AscribeNode final : public Node {
    public:
     AscribeNode(NodeId id, std::vector<SchemaField> schema, bool open = false)
@@ -585,7 +587,8 @@ class AscribeNode final : public Node {
     [[nodiscard]] auto schema() const noexcept -> const std::vector<SchemaField>& {
         return schema_;
     }
-    /// True if the ascription ends with a `*` wildcard (extra columns allowed).
+    /// True if the ascription was written with a trailing `*` wildcard.
+    /// Retained for source/IR fidelity; ascriptions always permit extras.
     [[nodiscard]] auto open() const noexcept -> bool { return open_; }
 
     /// True once `check_ascriptions` has proven this ascription holds against a

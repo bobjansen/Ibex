@@ -302,26 +302,17 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
             return;
         }
 
-        // A wildcard ascription (`as { a: Int, * }`) asserts only that the named
-        // columns exist with the named types; extra columns are explicitly
-        // allowed, so whether they are materialized is unobservable. Demand what
-        // the parent wants plus the names the check itself reads, and no more --
-        // naming a column asserts its shape, it does not ask for its data.
-        //
-        // An exact ascription is different and must keep widening: it also
-        // asserts the input has *no* column it does not list, and that can only
-        // be checked against the whole input. Narrowing it first would hide the
-        // extras it exists to reject.
+        // An ascription asserts only that the named columns exist with the named
+        // types. Extra physical columns pass through but are not statically
+        // visible, so whether they are materialized is unobservable. Demand
+        // what the parent wants plus the names the check itself reads, and no
+        // more -- naming a column asserts its shape, it does not ask for data.
         case NodeKind::Ascribe: {
             const auto& asc = static_cast<const AscribeNode&>(node);
             if (asc.checked()) {
                 // Already proven against the input's schema, so it reads nothing
                 // at all: pass the parent's demand straight through.
                 visit_children(node, need, out);
-                return;
-            }
-            if (!asc.open()) {
-                visit_children_widened(node, out);
                 return;
             }
             ColumnDemand below = need;

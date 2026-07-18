@@ -137,6 +137,13 @@ TEST_CASE("E2E: schema ascription passes a conforming table through", "[e2e][asc
     CHECK(col_dbl(out, "b") == std::vector<double>{1.5, 2.5});
 }
 
+TEST_CASE("E2E: schema ascription preserves unlisted physical columns", "[e2e][ascribe]") {
+    auto tables = make_trades();
+    auto out = run("trades as DataFrame<{ price: Int64 }>;", tables);
+    CHECK(col_i64(out, "price") == std::vector<std::int64_t>{10, 20, 30, 40, 50});
+    CHECK(out.find("symbol") != nullptr);
+}
+
 // Over a source with an unknown static schema (a registry table), the
 // ascription check is deferred to the runtime validation.
 TEST_CASE("E2E: schema ascription rejects a missing column at run time", "[e2e][ascribe]") {

@@ -9,6 +9,7 @@ pull the results back as a CSV. Three layers:
 | `build-ami.sh`       | local       | Bakes a reusable AMI (toolchain + R + uv + a warm ibex/Arrow build). Repeatable. |
 | `run.sh`             | local       | One instance runs the **whole** suite. |
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
+| `run-tpch.sh`        | local       | One instance runs the TPC-H/PDS-H quartet and downloads a TSV artifact. |
 | `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |
 | `bisect-git.sh`      | local       | Single-instance performance `git bisect` for one benchmark query. |
 | `compare-compilers.sh` | local     | A/B latest **Clang vs GCC** full Ibex builds for one commit. |
@@ -59,6 +60,21 @@ Re-run any time (e.g. after a toolchain bump) to refresh the AMI.
 ```
 
 Result → `benchmarking/results/scales_aws_<timestamp>.csv`.
+
+## 3a.1 TPC-H/PDS-H quartet
+
+```bash
+git push
+./benchmarking/aws/run-tpch.sh --on-demand --sf 1 --warmup 1 --iters 5
+```
+
+This runs Ibex, this repository's Polars implementation in default and
+single-threaded modes, plus the upstream Polars PDS-H Polars implementation in
+both modes and its DuckDB SQL. The runner pins the upstream PDS-H revision and
+downloads `benchmarking/results/tpch_aws_<timestamp>.tar.gz`; extract it to get
+one TSV per framework and a `versions.txt` manifest. Use `--sf 1,10` to run
+multiple scale factors sequentially. SF-10 needs materially more disk/RAM; use
+`--type r7i.4xlarge` when in doubt.
 
 ## 3b. Run one instance per engine (parallel, isolated)
 

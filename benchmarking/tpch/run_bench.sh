@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# run_bench.sh — time the implemented PDS-H queries: ibex vs. polars
+# run_bench.sh — time TPC-H/PDS-H queries: Ibex, this tree's Polars implementation,
+# and the upstream Polars PDS-H Polars + DuckDB implementations.
 # (multi-threaded, matching Polars' default/published numbers) vs.
 # polars-st (single-threaded, the fair apples-to-apples comparison since
 # Ibex has no multithreading yet).
@@ -12,7 +13,7 @@
 # is only defined at SF-1; higher scales are timing-only.
 #
 # Usage:
-#   ./run_bench.sh [--sf N] [--warmup N] [--iters N]
+#   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
 
 set -euo pipefail
 
@@ -24,11 +25,13 @@ RESULTS="$SCRIPT_DIR/results"
 SCALE=1
 WARMUP=1
 ITERS=5
+PDSH_ROOT="${PDSH_ROOT:-}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sf)     SCALE="$2"; shift 2 ;;
         --warmup) WARMUP="$2"; shift 2 ;;
         --iters)  ITERS="$2";  shift 2 ;;
+        --pdsh-root) PDSH_ROOT="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -36,6 +39,11 @@ done
 PARQUET_DIR="$DATA_ROOT/parquet_sf${SCALE}"
 if [[ ! -d "$PARQUET_DIR" ]]; then
     echo "error: $PARQUET_DIR not found — run ./gen_data.sh $SCALE && ./gen_parquet.sh $SCALE first" >&2
+    exit 1
+fi
+
+if [[ -z "$PDSH_ROOT" ]]; then
+    echo "error: --pdsh-root is required (a checkout of pola-rs/polars-benchmark)" >&2
     exit 1
 fi
 
@@ -59,6 +67,21 @@ POLARS_MAX_THREADS=1 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_polars.py"
     --warmup "$WARMUP" --iters "$ITERS" --out "$RESULTS/polars_st${SUFFIX}.tsv.tmp"
 sed 's/^polars\t/polars-st\t/' "$RESULTS/polars_st${SUFFIX}.tsv.tmp" > "$RESULTS/polars_st${SUFFIX}.tsv"
 rm -f "$RESULTS/polars_st${SUFFIX}.tsv.tmp"
+
+echo "=== upstream PDS-H Polars (multi-threaded, $(nproc) cores) ==="
+uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --pdsh-root "$PDSH_ROOT" \
+    --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars \
+    --out "$RESULTS/pdsh_polars${SUFFIX}.tsv"
+
+echo "=== upstream PDS-H Polars (single-threaded) ==="
+POLARS_MAX_THREADS=1 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
+    --engine polars --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
+    --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
+
+echo "=== upstream PDS-H DuckDB SQL ==="
+uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --pdsh-root "$PDSH_ROOT" \
+    --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-duckdb \
+    --out "$RESULTS/pdsh_duckdb${SUFFIX}.tsv"
 
 echo
 python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*"${SUFFIX}.tsv"

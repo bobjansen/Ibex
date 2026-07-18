@@ -16,6 +16,34 @@
 
 set -euo pipefail
 
+# Retry apt-get/add-apt-repository on transient dpkg/apt lock contention — e.g.
+# unattended-upgrades holding /var/lib/dpkg/lock-frontend right after boot.
+apt_get_retry() {
+    local attempt=1 max_attempts=36 delay=5
+    while ! apt-get "$@"; do
+        if (( attempt >= max_attempts )); then
+            echo "apt-get $* failed after ${max_attempts} attempts" >&2
+            return 1
+        fi
+        echo "apt-get $* failed (attempt ${attempt}/${max_attempts}, likely a dpkg/apt lock) — retrying in ${delay}s" >&2
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
+add_apt_repository_retry() {
+    local attempt=1 max_attempts=36 delay=5
+    while ! add-apt-repository "$@"; do
+        if (( attempt >= max_attempts )); then
+            echo "add-apt-repository $* failed after ${max_attempts} attempts" >&2
+            return 1
+        fi
+        echo "add-apt-repository $* failed (attempt ${attempt}/${max_attempts}, likely a dpkg/apt lock) — retrying in ${delay}s" >&2
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
 INSTALL_R=1
 
 while [[ $# -gt 0 ]]; do
@@ -40,7 +68,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 
 echo "━━━ System packages ━━━"
-apt-get update -qq
+apt_get_retry update -qq
 
 # ── C++ toolchain ────────────────────────────────────────────────────────────
 # Noble's apt only ships clang-18 (reports __cpp_concepts=201907L, forcing the
@@ -48,7 +76,7 @@ apt-get update -qq
 # apt.llvm.org so benchmark builds use a modern compiler. Bump CLANG_VERSION to
 # re-baseline; must match bootstrap.sh.
 CLANG_VERSION=21
-apt-get install -y --no-install-recommends \
+apt_get_retry install -y --no-install-recommends \
     ninja-build \
     libjemalloc-dev libcurl4-openssl-dev libssl-dev zlib1g-dev \
     git curl unzip ca-certificates time \
@@ -69,15 +97,15 @@ chmod +x /tmp/llvm.sh
 # Pull the newest GCC exposed by Ubuntu's toolchain repo. This keeps the
 # compiler comparison on the latest available GCC without hard-coding a version
 # into the benchmark harness.
-add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
-apt-get update -qq
+add_apt_repository_retry -y ppa:ubuntu-toolchain-r/test || true
+apt_get_retry update -qq
 GCC_VERSION="$(apt-cache search --names-only '^g\+\+-[0-9]+$' \
     | awk '{ sub(/^g\+\+-/, "", $1); print $1 }' \
     | sort -n | tail -1)"
 if [[ -n "$GCC_VERSION" ]]; then
-    apt-get install -y "gcc-${GCC_VERSION}" "g++-${GCC_VERSION}"
+    apt_get_retry install -y "gcc-${GCC_VERSION}" "g++-${GCC_VERSION}"
 else
-    apt-get install -y gcc g++
+    apt_get_retry install -y gcc g++
 fi
 
 # Make the freshly installed Clang the unversioned default.
@@ -96,7 +124,7 @@ echo ""
 
 # ── Python + uv ──────────────────────────────────────────────────────────────
 echo "━━━ Python ━━━"
-apt-get install -y --no-install-recommends python3 python3-venv python3-dev
+apt_get_retry install -y --no-install-recommends python3 python3-venv python3-dev
 
 if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -118,7 +146,7 @@ echo ""
 # ── R ────────────────────────────────────────────────────────────────────────
 if [[ $INSTALL_R -eq 1 ]]; then
     echo "━━━ R ━━━"
-    apt-get install -y --no-install-recommends \
+    apt_get_retry install -y --no-install-recommends \
         r-base r-cran-data.table r-cran-optparse
 
     # dplyr and tidyr may not be in apt; install from CRAN if missing

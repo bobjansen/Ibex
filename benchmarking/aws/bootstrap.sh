@@ -23,6 +23,10 @@
 #   IBEX_ITERS        — timed iterations                    (normal mode)
 #   IBEX_TF_ROWS      — optional --tf-rows override         (normal mode)
 #   IBEX_BOTH_THREADING — include single-thread variants    (normal mode)
+#   IBEX_BUILD_REQUIRED — "0" for engine-only workers that do not execute Ibex
+#                         (set by run-per-engine.sh; default "1")
+#   IBEX_BUILD_TARGETS  — optional whitespace-separated Ninja targets for an
+#                         engine worker (run-per-engine.sh uses "ibex_bench")
 #   IBEX_SUITE_ARGS   — verbatim extra args for run_scale_suite.sh (overrides
 #                       the default arg set; used by run-per-engine.sh)
 #   IBEX_PROVISION_ONLY — "1" to provision + image-prep and stop (build-ami.sh)
@@ -264,7 +268,13 @@ build_ibex() {
         -DIBEX_ENABLE_LTO=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -S /ibex
-    ninja -C /ibex/build-release
+    if [[ -n "${IBEX_BUILD_TARGETS:-}" ]]; then
+        local targets=()
+        read -r -a targets <<< "${IBEX_BUILD_TARGETS}"
+        ninja -C /ibex/build-release "${targets[@]}"
+    else
+        ninja -C /ibex/build-release
+    fi
 }
 
 build_ibex_with_compiler() {
@@ -725,7 +735,11 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     exit 0
 fi
 
-build_ibex
+if [[ "${IBEX_BUILD_REQUIRED:-1}" == "1" ]]; then
+    build_ibex
+else
+    echo "Skipping Ibex CMake build (selected benchmark engine does not use it)."
+fi
 
 # Each launch produces a complete, self-contained CSV. The default arg set runs
 # the full multi-threaded engine set + pandas + dplyr and duckdb at every size;

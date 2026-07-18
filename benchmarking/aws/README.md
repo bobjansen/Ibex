@@ -91,6 +91,12 @@ only its engine enabled, uploads its slice, and self-terminates;
 `run-per-engine.sh` polls all of them and concatenates the slices into one
 `benchmarking/results/scales_aws_<timestamp>.csv` (same shape as `run.sh`).
 
+Engine workers also avoid unrelated native build work: only the `ibex` worker
+configures CMake, and it builds only the `ibex_bench` target. Python, R,
+DuckDB, DataFusion, ClickHouse, and SQLite workers skip the Ibex build entirely.
+Downloaded per-engine slices live in a run-specific directory so an interrupted
+run cannot accidentally reuse a result file from an earlier sweep.
+
 Engine groups (each = one instance):
 
 | `--engines` token | Frameworks produced |

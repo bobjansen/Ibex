@@ -5048,6 +5048,56 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
         CHECK(a[3] == 40);  // non-matching, unchanged
     }
 
+    // Multiple subset fields share a projection of only their referenced
+    // columns. Expressions retain the guarded update's original-row snapshot.
+    {
+        auto registry = make();
+        auto ir = require_ir(R"(t[where g == "x" update { a = a + 1, doubled = a * 2 }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto& a = std::get<Column<std::int64_t>>(*result->find("a"));
+        CHECK(a[0] == 11);
+        CHECK(a[1] == 20);
+        CHECK(a[2] == 31);
+        CHECK(a[3] == 40);
+        const auto& doubled = std::get<Column<std::int64_t>>(*result->find("doubled"));
+        CHECK(doubled[0] == 20);
+        CHECK(doubled[2] == 60);
+        const auto* doubled_entry = result->find_entry("doubled");
+        REQUIRE(doubled_entry->validity.has_value());
+        CHECK((*doubled_entry->validity)[0]);
+        CHECK_FALSE((*doubled_entry->validity)[1]);
+        CHECK((*doubled_entry->validity)[2]);
+        CHECK_FALSE((*doubled_entry->validity)[3]);
+    }
+
+    // A literal replacement on an existing fixed-width column takes the
+    // direct masked-copy path. It must still leave the registry's shared input
+    // untouched and keep an all-valid output free of a validity bitmap.
+    {
+        runtime::Table t;
+        t.add_column("price", Column<double>{800.0, 950.0, 900.0, 999.0});
+        runtime::TableRegistry registry;
+        registry.emplace("prices", t);
+        auto ir = require_ir(R"(prices[where price > 900.0 update { price = 900.0 }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto& price = std::get<Column<double>>(*result->find("price"));
+        REQUIRE(price.size() == 4);
+        CHECK(price[0] == 800.0);
+        CHECK(price[1] == 900.0);
+        CHECK(price[2] == 900.0);
+        CHECK(price[3] == 900.0);
+        CHECK_FALSE(result->find_entry("price")->validity.has_value());
+
+        const auto& original = std::get<Column<double>>(*registry.at("prices").find("price"));
+        REQUIRE(original.size() == 4);
+        CHECK(original[0] == 800.0);
+        CHECK(original[1] == 950.0);
+        CHECK(original[2] == 900.0);
+        CHECK(original[3] == 999.0);
+    }
+
     // Non-row-local field (lag): evaluated over the FULL table, then assigned to
     // matching rows; a new column is null off-mask.
     {

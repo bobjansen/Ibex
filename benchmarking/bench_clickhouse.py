@@ -297,6 +297,15 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         "where_update_clip",
         "SELECT symbol, if(price > 900.0, 900.0, price) AS price FROM prices",
     )
+    run(
+        "where_update_expr",
+        "SELECT symbol, if(price > 900.0, price * 0.9, price) AS price FROM prices",
+    )
+    run(
+        "where_update_multi",
+        "SELECT symbol, if(price > 900.0, price * 0.9, price) AS price, "
+        "if(price > 900.0, price - 900.0, NULL) AS excess FROM prices",
+    )
     run("rbind_two", "SELECT * FROM prices UNION ALL SELECT * FROM prices")
 
     run(
@@ -726,6 +735,10 @@ def bench_clickhouse_fill(n_rows, warmup, iters, sess):
     run(
         "fill_null",
         "SELECT coalesce(val, 0.0) AS v2 FROM fill_data",
+    )
+    run(
+        "where_update_nullable",
+        "SELECT if(isNull(val), 0.0, val) AS val FROM fill_data",
     )
     run(
         "fill_forward",

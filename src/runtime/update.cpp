@@ -1779,11 +1779,73 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     if (!mask) {
         return std::unexpected(mask.error());
     }
-    std::vector<uint8_t> matched(n, 0);
+
+    // Common CASE-WHEN shape: replacing values in an existing, non-null,
+    // fixed-width column with a literal. The general guarded-update path below
+    // is deliberately able to evaluate arbitrary row-local expressions on a
+    // gathered subset, but that is pure overhead for `where price > x update
+    // { price = y }`: it builds an index, gathers every input column, broadcasts
+    // the literal, deep-copies the old column, and scatters into another full
+    // column. Copy the required output column once and apply the mask directly.
+    // Restrict this to a single assignment so the snapshot semantics of a
+    // multi-field guarded update remain unchanged.
+    if (update.fields().size() == 1) {
+        const auto& field = update.fields().front();
+        const auto* literal = std::get_if<ir::Literal>(&field.expr.node);
+        const ColumnEntry* old_entry = input.find_entry(field.alias);
+        if (literal != nullptr && old_entry != nullptr && !old_entry->validity.has_value()) {
+            ColumnValue replacement =
+                broadcast_scalar_column(scalar_from_literal(*literal), std::size_t{1});
+            if (old_entry->column->index() != replacement.index()) {
+                return std::unexpected(
+                    "guarded update cannot change the type of existing column '" + field.alias +
+                    "'");
+            }
+
+            auto result = std::visit(
+                [&](const auto& old_col) -> std::optional<ColumnValue> {
+                    using Col = std::decay_t<decltype(old_col)>;
+                    if constexpr (std::is_same_v<Col, Column<std::string>> ||
+                                  std::is_same_v<Col, Column<Categorical>>) {
+                        // Flat strings cannot be overwritten in place, and a
+                        // string literal is not dictionary-compatible with a
+                        // categorical column. Keep their established path.
+                        return std::nullopt;
+                    } else {
+                        Col out = old_col;
+                        const auto& scalar_col = std::get<Col>(replacement);
+                        const auto value = scalar_col[0];
+                        if (mask->valid.has_value()) {
+                            const auto& valid = *mask->valid;
+                            for (std::size_t i = 0; i < n; ++i) {
+                                if (mask->value[i] != 0 && valid[i]) {
+                                    out[i] = value;
+                                }
+                            }
+                        } else {
+                            for (std::size_t i = 0; i < n; ++i) {
+                                if (mask->value[i] != 0) {
+                                    out[i] = value;
+                                }
+                            }
+                        }
+                        return ColumnValue{std::move(out)};
+                    }
+                },
+                *old_entry->column);
+            if (result.has_value()) {
+                const auto pos = input.index.at(field.alias);
+                Table output = std::move(input);
+                output.replace_column(pos, std::move(*result));
+                return output;
+            }
+        }
+    }
+
     std::vector<std::size_t> matched_idx;
+    matched_idx.reserve(n / 8);
     for (std::size_t i = 0; i < n; ++i) {
         const bool m = mask->value[i] != 0 && (!mask->valid.has_value() || (*mask->valid)[i] != 0);
-        matched[i] = m ? 1U : 0U;
         if (m) {
             matched_idx.push_back(i);
         }
@@ -1791,25 +1853,46 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
 
     Table output = std::move(input);
     std::optional<Table> sub;  // matching rows of the original columns (built lazily)
+    robin_hood::unordered_set<std::string> subset_refs;
+    for (const auto& field : update.fields()) {
+        if (ir::is_subset_evaluable_expr(field.expr)) {
+            ir::collect_expr_column_refs(field.expr, subset_refs);
+        }
+    }
 
     for (const auto& field : update.fields()) {
-        // Snapshot the old column + validity (if the name exists) before overwriting.
+        // Retain the old column's shared storage rather than deep-copying it.
+        // replace_column() reseats the output handle only after the result has
+        // been built, so this remains a stable snapshot of the old values.
         const ColumnEntry* old_entry = output.find_entry(field.alias);
-        std::optional<ColumnValue> old_col;
-        std::optional<ValidityBitmap> old_valid;
-        if (old_entry != nullptr) {
-            old_col = *old_entry->column;
-            old_valid = old_entry->validity;
-        }
+        const std::shared_ptr<ColumnValue> old_col =
+            old_entry != nullptr ? old_entry->column : nullptr;
+        const ValidityBitmap* old_valid = old_entry != nullptr && old_entry->validity.has_value()
+                                              ? &*old_entry->validity
+                                              : nullptr;
 
         // Evaluate the field. Subset-evaluable fields run on the matching rows
         // only; the rest run over the full table.
         const bool subset = ir::is_subset_evaluable_expr(field.expr);
-        ColumnValue new_vals;
+        std::shared_ptr<ColumnValue> new_vals;
         std::optional<ValidityBitmap> new_valid;
         {
             if (subset && !sub.has_value()) {
-                sub = gather_rows(output, matched_idx);
+                // A subset expression only needs the columns it references.
+                // Avoid gathering unrelated payload columns (often the bulk
+                // of a wide table) merely to evaluate one guarded assignment.
+                Table subset_source;
+                for (const auto& entry : output.columns) {
+                    if (subset_refs.contains(entry.name)) {
+                        subset_source.add_column_shared(entry.name, entry.column, entry.validity);
+                    }
+                }
+                if (subset_source.columns.empty()) {
+                    subset_source.logical_rows = matched_idx.size();
+                    sub = std::move(subset_source);
+                } else {
+                    sub = gather_rows(subset_source, matched_idx);
+                }
             }
             Table src_in = subset ? Table{*sub} : Table{output};
             auto upd = update_table(std::move(src_in), {field}, scalars, externs);
@@ -1817,13 +1900,13 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                 return std::unexpected(upd.error());
             }
             const ColumnEntry* e = upd->find_entry(field.alias);
-            new_vals = *e->column;
+            new_vals = e->column;
             new_valid = e->validity;
         }
 
         // A guarded assignment may not change the type of an existing column —
         // non-matching rows must keep their old (same-type) values.
-        if (old_col.has_value() && old_col->index() != new_vals.index()) {
+        if (old_col != nullptr && old_col->index() != new_vals->index()) {
             return std::unexpected("guarded update cannot change the type of existing column '" +
                                    field.alias + "'");
         }
@@ -1834,14 +1917,38 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
         auto [result_col, result_valid] = std::visit(
             [&](const auto& src) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
                 using Col = std::decay_t<decltype(src)>;
-                const Col* oldc = old_col.has_value() ? &std::get<Col>(*old_col) : nullptr;
+                const Col* oldc = old_col != nullptr ? &std::get<Col>(*old_col) : nullptr;
+
+                // The overwhelmingly common case has valid values on both
+                // arms. Start with the required copy of the old output column,
+                // then scatter only matching rows into it. This avoids a
+                // branch and a validity-bit write for every input row.
+                if constexpr (!std::is_same_v<Col, Column<std::string>> &&
+                              !std::is_same_v<Col, Column<Categorical>>) {
+                    if (oldc != nullptr && old_valid == nullptr && !new_valid.has_value()) {
+                        Col out = *oldc;
+                        if (subset) {
+                            for (std::size_t k = 0; k < matched_idx.size(); ++k) {
+                                out[matched_idx[k]] = src[k];
+                            }
+                        } else {
+                            for (const std::size_t i : matched_idx) {
+                                out[i] = src[i];
+                            }
+                        }
+                        return {ColumnValue{std::move(out)}, std::nullopt};
+                    }
+                }
+
                 Col out;
                 out.reserve(n);
                 ValidityBitmap valid(n, true);
                 bool any_invalid = false;
                 std::size_t k = 0;  // running index into `src` for the subset case
                 for (std::size_t i = 0; i < n; ++i) {
-                    if (matched[i] != 0) {
+                    const bool matches =
+                        mask->value[i] != 0 && (!mask->valid.has_value() || (*mask->valid)[i] != 0);
+                    if (matches) {
                         const std::size_t si = subset ? k++ : i;
                         out.push_back(src[si]);
                         const bool v = !new_valid.has_value() || (*new_valid)[si];
@@ -1849,7 +1956,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         any_invalid = any_invalid || !v;
                     } else if (oldc != nullptr) {
                         out.push_back((*oldc)[i]);
-                        const bool v = !old_valid.has_value() || (*old_valid)[i];
+                        const bool v = old_valid == nullptr || (*old_valid)[i];
                         valid.set(i, v);
                         any_invalid = any_invalid || !v;
                     } else {
@@ -1866,7 +1973,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                     ColumnValue{std::move(out)},
                     any_invalid ? std::optional<ValidityBitmap>{std::move(valid)} : std::nullopt};
             },
-            new_vals);
+            *new_vals);
 
         if (auto it = output.index.find(field.alias); it != output.index.end()) {
             output.replace_column(it->second, std::move(result_col), std::move(result_valid));

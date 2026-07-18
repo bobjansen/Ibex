@@ -340,6 +340,18 @@ if (!skip_data_table) {
     bench("data.table", "where_update_clip",
         function() dt[, .(symbol, price = fifelse(price > 900.0, 900.0, price))])
 
+    bench("data.table", "where_update_expr",
+        function() dt[, .(symbol, price = fifelse(price > 900.0, price * 0.9, price))])
+
+    bench("data.table", "where_update_multi",
+        function() dt[, .(symbol,
+            price = fifelse(price > 900.0, price * 0.9, price),
+            excess = fifelse(price > 900.0, price - 900.0, NA_real_))])
+
+    bench("data.table", "where_update_window",
+        function() dt[, .(symbol, price,
+            prev = fifelse(price > 900.0, shift(price, 1L), NA_real_))])
+
     bench("data.table", "rbind_two",
         function() rbindlist(list(dt[, .(symbol, price)], dt[, .(symbol, price)])))
 
@@ -496,6 +508,19 @@ if (!skip_dplyr) {
 
     bench("dplyr", "where_update_clip",
         function() tb |> mutate(price = if_else(price > 900.0, 900.0, price)))
+
+    bench("dplyr", "where_update_expr",
+        function() tb |> mutate(price = if_else(price > 900.0, price * 0.9, price)))
+
+    bench("dplyr", "where_update_multi",
+        function() tb |> mutate(
+            excess = if_else(price > 900.0, price - 900.0, NA_real_),
+            price = if_else(price > 900.0, price * 0.9, price)) |>
+            select(symbol, price, excess))
+
+    bench("dplyr", "where_update_window",
+        function() tb |> mutate(
+            prev = if_else(price > 900.0, lag(price, 1L), NA_real_)))
 
     bench("dplyr", "rbind_two",
         function() bind_rows(tb, tb))
@@ -891,6 +916,9 @@ if (!is.null(csv_lookup_path)) {
         bench("data.table", "fill_null",
             function() dt_fill[, v2 := nafill(val, fill = 0.0)][])
 
+        bench("data.table", "where_update_nullable",
+            function() dt_fill[, .(val = fifelse(is.na(val), 0.0, val))])
+
         bench("data.table", "fill_forward",
             function() dt_fill[, v2 := nafill(val, type = "locf")][])
 
@@ -906,6 +934,9 @@ if (!is.null(csv_lookup_path)) {
 
         bench("dplyr", "fill_null",
             function() tb_fill |> mutate(v2 = tidyr::replace_na(val, 0.0)))
+
+        bench("dplyr", "where_update_nullable",
+            function() tb_fill |> mutate(val = tidyr::replace_na(val, 0.0)))
 
         bench("dplyr", "fill_forward",
             function() tb_fill |> tidyr::fill(val, .direction = "down") |>

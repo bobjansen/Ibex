@@ -87,6 +87,9 @@ QUERY_ORDER = [
     # transforms / single-pass language features
     "pmin_clip",
     "where_update_clip",
+    "where_update_expr",
+    "where_update_multi",
+    "where_update_window",
     "rbind_two",
     # statistics
     "corr_price_vol",
@@ -106,6 +109,7 @@ QUERY_ORDER = [
     "dcast_long_to_wide_cat_pivot",
     # fill / null propagation
     "fill_null",
+    "where_update_nullable",
     "fill_forward",
     "fill_backward",
     # time-series (cross-engine: ibex, pandas, polars, duckdb, data.table, dplyr)
@@ -174,6 +178,10 @@ QUERY_LABEL = {
     "symbol_day_to_symbol": "symbol×day→symbol rollup",
     "pmin_clip": "pmin clip (winsorise)",
     "where_update_clip": "guarded update (CASE WHEN)",
+    "where_update_expr": "guarded update (expression)",
+    "where_update_multi": "guarded update (multi-field)",
+    "where_update_window": "guarded update (window)",
+    "where_update_nullable": "guarded update (nullable)",
     "rbind_two": "rbind (vertical concat)",
     "corr_price_vol": "correlation matrix",
     "sort_price": "sort (full)",

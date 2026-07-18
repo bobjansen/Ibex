@@ -124,44 +124,42 @@ cmake --build build-release
         </div>
         <div class="tour-code">
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
-<span class="kw">import</span> <span class="str">"parquet"</span>;
-
-<span class="kw">let</span> cars_csv = <span class="fn-name">read_csv</span>(<span class="str">"cars.csv"</span>);
-<span class="kw">let</span> cars_parquet = <span class="fn-name">read_parquet</span>(<span class="str">"cars.parquet"</span>);</code></pre>
+<span class="kw">import</span> <span class="str">"parquet"</span>;</code></pre>
         </div>
       </div>
 
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">Input data</span>
-          <h3>Start with two small CSV files</h3>
+          <h3>Build two tables, then write them as CSV</h3>
           <p>
-            Save these files next to your script. The cars table is inspired by
-            R's <code>mtcars</code> dataset: miles per gallon, cylinders,
-            horsepower, weight, and transmission type.
+            A <code>Table</code> literal builds a small table directly from
+            column arrays. Here it also gives us convenient input files for the
+            rest of the guide. The cars table is inspired by R's
+            <code>mtcars</code> dataset.
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="cm"># cars.csv</span>
-car,maker_id,mpg,cyl,hp,wt,am
-Mazda RX4,1,21.0,6,110,2.620,1
-Hornet 4 Drive,2,21.4,6,110,3.215,0
-Duster 360,2,14.3,8,245,3.570,0
-Merc 240D,3,24.4,4,62,3.190,0
-Fiat 128,4,32.4,4,66,2.200,1
-Toyota Corolla,5,33.9,4,65,1.835,1
-Camaro Z28,6,13.3,8,245,3.840,0
-Volvo 142E,7,21.4,4,109,2.780,1
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="cm"># makers.csv</span>
-maker_id,maker
-1,Mazda
-2,AMC
-3,Mercedes
-4,Fiat
-5,Toyota
-6,Chevrolet
-7,Volvo</code></pre>
+<span class="kw">let</span> sample_cars = Table {
+    car = [<span class="str">"Mazda RX4"</span>, <span class="str">"Hornet 4 Drive"</span>, <span class="str">"Duster 360"</span>, <span class="str">"Merc 240D"</span>,
+           <span class="str">"Fiat 128"</span>, <span class="str">"Toyota Corolla"</span>, <span class="str">"Camaro Z28"</span>, <span class="str">"Volvo 142E"</span>],
+    maker_id = [<span class="num">1</span>, <span class="num">2</span>, <span class="num">2</span>, <span class="num">3</span>, <span class="num">4</span>, <span class="num">5</span>, <span class="num">6</span>, <span class="num">7</span>],
+    mpg = [<span class="num">21.0</span>, <span class="num">21.4</span>, <span class="num">14.3</span>, <span class="num">24.4</span>, <span class="num">32.4</span>, <span class="num">33.9</span>, <span class="num">13.3</span>, <span class="num">21.4</span>],
+    cyl = [<span class="num">6</span>, <span class="num">6</span>, <span class="num">8</span>, <span class="num">4</span>, <span class="num">4</span>, <span class="num">4</span>, <span class="num">8</span>, <span class="num">4</span>],
+    hp = [<span class="num">110</span>, <span class="num">110</span>, <span class="num">245</span>, <span class="num">62</span>, <span class="num">66</span>, <span class="num">65</span>, <span class="num">245</span>, <span class="num">109</span>],
+    wt = [<span class="num">2.620</span>, <span class="num">3.215</span>, <span class="num">3.570</span>, <span class="num">3.190</span>, <span class="num">2.200</span>, <span class="num">1.835</span>, <span class="num">3.840</span>, <span class="num">2.780</span>],
+    am = [<span class="num">1</span>, <span class="num">0</span>, <span class="num">0</span>, <span class="num">0</span>, <span class="num">1</span>, <span class="num">1</span>, <span class="num">0</span>, <span class="num">1</span>]
+};
+
+<span class="kw">let</span> sample_makers = Table {
+    maker_id = [<span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>, <span class="num">4</span>, <span class="num">5</span>, <span class="num">6</span>, <span class="num">7</span>],
+    maker = [<span class="str">"Mazda"</span>, <span class="str">"AMC"</span>, <span class="str">"Mercedes"</span>, <span class="str">"Fiat"</span>, <span class="str">"Toyota"</span>, <span class="str">"Chevrolet"</span>, <span class="str">"Volvo"</span>]
+};
+
+<span class="fn-name">write_csv</span>(sample_cars, <span class="str">"cars.csv"</span>);
+<span class="fn-name">write_csv</span>(sample_makers, <span class="str">"makers.csv"</span>);</code></pre>
         </div>
       </div>
 
@@ -178,15 +176,8 @@ maker_id,maker
         <div class="tour-code">
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 
-<span class="kw">let</span> cars = <span class="fn-name">read_csv</span>(
-    <span class="str">"cars.csv"</span>,
-    schema = <span class="str">"car:str,maker_id:i64,mpg:f64,cyl:i64,hp:i64,wt:f64,am:i64"</span>
-);
-
-<span class="kw">let</span> makers = <span class="fn-name">read_csv</span>(
-    <span class="str">"makers.csv"</span>,
-    schema = <span class="str">"maker_id:i64,maker:str"</span>
-);</code></pre>
+<span class="kw">let</span> cars = <span class="fn-name">read_csv</span>(<span class="str">"cars.csv"</span>);
+<span class="kw">let</span> makers = <span class="fn-name">read_csv</span>(<span class="str">"makers.csv"</span>);</code></pre>
         </div>
       </div>
 
@@ -203,8 +194,7 @@ maker_id,maker
         <div class="tour-code">
 <pre><code><span class="kw">let</span> cars_with_nulls = <span class="fn-name">read_csv</span>(
     <span class="str">"cars.csv"</span>,
-    nulls = <span class="str">"&lt;empty&gt;,NA,null"</span>,
-    schema = <span class="str">"car:str,maker_id:i64,mpg:f64,cyl:i64,hp:i64,wt:f64,am:i64"</span>
+    nulls = <span class="str">"&lt;empty&gt;,NA,null"</span>
 );</code></pre>
         </div>
       </div>
@@ -542,15 +532,8 @@ rows: 5
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
 <span class="kw">import</span> <span class="str">"parquet"</span>;
 
-<span class="kw">let</span> cars = <span class="fn-name">read_csv</span>(
-    <span class="str">"cars.csv"</span>,
-    schema = <span class="str">"car:str,maker_id:i64,mpg:f64,cyl:i64,hp:i64,wt:f64,am:i64"</span>
-);
-
-<span class="kw">let</span> makers = <span class="fn-name">read_csv</span>(
-    <span class="str">"makers.csv"</span>,
-    schema = <span class="str">"maker_id:i64,maker:str"</span>
-);
+<span class="kw">let</span> cars = <span class="fn-name">read_csv</span>(<span class="str">"cars.csv"</span>);
+<span class="kw">let</span> makers = <span class="fn-name">read_csv</span>(<span class="str">"makers.csv"</span>);
 
 <span class="kw">let</span> enriched = cars[
     <span class="kw">update</span> {
@@ -583,7 +566,6 @@ rows: 5
     <span class="kw">order</span> { maker <span class="kw">asc</span>, car <span class="kw">asc</span> }
 ];
 
-<span class="cm">// Bind the row counts so script output stays focused on the tables below.</span>
 <span class="kw">let</span> summary_rows = <span class="fn-name">write_csv</span>(summary, <span class="str">"summary.csv"</span>);
 <span class="kw">let</span> car_rows = <span class="fn-name">write_parquet</span>(cars_with_makers, <span class="str">"cars_with_makers.parquet"</span>);
 

@@ -66,6 +66,31 @@ declare -A ENGINE_ARGS=(
     [sqlite]="--skip-ibex --skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st --with-sqlite"
 )
 
+# Only the native Ibex worker needs the CMake tree. Building Ibex on the R,
+# Python, and SQL-engine workers used to compile ~400 targets (including Arrow,
+# Parquet, tools, and tests) before running an engine that never uses them.
+declare -A ENGINE_BUILD_REQUIRED=(
+    [ibex]=1
+    [python]=0
+    [r]=0
+    [duckdb]=0
+    [datafusion]=0
+    [clickhouse]=0
+    [sqlite]=0
+)
+
+# The Ibex scale worker executes tools/ibex_bench only. Limit Ninja to that
+# target instead of building tests, examples, bridges, and unrelated tools.
+declare -A ENGINE_BUILD_TARGETS=(
+    [ibex]="ibex_bench"
+    [python]=""
+    [r]=""
+    [duckdb]=""
+    [datafusion]=""
+    [clickhouse]=""
+    [sqlite]=""
+)
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --engines)   ENGINES="$2"; shift 2 ;;
@@ -133,6 +158,8 @@ for engine in "${ENGINE_LIST[@]}"; do
         "IBEX_WARMUP=${WARMUP}" \
         "IBEX_ITERS=${ITERS}" \
         "IBEX_TF_ROWS=${TF_ROWS}" \
+        "IBEX_BUILD_REQUIRED=${ENGINE_BUILD_REQUIRED[$engine]}" \
+        "IBEX_BUILD_TARGETS=${ENGINE_BUILD_TARGETS[$engine]}" \
         "IBEX_SUITE_ARGS=${ENGINE_ARGS[$engine]}")
 
     instance_id=$(aws ec2 run-instances \
@@ -164,7 +191,10 @@ done
 echo ""
 
 # ── Poll until every engine's result lands (or its instance dies) ─────────────
-RESULT_DIR="$IBEX_ROOT/benchmarking/results/scales"
+# Use a run-specific directory. Reusing benchmarking/results/scales directly
+# allowed a dead/reclaimed instance to be reported as successful when a stale
+# per_engine_<name>.csv from an earlier run happened to exist there.
+RESULT_DIR="$IBEX_ROOT/benchmarking/results/scales/${TIMESTAMP}_${COMMIT:0:8}"
 mkdir -p "$RESULT_DIR"
 TIMEOUT=21600  # 6h — a full 1M-50M sweep for the slowest engine can run long
 START=$(date +%s)

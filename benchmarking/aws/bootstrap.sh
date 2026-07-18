@@ -32,6 +32,38 @@
 
 set -euo pipefail
 
+# Retry apt-get on transient dpkg/apt lock contention — e.g. unattended-upgrades
+# holding /var/lib/dpkg/lock-frontend at boot, which is exactly what killed the
+# 2026-07-18 R run: apt-get exited 100, set -euo pipefail propagated it, and
+# the instance self-terminated before ever reaching this script's own work.
+apt_get_retry() {
+    local attempt=1 max_attempts=36 delay=5
+    while ! apt-get "$@"; do
+        if (( attempt >= max_attempts )); then
+            echo "apt-get $* failed after ${max_attempts} attempts" >&2
+            return 1
+        fi
+        echo "apt-get $* failed (attempt ${attempt}/${max_attempts}, likely a dpkg/apt lock) — retrying in ${delay}s" >&2
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
+# Same retry treatment for add-apt-repository, which also touches apt/dpkg
+# locks (and shells out to `apt-get update` internally on some Ubuntu releases).
+add_apt_repository_retry() {
+    local attempt=1 max_attempts=36 delay=5
+    while ! add-apt-repository "$@"; do
+        if (( attempt >= max_attempts )); then
+            echo "add-apt-repository $* failed after ${max_attempts} attempts" >&2
+            return 1
+        fi
+        echo "add-apt-repository $* failed (attempt ${attempt}/${max_attempts}, likely a dpkg/apt lock) — retrying in ${delay}s" >&2
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+}
+
 # Print disk usage at the top so out-of-space failures are obvious from the
 # console without having to SSH in.
 df -h / || true
@@ -52,8 +84,8 @@ MARKER=/opt/ibex/.ami-provisioned
 # baked into the AMI by build-ami.sh; guarded by $MARKER so a baked AMI skips it.
 provision() {
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y \
+    apt_get_retry update -qq
+    apt_get_retry install -y \
         git ninja-build \
         libjemalloc-dev \
         libcurl4-openssl-dev libssl-dev zlib1g-dev \
@@ -85,16 +117,16 @@ provision() {
     # Latest GCC available to this Ubuntu image. The PPA is intentionally used
     # only to widen apt's candidate set; the exact version is resolved at image
     # build/run time so the compiler benchmark tracks the current toolchain.
-    add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
-    apt-get update -qq
+    add_apt_repository_retry -y ppa:ubuntu-toolchain-r/test || true
+    apt_get_retry update -qq
     local gcc_version
     gcc_version="$(apt-cache search --names-only '^g\+\+-[0-9]+$' \
         | awk '{ sub(/^g\+\+-/, "", $1); print $1 }' \
         | sort -n | tail -1)"
     if [[ -n "$gcc_version" ]]; then
-        apt-get install -y "gcc-${gcc_version}" "g++-${gcc_version}"
+        apt_get_retry install -y "gcc-${gcc_version}" "g++-${gcc_version}"
     else
-        apt-get install -y gcc g++
+        apt_get_retry install -y gcc g++
     fi
 
     # dplyr + tidyr aren't in apt; install from CRAN so the R bench's dplyr cells
@@ -178,20 +210,20 @@ find_latest_gxx_version() {
 
 install_latest_gcc() {
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y --no-install-recommends \
+    apt_get_retry update -qq
+    apt_get_retry install -y --no-install-recommends \
         ca-certificates gnupg software-properties-common
-    add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
-    apt-get update -qq
+    add_apt_repository_retry -y ppa:ubuntu-toolchain-r/test || true
+    apt_get_retry update -qq
 
     local gcc_version
     gcc_version="$(apt-cache search --names-only '^g\+\+-[0-9]+$' \
         | awk '{ sub(/^g\+\+-/, "", $1); print $1 }' \
         | sort -n | tail -1)"
     if [[ -n "$gcc_version" ]]; then
-        apt-get install -y --no-install-recommends "gcc-${gcc_version}" "g++-${gcc_version}"
+        apt_get_retry install -y --no-install-recommends "gcc-${gcc_version}" "g++-${gcc_version}"
     else
-        apt-get install -y --no-install-recommends gcc g++
+        apt_get_retry install -y --no-install-recommends gcc g++
     fi
 }
 

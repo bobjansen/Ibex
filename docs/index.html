@@ -176,6 +176,9 @@ active[<span class="kw">select</span> { symbol, price }];</code></pre>
           columns of <code>select</code>, the sort keys of <code>order</code>,
           the columns of a schema. Think struct fields, not a code block:
           <code>{ avg = mean(px), n = count() }</code>.
+          A schema ascription such as <code>rows as { px: Float64 }</code>
+          requires <code>px</code>, permits other physical columns, and exposes
+          only <code>px</code> to subsequent static checks.
         </p>
       </article>
       <article class="card">

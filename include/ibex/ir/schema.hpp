@@ -119,7 +119,8 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 /// before a single page is decoded.
 ///
 /// Ascriptions over an input whose schema is unknown or open are left alone for
-/// the interpreter to check against real data.
+/// the interpreter to check against real data. Extra input columns never make
+/// an ascription fail.
 [[nodiscard]] auto check_ascriptions(Node& root, const SourceSchemas& sources)
     -> std::expected<void, std::string>;
 

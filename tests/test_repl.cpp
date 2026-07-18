@@ -1916,12 +1916,10 @@ rows[select { n = count() }];
         REQUIRE(decode_calls.empty());
     }
 
-    SECTION("an exact ascription reads nothing either") {
-        // It also asserts the input has no unlisted column -- but that is a
-        // question about the schema, and the source's schema answers it without
-        // decoding a page. So `check_ascriptions` proves it up front and the
-        // scan is left to materialize only what the query actually reads: here,
-        // count(), which reads nothing.
+    SECTION("an ascription proved from source metadata reads nothing") {
+        // The source schema proves the required names and types without
+        // decoding a page. The scan is left to materialize only what the query
+        // actually reads: here, count(), which reads nothing.
         const std::string source = R"(
 extern fn read_fake() -> DataFrame from "fake.hpp";
 let rows = read_fake() as DataFrame<{ a: Int, b: Int }>;
@@ -1933,13 +1931,14 @@ rows[select { n = count() }];
         REQUIRE(decode_calls.empty());
     }
 
-    SECTION("an exact ascription still rejects an unlisted column") {
+    SECTION("an ascription permits an unlisted physical column") {
         const std::string source = R"(
 extern fn read_fake() -> DataFrame from "fake.hpp";
 let rows = read_fake() as DataFrame<{ a: Int }>;
 rows[select { n = count() }];
 )";
-        CHECK_FALSE(ibex::repl::execute_script(source, registry));
+        REQUIRE(ibex::repl::execute_script(source, registry));
+        REQUIRE(decode_calls.empty());
     }
 }
 

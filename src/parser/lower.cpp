@@ -1541,20 +1541,6 @@ class Lowerer {
                                               std::string(column_type_name(*field.type))});
                 }
             }
-            // Exact (non-wildcard) ascription forbids columns the input has that
-            // the ascription does not list. Add a `*` wildcard to allow extras.
-            if (!open) {
-                for (const auto& have : input.fields()) {
-                    const bool listed =
-                        std::any_of(fields.begin(), fields.end(),
-                                    [&](const ir::SchemaField& f) { return f.name == have.name; });
-                    if (!listed) {
-                        return std::unexpected(LowerError{
-                            .message = "schema ascription: input has extra column '" + have.name +
-                                       "' not in the ascribed schema (add `*` to allow extras)"});
-                    }
-                }
-            }
         }
         auto node = builder_.ascribe(std::move(fields), open);
         node->add_child(std::move(base.value()));

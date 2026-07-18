@@ -528,11 +528,34 @@ auto rbind_table(const std::vector<const Table*>& tables,
                 using Col = std::decay_t<decltype(ref_col)>;
                 Col dst;
                 dst.reserve(total_rows);
-                for (const auto& [ti, r] : order) {
-                    const auto& src = std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
-                    // For Categorical this remaps through each source's
-                    // dictionary into the result's; other types copy values.
-                    dst.push_back(src[r]);
+                if (merge_key.has_value()) {
+                    for (const auto& [ti, r] : order) {
+                        const auto& src =
+                            std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
+                        // For Categorical this remaps through each source's
+                        // dictionary into the result's; other types copy values.
+                        dst.push_back(src[r]);
+                    }
+                } else {
+                    // Plain append: every operand's rows land contiguously in
+                    // the output, so each operand can be copied in one shot
+                    // instead of gathered row-by-row through `order` — for
+                    // span-backed types that turns an O(rows) scalar loop
+                    // (with a variant unwrap on every row) into one `insert`
+                    // per operand that the compiler can fold into a memcpy.
+                    // Categorical still needs the per-row dictionary remap.
+                    for (std::size_t ti = 0; ti < tables.size(); ++ti) {
+                        const auto& src =
+                            std::get<Col>(*tables[ti]->columns[col_pos[ti][ci]].column);
+                        if constexpr (requires { src.span(); }) {
+                            auto sp = src.span();
+                            (void)dst.insert(dst.end(), sp.begin(), sp.end());
+                        } else {
+                            for (std::size_t r = 0, n = src.size(); r < n; ++r) {
+                                dst.push_back(src[r]);
+                            }
+                        }
+                    }
                 }
                 return ColumnValue{std::move(dst)};
             },

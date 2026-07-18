@@ -152,7 +152,14 @@ TEST_CASE("join: left join preserves left rows", "[join]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 200, 300});
 }
 
-TEST_CASE("join: left join preserves left row order when left side is smaller", "[join]") {
+// SPEC.md's ordering-constraints section is explicit that "any join drop[s]
+// ordering unless the implementation can prove a specific order" — there is
+// no language-level guarantee of left-row order. This small-left/large-right
+// path emits matched rows in the probe (right) side's scan order instead
+// (cheaper: no reassembly pass, and preserves locality for any downstream
+// join that probes this join's output), with unmatched left rows appended
+// after.
+TEST_CASE("join: left join emits matches in right-scan order when left side is smaller", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{2, 1, 4});
     lhs.add_column("lval", Column<std::int64_t>{20, 10, 40});
@@ -168,9 +175,9 @@ TEST_CASE("join: left join preserves left row order when left side is smaller", 
     auto out = interpret_expr("lhs left join rhs on id;", tables);
 
     CHECK(out.rows() == 4);
-    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 1, 1, 4});
-    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 10, 10, 40});
-    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 100, 101, 0});
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 1, 4});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 20, 10, 40});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{100, 200, 101, 0});
 
     const auto& rval_entry = out.columns[out.index.at("rval")];
     CHECK_FALSE(runtime::is_null(rval_entry, 0));
@@ -632,7 +639,12 @@ TEST_CASE("join: outer join row count and key values", "[join]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 200, 300, 400});
 }
 
-TEST_CASE("join: outer join preserves left rows first when left side is smaller", "[join]") {
+// See the comment on "left join emits matches in right-scan order..." above:
+// SPEC.md does not guarantee join row order. Matched rows come out in the
+// probe (right) side's scan order; unmatched left rows are appended, then
+// unmatched right rows.
+TEST_CASE("join: outer join emits matches in right-scan order when left side is smaller",
+          "[join]") {
     runtime::Table lhs;
     lhs.add_column("key", Column<std::string>{"B", "A", "D"});
     lhs.add_column("lval", Column<std::int64_t>{20, 10, 40});
@@ -646,9 +658,9 @@ TEST_CASE("join: outer join preserves left rows first when left side is smaller"
     auto& t = *result;
 
     REQUIRE(t.rows() == 5);
-    CHECK(col_str(t, "key") == std::vector<std::string>{"B", "A", "D", "C", "E"});
-    CHECK(col_i64(t, "lval") == std::vector<std::int64_t>{20, 10, 40, 0, 0});
-    CHECK(col_i64(t, "rval") == std::vector<std::int64_t>{200, 100, 0, 300, 500});
+    CHECK(col_str(t, "key") == std::vector<std::string>{"A", "B", "D", "C", "E"});
+    CHECK(col_i64(t, "lval") == std::vector<std::int64_t>{10, 20, 40, 0, 0});
+    CHECK(col_i64(t, "rval") == std::vector<std::int64_t>{100, 200, 0, 300, 500});
 
     const auto& lval_entry = t.columns[t.index.at("lval")];
     const auto& rval_entry = t.columns[t.index.at("rval")];
@@ -792,9 +804,12 @@ TEST_CASE("join: right join preserves right rows", "[join]") {
     CHECK(runtime::is_null(lval_entry, 2));
 }
 
+// See the comment on "left join emits matches in right-scan order..." above:
+// SPEC.md does not guarantee join row order. Matches come out in right-scan
+// order, then unmatched right rows are appended.
 TEST_CASE(
-    "join: right join appends unmatched right rows after left-ordered matches when left side is "
-    "smaller",
+    "join: right join emits matches in right-scan order, then unmatched right rows, when left "
+    "side is smaller",
     "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{2, 1});
@@ -811,9 +826,9 @@ TEST_CASE(
     auto out = interpret_expr("lhs right join rhs on id;", tables);
 
     REQUIRE(out.rows() == 5);
-    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 1, 1, 3, 4});
-    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 10, 10, 0, 0});
-    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 100, 101, 300, 400});
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 1, 3, 4});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 20, 10, 0, 0});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{100, 200, 101, 300, 400});
 
     const auto& lval_entry = out.columns[out.index.at("lval")];
     CHECK_FALSE(runtime::is_null(lval_entry, 0));
@@ -823,7 +838,10 @@ TEST_CASE(
     CHECK(runtime::is_null(lval_entry, 4));
 }
 
-TEST_CASE("join: multi-key outer join preserves left rows first when left side is smaller",
+// See the comment on "left join emits matches in right-scan order..." above:
+// SPEC.md does not guarantee join row order. Matches come out in right-scan
+// order, unmatched left rows next, then unmatched right rows.
+TEST_CASE("join: multi-key outer join emits matches in right-scan order when left side is smaller",
           "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{2, 1});
@@ -842,10 +860,10 @@ TEST_CASE("join: multi-key outer join preserves left rows first when left side i
     auto out = interpret_expr("lhs outer join rhs on {id, bucket};", tables);
 
     REQUIRE(out.rows() == 4);
-    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 1, 3, 4});
-    CHECK(col_i64(out, "bucket") == std::vector<std::int64_t>{10, 20, 30, 40});
-    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{200, 100, 0, 0});
-    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{600, 500, 700, 800});
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3, 4});
+    CHECK(col_i64(out, "bucket") == std::vector<std::int64_t>{20, 10, 30, 40});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{100, 200, 0, 0});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{500, 600, 700, 800});
 
     const auto& lval_entry = out.columns[out.index.at("lval")];
     CHECK_FALSE(runtime::is_null(lval_entry, 0));
@@ -1050,11 +1068,13 @@ TEST_CASE("non-equijoin: not-equal predicate", "[join][non-equijoin]") {
 // A right side above the chunked join's stream threshold (65,536 rows) makes
 // the operator materialize the left side, build its hash index there, and
 // probe with the right — the "swapped" path, which every other join test in
-// this file is too small to reach. It still owes the caller left-row order,
-// so the assertions below pin the exact emission order (left row ascending,
-// then right row ascending) against an independent reference, not just the
-// row count.
-TEST_CASE("join: swapped-mode inner join emits in left-row order", "[join]") {
+// this file is too small to reach. SPEC.md does not guarantee join row
+// order, and this path emits matches in right-scan (probe) order rather
+// than reassembling by left row (see the class comment on
+// ChunkedInnerJoinOperator), so the assertions below pin the exact emission
+// order (right row ascending, then left row ascending within a key's chain)
+// against an independent reference, not just the row count.
+TEST_CASE("join: swapped-mode inner join emits in right-scan order", "[join]") {
     constexpr std::size_t kLeftRows = 200;
     constexpr std::size_t kRightRows = 70000;  // > kStreamRightThreshold
     constexpr std::int64_t kLeftNullRow = 7;
@@ -1085,22 +1105,24 @@ TEST_CASE("join: swapped-mode inner join emits in left-row order", "[join]") {
     }
     right_validity.set(static_cast<std::size_t>(kRightNullRow), false);
 
-    // Reference: for each left row in order, every matching right row in
-    // ascending order. A null key matches nothing on either side.
-    std::vector<std::vector<std::size_t>> rights_by_key(200);
-    for (std::size_t r = 0; r < kRightRows; ++r) {
-        if (r == static_cast<std::size_t>(kRightNullRow)) {
-            continue;
-        }
-        rights_by_key[static_cast<std::size_t>(right_keys[r])].push_back(r);
-    }
-    std::vector<std::int64_t> want_lval;
-    std::vector<std::int64_t> want_rval;
+    // Reference: for each right row in ascending (scan) order, every
+    // matching left row in ascending order (the build-side hash chain
+    // enumerates ascending left-row order). A null key matches nothing on
+    // either side.
+    std::vector<std::vector<std::size_t>> lefts_by_key(200);
     for (std::size_t l = 0; l < kLeftRows; ++l) {
         if (l == static_cast<std::size_t>(kLeftNullRow)) {
             continue;
         }
-        for (std::size_t r : rights_by_key[static_cast<std::size_t>(left_keys[l])]) {
+        lefts_by_key[static_cast<std::size_t>(left_keys[l])].push_back(l);
+    }
+    std::vector<std::int64_t> want_lval;
+    std::vector<std::int64_t> want_rval;
+    for (std::size_t r = 0; r < kRightRows; ++r) {
+        if (r == static_cast<std::size_t>(kRightNullRow)) {
+            continue;
+        }
+        for (std::size_t l : lefts_by_key[static_cast<std::size_t>(right_keys[r])]) {
             want_lval.push_back(left_vals[l]);
             want_rval.push_back(right_vals[r]);
         }

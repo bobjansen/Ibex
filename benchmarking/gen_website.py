@@ -31,6 +31,21 @@ from extract_bench_code import extract_all, SOURCES
 
 GITHUB = "https://github.com/bobjansen/Ibex/blob/main"
 
+BENCHMARK_NAV = """  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link" href="./getting-started.html">Getting started</a>
+      <a class="nav-link active" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./comparison.html">Comparison</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="./io.html">I/O</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>"""
+
 # Engines shown on the code page, in display order: (engine_key, label, lang).
 # polars-st and ibex+parse run byte-identical code to polars / ibex (only the
 # thread count / parse-timing differs), so they're annotated, not duplicated.
@@ -196,6 +211,28 @@ HTML_TEMPLATE = """<!doctype html>
     button.opt:hover { border-color: var(--accent); }
     button.opt.on { background: var(--accent); border-color: var(--accent); color: #fff;
       font-weight: 600; }
+    .columns-grp { position: relative; }
+    .column-picker { position: relative; }
+    .column-picker summary { min-width: 8.5rem; padding: 0.28rem 2rem 0.28rem 0.7rem;
+      border: 1px solid var(--line); border-radius: 7px; background: #fff;
+      font-size: 0.85rem; cursor: pointer; list-style: none; }
+    .column-picker summary::-webkit-details-marker { display: none; }
+    .column-picker summary::after { content: "\\25be"; position: absolute; right: 0.7rem;
+      color: var(--muted); }
+    .column-picker[open] summary { border-color: var(--accent); }
+    .column-menu { position: absolute; top: calc(100% + 0.35rem); right: 0; z-index: 5;
+      min-width: 13rem; max-height: 20rem; overflow-y: auto; padding: 0.55rem;
+      border: 1px solid var(--line); border-radius: 9px; background: var(--paper);
+      box-shadow: 0 8px 24px rgba(22,32,31,.14); }
+    .column-actions { display: flex; gap: 0.35rem; padding-bottom: 0.4rem;
+      margin-bottom: 0.25rem; border-bottom: 1px solid var(--line); }
+    .column-actions button { border: 0; background: transparent; color: var(--accent);
+      font-family: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer;
+      padding: 0.2rem 0.35rem; }
+    .column-option { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0.35rem;
+      border-radius: 5px; font-size: 0.85rem; cursor: pointer; }
+    .column-option:hover { background: rgba(10,127,121,.07); }
+    .column-option input { accent-color: var(--accent); }
     .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px;
       background: var(--paper); }
     table.bench { margin: 0; }
@@ -218,18 +255,7 @@ HTML_TEMPLATE = """<!doctype html>
 <body>
 <main class="page">
 
-  <nav class="nav">
-    <span class="nav-logo">Ibex</span>
-    <div class="nav-links">
-      <a class="nav-link" href="./index.html">Docs</a>
-      <a class="nav-link" href="./io.html">I/O</a>
-      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
-      <a class="nav-link" href="./functions.html">Function reference</a>
-      <a class="nav-link" href="./comparison.html">Comparison</a>
-      <a class="nav-link active" href="./benchmarks.html">Benchmarks</a>
-      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
-    </div>
-  </nav>
+__BENCHMARK_NAV__
 
   <section class="hero">
     <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
@@ -261,6 +287,12 @@ HTML_TEMPLATE = """<!doctype html>
         <button class="opt" id="m-ratio">&times; fastest</button>
         <button class="opt" id="m-mem">Memory (MB)</button>
         <button class="opt" id="m-memratio">&times; least mem</button>
+      </div>
+      <div class="grp columns-grp"><span class="lbl">Columns</span>
+        <details class="column-picker" id="column-picker">
+          <summary id="column-summary">All columns</summary>
+          <div class="column-menu" id="column-menu"></div>
+        </details>
       </div>
     </div>
 
@@ -299,7 +331,7 @@ HTML_TEMPLATE = """<!doctype html>
 
 <script>
 const PAYLOAD = __PAYLOAD__;
-const state = { scale: null, metric: "ms" };
+const state = { scale: null, metric: "ms", columns: new Set() };
 
 function fmt(ms) {
   if (ms < 1) return ms.toFixed(3) + " ms";
@@ -329,11 +361,17 @@ function render() {
   const msrc = (P.mem || {})[state.scale] || {};           // memory for tooltips
   const unit = useMem ? "MB" : "ms";
   const best_lbl = useMem ? "lightest" : "fastest";
-  const fws = P.frameworks;
+  const fws = P.frameworks.filter(fw => state.columns.has(fw));
   let h = "<thead><tr><th class='qcol'>query</th>";
   for (const fw of fws)
     h += `<th class='${fw === "ibex" ? "ibex" : ""}'>${fw}</th>`;
   h += "</tr></thead><tbody>";
+
+  if (!fws.length) {
+    document.getElementById("tbl").innerHTML = h
+      + "<tr><td class='qcol'>Select at least one column to compare.</td></tr></tbody>";
+    return;
+  }
 
   let lastCat = null;
   for (const q of P.queries) {
@@ -384,6 +422,36 @@ function setScale(s) {
   render();
 }
 
+function setColumns(columns) {
+  state.columns = new Set(columns);
+  document.querySelectorAll("#column-menu input[type=checkbox]").forEach(input => {
+    input.checked = state.columns.has(input.value);
+  });
+  const count = state.columns.size;
+  document.getElementById("column-summary").textContent =
+    count === PAYLOAD.frameworks.length ? "All columns" : `${count} of ${PAYLOAD.frameworks.length}`;
+  render();
+}
+
+function initColumnPicker() {
+  const menu = document.getElementById("column-menu");
+  menu.innerHTML = "<div class='column-actions'>"
+    + "<button type='button' data-columns='all'>Select all</button>"
+    + "<button type='button' data-columns='none'>Clear</button></div>"
+    + PAYLOAD.frameworks.map(fw => `<label class='column-option'>`
+      + `<input type='checkbox' value='${fw}'>${fw}</label>`).join("");
+  menu.addEventListener("change", event => {
+    if (!event.target.matches("input[type=checkbox]")) return;
+    setColumns(Array.from(menu.querySelectorAll("input:checked"), input => input.value));
+  });
+  menu.addEventListener("click", event => {
+    const action = event.target.dataset.columns;
+    if (action === "all") setColumns(PAYLOAD.frameworks);
+    if (action === "none") setColumns([]);
+  });
+  setColumns(PAYLOAD.frameworks);
+}
+
 (function init() {
   const P = PAYLOAD, big = P.scales[P.scales.length - 1];
   document.getElementById("stats").innerHTML =
@@ -395,6 +463,7 @@ function setScale(s) {
     `<button class='opt' data-s='${n}'>${(n/1e6)}M</button>`).join("");
   document.querySelectorAll("#scales button").forEach(b =>
     b.onclick = () => setScale(b.dataset.s));
+  initColumnPicker();
   document.getElementById("m-ms").onclick = () => setMetric("ms");
   document.getElementById("m-ratio").onclick = () => setMetric("ratio");
   // Memory views only make sense when at least one cell carries peak RSS.
@@ -471,18 +540,7 @@ CODE_PAGE_TEMPLATE = """<!doctype html>
 <body>
 <main class="page">
 
-  <nav class="nav">
-    <span class="nav-logo">Ibex</span>
-    <div class="nav-links">
-      <a class="nav-link" href="./index.html">Docs</a>
-      <a class="nav-link" href="./io.html">I/O</a>
-      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
-      <a class="nav-link" href="./functions.html">Function reference</a>
-      <a class="nav-link" href="./comparison.html">Comparison</a>
-      <a class="nav-link active" href="./benchmarks.html">Benchmarks</a>
-      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
-    </div>
-  </nav>
+__BENCHMARK_NAV__
 
   <section class="hero">
     <p class="eyebrow">Methodology &amp; code</p>
@@ -678,6 +736,7 @@ def main(argv=None):
 
     max_rows_m = f"{max(payload['scales']) // 1_000_000}" if payload["scales"] else "16"
     out_html = (HTML_TEMPLATE
+                .replace("__BENCHMARK_NAV__", BENCHMARK_NAV)
                 .replace("__PAYLOAD__", json.dumps(payload, separators=(",", ":")))
                 .replace("__MAXM__", max_rows_m))
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -687,8 +746,10 @@ def main(argv=None):
 
     # Companion methodology + per-engine code page (auto-extracted from sources).
     code_payload = build_code_payload(cells)
-    code_html = CODE_PAGE_TEMPLATE.replace(
-        "__CODE_PAYLOAD__", json.dumps(code_payload, separators=(",", ":")))
+    code_html = (CODE_PAGE_TEMPLATE
+                 .replace("__BENCHMARK_NAV__", BENCHMARK_NAV)
+                 .replace("__CODE_PAYLOAD__",
+                          json.dumps(code_payload, separators=(",", ":"))))
     code_out = args.out.parent / "methodology.html"
     code_out.write_text(code_html, encoding="utf-8")
     print(f"wrote {code_out}  ({len(code_payload['queries'])} queries x "

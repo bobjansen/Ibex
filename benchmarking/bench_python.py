@@ -308,6 +308,23 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         "where_update_clip",
         lambda: df.assign(price=df["price"].where(df["price"] <= 900.0, 900.0)),
     )
+    run(
+        "where_update_expr",
+        lambda: df.assign(
+            price=df["price"].where(df["price"] <= 900.0, df["price"] * 0.9)
+        ),
+    )
+    run(
+        "where_update_multi",
+        lambda: df.assign(
+            price=df["price"].where(df["price"] <= 900.0, df["price"] * 0.9),
+            excess=(df["price"] - 900.0).where(df["price"] > 900.0),
+        ),
+    )
+    run(
+        "where_update_window",
+        lambda: df.assign(prev=df["price"].shift(1).where(df["price"] > 900.0)),
+    )
     run("rbind_two", lambda: pd.concat([df, df], ignore_index=True))
 
     run("cumsum_price", lambda: df.assign(cs=df["price"].cumsum()))
@@ -611,6 +628,35 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             .then(900.0)
             .otherwise(pl.col("price"))
             .alias("price")
+        ),
+    )
+    run(
+        "where_update_expr",
+        lambda: df.with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price") * 0.9)
+            .otherwise(pl.col("price"))
+            .alias("price")
+        ),
+    )
+    run(
+        "where_update_multi",
+        lambda: df.with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price") * 0.9)
+            .otherwise(pl.col("price"))
+            .alias("price"),
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price") - 900.0)
+            .alias("excess"),
+        ),
+    )
+    run(
+        "where_update_window",
+        lambda: df.with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price").shift(1))
+            .alias("prev")
         ),
     )
     run("rbind_two", lambda: pl.concat([df, df]))
@@ -955,6 +1001,41 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             .then(900.0)
             .otherwise(pl.col("price"))
             .alias("price")
+        )
+        .collect(),
+    )
+    run(
+        "where_update_expr",
+        lambda: scan()
+        .with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price") * 0.9)
+            .otherwise(pl.col("price"))
+            .alias("price")
+        )
+        .collect(),
+    )
+    run(
+        "where_update_multi",
+        lambda: scan()
+        .with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price") * 0.9)
+            .otherwise(pl.col("price"))
+            .alias("price"),
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price") - 900.0)
+            .alias("excess"),
+        )
+        .collect(),
+    )
+    run(
+        "where_update_window",
+        lambda: scan()
+        .with_columns(
+            pl.when(pl.col("price") > 900.0)
+            .then(pl.col("price").shift(1))
+            .alias("prev")
         )
         .collect(),
     )
@@ -1407,6 +1488,7 @@ def bench_pandas_fill(n_rows, warmup, iters):
         )
 
     run("fill_null", lambda: df_fill.assign(v2=df_fill["val"].fillna(0.0)))
+    run("where_update_nullable", lambda: df_fill.assign(val=df_fill["val"].fillna(0.0)))
     run("fill_forward", lambda: df_fill.assign(v2=df_fill["val"].ffill()))
     run("fill_backward", lambda: df_fill.assign(v2=df_fill["val"].bfill()))
     return rows
@@ -1458,6 +1540,10 @@ def bench_polars_fill(n_rows, warmup, iters):
     run(
         "fill_null",
         lambda: df_fill.with_columns(pl.col("val").fill_null(0.0).alias("v2")),
+    )
+    run(
+        "where_update_nullable",
+        lambda: df_fill.with_columns(pl.col("val").fill_null(0.0).alias("val")),
     )
     run(
         "fill_forward",

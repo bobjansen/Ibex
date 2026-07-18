@@ -87,7 +87,8 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "filter_group_sort", "update_group_filter", "group_rank_filter",
         "normalize_by_group", "symbol_day_to_symbol"]),
     ("Transforms", [
-        "pmin_clip", "where_update_clip", "rbind_two", "corr_price_vol"]),
+        "pmin_clip", "where_update_clip", "where_update_expr", "where_update_multi",
+        "where_update_window", "where_update_nullable", "rbind_two", "corr_price_vol"]),
     ("Joins", [
         "null_left_join", "null_semi_join", "null_anti_join",
         "inner_join_symbol", "inner_join_user",

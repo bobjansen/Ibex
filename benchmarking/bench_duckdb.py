@@ -338,6 +338,27 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ).fetchnumpy(),
     )
     run(
+        "where_update_expr",
+        lambda: con.sql(
+            "SELECT symbol, CASE WHEN price > 900.0 THEN price * 0.9 ELSE price END AS price "
+            "FROM prices"
+        ).fetchnumpy(),
+    )
+    run(
+        "where_update_multi",
+        lambda: con.sql(
+            "SELECT symbol, CASE WHEN price > 900.0 THEN price * 0.9 ELSE price END AS price, "
+            "CASE WHEN price > 900.0 THEN price - 900.0 ELSE NULL END AS excess FROM prices"
+        ).fetchnumpy(),
+    )
+    run(
+        "where_update_window",
+        lambda: con.sql(
+            "SELECT symbol, price, CASE WHEN price > 900.0 THEN "
+            "LAG(price) OVER (ORDER BY rowid) ELSE NULL END AS prev FROM prices"
+        ).fetchnumpy(),
+    )
+    run(
         "rbind_two",
         lambda: con.sql(
             "SELECT * FROM prices UNION ALL SELECT * FROM prices"
@@ -793,6 +814,12 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
         "fill_null",
         lambda: con.sql(
             "SELECT COALESCE(val, 0.0) AS v2 FROM fill_data"
+        ).fetchnumpy(),
+    )
+    run(
+        "where_update_nullable",
+        lambda: con.sql(
+            "SELECT CASE WHEN val IS NULL THEN 0.0 ELSE val END AS val FROM fill_data"
         ).fetchnumpy(),
     )
     run(

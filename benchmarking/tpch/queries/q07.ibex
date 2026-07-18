@@ -6,8 +6,15 @@
 //  shipped in 1995-1996.
 //
 //  Six tables: supplier and customer each carry a nation (the two `nation`
-//  aliases n1/n2 in the SQL), joined separately so both stay plain equijoins.
-//  The two-nation `OR` keeps only France->Germany and Germany->France pairs.
+//  aliases n1/n2 in the SQL). Both nation views are restricted to France and
+//  Germany before entering the fact-table chain; the final `OR` then keeps
+//  only the two cross-country directions.
+//
+//  The join chain deliberately starts with customer + its filtered nation.
+//  q07 has six relations, beyond the planner's conservative automatic-reorder
+//  limit, so source order matters: this applies the selective two-nation edge
+//  before orders and lineitem instead of building a large fact-table
+//  intermediate and filtering it near the end.
 //  `l_year` is `year(l_shipdate)`, materialized with `update` before the `by`
 //  because a group key must be a bare column.
 //
@@ -37,18 +44,22 @@ let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
 
 // Two views of nation: the supplier's (supp_nation) and the customer's (cust_nation).
 let supp_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+    filter n_name == "FRANCE" || n_name == "GERMANY"
+][
     select { s_nationkey = n_nationkey, supp_nation = n_name }
 ];
 let cust_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+    filter n_name == "FRANCE" || n_name == "GERMANY"
+][
     select { c_nationkey = n_nationkey, cust_nation = n_name }
 ];
 
 let joined = (((
-    (supplier join lineitem on l_suppkey)
-        join orders on o_orderkey)
-        join customer on c_custkey)
-        join supp_nation on s_nationkey)
-        join cust_nation on c_nationkey;
+    (customer join cust_nation on c_nationkey)
+        join orders on c_custkey)
+        join lineitem on o_orderkey)
+        join supplier on l_suppkey)
+        join supp_nation on s_nationkey;
 
 let result = joined[
     filter (supp_nation == "FRANCE" && cust_nation == "GERMANY")

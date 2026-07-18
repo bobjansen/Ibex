@@ -6,19 +6,15 @@
 //  average order quantity. Standard TPC-H qualification parameters: Brand#23,
 //  MED BOX.
 //
-//  Two things distinguish this from q02's correlated MIN (SPEC 5.7):
+//  The SQL expresses the average as a correlated scalar subquery. Here it is
+//  decorrelated explicitly into a grouped mean plus a join. The average still
+//  ranges over every lineitem row for each selected part: filtering part keys
+//  first removes unrelated groups without removing any row from a surviving
+//  part's average.
 //
-//    - The subquery's average ranges over EVERY lineitem row for the part, not
-//      just the Brand#23 MED BOX ones. The outer filter cannot be repeated
-//      inside it, and the subquery's own base is unfiltered lineitem.
-//    - The selected column wraps its aggregate in arithmetic
-//      (`0.2 * mean(...)`), which computes the mean into an internal temp and
-//      combines it afterwards. That is fine: the subquery just has to name one
-//      column and have it be an aggregate.
-//
-//  lineitem is bound once and scanned twice — by the outer join and by the
-//  subquery. Projection pushdown unions what the two demand, so its 6M rows are
-//  decoded once, not once per scan.
+//  `relevant_lineitems` is shared by the limit aggregate and final join. This
+//  keeps the selective part join ahead of the expensive group-by and avoids
+//  building quantity limits for every part in the database.
 //
 //  Run:
 //    ./build-release/tools/ibex_eval --plugin-path build-release/tools \
@@ -31,19 +27,22 @@ extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
 let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
 
-let result = (
-    part_raw[select { p_partkey, p_brand, p_container }]
-    join
-    lineitem_raw[select { p_partkey = l_partkey, l_quantity, l_extendedprice }]
-    on p_partkey
-)[
-    filter p_brand == "Brand#23" && p_container == "MED BOX"
-        && l_quantity < scalar(
-            lineitem_raw[
-                filter l_partkey == outer(p_partkey),
-                select { quantity_limit = 0.2 * mean(l_quantity) }
-            ]
-        ),
+let selected_parts = part_raw[
+    filter p_brand == "Brand#23" && p_container == "MED BOX",
+    select { p_partkey }
+];
+
+let relevant_lineitems = selected_parts join lineitem_raw[
+    select { p_partkey = l_partkey, l_quantity, l_extendedprice }
+] on p_partkey;
+
+let quantity_limits = relevant_lineitems[
+    select { quantity_limit = 0.2 * mean(l_quantity) },
+    by { p_partkey }
+];
+
+let result = (relevant_lineitems join quantity_limits on p_partkey)[
+    filter l_quantity < quantity_limit,
     select { avg_yearly = sum(l_extendedprice) / 7.0 }
 ];
 write_csv(result, "benchmarking/data/tpch/out/q17.csv");

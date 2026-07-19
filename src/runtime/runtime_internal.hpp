@@ -127,10 +127,14 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
 
 /// Bulk-gather rows from `src`, treating sentinel values (kNull = SIZE_MAX) as null positions
 /// that receive default values. Returns the new column plus a validity bitmap if any nulls exist.
+// n is the array length, kNull the sentinel value; distinct roles, not realistically
+// confusable at the handful of call sites.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 [[nodiscard]] inline auto gather_column_with_nulls(const ColumnValue& src,
                                                    const std::size_t* indices, std::size_t n,
                                                    std::size_t kNull)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
+    // NOLINTEND(bugprone-easily-swappable-parameters)
     return std::visit(
         [&](const auto& col) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
             using ColT = std::decay_t<decltype(col)>;

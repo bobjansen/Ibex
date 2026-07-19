@@ -2721,6 +2721,7 @@ auto deferred_probe_scan_of(const ir::Node& right) -> DeferredProbeScan {
     if (cur->kind() != ir::NodeKind::Scan) {
         return {};
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto it = deferred->find(static_cast<const ir::ScanNode&>(*cur).source_name());
     return it == deferred->end() ? DeferredProbeScan{}
                                  : DeferredProbeScan{.scan = &it->second, .name = &it->first};
@@ -3132,7 +3133,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             return;
         }
         const auto* col = std::get_if<Column<std::int64_t>>(&*entry->column);
-        if (col == nullptr || col->size() == 0) {
+        if (col == nullptr || col->empty()) {
             return;
         }
         const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
@@ -4014,6 +4015,7 @@ class ChunkedAggregateOperator final : public Operator {
     // Two fixed-width-integer keys, grouped as one composite. Mirrors
     // process_rows_int exactly, packing (key_a, key_b) into a two-word key so
     // a single hash probe replaces the generic path's per-key Key comparison.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_int_pair(const std::vector<const ColumnEntry*>& group_entries,
                                const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -4100,6 +4102,7 @@ class ChunkedAggregateOperator final : public Operator {
         return multi_cat_codes_flat_.data() + (group * n_keys);
     }
 
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void multi_cat_rehash_slots(std::size_t capacity, std::size_t n_keys) {
         multi_cat_slots_.assign(capacity, 0U);
         const std::size_t mask = capacity - 1;

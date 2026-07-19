@@ -87,6 +87,8 @@ auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_
 
 namespace {
 
+// values/mask mirror the _pext_u64(values, mask) intrinsic's own calling convention.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept -> std::uint64_t {
 #ifdef __BMI2__
     return _pext_u64(values, mask);

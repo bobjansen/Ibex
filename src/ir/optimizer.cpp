@@ -82,6 +82,7 @@ class DeadPurePreamblePass final : public OptimizationPass {
                                if (!node || node->kind() != NodeKind::ExternCall) {
                                    return false;
                                }
+                               // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
                                const auto& call = static_cast<const ExternCallNode&>(*node);
                                const auto it = context.callee_summaries.find(call.callee());
                                const auto& summary = it != context.callee_summaries.end()

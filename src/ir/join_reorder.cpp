@@ -32,6 +32,7 @@ void max_id(const Node& node, std::uint64_t& value) {
         }
     }
     if (node.kind() == NodeKind::Program) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& program = static_cast<const ProgramNode&>(node);
         for (const auto& preamble : program.preamble()) {
             if (preamble != nullptr) {
@@ -53,6 +54,7 @@ auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vec
         leaves.push_back(&node);
         return true;
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
         join.children().size() != 2 || join.children()[0] == nullptr ||
@@ -72,6 +74,7 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
         leaves.push_back(std::move(node));
         return true;
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     auto* join = static_cast<JoinNode*>(node.get());
     if (join->kind() != JoinKind::Inner || join->predicate().has_value() || join->keys().empty() ||
         join->mutable_children().size() != 2 || join->mutable_children()[0] == nullptr ||
@@ -107,6 +110,8 @@ auto aggregate_order_insensitive(const AggregateNode& aggregate) -> bool {
 /// the order the join happens to emit. `is_row_local_update_expr` is the
 /// existing front door for that question. A grouped `update ... by {...}` is
 /// excluded for the same reason.
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
+// guarded by the switch on node.kind() matching the target node type.
 auto is_row_wise(const Node& node) -> bool {
     switch (node.kind()) {
         case NodeKind::Project:
@@ -139,6 +144,7 @@ auto is_row_wise(const Node& node) -> bool {
             return false;
     }
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 /// The slot holding the aggregate's inner-join chain, which is only rarely the
 /// aggregate's immediate child: the aggregate block's own `select` lowers to a
@@ -247,6 +253,7 @@ auto walk(NodePtr node, const SourceStats& stats) -> NodePtr {
     }
     if (node->kind() == NodeKind::Aggregate && node->mutable_children().size() == 1 &&
         node->mutable_children()[0] != nullptr) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& aggregate = static_cast<const AggregateNode&>(*node);
         if (aggregate_order_insensitive(aggregate)) {
             if (NodePtr* chain = find_join_chain(node->mutable_children()[0])) {

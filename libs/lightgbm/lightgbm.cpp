@@ -238,7 +238,7 @@ auto predict_lightgbm(const void* native, const runtime::Table& design_matrix)
 
 }  // namespace ibex::lightgbm
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table("lightgbm_version",
                              [](const ibex::runtime::ExternArgs&)
                                  -> std::expected<ibex::runtime::ExternValue, std::string> {

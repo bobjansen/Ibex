@@ -3741,7 +3741,8 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
             reinterpret_cast<void*>(GetProcAddress(handle, "ibex_register")));
         if (fn == nullptr) {
             FreeLibrary(handle);
-            fmt::print("warning: plugin '{}' has no ibex_register symbol\n", full_path.string());
+            last_error = "has no ibex_register symbol";
+            last_candidate = full_path.string();
             continue;
         }
 #else
@@ -3760,7 +3761,8 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
         auto* fn = reinterpret_cast<RegisterFn>(dlsym(handle, "ibex_register"));
         if (fn == nullptr) {
             dlclose(handle);
-            fmt::print("warning: plugin '{}' has no ibex_register symbol\n", full_path.string());
+            last_error = "has no ibex_register symbol";
+            last_candidate = full_path.string();
             continue;
         }
 #endif
@@ -3981,7 +3983,11 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 auto stem = plugin_stem(stored_decl.source_path);
                 auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
                 if (result.status == PluginLoadStatus::NotFound) {
+#ifdef _WIN32
+                    fmt::print("warning: could not find plugin '{}.dll' in search path\n", stem);
+#else
                     fmt::print("warning: could not find plugin '{}.so' in search path\n", stem);
+#endif
                 } else if (result.status == PluginLoadStatus::LoadError) {
                     fmt::print("warning: {}\n", result.message);
                 }

@@ -273,6 +273,127 @@ auto scan_predicates(const Node& root) -> ScanPredicateMap {
     return candidates;
 }
 
+namespace {
+
+void count_scan_occurrences(const Node& node, std::map<std::string, std::size_t>& counts) {
+    if (node.kind() == NodeKind::Scan) {
+        ++counts[static_cast<const ScanNode&>(node).source_name()];
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            count_scan_occurrences(*child, counts);
+        }
+    }
+}
+
+/// Descend a chain of row-local Project / Rename / Update nodes to a Scan,
+/// mapping `key` back through renames and bare-column aliases to the scan's
+/// own column name. Any other node kind (a residual Filter, a Window, ...)
+/// makes the chain ineligible: removing rows at the scan would not commute
+/// with it. A renaming `select` lowers to Project(Update(Scan)) with
+/// bare-ColumnRef field exprs, which is why Update belongs here.
+auto match_probe_chain(const Node& node, std::string key)
+    -> std::optional<std::pair<std::string, std::string>> {
+    const Node* cur = &node;
+    while (true) {
+        switch (cur->kind()) {
+            case NodeKind::Scan:
+                return std::pair{static_cast<const ScanNode&>(*cur).source_name(), std::move(key)};
+            case NodeKind::Project: {
+                const auto& cols = static_cast<const ProjectNode&>(*cur).columns();
+                const bool keeps_key =
+                    std::any_of(cols.begin(), cols.end(),
+                                [&](const ColumnRef& col) { return col.name == key; });
+                if (!keeps_key) {
+                    return std::nullopt;
+                }
+                break;
+            }
+            case NodeKind::Rename: {
+                for (const auto& rs : static_cast<const RenameNode&>(*cur).renames()) {
+                    if (rs.new_name == key) {
+                        key = rs.old_name;
+                        break;
+                    }
+                }
+                break;
+            }
+            case NodeKind::Update: {
+                const auto& update = static_cast<const UpdateNode&>(*cur);
+                if (!update.tuple_fields().empty() || !update.group_by().empty()) {
+                    return std::nullopt;
+                }
+                for (const auto& field : update.fields()) {
+                    // Every field must be row-local for row removal at the
+                    // scan to commute with the update.
+                    if (!is_subset_evaluable_expr(field.expr)) {
+                        return std::nullopt;
+                    }
+                }
+                // Fields all read the update's INPUT, so the key maps through
+                // at most one alias — never chained within the same node.
+                for (const auto& field : update.fields()) {
+                    if (field.alias == key) {
+                        const auto* ref = std::get_if<ColumnRef>(&field.expr.node);
+                        if (ref == nullptr) {
+                            // The key is computed; no scan column to bound.
+                            return std::nullopt;
+                        }
+                        key = ref->name;
+                        break;
+                    }
+                }
+                break;
+            }
+            default:
+                return std::nullopt;
+        }
+        if (cur->children().size() != 1 || cur->children().front() == nullptr) {
+            return std::nullopt;
+        }
+        cur = cur->children().front().get();
+    }
+}
+
+void collect_deferrable(const Node& node, const std::set<std::string>& sources,
+                        const std::map<std::string, std::size_t>& counts,
+                        std::map<std::string, DeferrableProbeScan>& out) {
+    if (node.kind() == NodeKind::Join) {
+        const auto& join = static_cast<const JoinNode&>(node);
+        if (join.kind() == JoinKind::Inner && join.keys().size() == 1 &&
+            !join.predicate().has_value() && join.children().size() == 2 &&
+            join.children()[1] != nullptr) {
+            if (auto match = match_probe_chain(*join.children()[1], join.keys().front());
+                match.has_value() && sources.contains(match->first)) {
+                if (const auto count = counts.find(match->first);
+                    count != counts.end() && count->second == 1) {
+                    out.emplace(match->first,
+                                DeferrableProbeScan{.key_column = std::move(match->second)});
+                }
+            }
+        }
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_deferrable(*child, sources, counts, out);
+        }
+    }
+}
+
+}  // namespace
+
+auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources)
+    -> std::map<std::string, DeferrableProbeScan> {
+    std::map<std::string, DeferrableProbeScan> out;
+    if (sources.empty()) {
+        return out;
+    }
+    std::map<std::string, std::size_t> counts;
+    count_scan_occurrences(root, counts);
+    collect_deferrable(root, sources, counts, out);
+    return out;
+}
+
 auto remove_applied_scan_filters(NodePtr root, const std::set<std::string>& applied_sources)
     -> NodePtr {
     if (root == nullptr || applied_sources.empty()) {

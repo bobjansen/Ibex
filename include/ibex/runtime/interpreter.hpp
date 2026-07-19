@@ -4,15 +4,19 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <optional>
 #include <robin_hood.h>
+#include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -220,6 +224,123 @@ struct Table {
 
 using TableRegistry = robin_hood::unordered_map<std::string, Table>;
 using ScalarRegistry = robin_hood::unordered_map<std::string, ScalarValue>;
+
+class LazyTable;
+
+/// Register-blocked Bloom filter over int64 join keys: each key sets two bits
+/// inside one 64-bit word, so a membership probe touches a single cache line.
+/// Sized at ~16 bits per expected key, which keeps the false-positive rate in
+/// the low single-digit percent — false positives only cost wasted decode,
+/// never wrong answers.
+class JoinBloomFilter {
+   public:
+    explicit JoinBloomFilter(std::size_t expected_keys) {
+        // 16 bits/key = 4 keys per 64-bit word, rounded up to a power of two
+        // so the word index is a mask, not a modulo.
+        std::size_t words = 8;
+        while (words * 4 < expected_keys) {
+            words *= 2;
+        }
+        words_.assign(words, 0);
+        mask_ = words - 1;
+    }
+
+    void insert(std::int64_t key) noexcept {
+        const auto [word, bits] = position(key);
+        words_[word] |= bits;
+    }
+
+    [[nodiscard]] auto contains(std::int64_t key) const noexcept -> bool {
+        const auto [word, bits] = position(key);
+        return (words_[word] & bits) == bits;
+    }
+
+   private:
+    // splitmix64 finalizer: cheap, and mixes well enough that the word index
+    // (low bits) and the two bit choices (high bits) are independent.
+    [[nodiscard]] auto position(std::int64_t key) const noexcept
+        -> std::pair<std::size_t, std::uint64_t> {
+        auto h = static_cast<std::uint64_t>(key) + 0x9e3779b97f4a7c15ULL;
+        h = (h ^ (h >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+        h = (h ^ (h >> 27U)) * 0x94d049bb133111ebULL;
+        h ^= h >> 31U;
+        const std::uint64_t bits =
+            (std::uint64_t{1} << ((h >> 32U) & 63U)) | (std::uint64_t{1} << ((h >> 38U) & 63U));
+        return {static_cast<std::size_t>(h & mask_), bits};
+    }
+
+    std::vector<std::uint64_t> words_;
+    std::uint64_t mask_ = 0;
+};
+
+/// Key filter a join derives from its build side for a deferred probe scan.
+/// `ready` flips exactly once, before the scan is materialized, when the
+/// owning join has decided (filter present or deliberately absent). A scan
+/// materialized while `ready` is still false simply decodes without dynamic
+/// filtering — absence is always sound, only slower.
+struct DynamicScanFilter {
+    bool ready = false;
+    std::optional<std::int64_t> min;
+    std::optional<std::int64_t> max;
+    /// Exact membership: sorted distinct build keys, published when the build
+    /// side is small (dimension chains). Empty means "not published". Always
+    /// accompanied by `bloom`: the Bloom is the cheap reject path (a binary
+    /// search per probe key costs ~8 mispredicting branches — measured 88% of
+    /// a q17 run), the list only confirms the rare Bloom passes exactly.
+    std::vector<std::int64_t> in_list;
+    /// Approximate membership; false positives only.
+    std::optional<JoinBloomFilter> bloom;
+
+    [[nodiscard]] auto has_membership() const noexcept -> bool { return bloom.has_value(); }
+
+    /// Only meaningful when `has_membership()`; false means "cannot match".
+    [[nodiscard]] auto passes(std::int64_t key) const noexcept -> bool {
+        if (!bloom->contains(key)) {
+            return false;
+        }
+        return in_list.empty() || std::binary_search(in_list.begin(), in_list.end(), key);
+    }
+};
+
+/// A lazy source whose decode the whole-script driver deferred so the join
+/// probing it can narrow the scan with build-side bounds first (see
+/// `ir::deferrable_probe_scans` for eligibility). The driver still owns the
+/// static conjuncts and column demand it would have used to pre-decode.
+struct DeferredScan {
+    std::shared_ptr<LazyTable> lazy;
+    std::vector<ir::Expr> conjuncts;  ///< static scan predicates proven for this source
+    std::set<std::string> demand;     ///< columns the plan reads from this scan
+    bool demand_all = false;
+    std::string key_column;  ///< join key in the scan's own column names
+    std::shared_ptr<DynamicScanFilter> filter;
+};
+
+/// Keyed by scan (instance) name as it appears in the plan.
+using DeferredScanRegistry = std::map<std::string, DeferredScan>;
+
+/// Installs the deferred-scan registry consulted by `interpret` on this
+/// thread for the guard's lifetime (the same execution-scoped pattern as
+/// cooperative interruption). The registry must outlive the guard.
+class ScopedDeferredScans {
+   public:
+    explicit ScopedDeferredScans(const DeferredScanRegistry* scans) noexcept;
+    ~ScopedDeferredScans();
+    ScopedDeferredScans(const ScopedDeferredScans&) = delete;
+    auto operator=(const ScopedDeferredScans&) -> ScopedDeferredScans& = delete;
+    ScopedDeferredScans(ScopedDeferredScans&&) = delete;
+    auto operator=(ScopedDeferredScans&&) -> ScopedDeferredScans& = delete;
+
+   private:
+    const DeferredScanRegistry* previous_;
+};
+
+[[nodiscard]] auto current_deferred_scans() noexcept -> const DeferredScanRegistry*;
+
+/// Materialize a deferred scan now: static conjuncts plus whatever bounds its
+/// filter slot carries (if `ready`). The single decode path for deferred
+/// sources — both the chunked join and the interpret fallback use it.
+[[nodiscard]] auto materialize_deferred_scan(const DeferredScan& scan)
+    -> std::expected<Table, std::string>;
 
 /// Opaque model result produced by the `model { ... }` clause.
 /// Accessor functions (`coef`, `residuals`, `fitted`, `summary`) extract

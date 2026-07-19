@@ -83,9 +83,18 @@ class LazyTable {
     /// decoded with that selection. This deliberately bypasses `cache_`: a
     /// selected column must never masquerade as a cached whole-file column in a
     /// later query.
+    ///
+    /// `dynamic` + `dynamic_key` optionally add a join-derived key membership
+    /// filter (Bloom or exact IN-list) over the named key column, ANDed into
+    /// the selection. Ignored — soundly, membership only removes rows that
+    /// cannot match — when the key column is missing or not int64, and skipped
+    /// when a sampled pass rate says the filter barely rejects (a near-full
+    /// selection would gather-decode every other column for nothing).
     [[nodiscard]] auto project_where(const std::set<std::string>& names,
                                      const std::vector<ir::Expr>& conjuncts,
-                                     const ScalarRegistry* scalars = nullptr)
+                                     const ScalarRegistry* scalars = nullptr,
+                                     const DynamicScanFilter* dynamic = nullptr,
+                                     const std::string* dynamic_key = nullptr)
         -> std::expected<Table, std::string>;
 
     /// Materialize every column — the fallback for anything that consumes the

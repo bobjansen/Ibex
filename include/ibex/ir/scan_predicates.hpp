@@ -38,6 +38,23 @@ struct ScanInstanceSplit {
 [[nodiscard]] auto split_scan_instances(NodePtr root, const std::set<std::string>& sources)
     -> ScanInstanceSplit;
 
+/// A lazy scan eligible for deferred decode: it feeds — through nothing but
+/// column-only Project and Rename nodes — the RIGHT side of an inner
+/// single-key no-predicate join, and occurs nowhere else in the plan (run
+/// `split_scan_instances` first so this holds per instance). Deferring its
+/// decode lets the join derive bounds from its build side and hand them to
+/// the scan before any probe column is materialized.
+struct DeferrableProbeScan {
+    /// The join key translated back through the rename chain to the scan's
+    /// own column name.
+    std::string key_column;
+};
+
+/// Scan (instance) name -> eligibility info. `sources` is the set of lazy
+/// scan names the caller can actually defer; anything else is ignored.
+[[nodiscard]] auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources)
+    -> std::map<std::string, DeferrableProbeScan>;
+
 /// Remove row-local filters which have already been applied by a lazy source.
 /// `applied_sources` must contain only sources for which the caller actually
 /// materialized the selection. The implementation repeats the scan-predicate

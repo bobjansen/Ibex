@@ -730,3 +730,117 @@ TEST_CASE("LazyTable: a cached key column bypasses the fused scan",
     CHECK(table->rows() == 2);
     CHECK_FALSE(fused_called);
 }
+
+TEST_CASE("LazyTable: project_rows decodes only the selected rows",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+    auto table = lazy.project_rows({"a", "c"}, runtime::Selection{0, 2});
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+    REQUIRE(source.selections.size() == 1);
+    REQUIRE(source.selections.front().has_value());
+    CHECK(*source.selections.front() == runtime::Selection{0, 2});
+    const auto* c = std::get_if<Column<std::string>>(&*table->find("c"));
+    REQUIRE(c != nullptr);
+    CHECK((*c)[0] == "x");
+    CHECK((*c)[1] == "z");
+}
+
+TEST_CASE("LazyTable: join_key_selection returns the selection and its key values",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(2);
+    filter.bloom->insert(2);
+    filter.bloom->insert(3);
+    filter.in_list = {2, 3};
+
+    auto phase = lazy.join_key_selection({}, nullptr, filter, "a");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{1, 2});
+    const auto* keys = std::get_if<Column<std::int64_t>>(&*(*phase)->keys.column);
+    REQUIRE(keys != nullptr);
+    REQUIRE(keys->size() == 2);
+    CHECK((*keys)[0] == 2);
+    CHECK((*keys)[1] == 3);
+    // Only the key column was decoded (whole-file, cached).
+    REQUIRE(source.decode_calls.size() == 1);
+    CHECK(source.decode_calls.front() == std::vector<std::string>{"a"});
+}
+
+TEST_CASE("LazyTable: join_key_selection composes static conjuncts with membership",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(2);
+    filter.bloom->insert(1);
+    filter.bloom->insert(2);
+    filter.in_list = {1, 2};
+
+    // Conjunct keeps a > 1 -> {2, 3}; membership keeps {1, 2} -> exactly {2}.
+    auto phase = lazy.join_key_selection({greater_than("a", 1)}, nullptr, filter, "a");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{1});
+    const auto* keys = std::get_if<Column<std::int64_t>>(&*(*phase)->keys.column);
+    REQUIRE(keys != nullptr);
+    REQUIRE(keys->size() == 1);
+    CHECK((*keys)[0] == 2);
+}
+
+TEST_CASE("LazyTable: join_key_selection declines without membership or on a non-int key",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    runtime::DynamicScanFilter empty_filter;
+    auto no_membership = lazy.join_key_selection({}, nullptr, empty_filter, "a");
+    REQUIRE(no_membership);
+    CHECK_FALSE(no_membership->has_value());
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(1);
+    filter.bloom->insert(2);
+    auto non_int = lazy.join_key_selection({}, nullptr, filter, "b");
+    REQUIRE(non_int);
+    CHECK_FALSE(non_int->has_value());
+}
+
+TEST_CASE("LazyTable: join_key_selection uses the fused scan when available",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    runtime::LazyTable lazy{
+        source.schema(),
+        3,
+        [&source](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        },
+        {},
+        [](const std::string&, const runtime::DynamicScanFilter&)
+            -> std::expected<std::optional<runtime::Selection>, std::string> {
+            return std::optional{runtime::Selection{2}};
+        }};
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(1);
+    filter.bloom->insert(3);
+
+    auto phase = lazy.join_key_selection({}, nullptr, filter, "a");
+    REQUIRE(phase);
+    REQUIRE(phase->has_value());
+    CHECK((*phase)->selected == runtime::Selection{2});
+    // The key was decoded through the fused selection, never whole-file.
+    REQUIRE(source.selections.size() == 1);
+    REQUIRE(source.selections.front().has_value());
+    CHECK(*source.selections.front() == runtime::Selection{2});
+    const auto* keys = std::get_if<Column<std::int64_t>>(&*(*phase)->keys.column);
+    REQUIRE(keys != nullptr);
+    REQUIRE(keys->size() == 1);
+    CHECK((*keys)[0] == 3);
+}

@@ -108,11 +108,40 @@ class LazyTable {
                                      const std::string* dynamic_key = nullptr)
         -> std::expected<Table, std::string>;
 
+    /// Materialize `names` through an explicit ascending row selection —
+    /// late materialization for a caller (the deferred-probe join) that
+    /// already knows exactly which rows survive. Bypasses `cache_` like
+    /// `project_where` does, and for the same reason.
+    [[nodiscard]] auto project_rows(const std::set<std::string>& names, const Selection& selected)
+        -> std::expected<Table, std::string>;
+
+    /// Phase A of a two-phase deferred probe: compute the scan's selection
+    /// (static conjuncts + key membership, or the fused key scan) and the
+    /// key column's values for those rows — without decoding anything else.
+    /// The outer optional is nullopt when there is no selective answer
+    /// (no membership, non-int64 key, or the escape hatch fired) and the
+    /// caller must fall back to the ordinary full materialization.
+    struct JoinKeySelection {
+        Selection selected;  ///< ascending source-row indices
+        ColumnEntry keys;    ///< key values for exactly those rows
+    };
+    [[nodiscard]] auto join_key_selection(const std::vector<ir::Expr>& conjuncts,
+                                          const ScalarRegistry* scalars,
+                                          const DynamicScanFilter& dynamic,
+                                          const std::string& key_name)
+        -> std::expected<std::optional<JoinKeySelection>, std::string>;
+
     /// Materialize every column — the fallback for anything that consumes the
     /// table whole rather than through a query plan.
     [[nodiscard]] auto materialize() -> std::expected<Table, std::string>;
 
    private:
+    /// Decode the referenced columns whole-file into `cache_` (they are
+    /// legitimate whole-column entries) and return them as a table.
+    [[nodiscard]] auto decode_whole_columns(
+        const robin_hood::unordered_set<std::string>& referenced)
+        -> std::expected<Table, std::string>;
+
     Table schema_;
     std::size_t rows_ = 0;
     ColumnDecodeFn decode_;
@@ -122,5 +151,20 @@ class LazyTable {
 };
 
 using LazyTablePtr = std::shared_ptr<LazyTable>;
+
+/// Phase A of the two-phase deferred probe: the scan's selection (static
+/// conjuncts + membership, or the fused key scan) plus the key values for
+/// exactly those rows. nullopt = no selective answer; fall back to
+/// `materialize_deferred_scan`.
+[[nodiscard]] auto deferred_scan_key_selection(const DeferredScan& scan)
+    -> std::expected<std::optional<LazyTable::JoinKeySelection>, std::string>;
+
+/// Phase B: materialize the scan's demanded columns through the survivor
+/// selection, splicing in `key_column` (the survivors' key values, already
+/// in hand from phase A) at its schema position so column order matches the
+/// ordinary path.
+[[nodiscard]] auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
+                                                  ColumnEntry key_column)
+    -> std::expected<Table, std::string>;
 
 }  // namespace ibex::runtime

@@ -2700,24 +2700,30 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 /// driver only registers scans it proved eligible (ir::deferrable_probe_scans:
 /// occurs once, feeds exactly this shape), so a hit here IS the eligible
 /// position.
-auto deferred_probe_scan_of(const ir::Node& right) -> const DeferredScan* {
+struct DeferredProbeScan {
+    const DeferredScan* scan = nullptr;
+    const std::string* name = nullptr;  ///< scan (instance) name in the plan
+};
+
+auto deferred_probe_scan_of(const ir::Node& right) -> DeferredProbeScan {
     const auto* deferred = current_deferred_scans();
     if (deferred == nullptr) {
-        return nullptr;
+        return {};
     }
     const ir::Node* cur = &right;
     while (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename ||
            cur->kind() == ir::NodeKind::Update) {
         if (cur->children().size() != 1 || cur->children().front() == nullptr) {
-            return nullptr;
+            return {};
         }
         cur = cur->children().front().get();
     }
     if (cur->kind() != ir::NodeKind::Scan) {
-        return nullptr;
+        return {};
     }
     const auto it = deferred->find(static_cast<const ir::ScanNode&>(*cur).source_name());
-    return it == deferred->end() ? nullptr : &it->second;
+    return it == deferred->end() ? DeferredProbeScan{}
+                                 : DeferredProbeScan{.scan = &it->second, .name = &it->first};
 }
 
 /// Inner hash join for single-key no-predicate joins.
@@ -2750,10 +2756,11 @@ class ChunkedInnerJoinOperator final : public Operator {
     ChunkedInnerJoinOperator(OperatorPtr left, const ir::Node* right_node,
                              const TableRegistry* registry, const ScalarRegistry* scalars,
                              const ExternRegistry* externs, const std::vector<std::string>* keys,
-                             const DeferredScan* probe)
+                             const DeferredScan* probe, std::string probe_name)
         : left_(std::move(left)),
           keys_(keys),
           deferred_probe_(probe),
+          deferred_probe_name_(std::move(probe_name)),
           deferred_right_node_(right_node),
           deferred_registry_(registry),
           deferred_scalars_(scalars),
@@ -2766,6 +2773,17 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return std::unexpected(std::move(*err));
             }
             initialized_ = true;
+        }
+
+        if (mode_ == Mode::Precomputed) {
+            if (swapped_emitted_) {
+                return std::optional<Chunk>{};
+            }
+            swapped_emitted_ = true;
+            if (precomputed_output_.rows() == 0) {
+                return std::optional<Chunk>{};
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(precomputed_output_))};
         }
 
         if (mode_ == Mode::Swapped) {
@@ -2814,7 +2832,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
    private:
-    enum class Mode : std::uint8_t { Stream, Swapped };
+    enum class Mode : std::uint8_t { Stream, Swapped, Precomputed };
 
     static constexpr std::size_t kNil = std::numeric_limits<std::size_t>::max();
 
@@ -2832,6 +2850,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (deferred_probe_ != nullptr) {
             if (auto err = resolve_deferred_probe()) {
                 return err;
+            }
+            if (mode_ == Mode::Precomputed) {
+                return std::nullopt;
             }
         }
         const std::string& key_name = keys_->front();
@@ -2907,6 +2928,24 @@ class ChunkedInnerJoinOperator final : public Operator {
             use_materialized_left_ = true;
         }
         slot.ready = true;
+        if (use_materialized_left_) {
+            TwoPhase outcome = TwoPhase::NotApplicable;
+            if (auto err = try_two_phase_probe(slot, outcome)) {
+                return err;
+            }
+            if (outcome == TwoPhase::Precomputed) {
+                deferred_probe_ = nullptr;
+                mode_ = Mode::Precomputed;
+                return std::nullopt;
+            }
+            if (outcome == TwoPhase::RightMaterialized) {
+                // Phase A ran but full two-phase declined; its selection was
+                // reused to materialize right_, so fall through to the
+                // ordinary side-picking in initialize().
+                deferred_probe_ = nullptr;
+                return std::nullopt;
+            }
+        }
         auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
                                     deferred_externs_);
         if (!right.has_value()) {
@@ -2914,6 +2953,165 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         right_ = std::move(right.value());
         deferred_probe_ = nullptr;
+        return std::nullopt;
+    }
+
+    enum class TwoPhase : std::uint8_t { NotApplicable, RightMaterialized, Precomputed };
+
+    /// Interpret the Project/Rename/Update wrappers over an already
+    /// materialized scan table by shadowing the scan name in a registry
+    /// copy — the Scan case hits the registry before the deferred fallback.
+    auto interpret_wrapped_right(Table scan_table) -> std::optional<std::string> {
+        TableRegistry local = *deferred_registry_;
+        local.insert_or_assign(deferred_probe_name_, std::move(scan_table));
+        auto right =
+            interpret_node(*deferred_right_node_, local, deferred_scalars_, deferred_externs_);
+        if (!right.has_value()) {
+            return std::move(right.error());
+        }
+        right_ = std::move(right.value());
+        return std::nullopt;
+    }
+
+    /// Late materialization across the join (decode-fusion stage 5): probe
+    /// with just the scan's key column, then decode the payload columns only
+    /// for the rows that actually matched. When every survivor matched
+    /// exactly one build row (unique build keys — the common star shape),
+    /// the probe-side columns pass into the output without a gather.
+    ///
+    /// NotApplicable (nothing ran — no membership filter, or phase A had no
+    /// selective answer): the caller interprets the subtree as before. When
+    /// phase A DID run but full two-phase declines — the build side is
+    /// larger than the candidate set (two-phase forces build-on-left; the
+    /// ordinary side-picking may do better) or a key type surprise — its
+    /// selection is reused to materialize `right_` (RightMaterialized)
+    /// rather than thrown away: recomputing it from scratch was measured at
+    /// +12% on q03.
+    auto try_two_phase_probe(const DynamicScanFilter& slot, TwoPhase& outcome)
+        -> std::optional<std::string> {
+        outcome = TwoPhase::NotApplicable;
+        if (!slot.has_membership() || !left_materialized_.has_value()) {
+            return std::nullopt;
+        }
+        const Table& build = *left_materialized_;
+        const auto* build_entry = build.find_entry(keys_->front());
+        if (build_entry == nullptr ||
+            !std::holds_alternative<Column<std::int64_t>>(*build_entry->column)) {
+            return std::nullopt;
+        }
+
+        auto phase = deferred_scan_key_selection(*deferred_probe_);
+        if (!phase.has_value()) {
+            return std::move(phase.error());
+        }
+        if (!phase->has_value()) {
+            return std::nullopt;
+        }
+        auto sel = std::move(**phase);
+        const auto* keys_col = std::get_if<Column<std::int64_t>>(&*sel.keys.column);
+        if (build.rows() > sel.selected.size() || keys_col == nullptr) {
+            auto right_rows =
+                materialize_deferred_scan_rows(*deferred_probe_, sel.selected, std::move(sel.keys));
+            if (!right_rows.has_value()) {
+                return std::move(right_rows.error());
+            }
+            if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
+                return err;
+            }
+            outcome = TwoPhase::RightMaterialized;
+            return std::nullopt;
+        }
+
+        key_kind_ = ExprType::Int;
+        if (auto err = build_index(build, keys_->front())) {
+            return err;
+        }
+
+        // Probe the candidate keys in scan order; record one hit per
+        // surviving row plus the expanded (build row, survivor) pairs — the
+        // same probe-order-major layout emit_swapped produces.
+        const auto* key_data = keys_col->data();
+        const ValidityBitmap* key_validity =
+            sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
+        const std::size_t n = keys_col->size();
+        struct Hit {
+            std::size_t pos;   // index into the candidate selection
+            std::size_t head;  // first build row in the chain
+        };
+        std::vector<Hit> hits;
+        hits.reserve(n);
+        std::size_t total = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (key_validity != nullptr && !(*key_validity)[i]) {
+                continue;
+            }
+            const auto it = i64_heads_.find(key_data[i]);
+            if (it == i64_heads_.end()) {
+                continue;
+            }
+            hits.push_back(Hit{.pos = i, .head = it->second});
+            for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                ++total;
+            }
+        }
+
+        Selection survivors;
+        survivors.reserve(hits.size());
+        for (const Hit& hit : hits) {
+            survivors.push_back(sel.selected[hit.pos]);
+        }
+
+        std::vector<std::size_t> li(total, 0);
+        std::vector<std::size_t> ri(total, 0);
+        std::size_t pos = 0;
+        for (std::size_t h = 0; h < hits.size(); ++h) {
+            for (std::size_t cur = hits[h].head; cur != kNil; cur = chain_next_[cur]) {
+                li[pos] = cur;
+                ri[pos] = h;
+                ++pos;
+            }
+        }
+        const bool ri_identity = total == hits.size();
+
+        // Survivors' key values, gathered in memory from phase A's keys.
+        ColumnEntry key_entry;
+        key_entry.name = sel.keys.name;
+        if (hits.size() == n) {
+            key_entry.column = sel.keys.column;
+            key_entry.validity = sel.keys.validity;
+        } else {
+            Column<std::int64_t> gathered;
+            gathered.reserve(hits.size());
+            for (const Hit& hit : hits) {
+                gathered.push_back(key_data[hit.pos]);
+            }
+            key_entry.column = std::make_shared<ColumnValue>(std::move(gathered));
+            // Null keys never match, so every survivor's key is valid.
+        }
+
+        auto right_rows =
+            materialize_deferred_scan_rows(*deferred_probe_, survivors, std::move(key_entry));
+        if (!right_rows.has_value()) {
+            return std::move(right_rows.error());
+        }
+        if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
+            return err;
+        }
+        setup_right_emit_schema(keys_->front());
+
+        Table left_copy;
+        left_copy.columns.reserve(build.columns.size());
+        for (const auto& c : build.columns) {
+            left_copy.add_column(c.name, *c.column);
+            left_copy.columns.back().validity = c.validity;
+        }
+        auto out = assemble_output(std::move(left_copy), li.data(), ri.data(), total,
+                                   /*li_identity=*/false, ri_identity);
+        if (!out.has_value()) {
+            return std::move(out.error());
+        }
+        precomputed_output_ = std::move(*out);
+        outcome = TwoPhase::Precomputed;
         return std::nullopt;
     }
 
@@ -3388,7 +3586,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
     auto assemble_output(Table left_side, const std::size_t* li, const std::size_t* ri,
-                         std::size_t total, bool li_identity = false)
+                         std::size_t total, bool li_identity = false, bool ri_identity = false)
         -> std::expected<Table, std::string> {
         Table output;
         if (total == 0) {
@@ -3437,6 +3635,11 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         }
 
+        // ri_identity: every emitted row consumes the next probe-side row
+        // exactly once (two-phase deferred probe with a unique build side),
+        // so probe columns are shared rather than gathered — the same
+        // reasoning as li_identity above.
+        const bool share_right = ri_identity && total == right_.rows();
         for (const std::size_t idx : right_emit_idx_) {
             const auto& rc = right_.columns[idx];
             std::string name = rc.name;
@@ -3444,6 +3647,10 @@ class ChunkedInnerJoinOperator final : public Operator {
                 name += "_right";
             }
             out_names.insert(name);
+            if (share_right) {
+                output.add_column_shared(std::move(name), rc.column, rc.validity);
+                continue;
+            }
             auto [gathered, val] = gather_with_validity(*rc.column, rc.validity, ri);
             if (val.has_value()) {
                 output.add_column(std::move(name), std::move(gathered), std::move(*val));
@@ -3461,6 +3668,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Deferred-probe context (see the second constructor). `deferred_probe_`
     // doubles as the mode flag: non-null until the probe scan is resolved.
     const DeferredScan* deferred_probe_ = nullptr;
+    std::string deferred_probe_name_;
     const ir::Node* deferred_right_node_ = nullptr;
     const TableRegistry* deferred_registry_ = nullptr;
     const ScalarRegistry* deferred_scalars_ = nullptr;
@@ -3491,6 +3699,10 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Swapped mode: materialized left held for later gather.
     std::optional<Table> left_table_;
     bool swapped_emitted_ = false;
+
+    // Precomputed mode: the two-phase deferred probe assembled the whole
+    // join output during initialization.
+    Table precomputed_output_;
 };
 
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and
@@ -5835,10 +6047,11 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             // A deferred probe scan must not be interpreted here — the join
             // publishes build-side bounds into its filter slot first, then
             // interprets the right subtree itself (resolve_deferred_probe).
-            if (const auto* probe = deferred_probe_scan_of(*join.children()[1]); probe != nullptr) {
+            if (const auto probe = deferred_probe_scan_of(*join.children()[1]);
+                probe.scan != nullptr) {
                 return std::make_unique<ChunkedInnerJoinOperator>(
                     std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                    externs, &join.keys(), probe);
+                    externs, &join.keys(), probe.scan, *probe.name);
             }
             auto right_op =
                 build_operator(*join.children()[1], registry, scalars, externs, model_out);

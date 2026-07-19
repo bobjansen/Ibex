@@ -326,3 +326,106 @@ TEST_CASE("scan_predicates: does not remove a non-local filter", "[ir][scan_pred
     auto rewritten = ir::remove_applied_scan_filters(std::move(plan), {"t"});
     CHECK(rewritten->kind() == ir::NodeKind::Filter);
 }
+
+namespace {
+
+auto inner_join(ir::NodePtr left, ir::NodePtr right, std::string key) -> ir::NodePtr {
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{20}, ir::JoinKind::Inner,
+                                               std::vector<std::string>{std::move(key)});
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+    return join;
+}
+
+}  // namespace
+
+TEST_CASE("deferrable_probe_scans: bare right-side scan of an inner join is eligible",
+          "[ir][scan_predicates][deferred_scan]") {
+    auto plan =
+        inner_join(make_scan("build"), std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), "id");
+
+    auto deferrable = ir::deferrable_probe_scans(*plan, {"t"});
+    REQUIRE(deferrable.contains("t"));
+    CHECK(deferrable.at("t").key_column == "id");
+    // The left (build) side is never deferrable.
+    CHECK_FALSE(ir::deferrable_probe_scans(*plan, {"build"}).contains("build"));
+}
+
+TEST_CASE("deferrable_probe_scans: reaches the scan through project and rename, mapping the key",
+          "[ir][scan_predicates][deferred_scan]") {
+    // Join key `o_orderkey`; the scan calls it `l_orderkey`.
+    auto rename = std::make_unique<ir::RenameNode>(
+        ir::NodeId{3},
+        std::vector<ir::RenameSpec>{{.new_name = "o_orderkey", .old_name = "l_orderkey"}});
+    auto plan = inner_join(
+        make_scan("build"),
+        with_child(std::move(rename),
+                   with_child(std::make_unique<ir::ProjectNode>(
+                                  ir::NodeId{2}, refs({"l_orderkey", "l_extendedprice"})),
+                              std::make_unique<ir::ScanNode>(ir::NodeId{4}, "lineitem"))),
+        "o_orderkey");
+
+    auto deferrable = ir::deferrable_probe_scans(*plan, {"lineitem"});
+    REQUIRE(deferrable.contains("lineitem"));
+    CHECK(deferrable.at("lineitem").key_column == "l_orderkey");
+}
+
+TEST_CASE("deferrable_probe_scans: a residual filter in the chain blocks eligibility",
+          "[ir][scan_predicates][deferred_scan]") {
+    auto plan = inner_join(make_scan("build"),
+                           with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")),
+                                      std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t")),
+                           "id");
+
+    CHECK(ir::deferrable_probe_scans(*plan, {"t"}).empty());
+}
+
+TEST_CASE("deferrable_probe_scans: a scan consumed twice is never deferred",
+          "[ir][scan_predicates][deferred_scan]") {
+    // `t` is both the probe side and (filtered) the build side — reducing the
+    // probe instance would be unsound without per-instance identity.
+    auto plan =
+        inner_join(make_scan("t"), std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), "id");
+
+    CHECK(ir::deferrable_probe_scans(*plan, {"t"}).empty());
+}
+
+TEST_CASE("deferrable_probe_scans: non-inner, multi-key, and predicate joins are ineligible",
+          "[ir][scan_predicates][deferred_scan]") {
+    auto left_join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Left,
+                                                    std::vector<std::string>{"id"});
+    left_join->add_child(make_scan("build"));
+    left_join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK(ir::deferrable_probe_scans(*left_join, {"t"}).empty());
+
+    auto two_key = std::make_unique<ir::JoinNode>(ir::NodeId{6}, ir::JoinKind::Inner,
+                                                  std::vector<std::string>{"id", "id2"});
+    two_key->add_child(make_scan("build"));
+    two_key->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK(ir::deferrable_probe_scans(*two_key, {"t"}).empty());
+
+    auto with_pred = std::make_unique<ir::JoinNode>(ir::NodeId{7}, ir::JoinKind::Inner,
+                                                    std::vector<std::string>{"id"}, gt_zero("a"));
+    with_pred->add_child(make_scan("build"));
+    with_pred->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK(ir::deferrable_probe_scans(*with_pred, {"t"}).empty());
+}
+
+TEST_CASE("deferrable_probe_scans: a project that drops the join key blocks eligibility",
+          "[ir][scan_predicates][deferred_scan]") {
+    auto plan =
+        inner_join(make_scan("build"),
+                   with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{2}, refs({"payload"})),
+                              std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t")),
+                   "id");
+
+    CHECK(ir::deferrable_probe_scans(*plan, {"t"}).empty());
+}
+
+TEST_CASE("deferrable_probe_scans: only offered sources are returned",
+          "[ir][scan_predicates][deferred_scan]") {
+    auto plan =
+        inner_join(make_scan("build"), std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), "id");
+
+    CHECK(ir::deferrable_probe_scans(*plan, {"other"}).empty());
+}

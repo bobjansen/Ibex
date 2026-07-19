@@ -387,3 +387,219 @@ TEST_CASE("lazy table defaults to knowing no column stats", "[lazy_table]") {
         });
     CHECK(lazy.column_stats().empty());
 }
+
+TEST_CASE("JoinBloomFilter: no false negatives, few false positives",
+          "[runtime][lazy_table][deferred_scan]") {
+    runtime::JoinBloomFilter bloom(1000);
+    for (std::int64_t key = 0; key < 1000; ++key) {
+        bloom.insert(key * 7);
+    }
+    for (std::int64_t key = 0; key < 1000; ++key) {
+        CHECK(bloom.contains(key * 7));
+    }
+    // Probing 10K keys that were never inserted must reject the vast
+    // majority; the exact rate is probabilistic but ~1-2% at this sizing.
+    std::size_t false_positives = 0;
+    for (std::int64_t key = 0; key < 10000; ++key) {
+        false_positives += bloom.contains(1000 * 7 + key * 7 + 3) ? 1 : 0;
+    }
+    CHECK(false_positives < 1000);
+}
+
+TEST_CASE("DynamicScanFilter: the exact list cancels Bloom false positives",
+          "[runtime][lazy_table][deferred_scan]") {
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(4);
+    for (std::int64_t key : {10, 20, 30}) {
+        filter.bloom->insert(key);
+    }
+    filter.in_list = {10, 20, 30};
+    REQUIRE(filter.has_membership());
+    CHECK(filter.passes(10));
+    CHECK(filter.passes(30));
+    // With an exact list every non-member fails, Bloom collisions included.
+    for (std::int64_t key = 0; key < 1000; ++key) {
+        if (key != 10 && key != 20 && key != 30) {
+            CHECK_FALSE(filter.passes(key));
+        }
+    }
+}
+
+TEST_CASE("LazyTable: project_where applies a membership filter without conjuncts",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    // Keys are a = {1, 2, 3}; the join's build side saw only {2, 3}.
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(2);
+    filter.bloom->insert(2);
+    filter.bloom->insert(3);
+    filter.in_list = {2, 3};
+
+    const std::string key = "a";
+    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+    const auto* a = std::get_if<Column<std::int64_t>>(&*table->find("a"));
+    REQUIRE(a != nullptr);
+    REQUIRE(a->size() == 2);
+    CHECK((*a)[0] == 2);
+    CHECK((*a)[1] == 3);
+    // The key column decodes whole-file (the selection needs every row); the
+    // payload column decodes through the selection.
+    REQUIRE(source.selections.size() == 2);
+    CHECK_FALSE(source.selections.front().has_value());
+    REQUIRE(source.selections.back().has_value());
+    CHECK(*source.selections.back() == runtime::Selection{1, 2});
+}
+
+TEST_CASE("LazyTable: membership composes with static conjuncts",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(2);
+    filter.bloom->insert(1);
+    filter.bloom->insert(2);
+    filter.in_list = {1, 2};
+
+    // Static conjunct keeps a > 1 -> {2, 3}; membership keeps {1, 2}. The
+    // intersection is exactly {2}.
+    const std::string key = "a";
+    auto table = lazy.project_where({"a", "b"}, {greater_than("a", 1)}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == 1);
+    const auto* a = std::get_if<Column<std::int64_t>>(&*table->find("a"));
+    REQUIRE(a != nullptr);
+    REQUIRE(a->size() == 1);
+    CHECK((*a)[0] == 2);
+}
+
+TEST_CASE("LazyTable: a non-integer membership key is soundly ignored",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(1);
+    filter.bloom->insert(42);
+
+    // "b" is a double column: no filter applies, the projection is dense.
+    const std::string key = "b";
+    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == 3);
+}
+
+TEST_CASE("LazyTable: membership drops rows whose key is null",
+          "[runtime][lazy_table][deferred_scan]") {
+    // A deferred scan feeds exactly one inner join, and null keys never
+    // match, so a null-keyed row is as dead as an out-of-set one.
+    runtime::Table schema;
+    schema.add_column("k", Column<std::int64_t>{});
+    runtime::LazyTable lazy{
+        std::move(schema), 3,
+        [](const std::vector<std::string>&,
+           const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
+            REQUIRE(selection == nullptr);
+            runtime::Table out;
+            runtime::ValidityBitmap validity(3, true);
+            validity.set(1, false);
+            out.add_column("k", Column<std::int64_t>{{7, 0, 7}}, std::move(validity));
+            out.logical_rows = 3;
+            return out;
+        }};
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(1);
+    filter.bloom->insert(7);
+    filter.in_list = {7};
+
+    const std::string key = "k";
+    auto table = lazy.project_where({"k"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+}
+
+TEST_CASE("LazyTable: a barely-rejecting membership filter is abandoned",
+          "[runtime][lazy_table][deferred_scan]") {
+    // The escape hatch: past the sample threshold, a filter that passes
+    // (nearly) everything must not push the payload onto the gather path.
+    static constexpr std::size_t kRows = 200000;
+    std::vector<std::optional<runtime::Selection>> selections;
+    runtime::Table schema;
+    schema.add_column("k", Column<std::int64_t>{});
+    schema.add_column("v", Column<double>{});
+    runtime::LazyTable lazy{
+        std::move(schema), kRows,
+        [&selections](const std::vector<std::string>& names, const runtime::Selection* selection)
+            -> std::expected<runtime::Table, std::string> {
+            selections.push_back(selection == nullptr ? std::nullopt : std::optional{*selection});
+            runtime::Table out;
+            for (const auto& name : names) {
+                if (name == "k") {
+                    std::vector<std::int64_t> values(kRows);
+                    for (std::size_t row = 0; row < kRows; ++row) {
+                        values[row] = static_cast<std::int64_t>(row % 100);
+                    }
+                    out.add_column("k", Column<std::int64_t>{std::move(values)});
+                } else {
+                    out.add_column("v", Column<double>{std::vector<double>(kRows, 1.0)});
+                }
+            }
+            out.logical_rows = kRows;
+            return out;
+        }};
+
+    // Build side saw every key value: pass rate 1.0 -> abandon.
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(100);
+    for (std::int64_t key = 0; key < 100; ++key) {
+        filter.bloom->insert(key);
+    }
+
+    const std::string key = "k";
+    auto table = lazy.project_where({"k", "v"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == kRows);
+    for (const auto& selection : selections) {
+        CHECK_FALSE(selection.has_value());
+    }
+}
+
+TEST_CASE("LazyTable: a selective membership filter prunes past the sample threshold",
+          "[runtime][lazy_table][deferred_scan]") {
+    static constexpr std::size_t kRows = 200000;
+    runtime::Table schema;
+    schema.add_column("k", Column<std::int64_t>{});
+    runtime::LazyTable lazy{
+        std::move(schema), kRows,
+        [](const std::vector<std::string>& names,
+           const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
+            REQUIRE(selection == nullptr);
+            runtime::Table out;
+            for (const auto& name : names) {
+                if (name == "k") {
+                    std::vector<std::int64_t> values(kRows);
+                    for (std::size_t row = 0; row < kRows; ++row) {
+                        values[row] = static_cast<std::int64_t>(row % 100);
+                    }
+                    out.add_column("k", Column<std::int64_t>{std::move(values)});
+                }
+            }
+            out.logical_rows = kRows;
+            return out;
+        }};
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(1);
+    filter.bloom->insert(42);
+    filter.in_list = {42};
+
+    const std::string key = "k";
+    auto table = lazy.project_where({"k"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == kRows / 100);
+}

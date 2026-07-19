@@ -4,6 +4,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
@@ -146,6 +147,58 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     return output;
 }
 
+// Execution-scoped deferred-scan registry (same pattern as cooperative
+// interruption): installed by the whole-script driver around interpret(),
+// consulted by the Scan fallback below and by the chunked inner join.
+static thread_local const DeferredScanRegistry* g_deferred_scans = nullptr;
+
+ScopedDeferredScans::ScopedDeferredScans(const DeferredScanRegistry* scans) noexcept
+    : previous_(g_deferred_scans) {
+    g_deferred_scans = scans;
+}
+
+ScopedDeferredScans::~ScopedDeferredScans() {
+    g_deferred_scans = previous_;
+}
+
+auto current_deferred_scans() noexcept -> const DeferredScanRegistry* {
+    return g_deferred_scans;
+}
+
+auto materialize_deferred_scan(const DeferredScan& scan) -> std::expected<Table, std::string> {
+    std::vector<ir::Expr> conjuncts = scan.conjuncts;
+    const DynamicScanFilter* dynamic = nullptr;
+    if (scan.filter != nullptr && scan.filter->ready) {
+        if (scan.filter->has_membership()) {
+            dynamic = scan.filter.get();
+        }
+        const auto bound = [&](ir::CompareOp op, std::int64_t value) {
+            conjuncts.push_back(ir::Expr{ir::CompareExpr{
+                .op = op,
+                .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = scan.key_column}}),
+                .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = value}}),
+            }});
+        };
+        if (scan.filter->min.has_value()) {
+            bound(ir::CompareOp::Ge, *scan.filter->min);
+        }
+        if (scan.filter->max.has_value()) {
+            bound(ir::CompareOp::Le, *scan.filter->max);
+        }
+    }
+    if (conjuncts.empty() && dynamic == nullptr) {
+        return scan.demand_all ? scan.lazy->materialize() : scan.lazy->project(scan.demand);
+    }
+    std::set<std::string> names = scan.demand;
+    if (scan.demand_all) {
+        for (const auto& field : scan.lazy->schema().columns) {
+            names.insert(field.name);
+        }
+    }
+    return scan.lazy->project_where(names, conjuncts, nullptr, dynamic,
+                                    dynamic != nullptr ? &scan.key_column : nullptr);
+}
+
 auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames)
     -> std::expected<Table, std::string> {
     robin_hood::unordered_map<std::string, std::string> rename_map;
@@ -270,6 +323,19 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             const auto& scan = static_cast<const ir::ScanNode&>(node);
             auto it = registry.find(scan.source_name());
             if (it == registry.end()) {
+                // A deferred lazy source has no registry entry; decode it here
+                // with whatever bounds its join has published so far.
+                if (const auto* deferred = current_deferred_scans(); deferred != nullptr) {
+                    if (const auto entry = deferred->find(scan.source_name());
+                        entry != deferred->end()) {
+                        auto table = materialize_deferred_scan(entry->second);
+                        if (!table.has_value()) {
+                            return std::unexpected(std::move(table.error()));
+                        }
+                        normalize_time_index(table.value());
+                        return std::move(table.value());
+                    }
+                }
                 return std::unexpected("unknown table: " + scan.source_name() +
                                        " (available: " + format_tables(registry) + ")");
             }

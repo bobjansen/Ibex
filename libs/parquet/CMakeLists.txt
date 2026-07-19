@@ -218,14 +218,48 @@ endif()
 
 if(TARGET arrow_shared AND TARGET parquet_shared)
     target_link_libraries(ibex_parquet_plugin PRIVATE arrow_shared parquet_shared CURL::libcurl)
-    set(_ibex_arrow_rpath "$<TARGET_FILE_DIR:arrow_shared>;$<TARGET_FILE_DIR:parquet_shared>")
+    set(_ibex_arrow_shared_targets arrow_shared parquet_shared)
     if(TARGET arrow_ipc_shared)
         target_link_libraries(ibex_parquet_plugin PRIVATE arrow_ipc_shared)
-        string(APPEND _ibex_arrow_rpath ";$<TARGET_FILE_DIR:arrow_ipc_shared>")
+        list(APPEND _ibex_arrow_shared_targets arrow_ipc_shared)
     endif()
-    set_target_properties(ibex_parquet_plugin PROPERTIES
-        BUILD_RPATH "${_ibex_arrow_rpath}"
-    )
+
+    # Ship these plugins next to their arrow/parquet .so/.dylib/.dll: a release
+    # bundle is copied wholesale onto another machine (or even just moved out
+    # of the build tree), so an absolute BUILD_RPATH pointing at
+    # _deps/arrow-build on the CI runner would dangle. $ORIGIN/@loader_path
+    # instead resolves relative to wherever ibex_parquet_plugin itself ends up
+    # — which works as long as its arrow/parquet deps are copied alongside it
+    # (see the POST_BUILD copy below). Windows has no RPATH equivalent, but
+    # doesn't need one: the default DLL search order already includes the
+    # directory of the DLL being loaded, so copying arrow.dll/parquet.dll next
+    # to the plugin is sufficient there.
+    if(APPLE)
+        set_target_properties(ibex_parquet_plugin PROPERTIES
+            BUILD_RPATH "@loader_path"
+        )
+    elseif(NOT WIN32)
+        set_target_properties(ibex_parquet_plugin PROPERTIES
+            BUILD_RPATH "$ORIGIN"
+        )
+    endif()
+
+    foreach(_ibex_arrow_dep IN LISTS _ibex_arrow_shared_targets)
+        # Copy the SONAME-named file (e.g. libarrow.so.2200), not
+        # TARGET_FILE's fully-versioned real file (libarrow.so.2200.0.0): the
+        # dynamic loader resolves ibex_parquet_plugin's DT_NEEDED entries by
+        # SONAME, and `cmake -E copy` dereferences that symlink into a real
+        # file under the SONAME name at the destination, which is exactly the
+        # name the loader looks for. (No-op distinction on Windows, which has
+        # no SONAME concept — TARGET_SONAME_FILE just falls back to
+        # TARGET_FILE there.)
+        add_custom_command(TARGET ibex_parquet_plugin POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_SONAME_FILE:${_ibex_arrow_dep}>"
+                "${_ibex_parquet_output_dir}"
+            COMMENT "Copying ${_ibex_arrow_dep} runtime library next to ibex_parquet_plugin"
+        )
+    endforeach()
 else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()

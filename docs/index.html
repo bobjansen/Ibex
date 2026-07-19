@@ -62,7 +62,7 @@
       <article class="card">
         <span class="tour-tag">Language</span>
         <h3>DataFrame work without stringly SQL glue</h3>
-        <p>Clauses compose left-to-right, columns are real names, and static types catch mistakes before a pipeline runs.</p>
+        <p>Named clauses describe each transformation, column references are checked statically, and type errors are caught before the pipeline runs.</p>
       </article>
       <article class="card">
         <span class="tour-tag">Deployment</span>
@@ -79,7 +79,7 @@
     <p class="section-sub">
       Ibex is built for the expensive part of table work: grouped aggregation,
       rolling time windows, joins, filters, null handling, and reshaping. The
-      benchmark suite compares each query against the same operation in Polars,
+      <a href="benchmarks.html"> benchmark suite</a> compares each query against the same operation in Polars,
       DuckDB, ClickHouse, DataFusion, pandas, data.table, and dplyr.
     </p>
     <div class="grid-3 proof-grid">

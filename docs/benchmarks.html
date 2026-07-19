@@ -43,8 +43,9 @@
       border-radius: 5px; font-size: 0.85rem; cursor: pointer; }
     .column-option:hover { background: rgba(10,127,121,.07); }
     .column-option input { accent-color: var(--accent); }
-    .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px;
-      background: var(--paper); }
+    .tablewrap { width: min(1400px, calc(100vw - 2.4rem)); margin-left: 50%;
+      transform: translateX(-50%); overflow-x: auto; border: 1px solid var(--line);
+      border-radius: 12px; background: var(--paper); }
     table.bench { margin: 0; }
     .bench thead th { position: sticky; top: 0; background: var(--paper); z-index: 2; }
     .bench th.qcol, .bench td.qcol { position: sticky; left: 0; background: var(--paper);

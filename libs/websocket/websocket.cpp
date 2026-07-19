@@ -25,7 +25,7 @@ auto arg_str(const ExternArgs& args, std::size_t index) -> const std::string* {
 
 }  // namespace
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     // ws_listen(port: Int) -> Int
     //
     // Eagerly opens the WebSocket listen socket on `port` so that browser clients

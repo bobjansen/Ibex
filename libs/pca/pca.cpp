@@ -293,7 +293,7 @@ auto predict_pca(const void* native, const runtime::Table& design_matrix)
 
 }  // namespace ibex::pca
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_model("pca", ibex::runtime::ModelOps{
                                         .fit = ibex::pca::fit_pca,
                                         .predict = ibex::pca::predict_pca,

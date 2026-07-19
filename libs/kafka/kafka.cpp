@@ -10,7 +10,7 @@
 
 #include <ibex/runtime/extern_registry.hpp>
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table(
         "kafka_recv",
         [](const ibex::runtime::ExternArgs& args)

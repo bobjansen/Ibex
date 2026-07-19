@@ -10,7 +10,7 @@
 
 #include <ibex/runtime/extern_registry.hpp>
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     // udp_recv(port: Int, schema: String[, options: String]) -> DataFrame
     // Blocks until at least one UDP datagram arrives, drains the ready batch,
     // and returns a multi-row Table whose columns follow the schema string,

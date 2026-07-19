@@ -1,5 +1,17 @@
 #pragma once
 
+// Every plugin's `ibex_register` entry point must be visible in the shared
+// library's export table so the REPL's GetProcAddress/dlsym lookup can find
+// it. `extern "C"` alone only fixes name mangling — on MSVC a symbol isn't
+// exported at all unless explicitly marked dllexport (unlike GCC/Clang, which
+// export by default), so without this a plugin DLL builds fine but the
+// loader reports "has no ibex_register symbol".
+#if defined(_WIN32)
+#define IBEX_PLUGIN_EXPORT __declspec(dllexport)
+#else
+#define IBEX_PLUGIN_EXPORT
+#endif
+
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>

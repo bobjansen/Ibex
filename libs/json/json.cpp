@@ -11,7 +11,7 @@
 
 #include <ibex/runtime/extern_registry.hpp>
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table("read_json",
                              [](const ibex::runtime::ExternArgs& args)
                                  -> std::expected<ibex::runtime::ExternValue, std::string> {

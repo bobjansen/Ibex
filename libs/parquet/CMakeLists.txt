@@ -168,11 +168,15 @@ endif()
 
 add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
-target_compile_options(ibex_parquet_plugin
-    PRIVATE
-        $<$<CXX_COMPILER_ID:Clang>:-Wno-missing-designated-field-initializers>
-        $<$<CXX_COMPILER_ID:AppleClang>:-Wno-missing-field-initializers>
-)
+# -Wno-missing-designated-field-initializers only exists from Clang 19
+# onwards (the release workflow's Linux leg still pins clang-18), so fall
+# back to the older, broader -Wno-missing-field-initializers there instead of
+# erroring on an unknown flag under -Werror.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19)
+    target_compile_options(ibex_parquet_plugin PRIVATE -Wno-missing-designated-field-initializers)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+    target_compile_options(ibex_parquet_plugin PRIVATE -Wno-missing-field-initializers)
+endif()
 
 set_target_properties(ibex_parquet_plugin PROPERTIES
     OUTPUT_NAME parquet

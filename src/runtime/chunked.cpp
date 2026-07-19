@@ -2922,15 +2922,12 @@ class ChunkedInnerJoinOperator final : public Operator {
     // inner join regardless of which side ends up as the build: a probe row
     // whose key fails the filter cannot match.
     //
-    // Two parts, gated differently:
-    // - Membership (exact IN-list when the build side is tiny, Bloom
-    //   otherwise) is published unconditionally: whether it prunes enough to
-    //   act on is decided at the scan by a sampled pass rate — a range
-    //   estimate cannot predict set-membership selectivity.
-    // - Min/max bounds become synthesized conjuncts, so they are withheld
-    //   unless they provably prune: a near-full selection makes
-    //   project_where gather-decode the non-key columns, slower than the
-    //   dense decode it replaces.
+    // Everything here is published ungated — membership because a range
+    // estimate cannot predict set selectivity (the scan decides with a
+    // sampled pass rate), and min/max because the consumer owns the policy:
+    // materialize_deferred_scan gates conjunct synthesis on estimated
+    // pruning, the fused key scan uses the raw bounds for row-group
+    // skipping.
     void publish_build_filter(const Table& build, DynamicScanFilter& slot) const {
         const auto* entry = build.find_entry(keys_->front());
         if (entry == nullptr) {
@@ -2988,25 +2985,10 @@ class ChunkedInnerJoinOperator final : public Operator {
                 slot.in_list = std::move(keys);
             }
         }
-        // Judge selectivity against the source's own footer range for the
-        // scan-side key column. No stats → no way to prove the bounds prune
-        // → withhold them (never pay the gather path on a guess).
-        const auto& stats = deferred_probe_->lazy->column_stats();
-        const auto stat = stats.find(deferred_probe_->key_column);
-        if (stat == stats.end() || !stat->second.min.has_value() || !stat->second.max.has_value()) {
-            return;
-        }
-        const double source_min = static_cast<double>(*stat->second.min);
-        const double source_max = static_cast<double>(*stat->second.max);
-        const double kept_min = std::max(static_cast<double>(mn), source_min);
-        const double kept_max = std::min(static_cast<double>(mx), source_max);
-        const double source_span = source_max - source_min + 1.0;
-        const double kept_span = std::max(0.0, kept_max - kept_min + 1.0);
-        // Assume a uniform key distribution — the only estimate a min/max
-        // pair supports. Require at least ~20% estimated pruning.
-        if (kept_span / source_span > 0.8) {
-            return;
-        }
+        // Raw facts, not policy: whether these bounds are worth acting on is
+        // the consumer's call — materialize_deferred_scan gates synthesized
+        // conjuncts on estimated pruning, while the fused key scan uses them
+        // ungated to skip whole row groups (which has no gather downside).
         slot.min = mn;
         slot.max = mx;
     }

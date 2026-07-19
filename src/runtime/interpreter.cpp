@@ -165,6 +165,28 @@ auto current_deferred_scans() noexcept -> const DeferredScanRegistry* {
     return g_deferred_scans;
 }
 
+/// Whether synthesizing `[min, max]` bound conjuncts is worth it for this
+/// scan: only when the estimated pruning against the source's footer range is
+/// at least ~20% (uniform-distribution estimate — the only one a min/max pair
+/// supports). A near-full selection would push every non-key column onto the
+/// gather-decode path, slower than the dense decode it replaces; no stats
+/// means no proof, so no bounds. The publisher records raw bounds always —
+/// this is the consumer-side policy.
+static auto bounds_worth_applying(const DeferredScan& scan) -> bool {
+    const auto& stats = scan.lazy->column_stats();
+    const auto stat = stats.find(scan.key_column);
+    if (stat == stats.end() || !stat->second.min.has_value() || !stat->second.max.has_value()) {
+        return false;
+    }
+    const double source_min = static_cast<double>(*stat->second.min);
+    const double source_max = static_cast<double>(*stat->second.max);
+    const double kept_min = std::max(static_cast<double>(*scan.filter->min), source_min);
+    const double kept_max = std::min(static_cast<double>(*scan.filter->max), source_max);
+    const double source_span = source_max - source_min + 1.0;
+    const double kept_span = std::max(0.0, kept_max - kept_min + 1.0);
+    return kept_span / source_span <= 0.8;
+}
+
 auto materialize_deferred_scan(const DeferredScan& scan) -> std::expected<Table, std::string> {
     std::vector<ir::Expr> conjuncts = scan.conjuncts;
     const DynamicScanFilter* dynamic = nullptr;
@@ -172,17 +194,19 @@ auto materialize_deferred_scan(const DeferredScan& scan) -> std::expected<Table,
         if (scan.filter->has_membership()) {
             dynamic = scan.filter.get();
         }
-        const auto bound = [&](ir::CompareOp op, std::int64_t value) {
-            conjuncts.push_back(ir::Expr{ir::CompareExpr{
-                .op = op,
-                .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = scan.key_column}}),
-                .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = value}}),
-            }});
-        };
-        if (scan.filter->min.has_value()) {
+        // Bound conjuncts only when there is no membership filter (the Bloom
+        // was built from exactly these keys, so bounds add nothing to it) and
+        // they provably prune.
+        if (dynamic == nullptr && scan.filter->min.has_value() && scan.filter->max.has_value() &&
+            bounds_worth_applying(scan)) {
+            const auto bound = [&](ir::CompareOp op, std::int64_t value) {
+                conjuncts.push_back(ir::Expr{ir::CompareExpr{
+                    .op = op,
+                    .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = scan.key_column}}),
+                    .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = value}}),
+                }});
+            };
             bound(ir::CompareOp::Ge, *scan.filter->min);
-        }
-        if (scan.filter->max.has_value()) {
             bound(ir::CompareOp::Le, *scan.filter->max);
         }
     }

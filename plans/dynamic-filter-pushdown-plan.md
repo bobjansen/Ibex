@@ -1,7 +1,8 @@
 # Dynamic filter pushdown into parquet scans (sideways information passing)
 
-Status: Stages 1-2 implemented (uncommitted working tree, 2026-07-18/19);
-stages 3-4 open — stage 3 partially subsumed by measurement, see below.
+Status: COMPLETE. Stages 1-2 committed (a2e5527, 2026-07-19); stage 3
+subsumed by measurement (fires free on chained author orders); stage 4
+(fused key scan in the parquet decoder) implemented 2026-07-19.
 Parent investigation: `multiway-join-chain-perf-plan.md` (stage profile,
 probe-side Bloom dead end, DuckDB EXPLAIN ANALYZE comparison — all measured
 2026-07-18, same box, SF-1, single-threaded, `build-release/`).
@@ -192,10 +193,46 @@ New IR marker + deferred decode, single-hop first:
    lineitem Bloom sees date-filtered orders only → 16% not 3.3%) — a
    join-ORDER question, out of scope here; recorded for the reorder cost
    model.
-4. **Fuse the filter into the decoder** (decode-fusion Stage 4 synergy):
-   evaluate bounds/Bloom against dictionary pages / plain runs during decode
-   instead of decoding the key column fully first. Only worth scoping after
-   stages 1-2 show where the remaining time sits.
+4. **Fuse the filter into the decoder. — DONE (2026-07-19).** What shipped:
+   - `KeyFilterScanFn` — an OPTIONAL second callback on `LazyTable`
+     (alongside `ColumnDecodeFn`): `(key_name, DynamicScanFilter) ->
+     expected<optional<Selection>>`. The inner nullopt means "no fused
+     answer" (unsupported column type, or the filter stopped rejecting) and
+     the caller falls back to the stage-2 decode-then-filter path, so
+     correctness never depends on the fused path existing. This IS a plugin
+     interface addition — LazyTable grew a member, so every plugin needs a
+     rebuild (the Table(n) ABI gotcha; a stale parquet.so segfaulted
+     instantly in cache_ lookup during verification).
+   - `filtered_key_selection_impl` (parquet.hpp): per row group, skip
+     unread when the chunk's footer range is disjoint from the build keys'
+     raw bounds; otherwise ReadBatch the key pages and evaluate
+     `filter.passes` as values leave the decoder, emitting passing row
+     indices. Null keys fail. INT32/INT64 physical only (sign-extension
+     identical to the ordinary decode); nested/unsigned-32 decline. An
+     in-decoder escape hatch mirrors the runtime's: past 256K scanned rows
+     at >0.75 running pass rate, give up (bounded waste: a couple of
+     groups' key decode, and the fallback re-decodes the key which the
+     join demanded anyway).
+   - `project_where` takes the fused path only when membership is present,
+     conjuncts are empty, AND the key is not already cached whole-file (a
+     cached key means the in-memory pass is cheaper than re-reading pages
+     — the q17 double-instance case).
+   - Publisher/consumer split: `publish_build_filter` now records raw
+     min/max always (facts); `materialize_deferred_scan` owns the ≥20%
+     pruning gate for synthesized conjuncts and skips bounds entirely when
+     membership exists (policy). The fused scan uses the raw bounds for
+     row-group skipping, which has no gather downside.
+   Results (interleaved A/B vs the stage-2 binary, 7 reps, mins, SF-1):
+   **geomean 0.984** — q17 0.84, q08 0.92, q05 0.95, q02/q19 0.97, rest
+   parity (q12/q22 re-measured at 9 reps: noise); hit-heavy stress 436 vs
+   435ms. The fused pass shows up as ~13% of q05 (page decode + Bloom,
+   fused) replacing the ~19% it superseded (whole-column key decode +
+   alloc + separate Bloom pass). Cumulative vs the pre-plan baseline:
+   **geomean ≈ 0.88**. Correctness: 22/22 byte-identical, check_answers
+   OK, 1211/1211 clang release (4 new fused-path tests), g++ strict clean
+   1205/1205. Conjunct-carrying scans (q03/q07/q10 lineitem) still use
+   the stage-2 path — folding static conjuncts into the decoder is
+   decode-fusion Stage 4 (see project_decode_fusion), not this plan.
 
 ## Expected outcome
 
@@ -247,4 +284,7 @@ is ~2.5ns/key (~15ms over lineitem).
   findings for the cost model rather than acting on them).
 - Multi-key joins (q05's supplier edge) — the composite-int-key path is a
   separate follow-up once single-key lands.
-- Plugin ABI changes — none needed; assert this stays true in review.
+- Plugin ABI changes — none were needed for stages 1-3. Stage 4 added the
+  optional `KeyFilterScanFn` to `LazyTable` (member layout change → every
+  plugin .so must be rebuilt against the new headers; sources that don't
+  supply one are untouched behaviorally).

@@ -1651,6 +1651,118 @@ inline auto read_column_stats(const parquet::FileMetaData& metadata,
     return out;
 }
 
+/// Fused dynamic-filter key scan (dynamic filter pushdown, stage 4): decode
+/// the key column batch by batch and evaluate the join-derived filter as
+/// values leave the page decoder, emitting passing row indices instead of a
+/// materialized column. Row groups whose footer range is disjoint from the
+/// build keys' bounds are skipped without touching a page. Rows with a null
+/// key fail the filter (the caller proved the scan feeds one inner join, and
+/// null keys never match).
+///
+/// Returns nullopt when the filter stops rejecting: mirroring the runtime's
+/// escape hatch, a filter that passes almost everything must not force the
+/// gather-decode path, so once enough rows are scanned at a high pass rate
+/// the scan gives up and the caller decodes densely.
+template <typename DType>
+inline auto filtered_key_selection_impl(parquet::arrow::FileReader& reader, int leaf_index,
+                                        const ibex::runtime::DynamicScanFilter& filter)
+    -> std::optional<ibex::runtime::Selection> {
+    using Raw = typename DType::c_type;
+    const auto& metadata = *reader.parquet_reader()->metadata();
+
+    // Same policy knobs as the runtime's sampled escape hatch, applied to
+    // running totals: decided per row group, so a wrong guess costs at most
+    // a couple of groups' key decode.
+    constexpr double kAbandonPassRate = 0.75;
+    constexpr std::size_t kAbandonMinRows = 1 << 18;
+
+    ibex::runtime::Selection selected;
+    std::unique_ptr<Raw[]> values(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::unique_ptr<std::int16_t[]> definitions(
+        new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+
+    std::size_t base = 0;
+    std::size_t scanned = 0;
+    for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        const auto group_rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        // A group whose stats range is disjoint from the build keys' range
+        // cannot contribute a match; skip it without reading a page.
+        if (filter.min.has_value() && filter.max.has_value()) {
+            const auto chunk = metadata.RowGroup(group)->ColumnChunk(leaf_index);
+            if (chunk->is_stats_set()) {
+                const auto stats = chunk->statistics();
+                if (stats != nullptr && stats->HasMinMax() &&
+                    stats->physical_type() == DType::type_num) {
+                    const auto& typed_stats =
+                        static_cast<const parquet::TypedStatistics<DType>&>(*stats);
+                    const auto group_min = static_cast<std::int64_t>(typed_stats.min());
+                    const auto group_max = static_cast<std::int64_t>(typed_stats.max());
+                    if (group_max < *filter.min || group_min > *filter.max) {
+                        base += group_rows;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        auto column = reader.parquet_reader()->RowGroup(group)->Column(leaf_index);
+        if (column->type() != DType::type_num) {
+            throw std::runtime_error("read_parquet: physical column type does not match schema");
+        }
+        const auto* descriptor = column->descr();
+        if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
+            return std::nullopt;  // nested columns: no fused answer
+        }
+        const bool optional = descriptor->max_definition_level() != 0;
+        auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
+
+        std::size_t row = 0;
+        while (row < group_rows && typed->HasNext()) {
+            const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
+                static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+            std::int64_t values_read = 0;
+            const std::int64_t levels_read =
+                typed->ReadBatch(request, optional ? definitions.get() : nullptr, nullptr,
+                                 values.get(), &values_read);
+            if (levels_read <= 0) {
+                throw std::runtime_error("read_parquet: key column ended before its row group");
+            }
+            if (!optional || values_read == levels_read) {
+                for (std::int64_t i = 0; i < values_read; ++i) {
+                    if (filter.passes(
+                            static_cast<std::int64_t>(values[static_cast<std::size_t>(i)]))) {
+                        selected.push_back(base + row + static_cast<std::size_t>(i));
+                    }
+                }
+            } else {
+                // Nulls present: values are compacted, definition levels map
+                // them back to rows. A null key fails the filter.
+                std::size_t value_index = 0;
+                for (std::int64_t i = 0; i < levels_read; ++i) {
+                    if (definitions[static_cast<std::size_t>(i)] == 0) {
+                        continue;
+                    }
+                    if (filter.passes(static_cast<std::int64_t>(values[value_index]))) {
+                        selected.push_back(base + row + static_cast<std::size_t>(i));
+                    }
+                    ++value_index;
+                }
+            }
+            row += static_cast<std::size_t>(levels_read);
+        }
+        if (row != group_rows) {
+            throw std::runtime_error("read_parquet: key column ended before its row group");
+        }
+        base += group_rows;
+        scanned += group_rows;
+        if (scanned >= kAbandonMinRows && static_cast<double>(selected.size()) >
+                                              kAbandonPassRate * static_cast<double>(scanned)) {
+            return std::nullopt;
+        }
+    }
+    return selected;
+}
+
 inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
     std::string path_string{path};
     auto input = open_parquet_input(path);
@@ -1698,9 +1810,49 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
         }
     };
 
+    auto key_filter_scan = [reader, indices, arrow_schema, path_string](
+                               const std::string& key,
+                               const ibex::runtime::DynamicScanFilter& filter)
+        -> std::expected<std::optional<ibex::runtime::Selection>, std::string> {
+        auto it = indices->find(key);
+        if (it == indices->end()) {
+            return std::unexpected("read_parquet: no column '" + key + "' in " + path_string);
+        }
+        // Only types whose ordinary decode is the identity/sign-extension
+        // into int64 — the fused filter must see exactly the values the
+        // materialized column would hold. (Zero-extended unsigned widths
+        // would need their own conversion; join keys are never those.)
+        const auto id = arrow_schema->field(it->second)->type()->id();
+        const bool fusable = id == arrow::Type::INT8 || id == arrow::Type::INT16 ||
+                             id == arrow::Type::INT32 || id == arrow::Type::INT64 ||
+                             id == arrow::Type::UINT64;
+        const auto& manifest = reader->manifest();
+        if (!fusable || it->second >= static_cast<int>(manifest.schema_fields.size()) ||
+            !manifest.schema_fields[static_cast<std::size_t>(it->second)].is_leaf()) {
+            return std::optional<ibex::runtime::Selection>{};
+        }
+        const int leaf_index =
+            manifest.schema_fields[static_cast<std::size_t>(it->second)].column_index;
+        try {
+            const auto physical =
+                reader->parquet_reader()->metadata()->schema()->Column(leaf_index)->physical_type();
+            if (physical == parquet::Type::INT64) {
+                return filtered_key_selection_impl<parquet::Int64Type>(*reader, leaf_index, filter);
+            }
+            if (physical == parquet::Type::INT32) {
+                return filtered_key_selection_impl<parquet::Int32Type>(*reader, leaf_index, filter);
+            }
+            return std::optional<ibex::runtime::Selection>{};
+        } catch (const std::exception& e) {
+            return std::unexpected("read_parquet: fused key filter scan failed on " + path_string +
+                                   " (" + e.what() + ")");
+        }
+    };
+
     return std::make_shared<ibex::runtime::LazyTable>(
         schema_table_from_arrow(*arrow_schema), rows, std::move(decode),
-        read_column_stats(*reader->parquet_reader()->metadata(), *arrow_schema));
+        read_column_stats(*reader->parquet_reader()->metadata(), *arrow_schema),
+        std::move(key_filter_scan));
 }
 
 inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {

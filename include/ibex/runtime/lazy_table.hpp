@@ -25,6 +25,15 @@ using Selection = std::vector<std::size_t>;
 using ColumnDecodeFn = std::function<std::expected<Table, std::string>(
     const std::vector<std::string>&, const Selection*)>;
 
+/// Optional fused scan a source may support: evaluate a join-derived key
+/// filter against the named column *during* its decode and return the passing
+/// rows, without materializing the column. The inner optional is nullopt when
+/// the source has no fused answer — an unsupported column type, or the filter
+/// stopped rejecting partway through — and the caller must fall back to the
+/// ordinary decode-then-filter path, which is always correct.
+using KeyFilterScanFn = std::function<std::expected<std::optional<Selection>, std::string>(
+    const std::string&, const DynamicScanFilter&)>;
+
 /// What a source's metadata says about one column before anything is decoded.
 ///
 /// Parquet footers carry min/max and a null count per column chunk. They do
@@ -62,8 +71,10 @@ class LazyTable {
     /// `schema` is a zero-row Table carrying the source's column names and
     /// types; `rows` is its true row count. `stats` is optional metadata a
     /// source may know for free (Parquet's footer); an empty map costs only the
-    /// planning that would have used it.
-    LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats = {});
+    /// planning that would have used it. `key_filter_scan` is the optional
+    /// fused dynamic-filter scan; sources without one leave it empty.
+    LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats = {},
+              KeyFilterScanFn key_filter_scan = {});
 
     /// Column names and types, with no rows. Cheap: known from metadata alone.
     [[nodiscard]] auto schema() const noexcept -> const Table& { return schema_; }
@@ -106,6 +117,7 @@ class LazyTable {
     std::size_t rows_ = 0;
     ColumnDecodeFn decode_;
     SourceColumnStats stats_;
+    KeyFilterScanFn key_filter_scan_;
     robin_hood::unordered_map<std::string, ColumnEntry> cache_;
 };
 

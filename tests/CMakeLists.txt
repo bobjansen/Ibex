@@ -55,7 +55,9 @@ if(NOT WIN32)
     )
 endif()
 
-find_package(CURL REQUIRED)
+# CURL is optional (see libs/csv/CMakeLists.txt): test_csv.cpp only needs it
+# to exercise read_csv's HTTPS path, which is itself optional.
+find_package(CURL)
 
 target_link_libraries(ibex_tests
     PRIVATE
@@ -71,8 +73,12 @@ target_link_libraries(ibex_tests
         ibex_test_warning_suppressions
         nlohmann_json::nlohmann_json
         fast_float
-        CURL::libcurl
 )
+
+if(CURL_FOUND)
+    target_link_libraries(ibex_tests PRIVATE CURL::libcurl)
+    target_compile_definitions(ibex_tests PRIVATE IBEX_CSV_HAVE_CURL)
+endif()
 if(TARGET avrocpp_s)
     target_link_libraries(ibex_tests PRIVATE avrocpp_s)
 elseif(TARGET avrocpp)

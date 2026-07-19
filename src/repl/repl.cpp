@@ -4484,7 +4484,48 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             rewritten = ir::remove_applied_scan_filters(std::move(rewritten), applied_filters);
         }
         const auto demand = ir::required_columns(*rewritten);
+        // Deferred probe scans: an eligible scan (sole feed of an inner
+        // single-key join's right side, through projects/renames only) is not
+        // decoded here. The join decodes it during execution, after
+        // publishing build-side key bounds into its filter slot — see
+        // plans/dynamic-filter-pushdown-plan.md. The shared LazyTable is what
+        // makes this safe: project_where bypasses its whole-column cache.
+        const auto resolve_lazy_ptr = [&](const std::string& name) -> runtime::LazyTablePtr {
+            auto it = lazy_sources.find(name);
+            if (it == lazy_sources.end()) {
+                if (const auto instance = split.instances.find(name);
+                    instance != split.instances.end()) {
+                    it = lazy_sources.find(instance->second);
+                }
+            }
+            return it == lazy_sources.end() ? nullptr : it->second;
+        };
+        std::set<std::string> deferrable_names = lazy_names;
+        for (const auto& [instance_name, source] : split.instances) {
+            deferrable_names.insert(instance_name);
+        }
+        runtime::DeferredScanRegistry deferred_scans;
+        for (auto& [name, info] : ir::deferrable_probe_scans(*rewritten, deferrable_names)) {
+            const auto needed = demand.find(name);
+            auto lazy = resolve_lazy_ptr(name);
+            if (needed == demand.end() || lazy == nullptr) {
+                continue;
+            }
+            deferred_scans.emplace(
+                name, runtime::DeferredScan{
+                          .lazy = std::move(lazy),
+                          .conjuncts = applied_filters.contains(name) ? predicates.at(name)
+                                                                      : std::vector<ir::Expr>{},
+                          .demand = needed->second.names,
+                          .demand_all = needed->second.all,
+                          .key_column = std::move(info.key_column),
+                          .filter = std::make_shared<runtime::DynamicScanFilter>(),
+                      });
+        }
         for (const auto& [name, needed] : demand) {
+            if (deferred_scans.contains(name)) {
+                continue;
+            }
             auto* lazy = resolve_lazy(name);
             if (lazy == nullptr) {
                 continue;
@@ -4506,6 +4547,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
             tables.insert_or_assign(name, std::move(table.value()));
         }
+        const runtime::ScopedDeferredScans deferred_guard(&deferred_scans);
         return runtime::interpret(*rewritten, tables, nullptr, &externs);
     };
 

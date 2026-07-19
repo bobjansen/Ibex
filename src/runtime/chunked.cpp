@@ -8,6 +8,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <algorithm>
@@ -2694,6 +2695,31 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     std::vector<uint8_t> left_cat_matches_;
 };
 
+/// If `right` is a chain of Project/Rename nodes over a Scan whose name the
+/// driver registered as a deferred probe scan, return its registration. The
+/// driver only registers scans it proved eligible (ir::deferrable_probe_scans:
+/// occurs once, feeds exactly this shape), so a hit here IS the eligible
+/// position.
+auto deferred_probe_scan_of(const ir::Node& right) -> const DeferredScan* {
+    const auto* deferred = current_deferred_scans();
+    if (deferred == nullptr) {
+        return nullptr;
+    }
+    const ir::Node* cur = &right;
+    while (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename ||
+           cur->kind() == ir::NodeKind::Update) {
+        if (cur->children().size() != 1 || cur->children().front() == nullptr) {
+            return nullptr;
+        }
+        cur = cur->children().front().get();
+    }
+    if (cur->kind() != ir::NodeKind::Scan) {
+        return nullptr;
+    }
+    const auto it = deferred->find(static_cast<const ir::ScanNode&>(*cur).source_name());
+    return it == deferred->end() ? nullptr : &it->second;
+}
+
 /// Inner hash join for single-key no-predicate joins.
 ///
 /// Two execution modes:
@@ -2715,6 +2741,23 @@ class ChunkedInnerJoinOperator final : public Operator {
    public:
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<std::string>* keys)
         : left_(std::move(left)), right_(std::move(right)), keys_(keys) {}
+
+    /// Deferred-probe variant: the right side is an undecoded lazy scan (plus
+    /// its Project/Rename wrappers), interpreted only after this join has
+    /// published build-side key bounds into the scan's filter slot. The
+    /// registry/scalars/externs pointers are the interpret context and outlive
+    /// the operator.
+    ChunkedInnerJoinOperator(OperatorPtr left, const ir::Node* right_node,
+                             const TableRegistry* registry, const ScalarRegistry* scalars,
+                             const ExternRegistry* externs, const std::vector<std::string>* keys,
+                             const DeferredScan* probe)
+        : left_(std::move(left)),
+          keys_(keys),
+          deferred_probe_(probe),
+          deferred_right_node_(right_node),
+          deferred_registry_(registry),
+          deferred_scalars_(scalars),
+          deferred_externs_(externs) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -2786,6 +2829,11 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (keys_->size() != 1) {
             return "ChunkedInnerJoinOperator only supports single-key joins";
         }
+        if (deferred_probe_ != nullptr) {
+            if (auto err = resolve_deferred_probe()) {
+                return err;
+            }
+        }
         const std::string& key_name = keys_->front();
         const ColumnValue* rkey = right_.find(key_name);
         if (rkey == nullptr) {
@@ -2805,11 +2853,19 @@ class ChunkedInnerJoinOperator final : public Operator {
             return std::nullopt;
         }
 
-        auto left_res = MaterializeOperator(std::move(left_)).run();
-        if (!left_res.has_value()) {
-            return std::move(left_res.error());
+        Table left_table;
+        if (use_materialized_left_ && left_materialized_.has_value()) {
+            // The deferred-probe path already drained the left child.
+            left_table = std::move(*left_materialized_);
+            left_materialized_.reset();
+            use_materialized_left_ = false;
+        } else {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            left_table = std::move(*left_res);
         }
-        Table left_table = std::move(*left_res);
         const std::size_t n_left = left_table.rows();
 
         if (n_left < n_right) {
@@ -2829,6 +2885,130 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         setup_right_emit_schema(key_name);
         return std::nullopt;
+    }
+
+    /// The probe side is an undecoded lazy scan. When it is worth it, drain
+    /// the build (left) side first and publish its key filter (membership +
+    /// bounds) into the scan's filter slot, so the scan skips materializing
+    /// rows that cannot match. Every path marks the slot ready before the
+    /// scan is interpreted; the filter is an optimization the slot may
+    /// simply not carry.
+    auto resolve_deferred_probe() -> std::optional<std::string> {
+        DynamicScanFilter& slot = *deferred_probe_->filter;
+        // Pre-filter row count: an upper bound on the decoded size, good
+        // enough to decide whether the probe side is large enough to bother.
+        if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            publish_build_filter(*left_res, slot);
+            left_materialized_ = std::move(*left_res);
+            use_materialized_left_ = true;
+        }
+        slot.ready = true;
+        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
+                                    deferred_externs_);
+        if (!right.has_value()) {
+            return std::move(right.error());
+        }
+        right_ = std::move(right.value());
+        deferred_probe_ = nullptr;
+        return std::nullopt;
+    }
+
+    // Derive the probe scan's dynamic filter from the build side's valid key
+    // values (int keys only; other key types publish nothing). Sound for any
+    // inner join regardless of which side ends up as the build: a probe row
+    // whose key fails the filter cannot match.
+    //
+    // Two parts, gated differently:
+    // - Membership (exact IN-list when the build side is tiny, Bloom
+    //   otherwise) is published unconditionally: whether it prunes enough to
+    //   act on is decided at the scan by a sampled pass rate — a range
+    //   estimate cannot predict set-membership selectivity.
+    // - Min/max bounds become synthesized conjuncts, so they are withheld
+    //   unless they provably prune: a near-full selection makes
+    //   project_where gather-decode the non-key columns, slower than the
+    //   dense decode it replaces.
+    void publish_build_filter(const Table& build, DynamicScanFilter& slot) const {
+        const auto* entry = build.find_entry(keys_->front());
+        if (entry == nullptr) {
+            return;
+        }
+        const auto* col = std::get_if<Column<std::int64_t>>(&*entry->column);
+        if (col == nullptr || col->size() == 0) {
+            return;
+        }
+        const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
+        const auto* data = col->data();
+        const std::size_t n = col->size();
+        std::int64_t mn = std::numeric_limits<std::int64_t>::max();
+        std::int64_t mx = std::numeric_limits<std::int64_t>::min();
+        std::size_t valid_rows = 0;
+        for (std::size_t r = 0; r < n; ++r) {
+            if (validity != nullptr && !(*validity)[r]) {
+                continue;
+            }
+            mn = std::min(mn, data[r]);
+            mx = std::max(mx, data[r]);
+            ++valid_rows;
+        }
+        if (valid_rows == 0) {
+            return;
+        }
+
+        // Every build side gets a Bloom — even alongside an exact list, the
+        // Bloom is the probe fast path (see DynamicScanFilter::passes).
+        // Duplicate inserts are harmless. A small build side (dimension
+        // chains: nation, region, filtered part) additionally dedups cheaply
+        // into an exact list, cancelling the Bloom's false positives.
+        constexpr std::size_t kInListBuildMax = 4096;
+        constexpr std::size_t kInListMax = 1024;
+        JoinBloomFilter bloom(valid_rows);
+        for (std::size_t r = 0; r < n; ++r) {
+            if (validity != nullptr && !(*validity)[r]) {
+                continue;
+            }
+            bloom.insert(data[r]);
+        }
+        slot.bloom = std::move(bloom);
+        if (valid_rows <= kInListBuildMax) {
+            std::vector<std::int64_t> keys;
+            keys.reserve(valid_rows);
+            for (std::size_t r = 0; r < n; ++r) {
+                if (validity != nullptr && !(*validity)[r]) {
+                    continue;
+                }
+                keys.push_back(data[r]);
+            }
+            std::sort(keys.begin(), keys.end());
+            keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+            if (keys.size() <= kInListMax) {
+                slot.in_list = std::move(keys);
+            }
+        }
+        // Judge selectivity against the source's own footer range for the
+        // scan-side key column. No stats → no way to prove the bounds prune
+        // → withhold them (never pay the gather path on a guess).
+        const auto& stats = deferred_probe_->lazy->column_stats();
+        const auto stat = stats.find(deferred_probe_->key_column);
+        if (stat == stats.end() || !stat->second.min.has_value() || !stat->second.max.has_value()) {
+            return;
+        }
+        const double source_min = static_cast<double>(*stat->second.min);
+        const double source_max = static_cast<double>(*stat->second.max);
+        const double kept_min = std::max(static_cast<double>(mn), source_min);
+        const double kept_max = std::min(static_cast<double>(mx), source_max);
+        const double source_span = source_max - source_min + 1.0;
+        const double kept_span = std::max(0.0, kept_max - kept_min + 1.0);
+        // Assume a uniform key distribution — the only estimate a min/max
+        // pair supports. Require at least ~20% estimated pruning.
+        if (kept_span / source_span > 0.8) {
+            return;
+        }
+        slot.min = mn;
+        slot.max = mx;
     }
 
     static auto detect_key_kind(const ColumnValue& col, ExprType& out)
@@ -3295,6 +3475,14 @@ class ChunkedInnerJoinOperator final : public Operator {
     OperatorPtr left_;
     Table right_;
     const std::vector<std::string>* keys_;
+
+    // Deferred-probe context (see the second constructor). `deferred_probe_`
+    // doubles as the mode flag: non-null until the probe scan is resolved.
+    const DeferredScan* deferred_probe_ = nullptr;
+    const ir::Node* deferred_right_node_ = nullptr;
+    const TableRegistry* deferred_registry_ = nullptr;
+    const ScalarRegistry* deferred_scalars_ = nullptr;
+    const ExternRegistry* deferred_externs_ = nullptr;
 
     bool initialized_ = false;
     Mode mode_ = Mode::Stream;
@@ -5661,6 +5849,14 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 build_operator(*join.children()[0], registry, scalars, externs, model_out);
             if (!left_op.has_value()) {
                 return std::unexpected(std::move(left_op.error()));
+            }
+            // A deferred probe scan must not be interpreted here — the join
+            // publishes build-side bounds into its filter slot first, then
+            // interprets the right subtree itself (resolve_deferred_probe).
+            if (const auto* probe = deferred_probe_scan_of(*join.children()[1]); probe != nullptr) {
+                return std::make_unique<ChunkedInnerJoinOperator>(
+                    std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
+                    externs, &join.keys(), probe);
             }
             auto right_op =
                 build_operator(*join.children()[1], registry, scalars, externs, model_out);

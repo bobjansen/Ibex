@@ -603,3 +603,130 @@ TEST_CASE("LazyTable: a selective membership filter prunes past the sample thres
     REQUIRE(table);
     CHECK(table->rows() == kRows / 100);
 }
+
+TEST_CASE("LazyTable: a fused key filter scan replaces the decode-then-filter path",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    std::vector<std::string> scanned_keys;
+    runtime::LazyTable lazy{
+        source.schema(),
+        3,
+        [&source](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        },
+        {},
+        [&scanned_keys](const std::string& key, const runtime::DynamicScanFilter&)
+            -> std::expected<std::optional<runtime::Selection>, std::string> {
+            scanned_keys.push_back(key);
+            return std::optional{runtime::Selection{1, 2}};
+        }};
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(2);
+    filter.bloom->insert(2);
+    filter.bloom->insert(3);
+
+    const std::string key = "a";
+    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+    CHECK(scanned_keys == std::vector<std::string>{"a"});
+    // One decode call, already selected — the key column was never
+    // materialized whole-file.
+    REQUIRE(source.selections.size() == 1);
+    REQUIRE(source.selections.front().has_value());
+    CHECK(*source.selections.front() == runtime::Selection{1, 2});
+    CHECK(source.decode_calls.front() == std::vector<std::string>{"a", "b"});
+}
+
+TEST_CASE("LazyTable: a fused scan with no answer falls back to decode-then-filter",
+          "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    runtime::LazyTable lazy{
+        source.schema(),
+        3,
+        [&source](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        },
+        {},
+        [](const std::string&, const runtime::DynamicScanFilter&)
+            -> std::expected<std::optional<runtime::Selection>, std::string> {
+            return std::optional<runtime::Selection>{};  // no fused answer
+        }};
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(2);
+    filter.bloom->insert(2);
+    filter.bloom->insert(3);
+    filter.in_list = {2, 3};
+
+    const std::string key = "a";
+    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+    // Ordinary path: key decoded whole-file first, payload through the
+    // filtered selection.
+    REQUIRE(source.selections.size() == 2);
+    CHECK_FALSE(source.selections.front().has_value());
+    REQUIRE(source.selections.back().has_value());
+    CHECK(*source.selections.back() == runtime::Selection{1, 2});
+}
+
+TEST_CASE("LazyTable: a fused scan error surfaces", "[runtime][lazy_table][deferred_scan]") {
+    FakeSource source;
+    runtime::LazyTable lazy{
+        source.schema(),
+        3,
+        [&source](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        },
+        {},
+        [](const std::string&, const runtime::DynamicScanFilter&)
+            -> std::expected<std::optional<runtime::Selection>, std::string> {
+            return std::unexpected("fused scan boom");
+        }};
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(1);
+    filter.bloom->insert(2);
+
+    const std::string key = "a";
+    auto table = lazy.project_where({"a"}, {}, nullptr, &filter, &key);
+    REQUIRE_FALSE(table);
+    CHECK(table.error() == "fused scan boom");
+}
+
+TEST_CASE("LazyTable: a cached key column bypasses the fused scan",
+          "[runtime][lazy_table][deferred_scan]") {
+    // Another consumer already decoded the key whole-file (a second scan
+    // instance, q17-style); filtering the cached values in memory beats
+    // re-reading pages, so the fused scan must not run.
+    FakeSource source;
+    bool fused_called = false;
+    runtime::LazyTable lazy{
+        source.schema(),
+        3,
+        [&source](const std::vector<std::string>& names, const runtime::Selection* selection) {
+            return source.decode(names, selection);
+        },
+        {},
+        [&fused_called](const std::string&, const runtime::DynamicScanFilter&)
+            -> std::expected<std::optional<runtime::Selection>, std::string> {
+            fused_called = true;
+            return std::optional{runtime::Selection{}};
+        }};
+
+    REQUIRE(lazy.project({"a"}));
+
+    runtime::DynamicScanFilter filter;
+    filter.bloom.emplace(2);
+    filter.bloom->insert(2);
+    filter.bloom->insert(3);
+    filter.in_list = {2, 3};
+
+    const std::string key = "a";
+    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    REQUIRE(table);
+    CHECK(table->rows() == 2);
+    CHECK_FALSE(fused_called);
+}

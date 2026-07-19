@@ -15,11 +15,13 @@
 
 namespace ibex::runtime {
 
-LazyTable::LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats)
+LazyTable::LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats,
+                     KeyFilterScanFn key_filter_scan)
     : schema_(std::move(schema)),
       rows_(rows),
       decode_(std::move(decode)),
-      stats_(std::move(stats)) {}
+      stats_(std::move(stats)),
+      key_filter_scan_(std::move(key_filter_scan)) {}
 
 auto LazyTable::project(const std::set<std::string>& names) -> std::expected<Table, std::string> {
     std::vector<std::string> missing;
@@ -171,6 +173,51 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         dynamic != nullptr && dynamic_key != nullptr && dynamic->has_membership();
     if (conjuncts.empty() && !membership) {
         return project(names);
+    }
+
+    // Fused path: the source evaluates the key filter inside its own decoder,
+    // so the key column is never materialized whole-file. Only worth taking
+    // when nothing else needs that column densely — a cached key means the
+    // in-memory filter pass below is cheaper than re-reading pages.
+    if (membership && conjuncts.empty() && key_filter_scan_ != nullptr &&
+        !cache_.contains(*dynamic_key)) {
+        auto scan = key_filter_scan_(*dynamic_key, *dynamic);
+        if (!scan) {
+            return std::unexpected(scan.error());
+        }
+        if (scan->has_value()) {
+            Selection selected = std::move(**scan);
+            const bool all_rows = selected.size() == rows_;
+            std::vector<std::string> wanted;
+            for (const auto& field : schema_.columns) {
+                if (names.contains(field.name)) {
+                    wanted.push_back(field.name);
+                }
+            }
+            if (!wanted.empty()) {
+                auto decoded = decode_(wanted, all_rows ? nullptr : &selected);
+                if (!decoded) {
+                    return std::unexpected(decoded.error());
+                }
+                if (decoded->rows() != selected.size()) {
+                    return std::unexpected(
+                        "lazy source produced selected columns with the wrong row count");
+                }
+                Table out;
+                for (const auto& name : wanted) {
+                    const auto* entry = decoded->find_entry(name);
+                    if (entry == nullptr) {
+                        return std::unexpected("lazy source did not produce requested column '" +
+                                               name + "'");
+                    }
+                    out.add_column_shared(entry->name, entry->column, entry->validity);
+                }
+                out.logical_rows = selected.size();
+                return out;
+            }
+        }
+        // No fused answer (unsupported type, or the filter stopped
+        // rejecting): the ordinary decode-then-filter path below stands.
     }
 
     robin_hood::unordered_set<std::string> referenced;

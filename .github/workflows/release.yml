@@ -46,7 +46,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 cmake ninja-build
+          sudo apt-get install -y clang-18 cmake ninja-build libcurl4-openssl-dev
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
@@ -59,7 +59,8 @@ jobs:
             -DIBEX_WARNINGS_AS_ERRORS=ON \
             -DIBEX_ENABLE_MARCH_NATIVE=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
-            -DIBEX_BUILD_PARQUET=OFF
+            -DIBEX_BUILD_PARQUET=ON \
+            -DIBEX_PARQUET_S3=OFF
 
       - name: Configure (macOS)
         if: runner.os == 'macOS'
@@ -71,7 +72,16 @@ jobs:
             -DIBEX_WARNINGS_AS_ERRORS=ON \
             -DIBEX_ENABLE_MARCH_NATIVE=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
-            -DIBEX_BUILD_PARQUET=OFF
+            -DIBEX_BUILD_PARQUET=ON \
+            -DIBEX_PARQUET_S3=OFF
+
+      # libcurl powers HTTPS read_csv/read_parquet. Use the static-md triplet so
+      # curl links statically into the plugins (no libcurl.dll to bundle) while
+      # the CRT stays dynamic (/MD), matching the rest of the build. The default
+      # ssl feature resolves to Schannel here, so no OpenSSL build.
+      - name: Install libcurl (vcpkg)
+        if: runner.os == 'Windows'
+        run: vcpkg install curl:x64-windows-static-md
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
@@ -79,10 +89,13 @@ jobs:
         run: |
           cmake -B build-release \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md \
             -DIBEX_WARNINGS_AS_ERRORS=ON \
             -DIBEX_ENABLE_MARCH_NATIVE=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
-            -DIBEX_BUILD_PARQUET=OFF
+            -DIBEX_BUILD_PARQUET=ON \
+            -DIBEX_PARQUET_S3=OFF
 
       - name: Build
         shell: bash
@@ -104,7 +117,10 @@ jobs:
             find build-release/tools -maxdepth 1 \( -name '*.dll' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
           else
             cmake --install build-release --prefix "$PWD/stage"
-            find build-release/tools -maxdepth 1 \( -name '*.so' -o -name '*.dylib' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
+            # Arrow/Parquet's shared libs carry SONAME-versioned names
+            # (libarrow.so.2200), not a bare .so suffix, so -name '*.so' alone
+            # misses them.
+            find build-release/tools -maxdepth 1 \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
           fi
 
           cat > stage/README.txt <<EOF
@@ -121,7 +137,8 @@ jobs:
 
           Notes:
           - These release bundles intentionally disable -march=native for portability.
-          - The Parquet plugin is not included in these archives yet.
+          - The Parquet plugin is built without S3 filesystem support (IBEX_PARQUET_S3=OFF);
+            local and HTTPS parquet reads work, s3:// paths do not.
           EOF
 
           asset_name="ibex-${RELEASE_TAG}-${{ matrix.asset_suffix }}.zip"

@@ -38,6 +38,26 @@ option(IBEX_KAFKA_VENDOR_AVROCPP "Vendor Apache Avro C++ for Kafka schema-regist
 set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
     "Directory for bundled Ibex plugins")
 
+# Multi-config generators (Visual Studio, Xcode) silently append a per-config
+# subdirectory (Release/, Debug/, ...) to a target's LIBRARY/RUNTIME output
+# directory unless the per-config variant of that property is *also* set.
+# Every plugin (and ibex_repl_bin) sets only the plain property to
+# IBEX_PLUGIN_OUTPUT_DIR, so on single-config generators (Ninja, Makefiles —
+# what Linux/macOS use) everything lands directly in tools/, but on Windows'
+# default Visual Studio generator plugin DLLs land in tools/Release/ instead.
+# The release packaging step only looks directly in tools/ (maxdepth 1), so
+# plugin DLLs silently went missing from Windows release bundles and
+# `import "csv"` etc. failed to find them at runtime. Pre-seeding the
+# per-config variables here (before any target is created) makes every
+# config resolve to the same flat directory, matching single-config output.
+foreach(_ibex_cfg_type ${CMAKE_CONFIGURATION_TYPES})
+    string(TOUPPER "${_ibex_cfg_type}" _ibex_cfg_type_upper)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_ibex_cfg_type_upper} "${IBEX_PLUGIN_OUTPUT_DIR}")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_ibex_cfg_type_upper} "${IBEX_PLUGIN_OUTPUT_DIR}")
+endforeach()
+unset(_ibex_cfg_type)
+unset(_ibex_cfg_type_upper)
+
 # Include CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerOptions)

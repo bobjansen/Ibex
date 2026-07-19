@@ -43,6 +43,7 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
                                      .distinct = {}});
         return true;
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
         join.children().size() != 2 || join.children()[0] == nullptr ||

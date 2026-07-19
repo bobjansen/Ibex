@@ -13,6 +13,8 @@
 #include <vector>
 
 namespace ibex::ir {
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast in this file
+// is guarded by a node.kind() check (or switch) matching the target node type.
 namespace {
 
 auto append_conjuncts(const Expr& expr, std::vector<Expr>& out) -> bool {
@@ -417,5 +419,6 @@ auto remove_applied_scan_filters(NodePtr root, const std::set<std::string>& appl
     collect_max_id(*root, max_id);
     return remove_applied_filters(std::move(root), safe_sources, ++max_id);
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace ibex::ir

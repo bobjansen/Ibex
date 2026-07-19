@@ -31,6 +31,9 @@ auto SchemaInfo::find(std::string_view name) const -> const SchemaField* {
 
 namespace {
 
+// haystack/needles is self-documenting; UniqueKey is only a std::vector<std::string> alias,
+// not a genuinely confusable role.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto contains_all(const std::vector<std::string>& haystack, const UniqueKey& needles) -> bool {
     return std::ranges::all_of(needles, [&](const std::string& needle) {
         return std::ranges::find(haystack, needle) != haystack.end();
@@ -456,6 +459,7 @@ auto check_ascriptions(Node& root, const SourceSchemas& sources)
         // Nothing to prove it against; the interpreter checks it against data.
         return {};
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     auto& asc = static_cast<AscribeNode&>(root);
     if (auto ok = check_one(asc, input); !ok.has_value()) {
         return ok;
@@ -496,6 +500,8 @@ auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& ar
     return key;
 }
 
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
+// guarded by the switch on node.kind() matching the target node type.
 auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo {
     switch (node.kind()) {
         case NodeKind::Program:
@@ -864,6 +870,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
     }
     return SchemaInfo::unknown();
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 namespace {
 
@@ -918,6 +925,8 @@ void collect_expr_columns(const Expr& expr, std::vector<std::string>& out) {
 auto check_column_refs(const Node& node, const SourceSchemas& sources,
                        const robin_hood::unordered_set<std::string>& lexical_names,
                        bool check_expressions) -> std::optional<std::string> {
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
+    // guarded by a node.kind() check (or switch) matching the target node type.
     if (node.kind() == NodeKind::Program) {
         const auto& program = static_cast<const ProgramNode&>(node);
         for (const auto& pre : program.preamble()) {
@@ -1036,6 +1045,7 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
         default:
             break;
     }
+    // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
     return std::nullopt;
 }
 

@@ -79,6 +79,8 @@ void visit_children_widened(const Node& node, DemandMap& out) {
     visit_children(node, all, out);
 }
 
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
+// guarded by the switch on node.kind() matching the target node type.
 void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
     switch (node.kind()) {
         case NodeKind::Scan: {
@@ -335,6 +337,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
             return;
     }
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

@@ -12,6 +12,8 @@
 namespace ibex::ir {
 namespace {
 
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
+// guarded by the switch on node.kind() matching the target node type.
 auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSchemas& schemas,
               CardinalityOptions options) -> CardinalityEstimate {
     const auto child = [&](std::size_t index = 0) -> CardinalityEstimate {
@@ -177,6 +179,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
             return {};
     }
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 /// The column `alias` is computed from, when a field simply renames one --
 /// `select { o_orderkey = l_orderkey }`. Anything computed (`a * b`, a call) has
@@ -208,6 +211,8 @@ auto distinct_through(const Node& node, const std::string& column, const SourceS
     return distinct_below(*node.children().front(), column, stats);
 }
 
+// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
+// guarded by the switch on node.kind() matching the target node type.
 auto distinct_below(const Node& node, const std::string& column, const SourceStats& stats)
     -> std::optional<std::size_t> {
     switch (node.kind()) {
@@ -260,6 +265,7 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
             return std::nullopt;
     }
 }
+// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

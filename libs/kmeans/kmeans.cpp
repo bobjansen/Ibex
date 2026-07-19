@@ -231,7 +231,7 @@ auto predict_kmeans(const void* native, const runtime::Table& design_matrix)
 
 }  // namespace ibex::kmeans
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_model("kmeans", ibex::runtime::ModelOps{
                                            .fit = ibex::kmeans::fit_kmeans,
                                            .predict = ibex::kmeans::predict_kmeans,

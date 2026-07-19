@@ -394,7 +394,7 @@ auto make_adbc_source(const ibex::runtime::ExternArgs& args)
 
 }  // namespace
 
-extern "C" void ibex_register(ibex::runtime::ExternRegistry* registry) {
+extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* registry) {
     registry->register_table("read_adbc",
                              [](const ibex::runtime::ExternArgs& args)
                                  -> std::expected<ibex::runtime::ExternValue, std::string> {

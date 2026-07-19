@@ -19,7 +19,16 @@ FetchContent_Declare(
 # LightGBM emits noisy developer warnings; quiet them like the Arrow plugin does.
 set(_ibex_saved_suppress_dev_warnings "${CMAKE_SUPPRESS_DEVELOPER_WARNINGS}")
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1)
-FetchContent_MakeAvailable(LightGBM)
+# Add it EXCLUDE_FROM_ALL: LightGBM's own CMakeLists installs lib_lightgbm.a to
+# the system prefix (e.g. /usr/local/lib) unconditionally, which fails
+# `cmake --install` with permission denied on CI/release runners that don't
+# run as root. We only need it as a private static dependency of the plugin,
+# not as an installed artifact, so keep its install() rules out of ours.
+FetchContent_GetProperties(LightGBM)
+if(NOT lightgbm_POPULATED)
+    FetchContent_Populate(LightGBM)
+    add_subdirectory("${lightgbm_SOURCE_DIR}" "${lightgbm_BINARY_DIR}" EXCLUDE_FROM_ALL)
+endif()
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
 
 # Resolve the LightGBM library target across versions (static preferred).

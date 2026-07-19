@@ -1,4 +1,6 @@
-find_package(CURL REQUIRED)
+# CURL is optional (see libs/csv/CMakeLists.txt): the bench executables below
+# only need it to exercise read_csv's HTTPS path, which is itself optional.
+find_package(CURL)
 
 add_executable(ibex_repl_bin ibex_repl.cpp)
 
@@ -35,8 +37,12 @@ target_link_libraries(ibex_bench
         CLI11::CLI11
         fmt::fmt
         fast_float
-        CURL::libcurl
 )
+
+if(CURL_FOUND)
+    target_link_libraries(ibex_bench PRIVATE CURL::libcurl)
+    target_compile_definitions(ibex_bench PRIVATE IBEX_CSV_HAVE_CURL)
+endif()
 
 # zorro.hpp (included via rng.hpp) uses compile-time SIMD dispatch.
 # Mirror the same AVX2 flag used by ibex_runtime so the benchmark
@@ -144,8 +150,12 @@ target_link_libraries(ibex_bench_csv_read
         Ibex::CompilerOptions
         CLI11::CLI11
         fast_float
-        CURL::libcurl
 )
+
+if(CURL_FOUND)
+    target_link_libraries(ibex_bench_csv_read PRIVATE CURL::libcurl)
+    target_compile_definitions(ibex_bench_csv_read PRIVATE IBEX_CSV_HAVE_CURL)
+endif()
 
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_bench_csv_read PRIVATE Ibex::Sanitizers)

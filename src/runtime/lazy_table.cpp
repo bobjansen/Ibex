@@ -228,45 +228,11 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         referenced.insert(*dynamic_key);
     }
 
-    // Predicate columns are decoded whole-file (the selection needs every
-    // row), so they are legitimate cache entries: reuse any already cached,
-    // and cache the ones decoded here for later projections.
-    std::vector<std::string> predicate_missing;
-    predicate_missing.reserve(referenced.size());
-    for (const auto& field : schema_.columns) {
-        if (referenced.contains(field.name) && !cache_.contains(field.name)) {
-            predicate_missing.push_back(field.name);
-        }
+    auto predicates_res = decode_whole_columns(referenced);
+    if (!predicates_res) {
+        return std::unexpected(predicates_res.error());
     }
-    if (!predicate_missing.empty()) {
-        auto decoded = decode_(predicate_missing, nullptr);
-        if (!decoded) {
-            return std::unexpected(decoded.error());
-        }
-        for (auto& entry : decoded->columns) {
-            auto name = entry.name;
-            cache_.insert_or_assign(std::move(name), std::move(entry));
-        }
-        for (const auto& name : predicate_missing) {
-            if (!cache_.contains(name)) {
-                return std::unexpected("lazy source did not produce predicate column '" + name +
-                                       "'");
-            }
-        }
-    }
-
-    Table predicates;
-    for (const auto& field : schema_.columns) {
-        if (!referenced.contains(field.name)) {
-            continue;
-        }
-        const auto& entry = cache_.at(field.name);
-        predicates.add_column_shared(entry.name, entry.column, entry.validity);
-    }
-    predicates.logical_rows = rows_;
-    if (!predicates.columns.empty() && predicates.rows() != rows_) {
-        return std::unexpected("lazy source produced predicate columns with the wrong row count");
-    }
+    Table& predicates = *predicates_res;
 
     const auto key =
         membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
@@ -361,6 +327,196 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     }
     out.logical_rows = selected->size();
     return out;
+}
+
+auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string>& referenced)
+    -> std::expected<Table, std::string> {
+    // Predicate columns are decoded whole-file (the selection needs every
+    // row), so they are legitimate cache entries: reuse any already cached,
+    // and cache the ones decoded here for later projections.
+    std::vector<std::string> missing;
+    missing.reserve(referenced.size());
+    for (const auto& field : schema_.columns) {
+        if (referenced.contains(field.name) && !cache_.contains(field.name)) {
+            missing.push_back(field.name);
+        }
+    }
+    if (!missing.empty()) {
+        auto decoded = decode_(missing, nullptr);
+        if (!decoded) {
+            return std::unexpected(decoded.error());
+        }
+        for (auto& entry : decoded->columns) {
+            auto name = entry.name;
+            cache_.insert_or_assign(std::move(name), std::move(entry));
+        }
+        for (const auto& name : missing) {
+            if (!cache_.contains(name)) {
+                return std::unexpected("lazy source did not produce predicate column '" + name +
+                                       "'");
+            }
+        }
+    }
+
+    Table out;
+    for (const auto& field : schema_.columns) {
+        if (!referenced.contains(field.name)) {
+            continue;
+        }
+        const auto& entry = cache_.at(field.name);
+        out.add_column_shared(entry.name, entry.column, entry.validity);
+    }
+    out.logical_rows = rows_;
+    if (!out.columns.empty() && out.rows() != rows_) {
+        return std::unexpected("lazy source produced predicate columns with the wrong row count");
+    }
+    return out;
+}
+
+auto LazyTable::project_rows(const std::set<std::string>& names, const Selection& selected)
+    -> std::expected<Table, std::string> {
+    const bool all_rows = selected.size() == rows_;
+    // Columns already cached whole-file (predicate columns, or another scan
+    // instance's decode) are gathered in memory — re-reading their pages
+    // through the selection would repeat work already paid for.
+    std::vector<std::string> missing;
+    for (const auto& field : schema_.columns) {
+        if (names.contains(field.name) && !cache_.contains(field.name)) {
+            missing.push_back(field.name);
+        }
+    }
+    Table decoded;
+    if (!missing.empty()) {
+        auto res = decode_(missing, all_rows ? nullptr : &selected);
+        if (!res) {
+            return std::unexpected(res.error());
+        }
+        decoded = std::move(*res);
+        if (decoded.rows() != selected.size()) {
+            return std::unexpected(
+                "lazy source produced selected columns with the wrong row count");
+        }
+    }
+    Table out;
+    for (const auto& field : schema_.columns) {
+        if (!names.contains(field.name)) {
+            continue;
+        }
+        if (const auto cached = cache_.find(field.name); cached != cache_.end()) {
+            const auto& entry = cached->second;
+            if (all_rows) {
+                out.add_column_shared(entry.name, entry.column, entry.validity);
+            } else {
+                auto column = std::make_shared<ColumnValue>(
+                    gather_column(*entry.column, selected.data(), selected.size()));
+                std::optional<ValidityBitmap> validity;
+                if (entry.validity.has_value()) {
+                    ValidityBitmap bits(selected.size(), true);
+                    for (std::size_t row = 0; row < selected.size(); ++row) {
+                        bits.set(row, (*entry.validity)[selected[row]]);
+                    }
+                    validity = std::move(bits);
+                }
+                out.add_column_shared(entry.name, std::move(column), std::move(validity));
+            }
+            continue;
+        }
+        const auto* entry = decoded.find_entry(field.name);
+        if (entry == nullptr) {
+            return std::unexpected("lazy source did not produce requested column '" + field.name +
+                                   "'");
+        }
+        out.add_column_shared(entry->name, entry->column, entry->validity);
+    }
+    out.logical_rows = selected.size();
+    return out;
+}
+
+auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
+                                   const ScalarRegistry* scalars, const DynamicScanFilter& dynamic,
+                                   const std::string& key_name)
+    -> std::expected<std::optional<JoinKeySelection>, std::string> {
+    if (!dynamic.has_membership()) {
+        return std::optional<JoinKeySelection>{};
+    }
+
+    // Fused path, same conditions as project_where: the source computes the
+    // selection during the key column's decode, then only the surviving key
+    // values are decoded at all.
+    if (conjuncts.empty() && key_filter_scan_ != nullptr && !cache_.contains(key_name)) {
+        auto scan = key_filter_scan_(key_name, dynamic);
+        if (!scan) {
+            return std::unexpected(scan.error());
+        }
+        if (!scan->has_value()) {
+            return std::optional<JoinKeySelection>{};  // no fused answer
+        }
+        JoinKeySelection out;
+        out.selected = std::move(**scan);
+        auto keys = project_rows({key_name}, out.selected);
+        if (!keys) {
+            return std::unexpected(keys.error());
+        }
+        auto* entry = keys->find_entry(key_name);
+        if (entry == nullptr || !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
+            return std::optional<JoinKeySelection>{};
+        }
+        out.keys = std::move(*entry);
+        return std::optional{std::move(out)};
+    }
+
+    robin_hood::unordered_set<std::string> referenced;
+    for (const auto& conjunct : conjuncts) {
+        ir::collect_expr_column_refs(conjunct, referenced);
+    }
+    referenced.insert(key_name);
+
+    auto predicates_res = decode_whole_columns(referenced);
+    if (!predicates_res) {
+        return std::unexpected(predicates_res.error());
+    }
+    Table& predicates = *predicates_res;
+
+    const auto key = int64_key_column(predicates, key_name);
+    if (!key.has_value()) {
+        return std::optional<JoinKeySelection>{};
+    }
+
+    JoinKeySelection out;
+    if (!conjuncts.empty()) {
+        auto selected = filter_selection(predicates, conjuncts, scalars);
+        if (!selected) {
+            return std::unexpected(selected.error());
+        }
+        apply_membership_filter(*key, dynamic, *selected);
+        out.selected = std::move(*selected);
+    } else {
+        auto from_membership = membership_selection(*key, dynamic, rows_);
+        if (!from_membership.has_value()) {
+            return std::optional<JoinKeySelection>{};  // escape hatch
+        }
+        out.selected = std::move(*from_membership);
+    }
+
+    // Gather the key values for the selected rows from the cached whole
+    // column.
+    const auto* entry = predicates.find_entry(key_name);
+    out.keys.name = key_name;
+    if (out.selected.size() == rows_) {
+        out.keys.column = entry->column;
+        out.keys.validity = entry->validity;
+    } else {
+        out.keys.column = std::make_shared<ColumnValue>(
+            gather_column(*entry->column, out.selected.data(), out.selected.size()));
+        if (entry->validity.has_value()) {
+            ValidityBitmap validity(out.selected.size(), true);
+            for (std::size_t row = 0; row < out.selected.size(); ++row) {
+                validity.set(row, (*entry->validity)[out.selected[row]]);
+            }
+            out.keys.validity = std::move(validity);
+        }
+    }
+    return std::optional{std::move(out)};
 }
 
 auto LazyTable::materialize() -> std::expected<Table, std::string> {

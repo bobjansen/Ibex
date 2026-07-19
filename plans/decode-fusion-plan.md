@@ -199,7 +199,7 @@ LazyTable cache must not be poisoned by filtered decodes; conjunct
 evaluation needs the same semantics as `filter_selection` (fused same-column
 range passes — `src/runtime/filter.cpp`).
 
-### Stage 5 (horizon) — late materialization across joins
+### Stage 5 — late materialization across joins. DONE (2026-07-19)
 
 The planner knows join selectivities (cardinality estimates landed with the
 whole-script arc). Decode join keys + predicate columns first, probe, then
@@ -207,6 +207,47 @@ decode payload columns only for join survivors. Requires scan operators that
 hold the `LazyTable` and accept a selection at execution time rather than
 materializing up front. Don't start until Stage 4's per-row-group machinery
 exists — it's the same gather path.
+
+**Shipped 2026-07-19** on top of the dynamic-filter-pushdown machinery
+(which supplied the "scan holds the LazyTable + accepts a late selection"
+seam this stage was waiting for), scoped to deferred probe scans of the
+chunked inner join:
+
+- **Two-phase probe** (`ChunkedInnerJoinOperator::try_two_phase_probe`,
+  chunked.cpp): phase A = `LazyTable::join_key_selection` (selection from
+  static conjuncts + membership or the fused key scan, plus the key values
+  for exactly those rows — nothing else decoded); the join probes those
+  keys against the build index; phase B =
+  `materialize_deferred_scan_rows` decodes payload columns only for rows
+  with ≥1 match. Wrappers (Project/Rename/Update) run over the survivor
+  table by shadowing the scan name in a registry copy. Output is assembled
+  from the recorded (build row, survivor) pairs — no re-probe.
+- **Zero-copy probe emit**: when every survivor matched exactly one build
+  row (`ri_identity`, the key-unique star shape — every firing on PDS-H),
+  probe-side columns are shared into the join output instead of gathered
+  (`assemble_output` grew `ri_identity`, mirroring `li_identity`).
+- **`project_rows` is cache-aware**: columns already decoded whole-file
+  (predicate columns, another scan instance's decode) are gathered in
+  memory, never re-read through the selection. This alone was q18's win:
+  its second lineitem instance used to re-read pages through a 399-row
+  Skip-heavy selection.
+- **Declined-two-phase reuse**: when the economics guard declines (build
+  side larger than the candidate set — two-phase forces build-on-left),
+  phase A's selection still materializes `right_` instead of being thrown
+  away. First cut recomputed it from scratch: q03 +12%, q07 +9% —
+  measured, fixed, re-measured.
+
+Results (interleaved A/B vs the stage-4/dynamic-filter binary, 7 reps,
+mins, SF-1): **geomean 0.984** — q18 0.77, q10 0.91, q08 0.94, q13 0.96,
+q20/q21 0.97; borderline queries re-measured at 9 reps all parity
+(q03 0.98, q07 1.01, q17 1.00). Hit-heavy stress neutral (escape hatch →
+NotApplicable → dense path). Fires on q03/q05×2/q07×2/q09/q10/q17/q18,
+`ri_identity` on every one. Correctness: 22/22 byte-identical,
+check_answers 22/22 OK, 1216/1216 clang release, g++ strict clean.
+NOT done (possible v2): survivor selections do not propagate further down
+join chains (a fact table's payload still decodes before later joins
+shrink it), and the two joins in `join.cpp`'s statement path are
+untouched by design.
 
 ## Implementation notes (2026-07-16)
 

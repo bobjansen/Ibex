@@ -13,6 +13,17 @@
 //
 // Compile with: -I$(IBEX_ROOT)/libraries
 
+// curl.h and Arrow both eventually drag in <windows.h> on this platform
+// (via winsock2.h). Without NOMINMAX its min/max macros clobber every
+// std::numeric_limits<T>::max()-style call textually, which is exactly what
+// breaks arrow/util/compression.h's own use of it -- must be defined before
+// any of the includes below, whichever of them happens to pull windows.h in
+// first.
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#endif
+
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -29,6 +40,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <curl/curl.h>
@@ -42,11 +54,12 @@
 #include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/statistics.h>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -60,57 +73,42 @@ inline auto is_https_uri(std::string_view path) -> bool {
     return path.starts_with("https://");
 }
 
-inline void close_and_remove_temp(int fd, const std::string& path) {
-    if (fd >= 0) {
-        (void)::close(fd);
+inline void close_and_remove_temp(std::FILE* file, const std::string& path) {
+    if (file != nullptr) {
+        (void)std::fclose(file);
     }
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
 
-inline auto make_temp_parquet_file() -> std::pair<int, std::string> {
+// mkstemp() is POSIX-only; use stdio's "x" exclusive-create flag instead
+// (a C11 addition MSVC's fopen and glibc's fopen both support), retrying
+// under a random suffix on collision. Portable across POSIX and Windows
+// without any #ifdef.
+inline auto make_temp_parquet_file() -> std::pair<std::FILE*, std::string> {
     std::error_code ec;
     auto temp_dir = std::filesystem::temp_directory_path(ec);
     if (ec) {
         throw std::runtime_error("read_parquet: failed to locate temp directory: " + ec.message());
     }
 
-    auto pattern = (temp_dir / "ibex-parquet-XXXXXX").string();
-    std::vector<char> buffer(pattern.begin(), pattern.end());
-    buffer.push_back('\0');
-
-    int fd = ::mkstemp(buffer.data());
-    if (fd < 0) {
-        throw std::runtime_error("read_parquet: failed to create temp file: " +
-                                 std::string(std::strerror(errno)));
+    std::random_device rd;
+    std::mt19937_64 rng(rd());
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        std::ostringstream name;
+        name << "ibex-parquet-" << std::hex << rng();
+        auto path = (temp_dir / name.str()).string();
+        if (std::FILE* file = std::fopen(path.c_str(), "wbx")) {
+            return {file, path};
+        }
     }
-    return {fd, std::string(buffer.data())};
+    throw std::runtime_error("read_parquet: failed to create temp file: " +
+                             std::string(std::strerror(errno)));
 }
 
 inline auto write_http_chunk(char* ptr, std::size_t size, std::size_t nmemb, void* userdata)
     -> std::size_t {
-    if (size != 0 && nmemb > static_cast<std::size_t>(-1) / size) {
-        return 0;
-    }
-
-    const auto total = size * nmemb;
-    const char* data = ptr;
-    auto* fd = static_cast<int*>(userdata);
-    std::size_t written = 0;
-    while (written < total) {
-        const auto n = ::write(*fd, data + written, total - written);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return 0;
-        }
-        if (n == 0) {
-            return 0;
-        }
-        written += static_cast<std::size_t>(n);
-    }
-    return total;
+    return std::fwrite(ptr, size, nmemb, static_cast<std::FILE*>(userdata));
 }
 
 inline auto download_https_to_temp(std::string_view url) -> std::string {
@@ -121,10 +119,10 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
         throw std::runtime_error("read_parquet: failed to initialize HTTPS client");
     }
 
-    auto [fd, temp_path] = make_temp_parquet_file();
+    auto [file, temp_path] = make_temp_parquet_file();
     CURL* curl = curl_easy_init();
     if (curl == nullptr) {
-        close_and_remove_temp(fd, temp_path);
+        close_and_remove_temp(file, temp_path);
         throw std::runtime_error("read_parquet: failed to create HTTPS client");
     }
 
@@ -133,7 +131,7 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
     curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_http_chunk);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &fd);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -152,17 +150,17 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
     curl_easy_cleanup(curl);
 
-    const int close_result = ::close(fd);
-    fd = -1;
+    const int close_result = std::fclose(file);
+    file = nullptr;
 
     if (rc != CURLE_OK) {
-        close_and_remove_temp(fd, temp_path);
+        close_and_remove_temp(file, temp_path);
         std::string detail = error_buffer[0] != '\0' ? error_buffer : curl_easy_strerror(rc);
         throw std::runtime_error("read_parquet: failed to download '" + url_string + "' (" +
                                  detail + ", HTTP " + std::to_string(response_code) + ")");
     }
     if (close_result != 0) {
-        close_and_remove_temp(fd, temp_path);
+        close_and_remove_temp(file, temp_path);
         throw std::runtime_error("read_parquet: failed to finish temp download for '" + url_string +
                                  "': " + std::strerror(errno));
     }

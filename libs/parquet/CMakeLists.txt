@@ -153,8 +153,11 @@ set(UNSAFE_TREAT_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(arrow)
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
 
-# Bundled thrift uses deprecated std::iterator; suppress the warning on its target.
-if(TARGET thrift)
+# Bundled thrift uses deprecated std::iterator; suppress the warning on its
+# target. -Wno-deprecated-declarations is a GCC/Clang spelling; cl.exe reads
+# the leading -W as its numeric warning-level switch and hard-errors on the
+# non-numeric suffix (D8021), so only apply this outside MSVC.
+if(TARGET thrift AND NOT MSVC)
     target_compile_options(thrift PRIVATE -Wno-deprecated-declarations)
 endif()
 

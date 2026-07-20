@@ -231,8 +231,17 @@ if(TARGET arrow_shared AND TARGET parquet_shared)
     target_link_libraries(ibex_parquet_plugin PRIVATE arrow_shared parquet_shared CURL::libcurl)
     set(_ibex_arrow_shared_targets arrow_shared parquet_shared)
     if(TARGET arrow_ipc_shared)
-        target_link_libraries(ibex_parquet_plugin PRIVATE arrow_ipc_shared)
-        list(APPEND _ibex_arrow_shared_targets arrow_ipc_shared)
+        # On some configs (observed on Windows) arrow_ipc_shared exists as a
+        # target but isn't actually a shared/module library (e.g. IPC gets
+        # folded into arrow_shared directly) -- TARGET_FILE-family generator
+        # expressions hard-error on anything else, so only treat it as a
+        # runtime dependency to link/copy when it really is one.
+        get_target_property(_ibex_arrow_ipc_type arrow_ipc_shared TYPE)
+        if(_ibex_arrow_ipc_type MATCHES "^(SHARED|MODULE)_LIBRARY$")
+            target_link_libraries(ibex_parquet_plugin PRIVATE arrow_ipc_shared)
+            list(APPEND _ibex_arrow_shared_targets arrow_ipc_shared)
+        endif()
+        unset(_ibex_arrow_ipc_type)
     endif()
 
     # Ship these plugins next to their arrow/parquet .so/.dylib/.dll: a release
@@ -256,21 +265,28 @@ if(TARGET arrow_shared AND TARGET parquet_shared)
     endif()
 
     foreach(_ibex_arrow_dep IN LISTS _ibex_arrow_shared_targets)
-        # Copy the SONAME-named file (e.g. libarrow.so.2200), not
-        # TARGET_FILE's fully-versioned real file (libarrow.so.2200.0.0): the
-        # dynamic loader resolves ibex_parquet_plugin's DT_NEEDED entries by
-        # SONAME, and `cmake -E copy` dereferences that symlink into a real
-        # file under the SONAME name at the destination, which is exactly the
-        # name the loader looks for. (No-op distinction on Windows, which has
-        # no SONAME concept — TARGET_SONAME_FILE just falls back to
-        # TARGET_FILE there.)
+        if(WIN32)
+            # TARGET_SONAME_FILE is rejected outright ("not allowed for DLL
+            # target platforms") on Windows -- there's no SONAME concept, so
+            # copy the .dll itself via TARGET_FILE instead.
+            set(_ibex_arrow_dep_file "$<TARGET_FILE:${_ibex_arrow_dep}>")
+        else()
+            # Copy the SONAME-named file (e.g. libarrow.so.2200), not
+            # TARGET_FILE's fully-versioned real file (libarrow.so.2200.0.0):
+            # the dynamic loader resolves ibex_parquet_plugin's DT_NEEDED
+            # entries by SONAME, and `cmake -E copy` dereferences that symlink
+            # into a real file under the SONAME name at the destination,
+            # which is exactly the name the loader looks for.
+            set(_ibex_arrow_dep_file "$<TARGET_SONAME_FILE:${_ibex_arrow_dep}>")
+        endif()
         add_custom_command(TARGET ibex_parquet_plugin POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_SONAME_FILE:${_ibex_arrow_dep}>"
+                "${_ibex_arrow_dep_file}"
                 "${_ibex_parquet_output_dir}"
             COMMENT "Copying ${_ibex_arrow_dep} runtime library next to ibex_parquet_plugin"
         )
     endforeach()
+    unset(_ibex_arrow_dep_file)
 else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()

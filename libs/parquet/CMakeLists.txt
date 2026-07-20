@@ -161,6 +161,20 @@ if(TARGET thrift AND NOT MSVC)
     target_compile_options(thrift PRIVATE -Wno-deprecated-declarations)
 endif()
 
+if(WIN32 AND TARGET parquet_shared)
+    # Arrow drops the "lib"/SONAME-version naming it uses on Linux/macOS
+    # (libparquet.so.2200) on Windows, so parquet_shared's own DLL output is
+    # a bare "parquet.dll" -- identical to our own plugin's OUTPUT_NAME below,
+    # in the very same output directory. The POST_BUILD step further down
+    # that copies parquet_shared's runtime DLL next to the plugin would then
+    # silently overwrite our just-linked ibex plugin with Arrow's own
+    # library under that shared name, which is exactly what produced
+    # "Entry Point Not Found" for ibex_register at runtime (the file on disk
+    # was Arrow's Parquet DLL, not ours). Give Arrow's copy a distinct name
+    # so the two can never collide.
+    set_target_properties(parquet_shared PROPERTIES OUTPUT_NAME arrow_parquet)
+endif()
+
 add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
 # -Wno-missing-designated-field-initializers only exists from Clang 19

@@ -125,23 +125,15 @@ set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1)
 set(ARROW_WITH_THRIFT ON CACHE BOOL "" FORCE)
 set(Thrift_SOURCE "BUNDLED" CACHE STRING "" FORCE)
 set(ARROW_WITH_ZLIB ON CACHE BOOL "" FORCE)
-unset(ZLIB_INCLUDE_DIR CACHE)
-unset(ZLIB_LIBRARY CACHE)
+set(ZLIB_SOURCE "SYSTEM" CACHE STRING "" FORCE)
+# See cmake/ThriftZlibFix.cmake: on Windows, under the vcpkg toolchain,
+# ZLIB_LIBRARY ends up cached in multi-config list form ("optimized;<path>;
+# debug;<path>") by the time bundled Thrift's DefineOptions.cmake reads it,
+# which crashes its `file(TO_CMAKE_PATH ...)` call. The hook normalizes that
+# value to a single path right as Thrift's own project() call runs, so it's
+# immune to exactly when/what populated the cache.
 if(WIN32)
-    # On the multi-config generator Windows release builds use (MSVC/Visual
-    # Studio), find_package(ZLIB) returns ZLIB_LIBRARY as the
-    # "optimized;<path>;debug;<path>" list form instead of a single path.
-    # Arrow's own find_package(ZLIB) call (triggered by ZLIB_SOURCE=SYSTEM)
-    # sets that as a CACHE variable, which the *bundled Thrift* dependency
-    # Arrow vendors internally then reads via its decade-old
-    # `file(TO_CMAKE_PATH ${ZLIB_LIBRARY} ZLIB_LIBRARY)` — a call that
-    # assumes a single path and hard-errors ("must be called with exactly
-    # three arguments") on the list form. Building zlib from source instead
-    # skips the system find_package(ZLIB) call entirely, so that cache
-    # variable never gets populated in the form that trips Thrift up.
-    set(ZLIB_SOURCE "BUNDLED" CACHE STRING "" FORCE)
-else()
-    set(ZLIB_SOURCE "SYSTEM" CACHE STRING "" FORCE)
+    set(CMAKE_PROJECT_thrift_INCLUDE_BEFORE "${IBEX_ROOT}/cmake/ThriftZlibFix.cmake")
 endif()
 set(ARROW_WITH_ZSTD ON CACHE BOOL "" FORCE)
 set(zstd_SOURCE "BUNDLED" CACHE STRING "" FORCE)

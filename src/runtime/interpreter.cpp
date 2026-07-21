@@ -617,13 +617,36 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     "window requires a TimeFrame — use as_timeframe() to designate a timestamp "
                     "column");
             }
-            if (!update_node.group_by().empty()) {
-                return grouped_windowed_update_table(std::move(source.value()),
-                                                     update_node.fields(), win.duration(),
-                                                     update_node.group_by(), scalars, externs);
+            auto windowed =
+                update_node.group_by().empty()
+                    ? windowed_update_table(std::move(source.value()), update_node.fields(),
+                                            win.duration(), scalars, externs)
+                    : grouped_windowed_update_table(std::move(source.value()), update_node.fields(),
+                                                    win.duration(), update_node.group_by(), scalars,
+                                                    externs);
+            if (!windowed.has_value() || !win.select_only()) {
+                return windowed;
             }
-            return windowed_update_table(std::move(source.value()), update_node.fields(),
-                                         win.duration(), scalars, externs);
+            // `window` + `select`: keep only the time index, group keys, and the
+            // listed fields (row-preserving). The time index leads so the result
+            // stays a TimeFrame; a set dedupes fields that name a key or the index.
+            std::vector<ir::ColumnRef> keep;
+            robin_hood::unordered_set<std::string> seen;
+            auto keep_col = [&](const std::string& name) {
+                if (seen.insert(name).second) {
+                    keep.push_back(ir::ColumnRef{.name = name});
+                }
+            };
+            if (windowed->time_index.has_value()) {
+                keep_col(*windowed->time_index);
+            }
+            for (const auto& key : update_node.group_by()) {
+                keep_col(key.name);
+            }
+            for (const auto& field : update_node.fields()) {
+                keep_col(field.alias);
+            }
+            return project_table(windowed.value(), keep);
         }
         case ir::NodeKind::AsTimeframe: {
             const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);

@@ -692,8 +692,16 @@ class WindowNode final : public Node {
 
     [[nodiscard]] auto duration() const noexcept -> Duration { return duration_; }
 
+    /// True for the `window` + `select` form: the child Update computes the
+    /// listed fields as rolling aggregates, and the result is then projected
+    /// down to the time index, group keys, and those fields (row-preserving).
+    /// False for `window` + `update`, which unions the new fields onto the input.
+    [[nodiscard]] auto select_only() const noexcept -> bool { return select_only_; }
+    void set_select_only(bool value) noexcept { select_only_ = value; }
+
    private:
     Duration duration_;
+    bool select_only_ = false;
 };
 
 /// Melt node: unpivots wide-format columns into long-format (variable, value) rows.

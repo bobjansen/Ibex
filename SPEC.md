@@ -1455,9 +1455,15 @@ Preservation rules (normative minimums):
 - `order` always sets the ordering constraint to its key list (or schema order
   if no keys are provided).
 
-For `TimeFrame`, the only valid ordering constraint is ascending order on the
-time index column. Using `order` with any other key list is a compile-time
-error; ordering by the time index is a no-op.
+For `TimeFrame`, ordering by the time index (ascending) is a no-op that
+preserves the sortedness invariant. Ordering by any other key list is also
+permitted — it reshuffles the rows (e.g. grouping resampled bars by `symbol`) —
+and the time index is appended as an implicit final tiebreaker, so each
+leading-key group stays time-ascending and grouped `window`/rolling operators
+downstream remain correct. The result keeps its `TimeFrame` designation with
+the multi-key ordering constraint. A bare `order` (no keys) on a `TimeFrame`
+remains a compile-time error, since an all-column sort has no meaning under the
+time-sorted invariant.
 
 **`head <n>`**
 
@@ -2580,16 +2586,20 @@ tf[update { cp = cumprod(returns) }]
 
 ### 9.5 Sortedness Invariant
 
-A `TimeFrame` guarantees ascending order by its time index at all times. Any
-operation that would violate this invariant (e.g., updating the index column)
-is a compile-time error.
+A `TimeFrame` guarantees ascending order by its time index by construction. Any
+operation that would silently violate this (e.g., updating the index column) is
+a compile-time error.
 
 ```
 tf[update { timestamp = timestamp + 1s }]  // ERROR: cannot mutate time index
 ```
 
 This invariant is represented as an ordering constraint on the time index
-column in ascending order, preserved across all TimeFrame operations.
+column in ascending order, preserved across all TimeFrame operations — with one
+explicit exception: an `order` clause with non-time keys deliberately reorders
+the rows (see §5.3). The time index is retained as the final tiebreaker, so
+each leading-key group remains time-ascending; a subsequent `window`/rolling
+clause must therefore be grouped (`by`) on those leading keys to be meaningful.
 
 ---
 

@@ -900,6 +900,48 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
             *src);
     }
 
+    // rolling_first / rolling_last — the value at the window's leading edge
+    // (win_lo, the first in-window row) or trailing edge (i, the current row).
+    // Null-ness of the picked row carries through. Works for any non-categorical
+    // column type (OHLC's open/close are the motivating case).
+    if (call.callee == "rolling_first" || call.callee == "rolling_last") {
+        const bool is_last = call.callee == "rolling_last";
+        return std::visit(
+            [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    return std::unexpected(call.callee + ": categorical columns are not supported");
+                } else {
+                    ColT result;
+                    std::optional<ValidityBitmap> out_valid;
+                    if constexpr (!std::is_same_v<ColT, Column<std::string>>) {
+                        result.resize(rows);
+                    }
+                    std::size_t lo = 0;
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        while (lo < i && should_drop(lo, i))
+                            ++lo;
+                        const std::size_t pick = is_last ? i : lo;
+                        if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                            result.push_back(col[pick]);
+                        } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                            result.set(i, col[pick]);
+                        } else {
+                            result[i] = col[pick];
+                        }
+                        if (!valid_at(pick)) {
+                            if (!out_valid) {
+                                out_valid.emplace(rows, true);
+                            }
+                            out_valid->set(i, false);
+                        }
+                    }
+                    return ComputedColumn{std::move(result), std::move(out_valid)};
+                }
+            },
+            *src);
+    }
+
     // rolling_min / rolling_max — monotonic deque, O(n) amortised.
     const bool is_min = call.callee == "rolling_min";
     return std::visit(

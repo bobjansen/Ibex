@@ -165,7 +165,8 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         // argument's type.
         if (call->callee == "abs" || call->callee == "cumsum" || call->callee == "cumprod" ||
             call->callee == "lag" || call->callee == "lead" || call->callee == "rolling_sum" ||
-            call->callee == "rolling_min" || call->callee == "rolling_max") {
+            call->callee == "rolling_min" || call->callee == "rolling_max" ||
+            call->callee == "rolling_first" || call->callee == "rolling_last") {
             if (!call->args.empty()) {
                 const auto arg = expr_type(*call->args.front(), input);
                 if (arg.has_value() && is_numeric(*arg)) {
@@ -559,7 +560,33 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         // rows (its operands share child[0]'s schema), so a tuple unique within
         // one operand can repeat across them. Window's row multiplicity is not
         // modelled here.
-        case NodeKind::Window:
+        case NodeKind::Window: {
+            const auto& win = static_cast<const WindowNode&>(node);
+            SchemaInfo child = without_unique_keys(child_schema(node, sources));
+            if (!win.select_only() || !child.is_known()) {
+                return child;
+            }
+            // `window` + `select`: the child Update computes S ∪ fields; the
+            // result keeps only [time index, group keys, listed fields].
+            const auto& update = static_cast<const UpdateNode&>(*node.children().front());
+            std::vector<ColumnRef> keep;
+            robin_hood::unordered_set<std::string> seen;
+            auto keep_col = [&](const std::string& name) {
+                if (seen.insert(name).second) {
+                    keep.push_back(ColumnRef{.name = name});
+                }
+            };
+            if (child.time_index().has_value()) {
+                keep_col(*child.time_index());
+            }
+            for (const auto& key : update.group_by()) {
+                keep_col(key.name);
+            }
+            for (const auto& field : update.fields()) {
+                keep_col(field.alias);
+            }
+            return project_schema(keep, child);
+        }
         case NodeKind::Rbind:
             return without_unique_keys(child_schema(node, sources));
 

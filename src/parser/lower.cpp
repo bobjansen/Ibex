@@ -2056,14 +2056,30 @@ class Lowerer {
             expanded_select_fields = std::move(*expanded);
         }
 
-        if (!state.resample && !state.melt && !state.dcast && state.select &&
+        // `window` + `select` is a row-preserving rolling projection, not an
+        // aggregation: each listed field is computed over the trailing window
+        // (aggregate calls like max/first become their rolling_* form), then the
+        // result is projected down to the time index, group keys, and fields.
+        // It is handled entirely in the `window` block below, so it must skip the
+        // aggregate/projection lowering here.
+        const bool window_select = state.window && state.select;
+        if (window_select) {
+            for (auto& field : expanded_select_fields) {
+                if (field.expr != nullptr) {
+                    rewrite_aggregates_to_rolling(*field.expr);
+                }
+            }
+        }
+
+        if (!window_select && !state.resample && !state.melt && !state.dcast && state.select &&
             select_has_aggregate(expanded_select_fields)) {
             auto aggregate = lower_aggregate(state.by, expanded_select_fields, std::move(node));
             if (!aggregate.has_value()) {
                 return std::unexpected(aggregate.error());
             }
             node = std::move(aggregate.value());
-        } else if (!state.resample && !state.melt && !state.dcast && state.select) {
+        } else if (!window_select && !state.resample && !state.melt && !state.dcast &&
+                   state.select) {
             auto project = lower_select_projection(expanded_select_fields,
                                                    state.select->tuple_fields, std::move(node));
             if (!project.has_value()) {
@@ -2084,6 +2100,15 @@ class Lowerer {
             auto expanded = expand_map_fields(state.update->fields, state.update->map_fields);
             if (!expanded.has_value()) {
                 return std::unexpected(expanded.error());
+            }
+            // Inside a `window` block an aggregate call is windowed — rewrite it
+            // to its rolling_* form (mirrors the `window` + `select` handling).
+            if (state.window) {
+                for (auto& field : *expanded) {
+                    if (field.expr != nullptr) {
+                        rewrite_aggregates_to_rolling(*field.expr);
+                    }
+                }
             }
             auto update = lower_update(state.by, *expanded, state.update->tuple_fields,
                                        state.update->merge_expr);
@@ -2119,8 +2144,21 @@ class Lowerer {
             if (!duration.has_value()) {
                 return std::unexpected(duration.error());
             }
-            auto window_node = builder_.window(duration.value());
-            window_node->add_child(std::move(node));
+            auto window_node = builder_.window(duration.value(), window_select);
+            if (window_select) {
+                // Build the rolling computation as an Update (reusing `by` for the
+                // per-group window); the select-only flag makes the interpreter
+                // project down to the index, keys, and listed fields.
+                const ExprPtr no_merge;
+                auto update = lower_update(state.by, expanded_select_fields, {}, no_merge);
+                if (!update.has_value()) {
+                    return std::unexpected(update.error());
+                }
+                update.value()->add_child(std::move(node));
+                window_node->add_child(std::move(update.value()));
+            } else {
+                window_node->add_child(std::move(node));
+            }
             node = std::move(window_node);
         }
 
@@ -4070,6 +4108,34 @@ class Lowerer {
         return std::ranges::any_of(fields, [&](const auto& field) {
             return field.expr != nullptr && expr_contains_builtin_aggregate(*field.expr);
         });
+    }
+
+    // Inside a `window` block, aggregate calls are windowed: rewrite each
+    // recognised aggregate (`max`, `first`, …) to its `rolling_*` counterpart in
+    // place. Idempotent — a `rolling_*` callee is not itself an aggregate name —
+    // so it is safe even if the same AST is lowered more than once.
+    void rewrite_aggregates_to_rolling(Expr& expr) const {
+        if (auto* call = std::get_if<CallExpr>(&expr.node)) {
+            if (parse_agg_func(call->callee).has_value()) {
+                call->callee = "rolling_" + call->callee;
+            }
+            for (auto& arg : call->args) {
+                rewrite_aggregates_to_rolling(*arg);
+            }
+            return;
+        }
+        if (auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+            rewrite_aggregates_to_rolling(*binary->left);
+            rewrite_aggregates_to_rolling(*binary->right);
+            return;
+        }
+        if (auto* unary = std::get_if<UnaryExpr>(&expr.node)) {
+            rewrite_aggregates_to_rolling(*unary->expr);
+            return;
+        }
+        if (auto* group = std::get_if<GroupExpr>(&expr.node)) {
+            rewrite_aggregates_to_rolling(*group->expr);
+        }
     }
 
     auto lower_resample_aggs(const SelectClause& select)

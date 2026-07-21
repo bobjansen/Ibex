@@ -206,10 +206,13 @@ struct ByClause {
 
 struct WindowClause {
     DurationLiteral duration;
+    bool aligned = false;  ///< `aligned` modifier: reset rolling windows on the epoch grid
 };
 
 struct ResampleClause {
     DurationLiteral duration;
+    bool aligned = false;  ///< `aligned` modifier: accepted for symmetry — resample is always
+                           ///< epoch-aligned, so this has no additional effect today
 };
 
 struct MeltClause {

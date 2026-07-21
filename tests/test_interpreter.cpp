@@ -3234,6 +3234,52 @@ TEST_CASE("window + select computes rolling OHLC, keeps only listed fields") {
     REQUIRE((*close)[3] == 20.0);
 }
 
+TEST_CASE("window + select aligned resets on the epoch grid") {
+    // ts: 3,7,13,17 ns   price: 1,2,3,4   window 10ns aligned -> buckets [0,10),[10,20)
+    //   row 0 (t=3,  bucket 0): {1}       open=1 high=1 low=1 close=1
+    //   row 1 (t=7,  bucket 0): {1,2}     open=1 high=2 low=1 close=2
+    //   row 2 (t=13, bucket 1): reset {3} open=3 high=3 low=3 close=3
+    //   row 3 (t=17, bucket 1): {3,4}     open=3 high=4 low=3 close=4
+    // (A trailing window would give open=1,1,1,2 — the grid reset is the difference.)
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(3), ts_from_nanos(7), ts_from_nanos(13),
+                                             ts_from_nanos(17)});
+    table.add_column("price", Column<double>{1.0, 2.0, 3.0, 4.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[select { open = first(price), high = max(price), low = min(price), "
+        "close = last(price) }, window 10ns aligned];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+    REQUIRE(result->time_index.has_value());
+    const auto* open = std::get_if<Column<double>>(result->find("open"));
+    const auto* high = std::get_if<Column<double>>(result->find("high"));
+    const auto* low = std::get_if<Column<double>>(result->find("low"));
+    const auto* close = std::get_if<Column<double>>(result->find("close"));
+    REQUIRE(open != nullptr);
+    REQUIRE(high != nullptr);
+    REQUIRE(low != nullptr);
+    REQUIRE(close != nullptr);
+    // The grid reset at row 2 is the whole point: open/low jump to the new bucket.
+    REQUIRE((*open)[0] == 1.0);
+    REQUIRE((*open)[1] == 1.0);
+    REQUIRE((*open)[2] == 3.0);
+    REQUIRE((*open)[3] == 3.0);
+    REQUIRE((*low)[2] == 3.0);
+    REQUIRE((*low)[3] == 3.0);
+    REQUIRE((*high)[3] == 4.0);
+    REQUIRE((*close)[3] == 4.0);
+    // Invariant: the last tick of each bucket equals that bucket's resample bar.
+    // Bucket 0 ends at row 1 (open=1,close=2); bucket 1 ends at row 3 (open=3,close=4).
+    REQUIRE((*open)[1] == 1.0);
+    REQUIRE((*close)[1] == 2.0);
+}
+
 TEST_CASE("window + select + by keeps windows within each group") {
     // Two symbols interleaved in time; a 2ns window must not cross symbols.
     //   ts:     0    1    2    3

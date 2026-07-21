@@ -6238,10 +6238,10 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         auto result = update_node.group_by().empty()
                           ? windowed_update_table(std::move(source.value()), update_node.fields(),
-                                                  win.duration(), scalars, externs)
-                          : grouped_windowed_update_table(std::move(source.value()),
-                                                          update_node.fields(), win.duration(),
-                                                          update_node.group_by(), scalars, externs);
+                                                  win.duration(), scalars, externs, win.aligned())
+                          : grouped_windowed_update_table(
+                                std::move(source.value()), update_node.fields(), win.duration(),
+                                update_node.group_by(), scalars, externs, win.aligned());
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));
         }

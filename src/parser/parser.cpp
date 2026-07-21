@@ -1339,16 +1339,16 @@ class Parser {
             if (!consume(TokenKind::DurationLiteral, "expected duration literal after 'window'")) {
                 return std::nullopt;
             }
-            return WindowClause{.duration =
-                                    DurationLiteral{.text = std::string(previous().lexeme)}};
+            DurationLiteral duration{.text = std::string(previous().lexeme)};
+            return WindowClause{.duration = std::move(duration), .aligned = match_aligned()};
         }
         if (match(TokenKind::KeywordResample)) {
             if (!consume(TokenKind::DurationLiteral,
                          "expected duration literal after 'resample'")) {
                 return std::nullopt;
             }
-            return ResampleClause{.duration =
-                                      DurationLiteral{.text = std::string(previous().lexeme)}};
+            DurationLiteral duration{.text = std::string(previous().lexeme)};
+            return ResampleClause{.duration = std::move(duration), .aligned = match_aligned()};
         }
         if (match(TokenKind::KeywordMelt)) {
             auto fields = parse_field_list_or_single();
@@ -2054,6 +2054,16 @@ class Parser {
         }
         advance();
         return true;
+    }
+
+    // Optional `aligned` modifier after a `window`/`resample` duration. Matched
+    // as a contextual identifier so `aligned` stays usable as a column name.
+    auto match_aligned() -> bool {
+        if (check(TokenKind::Identifier) && peek().lexeme == "aligned") {
+            advance();
+            return true;
+        }
+        return false;
     }
 
     auto advance() -> const Token& {

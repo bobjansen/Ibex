@@ -552,6 +552,10 @@ struct ColumnEvalCtx {
     const ScalarRegistry* scalars = nullptr;
     const ExternRegistry* externs = nullptr;
     std::optional<ir::Duration> window;
+    // True when the enclosing `window` clause is `aligned`: a rolling duration
+    // window resets on the epoch grid (`[floor(t/dur)*dur, t]`) instead of
+    // trailing (`[t-dur, t]`). Ignored for count windows.
+    bool window_aligned = false;
 };
 
 // How a Scalar builtin's per-row `eval` meets a Null argument
@@ -963,7 +967,8 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
                                        std::optional<ir::Duration> block_default)
     -> std::expected<WindowSpec, std::string>;
 
-[[nodiscard]] auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec)
+[[nodiscard]] auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec,
+                                      bool aligned = false)
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto resample_table(const Table& input, ir::Duration bucket_dur,
                                   const std::vector<ir::ColumnRef>& extra_group_by,
@@ -981,12 +986,12 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                                          ir::Duration duration, const ScalarRegistry* scalars,
-                                         const ExternRegistry* externs)
+                                         const ExternRegistry* externs, bool aligned = false)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto grouped_windowed_update_table(
     Table input, const std::vector<ir::FieldSpec>& fields, ir::Duration duration,
     const std::vector<ir::ColumnRef>& group_by, const ScalarRegistry* scalars,
-    const ExternRegistry* externs) -> std::expected<Table, std::string>;
+    const ExternRegistry* externs, bool aligned = false) -> std::expected<Table, std::string>;
 [[nodiscard]] auto apply_guarded_update(Table input, const ir::UpdateNode& update,
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs)

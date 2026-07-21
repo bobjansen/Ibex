@@ -1200,12 +1200,14 @@ class ChunkedOrderOperator final : public Operator {
                 continue;
             }
             if (resolved_keys_.empty()) {
-                if (chunk.time_index.has_value()) {
-                    if (keys_->size() != 1 || (*keys_)[0].name != *chunk.time_index ||
-                        !(*keys_)[0].ascending) {
-                        return std::unexpected(
-                            "order on TimeFrame must be by time index ascending");
-                    }
+                // A bare `order` (no keys) on a TimeFrame is rejected — the
+                // time-sorted invariant makes an all-column sort meaningless.
+                // Ordering by explicit non-time keys is allowed and reshuffles
+                // the rows (the still-sorted check below then fails, so the EOF
+                // fallback routes through `order_table`, which appends the time
+                // index as an implicit tiebreaker and keeps the TimeFrame).
+                if (chunk.time_index.has_value() && keys_->empty()) {
+                    return std::unexpected("order on TimeFrame must be by time index ascending");
                 }
                 auto resolved = resolve_keys(chunk);
                 if (!resolved.has_value()) {
@@ -1402,6 +1404,10 @@ class ChunkedOrderOperator final : public Operator {
 
     auto concat_buffered(Table& out) -> std::expected<void, std::string> {
         Chunk first = std::move(buffered_.front());
+        // Carry the TimeFrame designation into the concatenated table so the
+        // `order_table` fallback can honor the TimeFrame ordering policy
+        // (keeping the index, appending it as an implicit tiebreaker).
+        out.time_index = first.time_index;
         out.columns = std::move(first.columns);
         for (std::size_t i = 0; i < out.columns.size(); ++i) {
             out.index[out.columns[i].name] = i;

@@ -1784,7 +1784,7 @@ TEST_CASE("Project dropping timestamp col clears time_index") {
     REQUIRE_FALSE(result->time_index.has_value());
 }
 
-TEST_CASE("Order by non-time-col on TimeFrame returns error") {
+TEST_CASE("Order by non-time-col on TimeFrame sorts and stays a TimeFrame") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
     table.add_column("val", Column<std::int64_t>{10, 20});
@@ -1793,7 +1793,36 @@ TEST_CASE("Order by non-time-col on TimeFrame returns error") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[order val asc];");
+    // Ordering a TimeFrame by a non-time key reshuffles the rows but keeps the
+    // TimeFrame designation; the time index is appended as an implicit final
+    // tiebreaker so each key group stays time-ascending.
+    auto ir = require_ir("data[order val desc];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+    const auto* val = std::get_if<Column<std::int64_t>>(result->find("val"));
+    REQUIRE(val != nullptr);
+    REQUIRE((*val)[0] == 20);
+    REQUIRE((*val)[1] == 10);
+    // ordering metadata reflects the true multi-key order, not just the time index.
+    REQUIRE(result->ordering.has_value());
+    REQUIRE(result->ordering->size() == 2);
+    REQUIRE(result->ordering->front().name == "val");
+    REQUIRE_FALSE(result->ordering->front().ascending);
+    REQUIRE(result->ordering->back().name == "ts");
+}
+
+TEST_CASE("Bare order on TimeFrame still errors") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
+    table.add_column("val", Column<std::int64_t>{10, 20});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[order];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("order on TimeFrame") != std::string::npos);
@@ -3104,6 +3133,41 @@ TEST_CASE("resample with by - one bucket per (bucket, symbol)") {
     REQUIRE(result->rows() == 4);
     REQUIRE(result->find("close") != nullptr);
     REQUIRE(result->find("symbol") != nullptr);
+}
+
+TEST_CASE("resample + order sorts the bars by a non-time key, keeps TimeFrame") {
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1 * min_ns),
+                                             ts_from_nanos(0), ts_from_nanos(1 * min_ns)});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0});
+    table.add_column("symbol", Column<std::string>{"B", "B", "A", "A"});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("tf", table);
+
+    // `order` sequences AFTER `resample` — it sorts the emitted bars by symbol,
+    // not the input ticks — and the bars stay a TimeFrame (time index kept as
+    // the implicit tiebreaker, so each symbol's bars are time-ascending).
+    auto ir =
+        require_ir(R"(tf[select { close = last(price) }, by symbol, resample 1m, order symbol];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+    const auto* sym = std::get_if<Column<std::string>>(result->find("symbol"));
+    REQUIRE(sym != nullptr);
+    // All "A" bars precede all "B" bars, ts-ascending within each symbol.
+    REQUIRE((*sym)[0] == "A");
+    REQUIRE((*sym)[1] == "A");
+    REQUIRE((*sym)[2] == "B");
+    REQUIRE((*sym)[3] == "B");
+    const auto* ts = std::get_if<Column<Timestamp>>(result->find("ts"));
+    REQUIRE(ts != nullptr);
+    REQUIRE((*ts)[0].nanos < (*ts)[1].nanos);
+    REQUIRE((*ts)[2].nanos < (*ts)[3].nanos);
 }
 
 TEST_CASE("resample error on non-timeframe") {

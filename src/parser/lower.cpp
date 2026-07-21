@@ -2101,7 +2101,10 @@ class Lowerer {
             node = std::move(update.value());
         }
 
-        if (state.order) {
+        // `order` normally precedes `window` (canonical clause order). With
+        // `resample`, though, the sort targets the emitted bars, not the input
+        // ticks — so it is deferred until after the resample node below.
+        if (state.order && !state.resample) {
             auto keys = lower_order(*state.order);
             if (!keys.has_value()) {
                 return std::unexpected(keys.error());
@@ -2145,6 +2148,18 @@ class Lowerer {
                                                    std::move(lowered.aggs));
             resample_node->add_child(std::move(node));
             node = std::move(resample_node);
+
+            // Deferred from the pre-window slot above: `order` on a resample
+            // sorts the emitted bars (e.g. group them by symbol), not the input.
+            if (state.order) {
+                auto keys = lower_order(*state.order);
+                if (!keys.has_value()) {
+                    return std::unexpected(keys.error());
+                }
+                auto order_node = builder_.order(std::move(keys.value()));
+                order_node->add_child(std::move(node));
+                node = std::move(order_node);
+            }
         }
 
         if (state.melt) {

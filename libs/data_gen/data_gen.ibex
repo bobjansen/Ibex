@@ -1,0 +1,32 @@
+// Synthetic data generators for testing and demos.
+//
+// `import data_gen;` then call any of the functions below. Generators draw
+// through Ibex's own RNG bridge, so `seed_rng(...)` makes them reproducible.
+
+// Synthetic tick data: timestamp, symbol, price, volume.
+// `symbols` is a comma-separated list, e.g. "AAPL,MSFT,GOOG".
+// `price` is a Gaussian random walk per row starting at `start_price` with
+// per-step stddev `volatility` (floored at 0.01).
+// Arrivals are a Poisson process: gaps between consecutive timestamps are
+// Exponential with mean `interval_ms`, not evenly spaced. `start_ts_ms` is the
+// first timestamp in Unix milliseconds (0 means "use current wall-clock time").
+extern fn gen_ticks(
+    n: Int,
+    symbols: String = "AAPL,MSFT,GOOG",
+    start_price: Float64 = 100.0,
+    volatility: Float64 = 0.5,
+    interval_ms: Float64 = 1000.0,
+    start_ts_ms: Int = 0
+) -> DataFrame from "data_gen.hpp";
+
+// Gaussian random walk: value[0] = start, value[i] = value[i-1] + N(0, step_std).
+extern fn gen_walk(n: Int, start: Float64 = 0.0, step_std: Float64 = 1.0) -> DataFrame from "data_gen.hpp";
+
+// n iid samples from N(mean, stddev) in a single "value" column.
+extern fn gen_normal(n: Int, mean: Float64 = 0.0, stddev: Float64 = 1.0) -> DataFrame from "data_gen.hpp";
+
+// n iid samples from Uniform[low, high) in a single "value" column.
+extern fn gen_uniform(n: Int, low: Float64 = 0.0, high: Float64 = 1.0) -> DataFrame from "data_gen.hpp";
+
+// n sequential string ids "<prefix>0" .. "<prefix>(n-1)".
+extern fn gen_ids(n: Int, prefix: String = "row") -> DataFrame from "data_gen.hpp";

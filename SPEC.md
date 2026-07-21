@@ -2521,9 +2521,27 @@ window argument (below); `lag` and `lead` do not.
 | `rolling_quantile(col, p)` | Quantile `p` within window (`Float64`); `p` is a numeric literal    |
 | `rolling_skew(col)`        | Sample skewness within window (`Float64`)                           |
 | `rolling_kurtosis(col)`    | Excess kurtosis within window (`Float64`)                           |
+| `rolling_first(col)`       | Value at the window's leading edge (first in-window row); any type   |
+| `rolling_last(col)`        | Value at the window's trailing edge (the current row); any type      |
 
 Rolling functions are **aggregate-like**: they produce one scalar per row
 (evaluated over the window) and are valid in both `select` and `update`.
+
+**Aggregates are windowed inside a `window` block.** Within a `window` clause an
+ordinary aggregate call is evaluated over the window rather than the whole frame:
+`max(col)` means `rolling_max(col)`, `first(col)` means `rolling_first(col)`, and
+so on for every aggregate with a `rolling_*` counterpart. This makes the OHLC
+idiom read naturally:
+
+```
+tf[select { open  = first(price), high = max(price),
+            low   = min(price),  close = last(price) }, by symbol, window 10ms]
+```
+
+With `select`, the result keeps only the time index, group keys, and listed
+fields (row-preserving — one row per input tick, each computed over its trailing
+window). With `update`, the fields are unioned onto the input as usual. For
+fixed, non-overlapping bars (one row per bucket) use `resample` instead.
 
 **Per-call windows.** A rolling call may carry its own window as a trailing
 argument, overriding (or standing in for) the enclosing `window` clause:

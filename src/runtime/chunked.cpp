@@ -6245,6 +6245,31 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));
         }
+        if (win.select_only()) {
+            // `window` + `select`: keep only the time index, group keys, and the
+            // listed fields (time index first so the result stays a TimeFrame).
+            std::vector<ir::ColumnRef> keep;
+            robin_hood::unordered_set<std::string> seen;
+            auto keep_col = [&](const std::string& name) {
+                if (seen.insert(name).second) {
+                    keep.push_back(ir::ColumnRef{.name = name});
+                }
+            };
+            if (result->time_index.has_value()) {
+                keep_col(*result->time_index);
+            }
+            for (const auto& key : update_node.group_by()) {
+                keep_col(key.name);
+            }
+            for (const auto& field : update_node.fields()) {
+                keep_col(field.alias);
+            }
+            auto projected = project_table(result.value(), keep);
+            if (!projected.has_value()) {
+                return std::unexpected(std::move(projected.error()));
+            }
+            result = std::move(projected);
+        }
         return std::make_unique<TableSourceOperator>(std::move(result.value()));
     }
 

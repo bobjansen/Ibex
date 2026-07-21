@@ -88,8 +88,10 @@ class Builder {
         return std::make_unique<RenameNode>(next_id(), std::move(renames));
     }
 
-    [[nodiscard]] auto window(Duration duration) -> NodePtr {
-        return std::make_unique<WindowNode>(next_id(), duration);
+    [[nodiscard]] auto window(Duration duration, bool select_only = false) -> NodePtr {
+        auto node = std::make_unique<WindowNode>(next_id(), duration);
+        node->set_select_only(select_only);
+        return node;
     }
 
     [[nodiscard]] auto resample(Duration duration, std::vector<ColumnRef> group_by,

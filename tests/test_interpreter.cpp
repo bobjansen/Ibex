@@ -3185,6 +3185,90 @@ TEST_CASE("resample error on non-timeframe") {
     REQUIRE(result.error().find("requires a TimeFrame") != std::string::npos);
 }
 
+TEST_CASE("window + select computes rolling OHLC, keeps only listed fields") {
+    // ts: 0,1,2,3 ns   price: 10,30,5,20   window 2ns -> [t-2, t]
+    //   row 0: {10}          open=10 high=10 low=10 close=10
+    //   row 1: {10,30}       open=10 high=30 low=10 close=30
+    //   row 2: {10,30,5}     open=10 high=30 low=5  close=5
+    //   row 3: {30,5,20}     open=30 high=30 low=5  close=20
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("price", Column<double>{10.0, 30.0, 5.0, 20.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[select { open = first(price), high = max(price), low = min(price), "
+        "close = last(price) }, window 2ns];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    // Row-preserving and still a TimeFrame.
+    REQUIRE(result->rows() == 4);
+    REQUIRE(result->time_index.has_value());
+    REQUIRE(*result->time_index == "ts");
+    // Only [ts, open, high, low, close] — the source `price` column is dropped.
+    REQUIRE(result->find("price") == nullptr);
+    REQUIRE(result->find("ts") != nullptr);
+    const auto* open = std::get_if<Column<double>>(result->find("open"));
+    const auto* high = std::get_if<Column<double>>(result->find("high"));
+    const auto* low = std::get_if<Column<double>>(result->find("low"));
+    const auto* close = std::get_if<Column<double>>(result->find("close"));
+    REQUIRE(open != nullptr);
+    REQUIRE(high != nullptr);
+    REQUIRE(low != nullptr);
+    REQUIRE(close != nullptr);
+    REQUIRE((*open)[0] == 10.0);
+    REQUIRE((*open)[1] == 10.0);
+    REQUIRE((*open)[2] == 10.0);
+    REQUIRE((*open)[3] == 30.0);
+    REQUIRE((*high)[1] == 30.0);
+    REQUIRE((*high)[3] == 30.0);
+    REQUIRE((*low)[2] == 5.0);
+    REQUIRE((*low)[3] == 5.0);
+    REQUIRE((*close)[0] == 10.0);
+    REQUIRE((*close)[1] == 30.0);
+    REQUIRE((*close)[2] == 5.0);
+    REQUIRE((*close)[3] == 20.0);
+}
+
+TEST_CASE("window + select + by keeps windows within each group") {
+    // Two symbols interleaved in time; a 2ns window must not cross symbols.
+    //   ts:     0    1    2    3
+    //   symbol  A    B    A    B
+    //   price   10   99   20   88
+    // For A at row 2: window [0,2] within A -> rows {0,2} = {10,20} -> first=10,last=20
+    // For B at row 3: window [1,3] within B -> rows {1,3} = {99,88} -> first=99,last=88
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "B"});
+    table.add_column("price", Column<double>{10.0, 99.0, 20.0, 88.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[select { open = first(price), close = last(price) }, by symbol, window 2ns];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+    REQUIRE(result->find("symbol") != nullptr);
+    const auto* open = std::get_if<Column<double>>(result->find("open"));
+    const auto* close = std::get_if<Column<double>>(result->find("close"));
+    REQUIRE(open != nullptr);
+    REQUIRE(close != nullptr);
+    // row 2 is symbol A: open=10 (first A in window), close=20 (current)
+    REQUIRE((*open)[2] == 10.0);
+    REQUIRE((*close)[2] == 20.0);
+    // row 3 is symbol B: open=99, close=88 — the intervening A rows are excluded
+    REQUIRE((*open)[3] == 99.0);
+    REQUIRE((*close)[3] == 88.0);
+}
+
 TEST_CASE("rolling_sum preserves other columns and time_index") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});

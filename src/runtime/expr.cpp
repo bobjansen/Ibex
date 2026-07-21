@@ -1185,7 +1185,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 if (name == "rolling_count") {
                     return ExprType::Int;
                 }
-                if (name == "rolling_sum" || name == "rolling_min" || name == "rolling_max") {
+                if (name == "rolling_sum" || name == "rolling_min" || name == "rolling_max" ||
+                    name == "rolling_first" || name == "rolling_last") {
                     if (a.empty()) {
                         return std::unexpected(std::string(name) + ": expected 1 argument");
                     }
@@ -1215,6 +1216,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                  "rolling_quantile",
                  "rolling_skew",
                  "rolling_kurtosis",
+                 "rolling_first",
+                 "rolling_last",
              }) {
             m.emplace(fn, rolling_transform);
         }

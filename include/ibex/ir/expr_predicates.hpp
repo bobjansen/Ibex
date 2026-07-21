@@ -11,7 +11,8 @@ namespace ibex::ir {
     return name == "rolling_sum" || name == "rolling_mean" || name == "rolling_min" ||
            name == "rolling_max" || name == "rolling_count" || name == "rolling_median" ||
            name == "rolling_std" || name == "rolling_ewma" || name == "rolling_quantile" ||
-           name == "rolling_skew" || name == "rolling_kurtosis";
+           name == "rolling_skew" || name == "rolling_kurtosis" || name == "rolling_first" ||
+           name == "rolling_last";
 }
 
 [[nodiscard]] constexpr auto is_cum_func(std::string_view name) -> bool {

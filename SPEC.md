@@ -879,7 +879,7 @@ order_key       = IDENT [ "asc" | "desc" ] ;
 by_clause       = "by" IDENT
                 | "by" "{" field_list "}" ;
 
-window_clause   = "window" DURATION_LIT ;
+window_clause   = "window" DURATION_LIT [ "aligned" ] ;
 
 melt_clause     = "melt" field_or_list ;
 
@@ -2494,8 +2494,26 @@ tf[window 5m, update { avg_5m = rolling_mean(price) }]
 ```
 
 **Semantics.** For each row at time `t`, the window defines the range
-`[t - duration, t]` (inclusive on both ends). Rolling functions operate on the
-subset of rows within this range.
+`[t - duration, t]` (inclusive on both ends) — a *trailing* window whose left
+edge tracks each row's own timestamp. Rolling functions operate on the subset of
+rows within this range.
+
+**`aligned`.** Adding `aligned` snaps the window to a fixed epoch-aligned grid
+instead: for a row at time `t` the range becomes `[floor(t / duration) · duration,
+t]`, so the window **resets on each grid boundary** (`…:00.000, :00.010, …` for a
+`10ms` window) rather than sliding continuously. This is the bar-in-progress
+view — combined with `select`, each row is the OHLC accumulated since the current
+bucket opened, and the last row of each bucket equals that bucket's `resample`
+bar. The grid is always epoch-aligned.
+
+```
+tf[select { open  = first(price), high = max(price),
+            low   = min(price),  close = last(price) }, by symbol, window 10ms aligned]
+```
+
+`resample` accepts `aligned` too, for symmetry; resample buckets are already
+epoch-aligned, so it has no additional effect there. Empty grid buckets (no
+ticks) simply produce no rows — there is no gap-filling.
 
 **Constraint.** `window` is valid only when the operand is a `TimeFrame`
 (constraint C8). Using `window` on a `DataFrame` is a compile-time error.

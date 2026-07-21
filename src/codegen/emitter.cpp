@@ -468,6 +468,10 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 throw std::runtime_error(
                     "ibex_compile: window + select is not yet supported in the compiled path");
             }
+            if (win.aligned()) {
+                throw std::runtime_error(
+                    "ibex_compile: aligned window is not yet supported in the compiled path");
+            }
             const auto& upd = static_cast<const ir::UpdateNode&>(window_child);
             if (!upd.tuple_fields().empty()) {
                 throw std::runtime_error(

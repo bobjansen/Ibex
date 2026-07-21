@@ -88,9 +88,11 @@ class Builder {
         return std::make_unique<RenameNode>(next_id(), std::move(renames));
     }
 
-    [[nodiscard]] auto window(Duration duration, bool select_only = false) -> NodePtr {
+    [[nodiscard]] auto window(Duration duration, bool select_only = false, bool aligned = false)
+        -> NodePtr {
         auto node = std::make_unique<WindowNode>(next_id(), duration);
         node->set_select_only(select_only);
+        node->set_aligned(aligned);
         return node;
     }
 

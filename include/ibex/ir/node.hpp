@@ -699,9 +699,15 @@ class WindowNode final : public Node {
     [[nodiscard]] auto select_only() const noexcept -> bool { return select_only_; }
     void set_select_only(bool value) noexcept { select_only_ = value; }
 
+    /// True for the `aligned` modifier: rolling duration windows reset on the
+    /// epoch grid (`[floor(t/dur)*dur, t]`) instead of trailing (`[t-dur, t]`).
+    [[nodiscard]] auto aligned() const noexcept -> bool { return aligned_; }
+    void set_aligned(bool value) noexcept { aligned_ = value; }
+
    private:
     Duration duration_;
     bool select_only_ = false;
+    bool aligned_ = false;
 };
 
 /// Melt node: unpivots wide-format columns into long-format (variable, value) rows.

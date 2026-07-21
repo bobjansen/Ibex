@@ -620,10 +620,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             auto windowed =
                 update_node.group_by().empty()
                     ? windowed_update_table(std::move(source.value()), update_node.fields(),
-                                            win.duration(), scalars, externs)
+                                            win.duration(), scalars, externs, win.aligned())
                     : grouped_windowed_update_table(std::move(source.value()), update_node.fields(),
                                                     win.duration(), update_node.group_by(), scalars,
-                                                    externs);
+                                                    externs, win.aligned());
             if (!windowed.has_value() || !win.select_only()) {
                 return windowed;
             }

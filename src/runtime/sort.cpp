@@ -163,15 +163,14 @@ auto lsd_multi_radix(const std::vector<std::vector<std::uint64_t>>& codes, std::
 
 }  // namespace
 
-auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
+namespace {
+
+// Sort `input` by an already-resolved key list. The TimeFrame ordering policy
+// (and any implicit time-index tiebreaker) is decided by the public
+// `order_table` wrapper below before this runs.
+auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& resolved_keys)
     -> std::expected<Table, std::string> {
     std::size_t rows = input.rows();
-    if (input.time_index.has_value()) {
-        if (keys.size() != 1 || keys[0].name != *input.time_index || !keys[0].ascending) {
-            return std::unexpected("order on TimeFrame must be by time index ascending");
-        }
-    }
-    auto resolved_keys = ordering_keys_for_table(input, keys);
     if (rows <= 1 || input.columns.empty()) {
         Table output = input;
         output.ordering = resolved_keys;
@@ -219,7 +218,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
                 *column);
             if (already_sorted) {
                 Table output = input;
-                output.ordering = std::move(resolved_keys);
+                output.ordering = resolved_keys;
                 output.time_index = input.time_index;
                 normalize_time_index(output);
                 return output;
@@ -479,6 +478,43 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     std::iota(idx.begin(), idx.end(), std::size_t{0});
     pdqsort(idx.begin(), idx.end(), compare_row);
     return gather_rows(input, idx, &resolved_keys);
+}
+
+}  // namespace
+
+auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
+    -> std::expected<Table, std::string> {
+    auto resolved_keys = ordering_keys_for_table(input, keys);
+    // A TimeFrame is time-sorted by construction. Ordering it purely by the time
+    // index (ascending) preserves that. Ordering by any other key reshuffles the
+    // rows — permitted, e.g. sorting resampled OHLC bars by symbol — but the time
+    // index is appended as an implicit final tiebreaker so each leading-key group
+    // stays time-ascending (keeping grouped rolling/window correct) and the
+    // TimeFrame designation is kept. normalize_time_index (inside gather_rows)
+    // resets `ordering` to time-only, so the true multi-key order is restored
+    // here after the sort.
+    bool relaxed_timeframe = false;
+    if (input.time_index.has_value()) {
+        const bool time_only =
+            keys.size() == 1 && keys[0].name == *input.time_index && keys[0].ascending;
+        if (!time_only) {
+            if (keys.empty()) {
+                return std::unexpected("order on TimeFrame must be by time index ascending");
+            }
+            relaxed_timeframe = true;
+            if (std::ranges::none_of(resolved_keys, [&](const ir::OrderKey& k) {
+                    return k.name == *input.time_index;
+                })) {
+                resolved_keys.push_back(ir::OrderKey{.name = *input.time_index, .ascending = true});
+            }
+        }
+    }
+    auto result = order_table_resolved(input, resolved_keys);
+    if (result.has_value() && relaxed_timeframe) {
+        result->time_index = input.time_index;
+        result->ordering = std::move(resolved_keys);
+    }
+    return result;
 }
 
 auto head_table(const Table& input, std::size_t count, const std::vector<ir::ColumnRef>& group_by)

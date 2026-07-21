@@ -970,6 +970,12 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
 [[nodiscard]] auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec,
                                       bool aligned = false)
     -> std::expected<ComputedColumn, std::string>;
+/// Column of nominal window bounds for the enclosing `window` clause: for each
+/// row, the start (`want_end=false`) or end (`want_end=true`) of the window
+/// containing its timestamp. `aligned` selects grid boundaries vs a trailing
+/// `[t-dur, t]`. Returns the time index's type (Timestamp or Date).
+[[nodiscard]] auto window_bound_column(const Table& table, ir::Duration duration, bool aligned,
+                                       bool want_end) -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto resample_table(const Table& input, ir::Duration bucket_dur,
                                   const std::vector<ir::ColumnRef>& extra_group_by,
                                   const std::vector<ir::AggSpec>& aggregations)

@@ -2541,9 +2541,25 @@ window argument (below); `lag` and `lead` do not.
 | `rolling_kurtosis(col)`    | Excess kurtosis within window (`Float64`)                           |
 | `rolling_first(col)`       | Value at the window's leading edge (first in-window row); any type   |
 | `rolling_last(col)`        | Value at the window's trailing edge (the current row); any type      |
+| `window_start()`           | Nominal start of the current row's window (time-index type)         |
+| `window_end()`             | Nominal end of the current row's window (time-index type)           |
 
 Rolling functions are **aggregate-like**: they produce one scalar per row
 (evaluated over the window) and are valid in both `select` and `update`.
+
+**Window bounds.** `window_start()` and `window_end()` return the *nominal*
+bounds of the window a row belongs to (as `Timestamp`, or `Date` for a Date time
+index) — derived from the row's timestamp and the clause duration, not from where
+data actually falls. For an `aligned` window they are the grid boundaries
+`floor(t/dur)·dur` and that `+ dur`; for a trailing window they are `t - dur` and
+`t`. Both require an enclosing `window` clause. With `aligned`, `window_start()`
+is the canonical bar label — the same timestamp the finished `resample` bar
+carries:
+
+```
+tf[select { bar = window_start(), open = first(price), high = max(price),
+            low = min(price), close = last(price) }, by symbol, window 10ms aligned]
+```
 
 **Aggregates are windowed inside a `window` block.** Within a `window` clause an
 ordinary aggregate call is evaluated over the window rather than the whole frame:

@@ -191,6 +191,60 @@ auto rolling_window_spec(const ir::CallExpr& call, std::optional<ir::Duration> b
         call.callee + "(col, 20) for 20 rows or " + call.callee + "(col, 5s) for a time window");
 }
 
+auto window_bound_column(const Table& table, ir::Duration duration, bool aligned, bool want_end)
+    -> std::expected<ComputedColumn, std::string> {
+    const char* fn = want_end ? "window_end" : "window_start";
+    if (!table.time_index.has_value()) {
+        return std::unexpected(std::string(fn) + ": requires a TimeFrame");
+    }
+    const std::int64_t dur = duration.count();
+    if (dur <= 0) {
+        return std::unexpected(std::string(fn) + ": window duration must be positive");
+    }
+    const std::size_t rows = table.rows();
+    const auto* tcv = table.find(*table.time_index);
+
+    // Nominal bound of the window containing time `t`, in `unit` steps. aligned:
+    // start = floor(t/unit)*unit (grid boundary), end = start + unit. trailing:
+    // start = t - unit, end = t (the row's own timestamp).
+    auto bound = [&](std::int64_t t, std::int64_t unit) -> std::int64_t {
+        if (aligned) {
+            std::int64_t q = t / unit;
+            if (t < 0 && t % unit != 0) {
+                --q;  // floor toward -inf
+            }
+            const std::int64_t start = q * unit;
+            return want_end ? start + unit : start;
+        }
+        return want_end ? t : t - unit;
+    };
+
+    if (const auto* ts = std::get_if<Column<Timestamp>>(tcv)) {
+        Column<Timestamp> out;
+        out.resize(rows);
+        for (std::size_t i = 0; i < rows; ++i) {
+            out[i] = Timestamp{bound((*ts)[i].nanos, dur)};
+        }
+        return ComputedColumn{std::move(out), std::nullopt};
+    }
+    if (const auto* dt = std::get_if<Column<Date>>(tcv)) {
+        // Date time index: the duration is expressed in days.
+        static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
+        const std::int64_t dur_days = dur / kNsPerDay;
+        if (dur_days <= 0) {
+            return std::unexpected(std::string(fn) +
+                                   ": duration must be at least one day for a Date time index");
+        }
+        Column<Date> out;
+        out.resize(rows);
+        for (std::size_t i = 0; i < rows; ++i) {
+            out[i] = Date{static_cast<std::int32_t>(bound((*dt)[i].days, dur_days))};
+        }
+        return ComputedColumn{std::move(out), std::nullopt};
+    }
+    return std::unexpected(std::string(fn) + ": time index must be a Timestamp or Date column");
+}
+
 auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec, bool aligned)
     -> std::expected<ComputedColumn, std::string> {
     std::size_t rows = table.rows();

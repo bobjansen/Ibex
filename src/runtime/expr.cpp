@@ -1222,6 +1222,28 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             m.emplace(fn, rolling_transform);
         }
 
+        // window_start() / window_end(): the nominal bounds of the enclosing
+        // `window` clause's window for each row (grid boundaries when aligned,
+        // else [t-dur, t]). Zero-arg; the duration/alignment arrive via ctx.
+        const BuiltinFn window_bound{
+            .min_args = 0,
+            .max_args = 0,
+            .infer = [](std::string_view, const std::vector<ExprType>&) -> IT {
+                return ExprType::Timestamp;
+            },
+            .exec = TransformExec{.column_eval = [](const ir::CallExpr& call, const Table& input,
+                                                    std::size_t, const ColumnEvalCtx& ctx)
+                                      -> std::expected<ComputedColumn, std::string> {
+                if (!ctx.window.has_value()) {
+                    return std::unexpected(call.callee + ": requires an enclosing `window` clause");
+                }
+                return window_bound_column(input, *ctx.window, ctx.window_aligned,
+                                           /*want_end=*/call.callee == "window_end");
+            }},
+        };
+        m.emplace("window_start", window_bound);
+        m.emplace("window_end", window_bound);
+
         // ── Aggregates (N→1, per group): reduce a column to one scalar. The
         // registry is the single name-to-ir::AggFunc mapping — execution
         // (aggregate.cpp) resolves the enum through parse_aggregate_func,

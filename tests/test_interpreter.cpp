@@ -3280,6 +3280,58 @@ TEST_CASE("window + select aligned resets on the epoch grid") {
     REQUIRE((*close)[1] == 2.0);
 }
 
+TEST_CASE("window_start / window_end expose the nominal window bounds") {
+    // ts: 3,7,13,17 ns; buckets [0,10),[10,20).
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(3), ts_from_nanos(7), ts_from_nanos(13),
+                                             ts_from_nanos(17)});
+    table.add_column("price", Column<double>{1.0, 2.0, 3.0, 4.0});
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    SECTION("aligned: grid boundaries") {
+        auto ir = require_ir(
+            "data[select { ws = window_start(), we = window_end() }, window 10ns aligned];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* ws = std::get_if<Column<Timestamp>>(result->find("ws"));
+        const auto* we = std::get_if<Column<Timestamp>>(result->find("we"));
+        REQUIRE(ws != nullptr);
+        REQUIRE(we != nullptr);
+        // start = floor(t/10)*10 ; end = start + 10
+        REQUIRE((*ws)[0].nanos == 0);
+        REQUIRE((*ws)[1].nanos == 0);
+        REQUIRE((*ws)[2].nanos == 10);
+        REQUIRE((*ws)[3].nanos == 10);
+        REQUIRE((*we)[0].nanos == 10);
+        REQUIRE((*we)[3].nanos == 20);
+    }
+
+    SECTION("trailing: [t-dur, t]") {
+        auto ir =
+            require_ir("data[select { ws = window_start(), we = window_end() }, window 10ns];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* ws = std::get_if<Column<Timestamp>>(result->find("ws"));
+        const auto* we = std::get_if<Column<Timestamp>>(result->find("we"));
+        REQUIRE(ws != nullptr);
+        REQUIRE(we != nullptr);
+        REQUIRE((*ws)[0].nanos == 3 - 10);  // t - dur
+        REQUIRE((*we)[0].nanos == 3);       // t
+        REQUIRE((*ws)[3].nanos == 17 - 10);
+        REQUIRE((*we)[3].nanos == 17);
+    }
+
+    SECTION("errors without an enclosing window clause") {
+        auto ir = require_ir("data[select { ws = window_start() }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE_FALSE(result.has_value());
+        REQUIRE(result.error().find("requires an enclosing `window` clause") != std::string::npos);
+    }
+}
+
 TEST_CASE("window + select + by keeps windows within each group") {
     // Two symbols interleaved in time; a 2ns window must not cross symbols.
     //   ts:     0    1    2    3

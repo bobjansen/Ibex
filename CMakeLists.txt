@@ -104,6 +104,7 @@ target_link_libraries(ibex_lib
 # Plugin libraries
 add_subdirectory(libs/csv)
 add_subdirectory(libs/json)
+add_subdirectory(libs/data_gen)
 if(NOT WIN32)
     add_subdirectory(libs/udp)
     add_subdirectory(libs/websocket)

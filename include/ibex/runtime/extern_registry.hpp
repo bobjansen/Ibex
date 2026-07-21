@@ -15,7 +15,9 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/rng.hpp>
 
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -26,6 +28,26 @@
 #include <vector>
 
 namespace ibex::runtime {
+
+/// Function-pointer bridge to the host process's RNG singletons.
+///
+/// A plugin `.so` statically links its own copy of librng.a (the same way it
+/// links the rest of libibex_runtime.a), so calling `ibex::runtime::fill_normal`
+/// directly from plugin code would touch a *different* thread_local engine
+/// than the one the REPL's `seed_rng` reseeds — same algorithm, disjoint state,
+/// silently unreproducible. `ExternRegistry` is constructed once in the host
+/// process, so its default member initializers below capture the addresses of
+/// the host's own instantiations; a plugin that calls through this struct's
+/// pointers therefore reaches the exact engine `seed_rng` controls, no matter
+/// which shared object's code happens to invoke them.
+struct RngBridge {
+    void (*fill_uniform)(double*, std::size_t, double, double) noexcept = &runtime::fill_uniform;
+    void (*fill_normal)(double*, std::size_t, double, double) noexcept = &runtime::fill_normal;
+    void (*fill_exponential)(double*, std::size_t, double) noexcept = &runtime::fill_exponential;
+    void (*fill_bernoulli)(std::int64_t*, std::size_t, double) noexcept = &runtime::fill_bernoulli;
+    void (*fill_int)(std::int64_t*, std::size_t, std::int64_t,
+                     std::uint64_t) noexcept = &runtime::fill_int;
+};
 
 /// Sentinel returned by a stream source to signal "receive timeout — no data
 /// arrived but I am not done; keep listening."
@@ -142,6 +164,12 @@ class ExternRegistry {
    public:
     ExternRegistry() = default;
 
+    /// Function pointers into the host process's own RNG engine (see
+    /// RngBridge). Plugins that want reproducible-under-`seed_rng` random data
+    /// should generate through `registry->rng()` rather than calling
+    /// `ibex::runtime::fill_*` directly.
+    [[nodiscard]] auto rng() const noexcept -> const RngBridge& { return rng_; }
+
     /// Register a scalar-returning extern function.
     void register_scalar(std::string name, ScalarKind kind, ExternFn func) {
         registry_.insert_or_assign(std::move(name), ExternFunction{
@@ -247,6 +275,7 @@ class ExternRegistry {
    private:
     robin_hood::unordered_map<std::string, ExternFunction> registry_;
     robin_hood::unordered_map<std::string, ModelOps> models_;
+    RngBridge rng_;
 };
 
 }  // namespace ibex::runtime

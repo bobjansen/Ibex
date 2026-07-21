@@ -1201,7 +1201,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 if (!spec) {
                     return std::unexpected(spec.error());
                 }
-                return apply_rolling_func(call, input, *spec);
+                return apply_rolling_func(call, input, *spec, ctx.window_aligned);
             }},
         };
         for (const auto* fn : {

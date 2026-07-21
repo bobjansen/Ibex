@@ -2144,7 +2144,8 @@ class Lowerer {
             if (!duration.has_value()) {
                 return std::unexpected(duration.error());
             }
-            auto window_node = builder_.window(duration.value(), window_select);
+            auto window_node =
+                builder_.window(duration.value(), window_select, state.window->aligned);
             if (window_select) {
                 // Build the rolling computation as an Update (reusing `by` for the
                 // per-group window); the select-only flag makes the interpreter
@@ -4581,7 +4582,7 @@ class Lowerer {
             }
             case ir::NodeKind::Window: {
                 const auto& window = static_cast<const ir::WindowNode&>(node);
-                clone = builder_.window(window.duration());
+                clone = builder_.window(window.duration(), window.select_only(), window.aligned());
                 break;
             }
             case ir::NodeKind::Resample: {

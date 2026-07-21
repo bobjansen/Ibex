@@ -191,7 +191,7 @@ auto rolling_window_spec(const ir::CallExpr& call, std::optional<ir::Duration> b
         call.callee + "(col, 20) for 20 rows or " + call.callee + "(col, 5s) for a time window");
 }
 
-auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec)
+auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec, bool aligned)
     -> std::expected<ComputedColumn, std::string> {
     std::size_t rows = table.rows();
 
@@ -237,20 +237,52 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
         }
     }
 
+    // `aligned` duration window: reset on the epoch grid. bucket_start(i) is the
+    // start of the fixed-grid bucket containing row i (floor toward -inf, so
+    // negative timestamps bucket correctly), and the window is [bucket_start, t].
+    const bool aligned_dur = aligned && !is_count;
+    auto bucket_start = [&](std::size_t i) -> std::int64_t {
+        const std::int64_t t = time_vals[i];
+        std::int64_t q = t / dur_val;
+        if (t < 0 && t % dur_val != 0) {
+            --q;  // floor for negative timestamps
+        }
+        return q * dur_val;
+    };
+
     // Spec-aware window bounds, shared by both rolling mechanisms.
     //
     // should_drop(lo, i): is row `lo` outside the window ending at row `i`?
     //   Both bounds are monotonic (the TimeFrame is sorted ascending), so the
-    //   two-pointer `lo` only ever advances.
+    //   two-pointer `lo` only ever advances. For an aligned window `lo` is out
+    //   once it predates the current bucket's start.
     auto should_drop = [&](std::size_t lo, std::size_t i) -> bool {
         if (is_count)
             return (i - lo) >= count_n;
+        if (aligned_dur)
+            return time_vals[lo] < bucket_start(i);
         return time_vals[lo] < time_vals[i] - dur_val;
     };
     // win_lo(i): the first in-window row index for the window ending at `i`.
     auto win_lo = [&](std::size_t i) -> std::size_t {
         if (is_count)
             return i + 1 >= count_n ? i + 1 - count_n : 0;
+        if (aligned_dur) {
+            // First row at or after this bucket's start — binary search, O(log n),
+            // matching the trailing `window_lo`.
+            const std::int64_t start = bucket_start(i);
+            std::size_t lo = 0;
+            std::size_t hi = i;
+            while (lo < hi) {
+                const std::size_t mid = lo + ((hi - lo) / 2);
+                if (time_vals[mid] < start) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return lo;
+        }
         return window_lo(*time_col_ptr, i, duration);
     };
 

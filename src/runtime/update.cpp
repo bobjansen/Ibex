@@ -1396,7 +1396,8 @@ auto add_computed_column(Table& table, const std::string& alias, ComputedColumn 
 // field evaluator, so rolling aggregates without a per-call window use it.
 auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                            ir::Duration duration, const ScalarRegistry* scalars,
-                           const ExternRegistry* externs) -> std::expected<Table, std::string> {
+                           const ExternRegistry* externs, bool aligned)
+    -> std::expected<Table, std::string> {
     Table output = std::move(input);
     const std::size_t rows = output.rows();
     if (!output.time_index.has_value()) {
@@ -1435,9 +1436,11 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
         // Shared field evaluator; ctx.window carries the enclosing `window`
         // clause's duration as the rolling_* fallback (a per-call window
         // overrides it).
-        auto col = evaluate_field(
-            field.expr, output,
-            ColumnEvalCtx{.scalars = scalars, .externs = externs, .window = duration});
+        auto col = evaluate_field(field.expr, output,
+                                  ColumnEvalCtx{.scalars = scalars,
+                                                .externs = externs,
+                                                .window = duration,
+                                                .window_aligned = aligned});
         if (!col) {
             return std::unexpected(col.error());
         }
@@ -1457,10 +1460,10 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
 auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                                    ir::Duration duration,
                                    const std::vector<ir::ColumnRef>& group_by,
-                                   const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<Table, std::string> {
+                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                   bool aligned) -> std::expected<Table, std::string> {
     if (group_by.empty()) {
-        return windowed_update_table(std::move(input), fields, duration, scalars, externs);
+        return windowed_update_table(std::move(input), fields, duration, scalars, externs, aligned);
     }
     if (!input.time_index.has_value()) {
         return std::unexpected("window: requires a TimeFrame");
@@ -1487,7 +1490,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
 
     const std::size_t rows = input.rows();
     if (rows == 0) {
-        return windowed_update_table(std::move(input), fields, duration, scalars, externs);
+        return windowed_update_table(std::move(input), fields, duration, scalars, externs, aligned);
     }
 
     // Bucket rows by group key — the row indices land in original
@@ -1529,7 +1532,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             }
         }
         sub.time_index = input.time_index;
-        return windowed_update_table(std::move(sub), fields, duration, scalars, externs);
+        return windowed_update_table(std::move(sub), fields, duration, scalars, externs, aligned);
     };
 
     // Run the first group to learn the new field column types/names.

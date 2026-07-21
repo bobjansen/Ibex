@@ -5,8 +5,11 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <vector>
+
+#include "exe_path.hpp"
 
 auto main(int argc, char** argv) -> int {
     CLI::App app{"Ibex — interactive columnar DSL"};
@@ -29,7 +32,8 @@ auto main(int argc, char** argv) -> int {
     app.add_flag("--no-history", no_history, "Disable persistent readline history");
     app.add_option("--plugin-path", plugin_path,
                    "Directory to search for plugin shared libraries (*.so). "
-                   "Defaults to IBEX_LIBRARY_PATH environment variable.");
+                   "Defaults to IBEX_LIBRARY_PATH environment variable, then to "
+                   "the directory containing this executable.");
     app.add_option("--import-path", import_path,
                    "Directory to search for library stub files (*.ibex) used by "
                    "`import` declarations.  Defaults to the plugin search path.");
@@ -45,12 +49,20 @@ auto main(int argc, char** argv) -> int {
         spdlog::set_level(spdlog::level::info);
     }
 
-    // Resolve plugin search path: --plugin-path flag takes precedence,
-    // then fall back to IBEX_LIBRARY_PATH environment variable.
+    // Resolve plugin search path: --plugin-path flag takes precedence, then
+    // IBEX_LIBRARY_PATH, then the directory holding this executable (where
+    // plugins are built/packaged by default).
     if (plugin_path.empty()) {
         const char* env = std::getenv("IBEX_LIBRARY_PATH");
         if (env != nullptr) {
             plugin_path = env;
+        }
+    }
+    if (plugin_path.empty()) {
+        std::error_code ec;
+        auto exe_dir = ibex::tools::executable_directory();
+        if (!exe_dir.empty() && std::filesystem::exists(exe_dir, ec)) {
+            plugin_path = exe_dir.string();
         }
     }
 

@@ -39,6 +39,11 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - `window` requires TimeFrame operand
 
 ## Benchmarking Notes
+- **Always check performance after changes on hot execution paths**, including
+  refactors intended to be behavior- or serial-only. Build and measure the
+  affected release-path workload against a pre-change baseline with
+  `benchmarking/compare_ibex_git.sh` before declaring the work complete; do not
+  infer performance neutrality from unchanged output.
 - For mutating benchmarks (e.g., `data.table` updates), exclude input-copy cost from timing by preparing copies outside the timed section.
 - Built-ins should remain minimal; prefer `extern fn` hooks for functionality implemented in C++
 - Workflow: when loading string columns (CSV/parquet), auto-detect categorical encoding where possible.

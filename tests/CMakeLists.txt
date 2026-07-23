@@ -12,6 +12,7 @@ set(IBEX_TEST_SOURCES
     test_ir_canonicalize.cpp
     test_ir_cardinality.cpp
     test_ir_extern_sources.cpp
+    test_ir_expr_predicates.cpp
     test_ir_join_pushdown.cpp
     test_ir_join_order.cpp
     test_ir_join_reorder.cpp

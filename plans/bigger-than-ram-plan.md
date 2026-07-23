@@ -233,8 +233,8 @@ today — both the ADBC plugin and `write_parquet` route through
 
 ### Phase 6 — Planner-driven adaptive operator selection
 
-Once spillable variants of sort/join exist, `build_operator()` /
-`plan_pipelines()` need to *choose* between the in-memory fast path and the
+Once spillable variants of sort/join exist, `build_operator()` needs to *choose*
+between the in-memory fast path and the
 spillable one. The design constraint from Phase 1 makes this simple: no
 cardinality estimation or plan-time statistics are needed. Every spillable
 operator starts in-memory and switches to its disk-backed mode reactively,
@@ -314,5 +314,5 @@ spill correct and tested first.
   shares a design principle worth keeping consistent: both prefer a single
   reactive dispatch point (budget-crossed → spill; expression shape →
   FnKind) over scattered conditionals, so operator-selection code added in
-  Phase 6 should live in `build_operator()`/`plan_pipelines()`, not as a new
+Phase 6 should live in `build_operator()`, not as a new
   ad hoc branch elsewhere.

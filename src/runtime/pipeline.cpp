@@ -1,101 +1,94 @@
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
+#include <algorithm>
 #include <utility>
 
 namespace ibex::runtime {
 
-auto classify_node(ir::NodeKind kind) noexcept -> PipelineRole {
+auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability {
     switch (kind) {
-        case ir::NodeKind::Scan:
-        case ir::NodeKind::ExternCall:
-        case ir::NodeKind::Construct:
-            return PipelineRole::Source;
-
         case ir::NodeKind::Filter:
         case ir::NodeKind::Project:
         case ir::NodeKind::Rename:
         case ir::NodeKind::FilterProject:
         case ir::NodeKind::FilterUpdateProject:
-            return PipelineRole::Passthrough;
+            return ExecutionCapability::ParallelMap;
 
-        case ir::NodeKind::Columns:
-        case ir::NodeKind::Update:
         case ir::NodeKind::Head:
         case ir::NodeKind::Tail:
         case ir::NodeKind::FilterHead:
         case ir::NodeKind::FilterTail:
+            return ExecutionCapability::OrderedStream;
+
         case ir::NodeKind::Aggregate:
         case ir::NodeKind::Order:
         case ir::NodeKind::TopK:
         case ir::NodeKind::Distinct:
         case ir::NodeKind::Join:
-        case ir::NodeKind::Window:
-        case ir::NodeKind::Resample:
-        case ir::NodeKind::AsTimeframe:
-        case ir::NodeKind::Ascribe:
-        case ir::NodeKind::Melt:
-        case ir::NodeKind::Dcast:
-        case ir::NodeKind::Stream:
-        case ir::NodeKind::Cov:
-        case ir::NodeKind::Corr:
-        case ir::NodeKind::Transpose:
-        case ir::NodeKind::Matmul:
-        case ir::NodeKind::Rbind:
-        case ir::NodeKind::Model:
-        case ir::NodeKind::Program:
-            return PipelineRole::Breaker;
+            return ExecutionCapability::ParallelBarrier;
+
+        default:
+            return ExecutionCapability::Barrier;
     }
-    return PipelineRole::Breaker;
 }
 
 namespace {
 
-void walk(const ir::Node& node, PipelinePlan& plan, PipelineSegment& current) {
-    const auto role = classify_node(node.kind());
-
-    if (role == PipelineRole::Source) {
-        current.nodes.insert(current.nodes.begin(), &node);
-        return;
-    }
-
-    if (role == PipelineRole::Passthrough) {
-        if (!node.children().empty()) {
-            walk(*node.children().front(), plan, current);
+auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
+    switch (node.kind()) {
+        case ir::NodeKind::Filter:
+            return ir::is_subset_evaluable_expr(
+                static_cast<const ir::FilterNode&>(node).predicate());
+        case ir::NodeKind::FilterProject:
+            return ir::is_subset_evaluable_expr(
+                static_cast<const ir::FilterProjectNode&>(node).predicate());
+        case ir::NodeKind::FilterUpdateProject: {
+            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+            if (!ir::is_subset_evaluable_expr(fup.predicate())) {
+                return false;
+            }
+            return std::ranges::all_of(fup.fields(), [](const ir::FieldSpec& field) {
+                return ir::is_subset_evaluable_expr(field.expr);
+            });
         }
-        current.nodes.push_back(&node);
-        return;
+        case ir::NodeKind::Project:
+        case ir::NodeKind::Rename:
+            return true;
+        default:
+            return false;
     }
-
-    // Breaker: recurse into child to finish the upstream segment,
-    // then close the current segment and start a new one.
-    if (!node.children().empty()) {
-        walk(*node.children().front(), plan, current);
-    }
-
-    // The current segment holds the upstream pipeline (source → passthroughs).
-    // Close it if non-empty.
-    if (!current.nodes.empty()) {
-        plan.segments.push_back(std::move(current));
-        current = PipelineSegment{};
-    }
-
-    // The breaker itself forms a single-node segment.
-    PipelineSegment breaker_seg;
-    breaker_seg.nodes.push_back(&node);
-    plan.segments.push_back(std::move(breaker_seg));
 }
 
 }  // namespace
 
-auto plan_pipelines(const ir::Node& root) -> PipelinePlan {
-    PipelinePlan plan;
-    PipelineSegment current;
-    walk(root, plan, current);
-    if (!current.nodes.empty()) {
-        plan.segments.push_back(std::move(current));
+auto analyze_parallel_island(const ir::Node& root) -> ParallelIslandCandidate {
+    ParallelIslandCandidate candidate;
+    const ir::Node* current = &root;
+
+    while (execution_capability(current->kind()) == ExecutionCapability::ParallelMap) {
+        if (!expressions_are_subset_evaluable(*current)) {
+            candidate.reason = ParallelEligibilityReason::UnsupportedExpression;
+            return candidate;
+        }
+        if (current->children().size() != 1 || current->children().front() == nullptr) {
+            candidate.reason = ParallelEligibilityReason::UnsupportedShape;
+            return candidate;
+        }
+        candidate.operators.push_back(current);
+        current = current->children().front().get();
     }
-    return plan;
+
+    if (candidate.operators.empty()) {
+        candidate.reason = ParallelEligibilityReason::NotParallelMap;
+        return candidate;
+    }
+
+    std::reverse(candidate.operators.begin(), candidate.operators.end());
+    candidate.input = current;
+    candidate.reason = ParallelEligibilityReason::Eligible;
+    return candidate;
 }
 
 }  // namespace ibex::runtime

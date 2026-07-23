@@ -1,6 +1,7 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/runtime/pipeline.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -49,6 +50,30 @@ TEST_CASE("Lower filter and select to IR") {
     const auto* scan = as_node<ir::ScanNode>(fp->children()[0].get());
     REQUIRE(scan != nullptr);
     REQUIRE(scan->source_name() == "df");
+}
+
+TEST_CASE("Parallel-island eligibility follows lowered canonical IR", "[runtime][pipeline]") {
+    auto program = require_parse("df[filter price > 10, select { price }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    auto candidate = runtime::analyze_parallel_island(**result);
+    REQUIRE(candidate.eligible());
+    REQUIRE(candidate.input != nullptr);
+    CHECK(candidate.input->kind() == ir::NodeKind::Scan);
+    REQUIRE(candidate.operators.size() == 1);
+    CHECK(candidate.operators[0]->kind() == ir::NodeKind::FilterProject);
+}
+
+TEST_CASE("Parallel-island eligibility rejects lowered non-row-local expressions",
+          "[runtime][pipeline]") {
+    auto program = require_parse("df[filter lag(price) > 10];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    auto candidate = runtime::analyze_parallel_island(**result);
+    CHECK_FALSE(candidate.eligible());
+    CHECK(candidate.reason == runtime::ParallelEligibilityReason::UnsupportedExpression);
 }
 
 TEST_CASE("Lowering optimizer elides dead pure preamble calls") {

@@ -5687,6 +5687,10 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+    // Phase 1 invokes analyze_parallel_island() at this physical-execution
+    // seam once RuntimeOptions can request a parallel executor. Do not run the
+    // analysis merely to discard it on the serial path: build_operator() is a
+    // hot query-construction path, and this prerequisite must be cost-neutral.
     if (node.kind() == ir::NodeKind::Filter) {
         const auto& filter = static_cast<const ir::FilterNode&>(node);
         if (filter.children().empty()) {

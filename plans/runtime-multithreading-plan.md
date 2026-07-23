@@ -163,13 +163,12 @@ state. The physical source must expose partitions deliberately.
 ### Operator categories
 
 **Where the eligibility decision lives (Option B).** The seam is the existing
-operator builder, not a separate planner object. `plan_pipelines()` /
-`PipelinePlan` (`include/ibex/runtime/pipeline.hpp`) is analysis-only and its
-sole caller is `tests/test_operator.cpp`; the execution path is
+operator builder, not a separate planner object. The former `plan_pipelines()` /
+`PipelinePlan` test-only segmenter was retired because the execution path is
 `interpret()` → `build_operator()` → `MaterializeOperator::run()`
-(`src/runtime/interpreter.cpp:1433`), which recurses the IR directly and never
-consults `PipelinePlan`. Rather than promote that test-only segmenter onto the
-hot path, `build_operator()` — which already owns operator fusion
+(`src/runtime/interpreter.cpp:1433`), which recurses the IR directly. Rather
+than promote that disconnected segmenter onto the hot path, `build_operator()`
+— which already owns operator fusion
 (`FilterProject`, `FilterUpdateProject`, join-shape selection) — remains
 authoritative and gains one eligibility pass it consults at each `Passthrough`
 chain to choose a parallel-island operator or the existing serial chain. This
@@ -185,19 +184,16 @@ and where to retain the existing serial fallback. There must be one owner of thi
 decision, one eligibility vocabulary, and one fallback path — and it is this
 seam, not `plan_pipelines`.
 
-The builder today reaches for `classify_node`'s three roles — `Source`,
-`Passthrough`, and `Breaker` (`src/runtime/pipeline.cpp`). This plan adds a
-new execution-capability vocabulary of four categories and maps it onto those
-roles; it is not a classification `build_operator()` performs today:
+The builder's eligibility pass uses one execution-capability vocabulary:
 
-| Category | Maps from today's role | Initial behavior | Examples |
-|---|---|---|---|
-| Parallel map | `Passthrough` | One independent task per morsel, ordered merge | row-local filter, project; fused filter/update/project |
-| Ordered/stateful stream | some `Breaker`s | Preserve order; initially serial unless a boundary algorithm is supplied | head/tail, lag/lead, fill, cumulative functions |
-| Barrier | most `Breaker`s | Materialize or synchronize before continuing; serial first | order, distinct, general join, windows, rank, model |
-| Parallel barrier (later) | `Breaker` | local worker state, deterministic finalize/merge, then next stage | group-by, join build/probe, sort |
+| Category | Initial behavior | Examples |
+|---|---|---|
+| Parallel map | One independent task per morsel, ordered merge | row-local filter, project; fused filter/update/project |
+| Ordered/stateful stream | Preserve order; initially serial unless a boundary algorithm is supplied | head/tail, lag/lead, fill, cumulative functions |
+| Barrier | Materialize or synchronize before continuing; serial first | windows, rank, model |
+| Parallel barrier (later) | local worker state, deterministic finalize/merge, then next stage | group-by, join build/probe, sort |
 
-Note that standalone `Update` is a `Breaker` today, not `Passthrough` — see the
+Note that standalone `Update` is a barrier today, not a parallel map — see the
 Phase 1 eligibility note below. Pipelines stop at a barrier. This makes every phase transition obvious and
 keeps control flow out of individual operators. A first implementation needs
 only the first two rows plus the existing serial fallback.
@@ -398,9 +394,8 @@ Eligibility is intentionally narrow:
 - every output column/validity bitmap is either task-owned or written into a
   disjoint preallocated range.
 
-Scope the first landing to paths that are already `Passthrough` in
-`classify_node` — `Filter`, `Project`, `Rename`, `FilterProject`,
-`FilterUpdateProject`. Standalone `NodeKind::Update` is currently a `Breaker`,
+Scope the first landing to `ParallelMap` paths — `Filter`, `Project`, `Rename`,
+`FilterProject`, `FilterUpdateProject`. Standalone `NodeKind::Update` is a barrier,
 although `build_operator()` already routes eligible row-local updates through
 `ChunkedUpdateOperator`. Making bare update part of the parallel island still
 is not free: the eligibility pass must make its role conditional on the

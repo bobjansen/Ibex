@@ -9,8 +9,8 @@ is defensive and only reachable for node kinds that are not yet classified (and
 `Scan`, which the caller handles as a source).
 
 The substrate (`Operator`/`TableSourceOperator`/`MaterializeOperator` in
-`include/ibex/runtime/operator.hpp`, `chunk_to_table`/`table_to_chunk`,
-`plan_pipelines()` in `src/runtime/pipeline.cpp`) is stable. What the roadmap
+`include/ibex/runtime/operator.hpp`, `chunk_to_table`/`table_to_chunk`) is
+stable. What the roadmap
 tracks now is removing the remaining materialization boundaries and finding
 fusion opportunities that actually move the benchmark.
 

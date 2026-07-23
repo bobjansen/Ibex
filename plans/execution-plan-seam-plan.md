@@ -1,7 +1,7 @@
 # Execution-Plan Seam Plan
 
 **Prerequisite for [runtime-multithreading-plan.md](runtime-multithreading-plan.md)**
-— to be completed *before* that plan's Phase 0. The master plan repeatedly names
+— completed before that plan's Phase 0. The master plan repeatedly names
 "the existing pipeline planner" as the single owner of the parallel-eligibility
 decision (see its *Operator categories* section). That owner does not exist in
 the execution path today. This plan establishes it.
@@ -15,7 +15,7 @@ The master plan asserts:
 
 But there is no planner in the execution path to extend:
 
-- `plan_pipelines()` / `PipelinePlan` (`include/ibex/runtime/pipeline.hpp`,
+- `plan_pipelines()` / `PipelinePlan` (formerly in `include/ibex/runtime/pipeline.hpp`,
   `src/runtime/pipeline.cpp`) is **analysis-only**: it segments the IR tree into
   `PipelineSegment`s and classifies nodes via `classify_node` into
   `Source` / `Passthrough` / `Breaker`. It builds no operators and drives no
@@ -31,11 +31,16 @@ recursive builder. Until one authoritative seam decides island vs. barrier vs.
 serial fallback, the master plan's "one owner" cannot be honoured, and the
 parallel-eligibility check would inevitably grow a second copy.
 
-## Decision to make first (owner: user)
+## Decision
 
-Pick the seam. The rest of this plan branches on the answer.
+**Option B is selected.** `build_operator()` remains the authoritative
+physical-execution seam. `analyze_parallel_island()` owns both the
+execution-capability vocabulary and the expression-level eligibility checks.
+Phase 1 will invoke it from that seam once `RuntimeOptions` can request a
+parallel executor; the serial prerequisite deliberately does not run analysis
+only to discard it on a hot query-construction path.
 
-### Option A — authoritative physical-plan builder
+### Option A — authoritative physical-plan builder (not selected)
 
 Make `plan_pipelines()` (or a successor `build_physical_plan()`) the artifact
 `build_operator()` consumes: segment first, then build operators per segment,
@@ -48,7 +53,7 @@ so segment boundaries *are* the barrier/island boundaries the executor sees.
   selection). That fusion logic must move into, or be consulted by, the planner
   so segments reflect the *fused* physical operators, not raw IR kinds.
 
-### Option B — `build_operator`-hosted island selection (recommended)
+### Option B — `build_operator`-hosted island selection (selected)
 
 Keep `build_operator()` authoritative (it matches reality and already owns
 fusion). Factor the **eligibility decision** into one analysis pass that
@@ -68,51 +73,36 @@ re-derives fusion. The non-negotiable requirement from the master plan is *one
 eligibility vocabulary in one place*; Option B satisfies it without a second
 execution engine. Record the decision in the master plan before Phase 0 starts.
 
-## Work (shared, then per-branch)
+## Delivered work
 
-### Shared
-
-1. **Define the execution-capability vocabulary once.** The master plan adds
+1. **Execution-capability vocabulary.** The master plan adds
    four categories (Parallel map / Ordered stream / Barrier / Parallel barrier)
-   mapped onto today's three roles. Land that enum and the role→category mapping
-   as a single function, co-located with `classify_node`
-   (`src/runtime/pipeline.cpp`). No behavior change yet — it must return
-   "Barrier or serial" for everything so `IBEX_THREADS=1` output is byte-identical.
+   as a single function in `src/runtime/pipeline.cpp`. No behavior change yet —
+   the builder retains its serial fallback, so `IBEX_THREADS=1` output is
+   byte-identical.
 2. **One eligibility pass.** A single function that, given a candidate
    `Passthrough` chain, returns whether it is a parallel map. It owns the
-   expression-tree scan the master plan's Phase 0 item 6 describes (extern /
+   expression-tree scan the master plan's Phase 0 item 7 describes (extern /
    plugin / generator / neighbour-reading transforms → ineligible). This is the
    single place the master plan's "one eligibility vocabulary" lives. Every other
    site queries it; none re-implements it.
-3. **Prove single-ownership with a test from the lowerer.** Following the
+3. **Lowerer-based ownership test.** Following the
    standing lesson in `project_join_reorder_cost_model` ("test optimizer passes
    FROM THE LOWERER"), assert the capability/eligibility decision on lowered IR,
    not hand-built nodes, so the classification the executor actually sees is the
    one under test.
 
-### If Option A
-
-4a. Route `interpret()` through the planner: `build_physical_plan(root)` →
-    per-segment operator construction → execution. Move fusion recognition into
-    the planner so segments carry fused physical operators.
-5a. Delete the test-only status of `plan_pipelines`: it is now on the hot path
-    and needs the full interpreter/parity/e2e suite, not just `test_operator.cpp`.
-
-### If Option B
-
-4b. Retire or repurpose `PipelinePlan`. If kept, it becomes the backing store
-    for the eligibility pass; if not, delete it and its test so there is no
-    second, drifting classifier.
-5b. **Rewrite the master plan's *Operator categories* section** to name
-    `build_operator` + the single eligibility pass as the owner, and stop
-    describing `plan_pipelines` as the thing being extended. This is a required
-    output of this plan, not optional.
+4. **Retire the test-only pipeline representation.** Its segmentation
+   implementation, role classifier, and hand-built-node tests are deleted.
+5. **Synchronize the master plan.** Its *Operator categories* section now names
+   `build_operator` + the single eligibility pass as the owner.
 
 ## Done when
 
 - One capability vocabulary and one eligibility function exist, exercised from
-  the lowerer, and every candidate site consults them.
-- `interpret()`'s chosen seam (A or B) is authoritative and on the hot path.
+  the lowerer.
+- `build_operator()` is designated as the authoritative hot-path seam; Phase 1
+  will activate its eligibility consultation with the parallel executor.
 - The master plan's *Operator categories* section describes the seam that
   actually exists.
 - `IBEX_THREADS=1` output is byte-for-byte unchanged (this whole plan is a

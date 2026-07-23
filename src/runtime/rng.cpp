@@ -34,54 +34,98 @@ std::uint64_t entropy_seed() noexcept {
 
 }  // namespace
 
-// The engines live as function-local thread_locals rather than namespace-scope
-// globals so each stays a per-thread singleton without tripping
-// cppcoreguidelines-avoid-non-const-global-variables. Accessors are called once
-// per bulk fill, so the first-use guard is off the hot path.
+auto derive_rng_seed(std::uint64_t master_seed, std::uint64_t stream_id) noexcept -> std::uint64_t {
+    // SplitMix64 finalizer. Mixing the stream ID separately avoids correlated
+    // low-numbered worker seeds while keeping assignment fully deterministic.
+    auto mix = [](std::uint64_t value) noexcept {
+        value ^= value >> 30;
+        value *= 0xBF58476D1CE4E5B9ULL;
+        value ^= value >> 27;
+        value *= 0x94D049BB133111EBULL;
+        return value ^ (value >> 31);
+    };
+    return mix(master_seed ^ mix(stream_id + 0x9E3779B97F4A7C15ULL));
+}
+
+RngStream::RngStream(std::uint64_t seed) noexcept : scalar_{seed}, simd_{seed}, x4_{seed} {}
+
+void RngStream::reseed(std::uint64_t seed) noexcept {
+    scalar_ = Xoshiro256pp{seed};
+    simd_ = zorro::Rng{seed};
+    x4_ = Xoshiro256pp_x4_portable{seed};
+}
+
+// The default stream lives as a function-local thread_local rather than a
+// namespace-scope global. It is safe for independent callers on different
+// threads, but explicit streams make parallel scheduling reproducible.
+auto get_rng_stream() noexcept -> RngStream& {
+    alignas(64) static thread_local RngStream rng{entropy_seed()};
+    return rng;
+}
 
 auto get_rng() noexcept -> Xoshiro256pp& {
-    alignas(64) static thread_local Xoshiro256pp rng{entropy_seed()};
-    return rng;
+    return get_rng_stream().scalar();
 }
 
 auto get_rng_simd() noexcept -> zorro::Rng& {
-    alignas(64) static thread_local zorro::Rng rng{entropy_seed()};
-    return rng;
+    return get_rng_stream().simd();
 }
 
 auto get_rng_x4() noexcept -> Xoshiro256pp_x4_portable& {
-    alignas(64) static thread_local Xoshiro256pp_x4_portable rng{entropy_seed()};
-    return rng;
+    return get_rng_stream().x4();
 }
 
 void reseed(std::uint64_t seed) noexcept {
-    get_rng() = Xoshiro256pp{seed};
-    get_rng_simd() = zorro::Rng{seed};
-    get_rng_x4() = Xoshiro256pp_x4_portable{seed};
+    get_rng_stream().reseed(seed);
 }
 
 void fill_uniform(double* __restrict out, std::size_t rows, double low, double high) noexcept {
-    get_rng_simd().fill_uniform(out, rows, low, high);
+    fill_uniform(get_rng_stream(), out, rows, low, high);
+}
+
+void fill_uniform(RngStream& stream, double* __restrict out, std::size_t rows, double low,
+                  double high) noexcept {
+    stream.simd().fill_uniform(out, rows, low, high);
 }
 
 void fill_normal(double* __restrict out, std::size_t rows, double mean, double stddev) noexcept {
-    get_rng_simd().fill_normal(out, rows, mean, stddev);
+    fill_normal(get_rng_stream(), out, rows, mean, stddev);
+}
+
+void fill_normal(RngStream& stream, double* __restrict out, std::size_t rows, double mean,
+                 double stddev) noexcept {
+    stream.simd().fill_normal(out, rows, mean, stddev);
 }
 
 void fill_exponential(double* __restrict out, std::size_t rows, double lambda) noexcept {
-    get_rng_simd().fill_exponential(out, rows, lambda);
+    fill_exponential(get_rng_stream(), out, rows, lambda);
+}
+
+void fill_exponential(RngStream& stream, double* __restrict out, std::size_t rows,
+                      double lambda) noexcept {
+    stream.simd().fill_exponential(out, rows, lambda);
 }
 
 // Bulk int64 fills delegate to the SIMD-dispatched zorro engine (the same one
 // that backs the double fills), so bernoulli/int are hand-vectorized rather
 // than relying on the compiler to auto-vectorize a portable loop.
 void fill_bernoulli(std::int64_t* __restrict out, std::size_t rows, double p) noexcept {
-    get_rng_simd().fill_bernoulli(out, rows, p);
+    fill_bernoulli(get_rng_stream(), out, rows, p);
+}
+
+void fill_bernoulli(RngStream& stream, std::int64_t* __restrict out, std::size_t rows,
+                    double p) noexcept {
+    stream.simd().fill_bernoulli(out, rows, p);
 }
 
 void fill_int(std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
               std::uint64_t span) noexcept {
-    get_rng_simd().fill_int(out, rows, lo, span);
+    fill_int(get_rng_stream(), out, rows, lo, span);
+}
+
+void fill_int(RngStream& stream, std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
+              std::uint64_t span) noexcept {
+    stream.simd().fill_int(out, rows, lo, span);
 }
 
 }  // namespace ibex::runtime

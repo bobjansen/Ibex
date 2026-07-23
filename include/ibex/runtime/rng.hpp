@@ -13,8 +13,13 @@
 // Integer fills (bernoulli → int64, rand_int)
 //   · Use zorro::Xoshiro256pp_x4_portable directly (integer-domain comparison)
 //
-// Seeding: reseed() resets all three thread-local engines to the given seed.
+// RngStream owns all engines needed by one execution stream.  It has no shared
+// mutable state, so give each worker its own stream when evaluating in
+// parallel.  Construct streams with derive_rng_seed(master_seed, worker_id) to
+// make their assignment deterministic and independent of OS thread identity.
+// reseed() resets the calling thread's default stream.
 
+#include <cstddef>
 #include <cstdint>
 #include <zorro.hpp>
 
@@ -24,6 +29,41 @@ namespace ibex::runtime {
 using zorro::bits_to_01;
 using zorro::bits_to_pm1;
 using zorro::Xoshiro256pp;
+using zorro::Xoshiro256pp_x4_portable;
+
+/// Mix a master seed and a stable stream identifier into a stream seed.
+///
+/// The identifier should describe logical work (for example, a partition or
+/// worker number), rather than std::thread::id: the latter makes reproducible
+/// parallel work depend on scheduling.
+[[nodiscard]] auto derive_rng_seed(std::uint64_t master_seed, std::uint64_t stream_id) noexcept
+    -> std::uint64_t;
+
+/// The complete mutable RNG state for one execution stream.
+///
+/// RngStream is intentionally non-shared: concurrent callers must use one
+/// instance per worker.  Its individual engines are exposed for the existing
+/// std::distribution and vectorized paths, while the fill_* overloads below
+/// provide the usual convenient bulk interface.
+class alignas(64) RngStream {
+   public:
+    explicit RngStream(std::uint64_t seed) noexcept;
+
+    void reseed(std::uint64_t seed) noexcept;
+
+    [[nodiscard]] auto scalar() noexcept -> Xoshiro256pp& { return scalar_; }
+    [[nodiscard]] auto simd() noexcept -> zorro::Rng& { return simd_; }
+    [[nodiscard]] auto x4() noexcept -> Xoshiro256pp_x4_portable& { return x4_; }
+
+   private:
+    Xoshiro256pp scalar_;
+    zorro::Rng simd_;
+    Xoshiro256pp_x4_portable x4_;
+};
+
+/// The calling thread's default stream. Prefer explicit RngStream instances
+/// for work that can move between workers or needs reproducible parallelism.
+auto get_rng_stream() noexcept -> RngStream&;
 
 // ─── Thread-local scalar engine (for std::distribution) ──────────────────────
 
@@ -35,8 +75,6 @@ auto get_rng_simd() noexcept -> zorro::Rng&;
 
 // ─── Thread-local x4 portable engine (for integer fills) ─────────────────────
 
-using zorro::Xoshiro256pp_x4_portable;
-
 auto get_rng_x4() noexcept -> Xoshiro256pp_x4_portable&;
 
 // ─── Seeding ─────────────────────────────────────────────────────────────────
@@ -46,16 +84,26 @@ void reseed(std::uint64_t seed) noexcept;
 // ─── Bulk fills: double output (delegate to zorro::Rng) ──────────────────────
 
 void fill_uniform(double* __restrict out, std::size_t rows, double low, double high) noexcept;
+void fill_uniform(RngStream& stream, double* __restrict out, std::size_t rows, double low,
+                  double high) noexcept;
 
 void fill_normal(double* __restrict out, std::size_t rows, double mean, double stddev) noexcept;
+void fill_normal(RngStream& stream, double* __restrict out, std::size_t rows, double mean,
+                 double stddev) noexcept;
 
 void fill_exponential(double* __restrict out, std::size_t rows, double lambda) noexcept;
+void fill_exponential(RngStream& stream, double* __restrict out, std::size_t rows,
+                      double lambda) noexcept;
 
 // ─── Bulk fills: int64 output (zorro has no int64 bernoulli/int) ─────────────
 
 void fill_bernoulli(std::int64_t* __restrict out, std::size_t rows, double p) noexcept;
+void fill_bernoulli(RngStream& stream, std::int64_t* __restrict out, std::size_t rows,
+                    double p) noexcept;
 
 void fill_int(std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
+              std::uint64_t span) noexcept;
+void fill_int(RngStream& stream, std::int64_t* __restrict out, std::size_t rows, std::int64_t lo,
               std::uint64_t span) noexcept;
 
 }  // namespace ibex::runtime

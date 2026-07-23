@@ -34,6 +34,7 @@ set(IBEX_TEST_SOURCES
     test_join.cpp
     test_lazy_table.cpp
     test_operator.cpp
+    test_table_compare.cpp
 )
 if(NOT WIN32)
     list(APPEND IBEX_TEST_SOURCES test_websocket.cpp test_udp.cpp)

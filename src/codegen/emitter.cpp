@@ -806,6 +806,11 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             const auto& cn = static_cast<const ir::ConstructNode&>(node);
             auto var = fresh_var();
             *out_ << "    ibex::runtime::Table " << var << ";\n";
+            if (cn.row_count().has_value()) {
+                *out_ << "    " << var << ".logical_rows = static_cast<std::size_t>("
+                      << emit_raw_expr(*cn.row_count()) << ");\n";
+                return var;
+            }
             for (const auto& col : cn.columns()) {
                 if (col.expr_node) {
                     // Expression column: emit the sub-node then extract the column.

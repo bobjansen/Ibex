@@ -1,0 +1,2 @@
+let t = Table { name = ["a", "bb", "ccc"], flag = [true, false, true], x = [1, 2, 3] };
+t[filter flag][update { label = substring(name, 0, 1), doubled = x * 2 }][select { label, doubled }];

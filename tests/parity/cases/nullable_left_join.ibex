@@ -1,0 +1,5 @@
+// The unmatched first and last rows carry genuine null validity for `v`.
+let l = Table { id = [1, 2, 3] };
+let r = Table { id = [2], v = [20] };
+let j = l left join r on id;
+j[select { id, v }][order { id asc }];

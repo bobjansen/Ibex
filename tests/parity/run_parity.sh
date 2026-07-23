@@ -83,6 +83,9 @@ trap 'rm -rf "$TMPDIR_WORK"' EXIT
 fail=0
 for case_file in "$CASES_DIR"/*.ibex; do
     name="$(basename "${case_file%.ibex}")"
+    if [[ -n "${PARITY_CASE:-}" && "$name" != "$PARITY_CASE" ]]; then
+        continue
+    fi
     cpp_file="$TMPDIR_WORK/$name.cpp"
     bin_file="$TMPDIR_WORK/$name.bin"
     "$IBEX_COMPILE" "$case_file" --table-entry-point -o "$cpp_file"

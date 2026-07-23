@@ -1,0 +1,1 @@
+Table { x = [] }[filter x > 0][select { x }];

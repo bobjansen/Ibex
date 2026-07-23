@@ -187,6 +187,7 @@ int main(int argc, char* argv[]) {
     std::string input_path;
     std::string output_path;
     bool no_print = false;
+    bool table_entry_point = false;
     bool bench = false;
     int bench_warmup = 3;
     int bench_iters = 10;
@@ -195,6 +196,8 @@ int main(int argc, char* argv[]) {
     app.add_option("input", input_path, "Input .ibex source file")->required();
     app.add_option("-o,--output", output_path, "Output .cpp file (default: stdout)");
     app.add_flag("--no-print", no_print, "Disable ibex::ops::print() in generated code");
+    app.add_flag("--table-entry-point", table_entry_point,
+                 "Emit ibex_generated_execute() returning Table instead of main()");
     app.add_flag("--bench", bench,
                  "Emit a benchmark harness: data loaded once, query timed internally");
     app.add_option("--bench-warmup", bench_warmup, "Warmup iterations (default: 3)")
@@ -259,6 +262,7 @@ int main(int argc, char* argv[]) {
     ibex::codegen::Emitter::Config config;
     config.source_name = input_path;
     config.print_result = !no_print && !bench;
+    config.table_entry_point = table_entry_point;
     config.bench_mode = bench;
     config.bench_warmup = bench_warmup;
     config.bench_iters = bench_iters;

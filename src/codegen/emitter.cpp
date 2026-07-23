@@ -97,7 +97,7 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     out << "#include <ctime>\n";
     if (config.bench_mode)
         out << "#include <chrono>\n#include <cstdio>\n";
-    else
+    else if (!config.table_entry_point)
         out << "#include <iostream>\n";
     out << "#include <limits>\n";
     out << "#include <optional>\n";
@@ -112,7 +112,12 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     }
 
     out << "\n";
-    out << "int main() {\n";
+    if (config.table_entry_point) {
+        if (config.bench_mode)
+            throw std::runtime_error("table entry point cannot be a benchmark harness");
+        out << "ibex::runtime::Table " << config.entry_point_name << "() {\n";
+    } else
+        out << "int main() {\n";
 
     if (!config.scalar_bindings.empty()) {
         out << "    ibex::runtime::ScalarRegistry _ibex_scalars;\n";
@@ -179,12 +184,15 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
         out << "    std::fprintf(stderr, \"avg_ms=%.3f\\n\", _avg_ms);\n";
     } else {
         auto result_var = emit_node(root);
-        if (config.print_result) {
+        if (config.table_entry_point) {
+            out << "    return " << result_var << ";\n";
+        } else if (config.print_result) {
             out << "    ibex::ops::print(" << result_var << ");\n";
         }
     }
 
-    out << "    return 0;\n";
+    if (!config.table_entry_point)
+        out << "    return 0;\n";
     out << "}\n";
 
     out_ = nullptr;

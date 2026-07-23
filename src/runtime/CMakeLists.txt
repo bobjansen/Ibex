@@ -15,6 +15,7 @@ add_library(ibex_runtime STATIC
     runtime_internal.cpp
     sort.cpp
     table_format.cpp
+    table_compare.cpp
     update.cpp
     window.cpp
 )

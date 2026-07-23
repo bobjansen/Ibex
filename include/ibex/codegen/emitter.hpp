@@ -37,6 +37,9 @@ class Emitter {
         bool bench_mode = false;
         int bench_warmup = 3;
         int bench_iters = 10;
+        /// Emit a callable Table-returning entry point instead of main().
+        bool table_entry_point = false;
+        std::string entry_point_name = "ibex_generated_execute";
     };
 
     /// Emit a complete C++ translation unit to `out`.

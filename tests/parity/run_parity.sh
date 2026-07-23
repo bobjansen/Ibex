@@ -36,6 +36,7 @@ fi
 
 IBEX_EVAL="$BUILD_DIR/tools/ibex_eval"
 IBEX_COMPILE="$BUILD_DIR/tools/ibex_compile"
+STRUCTURED_RUNNER="$SCRIPT_DIR/structured_runner.cpp"
 CASES_DIR="$SCRIPT_DIR/cases"
 
 if [[ ! -x "$IBEX_EVAL" ]]; then
@@ -69,6 +70,7 @@ _spdlog_lib="$BUILD_DIR/_deps/spdlog-build/libspdlog.a"
 
 IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
+    "$BUILD_DIR/src/parser/libibex_parser.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
     "$BUILD_DIR/src/core/libibex_core.a"
     "$_fmt_lib"
@@ -83,19 +85,11 @@ for case_file in "$CASES_DIR"/*.ibex; do
     name="$(basename "${case_file%.ibex}")"
     cpp_file="$TMPDIR_WORK/$name.cpp"
     bin_file="$TMPDIR_WORK/$name.bin"
-    interp_out="$TMPDIR_WORK/$name.interp.out"
-    transpiled_out="$TMPDIR_WORK/$name.transpiled.out"
-    diff_out="$TMPDIR_WORK/$name.diff"
-
-    "$IBEX_EVAL" "$case_file" >"$interp_out"
-    "$IBEX_COMPILE" "$case_file" -o "$cpp_file"
+    "$IBEX_COMPILE" "$case_file" --table-entry-point -o "$cpp_file"
     "$CXX" "${EXTRA_CXXFLAGS[@]}" -std="$CXX_STD_FLAG" \
-        "${IBEX_INCS[@]}" "$cpp_file" "${IBEX_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
-    "$bin_file" >"$transpiled_out"
-
-    if ! diff -u "$interp_out" "$transpiled_out" >"$diff_out"; then
+        "${IBEX_INCS[@]}" "$cpp_file" "$STRUCTURED_RUNNER" "${IBEX_LIBS[@]}" "${EXTRA_LDFLAGS[@]}" -o "$bin_file"
+    if ! "$bin_file" "$case_file"; then
         echo "parity mismatch: $name" >&2
-        cat "$diff_out" >&2
         fail=1
     else
         echo "parity ok: $name"

@@ -1,0 +1,3 @@
+// melt's `variable` output is dictionary-encoded Categorical, not String.
+let t = Table { id = [1, 2], a = [10, 20], b = [100, 200] };
+t[melt id, select { a, b }];

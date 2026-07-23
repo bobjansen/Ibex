@@ -22,7 +22,9 @@ complete enough to move under `plans/done/`.
 
 | Plan | Notes |
 |---|---|
-| [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Kernel-level parallelism (`IBEX_THREADS`, `parallel_for`), single-threaded default. No code yet. |
+| [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Query-scoped, morsel-driven execution: ordered parallel row-local pipeline first; nullable chunks, deterministic RNG, safe lazy/extern boundaries, then parallel barriers. `IBEX_THREADS=1` default. No code yet. **Gated on two Phase-0 prerequisites below.** |
+| [execution-plan-seam-plan.md](execution-plan-seam-plan.md) | **Prereq for runtime-multithreading, before its Phase 0.** The "existing pipeline planner" the master plan extends is test-only: `plan_pipelines()` is called only by `test_operator.cpp`, while `interpret()` runs `build_operator()` directly. Establish one authoritative eligibility seam first. Decision pending (owner: user): authoritative physical-plan builder vs. `build_operator`-hosted island selection (recommended). Single-threaded refactor, no parallelism. |
+| [serial-parity-comparator-plan.md](serial-parity-comparator-plan.md) | **Prereq for runtime-multithreading, before its Phase 0.** The master plan's parity gate needs schema/metadata/validity/categorical-backing comparison; the current `run_parity.sh` only `diff`s stdout and can see none of that. Build an in-process structured `Table`-vs-`Table` comparator + case matrix. |
 | [julia-integration-plan.md](julia-integration-plan.md) | Ibex.jl package, `ibex"""..."""` macro, Arrow/Tables.jl interop, DataFrames.jl benchmark baseline |
 | [short-mode-plan.md](short-mode-plan.md) | Prefix-abbreviated golf mode (`t[s{s,p}]`) behind an explicit mode gate + formatter round-trip. Design sketch only |
 
@@ -56,7 +58,13 @@ complete enough to move under `plans/done/`.
   project_execution_roadmap).
 - **runtime-multithreading** is the answer to the remaining polars
   multi-thread gaps in **benchmark-perf-priorities** (single-thread ibex
-  already wins 37/41 vs polars-st).
+  already wins 37/41 vs polars-st). It is gated on two Phase-0 prerequisites:
+  **execution-plan-seam** (there is no execution-path planner to extend —
+  `plan_pipelines` is test-only) and **serial-parity-comparator** (the parity
+  gate needs structural comparison the stdout-diff harness cannot do). A third
+  gap — a partition/merge metadata contract for `ordering`/`time_index`/
+  `logical_rows` — is being handled directly in the master plan by the user, not
+  as a separate plan.
 - **bigger-than-ram** builds directly on **chunked-execution**: every
   "materializing" row in that plan's coverage table (unsorted `Order`/
   `AsTimeframe`, non-streaming `Tail`, general `Join`) is a target phase

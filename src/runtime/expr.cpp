@@ -1292,7 +1292,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         // registry construction.
         for (const auto& [name, fn] : m) {
             validate_builtin(name, fn);
-            if (ir::fn_kind(name) != fn_kind_of(fn)) {
+            const auto kind = ir::fn_kind(name);
+            if (!kind.has_value() || *kind != fn_kind_of(fn)) {
                 invariant_violation(
                     "builtins(): ir::fn_kind disagrees with the registry's exec "
                     "alternative for '" +

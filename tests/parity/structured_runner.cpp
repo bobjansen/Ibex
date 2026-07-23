@@ -1,5 +1,6 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
+#include <ibex/parser/scalar_bindings.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_compare.hpp>
 
@@ -25,7 +26,18 @@ auto main(int argc, char** argv) -> int {
         std::cerr << lowered.error().message << '\n';
         return 1;
     }
-    auto interpreted = ibex::runtime::interpret(**lowered, {});
+    // Scalar `let` bindings are not lowered into IR — reconstruct the registry
+    // the same way ibex_compile does so the interpreter reference resolves them.
+    auto scalar_bindings = ibex::parser::collect_scalar_bindings(*parsed);
+    if (!scalar_bindings) {
+        std::cerr << scalar_bindings.error() << '\n';
+        return 1;
+    }
+    ibex::runtime::ScalarRegistry scalars;
+    for (auto& [name, value] : *scalar_bindings) {
+        scalars[name] = std::move(value);
+    }
+    auto interpreted = ibex::runtime::interpret(**lowered, {}, &scalars);
     if (!interpreted) {
         std::cerr << interpreted.error() << '\n';
         return 1;

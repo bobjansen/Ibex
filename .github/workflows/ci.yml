@@ -143,6 +143,16 @@ jobs:
       - name: Fusion invariants
         run: ./build/tools/ibex_fusion_bench --check --rows 500000 --iters 3 --warmup 1
 
+      # Interpreter vs codegen parity. Reuses this job's Release build (tools on,
+      # parquet off — every case is an in-memory Table, so no Arrow link needed).
+      # Each case is compiled and its generated output compared row-for-row
+      # against the interpreter; a mismatch fails the build.
+      - name: Interpreter-codegen parity
+        env:
+          BUILD_DIR: build
+          CXX: clang++-18
+        run: ./tests/parity/run_parity.sh
+
   clang-tidy:
     runs-on: ubuntu-24.04
     steps:

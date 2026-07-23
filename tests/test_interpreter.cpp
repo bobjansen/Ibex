@@ -10,11 +10,13 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <map>
 #include <sstream>
+#include <thread>
 
 namespace {
 
@@ -5114,6 +5116,39 @@ TEST_CASE("reseed with different seeds produces different rand_uniform sequences
         }
     }
     CHECK(any_different);
+}
+
+TEST_CASE("RngStream gives parallel workers deterministic independent state", "[rng][thread]") {
+    constexpr std::uint64_t master_seed = 0xA11CE5EEDULL;
+    constexpr std::size_t worker_count = 3;
+    constexpr std::size_t draws_per_worker = 37;
+
+    std::array<std::array<double, draws_per_worker>, worker_count> expected{};
+    std::array<std::array<double, draws_per_worker>, worker_count> actual{};
+
+    // Establish the expected result without involving threads. Stream IDs are
+    // logical worker IDs, so the result does not depend on thread scheduling.
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+        runtime::RngStream stream{
+            runtime::derive_rng_seed(master_seed, static_cast<std::uint64_t>(worker))};
+        runtime::fill_uniform(stream, expected[worker].data(), draws_per_worker, -3.0, 7.0);
+    }
+
+    std::array<std::thread, worker_count> workers;
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+        workers[worker] = std::thread([&, worker] {
+            runtime::RngStream stream{
+                runtime::derive_rng_seed(master_seed, static_cast<std::uint64_t>(worker))};
+            runtime::fill_uniform(stream, actual[worker].data(), draws_per_worker, -3.0, 7.0);
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    CHECK(actual == expected);
+    CHECK(expected[0] != expected[1]);
+    CHECK(expected[1] != expected[2]);
 }
 
 TEST_CASE("reseed produces identical rand_normal sequence") {

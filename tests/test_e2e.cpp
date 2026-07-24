@@ -95,6 +95,53 @@ auto make_trades() -> runtime::TableRegistry {
     return reg;
 }
 
+// Run a program with the Phase 1 serial-island path enabled at a small morsel
+// grain, so an eligible chain is partitioned into several ranges.
+auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, std::size_t grain)
+    -> runtime::Table {
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_grain = grain;
+    auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+    REQUIRE(result.has_value());
+    return std::move(*result);
+}
+
+// Byte-for-byte table equality: schema, row count, per-column data and validity.
+void require_tables_equal(const runtime::Table& a, const runtime::Table& b) {
+    REQUIRE(a.columns.size() == b.columns.size());
+    REQUIRE(a.rows() == b.rows());
+    for (std::size_t c = 0; c < a.columns.size(); ++c) {
+        REQUIRE(a.columns[c].name == b.columns[c].name);
+        const auto& av = *a.columns[c].column;
+        const auto& bv = *b.columns[c].column;
+        REQUIRE(av.index() == bv.index());
+        std::visit(
+            [&](const auto& lhs) {
+                using Col = std::decay_t<decltype(lhs)>;
+                const auto& rhs = std::get<Col>(bv);
+                REQUIRE(lhs.size() == rhs.size());
+                for (std::size_t i = 0; i < lhs.size(); ++i) {
+                    REQUIRE(lhs[i] == rhs[i]);
+                }
+            },
+            av);
+        REQUIRE(a.columns[c].validity.has_value() == b.columns[c].validity.has_value());
+        if (a.columns[c].validity.has_value()) {
+            const auto& av2 = *a.columns[c].validity;
+            const auto& bv2 = *b.columns[c].validity;
+            REQUIRE(av2.size() == bv2.size());
+            for (std::size_t i = 0; i < av2.size(); ++i) {
+                REQUIRE(av2[i] == bv2[i]);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 // --- Grouping ----------------------------------------------------------------
@@ -1858,4 +1905,60 @@ days[update = gen_correlated_returns(symbols)];
     CHECK(pearson("AAPL", "MSFT") == Catch::Approx(0.70).epsilon(0.12));
     CHECK(pearson("AAPL", "GOOG") == Catch::Approx(0.50).epsilon(0.12));
     CHECK(pearson("MSFT", "GOOG") == Catch::Approx(0.60).epsilon(0.12));
+}
+
+// --- Phase 1 serial-island equivalence ---------------------------------------
+//
+// With ExecutionContext.parallel set, an eligible row-local chain is executed
+// over a PartitionedTableSource in morsel grains. This slice runs the morsels
+// serially, so the result must be byte-identical to the plain serial path. A
+// small grain (relative to the row count) forces several morsels and a range
+// boundary that a null straddles.
+
+namespace {
+
+// 11-row table so grain=3 yields 4 morsels, with a partial last morsel and a
+// filter that keeps rows straddling every range boundary.
+auto make_island_table() -> runtime::TableRegistry {
+    runtime::Table t;
+    t.add_column("price", Column<std::int64_t>{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110});
+    t.add_column("qty", Column<std::int64_t>{5, 3, 8, 2, 1, 7, 4, 6, 9, 2, 3});
+    t.add_column("symbol", Column<std::string>{"AAPL", "GOOG", "AAPL", "GOOG", "AAPL", "MSFT",
+                                               "AAPL", "GOOG", "MSFT", "AAPL", "GOOG"});
+    runtime::TableRegistry reg;
+    reg.emplace("t", std::move(t));
+    return reg;
+}
+
+}  // namespace
+
+TEST_CASE("E2E: parallel serial-island matches serial output", "[e2e][parallel]") {
+    auto tables = make_island_table();
+    const std::size_t grain = 3;  // 11 rows -> 4 morsels
+
+    // Each case is an eligible parallel-map shape: bare filter, fused
+    // filter+project, fused filter+update+project, project, and rename.
+    const char* cases[] = {
+        "t[filter price > 35];",
+        "t[filter price > 35, select { price, qty }];",
+        "t[filter qty > 2, select { price, notional = price * qty }];",
+        "t[select { price, qty }];",
+        "t[filter price > 15][rename px = price];",
+    };
+    for (const auto* src : cases) {
+        INFO("query: " << src);
+        auto serial = run(src, tables);
+        auto parallel = run_parallel(src, tables, grain);
+        require_tables_equal(serial, parallel);
+    }
+}
+
+TEST_CASE("E2E: parallel serial-island falls back to serial for ineligible shapes",
+          "[e2e][parallel]") {
+    auto tables = make_island_table();
+    // lag() is not row-local: analyze_parallel_island rejects it, so the seam
+    // must leave the query on the untouched serial chain and still succeed.
+    auto serial = run("t[select { price, prev = lag(price, 1) }];", tables);
+    auto parallel = run_parallel("t[select { price, prev = lag(price, 1) }];", tables, 3);
+    require_tables_equal(serial, parallel);
 }

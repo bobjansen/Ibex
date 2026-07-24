@@ -4,6 +4,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/query_lease.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 
@@ -10424,4 +10425,44 @@ TEST_CASE("substring propagates null", "[interpreter][substring]") {
     REQUIRE(out->validity.has_value());
     CHECK((*out->validity)[0] == true);
     CHECK((*out->validity)[1] == false);  // null in -> null out
+}
+
+TEST_CASE("QueryExecutionLease grants the single slot exclusively", "[runtime][lease]") {
+    {
+        const runtime::QueryExecutionLease first;
+        REQUIRE(first.held());
+        // A second lease taken while the first is live does not get the slot.
+        const runtime::QueryExecutionLease second;
+        REQUIRE_FALSE(second.held());
+    }
+    // Released on scope exit, so the slot is claimable again.
+    const runtime::QueryExecutionLease again;
+    REQUIRE(again.held());
+}
+
+TEST_CASE("interpret rejects a re-entrant query while one is in flight", "[runtime][lease]") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{10, 20, 30});
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+    auto ir = require_ir("trades[filter price > 15];");
+
+    // Simulate a query already running (equivalently, an extern/plugin calling
+    // back into interpret() from inside the query it runs under): the outer
+    // lease holds the single slot, so the nested interpret() must be rejected
+    // with the stable error rather than executing.
+    {
+        const runtime::QueryExecutionLease outer;
+        REQUIRE(outer.held());
+
+        auto rejected = runtime::interpret(*ir, registry);
+        REQUIRE_FALSE(rejected.has_value());
+        REQUIRE(rejected.error() == runtime::query_in_flight_message());
+    }
+
+    // With the slot free again, the same call now runs normally — the guard
+    // rejects, it does not poison the runtime.
+    auto ok = runtime::interpret(*ir, registry);
+    REQUIRE(ok.has_value());
+    REQUIRE(ok->rows() == 2);
 }

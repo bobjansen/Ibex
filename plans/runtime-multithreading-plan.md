@@ -649,14 +649,37 @@ scales; eligibility is still the narrow set below.
    `memmove` and made the island 15× *slower* than the serial path. Fixed by
    growing the reservation geometrically. This was a pre-existing defect on
    every chunked path, not an island-specific one.
-2. **A computed `select` does not reach the island on the REPL/script path.**
+2. **A computed `select` did not reach the island — fixed by slice 1c below.**
    `filter … , select { y = f(x) }` lowers to `Project(Update(Filter(x)))`, and
-   only `canonicalize` R6 fuses that into the eligible `FilterUpdateProject`.
-   The REPL and whole-script paths do not run canonicalize, so the island there
-   captures only the top `Project` while the `Update` — where the work is —
-   stays a serial barrier. Widening eligibility to standalone row-local `Update`
-   (the conditional-classification work called out below) is worth more on that
-   path than any further executor tuning.
+   `Update` was a barrier, so the island captured only the top `Project` while
+   the work stayed serial. `canonicalize` R6 fuses that shape into the eligible
+   `FilterUpdateProject`, but only where it runs — and `lower_script()`
+   optimizes its *result* plan while leaving `shared_bindings[].plan`
+   un-optimized, so a `let`-bound query in a script keeps the unfused shape.
+   **That gap is not island-specific and is worth its own look: those binding
+   plans skip every optimizer pass, not just fusion.**
+
+### Slice 1c — row-local `Update` eligibility
+
+`execution_capability()` gained a node-aware overload. A bare `Update` is still
+a barrier in general, but an unguarded, ungrouped, tuple-free update whose every
+field is scalar-only is classified `ParallelMap` — the conditional
+classification this section already called for. The field test is
+`is_subset_evaluable_expr`, deliberately stricter than the
+`is_row_local_update_expr` that routes an update to the serial
+`ChunkedUpdateOperator`: the looser one admits aggregates, which per morsel
+would become per-morsel aggregates. `ChunkedUpdateOperator` now propagates
+morsel identity, without which the island's own validator rejects its output.
+
+Measured on the same 20M-row table, with the heavy expression in an `update`
+(whole-script wall, ~0.5s of it serial generation and aggregation):
+
+| threads | serial | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|---|
+| wall (s) | 2.37 | 3.15 | 1.92 | 1.25 | 1.09 | 1.01 |
+
+Before this slice the same query was ~2.6s at *every* thread count, because the
+`Update` holding the arithmetic was a barrier.
 
 **Acceptance measurement (local, 24-core WSL2, release, 20M rows).** The
 compute-heavy row-local workload the acceptance criterion asks for, expressed as

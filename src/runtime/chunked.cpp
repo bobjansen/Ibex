@@ -670,12 +670,14 @@ class ChunkedUpdateOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        Table t = chunk_to_table(std::move(*chunk_res.value()));
+        Chunk input = std::move(*chunk_res.value());
+        const auto identity = chunk_identity_of(input);
+        Table t = chunk_to_table(std::move(input));
         auto out = update_table(std::move(t), *fields_, scalars_, externs_, *exec_);
         if (!out.has_value()) {
             return std::unexpected(std::move(out.error()));
         }
-        return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
+        return std::optional<Chunk>{table_to_chunk(std::move(out.value()), identity)};
     }
 
    private:
@@ -5896,6 +5898,15 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
         case ir::NodeKind::Rename: {
             const auto& rename = static_cast<const ir::RenameNode&>(node);
             return std::make_unique<ChunkedRenameOperator>(std::move(child), &rename.renames());
+        }
+        case ir::NodeKind::Update: {
+            // Only reachable for an update `execution_capability(const Node&)`
+            // proved row-local: unguarded, ungrouped, scalar-only fields, no
+            // tuple assignment. An update never drops rows, so it needs no
+            // empty-morsel handling to stay 1:1.
+            const auto& update = static_cast<const ir::UpdateNode&>(node);
+            return std::make_unique<ChunkedUpdateOperator>(std::move(child), &update.fields(),
+                                                           scalars, externs, exec);
         }
         case ir::NodeKind::FilterProject: {
             const auto& fp = static_cast<const ir::FilterProjectNode&>(node);

@@ -65,6 +65,60 @@ TEST_CASE("Parallel-island eligibility follows lowered canonical IR", "[runtime]
     CHECK(candidate.operators[0]->kind() == ir::NodeKind::FilterProject);
 }
 
+TEST_CASE("Parallel-island eligibility admits a row-local update", "[runtime][pipeline]") {
+    // An `update` is where a query's arithmetic lives. It is a barrier in
+    // general, but an unguarded, ungrouped, scalar-only one is a row-local map,
+    // and an island that excluded it would parallelize the projection around
+    // the work rather than the work.
+    {
+        auto program = require_parse("df[update { n = price * 2 }];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        auto candidate = runtime::analyze_parallel_island(**result);
+        REQUIRE(candidate.eligible());
+        REQUIRE(candidate.input != nullptr);
+        CHECK(candidate.input->kind() == ir::NodeKind::Scan);
+        REQUIRE(candidate.operators.size() == 1);
+        CHECK(candidate.operators[0]->kind() == ir::NodeKind::Update);
+    }
+    {
+        // And it chains with the other map kinds (source-to-sink order).
+        auto program = require_parse("df[update { n = price * 2 }][filter n > 5];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        auto candidate = runtime::analyze_parallel_island(**result);
+        REQUIRE(candidate.eligible());
+        REQUIRE(candidate.operators.size() == 2);
+        CHECK(candidate.operators[0]->kind() == ir::NodeKind::Update);
+        CHECK(candidate.operators[1]->kind() == ir::NodeKind::Filter);
+    }
+}
+
+TEST_CASE("Parallel-island eligibility rejects updates that are not row-local",
+          "[runtime][pipeline]") {
+    // Each of these is a barrier for a different reason, and each would be
+    // silently wrong if evaluated one morsel at a time.
+    const char* cases[] = {
+        // Aggregate over the whole table: per morsel this becomes a per-morsel
+        // mean. `is_row_local_update_expr` (which routes the *serial* chunked
+        // update) accepts this, so the island must apply the stricter test.
+        "df[update { d = price - mean(price) }];",
+        "df[update { c = cumsum(price) }];",           // transform reads neighbours
+        "df[update { r = rand_normal(0.0, 1.0) }];",   // generator
+        "df[update { avg = price }, by symbol];",      // grouped
+        "df[where price > 10 update { price = 0 }];",  // row guard
+    };
+    for (const auto* src : cases) {
+        INFO("query: " << src);
+        auto program = require_parse(src);
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+        CHECK_FALSE(runtime::analyze_parallel_island(**result).eligible());
+    }
+}
+
 TEST_CASE("Parallel-island eligibility rejects lowered non-row-local expressions",
           "[runtime][pipeline]") {
     auto program = require_parse("df[filter lag(price) > 10];");

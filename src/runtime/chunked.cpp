@@ -75,6 +75,25 @@ auto table_to_chunk(Table table) -> Chunk {
     return c;
 }
 
+/// Morsel identity survives every one-input/one-output parallel-map operator.
+/// It is intentionally separate from Table metadata: sequence/row offset are
+/// executor transport state, never user-visible table properties.
+struct ChunkIdentity {
+    std::uint64_t sequence = 0;
+    std::size_t row_offset = 0;
+};
+
+[[nodiscard]] auto chunk_identity_of(const Chunk& chunk) -> ChunkIdentity {
+    return ChunkIdentity{.sequence = chunk.sequence, .row_offset = chunk.row_offset};
+}
+
+[[nodiscard]] auto table_to_chunk(Table table, ChunkIdentity identity) -> Chunk {
+    auto chunk = table_to_chunk(std::move(table));
+    chunk.sequence = identity.sequence;
+    chunk.row_offset = identity.row_offset;
+    return chunk;
+}
+
 // Whether a streamed aggregate slot has enough observations to be non-null.
 // Mirrors the materializing aggregate's `agg_result_is_valid`.
 auto chunked_agg_valid(ir::AggFunc func, const AggSlot& slot) -> bool {
@@ -143,9 +162,9 @@ namespace {
 class SchemaCarrier {
    public:
     /// Offer a zero-row result as the schema of last resort.
-    void hold(Table&& empty) {
+    void hold(Table&& empty, ChunkIdentity identity = {}) {
         if (!held_.has_value() && !empty.columns.empty()) {
-            held_ = std::move(empty);
+            held_ = Held{.table = std::move(empty), .identity = identity};
         }
     }
     void emitted() { emitted_ = true; }
@@ -155,19 +174,26 @@ class SchemaCarrier {
             return std::nullopt;
         }
         emitted_ = true;
-        return table_to_chunk(std::move(*held_));
+        return table_to_chunk(std::move(held_->table), held_->identity);
     }
 
    private:
-    std::optional<Table> held_;
+    struct Held {
+        Table table;
+        ChunkIdentity identity;
+    };
+    std::optional<Held> held_;
     bool emitted_ = false;
 };
 
 class ChunkedFilterOperator final : public Operator {
    public:
     ChunkedFilterOperator(OperatorPtr child, const ir::Expr* predicate,
-                          const ScalarRegistry* scalars)
-        : child_(std::move(child)), predicate_(predicate), scalars_(scalars) {}
+                          const ScalarRegistry* scalars, bool preserve_empty_morsels = false)
+        : child_(std::move(child)),
+          predicate_(predicate),
+          scalars_(scalars),
+          preserve_empty_morsels_(preserve_empty_morsels) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -178,17 +204,23 @@ class ChunkedFilterOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 return schema_.release();
             }
-            const Table t = chunk_to_table(std::move(*chunk_res.value()));
+            Chunk input = std::move(*chunk_res.value());
+            const auto identity = chunk_identity_of(input);
+            const Table t = chunk_to_table(std::move(input));
             auto filtered = filter_table(t, *predicate_, scalars_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
             }
             if (!filtered->columns.empty() && filtered->rows() == 0) {
-                schema_.hold(std::move(filtered.value()));
+                if (preserve_empty_morsels_) {
+                    return std::optional<Chunk>{
+                        table_to_chunk(std::move(filtered.value()), identity)};
+                }
+                schema_.hold(std::move(filtered.value()), identity);
                 continue;
             }
             schema_.emitted();
-            return std::optional<Chunk>{table_to_chunk(std::move(filtered.value()))};
+            return std::optional<Chunk>{table_to_chunk(std::move(filtered.value()), identity)};
         }
     }
 
@@ -196,6 +228,7 @@ class ChunkedFilterOperator final : public Operator {
     OperatorPtr child_;
     const ir::Expr* predicate_;
     const ScalarRegistry* scalars_;
+    bool preserve_empty_morsels_ = false;
     SchemaCarrier schema_;
 };
 
@@ -215,12 +248,14 @@ class ChunkedProjectOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        const Table t = chunk_to_table(std::move(*chunk_res.value()));
+        Chunk input = std::move(*chunk_res.value());
+        const auto identity = chunk_identity_of(input);
+        const Table t = chunk_to_table(std::move(input));
         auto projected = project_table(t, *columns_);
         if (!projected.has_value()) {
             return std::unexpected(std::move(projected.error()));
         }
-        return std::optional<Chunk>{table_to_chunk(std::move(projected.value()))};
+        return std::optional<Chunk>{table_to_chunk(std::move(projected.value()), identity)};
     }
 
    private:
@@ -236,8 +271,12 @@ class ChunkedFilterProjectOperator final : public Operator {
    public:
     ChunkedFilterProjectOperator(OperatorPtr child, const ir::Expr* predicate,
                                  const std::vector<ir::ColumnRef>* columns,
-                                 const ScalarRegistry* scalars)
-        : child_(std::move(child)), predicate_(predicate), columns_(columns), scalars_(scalars) {}
+                                 const ScalarRegistry* scalars, bool preserve_empty_morsels = false)
+        : child_(std::move(child)),
+          predicate_(predicate),
+          columns_(columns),
+          scalars_(scalars),
+          preserve_empty_morsels_(preserve_empty_morsels) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -248,17 +287,22 @@ class ChunkedFilterProjectOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 return schema_.release();
             }
-            const Table t = chunk_to_table(std::move(*chunk_res.value()));
+            Chunk input = std::move(*chunk_res.value());
+            const auto identity = chunk_identity_of(input);
+            const Table t = chunk_to_table(std::move(input));
             auto out = filter_project_table(t, *predicate_, *columns_, scalars_);
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
             }
             if (!out->columns.empty() && out->rows() == 0) {
-                schema_.hold(std::move(out.value()));
+                if (preserve_empty_morsels_) {
+                    return std::optional<Chunk>{table_to_chunk(std::move(out.value()), identity)};
+                }
+                schema_.hold(std::move(out.value()), identity);
                 continue;
             }
             schema_.emitted();
-            return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
+            return std::optional<Chunk>{table_to_chunk(std::move(out.value()), identity)};
         }
     }
 
@@ -267,6 +311,7 @@ class ChunkedFilterProjectOperator final : public Operator {
     const ir::Expr* predicate_;
     const std::vector<ir::ColumnRef>* columns_;
     const ScalarRegistry* scalars_;
+    bool preserve_empty_morsels_ = false;
     SchemaCarrier schema_;
 };
 
@@ -474,7 +519,8 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
                                        const std::vector<ir::ColumnRef>* project_columns,
                                        std::vector<ir::ColumnRef> gather_columns,
                                        const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                       const ExecutionContext& exec)
+                                       const ExecutionContext& exec,
+                                       bool preserve_empty_morsels = false)
         : child_(std::move(child)),
           predicate_(predicate),
           fields_(fields),
@@ -482,7 +528,8 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
           gather_columns_(std::move(gather_columns)),
           scalars_(scalars),
           externs_(externs),
-          exec_(&exec) {}
+          exec_(&exec),
+          preserve_empty_morsels_(preserve_empty_morsels) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -491,9 +538,11 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
                 return std::unexpected(std::move(chunk_res.error()));
             }
             if (!chunk_res.value().has_value()) {
-                return std::optional<Chunk>{};
+                return schema_.release();
             }
-            const Table t = chunk_to_table(std::move(*chunk_res.value()));
+            Chunk input = std::move(*chunk_res.value());
+            const auto identity = chunk_identity_of(input);
+            const Table t = chunk_to_table(std::move(input));
             auto filtered = filter_project_table(t, *predicate_, gather_columns_, scalars_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
@@ -511,11 +560,15 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
             // An empty chunk still runs the update and the projection, cheaply,
             // because the schema it has to carry is the one they produce.
             if (empty) {
-                schema_.hold(std::move(projected.value()));
+                if (preserve_empty_morsels_) {
+                    return std::optional<Chunk>{
+                        table_to_chunk(std::move(projected.value()), identity)};
+                }
+                schema_.hold(std::move(projected.value()), identity);
                 continue;
             }
             schema_.emitted();
-            return std::optional<Chunk>{table_to_chunk(std::move(projected.value()))};
+            return std::optional<Chunk>{table_to_chunk(std::move(projected.value()), identity)};
         }
     }
 
@@ -529,6 +582,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
     const ScalarRegistry* scalars_;
     const ExternRegistry* externs_;
     const ExecutionContext* exec_;
+    bool preserve_empty_morsels_ = false;
 };
 
 class ChunkedRenameOperator final : public Operator {
@@ -5741,6 +5795,54 @@ class OwningIslandOperator final : public Operator {
     OperatorPtr chain_;
 };
 
+/// Serial-slice stand-in for the Phase 1 ordered merger. The current source
+/// emits in sequence order, so validating the stream is enough to make a lost,
+/// duplicated, or provenance-stripped morsel an immediate error. A later
+/// concurrent merger replaces this with sequence-indexed buffering/release.
+class SerialIslandOrderValidator final : public Operator {
+   public:
+    SerialIslandOrderValidator(OperatorPtr child, std::uint64_t expected_morsels, std::size_t grain)
+        : child_(std::move(child)),
+          expected_morsels_(expected_morsels),
+          grain_(grain == 0 ? 1 : grain) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        auto result = child_->next();
+        if (!result.has_value()) {
+            return std::unexpected(std::move(result.error()));
+        }
+        if (result->has_value()) {
+            const auto& chunk = result->value();
+            const auto expected_offset = static_cast<std::size_t>(next_sequence_) * grain_;
+            if (chunk.sequence != next_sequence_ || chunk.row_offset != expected_offset) {
+                return std::unexpected("parallel island: morsel identity gap or reordering");
+            }
+            ++next_sequence_;
+            return result;
+        }
+        if (next_sequence_ != expected_morsels_) {
+            return std::unexpected("parallel island: missing output morsel");
+        }
+        return result;
+    }
+
+   private:
+    OperatorPtr child_;
+    std::uint64_t expected_morsels_ = 0;
+    std::uint64_t next_sequence_ = 0;
+    std::size_t grain_ = 1;
+};
+
+[[nodiscard]] auto partitioned_morsel_count(const Table& input, std::size_t grain)
+    -> std::uint64_t {
+    const std::size_t normalized_grain = grain == 0 ? 1 : grain;
+    const std::size_t rows = input.rows();
+    if (rows == 0) {
+        return 1;  // one zero-row schema/logical-row carrier
+    }
+    return static_cast<std::uint64_t>((rows + normalized_grain - 1) / normalized_grain);
+}
+
 // True if any Scan in `node`'s subtree reads a lazy/deferred source: no eager
 // registry entry, but resolvable through the deferred-scan registry. See the
 // header declaration for why the parallel seam rejects these.
@@ -5756,6 +5858,62 @@ auto node_reads_deferred_source(const ir::Node& node, const TableRegistry& regis
         }
     }
     return false;
+}
+
+// One construction point for every row-local map operator that can live in a
+// parallel island. The serial planner uses the same factory: only the island
+// asks maps to retain zero-row morsels, because its ordered merger needs one
+// output identity for every input morsel. Keeping the construction (especially
+// FUP's gather set) here prevents the two planners from drifting as range-aware
+// kernels replace these chunked implementations.
+auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
+                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                  const ExecutionContext& exec, bool preserve_empty_morsels)
+    -> std::expected<OperatorPtr, std::string> {
+    switch (node.kind()) {
+        case ir::NodeKind::Filter: {
+            const auto& filter = static_cast<const ir::FilterNode&>(node);
+            return std::make_unique<ChunkedFilterOperator>(std::move(child), &filter.predicate(),
+                                                           scalars, preserve_empty_morsels);
+        }
+        case ir::NodeKind::Project: {
+            const auto& project = static_cast<const ir::ProjectNode&>(node);
+            return std::make_unique<ChunkedProjectOperator>(std::move(child), &project.columns());
+        }
+        case ir::NodeKind::Rename: {
+            const auto& rename = static_cast<const ir::RenameNode&>(node);
+            return std::make_unique<ChunkedRenameOperator>(std::move(child), &rename.renames());
+        }
+        case ir::NodeKind::FilterProject: {
+            const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+            return std::make_unique<ChunkedFilterProjectOperator>(
+                std::move(child), &fp.predicate(), &fp.columns(), scalars, preserve_empty_morsels);
+        }
+        case ir::NodeKind::FilterUpdateProject: {
+            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+            robin_hood::unordered_set<std::string> update_outputs;
+            robin_hood::unordered_set<std::string> needed;
+            for (const auto& field : fup.fields()) {
+                update_outputs.insert(field.alias);
+                collect_expr_column_refs(field.expr, needed);
+            }
+            for (const auto& column : fup.project_columns()) {
+                if (!update_outputs.contains(column.name)) {
+                    needed.insert(column.name);
+                }
+            }
+            std::vector<ir::ColumnRef> gather_columns;
+            gather_columns.reserve(needed.size());
+            for (const auto& name : needed) {
+                gather_columns.push_back(ir::ColumnRef{.name = name});
+            }
+            return std::make_unique<ChunkedFilterUpdateProjectOperator>(
+                std::move(child), &fup.predicate(), &fup.fields(), &fup.project_columns(),
+                std::move(gather_columns), scalars, externs, exec, preserve_empty_morsels);
+        }
+        default:
+            return std::unexpected("row-local map factory: unsupported operator kind");
+    }
 }
 
 // Build one eligible row-local parallel-map chain as an island: materialize its
@@ -5780,62 +5938,22 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
         return std::unexpected(std::move(input_tbl.error()));
     }
     auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
+    const auto expected_morsels = partitioned_morsel_count(*owned, exec.parallel_grain);
 
     OperatorPtr chain = std::make_unique<PartitionedTableSource>(*owned, exec.parallel_grain);
 
     for (const ir::Node* op_node : candidate.operators) {
-        switch (op_node->kind()) {
-            case ir::NodeKind::Filter: {
-                const auto& f = static_cast<const ir::FilterNode&>(*op_node);
-                chain = std::make_unique<ChunkedFilterOperator>(std::move(chain), &f.predicate(),
-                                                                scalars);
-                break;
-            }
-            case ir::NodeKind::Project: {
-                const auto& p = static_cast<const ir::ProjectNode&>(*op_node);
-                chain = std::make_unique<ChunkedProjectOperator>(std::move(chain), &p.columns());
-                break;
-            }
-            case ir::NodeKind::Rename: {
-                const auto& r = static_cast<const ir::RenameNode&>(*op_node);
-                chain = std::make_unique<ChunkedRenameOperator>(std::move(chain), &r.renames());
-                break;
-            }
-            case ir::NodeKind::FilterProject: {
-                const auto& fp = static_cast<const ir::FilterProjectNode&>(*op_node);
-                chain = std::make_unique<ChunkedFilterProjectOperator>(
-                    std::move(chain), &fp.predicate(), &fp.columns(), scalars);
-                break;
-            }
-            case ir::NodeKind::FilterUpdateProject: {
-                const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(*op_node);
-                robin_hood::unordered_set<std::string> update_outputs;
-                robin_hood::unordered_set<std::string> needed;
-                for (const auto& fld : fup.fields()) {
-                    update_outputs.insert(fld.alias);
-                    collect_expr_column_refs(fld.expr, needed);
-                }
-                for (const auto& col : fup.project_columns()) {
-                    if (update_outputs.find(col.name) == update_outputs.end()) {
-                        needed.insert(col.name);
-                    }
-                }
-                std::vector<ir::ColumnRef> gather_cols;
-                gather_cols.reserve(needed.size());
-                for (const auto& name : needed) {
-                    gather_cols.push_back(ir::ColumnRef{.name = name});
-                }
-                chain = std::make_unique<ChunkedFilterUpdateProjectOperator>(
-                    std::move(chain), &fup.predicate(), &fup.fields(), &fup.project_columns(),
-                    std::move(gather_cols), scalars, externs, exec);
-                break;
-            }
-            default:
-                // analyze_parallel_island() only admits the kinds above.
-                return std::unexpected("parallel island: unexpected operator kind in chain");
+        auto next =
+            build_row_local_map_operator(*op_node, std::move(chain), scalars, externs, exec, true);
+        if (!next.has_value()) {
+            // analyze_parallel_island() only admits row-local map kinds.
+            return std::unexpected("parallel island: " + next.error());
         }
+        chain = std::move(next.value());
     }
 
+    chain = std::make_unique<SerialIslandOrderValidator>(std::move(chain), expected_morsels,
+                                                         exec.parallel_grain);
     return std::make_unique<OwningIslandOperator>(std::move(owned), std::move(chain));
 }
 
@@ -5877,8 +5995,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
-        return std::make_unique<ChunkedFilterOperator>(std::move(child_op.value()),
-                                                       &filter.predicate(), scalars);
+        return build_row_local_map_operator(node, std::move(child_op.value()), scalars, externs,
+                                            exec, false);
     }
 
     if (node.kind() == ir::NodeKind::Project) {
@@ -5891,8 +6009,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
-        return std::make_unique<ChunkedProjectOperator>(std::move(child_op.value()),
-                                                        &project.columns());
+        return build_row_local_map_operator(node, std::move(child_op.value()), scalars, externs,
+                                            exec, false);
     }
 
     // Fused Project(Filter(x)) produced by canonicalize R5.
@@ -5906,8 +6024,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
-        return std::make_unique<ChunkedFilterProjectOperator>(
-            std::move(child_op.value()), &fp.predicate(), &fp.columns(), scalars);
+        return build_row_local_map_operator(node, std::move(child_op.value()), scalars, externs,
+                                            exec, false);
     }
 
     // Fused Head(Filter(x)) / Tail(Filter(x)) produced by canonicalize R7/R8.
@@ -5938,38 +6056,19 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                                                            &ft.predicate(), ft.count(), scalars);
     }
 
-    // Fused Project(Update(Filter(x))) produced by canonicalize R6. The
-    // gather set (columns the update reads ∪ projected columns not produced
-    // by the update) is recomputed here from the node payload.
+    // Fused Project(Update(Filter(x))) produced by canonicalize R6.
     if (node.kind() == ir::NodeKind::FilterUpdateProject) {
         const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
         if (fup.children().empty()) {
             return std::unexpected("filter_update_project node missing child");
-        }
-        robin_hood::unordered_set<std::string> update_outputs;
-        robin_hood::unordered_set<std::string> needed;
-        for (const auto& f : fup.fields()) {
-            update_outputs.insert(f.alias);
-            collect_expr_column_refs(f.expr, needed);
-        }
-        for (const auto& col : fup.project_columns()) {
-            if (update_outputs.find(col.name) == update_outputs.end()) {
-                needed.insert(col.name);
-            }
-        }
-        std::vector<ir::ColumnRef> gather_cols;
-        gather_cols.reserve(needed.size());
-        for (const auto& name : needed) {
-            gather_cols.push_back(ir::ColumnRef{.name = name});
         }
         auto child_op =
             build_operator(*fup.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
-        return std::make_unique<ChunkedFilterUpdateProjectOperator>(
-            std::move(child_op.value()), &fup.predicate(), &fup.fields(), &fup.project_columns(),
-            std::move(gather_cols), scalars, externs, exec);
+        return build_row_local_map_operator(node, std::move(child_op.value()), scalars, externs,
+                                            exec, false);
     }
 
     if (node.kind() == ir::NodeKind::Rename) {
@@ -5982,8 +6081,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
-        return std::make_unique<ChunkedRenameOperator>(std::move(child_op.value()),
-                                                       &rename.renames());
+        return build_row_local_map_operator(node, std::move(child_op.value()), scalars, externs,
+                                            exec, false);
     }
 
     if (node.kind() == ir::NodeKind::ExternCall && externs != nullptr) {

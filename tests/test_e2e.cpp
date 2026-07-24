@@ -2182,6 +2182,65 @@ TEST_CASE("E2E: parallel island on worker threads preserves metadata and an empt
     REQUIRE(island_empty.rows() == 0);
 }
 
+namespace {
+
+// Run an island query that fails inside every morsel, optionally with an
+// interrupt pending or arriving mid-flight. Returns the reported error.
+auto run_failing_island(bool interrupt_before, bool interrupt_during) -> std::string {
+    auto tables = make_wide_island_table(200000);
+    // A string/number comparison is rejected by the filter at evaluation time,
+    // so it is a genuine per-morsel worker failure rather than a build error.
+    auto parsed = parser::parse(R"(t[filter price > "a"];)");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_grain = 64;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+
+    if (interrupt_before) {
+        runtime::request_interrupt();
+    }
+    std::thread interrupter;
+    if (interrupt_during) {
+        interrupter = std::thread([] { runtime::request_interrupt(); });
+    }
+    auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+    if (interrupter.joinable()) {
+        interrupter.join();
+    }
+    runtime::clear_interrupt();
+
+    REQUIRE_FALSE(result.has_value());
+    return result.error();
+}
+
+}  // namespace
+
+TEST_CASE("E2E: parallel island reports a worker failure", "[e2e][parallel]") {
+    // Every morsel fails. The island must surface the failure (not hang waiting
+    // for a morsel that will never arrive) and must report the same message the
+    // serial path does, rather than a thread-timing-dependent one.
+    CHECK(run_failing_island(false, false) == "filter: cannot compare string and numeric");
+}
+
+TEST_CASE("E2E: parallel island reports interruption over a concurrent worker failure",
+          "[e2e][parallel]") {
+    // Both conditions hold at once: a pending interrupt and a worker error
+    // recorded by every morsel. Cancellation outranks the data error, or Ctrl+C
+    // would surface as an arbitrary query error depending on which thread won.
+    CHECK(run_failing_island(true, false) == runtime::interrupt_message());
+
+    // The same collision, now genuinely racing: whichever side wins, the query
+    // must report one of the two defined answers and must terminate cleanly.
+    const std::string raced = run_failing_island(false, true);
+    CHECK((raced == runtime::interrupt_message() ||
+           raced == "filter: cannot compare string and numeric"));
+}
+
 TEST_CASE("E2E: parallel island cancels cleanly when interrupted", "[e2e][parallel]") {
     // A pending interrupt must unwind the island through the usual error
     // channel — cancelling in-flight workers and joining them before the

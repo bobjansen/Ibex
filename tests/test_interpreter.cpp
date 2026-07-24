@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -10440,17 +10441,42 @@ TEST_CASE("QueryExecutionLease grants the single slot exclusively", "[runtime][l
     REQUIRE(again.held());
 }
 
-TEST_CASE("interpret rejects a re-entrant query while one is in flight", "[runtime][lease]") {
+TEST_CASE("QueryExecutionLease permits exactly one simultaneous claimant", "[runtime][lease]") {
+    std::barrier start{3};
+    std::barrier release{3};
+    std::array<bool, 2> held{};
+    std::array<std::thread, 2> claimants{
+        std::thread{[&] {
+            start.arrive_and_wait();
+            const runtime::QueryExecutionLease lease;
+            held[0] = lease.held();
+            release.arrive_and_wait();
+        }},
+        std::thread{[&] {
+            start.arrive_and_wait();
+            const runtime::QueryExecutionLease lease;
+            held[1] = lease.held();
+            release.arrive_and_wait();
+        }},
+    };
+    start.arrive_and_wait();
+    release.arrive_and_wait();
+    for (auto& claimant : claimants) {
+        claimant.join();
+    }
+    REQUIRE((held[0] != held[1]));
+}
+
+TEST_CASE("interpret rejects nested execution while a query lease is held", "[runtime][lease]") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{10, 20, 30});
     runtime::TableRegistry registry;
     registry.emplace("trades", table);
     auto ir = require_ir("trades[filter price > 15];");
 
-    // Simulate a query already running (equivalently, an extern/plugin calling
-    // back into interpret() from inside the query it runs under): the outer
-    // lease holds the single slot, so the nested interpret() must be rejected
-    // with the stable error rather than executing.
+    // A plugin/extern callback initiating interpretation is unsupported. The
+    // host runtime's held lease makes that nested call fail rather than creating
+    // a competing query.
     {
         const runtime::QueryExecutionLease outer;
         REQUIRE(outer.held());

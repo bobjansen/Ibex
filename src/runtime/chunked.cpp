@@ -5741,6 +5741,23 @@ class OwningIslandOperator final : public Operator {
     OperatorPtr chain_;
 };
 
+// True if any Scan in `node`'s subtree reads a lazy/deferred source: no eager
+// registry entry, but resolvable through the deferred-scan registry. See the
+// header declaration for why the parallel seam rejects these.
+auto node_reads_deferred_source(const ir::Node& node, const TableRegistry& registry,
+                                const ExecutionContext& exec) -> bool {
+    if (node.kind() == ir::NodeKind::Scan) {
+        const auto& name = static_cast<const ir::ScanNode&>(node).source_name();
+        return registry.find(name) == registry.end() && exec.deferred_scan(name) != nullptr;
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr && node_reads_deferred_source(*child, registry, exec)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Build one eligible row-local parallel-map chain as an island: materialize its
 // input subtree once, then run the chain over a `PartitionedTableSource` in
 // fixed morsel grains instead of a single whole-table chunk.
@@ -5833,9 +5850,19 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
     // built as one island here and its inner nodes are not recursed into
     // separately (only the island's input subtree is), so there is no
     // re-analysis of the chain and no infinite recursion.
+    //
+    // A query whose island input reads a lazy/deferred source stays on the
+    // serial chain. `analyze_parallel_island()` verifies only the map chain's
+    // IR shape and expressions; the lazy/deferred gate is a source-node check
+    // that needs the registry + ExecutionContext, so it is reported up to this
+    // single eligibility decision (the plan's item-7 pattern). The gate is
+    // required by the LazyTable synchronization contract and is an interim
+    // rule: it is safe-but-unnecessary in this serial slice (the input is
+    // materialized on a serial boundary before any fan-out), and a later phase
+    // lifts it deliberately once the contract is implemented.
     if (exec.parallel) {
         const auto island = analyze_parallel_island(node);
-        if (island.eligible()) {
+        if (island.eligible() && !node_reads_deferred_source(*island.input, registry, exec)) {
             return build_parallel_island(island, registry, scalars, externs, exec, model_out);
         }
     }

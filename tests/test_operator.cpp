@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <iterator>
 #include <memory>
 #include <string>
 #include <utility>
@@ -271,7 +272,7 @@ auto columns_equal(const runtime::ColumnValue& a, const runtime::ColumnValue& b)
 // `input` byte-for-byte: schema, column data, validity, and table metadata.
 void require_roundtrip(const runtime::Table& input, std::size_t grain) {
     runtime::MaterializeOperator sink{
-        std::make_unique<runtime::PartitionedTableSource>(&input, grain)};
+        std::make_unique<runtime::PartitionedTableSource>(input, grain)};
     auto result = sink.run();
     REQUIRE(result.has_value());
     const auto& out = result.value();
@@ -333,7 +334,7 @@ TEST_CASE("PartitionedTableSource preserves ordering and time_index") {
     input.ordering = std::vector<ir::OrderKey>{ir::OrderKey{.name = "ts", .ascending = true}};
     input.time_index = std::string{"ts"};
 
-    runtime::MaterializeOperator sink{std::make_unique<runtime::PartitionedTableSource>(&input, 2)};
+    runtime::MaterializeOperator sink{std::make_unique<runtime::PartitionedTableSource>(input, 2)};
     auto result = sink.run();
     REQUIRE(result.has_value());
     const auto& out = result.value();
@@ -348,7 +349,7 @@ TEST_CASE("PartitionedTableSource emits one empty schema-carrier chunk for a zer
     input.add_column("i", Column<std::int64_t>{});
     input.add_column("s", Column<std::string>{});
 
-    runtime::PartitionedTableSource source{&input, 4};
+    runtime::PartitionedTableSource source{input, 4};
     auto first = source.next();
     REQUIRE(first.has_value());
     REQUIRE(first.value().has_value());  // one empty schema carrier
@@ -365,34 +366,57 @@ TEST_CASE("PartitionedTableSource emits one empty schema-carrier chunk for a zer
     require_roundtrip(input, 4);
 }
 
-TEST_CASE("PartitionedTableSource emits one chunk for a column-less frame") {
+TEST_CASE("PartitionedTableSource partitions a column-less frame by logical rows") {
     runtime::Table input;
     input.logical_rows = 42;  // e.g. a Table(n) scaffold
 
-    runtime::PartitionedTableSource source{&input, 8};
-    auto first = source.next();
-    REQUIRE(first.has_value());
-    REQUIRE(first.value().has_value());
-    REQUIRE(first.value()->columns.empty());
-    REQUIRE(first.value()->rows() == 42);
-    REQUIRE(first.value()->sequence == 0);
+    runtime::PartitionedTableSource source{input, 8};
+    const std::size_t expected_offsets[] = {0, 8, 16, 24, 32, 40};
+    const std::size_t expected_rows[] = {8, 8, 8, 8, 8, 2};
+    for (std::uint64_t sequence = 0; sequence < std::size(expected_rows); ++sequence) {
+        auto chunk = source.next();
+        REQUIRE(chunk.has_value());
+        REQUIRE(chunk.value().has_value());
+        REQUIRE(chunk.value()->columns.empty());
+        REQUIRE(chunk.value()->rows() == expected_rows[sequence]);
+        REQUIRE(chunk.value()->sequence == sequence);
+        REQUIRE(chunk.value()->row_offset == expected_offsets[sequence]);
+    }
+    auto done = source.next();
+    REQUIRE(done.has_value());
+    REQUIRE_FALSE(done.value().has_value());
 
-    auto second = source.next();
-    REQUIRE(second.has_value());
-    REQUIRE_FALSE(second.value().has_value());
-
-    runtime::MaterializeOperator sink{std::make_unique<runtime::PartitionedTableSource>(&input, 8)};
+    runtime::MaterializeOperator sink{std::make_unique<runtime::PartitionedTableSource>(input, 8)};
     auto result = sink.run();
     REQUIRE(result.has_value());
     REQUIRE(result.value().columns.empty());
     REQUIRE(result.value().rows() == 42);
 }
 
+TEST_CASE("PartitionedTableSource emits one zero-row carrier for a column-less frame") {
+    runtime::Table input;
+    input.logical_rows = 0;
+
+    runtime::PartitionedTableSource source{input, 8};
+    auto first = source.next();
+    REQUIRE(first.has_value());
+    REQUIRE(first.value().has_value());
+    REQUIRE(first.value()->columns.empty());
+    REQUIRE(first.value()->rows() == 0);
+    REQUIRE(first.value()->sequence == 0);
+    REQUIRE(first.value()->row_offset == 0);
+
+    auto done = source.next();
+    REQUIRE(done.has_value());
+    REQUIRE_FALSE(done.value().has_value());
+    require_roundtrip(input, 8);
+}
+
 TEST_CASE("PartitionedTableSource stamps ascending sequence and absolute row_offset") {
     runtime::Table input;
     input.add_column("i", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6});  // 7 rows
 
-    runtime::PartitionedTableSource source{&input, 3};
+    runtime::PartitionedTableSource source{input, 3};
     // Expect ranges [0,3), [3,6), [6,7): sequence 0,1,2 and row_offset 0,3,6.
     const std::size_t expected_offsets[] = {0, 3, 6};
     const std::size_t expected_rows[] = {3, 3, 1};

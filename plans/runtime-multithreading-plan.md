@@ -217,6 +217,20 @@ only the first two rows plus the existing serial fallback.
 
 ## Phase 0 — Correctness Prerequisites
 
+**STATUS (2026-07-24): complete to its natural boundary.** Every Phase-0 piece
+that is observable and testable at `IBEX_THREADS=1` has landed: item 1 (serial
+parity gate), item 2 (multi-chunk nulls), item 3 (island `TableProperties` +
+empty-output contract), item 4's building blocks (`TableRangeMorsel` /
+`PartitionedTableSource` / gather helpers + round-trip tests), item 5
+(`ExecutionContext` threading, TLS deferred-scans removed), and item 6's
+one-query-at-a-time lease. The three residuals — item 4 wiring, item 6
+worker failure/cancellation determinism, and item 7 (extern eligibility pass)
+— all share one root cause: there is no executor / eligibility pass /
+`classify_node` island-role layer yet. That layer *is* the Phase 0→1 boundary,
+so those residuals are Phase 1's foundation, not independently completable
+Phase-0 work. Item 5's LazyTable Synchronization Contract is written (design)
+but unimplemented; Phase 3 lifts the interim ineligibility gate.
+
 **Sequencing risk — complete and bake this phase before adding any parallel
 execution code.** Phase 0 is not setup that can be folded into the first
 parallel operator PR. In particular, item 3 replaces an execution-wide

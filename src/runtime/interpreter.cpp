@@ -6,6 +6,7 @@
 #include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/query_lease.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -1421,6 +1422,14 @@ auto Table::find(const std::string& name) const -> const ColumnValue* {
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
                const ExternRegistry* externs, ModelResult* model_out, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
+    // One query at a time (Phase 0 item 6): a concurrent or re-entrant top-level
+    // entry is rejected rather than serialized. This is the single chokepoint —
+    // internal recursion goes through interpret_node/build_operator, never back
+    // through this public entry — so the lease is claimed exactly once per query.
+    const QueryExecutionLease lease;
+    if (!lease.held()) {
+        return std::unexpected(query_in_flight_message());
+    }
     tune_allocator_once();
     auto op = build_operator(node, registry, scalars, externs, exec, model_out);
     if (!op.has_value()) {

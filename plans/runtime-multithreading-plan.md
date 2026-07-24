@@ -303,6 +303,23 @@ ownership boundary that makes later parallel changes reviewable.
    absolute row indices from the shared immutable input and produce task-owned
    output chunks. Carry `sequence` and source `row_offset` through
    chunk-preserving operators, including empty schema-carrier chunks.
+
+   **Phase-0 status (done):** `Chunk` carries `sequence` + `row_offset` (default
+   0); `include/ibex/runtime/morsel.hpp` holds `TableRangeMorsel`, the
+   `gather_range`/`gather_validity` materializing helpers, and
+   `PartitionedTableSource`, all covered by byte-identical round-trip tests
+   through `MaterializeOperator` (`tests/test_operator.cpp`).
+
+   **Deliberately deferred to Phase 1 — NOT an open issue.** Two pieces are
+   intentionally left out here and are *not* loose ends: (a) wiring
+   `PartitionedTableSource` into `build_operator`, and (b) propagating
+   `sequence`/`row_offset` through every chunk-preserving operator. Both are
+   untestable until an island can actually be partitioned, which requires the
+   `classify_node`/island-eligibility layer that does not yet exist — adding
+   either now would be speculative dead code no test can exercise, and Phase 0
+   is explicitly a behavior-preserving refactor at `IBEX_THREADS=1`. They land
+   with the worker pool, ordered merger, and range-aware zero-copy kernels in
+   Phase 1, where they first become reachable and verifiable.
 5. **Context instead of worker TLS (highest-risk gate).** Replace
    execution-scoped thread-local deferred scans with `ExecutionContext`
    propagation through `interpret`, `build_operator`, every applicable operator

@@ -1,10 +1,12 @@
 #pragma once
 
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -53,6 +55,35 @@ struct Mask {
 [[nodiscard]] auto is_simple_identifier(std::string_view name) -> bool;
 [[nodiscard]] auto format_columns(const Table& table) -> std::string;
 auto normalize_time_index(Table& table) -> void;
+
+/// Where a sort key or the time-index column ends up after one operator: its
+/// name in the output, or `nullopt` when it no longer carries that ordering
+/// guarantee — either dropped (projected away) or present with **rewritten
+/// values** (an update field overwrote it in place; still a column, no longer a
+/// valid key). One hook unifies the three serial metadata rules: presence
+/// (project/filter), overwrite (update), and renaming (rename).
+using KeyColumnFate = std::function<std::optional<std::string>(const std::string&)>;
+
+/// Derive an operator's output ordering + time_index from its input, applying
+/// `fate` to each ordering key and the time index. Ordering is all-or-nothing:
+/// cleared unless every key survives (rename-mapped, un-overwritten). Losing the
+/// time index also clears ordering — a by-time ordering is void without its
+/// column (for a TimeFrame the sole key *is* the time index, so this is already
+/// implied, but it keeps the rule self-contained for non-TimeFrame callers).
+/// This is the extracted, shared form of the rules previously inlined at each
+/// serial site; the future parallel merger derives island metadata through it
+/// too, so serial and parallel cannot disagree.
+[[nodiscard]] auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate)
+    -> TableProperties;
+
+/// Extract the order-sensitive metadata from a materialized table.
+[[nodiscard]] auto table_properties_of(const Table& table) -> TableProperties;
+
+/// Write derived `props` onto `table` (setting or clearing `ordering` /
+/// `time_index`) and re-establish the TimeFrame invariant via
+/// `normalize_time_index`. The single place metadata lands on a table, so the
+/// serial operators and the merger apply it identically.
+auto apply_table_properties(Table& table, const TableProperties& props) -> void;
 [[nodiscard]] auto int64_to_date_checked(std::int64_t value) -> Date;
 [[nodiscard]] auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarValue;
 [[nodiscard]] auto column_kind(const ColumnValue& column) -> ExprType;

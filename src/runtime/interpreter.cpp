@@ -72,12 +72,6 @@ void tune_allocator_once() {
 
 }  // namespace
 
-auto ordering_keys_present(const std::vector<ir::OrderKey>& keys,
-                           const robin_hood::unordered_map<std::string, std::size_t>& index)
-    -> bool {
-    return std::ranges::all_of(keys, [index](const auto& key) { return index.contains(key.name); });
-}
-
 auto ordering_keys_for_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     -> std::vector<ir::OrderKey> {
     if (!keys.empty()) {
@@ -133,18 +127,15 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
         // later mutation reseats a fresh column, so sharing is safe.
         output.add_column_shared(col.name, entry->column, entry->validity);
     }
-    if (input.ordering.has_value() && ordering_keys_present(*input.ordering, output.index)) {
-        output.ordering = input.ordering;
-    }
-    if (input.time_index.has_value()) {
-        if (output.index.contains(*input.time_index)) {
-            output.time_index = input.time_index;
-        } else {
-            output.time_index.reset();
-            output.ordering.reset();
-        }
-    }
-    normalize_time_index(output);
+    // A key or the time index survives only if its column survives the
+    // selection; a dropped time index also voids the ordering.
+    apply_table_properties(
+        output, derive_table_properties(table_properties_of(input),
+                                        [&](const std::string& name) -> std::optional<std::string> {
+                                            return output.index.contains(name)
+                                                       ? std::optional<std::string>{name}
+                                                       : std::nullopt;
+                                        }));
     return output;
 }
 
@@ -266,24 +257,14 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
         output.add_column_shared(out_name, entry.column, entry.validity);
     }
 
-    if (input.ordering.has_value()) {
-        std::vector<ir::OrderKey> new_ordering;
-        for (const auto& key : *input.ordering) {
-            auto it = rename_map.find(key.name);
-            new_ordering.push_back({
-                .name = (it != rename_map.end()) ? it->second : key.name,
-                .ascending = key.ascending,
-            });
-        }
-        output.ordering = std::move(new_ordering);
-    }
-
-    if (input.time_index.has_value()) {
-        auto it = rename_map.find(*input.time_index);
-        output.time_index = (it != rename_map.end()) ? it->second : *input.time_index;
-    }
-
-    normalize_time_index(output);
+    // Rename never drops a column, it relabels it; rewrite each key and the
+    // time index to its new name.
+    apply_table_properties(
+        output, derive_table_properties(table_properties_of(input),
+                                        [&](const std::string& name) -> std::optional<std::string> {
+                                            auto it = rename_map.find(name);
+                                            return it != rename_map.end() ? it->second : name;
+                                        }));
     return output;
 }
 

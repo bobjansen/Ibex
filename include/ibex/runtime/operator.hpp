@@ -121,9 +121,40 @@ class TableSourceOperator final : public Operator {
 /// Concat assumes all chunks agree on schema (column count, names, and
 /// variant alternatives) and that any `Column<Categorical>` values across
 /// chunks share the same backing dictionary — which is the contract the
-/// chunked csv source provides. Validity bitmaps are not yet supported
-/// on multi-chunk streams; any non-null validity on any chunk is
-/// rejected until step 4+ wants to stream nulls.
+/// chunked csv source provides. Per-chunk validity bitmaps are concatenated
+/// across chunks: a missing bitmap on any chunk means "every row valid", so
+/// a nullable column that carries validity on only some chunks is widened to
+/// a full-length bitmap on demand.
+///
+/// Append a chunk column's optional validity onto the result column's optional
+/// validity. `prev_rows` is the result column's length before this chunk and
+/// `src_rows` the chunk column's length. A `nullopt` bitmap means every row is
+/// valid; the result stays `nullopt` (zero overhead) until some chunk actually
+/// carries nulls, at which point the previously-accumulated rows are backfilled
+/// as valid.
+inline void materialize_append_validity(std::optional<ValidityBitmap>& dst_valid,
+                                        std::size_t prev_rows,
+                                        const std::optional<ValidityBitmap>& src_valid,
+                                        std::size_t src_rows) {
+    if (!dst_valid.has_value() && !src_valid.has_value()) {
+        return;  // both all-valid: keep the column bitmap-free.
+    }
+    if (!dst_valid.has_value()) {
+        // The result was implicitly all-valid so far; materialize that prefix.
+        dst_valid.emplace(prev_rows, true);
+    }
+    dst_valid->reserve(prev_rows + src_rows);
+    if (src_valid.has_value()) {
+        for (std::size_t r = 0; r < src_rows; ++r) {
+            dst_valid->push_back((*src_valid)[r]);
+        }
+    } else {
+        for (std::size_t r = 0; r < src_rows; ++r) {
+            dst_valid->push_back(true);
+        }
+    }
+}
+
 class MaterializeOperator {
    public:
     explicit MaterializeOperator(OperatorPtr child) : child_(std::move(child)) {}
@@ -170,6 +201,17 @@ class MaterializeOperator {
             if (chunk.columns.size() != n_cols) {
                 return std::unexpected("MaterializeOperator: chunk schema mismatch (column count)");
             }
+
+            if (n_cols == 0) {
+                // Column-less frames (e.g. `Table(n)` row scaffolds) carry their
+                // row count in `logical_rows`, not in any column; accumulate it
+                // across chunks so multi-chunk zero-column output reports the
+                // total rather than only the first chunk's count.
+                result.logical_rows =
+                    result.logical_rows.value_or(0) + chunk.logical_rows.value_or(0);
+                continue;
+            }
+
             for (std::size_t i = 0; i < n_cols; ++i) {
                 if (chunk.columns[i].name != result.columns[i].name) {
                     return std::unexpected(
@@ -179,15 +221,14 @@ class MaterializeOperator {
                     return std::unexpected(
                         "MaterializeOperator: chunk schema mismatch (column type)");
                 }
-                if (chunk.columns[i].validity.has_value() ||
-                    result.columns[i].validity.has_value()) {
-                    return std::unexpected(
-                        "MaterializeOperator: validity bitmaps not yet supported on multi-chunk "
-                        "streams");
-                }
             }
 
+            // Every result column has the same length before this chunk lands;
+            // capture it once for validity backfill. (`n_cols == 0` returned
+            // above, so there is always a column 0 here.)
+            const std::size_t prev_rows = column_size(*result.columns[0].column);
             for (std::size_t i = 0; i < n_cols; ++i) {
+                const std::size_t src_rows = column_size(*chunk.columns[i].column);
                 auto& dst_col = result.mutable_column(i);
                 std::visit(
                     [&](auto& dst) {
@@ -205,6 +246,8 @@ class MaterializeOperator {
                         }
                     },
                     dst_col);
+                materialize_append_validity(result.columns[i].validity, prev_rows,
+                                            chunk.columns[i].validity, src_rows);
             }
             // `chunk` goes out of scope here, releasing its memory before
             // the next `child_->next()` call.

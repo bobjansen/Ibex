@@ -96,33 +96,49 @@ struct TableRangeMorsel {
 ///   * The pointed-to table must outlive the operator and must not be mutated
 ///     while it is being drained.
 ///   * A grain of 0 is treated as 1 (never an infinite loop / empty range).
-///   * A column-less frame (e.g. a `Table(n)` scaffold) emits exactly one
-///     chunk carrying `logical_rows`; a zero-row table with columns emits
-///     exactly one empty schema-carrier chunk. Both mirror
-///     `TableSourceOperator` so `MaterializeOperator` reconstructs the schema
-///     and metadata.
+///   * A column-less frame (e.g. a `Table(n)` scaffold) is partitioned by
+///     `grain` too, carrying each range's `logical_rows`. A zero-row input —
+///     with or without columns — emits exactly one zero-row carrier so its
+///     schema/metadata reach `MaterializeOperator`.
 ///
 /// This does NOT reuse `TableSourceOperator` (which emits the whole table as
 /// one chunk) and it does NOT introduce column slicing/views — the ranges are
 /// materialized by `gather_range`. Zero-copy range kernels are Phase 1.
 class PartitionedTableSource final : public Operator {
    public:
-    PartitionedTableSource(const Table* input, std::size_t grain)
-        : input_(input), grain_(grain == 0 ? 1 : grain) {}
+    PartitionedTableSource(const Table& input, std::size_t grain)
+        : input_(&input), grain_(grain == 0 ? 1 : grain) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        // Column-less frame: one schema-carrier chunk with the logical row count.
+        // Column-less frames still have stable logical row ranges. They need no
+        // data gather, but a future range-aware kernel must receive the same
+        // morsel identity as it would for an ordinary table.
         if (input_->columns.empty()) {
-            if (emitted_column_less_) {
+            const std::size_t total = input_->rows();
+            if (cursor_ >= total) {
+                // A zero-row column-less frame has no schema columns, but it
+                // still needs one carrier so the sink observes its metadata.
+                if (total == 0 && !emitted_empty_) {
+                    emitted_empty_ = true;
+                    Chunk chunk;
+                    chunk.logical_rows = 0;
+                    chunk.ordering = input_->ordering;
+                    chunk.time_index = input_->time_index;
+                    chunk.sequence = sequence_++;
+                    chunk.row_offset = 0;
+                    return std::optional<Chunk>{std::move(chunk)};
+                }
                 return std::optional<Chunk>{};
             }
-            emitted_column_less_ = true;
+            const std::size_t begin = cursor_;
+            const std::size_t end = std::min(begin + grain_, total);
+            cursor_ = end;
             Chunk chunk;
-            chunk.logical_rows = input_->logical_rows;
+            chunk.logical_rows = end - begin;
             chunk.ordering = input_->ordering;
             chunk.time_index = input_->time_index;
             chunk.sequence = sequence_++;
-            chunk.row_offset = 0;
+            chunk.row_offset = begin;
             return std::optional<Chunk>{std::move(chunk)};
         }
 
@@ -164,7 +180,6 @@ class PartitionedTableSource final : public Operator {
     std::size_t grain_;
     std::size_t cursor_ = 0;
     std::uint64_t sequence_ = 0;
-    bool emitted_column_less_ = false;
     bool emitted_empty_ = false;
 };
 

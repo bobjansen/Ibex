@@ -6060,7 +6060,7 @@ class ParallelIslandOperator final : public Operator {
             const auto slot = static_cast<std::size_t>(next_sequence_ % window_);
             ready_.wait(lock, [&] {
                 return ring_ready_[slot] || cancelled_ || active_workers_ == 0 ||
-                       (error_.has_value() && error_sequence_ <= next_sequence_);
+                       (has_error_ && error_sequence_ <= next_sequence_);
             });
             if (ring_ready_[slot]) {
                 chunk = std::move(ring_[slot]);
@@ -6085,11 +6085,13 @@ class ParallelIslandOperator final : public Operator {
         if (interrupt_requested()) {
             return fail(interrupt_message());
         }
-        // Copy the message out before `fail()`, which takes the same lock.
+        // Compose the message out here, before `fail()` takes the same lock.
         std::optional<std::string> failure;
         {
             const std::scoped_lock lock(mutex_);
-            failure = error_;
+            if (has_error_) {
+                failure = error_fixed_ != nullptr ? std::string(error_fixed_) : error_owned_;
+            }
         }
         if (failure.has_value()) {
             return fail(std::move(*failure));
@@ -6111,6 +6113,13 @@ class ParallelIslandOperator final : public Operator {
     }
 
     void run_worker(std::size_t worker_id) noexcept {
+        // Cleanup runs however this scope is left, so no path can leave the
+        // consumer waiting on a worker that is gone.
+        struct ExitGuard {
+            ParallelIslandOperator* self;
+            ~ExitGuard() { self->worker_exited(); }
+        } const guard{this};
+
         std::uint64_t sequence = 0;
         try {
             run_worker_loop(worker_id, sequence);
@@ -6121,12 +6130,23 @@ class ParallelIslandOperator final : public Operator {
             // say. Convert it to a sequence-tagged island error so it obeys the
             // same lowest-sequence determinism as any other failure, rather
             // than unwinding through a pool thread.
-            record_error(sequence,
-                         "parallel island: worker exception: " + std::string(error.what()));
+            //
+            // Composing that message allocates, and the exception this handler
+            // most expects is `bad_alloc` — so the detailed message is
+            // best-effort, with an allocation-free fallback underneath it.
+            // Throwing from here would terminate the process, since this
+            // function is noexcept precisely so a worker cannot unwind into the
+            // pool. `what()` cannot be stored: it dies with the exception.
+            try {
+                record_error(sequence,
+                             "parallel island: worker exception: " + std::string(error.what()));
+            } catch (...) {
+                record_fault(sequence,
+                             "parallel island: worker exception (no memory to report it)");
+            }
         } catch (...) {
-            record_error(sequence, "parallel island: worker threw a non-standard exception");
+            record_fault(sequence, "parallel island: worker threw a non-standard exception");
         }
-        worker_exited();
     }
 
     void run_worker_loop(std::size_t worker_id, std::uint64_t& claimed) {
@@ -6146,9 +6166,9 @@ class ParallelIslandOperator final : public Operator {
                 // consumer has released the morsel `window_` ahead of it.
                 space_.wait(lock, [&] {
                     return cancelled_ || sequence < released_ + window_ ||
-                           (error_.has_value() && error_sequence_ < sequence);
+                           (has_error_ && error_sequence_ < sequence);
                 });
-                if (cancelled_ || (error_.has_value() && error_sequence_ < sequence)) {
+                if (cancelled_ || (has_error_ && error_sequence_ < sequence)) {
                     break;  // only ever abandons morsels above the reported failure
                 }
             }
@@ -6166,12 +6186,12 @@ class ParallelIslandOperator final : public Operator {
                 break;
             }
             if (!produced->has_value()) {
-                record_error(sequence, "parallel island: worker produced no output morsel");
+                record_fault(sequence, "parallel island: worker produced no output morsel");
                 break;
             }
             Chunk out = std::move(**produced);
             if (out.sequence != sequence || out.row_offset != begin) {
-                record_error(sequence, "parallel island: morsel identity gap or reordering");
+                record_fault(sequence, "parallel island: morsel identity gap or reordering");
                 break;
             }
             {
@@ -6184,14 +6204,44 @@ class ParallelIslandOperator final : public Operator {
         }
     }
 
-    void record_error(std::uint64_t sequence, std::string message) {
+    // Record an owned message. The caller has already built the string, so
+    // taking it by value and moving it under the lock never allocates here.
+    void record_error(std::uint64_t sequence, std::string message) noexcept {
         {
             const std::scoped_lock lock(mutex_);
-            if (!error_.has_value() || sequence < error_sequence_) {
-                error_ = std::move(message);
-                error_sequence_ = sequence;
+            if (claim_failure(sequence)) {
+                error_owned_ = std::move(message);
+                error_fixed_ = nullptr;
             }
         }
+        wake_all();
+    }
+
+    // Record a message in static storage. Allocates nothing at all, so it is
+    // the only reporting path available once allocation is what failed.
+    void record_fault(std::uint64_t sequence, const char* message) noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            if (claim_failure(sequence)) {
+                error_owned_.clear();  // frees, never allocates
+                error_fixed_ = message;
+            }
+        }
+        wake_all();
+    }
+
+    // True if `sequence` becomes the reported failure. Lowest sequence wins, so
+    // the error a query reports never depends on thread timing.
+    [[nodiscard]] auto claim_failure(std::uint64_t sequence) noexcept -> bool {
+        if (has_error_ && sequence >= error_sequence_) {
+            return false;
+        }
+        has_error_ = true;
+        error_sequence_ = sequence;
+        return true;
+    }
+
+    void wake_all() noexcept {
         ready_.notify_all();
         space_.notify_all();
     }
@@ -6230,8 +6280,9 @@ class ParallelIslandOperator final : public Operator {
         if (interrupt_requested()) {
             return std::unexpected(interrupt_message());
         }
-        if (error_.has_value()) {
-            return std::unexpected(*error_);
+        if (has_error_) {
+            return std::unexpected(error_fixed_ != nullptr ? std::string(error_fixed_)
+                                                           : error_owned_);
         }
         for (auto& worker : workers_) {
             auto trailing = worker.chain->next();
@@ -6272,7 +6323,13 @@ class ParallelIslandOperator final : public Operator {
     std::uint64_t released_ = 0;
     std::size_t active_workers_ = 0;
     bool cancelled_ = false;
-    std::optional<std::string> error_;
+    // The failure channel is split so it can be written without allocating.
+    // `error_owned_` carries a message moved in from a worker (moving a string
+    // never allocates); `error_fixed_` points at static storage and is the only
+    // path usable when the failure *is* an allocation failure.
+    bool has_error_ = false;
+    std::string error_owned_;
+    const char* error_fixed_ = nullptr;
     std::uint64_t error_sequence_ = 0;
 
     std::uint64_t next_sequence_ = 0;

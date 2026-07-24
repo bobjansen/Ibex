@@ -376,7 +376,10 @@ struct ModelResult {
 
 using ModelRegistry = robin_hood::unordered_map<std::string, ModelResult>;
 
-/// Interpret an IR node tree against a table registry.
+/// Interpret an IR node tree against a table registry. This is a top-level
+/// runtime entry point: extern/plugin callbacks must not call it re-entrantly.
+/// Plugins provide data/functions to the host query; they do not initiate
+/// nested query execution.
 class ExternRegistry;
 
 [[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,

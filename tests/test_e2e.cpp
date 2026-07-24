@@ -8,6 +8,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/stream_buffered.hpp>
 
 #include <catch2/catch_approx.hpp>
@@ -1994,12 +1995,68 @@ TEST_CASE("E2E: parallel serial-island preserves metadata and an all-filtered sc
     REQUIRE(island_metadata.ordering.has_value());
     REQUIRE((*island_metadata.ordering)[0].name == "time");
 
-    // Grain 3 produces four input morsels. Every one is rejected; the final
-    // table must nevertheless retain the projected schema and zero rows.
-    constexpr auto all_filtered_query = R"(t[filter value > 99, select { ts, value }];)";
-    auto serial_empty = run(all_filtered_query, tables);
-    auto island_empty = run_parallel(all_filtered_query, tables, 2);
-    require_tables_equal(serial_empty, island_empty);
-    REQUIRE(island_empty.columns.size() == 2);
-    REQUIRE(island_empty.rows() == 0);
+    // Grain 2 produces three input morsels. Every one is rejected. The
+    // serial-island validator requires one identified output morsel per input,
+    // while final materialization must retain the serial schema and zero rows.
+    const char* all_filtered_cases[] = {
+        "t[filter value > 99];",
+        "t[filter value > 99, select { ts, value }];",
+        "t[filter value > 99, select { ts, doubled = value * 2 }];",
+    };
+    for (const auto* query : all_filtered_cases) {
+        INFO("all-filtered query: " << query);
+        auto serial_empty = run(query, tables);
+        auto island_empty = run_parallel(query, tables, 2);
+        require_tables_equal(serial_empty, island_empty);
+        REQUIRE(island_empty.columns.size() == 2);
+        REQUIRE(island_empty.rows() == 0);
+    }
+}
+
+TEST_CASE("E2E: parallel serial-island handles a zero-row input", "[e2e][parallel]") {
+    // A zero-row input still yields exactly one empty schema-carrier morsel
+    // (partitioned_morsel_count -> 1), which the SerialIslandOrderValidator must
+    // accept, and the result must keep the schema with zero rows.
+    runtime::Table t;
+    t.add_column("x", Column<std::int64_t>{});
+    t.add_column("y", Column<double>{});
+    runtime::TableRegistry tables;
+    tables.emplace("e", std::move(t));
+
+    const char* cases[] = {
+        "e[filter x > 0];",
+        "e[filter x > 0, select { x, y }];",
+        "e[filter x > 0, select { x, z = y * 2 }];",
+        "e[select { x, y }];",
+    };
+    for (const auto* query : cases) {
+        INFO("zero-row query: " << query);
+        auto serial = run(query, tables);
+        auto island = run_parallel(query, tables, 4);
+        require_tables_equal(serial, island);
+        REQUIRE(island.rows() == 0);
+    }
+}
+
+TEST_CASE("E2E: parallel serial-island handles a column-less row scaffold", "[e2e][parallel]") {
+    // A `Table(n)` scaffold carries its row count in `logical_rows` with no
+    // columns. The partitioned source splits it into logical row ranges (grain 2
+    // over 3 rows -> two morsels), so the project runs per morsel and the
+    // validator sees a full, ordered stream that reassembles to 3 rows.
+    {
+        // Guard: the case is only meaningful if it actually takes the parallel
+        // island (a column-less input), not a silent serial fallback.
+        auto parsed = parser::parse("Table(3)[select { c = 1 }];");
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        auto candidate = runtime::analyze_parallel_island(**lowered);
+        REQUIRE(candidate.eligible());  // takes the island, not a serial fallback
+        REQUIRE(candidate.input != nullptr);
+    }
+    auto serial = run("Table(3)[select { c = 1 }];", {});
+    auto island = run_parallel("Table(3)[select { c = 1 }];", {}, 2);
+    require_tables_equal(serial, island);
+    REQUIRE(island.rows() == 3);
+    CHECK(col_i64(island, "c") == std::vector<std::int64_t>{1, 1, 1});
 }

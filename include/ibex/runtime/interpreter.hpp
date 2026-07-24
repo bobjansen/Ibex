@@ -336,6 +336,22 @@ struct ExecutionContext {
     /// alive for the whole `interpret()` call.
     const DeferredScanRegistry* deferred_scans = nullptr;
 
+    /// Runtime-multithreading Phase 1 (serial-island slice). When set,
+    /// `build_operator()` consults `analyze_parallel_island()` at its seam and,
+    /// for an eligible row-local parallel-map chain, executes it over a
+    /// `PartitionedTableSource` in fixed morsel grains instead of a single
+    /// whole-table chunk. This first slice runs those morsels *serially* through
+    /// the existing chunked operators — no worker pool yet — so output is
+    /// byte-identical to the plain serial path; the flag exists to exercise the
+    /// island wiring and morsel handoff before threads are introduced. Default
+    /// off keeps every existing caller on the untouched serial chain.
+    bool parallel = false;
+
+    /// Morsel row-grain for the partitioned island source when `parallel` is
+    /// set. A source is partitioned into contiguous ranges of at most this many
+    /// rows. Ignored when `parallel` is false.
+    std::size_t parallel_grain = 65536;
+
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.
     [[nodiscard]] auto deferred_scan(const std::string& name) const -> const DeferredScan* {

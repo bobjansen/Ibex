@@ -9,7 +9,9 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
+#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -5721,14 +5723,123 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 // matches are the post-canonicalization shapes (e.g. Project(Filter(x))
 // for the fused operator, not Project(Filter(Order(x)))).
 
+// Runtime-multithreading Phase 1, serial-island slice. Owns the materialized
+// input `Table` that the island's `PartitionedTableSource` reads by pointer.
+// `input_` is declared before `chain_` so the chain — which holds a raw
+// pointer into `input_` — is destroyed first.
+class OwningIslandOperator final : public Operator {
+   public:
+    OwningIslandOperator(std::unique_ptr<Table> input, OperatorPtr chain)
+        : input_(std::move(input)), chain_(std::move(chain)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        return chain_->next();
+    }
+
+   private:
+    std::unique_ptr<Table> input_;
+    OperatorPtr chain_;
+};
+
+// Build one eligible row-local parallel-map chain as an island: materialize its
+// input subtree once, then run the chain over a `PartitionedTableSource` in
+// fixed morsel grains instead of a single whole-table chunk.
+//
+// This slice executes the morsels *serially* through the existing chunked
+// operators, so `MaterializeOperator`'s in-order concat is the (trivially
+// ordered) merger and the output is byte-identical to the plain serial chain.
+// The worker pool, range-aware zero-copy kernels, and out-of-order ordered
+// merger are later Phase 1 slices. `candidate.operators` is source-to-sink.
+auto build_parallel_island(const ParallelIslandCandidate& candidate, const TableRegistry& registry,
+                           const ScalarRegistry* scalars, const ExternRegistry* externs,
+                           const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    auto input_op = build_operator(*candidate.input, registry, scalars, externs, exec, model_out);
+    if (!input_op.has_value()) {
+        return std::unexpected(std::move(input_op.error()));
+    }
+    auto input_tbl = materialize_operator(std::move(input_op.value()));
+    if (!input_tbl.has_value()) {
+        return std::unexpected(std::move(input_tbl.error()));
+    }
+    auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
+
+    OperatorPtr chain = std::make_unique<PartitionedTableSource>(*owned, exec.parallel_grain);
+
+    for (const ir::Node* op_node : candidate.operators) {
+        switch (op_node->kind()) {
+            case ir::NodeKind::Filter: {
+                const auto& f = static_cast<const ir::FilterNode&>(*op_node);
+                chain = std::make_unique<ChunkedFilterOperator>(std::move(chain), &f.predicate(),
+                                                                scalars);
+                break;
+            }
+            case ir::NodeKind::Project: {
+                const auto& p = static_cast<const ir::ProjectNode&>(*op_node);
+                chain = std::make_unique<ChunkedProjectOperator>(std::move(chain), &p.columns());
+                break;
+            }
+            case ir::NodeKind::Rename: {
+                const auto& r = static_cast<const ir::RenameNode&>(*op_node);
+                chain = std::make_unique<ChunkedRenameOperator>(std::move(chain), &r.renames());
+                break;
+            }
+            case ir::NodeKind::FilterProject: {
+                const auto& fp = static_cast<const ir::FilterProjectNode&>(*op_node);
+                chain = std::make_unique<ChunkedFilterProjectOperator>(
+                    std::move(chain), &fp.predicate(), &fp.columns(), scalars);
+                break;
+            }
+            case ir::NodeKind::FilterUpdateProject: {
+                const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(*op_node);
+                robin_hood::unordered_set<std::string> update_outputs;
+                robin_hood::unordered_set<std::string> needed;
+                for (const auto& fld : fup.fields()) {
+                    update_outputs.insert(fld.alias);
+                    collect_expr_column_refs(fld.expr, needed);
+                }
+                for (const auto& col : fup.project_columns()) {
+                    if (update_outputs.find(col.name) == update_outputs.end()) {
+                        needed.insert(col.name);
+                    }
+                }
+                std::vector<ir::ColumnRef> gather_cols;
+                gather_cols.reserve(needed.size());
+                for (const auto& name : needed) {
+                    gather_cols.push_back(ir::ColumnRef{.name = name});
+                }
+                chain = std::make_unique<ChunkedFilterUpdateProjectOperator>(
+                    std::move(chain), &fup.predicate(), &fup.fields(), &fup.project_columns(),
+                    std::move(gather_cols), scalars, externs, exec);
+                break;
+            }
+            default:
+                // analyze_parallel_island() only admits the kinds above.
+                return std::unexpected("parallel island: unexpected operator kind in chain");
+        }
+    }
+
+    return std::make_unique<OwningIslandOperator>(std::move(owned), std::move(chain));
+}
+
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // Phase 1 invokes analyze_parallel_island() at this physical-execution
-    // seam once RuntimeOptions can request a parallel executor. Do not run the
-    // analysis merely to discard it on the serial path: build_operator() is a
-    // hot query-construction path, and this prerequisite must be cost-neutral.
+    // Runtime-multithreading Phase 1 seam. Only consult the island analysis
+    // when a parallel executor is actually requested — build_operator() is a
+    // hot query-construction path, so the serial default must not pay for
+    // analysis it would discard. When eligible, the whole row-local chain is
+    // built as one island here and its inner nodes are not recursed into
+    // separately (only the island's input subtree is), so there is no
+    // re-analysis of the chain and no infinite recursion.
+    if (exec.parallel) {
+        const auto island = analyze_parallel_island(node);
+        if (island.eligible()) {
+            return build_parallel_island(island, registry, scalars, externs, exec, model_out);
+        }
+    }
+
     if (node.kind() == ir::NodeKind::Filter) {
         const auto& filter = static_cast<const ir::FilterNode&>(node);
         if (filter.children().empty()) {

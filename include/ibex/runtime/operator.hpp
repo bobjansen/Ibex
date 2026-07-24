@@ -3,6 +3,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -201,6 +202,19 @@ class MaterializeOperator {
 
         const std::size_t n_cols = result.columns.size();
 
+        // Reserved capacity per output column, grown geometrically below.
+        //
+        // Reserving exactly `size + chunk` per chunk is what a growing vector
+        // must never do: `reserve` allocates precisely what it is asked for, so
+        // every chunk reallocates and copies the whole accumulated column, and
+        // the concat becomes quadratic in the chunk count. That is invisible
+        // with one chunk and dominates everything at a few hundred (a 20M-row
+        // island at a 64k grain spent 93% of its runtime in `memmove`).
+        std::vector<std::size_t> reserved(n_cols, 0);
+        for (std::size_t i = 0; i < n_cols; ++i) {
+            reserved[i] = column_size(*result.columns[i].column);
+        }
+
         while (true) {
             // Per-chunk interruption boundary for streamed pipelines.
             if (interrupt_requested()) {
@@ -247,11 +261,18 @@ class MaterializeOperator {
             for (std::size_t i = 0; i < n_cols; ++i) {
                 const std::size_t src_rows = column_size(*chunk.columns[i].column);
                 auto& dst_col = result.mutable_column(i);
+                const std::size_t needed = prev_rows + src_rows;
+                const bool grow = needed > reserved[i];
+                if (grow) {
+                    reserved[i] = std::max(needed, reserved[i] * 2);
+                }
                 std::visit(
                     [&](auto& dst) {
                         using Col = std::decay_t<decltype(dst)>;
                         auto& src = std::get<Col>(*chunk.columns[i].column);
-                        dst.reserve(dst.size() + src.size());
+                        if (grow) {
+                            dst.reserve(reserved[i]);
+                        }
                         if constexpr (std::is_same_v<Col, Column<Categorical>>) {
                             for (std::size_t r = 0; r < src.size(); ++r) {
                                 dst.push_code(src.code_at(r));

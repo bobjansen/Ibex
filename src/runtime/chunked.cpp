@@ -8,13 +8,17 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/pipeline.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +29,7 @@
 #include <expected>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <pdqsort.h>
@@ -5833,14 +5838,18 @@ class SerialIslandOrderValidator final : public Operator {
     std::size_t grain_ = 1;
 };
 
-[[nodiscard]] auto partitioned_morsel_count(const Table& input, std::size_t grain)
-    -> std::uint64_t {
-    const std::size_t normalized_grain = grain == 0 ? 1 : grain;
-    const std::size_t rows = input.rows();
-    if (rows == 0) {
-        return 1;  // one zero-row schema/logical-row carrier
+void configure_parallel_from_env(ExecutionContext& exec) {
+    if (parallel_enabled_from_env()) {
+        exec.parallel = true;
     }
-    return static_cast<std::uint64_t>((rows + normalized_grain - 1) / normalized_grain);
+    if (const std::size_t grain = morsel_rows_from_env(); grain > 0) {
+        exec.parallel_grain = grain;
+        // An explicit grain is an explicit request to partition at that size,
+        // so it also lowers the serial threshold — otherwise the default
+        // threshold would silently override the knob it was asked to honor.
+        exec.parallel_min_rows = std::min(exec.parallel_min_rows, grain);
+    }
+    exec.parallel_threads = default_thread_count();
 }
 
 // True if any Scan in `node`'s subtree reads a lazy/deferred source: no eager
@@ -5916,15 +5925,328 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
     }
 }
 
-// Build one eligible row-local parallel-map chain as an island: materialize its
-// input subtree once, then run the chain over a `PartitionedTableSource` in
-// fixed morsel grains instead of a single whole-table chunk.
+// The base of one worker's island chain: a source the worker refills with the
+// morsel it just claimed. The chain above it is an ordinary chunked map chain,
+// so a worker needs no range-aware kernels — it consumes a materialized morsel
+// exactly as the serial path does. (Replacing this gather with a zero-copy
+// range kernel is the next lever; `TableRangeMorsel` already carries the
+// pointer+range shape that needs.)
+class MorselFeeder final : public Operator {
+   public:
+    void supply(Chunk chunk) { pending_ = std::move(chunk); }
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (!pending_.has_value()) {
+            return std::optional<Chunk>{};
+        }
+        auto chunk = std::move(*pending_);
+        pending_.reset();
+        return std::optional<Chunk>{std::move(chunk)};
+    }
+
+   private:
+    std::optional<Chunk> pending_;
+};
+
+// One worker's private copy of the island's map chain. The operators are
+// per-worker (they carry mutable per-chunk state); the IR nodes, registries,
+// and the input table they read are shared and immutable for the island's
+// lifetime.
+struct IslandWorkerChain {
+    MorselFeeder* feeder = nullptr;  // owned by `chain`, refilled per morsel
+    OperatorPtr chain;
+};
+
+[[nodiscard]] auto build_island_worker_chain(const std::vector<const ir::Node*>& operators,
+                                             const ScalarRegistry* scalars,
+                                             const ExternRegistry* externs,
+                                             const ExecutionContext& exec)
+    -> std::expected<IslandWorkerChain, std::string> {
+    auto feeder = std::make_unique<MorselFeeder>();
+    IslandWorkerChain worker{.feeder = feeder.get(), .chain = std::move(feeder)};
+    for (const ir::Node* op_node : operators) {
+        // `preserve_empty_morsels` is what makes one input morsel yield exactly
+        // one identified output morsel — the merger indexes by sequence, so a
+        // silently coalesced empty result would be a lost slot, not a smaller
+        // answer.
+        auto next = build_row_local_map_operator(*op_node, std::move(worker.chain), scalars,
+                                                 externs, exec, true);
+        if (!next.has_value()) {
+            // analyze_parallel_island() only admits row-local map kinds.
+            return std::unexpected("parallel island: " + next.error());
+        }
+        worker.chain = std::move(next.value());
+    }
+    return worker;
+}
+
+// Runtime-multithreading Phase 1: the parallel island executor.
 //
-// This slice executes the morsels *serially* through the existing chunked
-// operators, so `MaterializeOperator`'s in-order concat is the (trivially
-// ordered) merger and the output is byte-identical to the plain serial chain.
-// The worker pool, range-aware zero-copy kernels, and out-of-order ordered
-// merger are later Phase 1 slices. `candidate.operators` is source-to-sink.
+// Workers pull numbered morsels from one shared cursor over the immutable
+// materialized input, run their own chain over each, and deposit the result in
+// a bounded ring indexed by `sequence`. `next()` is the ordered merger: it
+// releases results strictly in sequence order, so the operator's output is
+// byte-identical to the serial chain's regardless of completion order. The ring
+// is the plan's bounded in-flight queue — a worker that runs ahead of the
+// consumer by a full window blocks instead of buffering the whole island.
+//
+// Output ownership (the plan's Phase-1 allocator variable): each task owns the
+// chunk it produces, and the merger's consumer moves it straight into the
+// downstream `MaterializeOperator` concat. Nothing escapes into task-local
+// scratch storage, so no arena ownership has to be transferred. That is the
+// simplest of the strategies the plan allows and the one whose allocation
+// behavior the acceptance benchmarks measure; a presized query-owned buffer
+// pool is the next option if allocation shows up in those numbers.
+//
+// Error and cancellation determinism: a failing morsel records its error under
+// the lock, keeping the *lowest* sequence, and workers abandon only morsels
+// above it — so every morsel below the reported failure is still produced, and
+// the error a query reports does not depend on thread timing.
+class ParallelIslandOperator final : public Operator {
+   public:
+    ParallelIslandOperator(std::unique_ptr<Table> input, std::vector<IslandWorkerChain> workers,
+                           std::size_t grain, std::uint64_t morsel_count, WorkerPool& pool)
+        : input_(std::move(input)),
+          workers_(std::move(workers)),
+          grain_(grain == 0 ? 1 : grain),
+          morsel_count_(morsel_count),
+          window_(std::max<std::size_t>(workers_.size() * 2, 2)),
+          pool_(&pool),
+          active_workers_(workers_.size()) {
+        ring_.resize(window_);
+        ring_ready_.assign(window_, false);
+    }
+
+    ~ParallelIslandOperator() override { cancel_and_join(); }
+
+    ParallelIslandOperator(const ParallelIslandOperator&) = delete;
+    auto operator=(const ParallelIslandOperator&) -> ParallelIslandOperator& = delete;
+    ParallelIslandOperator(ParallelIslandOperator&&) = delete;
+    auto operator=(ParallelIslandOperator&&) -> ParallelIslandOperator& = delete;
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (finished_) {
+            return std::optional<Chunk>{};
+        }
+        if (!started_) {
+            started_ = true;
+            batch_ = pool_->submit(workers_.size(), [this](std::size_t id) { run_worker(id); });
+        }
+        if (next_sequence_ >= morsel_count_) {
+            return finish();
+        }
+        if (interrupt_requested()) {
+            return fail(interrupt_message());
+        }
+
+        std::optional<Chunk> chunk;
+        {
+            std::unique_lock lock(mutex_);
+            const auto slot = static_cast<std::size_t>(next_sequence_ % window_);
+            ready_.wait(lock, [&] {
+                return ring_ready_[slot] || cancelled_ || active_workers_ == 0 ||
+                       (error_.has_value() && error_sequence_ <= next_sequence_);
+            });
+            if (ring_ready_[slot]) {
+                chunk = std::move(ring_[slot]);
+                ring_[slot].reset();
+                ring_ready_[slot] = false;
+                ++next_sequence_;
+                ++released_;
+            }
+        }
+        if (chunk.has_value()) {
+            space_.notify_all();
+            return std::optional<Chunk>{std::move(*chunk)};
+        }
+
+        // No chunk: the island stopped early. Report why, deterministically.
+        // Copy the message out before `fail()`, which takes the same lock.
+        std::optional<std::string> failure;
+        {
+            const std::scoped_lock lock(mutex_);
+            failure = error_;
+        }
+        if (failure.has_value()) {
+            return fail(std::move(*failure));
+        }
+        if (interrupt_requested()) {
+            return fail(interrupt_message());
+        }
+        return fail("parallel island: missing output morsel");
+    }
+
+   private:
+    void run_worker(std::size_t worker_id) {
+        auto& worker = workers_[worker_id];
+        const std::size_t rows = input_->rows();
+        while (true) {
+            const std::uint64_t sequence = cursor_.fetch_add(1, std::memory_order_relaxed);
+            if (sequence >= morsel_count_) {
+                break;
+            }
+            {
+                std::unique_lock lock(mutex_);
+                // Backpressure: this morsel's ring slot is only free once the
+                // consumer has released the morsel `window_` ahead of it.
+                space_.wait(lock, [&] {
+                    return cancelled_ || sequence < released_ + window_ ||
+                           (error_.has_value() && error_sequence_ < sequence);
+                });
+                if (cancelled_ || (error_.has_value() && error_sequence_ < sequence)) {
+                    break;  // only ever abandons morsels above the reported failure
+                }
+            }
+            if (interrupt_requested()) {
+                cancel();
+                break;
+            }
+
+            const auto [begin, end] = morsel_row_range(rows, grain_, sequence);
+            worker.feeder->supply(make_morsel_chunk(*input_, begin, end, sequence));
+            auto produced = worker.chain->next();
+
+            if (!produced.has_value()) {
+                record_error(sequence, std::move(produced.error()));
+                break;
+            }
+            if (!produced->has_value()) {
+                record_error(sequence, "parallel island: worker produced no output morsel");
+                break;
+            }
+            Chunk out = std::move(**produced);
+            if (out.sequence != sequence || out.row_offset != begin) {
+                record_error(sequence, "parallel island: morsel identity gap or reordering");
+                break;
+            }
+            {
+                const std::scoped_lock lock(mutex_);
+                const auto slot = static_cast<std::size_t>(sequence % window_);
+                ring_[slot] = std::move(out);
+                ring_ready_[slot] = true;
+            }
+            ready_.notify_one();
+        }
+        {
+            const std::scoped_lock lock(mutex_);
+            --active_workers_;
+        }
+        ready_.notify_all();
+    }
+
+    void record_error(std::uint64_t sequence, std::string message) {
+        {
+            const std::scoped_lock lock(mutex_);
+            if (!error_.has_value() || sequence < error_sequence_) {
+                error_ = std::move(message);
+                error_sequence_ = sequence;
+            }
+        }
+        ready_.notify_all();
+        space_.notify_all();
+    }
+
+    void cancel() {
+        {
+            const std::scoped_lock lock(mutex_);
+            cancelled_ = true;
+        }
+        ready_.notify_all();
+        space_.notify_all();
+    }
+
+    void cancel_and_join() {
+        cancel();
+        batch_.wait();
+    }
+
+    // Drain the island cleanly at EOF, then check the per-worker chains really
+    // are exhausted: a chain still holding a suppressed schema carrier would
+    // mean a morsel was coalesced away rather than emitted.
+    [[nodiscard]] auto finish() -> std::expected<std::optional<Chunk>, std::string> {
+        finished_ = true;
+        batch_.wait();
+        if (error_.has_value()) {
+            return std::unexpected(*error_);
+        }
+        for (auto& worker : workers_) {
+            auto trailing = worker.chain->next();
+            if (!trailing.has_value()) {
+                return std::unexpected(std::move(trailing.error()));
+            }
+            if (trailing->has_value()) {
+                return std::unexpected("parallel island: unexpected trailing morsel");
+            }
+        }
+        return std::optional<Chunk>{};
+    }
+
+    [[nodiscard]] auto fail(std::string message)
+        -> std::expected<std::optional<Chunk>, std::string> {
+        finished_ = true;
+        cancel_and_join();
+        return std::unexpected(std::move(message));
+    }
+
+    // `input_` is declared first so it outlives `workers_`: the chains read it
+    // through raw pointers, and the batch is joined before any member is
+    // destroyed.
+    std::unique_ptr<Table> input_;
+    std::vector<IslandWorkerChain> workers_;
+    std::size_t grain_ = 1;
+    std::uint64_t morsel_count_ = 0;
+    std::size_t window_ = 2;
+    WorkerPool* pool_;
+
+    std::atomic<std::uint64_t> cursor_{0};
+
+    std::mutex mutex_;
+    std::condition_variable ready_;  // consumer waits for the next sequence
+    std::condition_variable space_;  // workers wait for ring space
+    std::vector<std::optional<Chunk>> ring_;
+    std::vector<bool> ring_ready_;
+    std::uint64_t released_ = 0;
+    std::size_t active_workers_ = 0;
+    bool cancelled_ = false;
+    std::optional<std::string> error_;
+    std::uint64_t error_sequence_ = 0;
+
+    std::uint64_t next_sequence_ = 0;
+    bool started_ = false;
+    bool finished_ = false;
+    WorkerPool::Batch batch_;
+};
+
+// How many workers an island of `morsel_count` morsels over `rows` rows should
+// run on: 0 means "stay on the serial morsel chain".
+//
+// This is the plan's grain-size serial threshold. Below it, task dispatch,
+// ring synchronization, and the merge cost more than the map they parallelize —
+// cache-resident work should not pay for threads. A single morsel is serial by
+// definition, and a one-thread budget means the caller asked for serial.
+[[nodiscard]] auto island_worker_count(const ExecutionContext& exec, std::size_t rows,
+                                       std::uint64_t morsel_count) -> std::size_t {
+    if (morsel_count < 2 || rows < exec.parallel_min_rows) {
+        return 0;
+    }
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t workers =
+        std::min({budget, pool_size, static_cast<std::size_t>(morsel_count)});
+    return workers < 2 ? 0 : workers;
+}
+
+// Build one eligible row-local parallel-map chain as an island: materialize its
+// input subtree once, then run the chain over morsels of that table instead of
+// one whole-table chunk. `candidate.operators` is source-to-sink.
+//
+// Two executors, one morsel model. A large input fans out across the worker
+// pool and is reassembled by `ParallelIslandOperator`'s ordered merger; a small
+// one (or a single-threaded budget) runs the same morsels serially through a
+// `PartitionedTableSource`, where `MaterializeOperator`'s in-order concat is
+// the trivially ordered merger. Both stamp and check the same morsel identity,
+// so both are byte-identical to the plain serial chain — which is exactly what
+// lets the threshold move without changing an answer.
 auto build_parallel_island(const ParallelIslandCandidate& candidate, const TableRegistry& registry,
                            const ScalarRegistry* scalars, const ExternRegistry* externs,
                            const ExecutionContext& exec, ModelResult* model_out)
@@ -5939,9 +6261,30 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
     }
     auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
     const auto expected_morsels = partitioned_morsel_count(*owned, exec.parallel_grain);
+    const std::size_t worker_count = island_worker_count(exec, owned->rows(), expected_morsels);
+    if (exec.parallel_stats != nullptr) {
+        auto& stats = *exec.parallel_stats;
+        (worker_count >= 2 ? stats.parallel_islands : stats.serial_islands)
+            .fetch_add(1, std::memory_order_relaxed);
+        stats.morsels.fetch_add(expected_morsels, std::memory_order_relaxed);
+    }
+
+    if (worker_count >= 2) {
+        std::vector<IslandWorkerChain> workers;
+        workers.reserve(worker_count);
+        for (std::size_t i = 0; i < worker_count; ++i) {
+            auto worker = build_island_worker_chain(candidate.operators, scalars, externs, exec);
+            if (!worker.has_value()) {
+                return std::unexpected(std::move(worker.error()));
+            }
+            workers.push_back(std::move(worker.value()));
+        }
+        return std::make_unique<ParallelIslandOperator>(std::move(owned), std::move(workers),
+                                                        exec.parallel_grain, expected_morsels,
+                                                        process_worker_pool());
+    }
 
     OperatorPtr chain = std::make_unique<PartitionedTableSource>(*owned, exec.parallel_grain);
-
     for (const ir::Node* op_node : candidate.operators) {
         auto next =
             build_row_local_map_operator(*op_node, std::move(chain), scalars, externs, exec, true);

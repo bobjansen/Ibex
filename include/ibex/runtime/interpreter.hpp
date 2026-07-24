@@ -392,11 +392,14 @@ struct ExecutionContext {
     }
 };
 
-/// Apply the parallel-island environment switches to `exec`:
-/// `IBEX_PARALLEL` enables islands, `IBEX_THREADS` sets the thread budget, and
-/// `IBEX_MORSEL_ROWS` overrides the morsel grain (and, when set explicitly,
-/// drops the serial threshold to that grain so a deliberately small grain is
-/// honored). Unset variables leave `exec` untouched.
+/// Apply the parallel-island environment switches to `exec`: `IBEX_PARALLEL`
+/// enables islands, and `IBEX_MORSEL_ROWS` overrides the morsel grain (and,
+/// when set explicitly, drops the serial threshold to that grain so a
+/// deliberately small grain is honored). Unset variables leave `exec`
+/// untouched, so this never overrides a budget the caller chose.
+///
+/// `IBEX_THREADS` is deliberately *not* applied here: it sizes the process
+/// worker pool, which a zero `parallel_threads` defers to anyway.
 ///
 /// This is how a benchmark run turns the executor on: parallel islands stay off
 /// by default until Phase 1's acceptance measurements say otherwise.
